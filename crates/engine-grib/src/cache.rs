@@ -175,41 +175,78 @@ impl DecodedGrid {
     #[allow(clippy::type_complexity)]
     pub fn extract_bbox(&self, bbox: [f64; 4]) -> Option<(Vec<f64>, Vec<f64>, Vec<Option<f64>>)> {
         let [west, south, east, north] = bbox;
-
-        // Find column range
-        let col_start = ((west - self.lon_first) / self.lon_inc).floor() as isize;
-        let col_end = ((east - self.lon_first) / self.lon_inc).ceil() as isize;
-
-        // Find row range (lat_inc is negative for N→S grids)
-        let (row_start, row_end) = if self.lat_inc < 0.0 {
-            // N→S: north has smaller row index
-            let rs = ((north - self.lat_first) / self.lat_inc).floor() as isize;
-            let re = ((south - self.lat_first) / self.lat_inc).ceil() as isize;
-            (rs, re)
-        } else {
-            let rs = ((south - self.lat_first) / self.lat_inc).floor() as isize;
-            let re = ((north - self.lat_first) / self.lat_inc).ceil() as isize;
-            (rs, re)
-        };
-
-        // Clamp to grid bounds
-        let col_start = col_start.max(0) as usize;
-        let col_end = (col_end.min(self.ni as isize) as usize).max(col_start);
-        let row_start = row_start.max(0) as usize;
-        let row_end = (row_end.min(self.nj as isize) as usize).max(row_start);
-
-        if col_start >= col_end || row_start >= row_end {
+        if self.ni == 0 || self.nj == 0 || self.lon_inc <= 0.0 || self.lat_inc == 0.0 {
             return None;
         }
 
-        let nx = col_end - col_start;
-        let ny = row_end - row_start;
+        // Column range in grid units, relative to `lon_first`. On a
+        // 360°-spanning grid the bbox may sit a whole turn away from
+        // `lon_first` (ECMWF open data starts at 180°, a Finnish bbox at
+        // 24° is at column −624): shift the range by whole turns so it
+        // starts inside the grid, then walk columns modulo `ni` — the same
+        // wrap `wrap_col` applies on the sampling path (#663). Every cast
+        // happens AFTER clamping; a negative `isize as usize` once turned a
+        // Finnish bbox into a ~1.8e19-element allocation and a 502.
+        let cols_per_360 = 360.0 / self.lon_inc;
+        let global = (self.ni as f64) >= cols_per_360 - 0.5;
+        let mut c0 = ((west - self.lon_first) / self.lon_inc).floor();
+        let mut c1 = ((east - self.lon_first) / self.lon_inc).ceil();
+        if !(c0.is_finite() && c1.is_finite()) {
+            return None;
+        }
+        // Both ends inclusive: a bbox edge exactly on a node keeps that
+        // node, and a bbox narrower than one cell still returns the cell it
+        // sits in.
+        if c1 < c0 {
+            c1 = c0;
+        }
+        let cols: Vec<usize> = if global {
+            let shift = c0.rem_euclid(cols_per_360) - c0;
+            c0 += shift;
+            c1 += shift;
+            // Cap at one full turn so a ±180° bbox is the whole grid once.
+            let n = ((c1 - c0) as usize + 1).min(self.ni);
+            let start = c0 as usize;
+            (0..n).map(|k| (start + k) % self.ni).collect()
+        } else {
+            let start = c0.max(0.0).min(self.ni as f64) as usize;
+            let end = (c1 + 1.0).max(0.0).min(self.ni as f64) as usize;
+            (start..end).collect()
+        };
 
-        let mut x_coords = Vec::with_capacity(nx);
-        for c in col_start..col_end {
-            x_coords.push(self.lon_first + c as f64 * self.lon_inc);
+        // Row range (lat_inc is negative for N→S grids), clamped before cast.
+        let (r0, r1) = if self.lat_inc < 0.0 {
+            (
+                ((north - self.lat_first) / self.lat_inc).floor(),
+                ((south - self.lat_first) / self.lat_inc).ceil(),
+            )
+        } else {
+            (
+                ((south - self.lat_first) / self.lat_inc).floor(),
+                ((north - self.lat_first) / self.lat_inc).ceil(),
+            )
+        };
+        if !(r0.is_finite() && r1.is_finite()) {
+            return None;
+        }
+        let row_start = r0.max(0.0).min(self.nj as f64) as usize;
+        let row_end = (r1.max(r0) + 1.0).max(0.0).min(self.nj as f64) as usize;
+
+        if cols.is_empty() || row_start >= row_end {
+            return None;
         }
 
+        // Longitudes in the requester's frame: ascending from the bbox
+        // west edge, so a range that crosses the grid seam reads
+        // …, 359.75, 360.0 → −0.25, 0.0 … as a monotonic axis.
+        let x_coords: Vec<f64> = (0..cols.len())
+            .map(|k| {
+                let raw = self.lon_first + (c0 + k as f64) * self.lon_inc;
+                raw - ((raw - west) / 360.0).floor() * 360.0
+            })
+            .collect();
+
+        let ny = row_end - row_start;
         let mut y_coords = Vec::with_capacity(ny);
         for r in row_start..row_end {
             y_coords.push(self.lat_first + r as f64 * self.lat_inc);
@@ -219,7 +256,7 @@ impl DecodedGrid {
             y_coords.reverse();
         }
 
-        let mut values = Vec::with_capacity(nx * ny);
+        let mut values = Vec::with_capacity(cols.len() * ny);
         // Output in y-ascending order (south to north)
         let row_iter: Box<dyn Iterator<Item = usize>> = if self.lat_inc < 0.0 {
             Box::new((row_start..row_end).rev())
@@ -227,7 +264,7 @@ impl DecodedGrid {
             Box::new(row_start..row_end)
         };
         for r in row_iter {
-            for c in col_start..col_end {
+            for &c in &cols {
                 values.push(Some(self.values[r * self.ni + c]));
             }
         }
@@ -485,5 +522,76 @@ mod tests {
             out.iter().all(|v| v.is_none()),
             "out-of-domain projected render must be all-None, got {out:?}"
         );
+    }
+
+    /// #663: ECMWF open data is a 0.25° global grid whose first longitude
+    /// is 180°. A Finnish bbox is a whole turn west of `lon_first`; the old
+    /// code cast the negative column index to `usize` and panicked with a
+    /// capacity overflow — every EDR area query on the collection 502'd.
+    fn global_grid(lon_first: f64) -> DecodedGrid {
+        let (ni, nj) = (1440usize, 721usize);
+        // value = column index, so the extracted values name the columns.
+        let values: Vec<f64> = (0..ni * nj).map(|i| (i % ni) as f64).collect();
+        DecodedGrid {
+            ni,
+            nj,
+            lon_first,
+            lat_first: 90.0,
+            lon_inc: 0.25,
+            lat_inc: -0.25,
+            values: Arc::new(values),
+            triple: (0, 0, 0),
+            centre: 0,
+            first_surface_type: 1,
+            first_surface_value: None,
+        }
+    }
+
+    #[test]
+    fn extract_bbox_wraps_a_180_first_global_grid() {
+        let g = global_grid(180.0);
+        let (x, y, v) = g
+            .extract_bbox([24.0, 60.0, 26.0, 61.0])
+            .expect("intersects");
+        // 24°E is column (24 − 180)/0.25 = −624 ≡ 816 (mod 1440).
+        assert_eq!(x.first().copied(), Some(24.0));
+        assert_eq!(x.last().copied(), Some(26.0));
+        assert!(x.windows(2).all(|w| w[1] > w[0]));
+        assert_eq!(x.len(), 9);
+        assert_eq!(y, vec![60.0, 60.25, 60.5, 60.75, 61.0]);
+        assert_eq!(v.len(), 9 * 5);
+        assert_eq!(v[0], Some(816.0));
+        assert_eq!(v[8], Some(824.0));
+    }
+
+    #[test]
+    fn extract_bbox_crosses_the_seam_of_a_greenwich_first_grid() {
+        let g = global_grid(0.0);
+        let (x, _y, v) = g.extract_bbox([-1.0, 50.0, 1.0, 50.5]).expect("intersects");
+        // −1° is column 1436; the axis must read −1.0 … 1.0 ascending and
+        // the values must come from columns 1436..1439 then 0..4.
+        assert_eq!(x, vec![-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]);
+        let first_row: Vec<f64> = v[..9].iter().map(|c| c.unwrap()).collect();
+        assert_eq!(
+            first_row,
+            vec![1436.0, 1437.0, 1438.0, 1439.0, 0.0, 1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn extract_bbox_regional_grid_clamps_instead_of_wrapping() {
+        // 10–11°E grid: a bbox entirely west of it does not wrap around
+        // the planet; it simply misses.
+        let g = grid_2x2();
+        assert!(g.extract_bbox([-5.0, 59.0, -4.0, 60.0]).is_none());
+        // Sub-cell bbox on a node still returns the cell it sits in.
+        let (x, _, _) = g.extract_bbox([10.0, 59.5, 10.0, 59.6]).expect("one cell");
+        assert_eq!(x, vec![10.0]);
+        // A whole-planet bbox on a global grid is exactly one turn.
+        let g = global_grid(180.0);
+        let (x, _, _) = g
+            .extract_bbox([-180.0, -90.0, 180.0, 90.0])
+            .expect("global");
+        assert_eq!(x.len(), 1440);
     }
 }
