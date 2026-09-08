@@ -200,18 +200,25 @@ impl DecodedGrid {
         if c1 < c0 {
             c1 = c0;
         }
-        let cols: Vec<usize> = if global {
+        // `cols` are storage columns (wrapped on a global grid); `positions`
+        // are the same columns as unwrapped offsets from `lon_first`, which
+        // is what the longitude axis is computed from — on a global grid a
+        // wrapped column has lost its turn count, on a regional grid a
+        // clamped column is not the unclamped `c0`.
+        let (cols, positions): (Vec<usize>, Vec<f64>) = if global {
             let shift = c0.rem_euclid(cols_per_360) - c0;
             c0 += shift;
             c1 += shift;
             // Cap at one full turn so a ±180° bbox is the whole grid once.
             let n = ((c1 - c0) as usize + 1).min(self.ni);
             let start = c0 as usize;
-            (0..n).map(|k| (start + k) % self.ni).collect()
+            (0..n)
+                .map(|k| ((start + k) % self.ni, c0 + k as f64))
+                .unzip()
         } else {
             let start = c0.max(0.0).min(self.ni as f64) as usize;
             let end = (c1 + 1.0).max(0.0).min(self.ni as f64) as usize;
-            (start..end).collect()
+            (start..end).map(|c| (c, c as f64)).unzip()
         };
 
         // Row range (lat_inc is negative for N→S grids), clamped before cast.
@@ -239,10 +246,15 @@ impl DecodedGrid {
         // Longitudes in the requester's frame: ascending from the bbox
         // west edge, so a range that crosses the grid seam reads
         // …, 359.75, 360.0 → −0.25, 0.0 … as a monotonic axis.
-        let x_coords: Vec<f64> = (0..cols.len())
-            .map(|k| {
-                let raw = self.lon_first + (c0 + k as f64) * self.lon_inc;
-                raw - ((raw - west) / 360.0).floor() * 360.0
+        let x_coords: Vec<f64> = positions
+            .iter()
+            .map(|&pos| {
+                let raw = self.lon_first + pos * self.lon_inc;
+                if global {
+                    raw - ((raw - west) / 360.0).floor() * 360.0
+                } else {
+                    raw
+                }
             })
             .collect();
 
@@ -584,6 +596,11 @@ mod tests {
         // the planet; it simply misses.
         let g = grid_2x2();
         assert!(g.extract_bbox([-5.0, 59.0, -4.0, 60.0]).is_none());
+        // A bbox straddling the grid's west edge clamps to the grid, and
+        // the longitude axis names the columns actually returned.
+        let (x, _, v) = g.extract_bbox([9.5, 59.0, 10.5, 60.0]).expect("overlaps");
+        assert_eq!(x, vec![10.0, 11.0]);
+        assert_eq!(v.len(), 4);
         // Sub-cell bbox on a node still returns the cell it sits in.
         let (x, _, _) = g.extract_bbox([10.0, 59.5, 10.0, 59.6]).expect("one cell");
         assert_eq!(x, vec![10.0]);
