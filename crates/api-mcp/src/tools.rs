@@ -249,7 +249,8 @@ impl MeteoCoreMcp {
         description = "Tracked storm cells at one analysis frame, most significant first. \
                        Significance combines radar intensity, size, trend, lightning and \
                        impact on populated areas — it is a ranking heuristic, NOT an official \
-                       warning. Each cell carries the reasons it ranked where it did."
+                       warning. Each cell carries the reasons it ranked where it did; \
+                       `clutter` and `weakening` among them are reasons it ranked LOWER."
     )]
     fn get_storm_cells(
         &self,

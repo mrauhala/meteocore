@@ -270,7 +270,14 @@ const AREA_CEILING_KM2: f64 = 200.0;
 const FLASH_RATE_CEILING_PER_MIN: f64 = 60.0;
 const VIL_CEILING_KG_M2: f64 = 50.0;
 const ECHO_TOP_CEILING_M: f64 = 15_000.0;
-const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 2.0;
+/// Where the intensifying / weakening bonuses saturate, dBZ per minute.
+///
+/// Matches the tracker's per-interval clamp (`MAX_CELL_TENDENCY_PER_S` =
+/// 2 dBZ per 5 min = 0.4 dBZ/min): the old ±2 ramp spanned five times what
+/// the input could reach, so every aged cell scored 0.4..0.6 on "trend" and
+/// a steady cell carried a constant half-credit that was cited as a reason
+/// on half the cells of a widespread-rain frame (#645).
+pub const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 0.4;
 /// A jump only counts from the 2σ test threshold up; 6σ saturates, since the
 /// difference between a 6σ and a 9σ surge is not what should decide a rank.
 const JUMP_SIGMA_FLOOR: f64 = 2.0;
@@ -363,7 +370,12 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("severity", 1.0),
     ("max_dbz", 0.6),
     ("area", 0.3),
-    ("trend", 0.5),
+    // Trend is two BONUS terms (#645): steady contributes nothing and dilutes
+    // nothing. Weakening is a DISCOUNT (negative bonus weight = fraction of
+    // the score removed at full value): a cell fading at the tracker's clamp
+    // keeps 85% — a decaying severe cell is still a severe cell right now.
+    ("intensifying", 0.5),
+    ("weakening", -0.15),
     ("deviant_mover", 0.4),
     ("lightning_jump", 0.9),
     ("flash_rate", 0.5),
@@ -374,10 +386,12 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("echo_top", 0.5),
     ("beam_coverage", 0.4),
     ("impact", 1.5),
-    // Negative, and as large as the biggest positive term: a fixed echo
-    // maximizes severity, max_dbz and impact at once (it is bright, compact
-    // and usually over a town), so anything smaller leaves it near the top.
-    ("clutter", -1.5),
+    // A DISCOUNT keeping a tenth of the score: a fixed echo maximizes
+    // severity, max_dbz and impact at once (it is bright, compact and usually
+    // over a town), and an additive penalty relative to the graded mass left
+    // the live Utajärvi clutter cell at rank 1 — 60 dBZ under a 650 m beam.
+    // Multiplicative, it sinks whatever else is wired.
+    ("clutter", -0.9),
 ];
 
 /// Map `value` onto 0..=1 across `floor..=ceiling`, saturating at both ends.
@@ -404,17 +418,28 @@ impl SignificanceTerms for CellFactSheet {
         // Prefer the measured tendency over the coarse growing/decaying flag;
         // fall back to the flag, and emit nothing for a newborn track (no
         // trend exists yet, so it should not be scored as "not growing").
+        // Two signed bonuses rather than one 0..1 term centred on 0.5: a
+        // steady cell then contributes exactly nothing and is never cited as
+        // "trend" among its reasons (#645).
+        // Only the side that fires is emitted: a present-at-zero bonus is
+        // the same as an absent one, so emitting both was a dead entry.
         if let Some(trend) = self.intensity_trend_dbz_min {
-            terms.push(Term::new(
-                "trend",
-                ramp(
-                    trend,
-                    -INTENSITY_TREND_CEILING_DBZ_MIN,
-                    INTENSITY_TREND_CEILING_DBZ_MIN,
-                ),
-            ));
+            if trend > 0.0 {
+                terms.push(Term::bonus(
+                    "intensifying",
+                    ramp(trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
+                ));
+            } else if trend < 0.0 {
+                terms.push(Term::bonus(
+                    "weakening",
+                    ramp(-trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
+                ));
+            }
         } else if let Some(trend) = self.trend {
-            terms.push(Term::flag("trend", trend == Trend::Growing));
+            match trend {
+                Trend::Growing => terms.push(Term::flag("intensifying", true)),
+                Trend::Decaying => terms.push(Term::flag("weakening", true)),
+            }
         }
 
         if let Some(lightning) = self.lightning {
@@ -422,7 +447,7 @@ impl SignificanceTerms for CellFactSheet {
             // outrank a cell that merely crossed the threshold. A jump with
             // no sigma still scores full — it happened, it just can't be
             // graded. An UNKNOWN jump scores 0: no bonus, no claim.
-            terms.push(Term::new(
+            terms.push(Term::bonus(
                 "lightning_jump",
                 match (lightning.jump, lightning.jump_sigma) {
                     (Some(true), Some(sigma)) => ramp(sigma, JUMP_SIGMA_FLOOR, JUMP_SIGMA_CEILING),
@@ -519,23 +544,39 @@ mod tests {
 
     #[test]
     fn near_tie_cells_rank_in_served_order_when_quantized() {
-        // The #644 pair: two weak steady cells differing by 0.1 km² of area,
-        // raw scores 3.5e-5 apart — inside one 4-dp bucket. Served as strings
-        // "10" sorts before "9", so the serving layer orders id 10 first; the
-        // rank must agree, which only rounding-before-rank guarantees.
-        let mut a = cell(10);
-        a.area_km2 = 10.1;
-        let mut b = cell(9);
-        b.area_km2 = 10.2;
+        // The #644 shape: two weak steady cells a tenth of a square kilometre
+        // apart whose raw scores land in ONE 4-dp bucket, ordered so that the
+        // raw comparator ranks them the other way from the served id-string
+        // order. The exact pair depends on the weight table, so search for
+        // one rather than pin numbers a weight change would silently invalidate.
         let scorer = WeightedScorer::new(DEFAULT_CELL_WEIGHTS);
-        // Input in id-STRING order, as score_cells does.
-        let items = vec![a, b];
+        let mk = |id: u64, area: f64| {
+            let mut c = cell(id);
+            c.area_km2 = area;
+            c
+        };
+        let mut found = None;
+        for tenths in 100..400u32 {
+            let a = f64::from(tenths) / 10.0;
+            // id 10 sorts before id 9 as a string, so put the SMALLER cell on
+            // id 10: the raw comparator then prefers the second item.
+            let items = vec![mk(10, a), mk(9, a + 0.1)];
+            let raw = scorer.rank(&items);
+            // Ask the code under test whether the pair ties, rather than
+            // re-implementing its quantizer here.
+            let q = scorer.rank_quantized(&items, 4);
+            if q[0].score == q[1].score && raw[0].raw < raw[1].raw {
+                found = Some(items);
+                break;
+            }
+        }
+        let items = found.expect("some 0.1 km² step must land inside one 4-dp bucket");
         let raw = scorer.rank(&items);
-        assert!(
-            (raw[0].raw - raw[1].raw).abs() < 5e-5 && raw[0].raw < raw[1].raw,
-            "precondition: a near-tie the raw comparator resolves the other way"
+        assert_eq!(
+            (raw[0].rank, raw[1].rank),
+            (2, 1),
+            "precondition: raw order disagrees"
         );
-        assert_eq!((raw[0].rank, raw[1].rank), (2, 1));
         let q = scorer.rank_quantized(&items, 4);
         assert_eq!((q[0].rank, q[1].rank), (1, 2), "ranked in served order");
     }
@@ -575,8 +616,13 @@ mod tests {
             exposure: 0.6,
         });
 
+        // Trend emits only the side that fires, so the union needs a decaying
+        // twin to cover `weakening`.
+        let mut fading = full.clone();
+        fading.intensity_trend_dbz_min = Some(-0.4);
+
         let weighted: Vec<&str> = DEFAULT_CELL_WEIGHTS.iter().map(|(n, _)| *n).collect();
-        for term in full.terms() {
+        for term in full.terms().iter().chain(fading.terms().iter()) {
             assert!(
                 weighted.contains(&term.name),
                 "term '{}' has no default weight",
@@ -584,7 +630,12 @@ mod tests {
             );
         }
         // And the reverse: no weight names a term that is never emitted.
-        let emitted: Vec<&str> = full.terms().iter().map(|t| t.name).collect();
+        let emitted: Vec<&str> = full
+            .terms()
+            .iter()
+            .chain(fading.terms().iter())
+            .map(|t| t.name)
+            .collect();
         for name in &weighted {
             assert!(emitted.contains(name), "weight '{name}' matches no term");
         }
@@ -594,11 +645,78 @@ mod tests {
     fn newborn_track_emits_no_trend_term() {
         // A track with no measured trend must not be scored as "not growing".
         let newborn = cell(1);
-        assert!(!newborn.terms().iter().any(|t| t.name == "trend"));
+        let names = |c: &CellFactSheet| -> Vec<&str> { c.terms().iter().map(|t| t.name).collect() };
+        assert!(!names(&newborn).contains(&"intensifying"));
+        assert!(!names(&newborn).contains(&"weakening"));
 
         let mut aged = cell(2);
         aged.trend = Some(Trend::Decaying);
-        assert!(aged.terms().iter().any(|t| t.name == "trend"));
+        assert!(names(&aged).contains(&"weakening"));
+        assert!(
+            !names(&aged).contains(&"intensifying"),
+            "only the firing side is emitted"
+        );
+    }
+
+    #[test]
+    fn a_steady_cell_gets_no_trend_credit_and_no_trend_reason() {
+        // #645: the old single term scored a steady cell 0.5 and cited "trend"
+        // as a reason for doing nothing. Now steady contributes exactly what a
+        // newborn's absent trend contributes: nothing.
+        let newborn = cell(1);
+        let mut steady = cell(2);
+        steady.intensity_trend_dbz_min = Some(0.0);
+        let s = scorer();
+        let ns = s.score_one(&newborn);
+        let ss = s.score_one(&steady);
+        assert_eq!(ns.score, ss.score);
+        assert!(
+            !ss.contributions
+                .iter()
+                .any(|c| matches!(c.term, "intensifying" | "weakening")),
+            "a steady cell emits no trend term at all"
+        );
+    }
+
+    #[test]
+    fn trend_bonuses_saturate_at_the_tracker_clamp_and_are_signed() {
+        let s = scorer();
+        let with = |t: f64| {
+            let mut c = cell(1);
+            c.intensity_trend_dbz_min = Some(t);
+            s.score_one(&c).score
+        };
+        let steady = with(0.0);
+        assert!(
+            with(0.4) > with(0.2) && with(0.2) > steady,
+            "intensifying ramps up"
+        );
+        assert!(
+            (with(0.4) - with(2.0)).abs() < 1e-12,
+            "saturates at the clamp"
+        );
+        assert!(
+            with(-0.4) < with(-0.2) && with(-0.2) < steady,
+            "weakening ramps down"
+        );
+        assert!(
+            (with(0.4) - steady) > (steady - with(-0.4)),
+            "weakening is the smaller effect"
+        );
+    }
+
+    #[test]
+    fn flags_that_did_not_fire_do_not_dilute_the_graded_mean() {
+        // #645: a plain aged cell scores the mean of what was measured. With
+        // severity Moderate (1/3), 47 dBZ (12/25 of the ramp) and 40 km²
+        // (0.2 of the ramp), that is (1/3 + 0.6·0.48 + 0.3·0.2) / 1.9.
+        let c = cell(1);
+        let expected = (1.0 / 3.0 + 0.6 * 0.48 + 0.3 * 0.2) / 1.9;
+        let got = scorer().score_one(&c).score;
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "got {got}, expected {expected}"
+        );
     }
 
     #[test]
@@ -986,13 +1104,11 @@ mod tests {
 
     #[test]
     fn unknown_motion_scores_as_no_bonus_not_as_an_absent_term() {
-        // The subtle one. Making an unknown flag ABSENT looks like the right
-        // application of "absent terms renormalize", but that rule is for a
-        // source nobody has wired — it affects every cell equally. For
-        // per-cell missingness, dropping the term shrinks the denominator, so
-        // every OTHER term weighs more and the cell scores HIGHER. A
-        // re-detected fixed echo is always a newborn, so renormalizing on
-        // unknown motion would promote exactly the clutter we demote.
+        // Before #645 this was the subtle one: an unknown flag made ABSENT
+        // shrank the denominator and promoted every newborn, so unknown had
+        // to be present at 0. Bonus terms sit outside the denominator, so
+        // present-at-zero and absent are now the same thing by construction;
+        // this pins that no future change re-opens the gap.
         let mut unknown = cell(1);
         unknown.deviant_mover = None;
         let mut known_not_deviant = cell(2);

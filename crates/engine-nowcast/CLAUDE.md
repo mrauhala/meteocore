@@ -348,15 +348,43 @@ see `docs/cell-intelligence-plan-amendment.md`).
   or unknown, so an unfiltered top-3 cited `deviant_mover` as a reason on a
   cell whose motion was unknown. Negative contributions stay: "demoted as
   likely clutter" is a real reason a cell ranked where it did.
-- **The SCORER treats unknown as 0.0, present — NOT as an absent term.** This
-  looks like a violation of "absent terms renormalize" and is deliberate. That
-  rule is for a source nobody wired, which affects every cell equally. For
-  per-cell missingness, dropping the term shrinks the denominator, every other
-  term weighs more, and the cell scores HIGHER. A re-detected fixed echo is
-  always a newborn, so renormalizing on unknown motion would promote exactly
-  the clutter #620 exists to demote. The payload must not claim what it does
-  not know; the scorer must not reward not knowing. Pinned by
-  `unknown_motion_scores_as_no_bonus_not_as_an_absent_term`.
+- **Flags are BONUS terms, outside the denominator, bounded by construction
+  (#645).** The GRADED terms — severity, max_dbz, area, flash_rate,
+  positive_cg, vil, echo_top, beam_coverage, impact — form a weighted mean.
+  A positive bonus (`deviant_mover`, `lightning_jump`, `intensifying`) fills
+  the remaining headroom, `s += (1 − s)·w·v/D`, composing as a soft OR so
+  three signals at once cannot push the top cells past 1.0 into a clamped
+  tie ordered by id. A negative bonus weight is a multiplicative DISCOUNT,
+  `s *= 1 − |w|·v`, with `|w|` the fraction removed at full value: `clutter`
+  is −0.9 (keeps a tenth), `weakening` −0.15. Discounts are NOT relative to
+  the graded mass — an additive −1.5 over a mass of 3.4 removed 0.44 and
+  left the live Utajärvi clutter cell (60 dBZ under a 650 m beam) at rank 1.
+  `contributions` still sum to `raw`. Two things follow. A flag that did not
+  fire dilutes nothing: the old all-in-denominator mean capped a plain cell
+  at 0.51 and packed the weak class into a tenth of the range (#636). And an
+  UNKNOWN flag scored as 0 is identical to an absent one by construction, so
+  the old trap — dropping an unknown flag shrank the denominator and
+  promoted every newborn, i.e. every re-detected fixed echo — cannot
+  re-open. The payload still says `null` for what it does not know. Pinned
+  by `unknown_motion_scores_as_no_bonus_not_as_an_absent_term`,
+  `flags_that_did_not_fire_do_not_dilute_the_graded_mean`,
+  `bonuses_cannot_push_the_score_past_one` and
+  `a_discount_removes_its_fraction_whatever_else_is_wired`.
+- **Trend is two bonuses, `intensifying` (+0.5) and `weakening` (−0.15, a
+  discount), ramped 0..0.4 dBZ/min** — the tracker's own clamp, which
+  `MAX_CELL_TENDENCY_PER_S` now derives from
+  `ds_core::cell_facts::INTENSITY_TREND_CEILING_DBZ_MIN` so the two cannot
+  drift. Only the side that fires is emitted; a steady cell emits neither.
+  The old single `trend` term ramped ±2 dBZ/min around a 0.5 centre, so every
+  aged cell sat in 0.4..0.6 and a steady cell carried a constant half-credit
+  cited as a reason on 145 of 274 cells of a widespread-rain frame. `trend`
+  is no longer a weight name: a `[nowcast.significance] trend = …` line
+  fails the collection at load, as any unknown name does — and so does
+  zeroing severity, max_dbz and area together (nothing graded left).
+- **`significance_reasons` names demotions too.** `clutter` and `weakening`
+  in the list are reasons a cell ranked LOWER (the MCP tool text says so);
+  `significance_is_demoted()` is true whenever any discount fired, weakening
+  included. Signed contribution values are the #650 follow-up.
 
 ## Fact sheets + significance ranking
 
@@ -385,8 +413,8 @@ see `docs/cell-intelligence-plan-amendment.md`).
   snapshot) and `significance_reasons` (top 3 contributing terms). The
   reasons field is load-bearing: a weight table with no ground truth has to
   be arguable to be tunable.
-- **Absent terms renormalize.** A cell with no volume/impact/lightning data
-  simply omits those terms. That is why wiring a new source later needs no
+- **Absent GRADED terms renormalize.** A cell with no volume/impact/lightning
+  data simply omits those terms. That is why wiring a new source later needs no
   config flag day — but it also means `measured-quiet` ranks BELOW
   `unknown`, which is correct (measured zero is information) and worth
   remembering when a newly wired source appears to demote everything.

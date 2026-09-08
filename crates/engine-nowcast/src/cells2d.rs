@@ -71,8 +71,12 @@ pub const MIN_PATH_FOR_STRAIGHTNESS_KM: f32 = 1.0;
 /// `significance_reasons` and inflated its rank.
 pub const DEVIANT_MIN_STRAIGHTNESS: f32 = 0.5;
 /// Per-second clamp on a cell's measured intensity tendency (±2 dBZ per
-/// 5-minute interval at the usual cadence).
-pub const MAX_CELL_TENDENCY_PER_S: f32 = 2.0 / 300.0;
+/// 5-minute interval at the usual cadence). Derived from the significance
+/// ramp ceiling in ds-core so the two cannot drift apart (#645): the ramp
+/// must saturate exactly where the tracker clamps, or every aged cell carries
+/// partial trend credit forever.
+pub const MAX_CELL_TENDENCY_PER_S: f32 =
+    (ds_core::cell_facts::INTENSITY_TREND_CEILING_DBZ_MIN / 60.0) as f32;
 /// Lightning join (#549): a strike outside every cell footprint joins the
 /// nearest cell centroid within this many km (anvil and adjacent flashes
 /// belong to the storm even when they miss the 35 dBZ contour).
