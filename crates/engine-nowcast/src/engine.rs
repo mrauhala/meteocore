@@ -24,7 +24,7 @@
 //!   runtime; source fetches (which may do blocking storage I/O internally)
 //!   happen only there, never on a request worker.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -35,10 +35,15 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::cell_facts::{CellFactSheet, LightningFacts, ScoredCell, Trend, DEFAULT_CELL_WEIGHTS};
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
+use ds_core::instances::{build_instances, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+};
 use ds_core::resample::ProjectionGrid;
 use ds_core::significance::WeightedScorer;
 
@@ -48,6 +53,9 @@ use crate::cells2d::{
 };
 use crate::impact::ImpactIndex;
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
+use crate::motion_grid::{
+    self, GridSpec, PARAMS as MOTION_PARAMS, PARAM_QUALITY, PARAM_U, PARAM_V,
+};
 use crate::objects::{segment_cells_labeled, PixelScale};
 use crate::tendency::EFOLD_INTERVALS;
 use crate::Grid;
@@ -195,6 +203,10 @@ struct Generation {
     /// The (blended) motion field this generation advected along — the
     /// EMA history for the NEXT generation (#524).
     field: MotionField,
+    /// The source interval the field's vectors are expressed over (pixels
+    /// per THIS many seconds) — what turns them into m/s for the EDR
+    /// motion product (#661).
+    interval_secs: f64,
     /// Tracked cells of this generation's analysis frame (#544/#546).
     cells: Arc<Vec<CellTrack>>,
 }
@@ -1108,6 +1120,7 @@ impl NowcastEngine {
             frames,
             geom,
             field,
+            interval_secs: interval.num_seconds() as f64,
             cells,
         })
     }
@@ -1869,6 +1882,246 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
             properties: Arc::new(props),
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// EdrEngine: the motion field as a data product (#661)
+// ---------------------------------------------------------------------------
+
+/// Parameter metadata for the served motion field. Labels say "precipitation
+/// motion" on purpose: radar echo motion is steering-level storm motion plus
+/// propagation, not surface wind, and a client must not present it as wind.
+fn motion_parameter_descriptions() -> HashMap<String, ParameterDescription> {
+    HashMap::from([
+        (
+            PARAM_U.to_string(),
+            ParameterDescription {
+                label: "Precipitation motion, eastward component".into(),
+                unit: "m/s".into(),
+                observed_property: "precipitation_motion_eastward".into(),
+            },
+        ),
+        (
+            PARAM_V.to_string(),
+            ParameterDescription {
+                label: "Precipitation motion, northward component".into(),
+                unit: "m/s".into(),
+                observed_property: "precipitation_motion_northward".into(),
+            },
+        ),
+        (
+            PARAM_QUALITY.to_string(),
+            ParameterDescription {
+                label: "Motion vector quality (1 = block-matched, 0 = filled from neighbours)"
+                    .into(),
+                unit: String::new(),
+                observed_property: "precipitation_motion_quality".into(),
+            },
+        ),
+    ])
+}
+
+impl NowcastEngine {
+    /// Generation selection for the EDR motion product. `reference_time`
+    /// (an instance pin) wins and must match exactly; otherwise `datetime`
+    /// picks the NEWEST generation anchored at or before the interval end
+    /// — the cell-history convention (#548), so a client animating source
+    /// frames gets the field that was current for each one. Neither ⇒
+    /// latest.
+    fn select_motion_generation(
+        state: &NowcastState,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Arc<Generation>, DataServerError> {
+        if let Some(rt) = reference_time {
+            return Self::select_generation(state, Some(rt)).ok_or_else(|| {
+                DataServerError::ReferenceTimeNotFound(format!(
+                    "no retained nowcast generation with reference time {}",
+                    rt.to_rfc3339()
+                ))
+            });
+        }
+        let end = datetime.map(|(_, e)| e);
+        let picked = match end {
+            None => state.generations.iter().next_back(),
+            Some(e) => state.generations.range(..=e).next_back(),
+        };
+        picked.map(|(_, g)| g.clone()).ok_or_else(|| {
+            DataServerError::LocationNotFound(match end {
+                None => "no nowcast generation available yet".to_string(),
+                Some(e) => format!("no nowcast generation at or before {}", e.to_rfc3339()),
+            })
+        })
+    }
+}
+
+impl EdrEngine for NowcastEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(Vec::new())
+    }
+
+    /// Every retained generation is an instance, exactly as WMS advertises
+    /// them via `reference_times` — one run list, two APIs.
+    fn get_instances(&self) -> Vec<RunInfo> {
+        let state = self.state.load();
+        build_instances(&state.generations, |_, g| g.times.clone())
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.state.load().generations.is_empty()
+    }
+
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let state = self.state.load();
+        state.generations.get(&reference_time).map(|g| RunInfo {
+            reference_time,
+            valid_times: g.times.clone(),
+        })
+    }
+
+    fn query_location(
+        &self,
+        _location_id: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::InvalidParameter(
+            "Location queries are not supported by nowcast collections".into(),
+        ))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        MOTION_PARAMS.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+        motion_parameter_descriptions()
+    }
+
+    /// The motion field is an analysis product: one per generation, valid
+    /// at the anchor. The extent spans the retained generations, not the
+    /// forecast leads (those are the WMS layer's business).
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let state = self.state.load();
+        let first = state.generations.keys().next()?;
+        let last = state.generations.keys().next_back()?;
+        Some((*first, *last))
+    }
+
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        let state = self.state.load();
+        if state.generations.is_empty() {
+            return None;
+        }
+        Some(state.generations.keys().copied().collect())
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        self.state.load().info.spatial_extent
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["area".to_string()]
+    }
+
+    /// The block-centre motion field inside the query polygon's bbox as a
+    /// CoverageJSON `Grid` (`[t, y, x]`, one `t` = the generation anchor).
+    /// The same shape a GRIB `10u`/`10v` area query returns, so one particle
+    /// renderer consumes either.
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let polygon = ds_core::feature::parse_area_coords(coords)?;
+        let bbox = polygon.bbox;
+
+        let wanted: Vec<&str> = match parameters {
+            None => MOTION_PARAMS.to_vec(),
+            Some(list) => {
+                let mut out = Vec::with_capacity(list.len());
+                for p in list {
+                    let p = p.as_str();
+                    if !MOTION_PARAMS.contains(&p) {
+                        return Err(DataServerError::InvalidParameter(format!(
+                            "Unknown parameter '{p}'; valid: {}",
+                            MOTION_PARAMS.join(", ")
+                        )));
+                    }
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+                if out.is_empty() {
+                    return Err(DataServerError::InvalidParameter(
+                        "No parameters specified for area query".into(),
+                    ));
+                }
+                out
+            }
+        };
+
+        let state = self.state.load();
+        let generation = Self::select_motion_generation(&state, datetime, reference_time)?;
+        let geom = &generation.geom;
+        let spec = GridSpec {
+            west: geom.west,
+            north: geom.north,
+            dlon: (geom.east - geom.west) / geom.width as f64,
+            dlat: (geom.north - geom.south) / geom.height as f64,
+        };
+        let grid = motion_grid::motion_grid(
+            &generation.field,
+            &spec,
+            generation.interval_secs,
+            [bbox.west, bbox.south, bbox.east, bbox.north],
+        )
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter(
+                "Bbox does not intersect the motion field grid".to_string(),
+            )
+        })?;
+
+        let descs = motion_parameter_descriptions();
+        let mut param_descs = HashMap::new();
+        let mut ranges = HashMap::new();
+        let shape = vec![1, grid.y.len(), grid.x.len()];
+        let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];
+        for name in wanted {
+            let values: &[f64] = match name {
+                PARAM_U => &grid.u,
+                PARAM_V => &grid.v,
+                _ => &grid.quality,
+            };
+            param_descs.insert(name.to_string(), descs[name].clone());
+            ranges.insert(
+                name.to_string(),
+                NdArray {
+                    shape: shape.clone(),
+                    axis_names: axis_names.clone(),
+                    // 2 decimals of m/s is well inside the estimator's noise
+                    // and keeps the document small (#661: ~3k vectors).
+                    values: values.iter().map(|&v| Some(round_to(v, 2))).collect(),
+                },
+            );
+        }
+
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Grid {
+                x: grid.x.iter().map(|&v| round_to(v, 5)).collect(),
+                y: grid.y.iter().map(|&v| round_to(v, 5)).collect(),
+                t: Some(vec![generation.reference_time]),
+                z: None,
+            },
+            parameters: param_descs,
+            ranges,
+        }))
+    }
 }
 
 impl FeatureEngine for NowcastEngine {

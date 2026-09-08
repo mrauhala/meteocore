@@ -119,6 +119,31 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   wired; null means "join skipped this generation" (source error — the
   generation itself never fails), 0 means measured-quiet.
 
+## Motion field as a data product (#661)
+
+- `EdrEngine` is implemented for ONE product: the per-generation motion
+  field, served by the `area` query as a CoverageJSON `Grid` (`[t, y, x]`,
+  one `t` = the generation anchor) with `motion_u` / `motion_v` (east/north
+  **m/s**) and `motion_quality` (1 block-matched, 0 filled) at the block
+  centres inside the query bbox. `motion_grid` is the pure conversion
+  (px/interval on the working grid → m/s; the row axis points SOUTH, so
+  `v` flips sign) — keep it I/O-free and unit-test any change against the
+  great-circle check there. Location/position queries are rejected;
+  reflectivity via EDR is still #523.
+- **It is precipitation motion, not wind.** Labels and observedProperty
+  ids say `precipitation_motion_*`; a client that renders it as wind is
+  misrepresenting steering-level echo motion as surface wind.
+- Generations are instances (`get_instances` = the same `reference_times`
+  WMS advertises). Selection: an instance pin must match exactly (404
+  otherwise); with no pin, `datetime` picks the NEWEST generation anchored
+  at or before the interval end (the #548 cell-history convention);
+  neither ⇒ latest. `Generation.interval_secs` is what turns the vectors
+  into m/s — it is the SOURCE interval the field was measured over, not
+  the nowcast `step`.
+- The whole-domain document is ~3k vectors (~30 KB before gzip) — no
+  tiling; a client uploads it as one texture and bilinear-samples it, which
+  reproduces the engine's own `MotionField::sample` field.
+
 ## Lightning metrics (#616)
 
 - **`jump_sigma` replaces a bare boolean as the scoring input.** The 2σ test
