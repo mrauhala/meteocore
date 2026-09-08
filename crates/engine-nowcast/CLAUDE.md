@@ -66,10 +66,12 @@ Resident bytes ≈ `max_pixels × (leads + 1) × max_generations × bytes/px`
 (1 B/px for the U8 path, 4 B/px for the f32 fallback). At the defaults
 (4 Mpx, 24 leads, 6 generations) that is ~600 MB per U8 collection and
 ~2.4 GB for an f32-fallback source — PVOL-max_files territory (#493).
-Until phase 2 (#523) makes deep retention useful (EDR `/instances`; today
-only an explicit `DIM_REFERENCE_TIME` pin reads old generations), set
-`max_generations = 2` in production configs. A generation-thinning
-follow-up (full frames only for the latest generation) is scoped in #523.
+Old generations are read only by an explicit pin — WMS `DIM_REFERENCE_TIME`
+or an EDR instance (the #661 motion field, ~30 KB per generation, is the
+first product that makes deep retention cheap to WANT; the frames are what
+make it expensive to HAVE). Until the generation-thinning follow-up in #523
+(full frames only for the latest generation), set `max_generations = 2`
+in production configs.
 
 ## Verification (V2.1, #542)
 
@@ -134,12 +136,27 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   ids say `precipitation_motion_*`; a client that renders it as wind is
   misrepresenting steering-level echo motion as surface wind.
 - Generations are instances (`get_instances` = the same `reference_times`
-  WMS advertises). Selection: an instance pin must match exactly (404
-  otherwise); with no pin, `datetime` picks the NEWEST generation anchored
-  at or before the interval end (the #548 cell-history convention);
-  neither ⇒ latest. `Generation.interval_secs` is what turns the vectors
-  into m/s — it is the SOURCE interval the field was measured over, not
-  the nowcast `step`.
+  WMS advertises), but an instance's `valid_times` is `[anchor]` — the
+  product has one valid time, NOT the forecast leads the WMS layer renders.
+  Selection: an instance pin resolves exactly or to the minute (the EDR id
+  is minute-precision; 404 otherwise) and a `datetime` excluding the
+  anchor is a 400; with no pin, `datetime` picks the NEWEST generation
+  anchored INSIDE the interval (the #548 cell-history rule, start bound
+  included); neither ⇒ latest. `Generation.interval_secs` is what turns
+  the vectors into m/s — it is the SOURCE interval the field was measured
+  over, not the nowcast `step`. The #524 EMA now rescales the previous
+  field by the interval ratio before blending, so a skipped composite no
+  longer biases the blended (and served) speed.
+- Block selection is by footprint overlap padded by one block each side
+  (a sub-block bbox still gets its block; edge bilinear sampling has both
+  neighbours — GRIB's enclosing-cell rule), a trailing partial block's
+  centre is clamped into the grid so served coordinates never leave the
+  spatial extent, and `y` ascends south→north like GRIB (ODIM/GeoTIFF are
+  north-first; a client must read `axes.y.values` either way).
+- **`/preview` coupling:** `server/src/preview.rs` prefers the MAP time
+  axis over EDR instants when both exist — because this collection's two
+  surfaces are different products (anchors vs leads). Do not make
+  `get_available_times` return the leads to "fix" a slider.
 - The whole-domain document is ~3k vectors (~30 KB before gzip) — no
   tiling; a client uploads it as one texture and bilinear-samples it, which
   reproduces the engine's own `MotionField::sample` field.

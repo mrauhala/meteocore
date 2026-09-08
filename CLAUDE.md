@@ -335,8 +335,8 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
     reference time; implement `EdrEngine::get_instances()` (default empty =
     non-forecast); honour the trailing `reference_time` parameter on query
     methods and `MapEngine::get_raster_tile` (`None` ⇒ latest); populate
-    `RasterInfo.reference_times`. GRIB and QueryData implement this; other
-    engines accept-and-ignore. Zarr instances are a follow-up (it pins the
+    `RasterInfo.reference_times`. GRIB, QueryData and Nowcast (generations
+    = runs, #661) implement this; other engines accept-and-ignore. Zarr instances are a follow-up (it pins the
     latest run internally).
   - API surface: EDR `/instances`, `/instances/{id}`,
     `/instances/{id}/{position,area}` — gated on `get_instances()` being

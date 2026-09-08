@@ -2131,3 +2131,176 @@ fn ranks_are_monotonic_in_the_order_cells_are_served() {
         "ranks must run 1..=n down the served page with no holes, got {ranks:?}"
     );
 }
+
+/// #661: the motion field as an EDR product. The mock disc moves +x only
+/// (DX_PER_FRAME px per 5-min frame), so the served eastward component
+/// must be positive and about the disc speed, the northward one ~0, the
+/// grid must be a `[t, y, x]` CoverageJSON Grid at the anchor, and the
+/// instance/datetime contracts must hold.
+#[test]
+fn edr_area_serves_the_motion_field_in_m_per_s() {
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::model::{CoverageResponse, DomainDescription};
+
+    let anchor = t0() + Duration::minutes(10);
+    let (_source, engine) =
+        build_with_history("PT1H", &[t0(), t0() + Duration::minutes(5), anchor], 3);
+    engine.poll_once();
+    assert!(engine.has_data());
+
+    // Instances = generations, with the product's single valid time.
+    let instances = engine.get_instances();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].reference_time, anchor);
+    assert_eq!(instances[0].valid_times, vec![anchor]);
+    assert!(engine.has_instances());
+    assert_eq!(
+        engine.find_instance(anchor).map(|r| r.valid_times),
+        Some(vec![anchor])
+    );
+    assert_eq!(engine.get_temporal_extent(), Some((anchor, anchor)));
+    assert_eq!(engine.supported_query_types(), vec!["area".to_string()]);
+
+    let coords = format!(
+        "POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))",
+        w = EXTENT[0],
+        s = EXTENT[1],
+        e = EXTENT[2],
+        n = EXTENT[3]
+    );
+    let CoverageResponse::Single(cov) = engine
+        .query_area(&coords, None, None, None, None)
+        .expect("area query")
+    else {
+        panic!("expected a single coverage");
+    };
+    let DomainDescription::Grid { x, y, t, z } = &cov.domain else {
+        panic!("expected a Grid domain");
+    };
+    assert_eq!(t.as_deref(), Some(&[anchor][..]));
+    assert!(z.is_none());
+    assert!(!x.is_empty() && !y.is_empty());
+    // Served coordinates never leave the collection extent (trailing
+    // partial block clamped).
+    assert!(x.iter().all(|v| (EXTENT[0]..=EXTENT[2]).contains(v)));
+    assert!(y.iter().all(|v| (EXTENT[1]..=EXTENT[3]).contains(v)));
+    // y ascends south→north, the GRIB convention a particle client already
+    // consumes for 10u/10v.
+    assert!(y.windows(2).all(|w| w[0] < w[1]));
+    for name in ["motion_u", "motion_v", "motion_quality"] {
+        let r = &cov.ranges[name];
+        assert_eq!(r.shape, vec![1, y.len(), x.len()]);
+        assert_eq!(r.axis_names, vec!["t", "y", "x"]);
+        assert_eq!(r.values.len(), x.len() * y.len());
+    }
+    assert_eq!(cov.parameters["motion_u"].unit, "m/s");
+    assert!(cov.parameters["motion_u"]
+        .label
+        .contains("Precipitation motion"));
+
+    // Units + sign: the disc moves east at DX_PER_FRAME px per 300 s on a
+    // grid EXTENT wide over W px. Measured blocks must agree.
+    let dlon = (EXTENT[2] - EXTENT[0]) / W as f64;
+    let mid_lat = (EXTENT[1] + EXTENT[3]) / 2.0;
+    let expect_u =
+        DX_PER_FRAME * dlon * engine_nowcast::KM_PER_DEG * 1000.0 * mid_lat.to_radians().cos()
+            / 300.0;
+    let q = &cov.ranges["motion_quality"].values;
+    let u = &cov.ranges["motion_u"].values;
+    let v = &cov.ranges["motion_v"].values;
+    let measured: Vec<usize> = (0..q.len()).filter(|&i| q[i] == Some(1.0)).collect();
+    assert!(!measured.is_empty(), "the disc must yield measured blocks");
+    for &i in &measured {
+        let (ui, vi) = (u[i].unwrap(), v[i].unwrap());
+        assert!(
+            (ui - expect_u).abs() < 0.35 * expect_u,
+            "eastward {ui} vs expected ~{expect_u} m/s"
+        );
+        assert!(vi.abs() < 0.35 * expect_u, "northward {vi} should be ~0");
+    }
+
+    // Parameter subset + unknown parameter.
+    let CoverageResponse::Single(sub) = engine
+        .query_area(&coords, None, Some(&["motion_v".to_string()]), None, None)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(sub.ranges.len(), 1);
+    assert!(matches!(
+        engine.query_area(&coords, None, Some(&["wind_u".to_string()]), None, None),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+
+    // Pinned instance: exact, and to the minute; a datetime excluding the
+    // anchor is a 400, one containing it is fine.
+    assert!(engine
+        .query_area(&coords, None, None, None, Some(anchor))
+        .is_ok());
+    assert!(engine
+        .query_area(
+            &coords,
+            None,
+            None,
+            None,
+            Some(anchor + Duration::seconds(30))
+        )
+        .is_ok());
+    assert!(matches!(
+        engine.query_area(&coords, None, None, None, Some(anchor + Duration::hours(1))),
+        Err(DataServerError::ReferenceTimeNotFound(_))
+    ));
+    assert!(matches!(
+        engine.query_area(
+            &coords,
+            Some((
+                anchor + Duration::minutes(5),
+                anchor + Duration::minutes(10)
+            )),
+            None,
+            None,
+            Some(anchor)
+        ),
+        Err(DataServerError::InvalidDatetime(_))
+    ));
+    assert!(engine
+        .query_area(
+            &coords,
+            Some((anchor, anchor + Duration::minutes(10))),
+            None,
+            None,
+            Some(anchor)
+        )
+        .is_ok());
+
+    // Unpinned datetime honours BOTH bounds (the #548 rule).
+    assert!(engine
+        .query_area(
+            &coords,
+            Some((anchor - Duration::minutes(1), anchor)),
+            None,
+            None,
+            None
+        )
+        .is_ok());
+    assert!(matches!(
+        engine.query_area(
+            &coords,
+            Some((anchor + Duration::minutes(1), anchor + Duration::hours(2))),
+            None,
+            None,
+            None
+        ),
+        Err(DataServerError::ReferenceTimeNotFound(_))
+    ));
+
+    // Sub-block bbox inside the grid still gets a block.
+    let tiny = format!(
+        "POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))",
+        w = 5.001,
+        s = 55.001,
+        e = 5.002,
+        n = 55.002
+    );
+    assert!(engine.query_area(&tiny, None, None, None, None).is_ok());
+}
