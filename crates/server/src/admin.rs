@@ -1235,7 +1235,7 @@ pub fn load_collections(
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
-            "nowcast" => &["wms", "maps", "tiles", "features"],
+            "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -2960,6 +2960,17 @@ pub fn load_collections(
         engines_by_id.insert(collection.id.clone(), EngineHandle::Nowcast(engine.clone()));
         nowcast_engines.push(engine.clone());
 
+        // EDR serves the per-generation motion field (#661) — the block
+        // vectors in m/s, generations as instances. No styles: the product
+        // is a vector field, not a colourised layer.
+        if collection.apis.contains(&"edr".to_string()) {
+            edr_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            edr_collections.insert(collection.id.clone(), collection.clone());
+            info!("Collection '{}': wired to EDR API", collection.id);
+        }
         if collection.apis.contains(&"wms".to_string()) {
             map_engines.insert(
                 collection.id.clone(),
