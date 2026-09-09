@@ -17,8 +17,9 @@ use ds_core::model::CoverageResponse;
 use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
-    parse_edr_format, parse_z, plot_dimensions, resolve_z_levels, split_position_coords,
-    AreaQueryParams, EdrFormat, LocationQueryParams, PositionQueryParams, TrajectoryQueryParams,
+    parse_edr_format, parse_within_metres, parse_z, plot_dimensions, resolve_z_levels,
+    split_position_coords, AreaQueryParams, EdrFormat, LocationQueryParams, PositionQueryParams,
+    RadiusQueryParams, TrajectoryQueryParams, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
@@ -56,6 +57,36 @@ fn render_coverage_response(
                 server_error()
             })?;
             Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+        }
+    }
+}
+
+/// Map an engine error from a data query to its HTTP response: request
+/// errors → 400, absent resources → 404, everything else a generic 500
+/// (logged under `label`). One home for the four data-query handlers so a
+/// new `DataServerError` variant cannot map differently per query type.
+fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
+    match e {
+        DataServerError::InvalidParameter(_)
+        | DataServerError::InvalidBbox(_)
+        | DataServerError::InvalidDatetime(_)
+        | DataServerError::QueryTooLarge(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        ),
+        DataServerError::LocationNotFound(_)
+        | DataServerError::CollectionNotFound(_)
+        | DataServerError::FeatureNotFound(_)
+        | DataServerError::ReferenceTimeNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "NotFound", "description": e.to_string() })),
+        ),
+        _ => {
+            tracing::error!("{label} query error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            )
         }
     }
 }
@@ -520,6 +551,41 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
+        // Radius query. Gated like trajectory: only engines advertising
+        // `radius` get the path, matching `data_queries` and the handler's
+        // 404 capability guard.
+        if supported.contains("radius") {
+            let radius_path = format!("/edr/collections/{id}/radius");
+            collection_paths[&radius_path] = json!({
+                "get": {
+                    "summary": format!("Radius query for {}", config.title),
+                    "operationId": format!("getRadius_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/coords-radius"},
+                        {"$ref": "#/components/parameters/within"},
+                        {"$ref": "#/components/parameters/within-units"},
+                        {"$ref": "#/components/parameters/datetime"},
+                        {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/z"}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Coverage data",
+                            "content": {
+                                "application/prs.coverage+json": {
+                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                }
+                            }
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Not found"},
+                        "500": {"description": "Server error"}
+                    }
+                }
+            });
+        }
+
         // Trajectory query (vertical cross-section). Only advertised
         // for engines that report `trajectory` in
         // `supported_query_types` — keeps the OpenAPI spec consistent
@@ -637,6 +703,38 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                                         "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                     },
                                     "image/png": {"schema": {"type": "string", "format": "binary"}}
+                                }
+                            },
+                            "400": {"description": "Bad request"},
+                            "404": {"description": "Not found"},
+                            "500": {"description": "Server error"}
+                        }
+                    }
+                });
+            }
+            if supported.contains("radius") {
+                let p = format!("/edr/collections/{id}/instances/{{instanceId}}/radius");
+                collection_paths[&p] = json!({
+                    "get": {
+                        "summary": format!("Radius query against a model run for {}", config.title),
+                        "operationId": format!("getInstanceRadius_{id}"),
+                        "tags": [id],
+                        "parameters": [
+                            instance_id_param.clone(),
+                            {"$ref": "#/components/parameters/coords-radius"},
+                            {"$ref": "#/components/parameters/within"},
+                            {"$ref": "#/components/parameters/within-units"},
+                            {"$ref": "#/components/parameters/datetime"},
+                            {"$ref": "#/components/parameters/parameter-name"},
+                            {"$ref": "#/components/parameters/z"}
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Coverage data",
+                                "content": {
+                                    "application/prs.coverage+json": {
+                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                    }
                                 }
                             },
                             "400": {"description": "Bad request"},
@@ -764,6 +862,27 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": true,
                     "schema": {"type": "string"},
                     "description": "WKT POLYGON geometry, e.g. POLYGON((24 60, 26 60, 26 61, 24 61, 24 60))"
+                },
+                "coords-radius": {
+                    "name": "coords",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "WKT POINT geometry at the centre of the circle, e.g. POINT(24.94 60.17). MULTIPOINT is not accepted for radius queries."
+                },
+                "within": {
+                    "name": "within",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "number"},
+                    "description": "Defines radius of area around defined coordinates to include in the data selection. Must be positive; at most 1000 km. The circle is evaluated as a 64-vertex geodesic polygon, so the response is the same shape as the area query's; engines whose area query samples the polygon's bounding box return the circle's bounding grid."
+                },
+                "within-units": {
+                    "name": "within-units",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "Distance units for the within parameter: km, m or mi (case-insensitive)."
                 },
                 "coords-linestring": {
                     "name": "coords",
@@ -1374,29 +1493,7 @@ async fn run_position_query(
         )
     })?;
 
-    let map_engine_error = |e: &ds_core::error::DataServerError| match e {
-        ds_core::error::DataServerError::InvalidParameter(_)
-        | ds_core::error::DataServerError::InvalidBbox(_)
-        | ds_core::error::DataServerError::InvalidDatetime(_)
-        | ds_core::error::DataServerError::QueryTooLarge(_) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        ),
-        ds_core::error::DataServerError::LocationNotFound(_)
-        | ds_core::error::DataServerError::CollectionNotFound(_)
-        | ds_core::error::DataServerError::FeatureNotFound(_)
-        | ds_core::error::DataServerError::ReferenceTimeNotFound(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": e.to_string() })),
-        ),
-        _ => {
-            tracing::error!("Position query error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-            )
-        }
-    };
+    let map_engine_error = |e: &DataServerError| map_query_error(e, "Position");
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
 
@@ -1508,31 +1605,109 @@ async fn run_area_query(
             z.as_deref(),
             reference_time,
         )
-        .map_err(|e| match &e {
-            ds_core::error::DataServerError::InvalidParameter(_)
-            | ds_core::error::DataServerError::InvalidBbox(_)
-            | ds_core::error::DataServerError::InvalidDatetime(_)
-            | ds_core::error::DataServerError::QueryTooLarge(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            ),
-            ds_core::error::DataServerError::LocationNotFound(_)
-            | ds_core::error::DataServerError::CollectionNotFound(_)
-            | ds_core::error::DataServerError::ReferenceTimeNotFound(_) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "code": "NotFound", "description": e.to_string() })),
-            ),
-            _ => {
-                tracing::error!("Area query error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-                )
-            }
-        })?;
+        .map_err(|e| map_query_error(&e, "Area"))?;
 
     let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
         tracing::error!("Area CoverageJSON serialise error: {e}");
+        server_error()
+    })?;
+    Ok(with_data_cache_control(
+        (
+            [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+            body,
+        )
+            .into_response(),
+        datetime,
+    ))
+}
+
+pub async fn radius_query(
+    Path(id): Path<String>,
+    Query(params): Query<RadiusQueryParams>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    run_radius_query(id, None, params, state).await
+}
+
+/// `GET /collections/{id}/instances/{instanceId}/radius` — radius query
+/// against a specific forecast model run.
+pub async fn instance_radius_query(
+    Path((id, instance_id)): Path<(String, String)>,
+    Query(params): Query<RadiusQueryParams>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    run_radius_query(id, Some(instance_id), params, state).await
+}
+
+/// OGC API - EDR `radius`: everything within `within` `within-units` of a
+/// WKT `POINT`. The engine turns the circle into a polygon and answers it
+/// as an area query (see `EdrEngine::query_radius`), so the response shape
+/// and error mapping are the area query's.
+async fn run_radius_query(
+    id: String,
+    instance_id: Option<String>,
+    params: RadiusQueryParams,
+    state: AppState,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
+    let (engine, _config) = lookup_collection(&state, &id)?;
+
+    // Same capability guard as trajectory: an engine that does not advertise
+    // `radius` has no such resource (404), and the live route stays
+    // consistent with `data_queries` and the OpenAPI gating.
+    if !engine.supported_query_types().iter().any(|q| q == "radius") {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "code": "NotFound",
+                "description": format!("Collection '{id}' does not support radius queries")
+            })),
+        ));
+    }
+
+    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
+        return Err(bad_request(&DataServerError::InvalidParameter(
+            "PNG output is not available for radius queries".into(),
+        )));
+    }
+
+    let within_m =
+        parse_within_metres(&params.within, &params.within_units).map_err(|e| bad_request(&e))?;
+
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+
+    let datetime = params
+        .datetime
+        .as_deref()
+        .map(parse_datetime_interval)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            )
+        })?;
+
+    let param_names: Option<Vec<String>> = params
+        .parameter_name
+        .as_deref()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+
+    let z = resolve_request_z(engine, params.z.as_deref())?;
+
+    let result = engine
+        .query_radius(
+            &params.coords,
+            within_m,
+            datetime,
+            param_names.as_deref(),
+            z.as_deref(),
+            reference_time,
+        )
+        .map_err(|e| map_query_error(&e, "Radius"))?;
+
+    let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
+        tracing::error!("Radius CoverageJSON serialise error: {e}");
         server_error()
     })?;
     Ok(with_data_cache_control(
@@ -1818,7 +1993,7 @@ fn build_collection_metadata(
         engine
             .supported_query_types()
             .into_iter()
-            .filter(|qt| qt == "position" || qt == "area")
+            .filter(|qt| qt == "position" || qt == "area" || qt == "radius")
             .collect()
     } else {
         engine.supported_query_types()
@@ -1835,23 +2010,29 @@ fn build_collection_metadata(
                 json!(["CoverageJSON", "PNG"]),
             ),
             "area" => (format!("{query_base}/area"), json!(["CoverageJSON"])),
+            "radius" => (format!("{query_base}/radius"), json!(["CoverageJSON"])),
             "trajectory" => (
                 format!("{query_base}/trajectory"),
                 json!(["CoverageJSON", "PNG"]),
             ),
             _ => continue,
         };
+        let mut variables = json!({
+            "query_type": qt,
+            "output_formats": output_formats,
+            "default_output_format": "CoverageJSON"
+        });
+        if qt == "radius" {
+            // EDR 1.1 radius link variables carry the accepted `within-units`.
+            variables["within_units"] = json!(WITHIN_UNITS);
+        }
         data_queries.insert(
             qt.clone(),
             json!({
                 "link": {
                     "href": endpoint,
                     "rel": "data",
-                    "variables": {
-                        "query_type": qt,
-                        "output_formats": output_formats,
-                        "default_output_format": "CoverageJSON"
-                    }
+                    "variables": variables
                 }
             }),
         );

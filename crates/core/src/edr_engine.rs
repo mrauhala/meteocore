@@ -132,6 +132,33 @@ pub trait EdrEngine: Send + Sync {
         ))
     }
 
+    /// Execute a radius query: everything within `within_m` metres of the
+    /// WKT `POINT(lon lat)` in `coords`.
+    ///
+    /// The default turns the circle into a 64-vertex geodesic `POLYGON`
+    /// ([`crate::feature::radius_polygon_wkt`]) and delegates to
+    /// [`Self::query_area`], so any engine that answers area queries
+    /// answers radius queries with the same semantics — including the
+    /// same caveat: an engine whose area query samples the polygon's
+    /// *bounding box* (GRIB, nowcast, PostGIS with an observations-derived
+    /// location source) returns the circle's bounding grid / square rather
+    /// than a masked disc. Override only for a native circle
+    /// predicate (e.g. `ST_DWithin`). Advertise `"radius"` in
+    /// [`Self::supported_query_types`] wherever `"area"` is.
+    fn query_radius(
+        &self,
+        coords: &str,
+        within_m: f64,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let (lat, lon) = crate::feature::parse_point_coords(coords)?;
+        let polygon = crate::feature::radius_polygon_wkt(lon, lat, within_m)?;
+        self.query_area(&polygon, datetime, parameters, z, reference_time)
+    }
+
     /// Execute a position query at the given coordinates.
     /// Default implementation returns an error.
     fn query_position(

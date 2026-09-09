@@ -54,6 +54,25 @@ owns the instance-id string form:
   non-empty.
 - Unknown instance id → 404 (`select_run` returns `None`).
 
+## Radius queries (#513)
+
+`GET /collections/{id}/radius?coords=POINT(lon lat)&within=<n>&within-units=km|m|mi`
+(and the `/instances/{id}/radius` twin) is the area query in disguise:
+`EdrEngine::query_radius` has a default that turns the circle into a
+64-vertex geodesic `POLYGON` (`ds_core::feature::radius_polygon_wkt`) and
+calls `query_area`, so an engine gets radius for free by adding `"radius"`
+next to `"area"` in `supported_query_types` — do both or neither. Engines
+whose area query samples the polygon's *bounding box* (GRIB, nowcast, and
+PostGIS stations when `location_source` is observations-derived — only its
+stations-only mode keeps the exact `ST_Within`) therefore return the
+circle's bounding grid / square, not a masked disc. The
+handler 404s a collection that doesn't advertise `radius` (same capability
+guard as trajectory), rejects `PNG`, and `data_queries.radius.link.
+variables.within_units` advertises the accepted units (`params::WITHIN_UNITS`).
+The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
+containing a pole or crossing the antimeridian is a 400 (#667). Engine
+errors from all data-query handlers map through `map_query_error`.
+
 ## Misc
 
 - Cross-section responses (`query_trajectory`, ODIM PVOL) are CoverageJSON

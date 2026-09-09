@@ -2159,7 +2159,10 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
         Some(vec![anchor])
     );
     assert_eq!(engine.get_temporal_extent(), Some((anchor, anchor)));
-    assert_eq!(engine.supported_query_types(), vec!["area".to_string()]);
+    assert_eq!(
+        engine.supported_query_types(),
+        vec!["area".to_string(), "radius".to_string()]
+    );
 
     let coords = format!(
         "POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))",

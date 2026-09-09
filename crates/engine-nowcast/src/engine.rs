@@ -2069,7 +2069,7 @@ impl EdrEngine for NowcastEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["area".to_string()]
+        vec!["area".to_string(), "radius".to_string()]
     }
 
     /// The block-centre motion field inside the query polygon's bbox as a
