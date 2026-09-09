@@ -832,10 +832,20 @@ pub async fn conformance(
         // limit filtering + offset pagination (numberMatched/Returned +
         // next/prev links). Sortable/Filterable/Hierarchical not declared.
         "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
+        // OGC API - EDR 1.1 (19-086r6). Every query type (locations, position,
+        // area, trajectory, instances) lives under the single `queries` class;
+        // each collection's `data_queries` says which ones it supports. The
+        // `html` and `oas30` classes are satisfied by `?f=html` / Accept on
+        // every metadata resource and by `/api`. `geojson` / `edr-geojson`
+        // are deliberately NOT declared: data queries answer 400 for
+        // f=GeoJSON (only /locations is GeoJSON).
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/queries",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/html",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/oas30",
     ];
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
