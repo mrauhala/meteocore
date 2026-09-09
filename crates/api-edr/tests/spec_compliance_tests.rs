@@ -914,6 +914,32 @@ async fn finding_27_conformance_valid() {
     );
 }
 
+// EDR 1.1 (19-086r6) declares one `queries` class for every query type,
+// plus `html` and `oas30` for the representations the server actually
+// serves. The two GeoJSON classes stay out (see finding 27).
+#[tokio::test]
+async fn declares_edr_queries_html_oas30_classes() {
+    let (_status, json) = get_json("/conformance").await;
+    let conforms_to = json["conformsTo"].as_array().unwrap();
+    let uris: Vec<&str> = conforms_to.iter().filter_map(|v| v.as_str()).collect();
+    for class in [
+        "core",
+        "collections",
+        "queries",
+        "json",
+        "covjson",
+        "html",
+        "oas30",
+    ] {
+        let uri = format!("http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/{class}");
+        assert!(uris.contains(&uri.as_str()), "must declare {uri}");
+    }
+    assert!(
+        !uris.iter().any(|u| u.ends_with("/conf/geojson")),
+        "geojson class must not be advertised — data queries cannot return GeoJSON"
+    );
+}
+
 // ===========================================================================
 // FINDING 28: Landing page structure is valid
 // ===========================================================================

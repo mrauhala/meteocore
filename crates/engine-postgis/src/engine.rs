@@ -407,7 +407,6 @@ impl EdrEngine for PostgisEngine {
         vec![
             "locations".to_string(),
             "position".to_string(),
-            "location".to_string(),
             "area".to_string(),
         ]
     }

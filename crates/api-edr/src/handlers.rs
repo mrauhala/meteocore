@@ -832,10 +832,20 @@ pub async fn conformance(
         // limit filtering + offset pagination (numberMatched/Returned +
         // next/prev links). Sortable/Filterable/Hierarchical not declared.
         "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
+        // OGC API - EDR 1.1 (19-086r6). Every query type (locations, position,
+        // area, trajectory, instances) lives under the single `queries` class;
+        // each collection's `data_queries` says which ones it supports. The
+        // `html` and `oas30` classes are satisfied by `?f=html` / Accept on
+        // every metadata resource and by `/api`. `geojson` / `edr-geojson`
+        // are deliberately NOT declared: data queries answer 400 for
+        // f=GeoJSON (only /locations is GeoJSON).
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/queries",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/html",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/oas30",
     ];
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
@@ -1041,8 +1051,11 @@ pub async fn collection(
 pub async fn instances(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, HandlerError> {
+    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &request_base_url(&state, &headers);
@@ -1055,34 +1068,101 @@ pub async fn instances(
     // deliberate, self-consistent choice (the resource is never advertised for
     // non-forecast collections, so conformant clients don't reach it).
     let runs = engine.get_instances();
-    // Each instance doc rebuilds the run-invariant bits (parameters, spatial
-    // extent) via build_collection_metadata. That's a handful of redundant
-    // clones (run count is bounded — a few to a few dozen) on a low-QPS
-    // discovery endpoint, not the `/collections`/`/api` hot paths #211 guards —
-    // kept simple over threading a precomputed-metadata variant through.
-    let instances: Vec<serde_json::Value> = runs
-        .iter()
-        .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run)))
-        .collect();
-    // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is `instances`
-    // (each item a collection-shaped instance), not `collections`.
-    Ok(Json(json!({
-        "links": [{
-            "href": format!("{base}/edr/collections/{}/instances", config.id),
-            "rel": "self",
-            "type": "application/json",
-            "title": format!("{} — instances", config.title)
-        }],
-        "instances": instances,
-    })))
+    let self_href = format!("{base}/edr/collections/{}/instances", config.id);
+    Ok(with_vary(match wanted {
+        Wanted::Json => {
+            // Each instance doc rebuilds the run-invariant bits (parameters,
+            // spatial extent) via build_collection_metadata. That's a handful
+            // of redundant clones (run count is bounded — a few to a few
+            // dozen) on a low-QPS discovery endpoint, not the `/collections`/
+            // `/api` hot paths #211 guards — kept simple over threading a
+            // precomputed-metadata variant through.
+            let instances: Vec<serde_json::Value> = runs
+                .iter()
+                .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run)))
+                .collect();
+            // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
+            // `instances` (each item a collection-shaped instance), not
+            // `collections`.
+            Json(json!({
+                "links": [{
+                    "href": self_href,
+                    "rel": "self",
+                    "type": "application/json",
+                    "title": format!("{} — instances", config.title)
+                }],
+                "instances": instances,
+            }))
+            .into_response()
+        }
+        Wanted::Html => {
+            // EDR 1.1 `html` class: the instance resources negotiate like every
+            // other metadata page (flagged on #669). One card per model run.
+            let cards: Vec<CollectionCard> = runs
+                .iter()
+                .map(|run| instance_card(config, base, run))
+                .collect();
+            let nav = [
+                LinkView::new(format!("{self_href}?f=json"), "alternate", Some("JSON")),
+                LinkView::new(
+                    format!("{base}/edr/collections/{}", config.id),
+                    "collection",
+                    Some("Collection"),
+                ),
+            ];
+            Html(ds_core::html::collections_html(
+                &format!("{} — instances", config.title),
+                &cards,
+                &nav,
+            ))
+            .into_response()
+        }
+    }))
+}
+
+/// The HTML card for one model run: id = the instance id, title = the
+/// reference time, description = the valid-time span.
+fn instance_card(
+    config: &CollectionConfig,
+    base: &str,
+    run: &ds_core::instances::RunInfo,
+) -> ds_core::html::CollectionCard {
+    let instance_id = run.instance_id();
+    let description = match (run.valid_times.first(), run.valid_times.last()) {
+        (Some(first), Some(last)) => format!(
+            "{} valid times, {} – {}",
+            run.valid_times.len(),
+            first.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            last.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        _ => "no valid times".to_string(),
+    };
+    ds_core::html::CollectionCard {
+        id: instance_id.clone(),
+        title: format!(
+            "Run {}",
+            run.reference_time
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        description,
+        self_href: format!(
+            "{base}/edr/collections/{}/instances/{instance_id}",
+            config.id
+        ),
+        keywords: Vec::new(),
+        license: None,
+    }
 }
 
 /// `GET /collections/{id}/instances/{instanceId}` — one model run's metadata.
 pub async fn instance(
     Path((id, instance_id)): Path<(String, String)>,
     State(state): State<AppState>,
+    Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, HandlerError> {
+    use ds_core::html::{LinkView, Wanted};
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &request_base_url(&state, &headers);
@@ -1118,12 +1198,36 @@ pub async fn instance(
             })),
         )
     })?;
-    Ok(Json(build_collection_metadata(
-        engine.as_ref(),
-        config,
-        base,
-        Some(&run),
-    )))
+    Ok(with_vary(match wanted {
+        Wanted::Json => Json(build_collection_metadata(
+            engine.as_ref(),
+            config,
+            base,
+            Some(&run),
+        ))
+        .into_response(),
+        Wanted::Html => {
+            let card = instance_card(config, base, &run);
+            let links = [
+                LinkView::new(
+                    format!("{}?f=json", card.self_href),
+                    "alternate",
+                    Some("JSON"),
+                ),
+                LinkView::new(
+                    format!("{base}/edr/collections/{}/instances", config.id),
+                    "up",
+                    Some("All instances"),
+                ),
+                LinkView::new(
+                    format!("{base}/edr/collections/{}", config.id),
+                    "collection",
+                    Some("Collection"),
+                ),
+            ];
+            Html(ds_core::html::collection_html(&card, &links)).into_response()
+        }
+    }))
 }
 
 pub async fn locations(
