@@ -155,6 +155,31 @@ fn select_vars<'a>(
     Ok(selected)
 }
 
+/// The time-axis indices an EDR query addresses: every step when
+/// `datetime` is absent, else the closed interval; none → 400. Shared by
+/// position and area so the window semantics cannot drift.
+fn select_time_idx(
+    cat: &Catalog,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<Vec<usize>, DataServerError> {
+    let time_idx: Vec<usize> = match datetime {
+        None => (0..cat.times.len()).collect(),
+        Some((start, end)) => cat
+            .times
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t >= start && **t <= end)
+            .map(|(i, _)| i)
+            .collect(),
+    };
+    if time_idx.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "No data available for the requested time range".into(),
+        ));
+    }
+    Ok(time_idx)
+}
+
 impl EdrEngine for ZarrEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
@@ -245,21 +270,7 @@ impl EdrEngine for ZarrEngine {
             return Err(DataServerError::Engine("No Zarr data available".into()));
         }
 
-        let time_idx: Vec<usize> = match datetime {
-            None => (0..cat.times.len()).collect(),
-            Some((start, end)) => cat
-                .times
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| **t >= start && **t <= end)
-                .map(|(i, _)| i)
-                .collect(),
-        };
-        if time_idx.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No data available for the requested time range".into(),
-            ));
-        }
+        let time_idx = select_time_idx(&cat, datetime)?;
 
         let selected = select_vars(&cat, parameters)?;
 
@@ -414,21 +425,7 @@ impl EdrEngine for ZarrEngine {
             return Err(DataServerError::Engine("No Zarr data available".into()));
         }
 
-        let time_idx: Vec<usize> = match datetime {
-            None => (0..cat.times.len()).collect(),
-            Some((start, end)) => cat
-                .times
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| **t >= start && **t <= end)
-                .map(|(i, _)| i)
-                .collect(),
-        };
-        if time_idx.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No data available for the requested time range".into(),
-            ));
-        }
+        let time_idx = select_time_idx(&cat, datetime)?;
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
 
         let selected = select_vars(&cat, parameters)?;
