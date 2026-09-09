@@ -37,7 +37,7 @@ use ds_core::feature::{check_area_budget, parse_area_coords, MAX_AREA_DIM};
 /// Most variables one EDR area request may address. Each is a separate
 /// blocking store round trip on the request thread (two across the
 /// antimeridian) and they cannot run concurrently (`concurrent_target(1)`).
-const MAX_AREA_VARIABLES: usize = 16;
+const MAX_AREA_VARIABLES: usize = 8;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,

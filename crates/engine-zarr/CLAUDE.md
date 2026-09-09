@@ -8,7 +8,7 @@ area/radius (a CRS84 `Grid` over the polygon bbox at native resolution,
 per variable for the whole timestep span — two across the antimeridian —
 cells outside the polygon masked to null — `QueryPolygon::sample_grid`,
 #671; the NATIVE read is budgeted too via `Catalog::window_dims`, and at
-most 16 variables per request since each is a sequential blocking read), WMS/Maps/Tiles rendering, CF time decoding, CF
+most 8 variables per request since each is a sequential blocking read — up to 16 round trips across the antimeridian, a deliberate cap, not fan-out), WMS/Maps/Tiles rendering, CF time decoding, CF
 packing, chunk LRU cache.
 NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5), EDR
 instances (#337 — the engine pins the latest run internally).
