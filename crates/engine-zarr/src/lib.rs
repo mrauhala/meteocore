@@ -269,27 +269,43 @@ impl EdrEngine for ZarrEngine {
         check_area_budget(time_idx.len(), ny, nx, selected.len())?;
         let mask = polygon.cell_mask(&axes);
 
-        let bbox = [
-            polygon.bbox.west,
-            polygon.bbox.south,
-            polygon.bbox.east,
-            polygon.bbox.north,
-        ];
+        // An antimeridian-crossing bbox (west > east) is read as two
+        // windows, one per side of the seam — `axis_window` needs min ≤ max.
+        let b = &polygon.bbox;
+        let bboxes: Vec<[f64; 4]> = if b.crosses_antimeridian() {
+            vec![
+                [b.west, b.south, 180.0, b.north],
+                [-180.0, b.south, b.east, b.north],
+            ]
+        } else {
+            vec![[b.west, b.south, b.east, b.north]]
+        };
+        // The datetime filter selects a contiguous run of the ascending time
+        // axis, so one hyperslab per (variable, seam side) covers every step.
+        let (t0, t1) = (time_idx[0], time_idx[time_idx.len() - 1]);
         let has_time = time_idx.len() > 1;
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
         for v in selected {
+            // One blocking store read per (variable, seam side) for the whole
+            // span (Performance rule 9) — `windows[side][step]`; a side
+            // entirely off the grid contributes nothing.
+            let windows: Vec<Vec<catalog::Window>> = bboxes
+                .iter()
+                .map(|bb| cat.read_window_span(v, t0..t1 + 1, *bb))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
             let mut values: Vec<Option<f64>> = Vec::with_capacity(time_idx.len() * ny * nx);
-            for &ti in &time_idx {
-                // One windowed read per (variable, timestep); a bbox entirely
-                // off the grid yields a fully-null slab rather than an error.
-                let window = cat.read_window(v, ti, bbox)?;
+            for (step, _) in time_idx.iter().enumerate() {
                 for (iy, &y) in axes.y.iter().enumerate() {
                     for (ix, &x) in axes.x.iter().enumerate() {
-                        values.push(match (&window, mask[axes.index(ix, iy)]) {
-                            (Some(win), true) => win.sample(x, y),
-                            _ => None,
+                        values.push(if mask[axes.index(ix, iy)] {
+                            windows.iter().find_map(|side| side[step].sample(x, y))
+                        } else {
+                            None
                         });
                     }
                 }

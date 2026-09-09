@@ -112,6 +112,21 @@ impl Catalog {
         time_idx: usize,
         bbox: [f64; 4],
     ) -> Result<Option<Window>, DataServerError> {
+        Ok(self
+            .read_window_span(var, time_idx..time_idx + 1, bbox)?
+            .and_then(|mut w| w.pop()))
+    }
+
+    /// [`Self::read_window`] for a contiguous span of timesteps in ONE store
+    /// read (one hyperslab, one trip through the blocking storage bridge —
+    /// not one per step), returning one [`Window`] per step in order. Used by
+    /// the EDR area path.
+    pub fn read_window_span(
+        &self,
+        var: &Variable,
+        time_span: Range<usize>,
+        bbox: [f64; 4],
+    ) -> Result<Option<Vec<Window>>, DataServerError> {
         let [west, south, east, north] = bbox;
         let (Some((i0, i1)), Some((j0, j1))) = (
             axis_window(&self.lons, west, east),
@@ -119,11 +134,12 @@ impl Catalog {
         ) else {
             return Ok(None); // bbox entirely outside the grid
         };
+        let nt = time_span.len().max(1);
 
         let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
         for a in 0..var.ndim {
             if Some(a) == var.time_axis {
-                ranges.push(time_idx as u64..time_idx as u64 + 1);
+                ranges.push(time_span.start as u64..time_span.start as u64 + nt as u64);
             } else if a == var.lat_axis {
                 ranges.push(j0 as u64..(j1 as u64) + 1);
             } else if a == var.lon_axis {
@@ -141,29 +157,36 @@ impl Catalog {
 
         let nrow = j1 - j0 + 1;
         let ncol = i1 - i0 + 1;
-        let mut data = vec![None; nrow * ncol];
-        for r in 0..nrow {
-            for c in 0..ncol {
-                let mut off = 0usize;
-                for (a, &len) in lens.iter().enumerate() {
-                    let idx = if a == var.lat_axis {
-                        r
-                    } else if a == var.lon_axis {
-                        c
-                    } else {
-                        0 // time + any pinned dims
-                    };
-                    off = off * len + idx;
+        let lons = self.lons[i0..=i1].to_vec();
+        let lats = self.lats[j0..=j1].to_vec();
+        let mut windows = Vec::with_capacity(nt);
+        for t in 0..nt {
+            let mut data = vec![None; nrow * ncol];
+            for r in 0..nrow {
+                for c in 0..ncol {
+                    let mut off = 0usize;
+                    for (a, &len) in lens.iter().enumerate() {
+                        let idx = if a == var.lat_axis {
+                            r
+                        } else if a == var.lon_axis {
+                            c
+                        } else if Some(a) == var.time_axis {
+                            t
+                        } else {
+                            0 // pinned dims
+                        };
+                        off = off * len + idx;
+                    }
+                    data[r * ncol + c] = conv[off];
                 }
-                data[r * ncol + c] = conv[off];
             }
+            windows.push(Window {
+                data,
+                lons: lons.clone(),
+                lats: lats.clone(),
+            });
         }
-
-        Ok(Some(Window {
-            data,
-            lons: self.lons[i0..=i1].to_vec(),
-            lats: self.lats[j0..=j1].to_vec(),
-        }))
+        Ok(Some(windows))
     }
 
     /// Sample a variable's value at `(lon, lat)` for each requested time index,
