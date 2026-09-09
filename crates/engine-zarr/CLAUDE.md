@@ -10,7 +10,9 @@ cells outside the polygon masked to null — `QueryPolygon::sample_grid`,
 #671; the NATIVE read is budgeted too via `Catalog::window_dims`, and at
 most 8 variables per request since each is a sequential blocking read — up to 16 round trips across the antimeridian, a deliberate cap, not fan-out; across the seam the two windows do not
 bracket each other, so cells within half a native cell of ±180° on a
-periodic store are nearest-only or null — #667), WMS/Maps/Tiles rendering, CF time decoding, CF
+periodic store are nearest-only or null, and a native 0..360 longitude
+axis is not normalised — position and area alike only answer requests in
+the store's own frame — #667), WMS/Maps/Tiles rendering, CF time decoding, CF
 packing, chunk LRU cache.
 NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5), EDR
 instances (#337 — the engine pins the latest run internally).
