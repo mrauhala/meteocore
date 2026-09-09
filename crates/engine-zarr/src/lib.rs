@@ -130,6 +130,26 @@ impl ZarrEngine {
     }
 }
 
+/// The variables an EDR query addresses: every one when `parameters` is
+/// absent, else the case-insensitive name matches; none → 400. Shared by
+/// position and area so the two cannot drift.
+fn select_vars<'a>(
+    cat: &'a Catalog,
+    parameters: Option<&[String]>,
+) -> Result<Vec<&'a catalog::Variable>, DataServerError> {
+    let selected: Vec<&catalog::Variable> = cat
+        .vars
+        .iter()
+        .filter(|v| parameters.is_none_or(|f| f.iter().any(|p| p.eq_ignore_ascii_case(&v.name))))
+        .collect();
+    if selected.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "No matching parameters found".into(),
+        ));
+    }
+    Ok(selected)
+}
+
 impl EdrEngine for ZarrEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
@@ -236,18 +256,7 @@ impl EdrEngine for ZarrEngine {
             ));
         }
 
-        let selected: Vec<&catalog::Variable> = cat
-            .vars
-            .iter()
-            .filter(|v| {
-                parameters.is_none_or(|f| f.iter().any(|p| p.eq_ignore_ascii_case(&v.name)))
-            })
-            .collect();
-        if selected.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No matching parameters found".into(),
-            ));
-        }
+        let selected = select_vars(&cat, parameters)?;
 
         // A polygon entirely outside the store's coverage is a 404, not an
         // all-null 200 (GRIB and QueryData answer the same way).
@@ -280,9 +289,14 @@ impl EdrEngine for ZarrEngine {
         } else {
             vec![[b.west, b.south, b.east, b.north]]
         };
-        // The datetime filter selects a contiguous run of the ascending time
-        // axis, so one hyperslab per (variable, seam side) covers every step.
-        let (t0, t1) = (time_idx[0], time_idx[time_idx.len() - 1]);
+        // One hyperslab per (variable, seam side) spanning the first..last
+        // matched index; steps are then addressed by offset, so the read is
+        // correct even if the axis were not strictly ascending (gaps just
+        // read a few unused steps).
+        let (t0, t1) = (
+            *time_idx.iter().min().expect("non-empty"),
+            *time_idx.iter().max().expect("non-empty"),
+        );
         let has_time = time_idx.len() > 1;
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
         let mut params_map = HashMap::new();
@@ -299,7 +313,8 @@ impl EdrEngine for ZarrEngine {
                 .flatten()
                 .collect();
             let mut values: Vec<Option<f64>> = Vec::with_capacity(time_idx.len() * ny * nx);
-            for (step, _) in time_idx.iter().enumerate() {
+            for &ti in &time_idx {
+                let step = ti - t0;
                 for (iy, &y) in axes.y.iter().enumerate() {
                     for (ix, &x) in axes.x.iter().enumerate() {
                         values.push(if mask[axes.index(ix, iy)] {
@@ -379,18 +394,7 @@ impl EdrEngine for ZarrEngine {
         }
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
 
-        let selected: Vec<&catalog::Variable> = cat
-            .vars
-            .iter()
-            .filter(|v| {
-                parameters.is_none_or(|f| f.iter().any(|p| p.eq_ignore_ascii_case(&v.name)))
-            })
-            .collect();
-        if selected.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No matching parameters found".into(),
-            ));
-        }
+        let selected = select_vars(&cat, parameters)?;
 
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();

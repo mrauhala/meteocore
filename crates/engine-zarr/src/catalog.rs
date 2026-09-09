@@ -157,10 +157,17 @@ impl Catalog {
 
         let nrow = j1 - j0 + 1;
         let ncol = i1 - i0 + 1;
-        let lons = self.lons[i0..=i1].to_vec();
-        let lats = self.lats[j0..=j1].to_vec();
+        let mut lons = self.lons[i0..=i1].to_vec();
+        let mut lats = self.lats[j0..=j1].to_vec();
         let mut windows = Vec::with_capacity(nt);
         for t in 0..nt {
+            // The last (for a render tile: the only) window takes the axes by
+            // move — no clone on the per-tile hot path.
+            let (wl, wla) = if t + 1 == nt {
+                (std::mem::take(&mut lons), std::mem::take(&mut lats))
+            } else {
+                (lons.clone(), lats.clone())
+            };
             let mut data = vec![None; nrow * ncol];
             for r in 0..nrow {
                 for c in 0..ncol {
@@ -182,8 +189,8 @@ impl Catalog {
             }
             windows.push(Window {
                 data,
-                lons: lons.clone(),
-                lats: lats.clone(),
+                lons: wl,
+                lats: wla,
             });
         }
         Ok(Some(windows))
