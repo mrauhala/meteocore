@@ -212,6 +212,138 @@ fn write_seam_store(dir: &std::path::Path) {
     .unwrap();
 }
 
+/// A plain geographic store with one timestep, the given axes and one
+/// constant-valued float32 variable per name — for the request-budget tests.
+fn write_grid_store(dir: &std::path::Path, lats: &[f64], lons: &[f64], names: &[&str]) {
+    use zarrs::array::{data_type, ArrayBuilder, ArraySubset};
+    use zarrs::filesystem::FilesystemStore;
+    use zarrs::group::GroupBuilder;
+
+    let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let store = std::sync::Arc::new(FilesystemStore::new(dir).unwrap());
+    GroupBuilder::new()
+        .build(store.clone(), "/")
+        .unwrap()
+        .store_metadata()
+        .unwrap();
+    let fcoord = |path: &str, vals: &[f64], dim: &str, at: serde_json::Value| {
+        let a = ArrayBuilder::new(
+            vec![vals.len() as u64],
+            vec![vals.len() as u64],
+            data_type::float64(),
+            f64::NAN,
+        )
+        .dimension_names(Some([dim]))
+        .attributes(obj(at))
+        .build(store.clone(), path)
+        .unwrap();
+        a.store_metadata().unwrap();
+        a.store_chunk(&[0], vals.to_vec()).unwrap();
+    };
+    let t0 = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp() as f64;
+    fcoord(
+        "/time",
+        &[t0],
+        "time",
+        serde_json::json!({"units":"seconds since 1970-01-01","standard_name":"time"}),
+    );
+    fcoord(
+        "/lat",
+        lats,
+        "lat",
+        serde_json::json!({"units":"degrees_north","standard_name":"latitude"}),
+    );
+    fcoord(
+        "/lon",
+        lons,
+        "lon",
+        serde_json::json!({"units":"degrees_east","standard_name":"longitude"}),
+    );
+    let n = lats.len() as u64 * lons.len() as u64;
+    for (i, name) in names.iter().enumerate() {
+        let a = ArrayBuilder::new(
+            vec![1, lats.len() as u64, lons.len() as u64],
+            vec![1, lats.len() as u64, lons.len() as u64],
+            data_type::float32(),
+            f32::NAN,
+        )
+        .dimension_names(Some(["time", "lat", "lon"]))
+        .attributes(obj(serde_json::json!({"units":"K","long_name":name})))
+        .build(store.clone(), &format!("/{name}"))
+        .unwrap();
+        a.store_metadata().unwrap();
+        a.store_chunks(
+            &ArraySubset::new_with_shape(a.chunk_grid_shape().to_vec()),
+            vec![i as f32; n as usize],
+        )
+        .unwrap();
+    }
+}
+
+/// Review on #674: the two hard caps on the blocking store read must reject,
+/// not just exist.
+#[test]
+fn area_query_caps_variables_per_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..9).map(|i| format!("v{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    write_grid_store(dir.path(), &[52.0, 51.0], &[10.0, 11.0], &refs);
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("many", &cfg).unwrap();
+    assert_eq!(e.get_parameters().len(), 9);
+    let err = e
+        .query_area("10,51,11,52", None, None, None, None)
+        .unwrap_err();
+    match err {
+        ds_core::error::DataServerError::QueryTooLarge(m) => {
+            assert!(m.contains("parameter-name"), "{m}")
+        }
+        other => panic!("expected QueryTooLarge, got {other}"),
+    }
+    // Selecting a subset is fine.
+    let qr = single(
+        e.query_area("10,51,11,52", None, Some(&names[..2]), None, None)
+            .unwrap(),
+    );
+    assert_eq!(qr.ranges.len(), 2);
+}
+
+#[test]
+fn area_query_budgets_the_native_read() {
+    // 1100 × 1000 native cells > the 1M-value budget even though the output
+    // grid is coarsened to 256 × 256.
+    let dir = tempfile::tempdir().unwrap();
+    let lats: Vec<f64> = (0..1000).map(|i| 80.0 - i as f64 * 0.1).collect();
+    let lons: Vec<f64> = (0..1100).map(|i| -100.0 + i as f64 * 0.1).collect();
+    write_grid_store(dir.path(), &lats, &lons, &["t"]);
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("fine", &cfg).unwrap();
+    let err = e
+        .query_area("-100,-20,10,80", None, None, None, None)
+        .unwrap_err();
+    match err {
+        ds_core::error::DataServerError::QueryTooLarge(m) => {
+            assert!(m.contains("native-resolution"), "{m}")
+        }
+        other => panic!("expected QueryTooLarge, got {other}"),
+    }
+    // A sub-budget window of the same store succeeds.
+    let qr = single(
+        e.query_area("-50,20,-40,30", None, None, None, None)
+            .unwrap(),
+    );
+    assert_eq!(qr.ranges["t"].shape, vec![100, 100]);
+}
+
 /// Review on #674: an antimeridian-crossing area bbox used to produce an
 /// all-null 200 because the store window needs min ≤ max. It is now read
 /// as one window per side of the seam.

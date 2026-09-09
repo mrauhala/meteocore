@@ -298,6 +298,10 @@ impl EdrEngine for ZarrEngine {
 
         // An antimeridian-crossing bbox (west > east) is read as two
         // windows, one per side of the seam — `axis_window` needs min ≤ max.
+        // Known gap: the windows do not bracket each other across ±180°, so
+        // on a periodic global store an output cell within half a native
+        // cell of the seam interpolates from one side only (nearest fallback)
+        // or is null. Periodic wrap-around sampling is #667's follow-up.
         let b = &polygon.bbox;
         let bboxes: Vec<[f64; 4]> = if b.crosses_antimeridian() {
             vec![
