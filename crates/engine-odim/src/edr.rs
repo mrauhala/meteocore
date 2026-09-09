@@ -48,7 +48,7 @@ use crate::reader::OdimComposite;
 /// over the whole grid would emit a multi-megabyte coverage per
 /// timestep. 256 keeps a single-timestep area response well under
 /// 1 MB while still being finer than most display use cases need.
-const MAX_AREA_DIM: usize = 256;
+use ds_core::feature::MAX_AREA_DIM;
 
 /// Cap on the number of timesteps an area query may span. The area
 /// coverage is an `ny × nx` grid (each ≤ `MAX_AREA_DIM`) *per*
@@ -336,26 +336,13 @@ impl OdimEngine {
         let deg_per_px_lat =
             ((ur_lat - ll_lat).abs() / self.seed_ysize as f64).max(f64::MIN_POSITIVE);
 
-        let west = polygon.bbox.west;
-        let south = polygon.bbox.south;
-        let east = polygon.bbox.east;
-        let north = polygon.bbox.north;
-
-        // Match the source resolution, clamped to [1, MAX_AREA_DIM].
-        let nx = (((east - west) / deg_per_px_lon).ceil() as usize).clamp(1, MAX_AREA_DIM);
-        let ny = (((north - south) / deg_per_px_lat).ceil() as usize).clamp(1, MAX_AREA_DIM);
-
-        // Cell centres. `x` ascends west→east, `y` descends
-        // north→south (index 0 = north), matching the row order the
-        // raster sampler and `NdArray` layout use.
-        let cell_w = (east - west) / nx as f64;
-        let cell_h = (north - south) / ny as f64;
-        let x_values: Vec<f64> = (0..nx)
-            .map(|ix| west + (ix as f64 + 0.5) * cell_w)
-            .collect();
-        let y_values: Vec<f64> = (0..ny)
-            .map(|iy| north - (iy as f64 + 0.5) * cell_h)
-            .collect();
+        // Shared cell-centre construction (ds-core, #671): x ascends
+        // west→east, y descends north→south, each ≤ `MAX_AREA_DIM`.
+        let axes = polygon.sample_grid(deg_per_px_lon, deg_per_px_lat, MAX_AREA_DIM);
+        let (nx, ny) = axes.dims();
+        let mask = polygon.cell_mask(&axes);
+        let x_values = axes.x;
+        let y_values = axes.y;
 
         let has_time = entries.len() > 1;
         let mut times = Vec::with_capacity(entries.len());
@@ -378,9 +365,9 @@ impl OdimEngine {
             let gain = self.gain_override.unwrap_or(composite.gain);
             let offset = self.offset_override.unwrap_or(composite.offset);
             let nodata = self.nodata_override.unwrap_or(composite.nodata);
-            for &y in &y_values {
-                for &x in &x_values {
-                    if polygon.contains(x, y) {
+            for (iy, &y) in y_values.iter().enumerate() {
+                for (ix, &x) in x_values.iter().enumerate() {
+                    if mask[iy * nx + ix] {
                         all_values.push(sample_bilinear(
                             &composite,
                             x,

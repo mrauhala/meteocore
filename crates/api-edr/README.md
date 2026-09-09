@@ -57,7 +57,7 @@ Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
 |---|---|---|
 | `coords` | ✓ | WKT per query type (see above) |
 | `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..` |
-| `parameter-name` | ✓ | comma-separated; validated per engine (unknown → 400) |
+| `parameter-name` | partial | comma-separated; 400 only when *no* requested name matches — a mix of valid and unknown names silently drops the unknown ones (#666, the #605 rule) |
 | `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent |
 | `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only; media-type aliases such as `f=application/json` rejected (#510); no CSV/NetCDF/GeoJSON |
 | `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
@@ -83,7 +83,7 @@ CoverageJSON 1.0 schema.
 | CSV | ✓ | – | ✓ | ✓ | – | n/a | stations whose point is inside the polygon (≤ 500) |
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | polygon-tested |
 | GRIB | – | ✓ | ✓ | ✓ | – | ✓ | **bbox only** — Grid over the polygon's bounding box, no mask (#671) |
-| QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked; `t` axis when several steps |
+| QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps |
 | Zarr | – | ✓ | – | – | – | – | pins the latest run internally; no area yet |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
 | ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | polar sampling; trajectory = RHI cross-section |

@@ -9,7 +9,7 @@ use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::parse_area_coords;
+use ds_core::feature::{check_area_budget, parse_area_coords, MAX_AREA_DIM};
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
@@ -47,12 +47,6 @@ impl RunSet {
 /// WMS `reference_time` (#337). The newest run is the default for un-pinned
 /// queries. New/removed files are picked up on poll and the run set is swapped
 /// atomically via `ArcSwap`; already-loaded files are reused (not re-parsed).
-/// Per-dimension cap of an EDR area grid (cells); a wider bbox is coarsened.
-const MAX_AREA_DIM: usize = 256;
-/// Total value budget of one area response across timesteps × cells ×
-/// parameters (~8 MB of CoverageJSON), mirroring GRIB's 1M-pixel limit.
-const MAX_AREA_VALUES: usize = 1_000_000;
-
 pub struct QueryDataEngine {
     /// Retained model runs. Swapped atomically on poll.
     runs: ArcSwap<RunSet>,
@@ -335,35 +329,47 @@ impl EdrEngine for QueryDataEngine {
             ));
         }
 
-        // Native resolution in degrees from the grid's corner coordinates —
-        // exact for lat-lon grids, a fair mean cell size for projected ones.
-        let (bl, tr) = (data.grid.area.bottom_left, data.grid.area.top_right);
-        let res_lon = (tr.0 - bl.0).abs() / data.grid.nx.max(1) as f64;
-        let res_lat = (tr.1 - bl.1).abs() / data.grid.ny.max(1) as f64;
-        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
-        let (nx, ny) = (axes.x.len(), axes.y.len());
-
-        let total = time_indices.len() * ny * nx * param_indices.len();
-        if total > MAX_AREA_VALUES {
-            return Err(DataServerError::QueryTooLarge(format!(
-                "Area query would return {total} values ({} timesteps × {ny} × {nx} cells × {} parameters); \
-                 the limit is {MAX_AREA_VALUES} — narrow the datetime window, the polygon or the parameters",
-                time_indices.len(),
-                param_indices.len()
-            )));
-        }
-
-        let mask: Vec<bool> = axes
-            .y
-            .iter()
-            .flat_map(|&y| axes.x.iter().map(move |&x| (x, y)))
-            .map(|(x, y)| polygon.contains(x, y))
-            .collect();
-        if !mask.iter().any(|&m| m) {
+        // A polygon entirely outside the run's coverage is a 404, not an
+        // all-null 200 (GRIB answers the same way).
+        let extent = {
+            let (bl, tr) = (data.grid.area.bottom_left, data.grid.area.top_right);
+            [
+                bl.0.min(tr.0),
+                bl.1.min(tr.1),
+                bl.0.max(tr.0),
+                bl.1.max(tr.1),
+            ]
+        };
+        if !polygon.bbox.intersects_bbox(&extent) {
             return Err(DataServerError::LocationNotFound(
-                "The polygon contains no grid cell centre".into(),
+                "The polygon lies outside the collection's spatial extent".into(),
             ));
         }
+
+        // Native resolution in degrees from the grid's corner coordinates —
+        // exact for lat-lon grids, a fair mean cell size for projected ones.
+        let res_lon = (extent[2] - extent[0]) / data.grid.nx.max(1) as f64;
+        let res_lat = (extent[3] - extent[1]) / data.grid.ny.max(1) as f64;
+        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
+        let (nx, ny) = axes.dims();
+        check_area_budget(time_indices.len(), ny, nx, param_indices.len())?;
+
+        // Project each cell centre ONCE (the CRS forward transform is the
+        // expensive part — Critical Rule 5); parameters and timesteps then
+        // reuse the fractional grid pixel. `None` = masked.
+        let mask = polygon.cell_mask(&axes);
+        let gt = data.grid.geo_transform();
+        let cell_px: Vec<Option<(f64, f64)>> = axes
+            .y
+            .iter()
+            .enumerate()
+            .flat_map(|(iy, &y)| {
+                let (gt, axes, mask) = (&gt, &axes, &mask);
+                axes.x.iter().enumerate().map(move |(ix, &x)| {
+                    mask[axes.index(ix, iy)].then(|| world_to_grid_px(gt, x, y))
+                })
+            })
+            .collect();
 
         let has_time = time_indices.len() > 1;
         let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
@@ -373,17 +379,11 @@ impl EdrEngine for QueryDataEngine {
         for (pi, param) in &param_indices {
             let mut values: Vec<Option<f64>> = Vec::with_capacity(time_indices.len() * ny * nx);
             for (ti, _) in &time_indices {
-                let mut cell = 0usize;
-                for &y in &axes.y {
-                    for &x in &axes.x {
-                        values.push(if mask[cell] {
-                            interpolate(&data, x, y, *pi, 0, *ti)
-                        } else {
-                            None
-                        });
-                        cell += 1;
-                    }
-                }
+                values.extend(cell_px.iter().map(|px| {
+                    px.and_then(|(col_f, row_f)| {
+                        sample_grid_bilinear(&data, col_f, row_f, *pi, 0, *ti)
+                    })
+                }));
             }
             params_map.insert(
                 param.name.clone(),
@@ -436,7 +436,9 @@ impl EdrEngine for QueryDataEngine {
 
         let time_indices = find_time_range(&data, datetime);
         if time_indices.is_empty() {
-            return Err(DataServerError::Engine(
+            // A window outside the run's steps is a request error (400), the
+            // same classification `query_area` uses — not a 500.
+            return Err(DataServerError::InvalidParameter(
                 "No data available for the requested time range".into(),
             ));
         }
@@ -1108,6 +1110,33 @@ mod tests {
             inside * 3 > total && inside * 3 < total * 2,
             "a right triangle fills about half its bbox: {inside}/{total}"
         );
+    }
+
+    #[test]
+    fn engine_area_query_outside_extent_is_not_found() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        let err = engine
+            .query_area(
+                "POLYGON((100 10, 101 10, 101 11, 100 11, 100 10))",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DataServerError::LocationNotFound(_)), "{err}");
+        // And a datetime window past the run's steps is a 400 on both paths.
+        let far: DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
+        for r in [
+            engine.query_area("36,-2,38,0", Some((far, far)), None, None, None),
+            engine.query_position("POINT(36.8 -1.3)", Some((far, far)), None, None, None),
+        ] {
+            assert!(
+                matches!(r, Err(DataServerError::InvalidParameter(_))),
+                "{r:?}"
+            );
+        }
     }
 
     #[test]
