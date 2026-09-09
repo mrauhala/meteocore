@@ -27,7 +27,9 @@ of these crates, read its file — it holds that crate's rules and gotchas:
 - `crates/api-wms/CLAUDE.md` — BBOX axis order, meta-tiling, TIME/ELEVATION/
   reference_time dimensions.
 - `crates/api-edr/CLAUDE.md` — CoverageJSON schema compliance, domain types,
-  instances.
+  instances. `crates/api-edr/README.md` is the EDR support-status page
+  (conformance classes, query types, per-engine matrix) — update it in
+  every PR that touches EDR behaviour, including engine `EdrEngine` impls.
 - `crates/api-3dtiles/CLAUDE.md` — routes, representations, caching, viewer.
 - `crates/api-mcp/CLAUDE.md` — MCP tools, the auth boundary, why the tool
   set is restricted to nowcast collections.
@@ -397,7 +399,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
-| QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
+| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles |
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |

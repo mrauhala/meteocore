@@ -175,11 +175,17 @@ impl QueryPolygon {
         if !self.bbox.contains(x, y) {
             return false;
         }
-        if !point_in_ring(x, y, &self.exterior) {
+        // An antimeridian-crossing polygon (bbox west > east, from the
+        // `west,south,east,north` form) is tested in a 0..360 longitude
+        // frame, where its ring is an ordinary planar shape.
+        let wrap = self.bbox.crosses_antimeridian();
+        let norm = |lon: f64| if wrap && lon < 0.0 { lon + 360.0 } else { lon };
+        let x = norm(x);
+        if !point_in_ring_by(x, y, &self.exterior, norm) {
             return false;
         }
         for hole in &self.holes {
-            if point_in_ring(x, y, hole) {
+            if point_in_ring_by(x, y, hole, norm) {
                 return false;
             }
         }
@@ -187,8 +193,173 @@ impl QueryPolygon {
     }
 }
 
+/// Per-dimension cap of a gridded engine's EDR area grid (cells per axis);
+/// a wider bbox is *coarsened* to this, never refused.
+pub const MAX_AREA_DIM: usize = 256;
+/// Total value budget of one gridded area response across timesteps ×
+/// cells × parameters (≈ 8 MB of CoverageJSON). One home for every engine
+/// so the budget cannot drift per engine (#672 review); GRIB / GeoTIFF /
+/// ODIM / PostGIS still carry older local limits — consolidating them is a
+/// follow-up.
+pub const MAX_AREA_VALUES: usize = 1_000_000;
+
+/// Enforce [`MAX_AREA_VALUES`] for a `timesteps × ny × nx × parameters`
+/// response, with the message every engine returns.
+pub fn check_area_budget(
+    timesteps: usize,
+    ny: usize,
+    nx: usize,
+    parameters: usize,
+) -> Result<(), DataServerError> {
+    let total = timesteps
+        .saturating_mul(ny)
+        .saturating_mul(nx)
+        .saturating_mul(parameters);
+    if total > MAX_AREA_VALUES {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "Area query would return {total} values ({timesteps} timesteps × {ny} × {nx} cells × \
+             {parameters} parameters); the limit is {MAX_AREA_VALUES} — narrow the datetime \
+             window, the polygon or the parameters"
+        )));
+    }
+    Ok(())
+}
+
+/// Cell-centre axes of a regular CRS84 grid over an area query's polygon
+/// bbox, at (roughly) a source's native resolution. The shared shape of a
+/// gridded engine's EDR *area* / *radius* result (#671): a CoverageJSON
+/// `Grid` must be rectangular, so the domain is the bbox and the engine
+/// masks cells outside the polygon to null via [`QueryPolygon::cell_mask`].
+///
+/// `x` ascends west→east, `y` descends north→south (index 0 = north),
+/// matching raster row order and the `[t, y, x]` NdArray layout. An
+/// antimeridian-crossing bbox (`west > east`, see [`Bbox`]) spans the seam:
+/// `x` keeps ascending through +180 and is wrapped into `(-180, 180]`, so
+/// the values are not monotonic in that one case. Each dimension is
+/// clamped to `[1, max_dim]`, so a bbox much wider than the source
+/// resolution allows is *coarsened*, never refused — the total-value
+/// budget is [`check_area_budget`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AreaGridAxes {
+    pub x: Vec<f64>,
+    pub y: Vec<f64>,
+}
+
+impl AreaGridAxes {
+    /// `(nx, ny)`.
+    pub fn dims(&self) -> (usize, usize) {
+        (self.x.len(), self.y.len())
+    }
+
+    /// Row-major cell index of `(ix, iy)` — `iy * nx + ix`, the layout of
+    /// [`QueryPolygon::cell_mask`] and of a `[y, x]` NdArray.
+    pub fn index(&self, ix: usize, iy: usize) -> usize {
+        iy * self.x.len() + ix
+    }
+}
+
+impl QueryPolygon {
+    /// See [`AreaGridAxes`]. `res_lon_deg` / `res_lat_deg` are the source's
+    /// cell sizes in degrees (non-positive or non-finite values are treated
+    /// as "one cell").
+    pub fn sample_grid(&self, res_lon_deg: f64, res_lat_deg: f64, max_dim: usize) -> AreaGridAxes {
+        let max_dim = max_dim.max(1);
+        let Bbox {
+            west,
+            south,
+            east,
+            north,
+        } = self.bbox;
+        let lon_span = if self.bbox.crosses_antimeridian() {
+            east + 360.0 - west
+        } else {
+            east - west
+        };
+        let cells = |span: f64, res: f64| -> usize {
+            if !(res.is_finite() && res > 0.0) {
+                return 1;
+            }
+            ((span / res).ceil() as usize).clamp(1, max_dim)
+        };
+        let nx = cells(lon_span, res_lon_deg);
+        let ny = cells(north - south, res_lat_deg);
+        let cell_w = lon_span / nx as f64;
+        let cell_h = (north - south) / ny as f64;
+        AreaGridAxes {
+            x: (0..nx)
+                .map(|ix| {
+                    let lon = west + (ix as f64 + 0.5) * cell_w;
+                    if lon > 180.0 {
+                        lon - 360.0
+                    } else {
+                        lon
+                    }
+                })
+                .collect(),
+            y: (0..ny)
+                .map(|iy| north - (iy as f64 + 0.5) * cell_h)
+                .collect(),
+        }
+    }
+
+    /// Which cells of `axes` an area query should fill: row-major
+    /// (`iy * nx + ix`), `true` where the cell centre is inside the polygon.
+    /// When no centre is inside — a sliver, an L, or a ring smaller than one
+    /// native cell whose bbox collapsed to a single cell whose centre the
+    /// shape misses — the cells containing a polygon vertex are used
+    /// instead, so a small-but-real shape still returns its data instead of
+    /// a false "no cell inside" 404.
+    pub fn cell_mask(&self, axes: &AreaGridAxes) -> Vec<bool> {
+        let (nx, ny) = axes.dims();
+        let mut mask: Vec<bool> = axes
+            .y
+            .iter()
+            .flat_map(|&y| axes.x.iter().map(move |&x| (x, y)))
+            .map(|(x, y)| self.contains(x, y))
+            .collect();
+        if mask.iter().any(|&m| m) || nx == 0 || ny == 0 {
+            return mask;
+        }
+        // Fallback: mark the cell whose extent contains each vertex. Cells
+        // are `cell_w × cell_h` around their centres.
+        let cell_w = if nx > 1 {
+            (axes.x[1] - axes.x[0]).rem_euclid(360.0)
+        } else {
+            self.bbox.east - self.bbox.west
+                + if self.bbox.crosses_antimeridian() {
+                    360.0
+                } else {
+                    0.0
+                }
+        };
+        let cell_h = if ny > 1 {
+            axes.y[0] - axes.y[1]
+        } else {
+            self.bbox.north - self.bbox.south
+        };
+        for &[vx, vy] in self.exterior.iter().chain(self.holes.iter().flatten()) {
+            let dx = (vx - (axes.x[0] - cell_w / 2.0)).rem_euclid(360.0);
+            let ix = ((dx / cell_w) as usize).min(nx - 1);
+            let dy = (axes.y[0] + cell_h / 2.0) - vy;
+            if dy < 0.0 {
+                continue;
+            }
+            let iy = ((dy / cell_h) as usize).min(ny - 1);
+            mask[axes.index(ix, iy)] = true;
+        }
+        mask
+    }
+}
+
 /// Ray-casting point-in-polygon test for a single ring.
 fn point_in_ring(x: f64, y: f64, ring: &[[f64; 2]]) -> bool {
+    point_in_ring_by(x, y, ring, |lon| lon)
+}
+
+/// [`point_in_ring`] with the ring's longitudes passed through `norm`
+/// (the caller normalises `x` the same way) — how an antimeridian-crossing
+/// ring is tested in a 0..360 frame without allocating a shifted copy.
+fn point_in_ring_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> bool {
     let n = ring.len();
     if n < 3 {
         return false;
@@ -196,8 +367,8 @@ fn point_in_ring(x: f64, y: f64, ring: &[[f64; 2]]) -> bool {
     let mut inside = false;
     let mut j = n - 1;
     for i in 0..n {
-        let (xi, yi) = (ring[i][0], ring[i][1]);
-        let (xj, yj) = (ring[j][0], ring[j][1]);
+        let (xi, yi) = (norm(ring[i][0]), ring[i][1]);
+        let (xj, yj) = (norm(ring[j][0]), ring[j][1]);
         if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
             inside = !inside;
         }
@@ -1444,6 +1615,77 @@ mod tests {
                 "1.1 r at {bearing}° must be outside"
             );
         }
+    }
+
+    #[test]
+    fn antimeridian_polygon_contains_points_on_both_sides_of_the_seam() {
+        let poly = parse_area_coords("170,10,-170,20").unwrap();
+        assert!(poly.contains(175.0, 15.0));
+        assert!(poly.contains(-175.0, 15.0));
+        assert!(poly.contains(180.0, 15.0));
+        assert!(!poly.contains(0.0, 15.0));
+        assert!(!poly.contains(160.0, 15.0));
+        assert!(!poly.contains(175.0, 25.0));
+    }
+
+    #[test]
+    fn sample_grid_crosses_the_antimeridian() {
+        let poly = parse_area_coords("170,10,-170,20").unwrap();
+        assert!(poly.bbox.crosses_antimeridian());
+        let axes = poly.sample_grid(5.0, 5.0, 256);
+        assert_eq!(axes.x, vec![172.5, 177.5, -177.5, -172.5]);
+        assert_eq!(axes.y, vec![17.5, 12.5]);
+        let mask = poly.cell_mask(&axes);
+        assert!(mask.iter().all(|&m| m), "every centre lies in the bbox");
+        // Coarsened to one cell: its centre is the seam itself.
+        let one = poly.sample_grid(0.0, 0.0, 256);
+        assert_eq!(one.x, vec![180.0]);
+        assert!(poly.cell_mask(&one)[0]);
+    }
+
+    #[test]
+    fn cell_mask_falls_back_to_vertex_cells_for_sub_cell_shapes() {
+        // A ring (square with a square hole) whose bbox is one 1° cell and
+        // whose bbox centre (10.5, 50.5) is inside the hole.
+        let poly = parse_area_coords(
+            "POLYGON((10 50, 11 50, 11 51, 10 51, 10 50),(10.2 50.2, 10.8 50.2, 10.8 50.8, 10.2 50.8, 10.2 50.2))",
+        )
+        .unwrap();
+        let axes = poly.sample_grid(1.0, 1.0, 256);
+        assert_eq!(axes.dims(), (1, 1));
+        assert!(!poly.contains(axes.x[0], axes.y[0]));
+        assert_eq!(poly.cell_mask(&axes), vec![true]);
+        // At native resolution the centre test decides and no fallback fires.
+        let fine = poly.sample_grid(0.1, 0.1, 256);
+        let mask = poly.cell_mask(&fine);
+        assert!(mask.iter().any(|&m| m) && !mask.iter().all(|&m| m));
+    }
+
+    #[test]
+    fn area_budget_rejects_over_limit() {
+        assert!(check_area_budget(4, 256, 256, 3).is_ok());
+        assert!(matches!(
+            check_area_budget(4, 256, 256, 4),
+            Err(DataServerError::QueryTooLarge(_))
+        ));
+        assert!(
+            check_area_budget(usize::MAX, 2, 2, 2).is_err(),
+            "no overflow"
+        );
+    }
+
+    #[test]
+    fn sample_grid_axes_match_resolution_and_orientation() {
+        let poly = parse_area_coords("POLYGON((10 50, 12 50, 12 51, 10 51, 10 50))").unwrap();
+        let axes = poly.sample_grid(0.5, 0.25, 256);
+        assert_eq!(axes.x, vec![10.25, 10.75, 11.25, 11.75]);
+        assert_eq!(axes.y, vec![50.875, 50.625, 50.375, 50.125]);
+        // Coarsened, never refused, when the bbox exceeds max_dim cells.
+        let coarse = poly.sample_grid(0.001, 0.001, 4);
+        assert_eq!((coarse.x.len(), coarse.y.len()), (4, 4));
+        // Degenerate resolution → one cell at the bbox centre.
+        let one = poly.sample_grid(0.0, f64::NAN, 256);
+        assert_eq!((one.x, one.y), (vec![11.0], vec![50.5]));
     }
 
     #[test]
