@@ -1289,7 +1289,7 @@ mod unimplemented_queries {
                 "negative radius",
             ),
             (
-                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=9000&within-units=km",
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=1001&within-units=km",
                 "radius over the cap",
             ),
             (

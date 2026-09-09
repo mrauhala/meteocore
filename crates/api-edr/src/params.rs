@@ -91,10 +91,12 @@ pub struct RadiusQueryParams {
 /// advertised in `data_queries.radius.link.variables.within_units`.
 pub const WITHIN_UNITS: [&str; 3] = ["km", "m", "mi"];
 
-/// Largest accepted radius. A circle bigger than this is a continental
-/// area query in disguise; the engines' own `QueryTooLarge` budgets still
-/// apply below it.
-pub const MAX_WITHIN_M: f64 = 5_000_000.0;
+/// Largest accepted radius. A radius query is a "near this point" question;
+/// anything bigger is a continental area query in disguise — and for the
+/// engines that sample the circle's *bounding box*, a 5000 km circle at
+/// 45° would have spanned ~173° of longitude. The engines' own
+/// `QueryTooLarge` budgets still apply below it.
+pub const MAX_WITHIN_M: f64 = 1_000_000.0;
 
 /// Parse `within` + `within-units` into metres. Rejects a non-finite or
 /// non-positive distance, an unknown unit (case-insensitive), and a radius
@@ -494,6 +496,7 @@ mod tests {
         assert!(parse_within_metres("-3", "km").is_err());
         assert!(parse_within_metres("inf", "km").is_err());
         assert!(parse_within_metres("10", "furlong").is_err());
-        assert!(parse_within_metres("6000", "km").is_err());
+        assert!(parse_within_metres("1001", "km").is_err());
+        assert!(parse_within_metres("1000", "km").is_ok());
     }
 }

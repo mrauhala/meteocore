@@ -61,6 +61,36 @@ fn render_coverage_response(
     }
 }
 
+/// Map an engine error from a data query to its HTTP response: request
+/// errors → 400, absent resources → 404, everything else a generic 500
+/// (logged under `label`). One home for the four data-query handlers so a
+/// new `DataServerError` variant cannot map differently per query type.
+fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
+    match e {
+        DataServerError::InvalidParameter(_)
+        | DataServerError::InvalidBbox(_)
+        | DataServerError::InvalidDatetime(_)
+        | DataServerError::QueryTooLarge(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        ),
+        DataServerError::LocationNotFound(_)
+        | DataServerError::CollectionNotFound(_)
+        | DataServerError::FeatureNotFound(_)
+        | DataServerError::ReferenceTimeNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "NotFound", "description": e.to_string() })),
+        ),
+        _ => {
+            tracing::error!("{label} query error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            )
+        }
+    }
+}
+
 fn bad_request(e: &DataServerError) -> HandlerError {
     (
         StatusCode::BAD_REQUEST,
@@ -844,15 +874,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "name": "within",
                     "in": "query",
                     "required": true,
-                    "schema": {"type": "number", "minimum": 0, "exclusiveMinimum": true},
-                    "description": "Radius of the circle around coords, in within-units. The circle is evaluated as a 64-vertex geodesic polygon, so the response is the same shape as the area query's; engines whose area query samples the polygon's bounding box return the circle's bounding grid."
+                    "schema": {"type": "number"},
+                    "description": "Defines radius of area around defined coordinates to include in the data selection. Must be positive; at most 1000 km. The circle is evaluated as a 64-vertex geodesic polygon, so the response is the same shape as the area query's; engines whose area query samples the polygon's bounding box return the circle's bounding grid."
                 },
                 "within-units": {
                     "name": "within-units",
                     "in": "query",
                     "required": true,
-                    "schema": {"type": "string", "enum": ["km", "m", "mi"]},
-                    "description": "Distance unit of within."
+                    "schema": {"type": "string"},
+                    "description": "Distance units for the within parameter: km, m or mi (case-insensitive)."
                 },
                 "coords-linestring": {
                     "name": "coords",
@@ -1359,29 +1389,7 @@ async fn run_position_query(
         )
     })?;
 
-    let map_engine_error = |e: &ds_core::error::DataServerError| match e {
-        ds_core::error::DataServerError::InvalidParameter(_)
-        | ds_core::error::DataServerError::InvalidBbox(_)
-        | ds_core::error::DataServerError::InvalidDatetime(_)
-        | ds_core::error::DataServerError::QueryTooLarge(_) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        ),
-        ds_core::error::DataServerError::LocationNotFound(_)
-        | ds_core::error::DataServerError::CollectionNotFound(_)
-        | ds_core::error::DataServerError::FeatureNotFound(_)
-        | ds_core::error::DataServerError::ReferenceTimeNotFound(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": e.to_string() })),
-        ),
-        _ => {
-            tracing::error!("Position query error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-            )
-        }
-    };
+    let map_engine_error = |e: &DataServerError| map_query_error(e, "Position");
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
 
@@ -1493,28 +1501,7 @@ async fn run_area_query(
             z.as_deref(),
             reference_time,
         )
-        .map_err(|e| match &e {
-            ds_core::error::DataServerError::InvalidParameter(_)
-            | ds_core::error::DataServerError::InvalidBbox(_)
-            | ds_core::error::DataServerError::InvalidDatetime(_)
-            | ds_core::error::DataServerError::QueryTooLarge(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            ),
-            ds_core::error::DataServerError::LocationNotFound(_)
-            | ds_core::error::DataServerError::CollectionNotFound(_)
-            | ds_core::error::DataServerError::ReferenceTimeNotFound(_) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "code": "NotFound", "description": e.to_string() })),
-            ),
-            _ => {
-                tracing::error!("Area query error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-                )
-            }
-        })?;
+        .map_err(|e| map_query_error(&e, "Area"))?;
 
     let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
         tracing::error!("Area CoverageJSON serialise error: {e}");
@@ -1613,28 +1600,7 @@ async fn run_radius_query(
             z.as_deref(),
             reference_time,
         )
-        .map_err(|e| match &e {
-            ds_core::error::DataServerError::InvalidParameter(_)
-            | ds_core::error::DataServerError::InvalidBbox(_)
-            | ds_core::error::DataServerError::InvalidDatetime(_)
-            | ds_core::error::DataServerError::QueryTooLarge(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            ),
-            ds_core::error::DataServerError::LocationNotFound(_)
-            | ds_core::error::DataServerError::CollectionNotFound(_)
-            | ds_core::error::DataServerError::ReferenceTimeNotFound(_) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "code": "NotFound", "description": e.to_string() })),
-            ),
-            _ => {
-                tracing::error!("Radius query error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-                )
-            }
-        })?;
+        .map_err(|e| map_query_error(&e, "Radius"))?;
 
     let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
         tracing::error!("Radius CoverageJSON serialise error: {e}");

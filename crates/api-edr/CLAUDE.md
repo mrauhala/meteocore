@@ -69,7 +69,9 @@ circle's bounding grid / square, not a masked disc. The
 handler 404s a collection that doesn't advertise `radius` (same capability
 guard as trajectory), rejects `PNG`, and `data_queries.radius.link.
 variables.within_units` advertises the accepted units (`params::WITHIN_UNITS`).
-A circle containing a pole or crossing the antimeridian is a 400 (#667).
+The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
+containing a pole or crossing the antimeridian is a 400 (#667). Engine
+errors from all data-query handlers map through `map_query_error`.
 
 ## Misc
 
