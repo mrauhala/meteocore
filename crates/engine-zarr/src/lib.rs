@@ -32,6 +32,7 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::{check_area_budget, parse_area_coords, MAX_AREA_DIM};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -193,7 +194,142 @@ impl EdrEngine for ZarrEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
+    }
+
+    /// Area query: a CRS84 `Grid` over the polygon's bbox at the store's
+    /// native resolution (each dimension ≤ `MAX_AREA_DIM`), every cell
+    /// bilinearly sampled from one windowed read per variable and timestep,
+    /// cells outside the polygon masked to null (#671). One `t` axis when the
+    /// datetime window selects more than one step.
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let polygon = parse_area_coords(coords)?;
+        let cat = self.catalog.load();
+        if cat.times.is_empty() {
+            return Err(DataServerError::Engine("No Zarr data available".into()));
+        }
+
+        let time_idx: Vec<usize> = match datetime {
+            None => (0..cat.times.len()).collect(),
+            Some((start, end)) => cat
+                .times
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| **t >= start && **t <= end)
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        if time_idx.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "No data available for the requested time range".into(),
+            ));
+        }
+
+        let selected: Vec<&catalog::Variable> = cat
+            .vars
+            .iter()
+            .filter(|v| {
+                parameters.is_none_or(|f| f.iter().any(|p| p.eq_ignore_ascii_case(&v.name)))
+            })
+            .collect();
+        if selected.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "No matching parameters found".into(),
+            ));
+        }
+
+        // A polygon entirely outside the store's coverage is a 404, not an
+        // all-null 200 (GRIB and QueryData answer the same way).
+        if !polygon.bbox.intersects_bbox(&cat.extent) {
+            return Err(DataServerError::LocationNotFound(
+                "The polygon lies outside the collection's spatial extent".into(),
+            ));
+        }
+
+        // Native cell size in degrees from the (half-cell-expanded) extent and
+        // the grid dimensions; a store with no grid size gets one cell.
+        let [w, s, e, n] = cat.extent;
+        let (res_lon, res_lat) = match cat.raster_info.grid_size {
+            Some([nx, ny]) => ((e - w) / nx.max(1) as f64, (n - s) / ny.max(1) as f64),
+            None => (0.0, 0.0),
+        };
+        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
+        let (nx, ny) = axes.dims();
+        check_area_budget(time_idx.len(), ny, nx, selected.len())?;
+        let mask = polygon.cell_mask(&axes);
+
+        let bbox = [
+            polygon.bbox.west,
+            polygon.bbox.south,
+            polygon.bbox.east,
+            polygon.bbox.north,
+        ];
+        let has_time = time_idx.len() > 1;
+        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
+        let mut params_map = HashMap::new();
+        let mut ranges = HashMap::new();
+        for v in selected {
+            let mut values: Vec<Option<f64>> = Vec::with_capacity(time_idx.len() * ny * nx);
+            for &ti in &time_idx {
+                // One windowed read per (variable, timestep); a bbox entirely
+                // off the grid yields a fully-null slab rather than an error.
+                let window = cat.read_window(v, ti, bbox)?;
+                for (iy, &y) in axes.y.iter().enumerate() {
+                    for (ix, &x) in axes.x.iter().enumerate() {
+                        values.push(match (&window, mask[axes.index(ix, iy)]) {
+                            (Some(win), true) => win.sample(x, y),
+                            _ => None,
+                        });
+                    }
+                }
+            }
+            params_map.insert(
+                v.name.clone(),
+                ParameterDescription {
+                    label: v.label.clone(),
+                    unit: v.units.clone(),
+                    observed_property: v.name.clone(),
+                },
+            );
+            let (shape, axis_names) = if has_time {
+                (
+                    vec![out_times.len(), ny, nx],
+                    vec!["t".to_string(), "y".to_string(), "x".to_string()],
+                )
+            } else {
+                (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
+            };
+            ranges.insert(
+                v.name.clone(),
+                NdArray {
+                    shape,
+                    axis_names,
+                    values,
+                },
+            );
+        }
+
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Grid {
+                x: axes.x,
+                y: axes.y,
+                t: has_time.then_some(out_times),
+                z: None,
+            },
+            parameters: params_map,
+            ranges,
+        }))
     }
 
     fn query_position(

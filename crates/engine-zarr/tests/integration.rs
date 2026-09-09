@@ -256,11 +256,136 @@ fn spatial_extent_is_half_cell_expanded() {
 }
 
 #[test]
-fn supported_query_types_is_position() {
+fn supported_query_types_are_position_area_radius() {
     assert_eq!(
         engine().supported_query_types(),
-        vec!["position".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string()
+        ]
     );
+}
+
+#[test]
+fn area_query_grid_matches_linear_field_and_masks_the_polygon() {
+    let e = engine();
+    // A right triangle with its right angle at the south-west corner: the
+    // bbox's north-east cells lie outside the shape.
+    let resp = e
+        .query_area(
+            "POLYGON((3 52, 8 52, 3 57, 3 52))",
+            Some((
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            )),
+            Some(&["t2m".to_string()]),
+            None,
+            None,
+        )
+        .unwrap();
+    let qr = single(resp);
+    let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &qr.domain else {
+        panic!("expected a Grid domain");
+    };
+    assert!(t.is_none(), "single timestep → no t axis");
+    // Native 1° cells over a 5°×5° bbox.
+    assert_eq!(x.len(), 5);
+    assert_eq!(y.len(), 5);
+    assert!(x.windows(2).all(|p| p[0] < p[1]));
+    assert!(y.windows(2).all(|p| p[0] > p[1]));
+    let nd = &qr.ranges["t2m"];
+    assert_eq!(nd.shape, vec![5, 5]);
+    assert_eq!(nd.axis_names, vec!["y", "x"]);
+    let mut inside = 0;
+    for (r, &lat) in y.iter().enumerate() {
+        for (c, &lon) in x.iter().enumerate() {
+            let v = nd.values[r * 5 + c];
+            // Inside the triangle ⇔ lon - 3 + lat - 52 < 5 at the cell centre.
+            let expect_inside = (lon - 3.0) + (lat - 52.0) < 5.0;
+            match v {
+                Some(v) => {
+                    assert!(
+                        expect_inside,
+                        "cell ({lon}, {lat}) outside the triangle has a value"
+                    );
+                    let exp = 273.15 + 0.1 * lat + 0.01 * lon; // f32 store: 1e-4 tolerance
+                    assert!(
+                        (v - exp).abs() < 1e-4,
+                        "({lon}, {lat}) = {v}, expected {exp}"
+                    );
+                    inside += 1;
+                }
+                None => assert!(
+                    !expect_inside,
+                    "cell ({lon}, {lat}) inside the triangle is null"
+                ),
+            }
+        }
+    }
+    // Centres on the hypotenuse (offset sum == 5) are edge points, excluded:
+    // 10 of the 25 cell centres are strictly inside.
+    assert_eq!(inside, 10, "10 of 25 cell centres lie strictly inside");
+}
+
+#[test]
+fn area_query_all_timesteps_has_t_axis() {
+    let e = engine();
+    let qr = single(e.query_area("4,53,6,55", None, None, None, None).unwrap());
+    let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &qr.domain else {
+        panic!("expected a Grid domain");
+    };
+    let t = t.as_ref().expect("all timesteps → t axis");
+    assert_eq!(t.len(), 4);
+    for key in ["t2m", "t2m_packed"] {
+        let nd = &qr.ranges[key];
+        assert_eq!(nd.shape, vec![4, y.len(), x.len()]);
+        assert_eq!(nd.axis_names, vec!["t", "y", "x"]);
+        // The field rises 0.5 K per timestep at every cell.
+        let per_t = y.len() * x.len();
+        for cell in 0..per_t {
+            let a = nd.values[cell].unwrap();
+            let b = nd.values[3 * per_t + cell].unwrap();
+            assert!((b - a - 1.5).abs() < 0.03, "{key} cell {cell}: {a} → {b}");
+        }
+    }
+}
+
+#[test]
+fn area_query_outside_extent_is_not_found() {
+    let err = engine()
+        .query_area("100,10,101,11", None, None, None, None)
+        .unwrap_err();
+    assert!(
+        matches!(err, ds_core::error::DataServerError::LocationNotFound(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn radius_query_delegates_to_area() {
+    let e = engine();
+    let qr = single(
+        e.query_radius(
+            "POINT(5.5 54.5)",
+            250_000.0,
+            None,
+            Some(&["t2m".to_string()]),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    let ds_core::model::DomainDescription::Grid { x, y, .. } = &qr.domain else {
+        panic!("expected a Grid domain");
+    };
+    let nd = &qr.ranges["t2m"];
+    // A 250 km disc spans ~4.5° of latitude → ≥ 4 native 1° cells per axis, so
+    // the bounding square's corner cell centres (~1.1 r out) are masked.
+    assert!(x.len() >= 4 && y.len() >= 4, "grid {}×{}", x.len(), y.len());
+    assert!(nd.values[0].is_none(), "NW corner must be masked");
+    let centre = ((y.len() / 2) * x.len()) + x.len() / 2;
+    assert!(nd.values[centre].is_some(), "centre must have data");
 }
 
 #[test]

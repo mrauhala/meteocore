@@ -2,8 +2,12 @@
 
 Zarr V2/V3 multidimensional-array engine (cloud-native, CF conventions),
 tracked in #125. Phases 1–3 ship today: local + remote (S3/HTTP) stores,
-WGS84 lat-lon grids, multi-variable EDR position queries (bilinear),
-WMS/Maps/Tiles rendering, CF time decoding, CF packing, chunk LRU cache.
+WGS84 lat-lon grids, multi-variable EDR position queries (bilinear), EDR
+area/radius (a CRS84 `Grid` over the polygon bbox at native resolution,
+≤ 256 cells per axis, 1M-value budget, one `read_window` per variable ×
+timestep, cells outside the polygon masked to null — `QueryPolygon::
+sample_grid`, #671), WMS/Maps/Tiles rendering, CF time decoding, CF
+packing, chunk LRU cache.
 NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5), EDR
 instances (#337 — the engine pins the latest run internally).
 
