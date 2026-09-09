@@ -84,7 +84,7 @@ CoverageJSON 1.0 schema.
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | polygon-tested |
 | GRIB | – | ✓ | ✓ | ✓ | – | ✓ | **bbox only** — Grid over the polygon's bounding box, no mask (#671) |
 | QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps |
-| Zarr | – | ✓ | ✓ | ✓ | – | – | Grid over bbox at native resolution, ≤ 256 cells/axis, one windowed read per variable × timestep, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Pins the latest run internally (no instances) |
+| Zarr | – | ✓ | ✓ | ✓ | – | – | Grid over bbox at native resolution, ≤ 256 cells/axis, one store read per variable for the whole time span (two across the antimeridian), cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Pins the latest run internally (no instances) |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
 | ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | polar sampling; trajectory = RHI cross-section |
 | PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | n/a | stations-only `location_source`: exact `ST_Within`; observations-derived: **bbox only** (#671) |
