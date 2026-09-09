@@ -2,6 +2,16 @@
 
 OGC API - EDR HTTP layer. Read the root `CLAUDE.md` first.
 
+## README.md is the EDR status page — keep it current
+
+`crates/api-edr/README.md` holds the conformance-class, query-type,
+parameter and per-engine support matrices (what works, what is partial,
+what is missing, and the known-gap order). **Any change to EDR behaviour
+— this crate, `EdrEngine` in ds-core, an engine's `EdrEngine` impl or its
+`supported_query_types` — must update that README in the same PR.** A
+reviewer should be able to answer "does engine X support query type Y?"
+from the README alone, without reading code.
+
 ## CoverageJSON schema compliance (critical)
 
 All CoverageJSON output MUST validate against the OGC CoverageJSON 1.0 schema

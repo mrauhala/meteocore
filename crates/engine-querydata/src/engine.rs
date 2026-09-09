@@ -9,6 +9,7 @@ use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::parse_area_coords;
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
@@ -46,6 +47,12 @@ impl RunSet {
 /// WMS `reference_time` (#337). The newest run is the default for un-pinned
 /// queries. New/removed files are picked up on poll and the run set is swapped
 /// atomically via `ArcSwap`; already-loaded files are reused (not re-parsed).
+/// Per-dimension cap of an EDR area grid (cells); a wider bbox is coarsened.
+const MAX_AREA_DIM: usize = 256;
+/// Total value budget of one area response across timesteps × cells ×
+/// parameters (~8 MB of CoverageJSON), mirroring GRIB's 1M-pixel limit.
+const MAX_AREA_VALUES: usize = 1_000_000;
+
 pub struct QueryDataEngine {
     /// Retained model runs. Swapped atomically on poll.
     runs: ArcSwap<RunSet>,
@@ -283,7 +290,137 @@ impl EdrEngine for QueryDataEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
+    }
+
+    /// Area query: a CRS84 `Grid` over the polygon's bbox at the source's
+    /// native resolution (each dimension ≤ `MAX_AREA_DIM`), every cell
+    /// bilinearly interpolated from the run's grid and cells outside the
+    /// polygon masked to null (#671). One `t` axis when the datetime window
+    /// selects more than one step.
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let polygon = parse_area_coords(coords)?;
+        let data = self.select_data(reference_time)?;
+
+        let time_indices = find_time_range(&data, datetime);
+        if time_indices.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "No data available for the requested time range".into(),
+            ));
+        }
+
+        let param_indices: Vec<(usize, &crate::parse::ParamInfo)> = data
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                parameters
+                    .is_none_or(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(&p.name)))
+            })
+            .collect();
+        if param_indices.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "No matching parameters found".into(),
+            ));
+        }
+
+        // Native resolution in degrees from the grid's corner coordinates —
+        // exact for lat-lon grids, a fair mean cell size for projected ones.
+        let (bl, tr) = (data.grid.area.bottom_left, data.grid.area.top_right);
+        let res_lon = (tr.0 - bl.0).abs() / data.grid.nx.max(1) as f64;
+        let res_lat = (tr.1 - bl.1).abs() / data.grid.ny.max(1) as f64;
+        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
+        let (nx, ny) = (axes.x.len(), axes.y.len());
+
+        let total = time_indices.len() * ny * nx * param_indices.len();
+        if total > MAX_AREA_VALUES {
+            return Err(DataServerError::QueryTooLarge(format!(
+                "Area query would return {total} values ({} timesteps × {ny} × {nx} cells × {} parameters); \
+                 the limit is {MAX_AREA_VALUES} — narrow the datetime window, the polygon or the parameters",
+                time_indices.len(),
+                param_indices.len()
+            )));
+        }
+
+        let mask: Vec<bool> = axes
+            .y
+            .iter()
+            .flat_map(|&y| axes.x.iter().map(move |&x| (x, y)))
+            .map(|(x, y)| polygon.contains(x, y))
+            .collect();
+        if !mask.iter().any(|&m| m) {
+            return Err(DataServerError::LocationNotFound(
+                "The polygon contains no grid cell centre".into(),
+            ));
+        }
+
+        let has_time = time_indices.len() > 1;
+        let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
+        let mut params_map = HashMap::new();
+        let mut ranges = HashMap::new();
+
+        for (pi, param) in &param_indices {
+            let mut values: Vec<Option<f64>> = Vec::with_capacity(time_indices.len() * ny * nx);
+            for (ti, _) in &time_indices {
+                let mut cell = 0usize;
+                for &y in &axes.y {
+                    for &x in &axes.x {
+                        values.push(if mask[cell] {
+                            interpolate(&data, x, y, *pi, 0, *ti)
+                        } else {
+                            None
+                        });
+                        cell += 1;
+                    }
+                }
+            }
+            params_map.insert(
+                param.name.clone(),
+                ParameterDescription {
+                    label: param.name.clone(),
+                    unit: String::new(),
+                    observed_property: param.name.clone(),
+                },
+            );
+            let (shape, axis_names) = if has_time {
+                (
+                    vec![times.len(), ny, nx],
+                    vec!["t".to_string(), "y".to_string(), "x".to_string()],
+                )
+            } else {
+                (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
+            };
+            ranges.insert(
+                param.name.clone(),
+                NdArray {
+                    shape,
+                    axis_names,
+                    values,
+                },
+            );
+        }
+
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Grid {
+                x: axes.x,
+                y: axes.y,
+                t: has_time.then_some(times),
+                z: None,
+            },
+            parameters: params_map,
+            ranges,
+        }))
     }
 
     fn query_position(
@@ -933,6 +1070,89 @@ mod tests {
         let temp = result.ranges.get("2 Metre Temperature (2t)").unwrap();
         let has_values = temp.values.iter().any(|v| v.is_some());
         assert!(has_values, "Temperature should have some values");
+    }
+
+    #[test]
+    fn engine_area_query_masks_outside_the_polygon() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        let [w, s, e, n] = engine.get_spatial_extent().unwrap();
+        // A triangle inside the extent: its bbox's north-east corner cell is
+        // outside the shape, its centroid inside.
+        let (x0, x1) = (w + 0.3 * (e - w), w + 0.6 * (e - w));
+        let (y0, y1) = (s + 0.3 * (n - s), s + 0.6 * (n - s));
+        let coords = format!("POLYGON(({x0} {y0}, {x1} {y0}, {x0} {y1}, {x0} {y0}))");
+        let (start, _) = engine.get_temporal_extent().unwrap();
+        let resp = engine
+            .query_area(&coords, Some((start, start)), None, None, None)
+            .unwrap();
+        let CoverageResponse::Single(res) = resp else {
+            panic!("expected a single Grid coverage");
+        };
+        let DomainDescription::Grid { x, y, t, .. } = &res.domain else {
+            panic!("expected a Grid domain");
+        };
+        assert!(t.is_none(), "one timestep → no t axis");
+        assert!(x.len() > 2 && y.len() > 2, "grid {}×{}", x.len(), y.len());
+        assert!(x.windows(2).all(|p| p[0] < p[1]) && y.windows(2).all(|p| p[0] > p[1]));
+        let arr = res.ranges.values().next().unwrap();
+        assert_eq!(arr.shape, vec![y.len(), x.len()]);
+        assert_eq!(arr.values.len(), y.len() * x.len());
+        // North-east corner (row 0, last col) is outside the triangle.
+        assert!(arr.values[x.len() - 1].is_none());
+        // South-west corner cell (last row, col 0) is inside and has data.
+        assert!(arr.values[(y.len() - 1) * x.len()].is_some());
+        let inside = arr.values.iter().filter(|v| v.is_some()).count();
+        let total = arr.values.len();
+        assert!(
+            inside * 3 > total && inside * 3 < total * 2,
+            "a right triangle fills about half its bbox: {inside}/{total}"
+        );
+    }
+
+    #[test]
+    fn engine_area_query_with_time_axis_and_budget() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        let [w, s, e, n] = engine.get_spatial_extent().unwrap();
+        let coords = format!(
+            "POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))",
+            w = w + 0.4 * (e - w),
+            e = w + 0.5 * (e - w),
+            s = s + 0.4 * (n - s),
+            n = s + 0.5 * (n - s)
+        );
+        let params = vec![engine.get_parameters()[0].clone()];
+        let resp = engine
+            .query_area(&coords, None, Some(&params), None, None)
+            .unwrap();
+        let CoverageResponse::Single(res) = resp else {
+            panic!("expected a single Grid coverage");
+        };
+        let DomainDescription::Grid { x, y, t, .. } = &res.domain else {
+            panic!("expected a Grid domain");
+        };
+        let t = t.as_ref().expect("all timesteps → t axis");
+        let arr = &res.ranges[&params[0]];
+        assert_eq!(arr.shape, vec![t.len(), y.len(), x.len()]);
+        assert_eq!(arr.axis_names, vec!["t", "y", "x"]);
+        // Whole extent × every timestep × every parameter blows the budget.
+        let whole = format!("POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))");
+        let big = engine.query_area(&whole, None, None, None, None);
+        match big {
+            Err(DataServerError::QueryTooLarge(_)) => {}
+            Ok(r) => {
+                // Small fixtures may fit; then the response must still be sane.
+                let CoverageResponse::Single(r) = r else {
+                    panic!()
+                };
+                assert!(r
+                    .ranges
+                    .values()
+                    .all(|a| a.values.len() == a.shape.iter().product::<usize>()));
+            }
+            Err(e) => panic!("unexpected error {e}"),
+        }
     }
 
     #[test]

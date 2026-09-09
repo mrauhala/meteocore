@@ -187,6 +187,56 @@ impl QueryPolygon {
     }
 }
 
+/// Cell-centre axes of a regular CRS84 grid over an area query's polygon
+/// bbox, at (roughly) a source's native resolution. The shared shape of a
+/// gridded engine's EDR *area* / *radius* result (#671): a CoverageJSON
+/// `Grid` must be rectangular, so the domain is the bbox and the engine
+/// masks cells whose centre fails [`QueryPolygon::contains`] to null.
+///
+/// `x` ascends west→east, `y` descends north→south (index 0 = north),
+/// matching raster row order and the `[t, y, x]` NdArray layout. Each
+/// dimension is clamped to `[1, max_dim]`, so a bbox much wider than the
+/// source resolution allows is *coarsened*, never refused — the total-value
+/// budget is the engine's call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AreaGridAxes {
+    pub x: Vec<f64>,
+    pub y: Vec<f64>,
+}
+
+impl QueryPolygon {
+    /// See [`AreaGridAxes`]. `res_lon_deg` / `res_lat_deg` are the source's
+    /// cell sizes in degrees (non-positive or non-finite values are treated
+    /// as "one cell").
+    pub fn sample_grid(&self, res_lon_deg: f64, res_lat_deg: f64, max_dim: usize) -> AreaGridAxes {
+        let max_dim = max_dim.max(1);
+        let Bbox {
+            west,
+            south,
+            east,
+            north,
+        } = self.bbox;
+        let cells = |span: f64, res: f64| -> usize {
+            if !(res.is_finite() && res > 0.0) {
+                return 1;
+            }
+            ((span / res).ceil() as usize).clamp(1, max_dim)
+        };
+        let nx = cells(east - west, res_lon_deg);
+        let ny = cells(north - south, res_lat_deg);
+        let cell_w = (east - west) / nx as f64;
+        let cell_h = (north - south) / ny as f64;
+        AreaGridAxes {
+            x: (0..nx)
+                .map(|ix| west + (ix as f64 + 0.5) * cell_w)
+                .collect(),
+            y: (0..ny)
+                .map(|iy| north - (iy as f64 + 0.5) * cell_h)
+                .collect(),
+        }
+    }
+}
+
 /// Ray-casting point-in-polygon test for a single ring.
 fn point_in_ring(x: f64, y: f64, ring: &[[f64; 2]]) -> bool {
     let n = ring.len();
@@ -1444,6 +1494,20 @@ mod tests {
                 "1.1 r at {bearing}° must be outside"
             );
         }
+    }
+
+    #[test]
+    fn sample_grid_axes_match_resolution_and_orientation() {
+        let poly = parse_area_coords("POLYGON((10 50, 12 50, 12 51, 10 51, 10 50))").unwrap();
+        let axes = poly.sample_grid(0.5, 0.25, 256);
+        assert_eq!(axes.x, vec![10.25, 10.75, 11.25, 11.75]);
+        assert_eq!(axes.y, vec![50.875, 50.625, 50.375, 50.125]);
+        // Coarsened, never refused, when the bbox exceeds max_dim cells.
+        let coarse = poly.sample_grid(0.001, 0.001, 4);
+        assert_eq!((coarse.x.len(), coarse.y.len()), (4, 4));
+        // Degenerate resolution → one cell at the bbox centre.
+        let one = poly.sample_grid(0.0, f64::NAN, 256);
+        assert_eq!((one.x, one.y), (vec![11.0], vec![50.5]));
     }
 
     #[test]
