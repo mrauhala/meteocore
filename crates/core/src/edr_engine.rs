@@ -140,8 +140,9 @@ pub trait EdrEngine: Send + Sync {
     /// [`Self::query_area`], so any engine that answers area queries
     /// answers radius queries with the same semantics — including the
     /// same caveat: an engine whose area query samples the polygon's
-    /// *bounding box* (GRIB, nowcast) returns the circle's bounding grid
-    /// rather than a masked disc. Override only for a native circle
+    /// *bounding box* (GRIB, nowcast, PostGIS with an observations-derived
+    /// location source) returns the circle's bounding grid / square rather
+    /// than a masked disc. Override only for a native circle
     /// predicate (e.g. `ST_DWithin`). Advertise `"radius"` in
     /// [`Self::supported_query_types`] wherever `"area"` is.
     fn query_radius(

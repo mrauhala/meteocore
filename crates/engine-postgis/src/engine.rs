@@ -1651,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn events_engine_advertises_area_only() {
+    fn events_engine_advertises_area_and_radius() {
         let engine = engine_with(events_engine_config());
         assert_eq!(
             engine.supported_query_types(),

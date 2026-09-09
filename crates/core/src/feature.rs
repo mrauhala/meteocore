@@ -414,9 +414,13 @@ pub fn radius_polygon_wkt(lon: f64, lat: f64, radius_m: f64) -> Result<String, D
         ));
     }
     // Angular radius in degrees of latitude; a circle reaching a pole has
-    // no single-ring lon/lat representation.
+    // no single-ring lon/lat representation. The margin keeps every vertex
+    // at least ~1 km from the pole, where longitude is ill-conditioned and
+    // neighbouring vertices would otherwise get arbitrary longitudes that
+    // the bbox-span check below cannot detect.
+    const POLE_MARGIN_DEG: f64 = 0.01;
     let ang_deg = (radius_m / crate::geo::EARTH_RADIUS_M).to_degrees();
-    if ang_deg >= 90.0 || lat.abs() + ang_deg >= 90.0 {
+    if lat.abs() + ang_deg >= 90.0 - POLE_MARGIN_DEG {
         return Err(DataServerError::InvalidParameter(
             "Radius circle would contain a pole; use an area query instead".into(),
         ));
@@ -1450,6 +1454,13 @@ mod tests {
         assert!(radius_polygon_wkt(200.0, 60.0, 1000.0).is_err());
         // Contains the pole.
         assert!(radius_polygon_wkt(25.0, 89.5, 100_000.0).is_err());
+        // Just short of the pole (inside the ~1 km margin) is rejected too;
+        // 89.5° + 0.495° = 89.995°.
+        assert!(radius_polygon_wkt(25.0, 89.5, 55_050.0).is_err());
+        // Comfortably short of it is accepted and the ring stays sane.
+        let wkt = radius_polygon_wkt(25.0, 89.5, 50_000.0).unwrap();
+        let poly = parse_area_coords(&wkt).unwrap();
+        assert!(poly.contains(25.0, 89.5));
         // Crosses the antimeridian.
         assert!(radius_polygon_wkt(179.9, 0.0, 50_000.0).is_err());
         // Same circle away from the seam is fine.
