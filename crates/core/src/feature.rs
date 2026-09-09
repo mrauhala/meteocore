@@ -386,6 +386,66 @@ pub fn parse_point_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
     Ok((lat, lon))
 }
 
+/// Number of vertices of the polygon [`radius_polygon_wkt`] builds. 64
+/// keeps the chord sag under 0.13 % of the radius (`1 - cos(π/64)`), well
+/// below any engine's sampling resolution.
+pub const RADIUS_POLYGON_VERTICES: usize = 64;
+
+/// Build the WKT `POLYGON` approximating a geodesic circle of `radius_m`
+/// metres around `(lon, lat)` — the shared translation of an EDR *radius*
+/// query into the *area* query every engine already answers, so the two
+/// query types cannot disagree about what "within" means.
+///
+/// Vertices are placed with [`crate::geo::destination_point`] (the same
+/// spherical geodesy the radar engines use) at equal bearings, clockwise
+/// from north, ring closed. Rejects a non-finite or non-positive radius,
+/// a circle that would contain a pole, and one that would cross the
+/// antimeridian: the resulting ring would fold over in lon/lat space and
+/// no area engine handles a bbox that wraps (#667).
+pub fn radius_polygon_wkt(lon: f64, lat: f64, radius_m: f64) -> Result<String, DataServerError> {
+    if !radius_m.is_finite() || radius_m <= 0.0 {
+        return Err(DataServerError::InvalidParameter(
+            "Radius must be a finite, positive distance".into(),
+        ));
+    }
+    if !lon.is_finite() || !lat.is_finite() || lon.abs() > 180.0 || lat.abs() > 90.0 {
+        return Err(DataServerError::InvalidParameter(
+            "Centre must be a finite lon/lat within ±180 / ±90".into(),
+        ));
+    }
+    // Angular radius in degrees of latitude; a circle reaching a pole has
+    // no single-ring lon/lat representation.
+    let ang_deg = (radius_m / crate::geo::EARTH_RADIUS_M).to_degrees();
+    if ang_deg >= 90.0 || lat.abs() + ang_deg >= 90.0 {
+        return Err(DataServerError::InvalidParameter(
+            "Radius circle would contain a pole; use an area query instead".into(),
+        ));
+    }
+    let ring: Vec<[f64; 2]> = (0..RADIUS_POLYGON_VERTICES)
+        .map(|i| {
+            let bearing = 360.0 * i as f64 / RADIUS_POLYGON_VERTICES as f64;
+            let (x, y) = crate::geo::destination_point(lon, lat, radius_m, bearing);
+            [x, y]
+        })
+        .collect();
+    let bb = ring_bbox(&ring);
+    if bb[2] - bb[0] > 180.0 {
+        return Err(DataServerError::InvalidParameter(
+            "Radius circle would cross the antimeridian; use an area query instead".into(),
+        ));
+    }
+    let mut wkt = String::with_capacity(32 + 24 * (RADIUS_POLYGON_VERTICES + 1));
+    wkt.push_str("POLYGON((");
+    for (i, [x, y]) in ring.iter().chain(std::iter::once(&ring[0])).enumerate() {
+        if i > 0 {
+            wkt.push_str(", ");
+        }
+        wkt.push_str(&format!("{x} {y}"));
+    }
+    wkt.push_str("))");
+    Ok(wkt)
+}
+
 /// Parse a WKT `LINESTRING(lon lat, lon lat, ...)` into a `Vec<(lon, lat)>`
 /// (engine-friendly order — note `parse_point_coords` returns `(lat, lon)`
 /// for legacy reasons; cross-section paths always carry `(lon, lat)` here).
@@ -1356,5 +1416,43 @@ mod tests {
         ];
         sort_features(&mut fs, &[]);
         assert_eq!(ids(&fs), ["c", "a"]);
+    }
+
+    #[test]
+    fn radius_polygon_contains_inside_and_excludes_outside() {
+        let wkt = radius_polygon_wkt(24.9384, 60.1699, 10_000.0).unwrap();
+        let poly = parse_area_coords(&wkt).unwrap();
+        assert_eq!(poly.exterior.len(), RADIUS_POLYGON_VERTICES + 1);
+        // Every vertex sits on the circle (spherical distance == radius).
+        for [x, y] in &poly.exterior {
+            let d = crate::geo::great_circle_distance_m(24.9384, 60.1699, *x, *y);
+            assert!((d - 10_000.0).abs() < 1.0, "vertex at {d} m");
+        }
+        // Centre and a point at 0.9 r along an off-axis bearing are inside;
+        // 1.1 r is outside — in every direction, not just along the axes.
+        assert!(poly.contains(24.9384, 60.1699));
+        for bearing in [17.0, 100.0, 203.0, 311.0] {
+            let (xi, yi) = crate::geo::destination_point(24.9384, 60.1699, 9_000.0, bearing);
+            let (xo, yo) = crate::geo::destination_point(24.9384, 60.1699, 11_000.0, bearing);
+            assert!(poly.contains(xi, yi), "0.9 r at {bearing}° must be inside");
+            assert!(
+                !poly.contains(xo, yo),
+                "1.1 r at {bearing}° must be outside"
+            );
+        }
+    }
+
+    #[test]
+    fn radius_polygon_rejects_degenerate_input() {
+        assert!(radius_polygon_wkt(25.0, 60.0, 0.0).is_err());
+        assert!(radius_polygon_wkt(25.0, 60.0, -5.0).is_err());
+        assert!(radius_polygon_wkt(25.0, 60.0, f64::NAN).is_err());
+        assert!(radius_polygon_wkt(200.0, 60.0, 1000.0).is_err());
+        // Contains the pole.
+        assert!(radius_polygon_wkt(25.0, 89.5, 100_000.0).is_err());
+        // Crosses the antimeridian.
+        assert!(radius_polygon_wkt(179.9, 0.0, 50_000.0).is_err());
+        // Same circle away from the seam is fine.
+        assert!(radius_polygon_wkt(170.0, 0.0, 50_000.0).is_ok());
     }
 }

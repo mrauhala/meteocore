@@ -69,6 +69,66 @@ pub struct AreaQueryParams {
     pub f: Option<String>,
 }
 
+/// Radius query parameters (OGC API - EDR 1.1 `radius`): everything
+/// within `within` `within-units` of a WKT `POINT`. Both distance
+/// parameters are required by the spec's OpenAPI; the accepted units are
+/// [`WITHIN_UNITS`]. Like area, the result is multi-coverage / gridded, so
+/// `PNG` is rejected.
+#[derive(Debug, Deserialize)]
+pub struct RadiusQueryParams {
+    pub coords: String,
+    pub within: String,
+    #[serde(rename = "within-units")]
+    pub within_units: String,
+    pub datetime: Option<String>,
+    #[serde(rename = "parameter-name")]
+    pub parameter_name: Option<String>,
+    pub z: Option<String>,
+    pub f: Option<String>,
+}
+
+/// `within-units` values the radius query accepts, in the order they are
+/// advertised in `data_queries.radius.link.variables.within_units`.
+pub const WITHIN_UNITS: [&str; 3] = ["km", "m", "mi"];
+
+/// Largest accepted radius. A circle bigger than this is a continental
+/// area query in disguise; the engines' own `QueryTooLarge` budgets still
+/// apply below it.
+pub const MAX_WITHIN_M: f64 = 5_000_000.0;
+
+/// Parse `within` + `within-units` into metres. Rejects a non-finite or
+/// non-positive distance, an unknown unit (case-insensitive), and a radius
+/// over [`MAX_WITHIN_M`].
+pub fn parse_within_metres(within: &str, units: &str) -> Result<f64, DataServerError> {
+    let value: f64 = within.trim().parse().map_err(|_| {
+        DataServerError::InvalidParameter(format!("within must be a number, got '{within}'"))
+    })?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(DataServerError::InvalidParameter(
+            "within must be a finite, positive distance".into(),
+        ));
+    }
+    let per_unit = match units.trim().to_ascii_lowercase().as_str() {
+        "km" => 1_000.0,
+        "m" => 1.0,
+        "mi" => 1_609.344,
+        other => {
+            return Err(DataServerError::InvalidParameter(format!(
+                "within-units '{other}' is not supported; use one of {}",
+                WITHIN_UNITS.join(", ")
+            )))
+        }
+    };
+    let metres = value * per_unit;
+    if metres > MAX_WITHIN_M {
+        return Err(DataServerError::InvalidParameter(format!(
+            "within exceeds the maximum radius of {} km",
+            MAX_WITHIN_M / 1_000.0
+        )));
+    }
+    Ok(metres)
+}
+
 /// Trajectory (vertical cross-section) query parameters. Accepts a WKT
 /// `LINESTRING(lon lat, lon lat, …)` and the standard EDR filters; `z`
 /// selects *elevation angles* from the collection's advertised vertical
@@ -422,5 +482,18 @@ mod tests {
     #[test]
     fn rejects_polygon() {
         assert!(split_position_coords("POLYGON((0 0,1 0,1 1,0 1,0 0))").is_err());
+    }
+
+    #[test]
+    fn within_units_convert_and_validate() {
+        assert_eq!(parse_within_metres("10", "km").unwrap(), 10_000.0);
+        assert_eq!(parse_within_metres("250", "M").unwrap(), 250.0);
+        assert!((parse_within_metres("1", "mi").unwrap() - 1_609.344).abs() < 1e-9);
+        assert!(parse_within_metres("abc", "km").is_err());
+        assert!(parse_within_metres("0", "km").is_err());
+        assert!(parse_within_metres("-3", "km").is_err());
+        assert!(parse_within_metres("inf", "km").is_err());
+        assert!(parse_within_metres("10", "furlong").is_err());
+        assert!(parse_within_metres("6000", "km").is_err());
     }
 }

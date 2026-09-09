@@ -4341,6 +4341,7 @@ impl EdrEngine for PolarVolumeSiteView {
             "locations".to_string(),
             "position".to_string(),
             "area".to_string(),
+            "radius".to_string(),
             "trajectory".to_string(),
         ]
     }

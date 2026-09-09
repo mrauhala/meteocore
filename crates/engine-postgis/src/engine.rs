@@ -402,13 +402,13 @@ impl EdrEngine for PostgisEngine {
         if self.config.events().is_some() {
             // Events have no stations: no locations, no position (a point
             // has probability zero of hitting an event) — area only.
-            return vec!["area".to_string()];
+            return vec!["area".to_string(), "radius".to_string()];
         }
         vec![
             "locations".to_string(),
             "position".to_string(),
-            "location".to_string(),
             "area".to_string(),
+            "radius".to_string(),
         ]
     }
 
@@ -1653,7 +1653,10 @@ mod tests {
     #[test]
     fn events_engine_advertises_area_only() {
         let engine = engine_with(events_engine_config());
-        assert_eq!(engine.supported_query_types(), vec!["area".to_string()]);
+        assert_eq!(
+            engine.supported_query_types(),
+            vec!["area".to_string(), "radius".to_string()]
+        );
     }
 
     #[test]

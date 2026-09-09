@@ -478,16 +478,18 @@ async fn finding_11_position_query_returns_400_for_unsupported_engine() {
 }
 
 #[tokio::test]
-async fn finding_11b_radius_query_not_implemented() {
-    let (status, _) = get_json(
+async fn finding_11b_radius_query_returns_404_for_unsupported_engine() {
+    // The route exists; an engine that does not advertise `radius` gets the
+    // capability-guard 404 (the resource does not exist for this collection),
+    // and the OpenAPI document does not list the path for it.
+    let (status, json) = get_json(
         "/collections/weather/radius?coords=POINT%2824.9384%2060.1699%29&within=50&within-units=km",
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "Radius query endpoint is not implemented"
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["code"], "NotFound");
+    let (_, api) = get_json("/api").await;
+    assert!(api["paths"]["/edr/collections/weather/radius"].is_null());
 }
 
 #[tokio::test]

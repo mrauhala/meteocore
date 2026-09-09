@@ -501,7 +501,11 @@ impl EdrEngine for OdimEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string(), "area".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
     }
 
     fn query_position(

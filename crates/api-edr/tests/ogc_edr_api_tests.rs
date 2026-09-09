@@ -117,7 +117,11 @@ impl EdrEngine for MockEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["locations".to_string(), "area".to_string()]
+        vec![
+            "locations".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
     }
 
     fn query_area(
@@ -229,6 +233,17 @@ async fn get(uri: &str) -> (StatusCode, Value) {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: Value = serde_json::from_slice(&body).unwrap();
     (status, json)
+}
+
+/// Like [`get`] but tolerates a non-JSON body (axum's own query-extractor
+/// rejection for a missing required parameter is plain text).
+async fn get_status(uri: &str) -> (StatusCode, Option<Value>) {
+    let app = build_router();
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,14 +1236,110 @@ mod unimplemented_queries {
     }
 
     #[tokio::test]
-    #[ignore = "radius query not yet implemented"]
     async fn radius_query() {
-        // GET /collections/{id}/radius?coords=POINT(24.9384 60.1699)&within=10&within-units=km
-        let (status, _) = get(
-            "/collections/weather/radius?coords=POINT(24.9384 60.1699)&within=10&within-units=km",
+        // 10 km around Helsinki: matches Helsinki, not Tampere (~160 km away).
+        let (status, json) = get(
+            "/collections/weather/radius?coords=POINT%2824.9384%2060.1699%29&within=10&within-units=km",
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "CoverageCollection");
+        let coverages = json["coverages"].as_array().unwrap();
+        assert_eq!(coverages.len(), 1, "should match Helsinki only");
+    }
+
+    #[tokio::test]
+    async fn radius_query_units_and_large_radius() {
+        // 200 km (in miles) around Helsinki reaches Tampere as well.
+        let (status, json) = get(
+            "/collections/weather/radius?coords=POINT%2824.9384%2060.1699%29&within=125&within-units=mi",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["coverages"].as_array().unwrap().len(), 2);
+        // Bare lon,lat shorthand and metres are accepted too.
+        let (status, json) =
+            get("/collections/weather/radius?coords=24.9384,60.1699&within=5000&within-units=m")
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["coverages"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn radius_query_rejects_bad_input() {
+        for (uri, why) in [
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=10",
+                "within-units is required",
+            ),
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within-units=km",
+                "within is required",
+            ),
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=10&within-units=furlong",
+                "unknown unit",
+            ),
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=0&within-units=km",
+                "zero radius",
+            ),
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=-1&within-units=km",
+                "negative radius",
+            ),
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=9000&within-units=km",
+                "radius over the cap",
+            ),
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2089.9%29&within=100&within-units=km",
+                "circle containing the pole",
+            ),
+            (
+                "/collections/weather/radius?coords=MULTIPOINT%28%2824.9%2060.2%29%29&within=10&within-units=km",
+                "MULTIPOINT centre",
+            ),
+            (
+                "/collections/weather/radius?coords=POINT%2824.9%2060.2%29&within=10&within-units=km&f=png",
+                "PNG output",
+            ),
+        ] {
+            let (status, json) = get_status(uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {uri}");
+            if let Some(json) = json {
+                assert_eq!(json["code"], "BadRequest", "{why}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn radius_query_no_match_is_404() {
+        let (status, _) =
+            get("/collections/weather/radius?coords=POINT%280%200%29&within=10&within-units=km")
+                .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn radius_advertised_in_data_queries_with_units() {
+        let (status, json) = get("/collections/weather").await;
+        assert_eq!(status, StatusCode::OK);
+        let radius = &json["data_queries"]["radius"]["link"];
+        assert!(
+            radius["href"]
+                .as_str()
+                .unwrap()
+                .ends_with("/collections/weather/radius"),
+            "{radius}"
+        );
+        assert_eq!(radius["variables"]["query_type"], "radius");
+        assert_eq!(
+            radius["variables"]["within_units"],
+            serde_json::json!(["km", "m", "mi"])
+        );
+        let (_, api) = get("/api").await;
+        assert!(api["paths"]["/edr/collections/weather/radius"].is_object());
     }
 
     #[tokio::test]

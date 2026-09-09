@@ -1837,7 +1837,11 @@ impl EdrEngine for GeoTiffEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string(), "area".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
     }
 
     fn get_parameters(&self) -> Vec<String> {

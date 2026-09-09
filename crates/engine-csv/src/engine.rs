@@ -221,7 +221,11 @@ impl EdrEngine for CsvEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["locations".to_string(), "area".to_string()]
+        vec![
+            "locations".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
     }
 
     fn query_area(
