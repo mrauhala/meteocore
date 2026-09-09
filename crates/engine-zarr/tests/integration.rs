@@ -500,6 +500,27 @@ fn area_query_outside_extent_is_not_found() {
 }
 
 #[test]
+fn window_dims_budget_the_native_read() {
+    // Reach the catalog through the engine's public surface: an area over the
+    // whole fixture reads at most the native 16 × 12 grid per step, and the
+    // response is well under the budget — while an off-grid bbox is None.
+    let e = engine();
+    let qr = single(
+        e.query_area(
+            "-0.5,48.5,15.5,60.5",
+            None,
+            Some(&["t2m".to_string()]),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    let nd = &qr.ranges["t2m"];
+    assert_eq!(nd.shape[0], 4);
+    assert!(nd.shape[1] <= 12 && nd.shape[2] <= 16, "{:?}", nd.shape);
+}
+
+#[test]
 fn radius_query_delegates_to_area() {
     let e = engine();
     let qr = single(

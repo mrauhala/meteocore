@@ -117,6 +117,16 @@ impl Catalog {
             .and_then(|mut w| w.pop()))
     }
 
+    /// Native cells `(ncols, nrows)` a [`Self::read_window_span`] of `bbox`
+    /// would fetch (including the one-cell margin), or `None` off-grid —
+    /// so a caller can budget the *read*, not just its output.
+    pub fn window_dims(&self, bbox: [f64; 4]) -> Option<(usize, usize)> {
+        let [west, south, east, north] = bbox;
+        let (i0, i1) = axis_window(&self.lons, west, east)?;
+        let (j0, j1) = axis_window(&self.lats, south, north)?;
+        Some((i1 - i0 + 1, j1 - j0 + 1))
+    }
+
     /// [`Self::read_window`] for a contiguous span of timesteps in ONE store
     /// read (one hyperslab, one trip through the blocking storage bridge —
     /// not one per step), returning one [`Window`] per step in order. Used by

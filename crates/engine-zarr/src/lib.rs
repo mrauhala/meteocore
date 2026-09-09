@@ -33,6 +33,11 @@ use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{check_area_budget, parse_area_coords, MAX_AREA_DIM};
+
+/// Most variables one EDR area request may address. Each is a separate
+/// blocking store round trip on the request thread (two across the
+/// antimeridian) and they cannot run concurrently (`concurrent_target(1)`).
+const MAX_AREA_VARIABLES: usize = 16;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -278,6 +283,19 @@ impl EdrEngine for ZarrEngine {
         check_area_budget(time_idx.len(), ny, nx, selected.len())?;
         let mask = polygon.cell_mask(&axes);
 
+        // Every variable is one blocking store round trip on this thread
+        // (zarrs retrieval is pinned to `concurrent_target(1)` — see the
+        // crate notes — so the reads cannot fan out), and an unfiltered
+        // request addresses every variable in the store. Cap the count and
+        // point at `parameter-name` rather than stall the worker N times.
+        if selected.len() > MAX_AREA_VARIABLES {
+            return Err(DataServerError::QueryTooLarge(format!(
+                "Area query addresses {} variables; at most {MAX_AREA_VARIABLES} per request — \
+                 select them with parameter-name",
+                selected.len()
+            )));
+        }
+
         // An antimeridian-crossing bbox (west > east) is read as two
         // windows, one per side of the seam — `axis_window` needs min ≤ max.
         let b = &polygon.bbox;
@@ -297,6 +315,21 @@ impl EdrEngine for ZarrEngine {
             *time_idx.iter().min().expect("non-empty"),
             *time_idx.iter().max().expect("non-empty"),
         );
+        // The output grid is coarsened to MAX_AREA_DIM per axis, but the
+        // store read covers the bbox at NATIVE resolution × the whole span:
+        // budget that too, or a global bbox on a fine store would pull the
+        // entire array through the blocking bridge before the output budget
+        // ever applied.
+        let (read_cols, read_rows) = bboxes
+            .iter()
+            .filter_map(|bb| cat.window_dims(*bb))
+            .fold((0, 0), |(c, r), (nc, nr)| (c + nc, r.max(nr)));
+        check_area_budget(t1 - t0 + 1, read_rows, read_cols, selected.len()).map_err(|e| {
+            DataServerError::QueryTooLarge(format!(
+                "{e} (native-resolution store read; the polygon covers {read_cols} × {read_rows} \
+                 source cells per timestep)"
+            ))
+        })?;
         let has_time = time_idx.len() > 1;
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
         let mut params_map = HashMap::new();
