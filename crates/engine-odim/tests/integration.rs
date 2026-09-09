@@ -197,7 +197,14 @@ fn edr_metadata_is_consistent() {
 
     let mut qt = engine.supported_query_types();
     qt.sort();
-    assert_eq!(qt, vec!["area".to_string(), "position".to_string()]);
+    assert_eq!(
+        qt,
+        vec![
+            "area".to_string(),
+            "position".to_string(),
+            "radius".to_string()
+        ]
+    );
 
     let (start, end) = engine
         .get_temporal_extent()
