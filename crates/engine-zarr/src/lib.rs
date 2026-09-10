@@ -32,7 +32,7 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{check_area_budget, parse_area_coords, MAX_AREA_DIM};
+use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, MAX_AREA_DIM};
 
 /// Most variables one EDR area request may address. Each is a separate
 /// blocking store round trip on the request thread (two across the
@@ -305,6 +305,7 @@ impl EdrEngine for ZarrEngine {
         let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
         check_area_budget(time_idx.len(), ny, nx, selected.len())?;
+        check_mask_budget(nx * ny, &polygon)?;
         let mask = polygon.cell_mask(&axes);
 
         // An antimeridian-crossing bbox (west > east) is read as two

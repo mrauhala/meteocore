@@ -340,6 +340,7 @@ impl OdimEngine {
         // west→east, y descends north→south, each ≤ `MAX_AREA_DIM`.
         let axes = polygon.sample_grid(deg_per_px_lon, deg_per_px_lat, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
+        ds_core::feature::check_mask_budget(nx * ny, polygon)?;
         let mask = polygon.cell_mask(&axes);
         let x_values = axes.x;
         let y_values = axes.y;

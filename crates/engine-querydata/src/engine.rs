@@ -9,7 +9,7 @@ use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{check_area_budget, parse_area_coords, MAX_AREA_DIM};
+use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, MAX_AREA_DIM};
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
@@ -353,6 +353,7 @@ impl EdrEngine for QueryDataEngine {
         let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
         check_area_budget(time_indices.len(), ny, nx, param_indices.len())?;
+        check_mask_budget(nx * ny, &polygon)?;
 
         // Project each cell centre ONCE (the CRS forward transform is the
         // expensive part — Critical Rule 5); parameters and timesteps then

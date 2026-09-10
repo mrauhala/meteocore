@@ -1188,6 +1188,7 @@ impl EdrEngine for GribEngine {
         // Row-major over y × x, like the values `extract_bbox` returns. The
         // longitude axis is in the requester's frame (a seam-crossing read
         // runs …359.75, 360, −0.25…), so wrap into (−180, 180] for the test.
+        ds_core::feature::check_mask_budget(area_pixels, &polygon)?;
         let x_wrapped: Vec<f64> = x_coords.iter().map(|&x| wrap_lon(x)).collect();
         let mask = polygon.mask_cells(&x_wrapped, &y_coords);
         if !mask.iter().any(|&m| m) {

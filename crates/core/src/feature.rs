@@ -181,6 +181,14 @@ impl QueryPolygon {
         let wrap = self.bbox.crosses_antimeridian();
         let norm = |lon: f64| if wrap && lon < 0.0 { lon + 360.0 } else { lon };
         let x = norm(x);
+        // The boundary belongs to the polygon (a station exactly on a bbox
+        // edge is inside it, as the inclusive `Bbox::contains` always said);
+        // ray casting alone is exclusive on the north/east edges.
+        if point_on_ring_by(x, y, &self.exterior, norm)
+            || self.holes.iter().any(|h| point_on_ring_by(x, y, h, norm))
+        {
+            return true;
+        }
         if !point_in_ring_by(x, y, &self.exterior, norm) {
             return false;
         }
@@ -191,6 +199,61 @@ impl QueryPolygon {
         }
         true
     }
+
+    /// Number of ring vertices (exterior + holes) — the per-cell cost of
+    /// [`Self::contains`].
+    pub fn vertex_count(&self) -> usize {
+        self.exterior.len() + self.holes.iter().map(Vec::len).sum::<usize>()
+    }
+
+    /// `true` when the polygon is exactly its bounding box (the
+    /// `west,south,east,north` form, or an axis-aligned rectangle ring with no
+    /// holes): every cell centre inside the bbox is inside the polygon, so
+    /// a mask is all-true without a ring walk.
+    pub fn is_rectangle(&self) -> bool {
+        if !self.holes.is_empty() {
+            return false;
+        }
+        let ring: Vec<[f64; 2]> = match self.exterior.as_slice() {
+            [a, b, c, d, e] if a == e => vec![*a, *b, *c, *d],
+            [a, b, c, d] => vec![*a, *b, *c, *d],
+            _ => return false,
+        };
+        let Bbox {
+            west,
+            south,
+            east,
+            north,
+        } = self.bbox;
+        // Exactly the four distinct corners, each once — a right triangle
+        // with its right angle at a corner also has every vertex ON a corner.
+        [[west, south], [east, south], [east, north], [west, north]]
+            .iter()
+            .all(|corner| ring.iter().filter(|v| *v == corner).count() == 1)
+    }
+}
+
+/// Upper bound on `cells × ring vertices` a single area mask may cost —
+/// ~20 M edge tests, tens of milliseconds, on the request-serving runtime.
+pub const MAX_MASK_EDGE_TESTS: usize = 20_000_000;
+
+/// Enforce [`MAX_MASK_EDGE_TESTS`] for masking `cells` grid cells against
+/// `polygon` (a rectangle costs nothing — [`QueryPolygon::mask_cells`] takes
+/// its fast path). Every gridded engine calls this before the mask so a
+/// complex WKT polygon over a large native grid cannot stall a worker.
+pub fn check_mask_budget(cells: usize, polygon: &QueryPolygon) -> Result<(), DataServerError> {
+    if polygon.is_rectangle() {
+        return Ok(());
+    }
+    let tests = cells.saturating_mul(polygon.vertex_count());
+    if tests > MAX_MASK_EDGE_TESTS {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "Area query would test {cells} grid cells against a {}-vertex polygon ({tests} edge \
+             tests; the limit is {MAX_MASK_EDGE_TESTS}) — simplify the polygon or narrow the area",
+            polygon.vertex_count()
+        )));
+    }
+    Ok(())
 }
 
 /// Per-dimension cap of a gridded engine's EDR area grid (cells per axis);
@@ -313,11 +376,17 @@ impl QueryPolygon {
     /// `true` where the cell centre is inside the polygon. When no centre is
     /// inside — a sliver, an L, or a ring smaller than one cell whose bbox
     /// collapsed to a single cell the shape misses — the cells nearest each
-    /// polygon vertex (within half a cell) are used instead, so a small-but-
-    /// real shape still returns its data instead of a false "no cell
-    /// inside" 404 (#671).
+    /// polygon vertex (within one cell spacing, see the rounding note in the
+    /// body) are used instead, so a small-but-real shape still returns its
+    /// data instead of a false "no cell inside" 404 (#671). A rectangle
+    /// (the bbox form) is all-true without a ring walk; bound the rest with
+    /// [`check_mask_budget`].
     pub fn mask_cells(&self, x: &[f64], y: &[f64]) -> Vec<bool> {
         let (nx, ny) = (x.len(), y.len());
+        if self.is_rectangle() {
+            // The axes were built inside this bbox, so every centre is in.
+            return vec![true; nx * ny];
+        }
         let mut mask: Vec<bool> = y
             .iter()
             .flat_map(|&yy| x.iter().map(move |&xx| (xx, yy)))
@@ -366,6 +435,29 @@ impl QueryPolygon {
 /// Ray-casting point-in-polygon test for a single ring.
 fn point_in_ring(x: f64, y: f64, ring: &[[f64; 2]]) -> bool {
     point_in_ring_by(x, y, ring, |lon| lon)
+}
+
+/// Exact test for a point on a ring's boundary (collinear with a segment and
+/// within its extent), longitudes passed through `norm` like
+/// [`point_in_ring_by`]. Exact rather than tolerant on purpose: the case
+/// that matters is a coordinate round-tripped verbatim onto an edge.
+fn point_on_ring_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> bool {
+    let n = ring.len();
+    if n < 2 {
+        return false;
+    }
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (norm(ring[i][0]), ring[i][1]);
+        let (xj, yj) = (norm(ring[j][0]), ring[j][1]);
+        let cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
+        if cross == 0.0 && x >= xi.min(xj) && x <= xi.max(xj) && y >= yi.min(yj) && y <= yi.max(yj)
+        {
+            return true;
+        }
+        j = i;
+    }
+    false
 }
 
 /// [`point_in_ring`] with the ring's longitudes passed through `norm`
@@ -1699,6 +1791,44 @@ mod tests {
         expect(&poly.mask_cells(&axes.x, &y_asc));
         // A vertex exactly on the bbox edge (all of them here) must not be
         // dropped by rounding — every vertex found a cell above.
+    }
+
+    #[test]
+    fn polygon_boundary_is_inclusive_on_every_edge() {
+        let rect = parse_area_coords("10,50,12,52").unwrap();
+        assert!(rect.is_rectangle());
+        for (x, y) in [
+            (10.0, 51.0),
+            (12.0, 51.0),
+            (11.0, 50.0),
+            (11.0, 52.0),
+            (12.0, 52.0),
+        ] {
+            assert!(rect.contains(x, y), "({x}, {y}) on the edge is inside");
+        }
+        assert!(!rect.contains(12.0000001, 51.0));
+        let tri = parse_area_coords("POLYGON((10 50, 12 50, 10 52, 10 50))").unwrap();
+        assert!(!tri.is_rectangle());
+        assert!(tri.contains(11.0, 51.0), "on the hypotenuse");
+        assert!(!tri.contains(11.0, 51.0000001));
+        // A rectangle mask is all-true without a ring walk.
+        let axes = rect.sample_grid(0.5, 0.5, 256);
+        assert!(rect.cell_mask(&axes).iter().all(|&m| m));
+    }
+
+    #[test]
+    fn mask_budget_bounds_cells_times_vertices() {
+        let rect = parse_area_coords("10,50,12,52").unwrap();
+        assert!(
+            check_mask_budget(usize::MAX, &rect).is_ok(),
+            "rectangles are free"
+        );
+        let tri = parse_area_coords("POLYGON((10 50, 12 50, 10 52, 10 50))").unwrap();
+        assert!(check_mask_budget(1_000_000, &tri).is_ok());
+        assert!(matches!(
+            check_mask_budget(MAX_MASK_EDGE_TESTS / tri.vertex_count() + 1, &tri),
+            Err(DataServerError::QueryTooLarge(_))
+        ));
     }
 
     #[test]

@@ -2137,6 +2137,7 @@ impl EdrEngine for NowcastEngine {
 
         // Blocks whose centre falls outside the polygon are null (#671);
         // `MotionGrid` is row-major over y × x.
+        ds_core::feature::check_mask_budget(grid.x.len() * grid.y.len(), &polygon)?;
         let mask = polygon.mask_cells(&grid.x, &grid.y);
         if !mask.iter().any(|&m| m) {
             return Err(DataServerError::LocationNotFound(

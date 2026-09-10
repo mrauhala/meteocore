@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::parse_area_coords;
+use ds_core::feature::{parse_area_coords, QueryPolygon};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
@@ -500,16 +500,7 @@ impl EdrEngine for PostgisEngine {
         // the live `ST_Within` prefilter.
         let stations = if self.config.location_source.uses_observations() {
             let polygon = parse_area_coords(coords)?;
-            let meta = self.load_meta();
-            // Stop at the cap + nothing more — mirrors the SQL path's
-            // `LIMIT MAX_STATIONS_IN_POLYGON`, so a huge polygon over a dense
-            // dataset never materialises an unbounded Vec just to error out.
-            meta.locations
-                .iter()
-                .filter(|l| polygon.contains(l.longitude, l.latitude))
-                .take(MAX_STATIONS_IN_POLYGON)
-                .cloned()
-                .collect::<Vec<Location>>()
+            stations_in_polygon(&self.load_meta().locations, &polygon)
         } else {
             let polygon_wkt = normalize_area_wkt(coords)?;
             run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?
@@ -536,6 +527,20 @@ impl EdrEngine for PostgisEngine {
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
+
+/// The observations-derived area prefilter: cached stations inside the
+/// polygon (exact point-in-polygon, boundary inclusive; #671). Stops at the
+/// cap + nothing more — mirrors the SQL path's `LIMIT MAX_STATIONS_IN_POLYGON`,
+/// so a huge polygon over a dense dataset never materialises an unbounded
+/// Vec just to error out.
+fn stations_in_polygon(locations: &[Location], polygon: &QueryPolygon) -> Vec<Location> {
+    locations
+        .iter()
+        .filter(|l| polygon.contains(l.longitude, l.latitude))
+        .take(MAX_STATIONS_IN_POLYGON)
+        .cloned()
+        .collect()
+}
 
 /// Both area prefilters (SQL `LIMIT 10001`, in-memory `.take(10001)`) fetch
 /// one row past the ceiling; a full batch means the polygon matched more
@@ -1728,6 +1733,25 @@ mod tests {
             latitude: lat,
             longitude: lon,
         }
+    }
+
+    /// #671: the observations-derived area path is an exact polygon test,
+    /// not the polygon's bbox — and a station exactly on the edge is in.
+    #[test]
+    fn stations_in_polygon_is_exact_and_boundary_inclusive() {
+        let stations = vec![
+            loc("inside", 10.5, 50.5),
+            loc("bbox-only", 11.9, 51.9), // inside the bbox, outside the triangle
+            loc("north-edge", 10.0, 52.0),
+            loc("east-edge", 12.0, 50.0),
+            loc("outside", 13.0, 53.0),
+        ];
+        let tri = parse_area_coords("POLYGON((10 50, 12 50, 10 52, 10 50))").unwrap();
+        let found = stations_in_polygon(&stations, &tri);
+        let ids: Vec<&str> = found.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, vec!["inside", "north-edge", "east-edge"]);
+        let rect = parse_area_coords("10,50,12,52").unwrap();
+        assert_eq!(stations_in_polygon(&stations, &rect).len(), 4);
     }
 
     #[test]
