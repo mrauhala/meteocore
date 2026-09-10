@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{parse_area_coords, QueryPolygon};
+use ds_core::feature::{check_mask_budget, parse_area_coords, QueryPolygon};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
@@ -500,7 +500,12 @@ impl EdrEngine for PostgisEngine {
         // the live `ST_Within` prefilter.
         let stations = if self.config.location_source.uses_observations() {
             let polygon = parse_area_coords(coords)?;
-            stations_in_polygon(&self.load_meta().locations, &polygon)
+            let meta = self.load_meta();
+            // Same cells × vertices bound the gridded engines apply: every
+            // cached station is ray-cast against the ring before `take` can
+            // stop it.
+            check_mask_budget(meta.locations.len(), &polygon)?;
+            stations_in_polygon(&meta.locations, &polygon)
         } else {
             let polygon_wkt = normalize_area_wkt(coords)?;
             run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?

@@ -226,10 +226,18 @@ impl QueryPolygon {
             north,
         } = self.bbox;
         // Exactly the four distinct corners, each once — a right triangle
-        // with its right angle at a corner also has every vertex ON a corner.
-        [[west, south], [east, south], [east, north], [west, north]]
+        // with its right angle at a corner also has every vertex ON a corner —
+        // AND every edge axis-aligned: the same four corners walked in bowtie
+        // order (sw, ne, se, nw) are a self-intersecting shape whose own
+        // `contains` excludes slivers near each corner.
+        let corners_once = [[west, south], [east, south], [east, north], [west, north]]
             .iter()
-            .all(|corner| ring.iter().filter(|v| *v == corner).count() == 1)
+            .all(|corner| ring.iter().filter(|v| *v == corner).count() == 1);
+        let axis_aligned = (0..4).all(|i| {
+            let (a, b) = (ring[i], ring[(i + 1) % 4]);
+            a[0] == b[0] || a[1] == b[1]
+        });
+        corners_once && axis_aligned
     }
 }
 
@@ -1809,6 +1817,19 @@ mod tests {
         assert!(!rect.contains(12.0000001, 51.0));
         let tri = parse_area_coords("POLYGON((10 50, 12 50, 10 52, 10 50))").unwrap();
         assert!(!tri.is_rectangle());
+        // Same four corners in bowtie order: self-intersecting, not a rectangle.
+        let bowtie = parse_area_coords("POLYGON((10 50, 12 52, 12 50, 10 52, 10 50))").unwrap();
+        assert!(!bowtie.is_rectangle());
+        // Its two lobes (west and east) meet at the centre; the north and
+        // south wedges are outside and must not be filled by a fast path.
+        assert!(
+            bowtie.contains(10.1, 51.0)
+                && !bowtie.contains(11.0, 50.1)
+                && !bowtie.contains(11.0, 51.9)
+        );
+        let ccw = parse_area_coords("POLYGON((10 50, 12 50, 12 52, 10 52, 10 50))").unwrap();
+        let cw = parse_area_coords("POLYGON((10 50, 10 52, 12 52, 12 50, 10 50))").unwrap();
+        assert!(ccw.is_rectangle() && cw.is_rectangle());
         assert!(tri.contains(11.0, 51.0), "on the hypotenuse");
         assert!(!tri.contains(11.0, 51.0000001));
         // A rectangle mask is all-true without a ring walk.
