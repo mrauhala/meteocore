@@ -466,6 +466,132 @@ fn forecast_uses_latest_run_with_lead_as_time() {
     );
 }
 
+/// Model runs as EDR instances (#337): every run on the reference axis is an
+/// instance with its own valid times, selectable on EDR queries, the render
+/// path and the two cache-key resolvers.
+#[test]
+fn forecast_runs_are_instances_and_selectable() {
+    let dir = tempfile::tempdir().unwrap();
+    write_forecast_store(dir.path());
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("fc", &cfg).unwrap();
+    let run0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let run1 = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+
+    assert!(e.has_instances());
+    let inst = e.get_instances();
+    assert_eq!(
+        inst.iter().map(|r| r.reference_time).collect::<Vec<_>>(),
+        vec![run0, run1],
+        "ascending by reference time"
+    );
+    assert_eq!(inst[0].instance_id(), "20260101T0000Z");
+    assert_eq!(
+        inst[0].valid_times,
+        vec![
+            run0,
+            run0 + chrono::Duration::hours(1),
+            run0 + chrono::Duration::hours(2)
+        ]
+    );
+    assert_eq!(e.find_instance(run0).unwrap().valid_times.len(), 3);
+    assert!(e.find_instance(run0 + chrono::Duration::hours(6)).is_none());
+    assert_eq!(e.raster_info().reference_times, vec![run0, run1]);
+
+    // EDR position against run 0: value = 0*1000 + lead + 0.1*60 + 0.01*10.
+    let qr = single(
+        e.query_position("POINT(10 60)", None, None, None, Some(run0))
+            .unwrap(),
+    );
+    let ds_core::model::DomainDescription::PointSeries { t, .. } = &qr.domain else {
+        panic!("expected PointSeries");
+    };
+    assert_eq!(t[0], run0, "valid times belong to the selected run");
+    let vals = &qr.ranges["temp"].values;
+    assert!((vals[0].unwrap() - 6.1).abs() < 0.05, "{vals:?}");
+    assert!((vals[2].unwrap() - 8.1).abs() < 0.05, "{vals:?}");
+    // A datetime window inside run 0's valid times but outside run 1's.
+    let qr = single(
+        e.query_position(
+            "POINT(10 60)",
+            Some((run0, run0 + chrono::Duration::hours(1))),
+            None,
+            None,
+            Some(run0),
+        )
+        .unwrap(),
+    );
+    assert_eq!(qr.ranges["temp"].values.len(), 2);
+    // Area against run 0 reads run 0 too.
+    let qr = single(
+        e.query_area("9.5,58.5,11.5,60.5", None, None, None, Some(run0))
+            .unwrap(),
+    );
+    assert!(qr.ranges["temp"]
+        .values
+        .iter()
+        .flatten()
+        .all(|&v| v < 1000.0));
+    // Unknown run → ReferenceTimeNotFound; None → latest.
+    let err = e
+        .query_position(
+            "POINT(10 60)",
+            None,
+            None,
+            None,
+            Some(run0 + chrono::Duration::hours(3)),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ds_core::error::DataServerError::ReferenceTimeNotFound(_)
+        ),
+        "{err}"
+    );
+
+    // Render path honours the run, and the cache-key resolvers agree with it.
+    let tile = e
+        .get_raster_tile(
+            [9.5, 58.5, 11.5, 60.5],
+            4,
+            4,
+            Some(run0),
+            &OutputCrs::Wgs84,
+            Some("temp"),
+            None,
+            Some(run0),
+        )
+        .unwrap();
+    let rendered: Vec<f64> = tile.values.iter_values().flatten().collect();
+    assert!(
+        !rendered.is_empty() && rendered.iter().all(|&v| v < 1000.0),
+        "{rendered:?}"
+    );
+    assert_eq!(e.resolve_reference_time(None, None), Some(run1));
+    assert_eq!(e.resolve_reference_time(None, Some(run0)), Some(run0));
+    assert_eq!(
+        e.resolve_time(Some(run0 + chrono::Duration::minutes(40)), Some(run0)),
+        Some(run0 + chrono::Duration::hours(1))
+    );
+    assert_eq!(
+        e.resolve_time(None, None),
+        Some(run1 + chrono::Duration::hours(2))
+    );
+
+    // A non-forecast store has no instances and ignores reference_time.
+    let plain = engine();
+    assert!(!plain.has_instances() && plain.get_instances().is_empty());
+    assert!(plain.raster_info().reference_times.is_empty());
+    assert_eq!(plain.resolve_reference_time(None, None), None);
+    assert!(plain
+        .query_position("POINT(5.5 54.5)", None, None, None, Some(run0))
+        .is_ok());
+}
+
 fn config(parameters: Option<Vec<String>>) -> ZarrConfig {
     ZarrConfig {
         data_path: Some(fixture_dir().to_string_lossy().into_owned()),

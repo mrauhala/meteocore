@@ -33,6 +33,7 @@ use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{check_area_budget, parse_area_coords, MAX_AREA_DIM};
+use ds_core::instances::{self, RunInfo};
 
 /// Most variables one EDR area request may address. Each is a separate
 /// blocking store round trip on the request thread (two across the
@@ -118,6 +119,7 @@ impl ZarrEngine {
             Ok(new_catalog) => {
                 let current = self.catalog.load();
                 if new_catalog.times != current.times
+                    || new_catalog.runs.len() != current.runs.len()
                     || new_catalog.vars.len() != current.vars.len()
                 {
                     log_loaded(&self.collection_id, &new_catalog);
@@ -158,14 +160,16 @@ fn select_vars<'a>(
 /// The time-axis indices an EDR query addresses: every step when
 /// `datetime` is absent, else the closed interval; none → 400. Shared by
 /// position and area so the window semantics cannot drift.
+/// Returns `(indices, valid times of the run)`.
 fn select_time_idx(
     cat: &Catalog,
+    run: Option<usize>,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<Vec<usize>, DataServerError> {
+) -> Result<(Vec<usize>, Vec<DateTime<Utc>>), DataServerError> {
+    let times = cat.valid_times(run);
     let time_idx: Vec<usize> = match datetime {
-        None => (0..cat.times.len()).collect(),
-        Some((start, end)) => cat
-            .times
+        None => (0..times.len()).collect(),
+        Some((start, end)) => times
             .iter()
             .enumerate()
             .filter(|(_, t)| **t >= start && **t <= end)
@@ -177,10 +181,30 @@ fn select_time_idx(
             "No data available for the requested time range".into(),
         ));
     }
-    Ok(time_idx)
+    Ok((time_idx, times))
 }
 
 impl EdrEngine for ZarrEngine {
+    /// Forecast model runs as EDR instances (#337): one per reference-axis
+    /// entry, each with its own valid times (run + leads). Empty for a
+    /// non-forecast store.
+    fn get_instances(&self) -> Vec<RunInfo> {
+        let cat = self.catalog.load();
+        instances::build_instances(&cat.runs, |_, &idx| cat.valid_times(Some(idx)))
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.catalog.load().runs.is_empty()
+    }
+
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let cat = self.catalog.load();
+        cat.runs.get(&reference_time).map(|&idx| RunInfo {
+            reference_time,
+            valid_times: cat.valid_times(Some(idx)),
+        })
+    }
+
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
     }
@@ -262,7 +286,7 @@ impl EdrEngine for ZarrEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
-        _reference_time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = parse_area_coords(coords)?;
         let cat = self.catalog.load();
@@ -270,7 +294,8 @@ impl EdrEngine for ZarrEngine {
             return Err(DataServerError::Engine("No Zarr data available".into()));
         }
 
-        let time_idx = select_time_idx(&cat, datetime)?;
+        let run = cat.resolve_run(reference_time)?;
+        let (time_idx, run_times) = select_time_idx(&cat, run, datetime)?;
 
         let selected = select_vars(&cat, parameters)?;
 
@@ -351,7 +376,7 @@ impl EdrEngine for ZarrEngine {
             }
         })?;
         let has_time = time_idx.len() > 1;
-        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
+        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| run_times[i]).collect();
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
         for v in selected {
@@ -360,7 +385,7 @@ impl EdrEngine for ZarrEngine {
             // entirely off the grid contributes nothing.
             let windows: Vec<Vec<catalog::Window>> = bboxes
                 .iter()
-                .map(|bb| cat.read_window_span(v, t0..t1 + 1, *bb))
+                .map(|bb| cat.read_window_span(v, run, t0..t1 + 1, *bb))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .flatten()
@@ -422,7 +447,7 @@ impl EdrEngine for ZarrEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
-        _reference_time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
         let cat = self.catalog.load();
@@ -430,15 +455,16 @@ impl EdrEngine for ZarrEngine {
             return Err(DataServerError::Engine("No Zarr data available".into()));
         }
 
-        let time_idx = select_time_idx(&cat, datetime)?;
-        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
+        let run = cat.resolve_run(reference_time)?;
+        let (time_idx, run_times) = select_time_idx(&cat, run, datetime)?;
+        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| run_times[i]).collect();
 
         let selected = select_vars(&cat, parameters)?;
 
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
         for v in selected {
-            let values = cat.sample_series(v, lon, lat, &time_idx)?;
+            let values = cat.sample_series(v, run, lon, lat, &time_idx)?;
             params_map.insert(
                 v.name.clone(),
                 ParameterDescription {
@@ -545,9 +571,10 @@ impl MapEngine for ZarrEngine {
         output_crs: &OutputCrs,
         parameter: Option<&str>,
         _z: Option<f64>, // Zarr collections expose no vertical dimension yet
-        _reference_time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let cat = self.catalog.load();
+        let run = cat.resolve_run(reference_time)?;
         let var = match parameter {
             Some(p) => cat.vars.iter().find(|v| v.name.eq_ignore_ascii_case(p)),
             None => cat.vars.first(),
@@ -560,11 +587,11 @@ impl MapEngine for ZarrEngine {
             )
         })?;
 
-        let time_idx = nearest_time_idx(&cat.times, time)
+        let time_idx = nearest_time_idx(&cat.valid_times(run), time)
             .ok_or_else(|| DataServerError::Engine("No Zarr data available".into()))?;
 
         let n = (width as usize) * (height as usize);
-        let Some(window) = cat.read_window(var, time_idx, bbox)? else {
+        let Some(window) = cat.read_window(var, run, time_idx, bbox)? else {
             // bbox entirely outside the grid → fully transparent tile.
             return Ok(RasterTile {
                 width,
@@ -648,16 +675,35 @@ impl MapEngine for ZarrEngine {
     fn resolve_time(
         &self,
         time: Option<DateTime<Utc>>,
-        _reference_time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
         // The cache-key authority (#507): the exact timestep
-        // `get_raster_tile` will render, via the SAME `nearest_time_idx`
-        // the render path uses. An empty time axis falls back to the
-        // requested time — the render errors and caches nothing.
+        // `get_raster_tile` will render, via the SAME run selection and
+        // `nearest_time_idx` the render path uses. An empty time axis (or an
+        // unknown run) falls back to the requested time — the render errors
+        // and caches nothing.
         let cat = self.catalog.load();
-        nearest_time_idx(&cat.times, time)
-            .map(|i| cat.times[i])
-            .or(time)
+        let Ok(run) = cat.resolve_run(reference_time) else {
+            return time;
+        };
+        let times = cat.valid_times(run);
+        nearest_time_idx(&times, time).map(|i| times[i]).or(time)
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The run-axis cache key (#521): the concrete run `get_raster_tile`
+        // reads — `None` ⇒ the latest run's reference time. An unknown run
+        // echoes the request (the render 404s and caches nothing); a
+        // non-forecast store has no run.
+        let cat = self.catalog.load();
+        match cat.resolve_run(reference_time) {
+            Ok(run) => cat.run_time(run),
+            Err(_) => reference_time,
+        }
     }
 }
 
@@ -678,7 +724,7 @@ fn nearest_time_idx(times: &[DateTime<Utc>], time: Option<DateTime<Utc>>) -> Opt
 
 fn log_loaded(collection_id: &str, cat: &Catalog) {
     tracing::info!(
-        "[{}] Loaded Zarr store: {} variable(s) [{}], {} time step(s)",
+        "[{}] Loaded Zarr store: {} variable(s) [{}], {} time step(s), {} run(s)",
         collection_id,
         cat.vars.len(),
         cat.vars
@@ -687,6 +733,7 @@ fn log_loaded(collection_id: &str, cat: &Catalog) {
             .collect::<Vec<_>>()
             .join(", "),
         cat.times.len(),
+        cat.runs.len(),
     );
 }
 

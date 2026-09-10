@@ -14,8 +14,7 @@ periodic store are nearest-only or null, and a native 0..360 longitude
 axis is not normalised — position and area alike only answer requests in
 the store's own frame — #667), WMS/Maps/Tiles rendering, CF time decoding, CF
 packing, chunk LRU cache.
-NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5), EDR
-instances (#337 — the engine pins the latest run internally).
+NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5).
 
 ## The one load-bearing rule
 
@@ -57,10 +56,15 @@ through it.**
   so the read path branches on `data_type()` and widens every supported
   int/float to `f64`. Fill sentinels are compared against the RAW
   (pre-scale) value; NaN/±inf map to nodata.
-- **Forecast axes:** with a CF `forecast_reference_time` axis AND a
-  `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/ICON-EU), the
-  engine uses the latest run and exposes valid time = run + lead as the time
-  axis (`cf::parse_duration_seconds` decodes the lead units).
+- **Forecast axes / instances (#337):** with a CF `forecast_reference_time`
+  axis AND a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/
+  ICON-EU), every run on the reference axis is an EDR instance / WMS
+  `DIM_REFERENCE_TIME` value (`Catalog::runs`, `RasterInfo.reference_times`);
+  the latest run is the default and provides `Catalog::times`. Reads take the
+  run (`Catalog::resolve_run(reference_time)` → reference-axis index) and
+  each run's valid times are run + leads (`Catalog::valid_times`). The
+  render path and both cache-key resolvers (`resolve_time`,
+  `resolve_reference_time`) share that selection (#507/#521).
 - **Bad-chunking WARN:** `time=1, lat=full, lon=full` chunking is
   pathological for point queries; logged at startup, still served.
 

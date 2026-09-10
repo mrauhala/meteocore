@@ -5,6 +5,7 @@
 //! it is swapped atomically via `ArcSwap`, so EDR queries read a consistent
 //! snapshot without locking.
 
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -42,11 +43,12 @@ pub struct Variable {
     /// Axis index of the time dimension within this variable's dim order. For a
     /// forecast (reference + lead), this is the **lead** axis.
     pub time_axis: Option<usize>,
-    /// For a forecast, the axis index of the **reference time** (model run),
-    /// pinned to [`ref_index`](Self::ref_index) (the latest run).
+    /// For a forecast, the axis index of the **reference time** (model run).
+    /// Reads take the run as a parameter ([`Catalog::resolve_run`]);
+    /// [`latest_run`](Self::latest_run) is the default.
     ref_axis: Option<usize>,
-    /// The reference-axis index to read (the latest run); 0 when not a forecast.
-    ref_index: u64,
+    /// The reference-axis index of the latest run; 0 when not a forecast.
+    latest_run: u64,
     /// Axis index of the latitude dimension.
     lat_axis: usize,
     /// Axis index of the longitude dimension.
@@ -87,8 +89,20 @@ fn convert_sample(raw: f64, scale: f64, offset: f64, fills: &[f64]) -> Option<f6
 pub struct Catalog {
     /// Data variables in stable (sorted) order.
     pub vars: Vec<Variable>,
-    /// Decoded time axis (ascending), shared across all variables.
+    /// Decoded time axis (ascending), shared across all variables. For a
+    /// forecast this is the **latest run's** valid times (run + leads); other
+    /// runs' valid times come from [`Self::valid_times`].
     pub times: Vec<DateTime<Utc>>,
+    /// Forecast model runs: reference time → index on the reference axis
+    /// (the `ds_core::instances` contract, #337). Empty for a non-forecast
+    /// store.
+    pub runs: BTreeMap<DateTime<Utc>, usize>,
+    /// Reference-axis index of the latest run (`None` when not a forecast).
+    latest_run: Option<usize>,
+    /// Decoded reference axis in axis order (forecast only).
+    ref_times: Vec<DateTime<Utc>>,
+    /// Lead offsets in axis order (forecast only); valid = run + lead.
+    leads: Vec<chrono::Duration>,
     /// Latitude axis values (degrees north; may be ascending or descending).
     lats: Vec<f64>,
     /// Longitude axis values (degrees east).
@@ -102,6 +116,50 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Resolve a requested model run to its reference-axis index: `None` ⇒
+    /// the latest run, `Some(rt)` ⇒ that exact run or `ReferenceTimeNotFound`.
+    /// A non-forecast store has no runs and answers `Ok(None)` for any
+    /// request (the shared accept-and-ignore contract).
+    pub fn resolve_run(
+        &self,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Option<usize>, DataServerError> {
+        if self.runs.is_empty() {
+            return Ok(None);
+        }
+        match reference_time {
+            None => Ok(self.latest_run),
+            Some(rt) => self.runs.get(&rt).copied().map(Some).ok_or_else(|| {
+                DataServerError::ReferenceTimeNotFound(format!(
+                    "no model run for reference time {rt}"
+                ))
+            }),
+        }
+    }
+
+    /// The valid times of `run` (a reference-axis index from
+    /// [`Self::resolve_run`]); the shared [`Self::times`] otherwise.
+    pub fn valid_times(&self, run: Option<usize>) -> Vec<DateTime<Utc>> {
+        match run {
+            Some(r) if r < self.ref_times.len() => {
+                let base = self.ref_times[r];
+                self.leads.iter().map(|d| base + *d).collect()
+            }
+            _ => self.times.clone(),
+        }
+    }
+
+    /// The reference time of `run`, for the run-axis cache key.
+    pub fn run_time(&self, run: Option<usize>) -> Option<DateTime<Utc>> {
+        run.and_then(|r| self.ref_times.get(r).copied())
+    }
+
+    /// The reference-axis range a read of `run` selects for `var`.
+    fn ref_range(var: &Variable, run: Option<usize>) -> Range<u64> {
+        let r = run.map(|r| r as u64).unwrap_or(var.latest_run);
+        r..r + 1
+    }
+
     /// Read a 2-D spatial slab of `var` at `time_idx` covering the WGS84 render
     /// `bbox` (`[west, south, east, north]`), expanded by one cell so edge
     /// pixels can interpolate. Returns `None` when the bbox lies entirely off
@@ -109,11 +167,12 @@ impl Catalog {
     pub fn read_window(
         &self,
         var: &Variable,
+        run: Option<usize>,
         time_idx: usize,
         bbox: [f64; 4],
     ) -> Result<Option<Window>, DataServerError> {
         Ok(self
-            .read_window_span(var, time_idx..time_idx + 1, bbox)?
+            .read_window_span(var, run, time_idx..time_idx + 1, bbox)?
             .and_then(|mut w| w.pop()))
     }
 
@@ -134,6 +193,7 @@ impl Catalog {
     pub fn read_window_span(
         &self,
         var: &Variable,
+        run: Option<usize>,
         time_span: Range<usize>,
         bbox: [f64; 4],
     ) -> Result<Option<Vec<Window>>, DataServerError> {
@@ -155,7 +215,7 @@ impl Catalog {
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
             } else if Some(a) == var.ref_axis {
-                ranges.push(var.ref_index..var.ref_index + 1);
+                ranges.push(Self::ref_range(var, run));
             } else {
                 ranges.push(0..1);
             }
@@ -213,6 +273,7 @@ impl Catalog {
     pub fn sample_series(
         &self,
         var: &Variable,
+        run: Option<usize>,
         lon: f64,
         lat: f64,
         time_idx: &[usize],
@@ -244,7 +305,7 @@ impl Catalog {
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
             } else if Some(a) == var.ref_axis {
-                ranges.push(var.ref_index..var.ref_index + 1);
+                ranges.push(Self::ref_range(var, run));
             } else {
                 ranges.push(0..1);
             }
@@ -539,9 +600,12 @@ pub fn build(
         ));
     };
 
-    // Resolve the latest run when a reference axis is pinned.
+    // Resolve the latest run when a reference axis is pinned, and keep every
+    // run: each is an EDR instance / WMS DIM_REFERENCE_TIME value (#337).
     let mut ref_pin: Option<(String, usize)> = None;
     let mut latest_ref_time: Option<DateTime<Utc>> = None;
+    let mut ref_times: Vec<DateTime<Utc>> = Vec::new();
+    let mut runs: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
     if forecast {
         let rd = ref_role_dim.as_ref().unwrap();
         let ref_arr = by_name.get(rd).ok_or_else(|| {
@@ -573,12 +637,19 @@ pub fn build(
         );
         latest_ref_time = Some(*t);
         ref_pin = Some((rd.clone(), idx));
+        for (i, rt) in decoded.iter().enumerate() {
+            // A duplicated reference time keeps its LAST axis position, the
+            // same "latest wins" rule `max_by_key` applied above.
+            runs.insert(*rt, i);
+        }
+        ref_times = decoded;
     }
 
     // Build the valid-time axis.
     let primary_arr = by_name.get(&primary_dim).ok_or_else(|| {
         DataServerError::Engine(format!("missing coordinate variable '{primary_dim}'"))
     })?;
+    let mut leads: Vec<chrono::Duration> = Vec::new();
     let times = if forecast {
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("lead coordinate '{primary_dim}' has no 'units'"))
@@ -591,7 +662,7 @@ pub fn build(
         let base = latest_ref_time.expect("forecast sets latest_ref_time");
         // Guard non-finite leads: `NaN as i64` is 0, which would silently yield
         // the run time (mirrors `cf::decode_times`'s finite check).
-        read_coord_f64(primary_arr)?
+        leads = read_coord_f64(primary_arr)?
             .iter()
             .map(|&v| {
                 if !v.is_finite() {
@@ -599,9 +670,12 @@ pub fn build(
                         "non-finite value in lead axis '{primary_dim}': {v}"
                     )));
                 }
-                Ok(base + chrono::Duration::milliseconds((v * secs * 1000.0).round() as i64))
+                Ok(chrono::Duration::milliseconds(
+                    (v * secs * 1000.0).round() as i64
+                ))
             })
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        leads.iter().map(|d| base + *d).collect()
     } else {
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("time coordinate '{primary_dim}' has no 'units'"))
@@ -649,8 +723,9 @@ pub fn build(
             continue;
         };
 
-        // Forecast: pin this variable's reference (run) axis to the latest run.
-        let (ref_axis, ref_index) = match &ref_pin {
+        // Forecast: this variable's reference (run) axis, defaulting to the
+        // latest run.
+        let (ref_axis, latest_run) = match &ref_pin {
             Some((rd, idx)) => (dims.iter().position(|d| d == rd), *idx as u64),
             None => (None, 0),
         };
@@ -739,7 +814,7 @@ pub fn build(
             label,
             time_axis,
             ref_axis,
-            ref_index,
+            latest_run,
             lat_axis,
             lon_axis,
             ndim,
@@ -759,9 +834,11 @@ pub fn build(
     let (south, north) = axis_extent(&lats);
     let extent = [west, south, east, north];
 
+    let reference_times: Vec<DateTime<Utc>> = runs.keys().copied().collect();
     let raster_info = build_raster_info(
         &vars,
         &times,
+        &reference_times,
         extent,
         [lons.len() as u32, lats.len() as u32],
     );
@@ -769,6 +846,10 @@ pub fn build(
     Ok(Catalog {
         vars,
         times,
+        latest_run: ref_pin.as_ref().map(|(_, idx)| *idx),
+        runs,
+        ref_times,
+        leads,
         lats,
         lons,
         extent,
@@ -781,6 +862,7 @@ pub fn build(
 fn build_raster_info(
     vars: &[Variable],
     times: &[DateTime<Utc>],
+    reference_times: &[DateTime<Utc>],
     extent: [f64; 4],
     grid_size: [u32; 2],
 ) -> RasterInfo {
@@ -798,7 +880,7 @@ fn build_raster_info(
         native_crs: "CRS:84".to_string(),
         spatial_extent: Some(extent),
         times: times.to_vec(),
-        reference_times: Vec::new(),
+        reference_times: reference_times.to_vec(),
         parameter,
         unit,
         parameters,
