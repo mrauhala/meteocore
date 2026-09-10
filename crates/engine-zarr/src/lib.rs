@@ -340,10 +340,15 @@ impl EdrEngine for ZarrEngine {
             .filter_map(|bb| cat.window_dims(*bb))
             .fold((0, 0), |(c, r), (nc, nr)| (c + nc, r.max(nr)));
         check_area_budget(t1 - t0 + 1, read_rows, read_cols, selected.len()).map_err(|e| {
-            DataServerError::QueryTooLarge(format!(
-                "{e} (native-resolution store read; the polygon covers {read_cols} × {read_rows} \
-                 source cells per timestep)"
-            ))
+            match e {
+                // Extend the inner message; re-wrapping the Display form would
+                // double the "Query too large:" prefix.
+                DataServerError::QueryTooLarge(m) => DataServerError::QueryTooLarge(format!(
+                    "{m} (native-resolution store read; the polygon covers {read_cols} × \
+                     {read_rows} source cells per timestep)"
+                )),
+                other => other,
+            }
         })?;
         let has_time = time_idx.len() > 1;
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
