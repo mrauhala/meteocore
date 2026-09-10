@@ -326,17 +326,21 @@ impl QueryPolygon {
         if mask.iter().any(|&m| m) || nx == 0 || ny == 0 {
             return mask;
         }
-        // Half-cell tolerance from the axis spacing; a single-cell axis
-        // spans the whole bbox.
-        let half = |axis: &[f64], lo: f64, hi: f64| -> f64 {
+        // One-cell tolerance from the axis spacing (a single-cell axis spans
+        // the whole bbox): every vertex lies inside the grid footprint, whose
+        // outermost centres are at most half a cell from its edge, so the
+        // nearest centre is always within one cell — the tolerance only
+        // rejects a vertex that is off the grid altogether. Half a cell would
+        // let a vertex exactly on the bbox edge miss by rounding.
+        let spacing = |axis: &[f64], lo: f64, hi: f64| -> f64 {
             if axis.len() > 1 {
-                ((axis[1] - axis[0]).abs() / 2.0).max(f64::EPSILON)
+                (axis[1] - axis[0]).abs().max(f64::EPSILON)
             } else {
-                ((hi - lo).abs() / 2.0).max(f64::EPSILON)
+                (hi - lo).abs().max(f64::EPSILON)
             }
         };
-        let hx = half(x, self.bbox.west, self.bbox.east);
-        let hy = half(y, self.bbox.south, self.bbox.north);
+        let hx = spacing(x, self.bbox.west, self.bbox.east);
+        let hy = spacing(y, self.bbox.south, self.bbox.north);
         let nearest = |axis: &[f64], v: f64, tol: f64| -> Option<usize> {
             axis.iter()
                 .enumerate()
@@ -1667,6 +1671,34 @@ mod tests {
         let fine = poly.sample_grid(0.1, 0.1, 256);
         let mask = poly.cell_mask(&fine);
         assert!(mask.iter().any(|&m| m) && !mask.iter().all(|&m| m));
+    }
+
+    #[test]
+    fn mask_cells_vertex_fallback_on_a_multi_cell_grid() {
+        // A 3° ring whose hole swallows every one of the 3×3 cell centres:
+        // no centre is inside, so the fallback marks the cells nearest the
+        // vertices — the four corners (outer and hole corners alike) — and
+        // nothing else. Checked in both y orientations.
+        let poly = parse_area_coords(
+            "POLYGON((10 50, 13 50, 13 53, 10 53, 10 50),(10.1 50.1, 12.9 50.1, 12.9 52.9, 10.1 52.9, 10.1 50.1))",
+        )
+        .unwrap();
+        let axes = poly.sample_grid(1.0, 1.0, 256);
+        assert_eq!(axes.dims(), (3, 3));
+        assert!(!axes
+            .y
+            .iter()
+            .any(|&y| axes.x.iter().any(|&x| poly.contains(x, y))));
+        let expect = |m: &[bool]| {
+            assert_eq!(m.len(), 9);
+            let on: Vec<usize> = (0..9).filter(|&i| m[i]).collect();
+            assert_eq!(on, vec![0, 2, 6, 8], "corner cells only: {m:?}");
+        };
+        expect(&poly.cell_mask(&axes));
+        let y_asc: Vec<f64> = axes.y.iter().rev().copied().collect();
+        expect(&poly.mask_cells(&axes.x, &y_asc));
+        // A vertex exactly on the bbox edge (all of them here) must not be
+        // dropped by rounding — every vertex found a cell above.
     }
 
     #[test]
