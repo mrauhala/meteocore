@@ -1085,8 +1085,12 @@ mod tests {
         let (y0, y1) = (s + 0.3 * (n - s), s + 0.6 * (n - s));
         let coords = format!("POLYGON(({x0} {y0}, {x1} {y0}, {x0} {y1}, {x0} {y0}))");
         let (start, _) = engine.get_temporal_extent().unwrap();
+        // Pin the parameter: `ranges` is a HashMap, and the precipitation
+        // field is legitimately nodata over part of the fixture, so picking
+        // an arbitrary range made this test order-dependent (flaked on CI).
+        let param = vec!["2 Metre Temperature (2t)".to_string()];
         let resp = engine
-            .query_area(&coords, Some((start, start)), None, None, None)
+            .query_area(&coords, Some((start, start)), Some(&param), None, None)
             .unwrap();
         let CoverageResponse::Single(res) = resp else {
             panic!("expected a single Grid coverage");
@@ -1097,7 +1101,7 @@ mod tests {
         assert!(t.is_none(), "one timestep → no t axis");
         assert!(x.len() > 2 && y.len() > 2, "grid {}×{}", x.len(), y.len());
         assert!(x.windows(2).all(|p| p[0] < p[1]) && y.windows(2).all(|p| p[0] > p[1]));
-        let arr = res.ranges.values().next().unwrap();
+        let arr = &res.ranges[&param[0]];
         assert_eq!(arr.shape, vec![y.len(), x.len()]);
         assert_eq!(arr.values.len(), y.len() * x.len());
         // North-east corner (row 0, last col) is outside the triangle.
