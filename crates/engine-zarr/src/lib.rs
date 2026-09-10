@@ -289,11 +289,6 @@ impl EdrEngine for ZarrEngine {
             Some([nx, ny]) => ((e - w) / nx.max(1) as f64, (n - s) / ny.max(1) as f64),
             None => (0.0, 0.0),
         };
-        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
-        let (nx, ny) = axes.dims();
-        check_area_budget(time_idx.len(), ny, nx, selected.len())?;
-        let mask = polygon.cell_mask(&axes);
-
         // Every variable is one blocking store round trip on this thread
         // (zarrs retrieval is pinned to `concurrent_target(1)` — see the
         // crate notes — so the reads cannot fan out), and an unfiltered
@@ -306,6 +301,11 @@ impl EdrEngine for ZarrEngine {
                 selected.len()
             )));
         }
+
+        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
+        let (nx, ny) = axes.dims();
+        check_area_budget(time_idx.len(), ny, nx, selected.len())?;
+        let mask = polygon.cell_mask(&axes);
 
         // An antimeridian-crossing bbox (west > east) is read as two
         // windows, one per side of the seam — `axis_window` needs min ≤ max.
