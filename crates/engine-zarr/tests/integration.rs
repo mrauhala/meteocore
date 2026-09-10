@@ -130,6 +130,275 @@ fn write_forecast_store(dir: &std::path::Path) {
     .unwrap();
 }
 
+/// A geographic store whose longitude axis runs every 2° from −178 to 178
+/// (so an area query across the seam lands on native-resolution cells on
+/// both sides), three latitudes, two timesteps, field
+/// `300 + 0.1·lat + 0.01·lon + t`.
+fn write_seam_store(dir: &std::path::Path) {
+    use zarrs::array::{data_type, ArrayBuilder, ArraySubset};
+    use zarrs::filesystem::FilesystemStore;
+    use zarrs::group::GroupBuilder;
+
+    let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let store = std::sync::Arc::new(FilesystemStore::new(dir).unwrap());
+    GroupBuilder::new()
+        .build(store.clone(), "/")
+        .unwrap()
+        .store_metadata()
+        .unwrap();
+    let fcoord = |path: &str, vals: &[f64], dim: &str, at: serde_json::Value| {
+        let a = ArrayBuilder::new(
+            vec![vals.len() as u64],
+            vec![vals.len() as u64],
+            data_type::float64(),
+            f64::NAN,
+        )
+        .dimension_names(Some([dim]))
+        .attributes(obj(at))
+        .build(store.clone(), path)
+        .unwrap();
+        a.store_metadata().unwrap();
+        a.store_chunk(&[0], vals.to_vec()).unwrap();
+    };
+    let t0 = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp() as f64;
+    fcoord(
+        "/time",
+        &[t0, t0 + 3600.0],
+        "time",
+        serde_json::json!({"units":"seconds since 1970-01-01","standard_name":"time"}),
+    );
+    let lats = [20.0_f64, 15.0, 10.0];
+    let lons: Vec<f64> = (0..179).map(|i| -178.0 + 2.0 * i as f64).collect();
+    fcoord(
+        "/lat",
+        &lats,
+        "lat",
+        serde_json::json!({"units":"degrees_north","standard_name":"latitude"}),
+    );
+    fcoord(
+        "/lon",
+        &lons,
+        "lon",
+        serde_json::json!({"units":"degrees_east","standard_name":"longitude"}),
+    );
+    let mut temp = Vec::new();
+    for t in 0..2 {
+        for &lat in &lats {
+            for &lon in lons.iter() {
+                temp.push((300.0 + 0.1 * lat + 0.01 * lon + t as f64) as f32);
+            }
+        }
+    }
+    let a = ArrayBuilder::new(
+        vec![2, 3, 179],
+        vec![2, 3, 179],
+        data_type::float32(),
+        f32::NAN,
+    )
+    .dimension_names(Some(["time", "lat", "lon"]))
+    .attributes(obj(
+        serde_json::json!({"units":"K","long_name":"temperature"}),
+    ))
+    .build(store.clone(), "/temp")
+    .unwrap();
+    a.store_metadata().unwrap();
+    a.store_chunks(
+        &ArraySubset::new_with_shape(a.chunk_grid_shape().to_vec()),
+        temp,
+    )
+    .unwrap();
+}
+
+/// A plain geographic store with one timestep, the given axes and one
+/// constant-valued float32 variable per name — for the request-budget tests.
+fn write_grid_store(dir: &std::path::Path, lats: &[f64], lons: &[f64], names: &[&str]) {
+    use zarrs::array::{data_type, ArrayBuilder, ArraySubset};
+    use zarrs::filesystem::FilesystemStore;
+    use zarrs::group::GroupBuilder;
+
+    let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let store = std::sync::Arc::new(FilesystemStore::new(dir).unwrap());
+    GroupBuilder::new()
+        .build(store.clone(), "/")
+        .unwrap()
+        .store_metadata()
+        .unwrap();
+    let fcoord = |path: &str, vals: &[f64], dim: &str, at: serde_json::Value| {
+        let a = ArrayBuilder::new(
+            vec![vals.len() as u64],
+            vec![vals.len() as u64],
+            data_type::float64(),
+            f64::NAN,
+        )
+        .dimension_names(Some([dim]))
+        .attributes(obj(at))
+        .build(store.clone(), path)
+        .unwrap();
+        a.store_metadata().unwrap();
+        a.store_chunk(&[0], vals.to_vec()).unwrap();
+    };
+    let t0 = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp() as f64;
+    fcoord(
+        "/time",
+        &[t0],
+        "time",
+        serde_json::json!({"units":"seconds since 1970-01-01","standard_name":"time"}),
+    );
+    fcoord(
+        "/lat",
+        lats,
+        "lat",
+        serde_json::json!({"units":"degrees_north","standard_name":"latitude"}),
+    );
+    fcoord(
+        "/lon",
+        lons,
+        "lon",
+        serde_json::json!({"units":"degrees_east","standard_name":"longitude"}),
+    );
+    let n = lats.len() as u64 * lons.len() as u64;
+    for (i, name) in names.iter().enumerate() {
+        let a = ArrayBuilder::new(
+            vec![1, lats.len() as u64, lons.len() as u64],
+            vec![1, lats.len() as u64, lons.len() as u64],
+            data_type::float32(),
+            f32::NAN,
+        )
+        .dimension_names(Some(["time", "lat", "lon"]))
+        .attributes(obj(serde_json::json!({"units":"K","long_name":name})))
+        .build(store.clone(), &format!("/{name}"))
+        .unwrap();
+        a.store_metadata().unwrap();
+        a.store_chunks(
+            &ArraySubset::new_with_shape(a.chunk_grid_shape().to_vec()),
+            vec![i as f32; n as usize],
+        )
+        .unwrap();
+    }
+}
+
+/// Review on #674: the two hard caps on the blocking store read must reject,
+/// not just exist.
+#[test]
+fn area_query_caps_variables_per_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..9).map(|i| format!("v{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    write_grid_store(dir.path(), &[52.0, 51.0], &[10.0, 11.0], &refs);
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("many", &cfg).unwrap();
+    assert_eq!(e.get_parameters().len(), 9);
+    let err = e
+        .query_area("10,51,11,52", None, None, None, None)
+        .unwrap_err();
+    match err {
+        ds_core::error::DataServerError::QueryTooLarge(m) => {
+            assert!(m.contains("parameter-name"), "{m}")
+        }
+        other => panic!("expected QueryTooLarge, got {other}"),
+    }
+    // Selecting a subset is fine.
+    let qr = single(
+        e.query_area("10,51,11,52", None, Some(&names[..2]), None, None)
+            .unwrap(),
+    );
+    assert_eq!(qr.ranges.len(), 2);
+}
+
+#[test]
+fn area_query_budgets_the_native_read() {
+    // 1100 × 1000 native cells > the 1M-value budget even though the output
+    // grid is coarsened to 256 × 256.
+    let dir = tempfile::tempdir().unwrap();
+    let lats: Vec<f64> = (0..1000).map(|i| 80.0 - i as f64 * 0.1).collect();
+    let lons: Vec<f64> = (0..1100).map(|i| -100.0 + i as f64 * 0.1).collect();
+    write_grid_store(dir.path(), &lats, &lons, &["t"]);
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("fine", &cfg).unwrap();
+    let err = e
+        .query_area("-100,-20,10,80", None, None, None, None)
+        .unwrap_err();
+    match err {
+        ds_core::error::DataServerError::QueryTooLarge(m) => {
+            assert!(m.contains("native-resolution"), "{m}")
+        }
+        other => panic!("expected QueryTooLarge, got {other}"),
+    }
+    // A sub-budget window of the same store succeeds.
+    let qr = single(
+        e.query_area("-50,20,-40,30", None, None, None, None)
+            .unwrap(),
+    );
+    assert_eq!(qr.ranges["t"].shape, vec![100, 100]);
+}
+
+/// Review on #674: an antimeridian-crossing area bbox used to produce an
+/// all-null 200 because the store window needs min ≤ max. It is now read
+/// as one window per side of the seam.
+#[test]
+fn area_query_across_the_antimeridian_reads_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    write_seam_store(dir.path());
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("seam", &cfg).unwrap();
+    let qr = single(
+        e.query_area("170,8,-170,22", None, None, None, None)
+            .unwrap(),
+    );
+    let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &qr.domain else {
+        panic!("expected a Grid domain");
+    };
+    assert_eq!(t.as_ref().map(Vec::len), Some(2));
+    assert!(x.iter().any(|&lon| lon > 170.0) && x.iter().any(|&lon| lon < -170.0));
+    let nd = &qr.ranges["temp"];
+    let per_t = x.len() * y.len();
+    let (mut east_side, mut west_side) = (0, 0);
+    for (iy, &lat) in y.iter().enumerate() {
+        for (ix, &lon) in x.iter().enumerate() {
+            let v = nd.values[iy * x.len() + ix];
+            let v1 = nd.values[per_t + iy * x.len() + ix];
+            // Cells beyond the outermost native columns (|lon| > 178) are
+            // off-grid and null; every other cell carries the field.
+            if lon.abs() <= 178.0 && (10.0..=20.0).contains(&lat) {
+                let v = v.unwrap_or_else(|| panic!("({lon}, {lat}) is null"));
+                let exp = 300.0 + 0.1 * lat + 0.01 * lon;
+                assert!(
+                    (v - exp).abs() < 1e-3,
+                    "({lon}, {lat}) = {v}, expected {exp}"
+                );
+                assert!(
+                    (v1.unwrap() - v - 1.0).abs() < 1e-3,
+                    "second step rises by 1"
+                );
+                if lon > 0.0 {
+                    east_side += 1
+                } else {
+                    west_side += 1
+                }
+            }
+        }
+    }
+    assert!(
+        east_side > 0 && west_side > 0,
+        "both sides of the seam: {east_side}/{west_side}"
+    );
+}
+
 #[test]
 fn forecast_uses_latest_run_with_lead_as_time() {
     let dir = tempfile::tempdir().unwrap();
@@ -256,11 +525,157 @@ fn spatial_extent_is_half_cell_expanded() {
 }
 
 #[test]
-fn supported_query_types_is_position() {
+fn supported_query_types_are_position_area_radius() {
     assert_eq!(
         engine().supported_query_types(),
-        vec!["position".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string()
+        ]
     );
+}
+
+#[test]
+fn area_query_grid_matches_linear_field_and_masks_the_polygon() {
+    let e = engine();
+    // A right triangle with its right angle at the south-west corner: the
+    // bbox's north-east cells lie outside the shape.
+    let resp = e
+        .query_area(
+            "POLYGON((3 52, 8 52, 3 57, 3 52))",
+            Some((
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            )),
+            Some(&["t2m".to_string()]),
+            None,
+            None,
+        )
+        .unwrap();
+    let qr = single(resp);
+    let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &qr.domain else {
+        panic!("expected a Grid domain");
+    };
+    assert!(t.is_none(), "single timestep → no t axis");
+    // Native 1° cells over a 5°×5° bbox.
+    assert_eq!(x.len(), 5);
+    assert_eq!(y.len(), 5);
+    assert!(x.windows(2).all(|p| p[0] < p[1]));
+    assert!(y.windows(2).all(|p| p[0] > p[1]));
+    let nd = &qr.ranges["t2m"];
+    assert_eq!(nd.shape, vec![5, 5]);
+    assert_eq!(nd.axis_names, vec!["y", "x"]);
+    let mut inside = 0;
+    for (r, &lat) in y.iter().enumerate() {
+        for (c, &lon) in x.iter().enumerate() {
+            let v = nd.values[r * 5 + c];
+            // Inside the triangle ⇔ lon - 3 + lat - 52 < 5 at the cell centre.
+            let expect_inside = (lon - 3.0) + (lat - 52.0) < 5.0;
+            match v {
+                Some(v) => {
+                    assert!(
+                        expect_inside,
+                        "cell ({lon}, {lat}) outside the triangle has a value"
+                    );
+                    let exp = 273.15 + 0.1 * lat + 0.01 * lon; // f32 store: 1e-4 tolerance
+                    assert!(
+                        (v - exp).abs() < 1e-4,
+                        "({lon}, {lat}) = {v}, expected {exp}"
+                    );
+                    inside += 1;
+                }
+                None => assert!(
+                    !expect_inside,
+                    "cell ({lon}, {lat}) inside the triangle is null"
+                ),
+            }
+        }
+    }
+    // Centres on the hypotenuse (offset sum == 5) are edge points, excluded:
+    // 10 of the 25 cell centres are strictly inside.
+    assert_eq!(inside, 10, "10 of 25 cell centres lie strictly inside");
+}
+
+#[test]
+fn area_query_all_timesteps_has_t_axis() {
+    let e = engine();
+    let qr = single(e.query_area("4,53,6,55", None, None, None, None).unwrap());
+    let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &qr.domain else {
+        panic!("expected a Grid domain");
+    };
+    let t = t.as_ref().expect("all timesteps → t axis");
+    assert_eq!(t.len(), 4);
+    for key in ["t2m", "t2m_packed"] {
+        let nd = &qr.ranges[key];
+        assert_eq!(nd.shape, vec![4, y.len(), x.len()]);
+        assert_eq!(nd.axis_names, vec!["t", "y", "x"]);
+        // The field rises 0.5 K per timestep at every cell.
+        let per_t = y.len() * x.len();
+        for cell in 0..per_t {
+            let a = nd.values[cell].unwrap();
+            let b = nd.values[3 * per_t + cell].unwrap();
+            assert!((b - a - 1.5).abs() < 0.03, "{key} cell {cell}: {a} → {b}");
+        }
+    }
+}
+
+#[test]
+fn area_query_outside_extent_is_not_found() {
+    let err = engine()
+        .query_area("100,10,101,11", None, None, None, None)
+        .unwrap_err();
+    assert!(
+        matches!(err, ds_core::error::DataServerError::LocationNotFound(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn window_dims_budget_the_native_read() {
+    // Reach the catalog through the engine's public surface: an area over the
+    // whole fixture reads at most the native 16 × 12 grid per step, and the
+    // response is well under the budget — while an off-grid bbox is None.
+    let e = engine();
+    let qr = single(
+        e.query_area(
+            "-0.5,48.5,15.5,60.5",
+            None,
+            Some(&["t2m".to_string()]),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    let nd = &qr.ranges["t2m"];
+    assert_eq!(nd.shape[0], 4);
+    assert!(nd.shape[1] <= 12 && nd.shape[2] <= 16, "{:?}", nd.shape);
+}
+
+#[test]
+fn radius_query_delegates_to_area() {
+    let e = engine();
+    let qr = single(
+        e.query_radius(
+            "POINT(5.5 54.5)",
+            250_000.0,
+            None,
+            Some(&["t2m".to_string()]),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    let ds_core::model::DomainDescription::Grid { x, y, .. } = &qr.domain else {
+        panic!("expected a Grid domain");
+    };
+    let nd = &qr.ranges["t2m"];
+    // A 250 km disc spans ~4.5° of latitude → ≥ 4 native 1° cells per axis, so
+    // the bounding square's corner cell centres (~1.1 r out) are masked.
+    assert!(x.len() >= 4 && y.len() >= 4, "grid {}×{}", x.len(), y.len());
+    assert!(nd.values[0].is_none(), "NW corner must be masked");
+    let centre = ((y.len() / 2) * x.len()) + x.len() / 2;
+    assert!(nd.values[centre].is_some(), "centre must have data");
 }
 
 #[test]
