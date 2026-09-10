@@ -1131,7 +1131,15 @@ impl EdrEngine for GribEngine {
         _z: Option<&[f64]>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let bbox = parse_bbox_from_wkt(coords)?;
+        // The polygon's bbox selects the native grid subset; cells whose
+        // centre falls outside the polygon are masked to null (#671).
+        let polygon = ds_core::feature::parse_area_coords(coords)?;
+        let bbox = [
+            polygon.bbox.west,
+            polygon.bbox.south,
+            polygon.bbox.east,
+            polygon.bbox.north,
+        ];
         let step_file = self.resolve_step(reference_time, datetime)?.file;
 
         // Default to first near-surface parameter
@@ -1177,6 +1185,17 @@ impl EdrEngine for GribEngine {
             )));
         }
 
+        // Row-major over y × x, like the values `extract_bbox` returns. The
+        // longitude axis is in the requester's frame (a seam-crossing read
+        // runs …359.75, 360, −0.25…), so wrap into (−180, 180] for the test.
+        let x_wrapped: Vec<f64> = x_coords.iter().map(|&x| wrap_lon(x)).collect();
+        let mask = polygon.mask_cells(&x_wrapped, &y_coords);
+        if !mask.iter().any(|&m| m) {
+            return Err(DataServerError::LocationNotFound(
+                "The polygon contains no grid cell".into(),
+            ));
+        }
+
         let mut param_descs = std::collections::HashMap::new();
         let mut ranges = std::collections::HashMap::new();
 
@@ -1197,15 +1216,18 @@ impl EdrEngine for GribEngine {
             // Metadata is populated by fetch_grid on first decode.
             let meta = self.param_metadata(pname);
 
-            // Apply unit conversion
-            let values: Vec<Option<f64>> = if meta.display.has_conversion() {
-                values
-                    .into_iter()
-                    .map(|v| v.map(|raw| meta.display.convert(raw)))
-                    .collect()
-            } else {
-                values
-            };
+            // Apply unit conversion, then the polygon mask.
+            let values: Vec<Option<f64>> = values
+                .into_iter()
+                .zip(&mask)
+                .map(|(v, &inside)| match (v, inside) {
+                    (Some(raw), true) if meta.display.has_conversion() => {
+                        Some(meta.display.convert(raw))
+                    }
+                    (v, true) => v,
+                    (_, false) => None,
+                })
+                .collect();
 
             param_descs.insert(
                 pname.to_string(),
@@ -1429,52 +1451,16 @@ fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
     )))
 }
 
-/// Extract bbox [west, south, east, north] from WKT POLYGON or simple bbox string.
-fn parse_bbox_from_wkt(coords: &str) -> Result<[f64; 4], DataServerError> {
-    let coords = coords.trim();
-
-    // Try "west,south,east,north" format first
-    let parts: Vec<&str> = coords.split(',').collect();
-    if parts.len() == 4 {
-        let vals: Result<Vec<f64>, _> = parts.iter().map(|p| p.trim().parse::<f64>()).collect();
-        if let Ok(v) = vals {
-            return Ok([v[0], v[1], v[2], v[3]]);
-        }
+/// Wrap a longitude into (−180, 180] for the polygon test — `extract_bbox`
+/// reports a seam-crossing axis in the requester's frame (…, 359.75, 360,
+/// −0.25, …) and `QueryPolygon` reasons in CRS84.
+fn wrap_lon(lon: f64) -> f64 {
+    let w = (lon + 180.0).rem_euclid(360.0) - 180.0;
+    if w == -180.0 {
+        180.0
+    } else {
+        w
     }
-
-    // Try WKT POLYGON((x1 y1, x2 y2, ...))
-    if coords.starts_with("POLYGON") {
-        let inner = coords
-            .replace("POLYGON((", "")
-            .replace("POLYGON ((", "")
-            .replace("))", "");
-        let mut min_x = f64::MAX;
-        let mut min_y = f64::MAX;
-        let mut max_x = f64::MIN;
-        let mut max_y = f64::MIN;
-
-        for pair in inner.split(',') {
-            let xy: Vec<&str> = pair.split_whitespace().collect();
-            if xy.len() >= 2 {
-                let x: f64 = xy[0].parse().map_err(|_| {
-                    DataServerError::InvalidParameter(format!("Invalid WKT coordinate: {pair}"))
-                })?;
-                let y: f64 = xy[1].parse().map_err(|_| {
-                    DataServerError::InvalidParameter(format!("Invalid WKT coordinate: {pair}"))
-                })?;
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-            }
-        }
-
-        return Ok([min_x, min_y, max_x, max_y]);
-    }
-
-    Err(DataServerError::InvalidParameter(format!(
-        "Cannot parse area coordinates: {coords}"
-    )))
 }
 
 /// Build `(reference_time, prefix)` pairs to scan for the given pattern,
@@ -1708,12 +1694,6 @@ mod tests {
         let (lon, lat) = parse_coords("25.5,60.2").unwrap();
         assert!((lon - 25.5).abs() < 1e-10);
         assert!((lat - 60.2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_parse_bbox() {
-        let bbox = parse_bbox_from_wkt("20,55,30,65").unwrap();
-        assert_eq!(bbox, [20.0, 55.0, 30.0, 65.0]);
     }
 
     #[test]

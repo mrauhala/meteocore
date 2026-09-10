@@ -302,50 +302,58 @@ impl QueryPolygon {
         }
     }
 
-    /// Which cells of `axes` an area query should fill: row-major
-    /// (`iy * nx + ix`), `true` where the cell centre is inside the polygon.
-    /// When no centre is inside — a sliver, an L, or a ring smaller than one
-    /// native cell whose bbox collapsed to a single cell whose centre the
-    /// shape misses — the cells containing a polygon vertex are used
-    /// instead, so a small-but-real shape still returns its data instead of
-    /// a false "no cell inside" 404.
+    /// Which cells of `axes` an area query should fill — see
+    /// [`Self::mask_cells`] (row-major, `iy * nx + ix`).
     pub fn cell_mask(&self, axes: &AreaGridAxes) -> Vec<bool> {
-        let (nx, ny) = axes.dims();
-        let mut mask: Vec<bool> = axes
-            .y
+        self.mask_cells(&axes.x, &axes.y)
+    }
+
+    /// Which cells of a regular grid with centre axes `x` and `y` (either
+    /// orientation; row-major `iy * nx + ix`) an area query should fill:
+    /// `true` where the cell centre is inside the polygon. When no centre is
+    /// inside — a sliver, an L, or a ring smaller than one cell whose bbox
+    /// collapsed to a single cell the shape misses — the cells nearest each
+    /// polygon vertex (within half a cell) are used instead, so a small-but-
+    /// real shape still returns its data instead of a false "no cell
+    /// inside" 404 (#671).
+    pub fn mask_cells(&self, x: &[f64], y: &[f64]) -> Vec<bool> {
+        let (nx, ny) = (x.len(), y.len());
+        let mut mask: Vec<bool> = y
             .iter()
-            .flat_map(|&y| axes.x.iter().map(move |&x| (x, y)))
-            .map(|(x, y)| self.contains(x, y))
+            .flat_map(|&yy| x.iter().map(move |&xx| (xx, yy)))
+            .map(|(xx, yy)| self.contains(xx, yy))
             .collect();
         if mask.iter().any(|&m| m) || nx == 0 || ny == 0 {
             return mask;
         }
-        // Fallback: mark the cell whose extent contains each vertex. Cells
-        // are `cell_w × cell_h` around their centres.
-        let cell_w = if nx > 1 {
-            (axes.x[1] - axes.x[0]).rem_euclid(360.0)
-        } else {
-            self.bbox.east - self.bbox.west
-                + if self.bbox.crosses_antimeridian() {
-                    360.0
-                } else {
-                    0.0
-                }
+        // Half-cell tolerance from the axis spacing; a single-cell axis
+        // spans the whole bbox.
+        let half = |axis: &[f64], lo: f64, hi: f64| -> f64 {
+            if axis.len() > 1 {
+                ((axis[1] - axis[0]).abs() / 2.0).max(f64::EPSILON)
+            } else {
+                ((hi - lo).abs() / 2.0).max(f64::EPSILON)
+            }
         };
-        let cell_h = if ny > 1 {
-            axes.y[0] - axes.y[1]
-        } else {
-            self.bbox.north - self.bbox.south
+        let hx = half(x, self.bbox.west, self.bbox.east);
+        let hy = half(y, self.bbox.south, self.bbox.north);
+        let nearest = |axis: &[f64], v: f64, tol: f64| -> Option<usize> {
+            axis.iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    // Longitude distance modulo 360 so a seam-wrapped axis
+                    // still finds its cell.
+                    let d = (c - v).abs();
+                    (i, d.min((d - 360.0).abs()))
+                })
+                .filter(|&(_, d)| d <= tol)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
         };
         for &[vx, vy] in self.exterior.iter().chain(self.holes.iter().flatten()) {
-            let dx = (vx - (axes.x[0] - cell_w / 2.0)).rem_euclid(360.0);
-            let ix = ((dx / cell_w) as usize).min(nx - 1);
-            let dy = (axes.y[0] + cell_h / 2.0) - vy;
-            if dy < 0.0 {
-                continue;
+            if let (Some(ix), Some(iy)) = (nearest(x, vx, hx), nearest(y, vy, hy)) {
+                mask[iy * nx + ix] = true;
             }
-            let iy = ((dy / cell_h) as usize).min(ny - 1);
-            mask[axes.index(ix, iy)] = true;
         }
         mask
     }

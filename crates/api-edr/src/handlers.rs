@@ -875,7 +875,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": true,
                     "schema": {"type": "number"},
-                    "description": "Defines radius of area around defined coordinates to include in the data selection. Must be positive; at most 1000 km. The circle is evaluated as a 64-vertex geodesic polygon, so the response is the same shape as the area query's; engines whose area query samples the polygon's bounding box return the circle's bounding grid."
+                    "description": "Defines radius of area around defined coordinates to include in the data selection. Must be positive; at most 1000 km. The circle is evaluated as a 64-vertex geodesic polygon, so the response is the same shape as the area query's: gridded engines return the circle's bbox as the Grid domain with cells outside the disc null."
                 },
                 "within-units": {
                     "name": "within-units",

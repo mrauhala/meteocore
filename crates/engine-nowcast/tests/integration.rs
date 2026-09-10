@@ -2306,4 +2306,39 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
         n = 55.002
     );
     assert!(engine.query_area(&tiny, None, None, None, None).is_ok());
+
+    // #671: a non-rectangular polygon masks the blocks outside it. Right
+    // triangle with the right angle at the south-west corner of the extent.
+    let tri = format!(
+        "POLYGON(({w} {s},{e} {s},{w} {n},{w} {s}))",
+        w = EXTENT[0],
+        s = EXTENT[1],
+        e = EXTENT[2],
+        n = EXTENT[3]
+    );
+    let CoverageResponse::Single(tri_cov) = engine
+        .query_area(&tri, None, None, None, None)
+        .expect("triangle area query")
+    else {
+        panic!("expected a single coverage");
+    };
+    let DomainDescription::Grid { x: tx, y: ty, .. } = &tri_cov.domain else {
+        panic!("expected a Grid domain");
+    };
+    let tu = &tri_cov.ranges["motion_u"].values;
+    // y ascends: the NE corner is the last row's last column.
+    assert!(
+        tu[tu.len() - 1].is_none(),
+        "NE block outside the triangle must be null"
+    );
+    assert!(
+        tu[0].is_some(),
+        "SW block inside the triangle must have a value"
+    );
+    let inside = tu.iter().filter(|v| v.is_some()).count();
+    assert!(
+        inside > 0 && inside * 3 < tx.len() * ty.len() * 2,
+        "about half the bbox masked: {inside}/{}",
+        tx.len() * ty.len()
+    );
 }
