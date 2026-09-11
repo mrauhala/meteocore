@@ -183,18 +183,18 @@ impl QueryPolygon {
         let x = norm(x);
         // The boundary belongs to the polygon (a station exactly on a bbox
         // edge is inside it, as the inclusive `Bbox::contains` always said);
-        // ray casting alone is exclusive on the north/east edges.
-        if point_on_ring_by(x, y, &self.exterior, norm)
-            || self.holes.iter().any(|h| point_on_ring_by(x, y, h, norm))
-        {
-            return true;
-        }
-        if !point_in_ring_by(x, y, &self.exterior, norm) {
-            return false;
+        // ray casting alone is exclusive on the north/east edges. One ring
+        // walk per ring decides both.
+        match ring_side_by(x, y, &self.exterior, norm) {
+            RingSide::Outside => return false,
+            RingSide::OnBoundary => return true,
+            RingSide::Inside => {}
         }
         for hole in &self.holes {
-            if point_in_ring_by(x, y, hole, norm) {
-                return false;
+            match ring_side_by(x, y, hole, norm) {
+                RingSide::Inside => return false,
+                RingSide::OnBoundary => return true, // a hole's edge is polygon
+                RingSide::Outside => {}
             }
         }
         true
@@ -242,7 +242,8 @@ impl QueryPolygon {
 }
 
 /// Upper bound on `cells × ring vertices` a single area mask may cost —
-/// ~20 M edge tests, tens of milliseconds, on the request-serving runtime.
+/// ~20 M edge tests (one ring walk per cell decides inside AND on-boundary),
+/// tens of milliseconds, on the request-serving runtime.
 pub const MAX_MASK_EDGE_TESTS: usize = 20_000_000;
 
 /// Enforce [`MAX_MASK_EDGE_TESTS`] for masking `cells` grid cells against
@@ -445,15 +446,27 @@ fn point_in_ring(x: f64, y: f64, ring: &[[f64; 2]]) -> bool {
     point_in_ring_by(x, y, ring, |lon| lon)
 }
 
-/// Exact test for a point on a ring's boundary (collinear with a segment and
-/// within its extent), longitudes passed through `norm` like
-/// [`point_in_ring_by`]. Exact rather than tolerant on purpose: the case
-/// that matters is a coordinate round-tripped verbatim onto an edge.
-fn point_on_ring_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> bool {
+/// Where a point lies relative to a ring.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RingSide {
+    Outside,
+    Inside,
+    /// Exactly on a segment (collinear and within its extent) — exact rather
+    /// than tolerant on purpose: the case that matters is a coordinate
+    /// round-tripped verbatim onto an edge.
+    OnBoundary,
+}
+
+/// One walk of the ring: ray casting plus the on-segment test in the same
+/// loop, so `contains` costs `vertices` edge tests per cell — the unit
+/// [`check_mask_budget`] counts. Longitudes pass through `norm` (the
+/// antimeridian frame; the caller normalises `x` the same way).
+fn ring_side_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> RingSide {
     let n = ring.len();
-    if n < 2 {
-        return false;
+    if n < 3 {
+        return RingSide::Outside;
     }
+    let mut inside = false;
     let mut j = n - 1;
     for i in 0..n {
         let (xi, yi) = (norm(ring[i][0]), ring[i][1]);
@@ -461,32 +474,24 @@ fn point_on_ring_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64
         let cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
         if cross == 0.0 && x >= xi.min(xj) && x <= xi.max(xj) && y >= yi.min(yj) && y <= yi.max(yj)
         {
-            return true;
+            return RingSide::OnBoundary;
         }
-        j = i;
-    }
-    false
-}
-
-/// [`point_in_ring`] with the ring's longitudes passed through `norm`
-/// (the caller normalises `x` the same way) — how an antimeridian-crossing
-/// ring is tested in a 0..360 frame without allocating a shifted copy.
-fn point_in_ring_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> bool {
-    let n = ring.len();
-    if n < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let mut j = n - 1;
-    for i in 0..n {
-        let (xi, yi) = (norm(ring[i][0]), ring[i][1]);
-        let (xj, yj) = (norm(ring[j][0]), ring[j][1]);
         if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
             inside = !inside;
         }
         j = i;
     }
-    inside
+    if inside {
+        RingSide::Inside
+    } else {
+        RingSide::Outside
+    }
+}
+
+/// [`point_in_ring`] with the ring's longitudes passed through `norm`; the
+/// boundary counts as inside.
+fn point_in_ring_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> bool {
+    ring_side_by(x, y, ring, norm) != RingSide::Outside
 }
 
 /// Parse a WKT ring string (comma-separated `lon lat` pairs) into coordinate pairs.

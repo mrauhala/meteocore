@@ -1189,7 +1189,12 @@ impl EdrEngine for GribEngine {
         // longitude axis is in the requester's frame (a seam-crossing read
         // runs …359.75, 360, −0.25…), so wrap into (−180, 180] for the test.
         ds_core::feature::check_mask_budget(area_pixels, &polygon)?;
-        let x_wrapped: Vec<f64> = x_coords.iter().map(|&x| wrap_lon(x)).collect();
+        // `extract_bbox` reports a seam-crossing axis in the requester's frame
+        // (…, 359.75, 360, −0.25, …); `QueryPolygon` reasons in CRS84.
+        let x_wrapped: Vec<f64> = x_coords
+            .iter()
+            .map(|&x| ds_core::geo::wrap_lon(x))
+            .collect();
         let mask = polygon.mask_cells(&x_wrapped, &y_coords);
         if !mask.iter().any(|&m| m) {
             return Err(DataServerError::LocationNotFound(
@@ -1208,11 +1213,23 @@ impl EdrEngine for GribEngine {
                 .and_then(|m| m.level);
 
             let pgrid = self.fetch_grid(&step_file, pname, plevel)?;
-            let (_xc, _yc, values) = pgrid.extract_bbox(bbox).ok_or_else(|| {
+            let (xc, yc, values) = pgrid.extract_bbox(bbox).ok_or_else(|| {
                 DataServerError::InvalidParameter(format!(
                     "Bbox does not intersect grid for {pname}"
                 ))
             })?;
+            // The mask and the Grid domain come from the first parameter's
+            // grid; a parameter on a different native grid cannot share them.
+            if xc != x_coords || yc != y_coords {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "Parameter '{pname}' is on a different grid than '{param_name}' \
+                     ({}×{} vs {}×{} cells over this area); query them separately",
+                    xc.len(),
+                    yc.len(),
+                    x_coords.len(),
+                    y_coords.len()
+                )));
+            }
 
             // Metadata is populated by fetch_grid on first decode.
             let meta = self.param_metadata(pname);
@@ -1450,18 +1467,6 @@ fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
     Err(DataServerError::InvalidParameter(format!(
         "Cannot parse coordinates: {coords}"
     )))
-}
-
-/// Wrap a longitude into (−180, 180] for the polygon test — `extract_bbox`
-/// reports a seam-crossing axis in the requester's frame (…, 359.75, 360,
-/// −0.25, …) and `QueryPolygon` reasons in CRS84.
-fn wrap_lon(lon: f64) -> f64 {
-    let w = (lon + 180.0).rem_euclid(360.0) - 180.0;
-    if w == -180.0 {
-        180.0
-    } else {
-        w
-    }
 }
 
 /// Build `(reference_time, prefix)` pairs to scan for the given pattern,
