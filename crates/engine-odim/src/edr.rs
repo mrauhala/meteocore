@@ -50,16 +50,6 @@ use crate::reader::OdimComposite;
 /// 1 MB while still being finer than most display use cases need.
 use ds_core::feature::MAX_AREA_DIM;
 
-/// Cap on the number of timesteps an area query may span. The area
-/// coverage is an `ny × nx` grid (each ≤ `MAX_AREA_DIM`) *per*
-/// timestep, so an unbounded count would let one request allocate
-/// hundreds of MB. 64 × 256 × 256 `Option<f64>` ≈ 67 MB worst case,
-/// which bounds a deliberate area-over-time query while still
-/// rejecting a "give me everything" request against a full
-/// 5-min-cadence catalog (~288 entries). A position query has no
-/// such cap because it yields only `N` scalars, not `N · ny · nx`.
-const MAX_AREA_TIMESTEPS: usize = 64;
-
 /// Parse an EDR `coords` value for a position query into
 /// `(lat, lon)`. Accepts WKT `POINT(lon lat)` and the bare
 /// `lon,lat` shorthand — the same two forms the other engines
@@ -312,20 +302,6 @@ impl OdimEngine {
             ));
         }
 
-        // Bound the response size. An area query produces an
-        // `ny × nx` grid per timestep (`ny`, `nx` ≤ `MAX_AREA_DIM`),
-        // so an unfiltered query over a full 5-min-cadence catalog
-        // (`max_files` up to ~288) would allocate hundreds of MB.
-        // Cap the timestep count and tell the client to narrow
-        // `datetime` rather than silently truncating their request.
-        if entries.len() > MAX_AREA_TIMESTEPS {
-            return Err(DataServerError::InvalidParameter(format!(
-                "Area query spans {} timesteps; the maximum is {MAX_AREA_TIMESTEPS}. \
-                 Narrow the `datetime` range.",
-                entries.len()
-            )));
-        }
-
         // Grid resolution comes from the seed composite's dimensions
         // (every timestep shares the same grid) — no probe load, so
         // a single unreadable first file no longer hard-fails the
@@ -340,6 +316,12 @@ impl OdimEngine {
         // west→east, y descends north→south, each ≤ `MAX_AREA_DIM`.
         let axes = polygon.sample_grid(deg_per_px_lon, deg_per_px_lat, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
+        // The shared per-response budget (#673) replaces the old 64-timestep
+        // cap: an unfiltered query over a full 5-min catalog (~288 entries ×
+        // 256 × 256 cells) is told to narrow `datetime` instead of
+        // allocating hundreds of MB; a position query has no such cap
+        // because it yields N scalars, not N · ny · nx.
+        ds_core::feature::check_area_budget(entries.len(), ny, nx, 1)?;
         ds_core::feature::check_mask_budget(nx * ny, polygon)?;
         let mask = polygon.cell_mask(&axes);
         let x_values = axes.x;

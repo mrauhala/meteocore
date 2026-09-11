@@ -269,10 +269,11 @@ pub fn check_mask_budget(cells: usize, polygon: &QueryPolygon) -> Result<(), Dat
 /// a wider bbox is *coarsened* to this, never refused.
 pub const MAX_AREA_DIM: usize = 256;
 /// Total value budget of one gridded area response across timesteps ×
-/// cells × parameters (≈ 8 MB of CoverageJSON). One home for every engine
-/// so the budget cannot drift per engine (#672 review); GRIB / GeoTIFF /
-/// ODIM / PostGIS still carry older local limits — consolidating them is a
-/// follow-up.
+/// cells × parameters (≈ 8 MB of CoverageJSON). One home for every gridded
+/// engine — GRIB, GeoTIFF, ODIM, QueryData, Zarr, nowcast — so the budget
+/// cannot drift per engine (#672 review, #673). PostGIS keeps its own
+/// `MAX_RESPONSE_VALUES`: that bounds SQL rows fetched across *every* query
+/// type (position, location, area), not a grid.
 pub const MAX_AREA_VALUES: usize = 1_000_000;
 
 /// Enforce [`MAX_AREA_VALUES`] for a `timesteps × ny × nx × parameters`

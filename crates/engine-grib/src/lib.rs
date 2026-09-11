@@ -1177,13 +1177,10 @@ impl EdrEngine for GribEngine {
             DataServerError::InvalidParameter("Bbox does not intersect grid".to_string())
         })?;
 
-        // Check area size limit
+        // The shared per-response budget (#673): one timestep here, every
+        // requested parameter on the same grid.
         let area_pixels = x_coords.len() * y_coords.len();
-        if area_pixels > 1_000_000 {
-            return Err(DataServerError::InvalidParameter(format!(
-                "Area query would return {area_pixels} pixels, exceeding limit of 1,000,000"
-            )));
-        }
+        ds_core::feature::check_area_budget(1, y_coords.len(), x_coords.len(), query_params.len())?;
 
         // Row-major over y × x, like the values `extract_bbox` returns. The
         // longitude axis is in the requester's frame (a seam-crossing read
