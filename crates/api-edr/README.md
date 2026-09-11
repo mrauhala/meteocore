@@ -82,14 +82,14 @@ CoverageJSON 1.0 schema.
 |---|---|---|---|---|---|---|---|
 | CSV | ✓ | – | ✓ | ✓ | – | n/a | stations whose point is inside the polygon (≤ 500) |
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | polygon-tested |
-| GRIB | – | ✓ | ✓ | ✓ | – | ✓ | **bbox only** — Grid over the polygon's bounding box, no mask (#671) |
+| GRIB | – | ✓ | ✓ | ✓ | – | ✓ | Grid over the polygon's bbox at native resolution (≤ 1M cells), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
 | QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps |
 | Zarr | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, one store read per variable for the whole time span (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
 | ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | polar sampling; trajectory = RHI cross-section |
-| PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | n/a | stations-only `location_source`: exact `ST_Within`; observations-derived: **bbox only** (#671) |
-| PostGIS events | – | – | ✓ | ✓ | – | n/a | events in the polygon as a `Point` CoverageCollection; **bbox only** (#671) |
-| Nowcast | – | – | ✓ (motion field) | ✓ | – | ✓ | motion blocks in the polygon's **bbox** (#671); reflectivity via EDR = #523 |
+| PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | n/a | stations-only `location_source`: exact `ST_Within` in SQL; observations-derived: exact point-in-polygon on the cached station set |
+| PostGIS events | – | – | ✓ | ✓ | – | n/a | events in the polygon (exact, in SQL) as a `Point` CoverageCollection |
+| Nowcast | – | – | ✓ (motion field) | ✓ | – | ✓ | motion blocks over the polygon's bbox, blocks outside the polygon masked; reflectivity via EDR = #523 |
 | CAP, GeoJSON | — no `EdrEngine` (Features/Maps only) — | | | | | | |
 
 Radius, cube, corridor and items have no engine-specific code: radius is
@@ -101,9 +101,8 @@ answered by every engine that answers area, the other three do not exist.
 2. `cube` and `corridor` (derivable from area / trajectory).
 3. `crs` on data queries + `crs_details`; EDR GeoJSON output for point results (then declare `edr-geojson`).
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
-5. Mask instead of bbox on GRIB / nowcast / PostGIS observations mode (#671).
 
 Related issues: #585 MULTIPOINT fan-out bound · #510 `f` aliases · #667
 antimeridian bboxes · #668 400-vs-404 on unsupported query types · #666
 shared parameter-name validation · #665 GRIB value rounding · #523 nowcast
-reflectivity via EDR · #671 bbox-vs-disc.
+reflectivity via EDR · #673 shared area budget.

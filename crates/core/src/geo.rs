@@ -68,6 +68,18 @@ pub fn beam_height_at_ground(elangle_deg: f64, ground_distance_m: f64) -> f64 {
     h
 }
 
+/// Wrap a longitude into (−180, 180] — the one formula for it (Critical Rule 4
+/// spirit: the GRIB seam-frame axis, `destination_point` and the nowcast impact
+/// join all need it).
+pub fn wrap_lon(lon_deg: f64) -> f64 {
+    let w = (lon_deg + 180.0).rem_euclid(360.0) - 180.0;
+    if w == -180.0 {
+        180.0
+    } else {
+        w
+    }
+}
+
 /// Great-circle distance between two WGS84 points, metres (haversine on the
 /// mean Earth radius). Good to ~0.3% — fine for range and coverage tests.
 ///

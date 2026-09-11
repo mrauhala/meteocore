@@ -2135,6 +2135,16 @@ impl EdrEngine for NowcastEngine {
             )
         })?;
 
+        // Blocks whose centre falls outside the polygon are null (#671);
+        // `MotionGrid` is row-major over y × x.
+        ds_core::feature::check_mask_budget(grid.x.len() * grid.y.len(), &polygon)?;
+        let mask = polygon.mask_cells(&grid.x, &grid.y);
+        if !mask.iter().any(|&m| m) {
+            return Err(DataServerError::LocationNotFound(
+                "The polygon contains no motion block".into(),
+            ));
+        }
+
         let mut param_descs = HashMap::new();
         let mut ranges = HashMap::new();
         let shape = vec![1, grid.y.len(), grid.x.len()];
@@ -2154,7 +2164,11 @@ impl EdrEngine for NowcastEngine {
                     axis_names: axis_names.clone(),
                     // 2 decimals of m/s is well inside the estimator's noise
                     // and keeps the document small (#661: ~3k vectors).
-                    values: values.iter().map(|&v| Some(round_to(v, 2))).collect(),
+                    values: values
+                        .iter()
+                        .zip(&mask)
+                        .map(|(&v, &inside)| inside.then(|| round_to(v, 2)))
+                        .collect(),
                 },
             );
         }

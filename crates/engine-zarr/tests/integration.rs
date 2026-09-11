@@ -696,8 +696,9 @@ fn area_query_grid_matches_linear_field_and_masks_the_polygon() {
     for (r, &lat) in y.iter().enumerate() {
         for (c, &lon) in x.iter().enumerate() {
             let v = nd.values[r * 5 + c];
-            // Inside the triangle ⇔ lon - 3 + lat - 52 < 5 at the cell centre.
-            let expect_inside = (lon - 3.0) + (lat - 52.0) < 5.0;
+            // Inside the triangle ⇔ lon - 3 + lat - 52 ≤ 5 at the cell centre
+            // (the boundary is inclusive, so centres on the hypotenuse count).
+            let expect_inside = (lon - 3.0) + (lat - 52.0) <= 5.0;
             match v {
                 Some(v) => {
                     assert!(
@@ -718,9 +719,9 @@ fn area_query_grid_matches_linear_field_and_masks_the_polygon() {
             }
         }
     }
-    // Centres on the hypotenuse (offset sum == 5) are edge points, excluded:
-    // 10 of the 25 cell centres are strictly inside.
-    assert_eq!(inside, 10, "10 of 25 cell centres lie strictly inside");
+    // Centres on the hypotenuse (offset sum == 5) are boundary points and the
+    // boundary is inclusive: 10 strictly inside + 5 on the edge.
+    assert_eq!(inside, 15, "10 interior + 5 hypotenuse cell centres");
 }
 
 #[test]

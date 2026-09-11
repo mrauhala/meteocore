@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::Bbox;
+use ds_core::feature::{check_mask_budget, parse_area_coords, QueryPolygon};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
@@ -495,21 +495,17 @@ impl EdrEngine for PostgisEngine {
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
         // Observations-derived modes (A/B) select stations in-memory from the
-        // cached set using the area's bounding box (a superset of exact
-        // `ST_Within` — documented v1 simplification). Stations-only mode keeps
+        // cached set with an exact point-in-polygon test (the bbox prefilter
+        // is inside `QueryPolygon::contains`; #671). Stations-only mode keeps
         // the live `ST_Within` prefilter.
         let stations = if self.config.location_source.uses_observations() {
-            let bbox = area_to_bbox(coords)?;
+            let polygon = parse_area_coords(coords)?;
             let meta = self.load_meta();
-            // Stop at the cap + nothing more — mirrors the SQL path's
-            // `LIMIT MAX_STATIONS_IN_POLYGON`, so a huge bbox over a dense
-            // dataset never materialises an unbounded Vec just to error out.
-            meta.locations
-                .iter()
-                .filter(|l| bbox.contains(l.longitude, l.latitude))
-                .take(MAX_STATIONS_IN_POLYGON)
-                .cloned()
-                .collect::<Vec<Location>>()
+            // Same cells × vertices bound the gridded engines apply: every
+            // cached station is ray-cast against the ring before `take` can
+            // stop it.
+            check_mask_budget(meta.locations.len(), &polygon)?;
+            stations_in_polygon(&meta.locations, &polygon)
         } else {
             let polygon_wkt = normalize_area_wkt(coords)?;
             run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?
@@ -536,6 +532,20 @@ impl EdrEngine for PostgisEngine {
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
+
+/// The observations-derived area prefilter: cached stations inside the
+/// polygon (exact point-in-polygon, boundary inclusive; #671). Stops at the
+/// cap + nothing more — mirrors the SQL path's `LIMIT MAX_STATIONS_IN_POLYGON`,
+/// so a huge polygon over a dense dataset never materialises an unbounded
+/// Vec just to error out.
+fn stations_in_polygon(locations: &[Location], polygon: &QueryPolygon) -> Vec<Location> {
+    locations
+        .iter()
+        .filter(|l| polygon.contains(l.longitude, l.latitude))
+        .take(MAX_STATIONS_IN_POLYGON)
+        .cloned()
+        .collect()
+}
 
 /// Both area prefilters (SQL `LIMIT 10001`, in-memory `.take(10001)`) fetch
 /// one row past the ceiling; a full batch means the polygon matched more
@@ -948,65 +958,6 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let dlon = (lon2 - lon1).to_radians();
     let a = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
     2.0 * EARTH_RADIUS_M * a.sqrt().atan2((1.0 - a).sqrt())
-}
-
-/// Reduce an EDR area `coords` value (a `west,south,east,north` bbox string or
-/// a `POLYGON((...))` WKT, CRS84 lon/lat) to its bounding box. For a true
-/// polygon this returns the enclosing box — the documented bbox-superset
-/// behavior of the observations-derived area path. Antimeridian-crossing
-/// polygons are not special-cased (v1).
-fn area_to_bbox(coords: &str) -> Result<Bbox, DataServerError> {
-    let s = coords.trim();
-    let invalid = |m: String| {
-        DataServerError::InvalidParameter(format!("cannot parse area coordinates: {m}"))
-    };
-    let is_polygon = s
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("POLYGON"));
-    if !is_polygon {
-        let parts: Vec<&str> = s.split(',').collect();
-        if parts.len() == 4 {
-            if let Ok(v) = parts
-                .iter()
-                .map(|p| p.trim().parse::<f64>())
-                .collect::<Result<Vec<_>, _>>()
-            {
-                return Bbox::new(v[0], v[1], v[2], v[3])
-                    .map_err(|e| DataServerError::InvalidParameter(format!("invalid bbox: {e}")));
-            }
-        }
-        return Err(invalid(s.to_string()));
-    }
-    // POLYGON WKT: collect every numeric token (lon lat pairs), take min/max.
-    let mut nums: Vec<f64> = Vec::new();
-    for tok in s.split(|c: char| c == '(' || c == ')' || c == ',' || c.is_whitespace()) {
-        let t = tok.trim();
-        if t.is_empty() || t.eq_ignore_ascii_case("POLYGON") {
-            continue;
-        }
-        nums.push(
-            t.parse::<f64>()
-                .map_err(|_| invalid(format!("bad coordinate '{t}'")))?,
-        );
-    }
-    if nums.len() < 8 || !nums.len().is_multiple_of(2) {
-        return Err(invalid("polygon needs at least 4 coordinate pairs".into()));
-    }
-    let (mut w, mut so, mut e, mut n) = (
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-    );
-    for pair in nums.as_chunks::<2>().0 {
-        let (lon, lat) = (pair[0], pair[1]);
-        w = w.min(lon);
-        e = e.max(lon);
-        so = so.min(lat);
-        n = n.max(lat);
-    }
-    Bbox::new(w, so, e, n)
-        .map_err(|e| DataServerError::InvalidParameter(format!("invalid polygon bbox: {e}")))
 }
 
 pub(crate) fn map_pg_error(e: tokio_postgres::Error, q: &BuiltQuery) -> DataServerError {
@@ -1789,6 +1740,25 @@ mod tests {
         }
     }
 
+    /// #671: the observations-derived area path is an exact polygon test,
+    /// not the polygon's bbox — and a station exactly on the edge is in.
+    #[test]
+    fn stations_in_polygon_is_exact_and_boundary_inclusive() {
+        let stations = vec![
+            loc("inside", 10.5, 50.5),
+            loc("bbox-only", 11.9, 51.9), // inside the bbox, outside the triangle
+            loc("north-edge", 10.0, 52.0),
+            loc("east-edge", 12.0, 50.0),
+            loc("outside", 13.0, 53.0),
+        ];
+        let tri = parse_area_coords("POLYGON((10 50, 12 50, 10 52, 10 50))").unwrap();
+        let found = stations_in_polygon(&stations, &tri);
+        let ids: Vec<&str> = found.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(ids, vec!["inside", "north-edge", "east-edge"]);
+        let rect = parse_area_coords("10,50,12,52").unwrap();
+        assert_eq!(stations_in_polygon(&stations, &rect).len(), 4);
+    }
+
     #[test]
     fn station_cap_maps_to_query_too_large_not_engine_error() {
         // A full-ceiling batch stays under the limit untouched.
@@ -1862,36 +1832,6 @@ mod tests {
         let meta = meta_with(vec![loc("tampere", 23.76, 61.50)]);
         // ~250 km away with a 25 km radius → nothing in range.
         assert!(nearest_in_memory(&meta, 24.95, 60.16, 25_000.0).is_none());
-    }
-
-    #[test]
-    fn area_to_bbox_parses_bbox_string() {
-        let b = area_to_bbox("10,40,30,50").unwrap();
-        assert_eq!((b.west, b.south, b.east, b.north), (10.0, 40.0, 30.0, 50.0));
-        assert!(b.contains(20.0, 45.0));
-        assert!(!b.contains(35.0, 45.0));
-    }
-
-    #[test]
-    fn area_to_bbox_reduces_polygon_to_bounding_box() {
-        // Triangle — bbox is its enclosing rectangle.
-        let b = area_to_bbox("POLYGON((0 0,10 0,5 8,0 0))").unwrap();
-        assert_eq!((b.west, b.south, b.east, b.north), (0.0, 0.0, 10.0, 8.0));
-        assert!(b.contains(5.0, 4.0));
-        assert!(!b.contains(20.0, 4.0));
-        // Case-insensitive WKT keyword.
-        let lc = area_to_bbox("polygon((0 0,10 0,5 8,0 0))").unwrap();
-        assert_eq!(
-            (lc.west, lc.south, lc.east, lc.north),
-            (0.0, 0.0, 10.0, 8.0)
-        );
-    }
-
-    #[test]
-    fn area_to_bbox_rejects_garbage() {
-        assert!(area_to_bbox("nonsense").is_err());
-        assert!(area_to_bbox("1,2,3").is_err());
-        assert!(area_to_bbox("POLYGON((0 0,1 1))").is_err()); // <4 pairs
     }
 
     fn dummy_stations() -> crate::schema::StationsMapping {

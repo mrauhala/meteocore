@@ -138,12 +138,12 @@ pub trait EdrEngine: Send + Sync {
     /// The default turns the circle into a 64-vertex geodesic `POLYGON`
     /// ([`crate::feature::radius_polygon_wkt`]) and delegates to
     /// [`Self::query_area`], so any engine that answers area queries
-    /// answers radius queries with the same semantics — including the
-    /// same caveat: an engine whose area query samples the polygon's
-    /// *bounding box* (GRIB, nowcast, PostGIS with an observations-derived
-    /// location source) returns the circle's bounding grid / square rather
-    /// than a masked disc. Override only for a native circle
-    /// predicate (e.g. `ST_DWithin`). Advertise `"radius"` in
+    /// answers radius queries with the same semantics: every gridded engine
+    /// masks cells whose centre falls outside the polygon to null (a
+    /// CoverageJSON `Grid` stays rectangular, so the domain is the circle's
+    /// bbox with a null rim), and the station engines test each point
+    /// (#671). Override only for a native circle predicate (e.g.
+    /// `ST_DWithin`). Advertise `"radius"` in
     /// [`Self::supported_query_types`] wherever `"area"` is.
     fn query_radius(
         &self,
