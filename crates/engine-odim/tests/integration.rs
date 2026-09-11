@@ -332,11 +332,12 @@ fn edr_query_area_returns_grid() {
     );
 }
 
-/// An unbounded area query (`datetime = None`) over a catalog with
-/// more than `MAX_AREA_TIMESTEPS` (64) entries is rejected with a
-/// `400`-class error rather than allocating a hundreds-of-MB
-/// coverage cube. Builds a 65-file catalog by copying the DMI
-/// fixture to distinct 5-minute-spaced timestamps.
+/// An unbounded area query (`datetime = None`) over a catalog with more
+/// entries than the shared area budget allows (65 timesteps × 256 × 256
+/// cells ≫ `MAX_AREA_VALUES`, #673) is rejected with a `400`-class error
+/// rather than allocating a hundreds-of-MB coverage cube. Builds a 65-file
+/// catalog by copying the DMI fixture to distinct 5-minute-spaced
+/// timestamps.
 #[test]
 fn edr_query_area_rejects_too_many_timesteps() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -344,8 +345,8 @@ fn edr_query_area_rejects_too_many_timesteps() {
         .join("../../testdata/odim-dmi-fixture.h5")
         .canonicalize()
         .expect("fixture path canonicalises");
-    // 65 files at 5-min spacing from 2026-05-14 00:00 — one past the
-    // 64-timestep cap.
+    // 65 files at 5-min spacing from 2026-05-14 00:00 — far over the
+    // 1M-value budget at the 256 × 256 area grid.
     for i in 0..65 {
         let total_min = i * 5;
         let hh = total_min / 60;
@@ -381,16 +382,17 @@ fn edr_query_area_rejects_too_many_timesteps() {
     )
     .expect("engine builds over the 65-file catalog");
 
-    // No datetime filter → all 65 entries → over the cap → error.
+    // No datetime filter → all 65 entries → over the budget → error.
     let err = engine
         .query_area("9.0,55.0,12.0,57.5", None, None, None, None)
         .unwrap_err();
     assert!(
-        format!("{err}").contains("maximum is 64"),
-        "expected a timestep-cap error, got: {err}"
+        matches!(err, ds_core::error::DataServerError::QueryTooLarge(_))
+            && format!("{err}").contains("65 timesteps"),
+        "expected the shared area-budget error, got: {err}"
     );
 
-    // A narrow datetime range keeps it under the cap → succeeds.
+    // A narrow datetime range keeps it under the budget → succeeds.
     use chrono::{TimeZone, Utc};
     let start = Utc.with_ymd_and_hms(2026, 5, 14, 0, 0, 0).unwrap();
     let end = Utc.with_ymd_and_hms(2026, 5, 14, 0, 30, 0).unwrap();
@@ -398,7 +400,7 @@ fn edr_query_area_rejects_too_many_timesteps() {
         engine
             .query_area("9.0,55.0,12.0,57.5", Some((start, end)), None, None, None)
             .is_ok(),
-        "a 7-timestep window must stay under the cap"
+        "a 7-timestep window must stay under the budget"
     );
 }
 
