@@ -84,7 +84,7 @@ CoverageJSON 1.0 schema.
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | polygon-tested |
 | GRIB | – | ✓ | ✓ | ✓ | – | ✓ | **bbox only** — Grid over the polygon's bounding box, no mask (#671) |
 | QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps |
-| Zarr | – | ✓ | ✓ | ✓ | – | – | Grid over bbox at native resolution, ≤ 256 cells/axis, one store read per variable for the whole time span (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Pins the latest run internally (no instances) |
+| Zarr | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, one store read per variable for the whole time span (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
 | ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | polar sampling; trajectory = RHI cross-section |
 | PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | n/a | stations-only `location_source`: exact `ST_Within`; observations-derived: **bbox only** (#671) |
@@ -97,7 +97,7 @@ answered by every engine that answers area, the other three do not exist.
 
 ## Known gaps, in suggested order
 
-1. Zarr instances; `locations` and `trajectory` under `/instances/{id}/`.
+1. `locations` and `trajectory` under `/instances/{id}/`.
 2. `cube` and `corridor` (derivable from area / trajectory).
 3. `crs` on data queries + `crs_details`; EDR GeoJSON output for point results (then declare `edr-geojson`).
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
