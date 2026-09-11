@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.9.0](https://github.com/mrauhala/meteocore/compare/v0.8.1...v0.9.0) (2026-09-11)
+
+
+### Features
+
+* **cells:** significance ranking + fact sheets for tracked storm cells ([#602](https://github.com/mrauhala/meteocore/issues/602)) ([6f5e99b](https://github.com/mrauhala/meteocore/commit/6f5e99bcb1e48b99047374612be7d05f850d90d0))
+* **nowcast:** impact context — what a cell is over and heading toward ([#603](https://github.com/mrauhala/meteocore/issues/603)) ([463e2ce](https://github.com/mrauhala/meteocore/commit/463e2ceeac772155c5ad2208a33b85eed716f16b))
+* **features:** sortby on /items, and stop ignoring it silently ([#606](https://github.com/mrauhala/meteocore/issues/606)) ([727d9d9](https://github.com/mrauhala/meteocore/commit/727d9d96a3e7945b7bfd7825c437f54e6df30ddd))
+* **mcp:** Model Context Protocol tools over tracked storm cells ([#608](https://github.com/mrauhala/meteocore/issues/608)) ([32209d3](https://github.com/mrauhala/meteocore/commit/32209d3d80714780f11584866da46fa51864856b))
+* **cells:** demote persistent stationary echoes as likely clutter ([#614](https://github.com/mrauhala/meteocore/issues/614)) ([#615](https://github.com/mrauhala/meteocore/issues/615)) ([0789ff4](https://github.com/mrauhala/meteocore/commit/0789ff4fe5ca85000d4766e3bea6be4e2c368488))
+* **cells:** lightning density, first flash, and jump magnitude in sigma ([#617](https://github.com/mrauhala/meteocore/issues/617)) ([e26be63](https://github.com/mrauhala/meteocore/commit/e26be6380342c03bdcc851663e3598586d9a1c88))
+* **cells:** IC/CG split and CG polarity per storm cell ([#616](https://github.com/mrauhala/meteocore/issues/616) part 2) ([#618](https://github.com/mrauhala/meteocore/issues/618)) ([cad2dc0](https://github.com/mrauhala/meteocore/commit/cad2dc0fe5373c9f41719ece142a8066afa1d8e1))
+* **cells:** path straightness and net displacement, so track_age stops being evidence ([#629](https://github.com/mrauhala/meteocore/issues/629)) ([#631](https://github.com/mrauhala/meteocore/issues/631)) ([90d19c6](https://github.com/mrauhala/meteocore/commit/90d19c6cf518839ac774c802ea2398c5928b843a))
+* **mcp:** make the advertised sortable properties reachable ([#630](https://github.com/mrauhala/meteocore/issues/630)) ([#632](https://github.com/mrauhala/meteocore/issues/632)) ([388d04e](https://github.com/mrauhala/meteocore/commit/388d04e0ba847f23f6236d30394fa2511077f0c6))
+* **cells:** births, deaths, pass-2 matches and velocity clamps as /metrics counters ([#643](https://github.com/mrauhala/meteocore/issues/643)) ([#656](https://github.com/mrauhala/meteocore/issues/656)) ([d899fd8](https://github.com/mrauhala/meteocore/commit/d899fd8d620263d2592d21bc5a6094132248db52))
+* **cells:** nearest radar, range and lowest-beam height per storm cell ([#642](https://github.com/mrauhala/meteocore/issues/642)) ([#658](https://github.com/mrauhala/meteocore/issues/658)) ([c91af8a](https://github.com/mrauhala/meteocore/commit/c91af8ab1cdaedf80a0a0a5b95e2c60a81a0b811))
+* **nowcast:** serve the motion field as EDR motion_u/motion_v/motion_quality ([#661](https://github.com/mrauhala/meteocore/issues/661)) ([#662](https://github.com/mrauhala/meteocore/issues/662)) ([1905b34](https://github.com/mrauhala/meteocore/commit/1905b34ecb2a7e9676119697c5df07d59345d801))
+* **edr:** radius query type on every area-capable engine ([#513](https://github.com/mrauhala/meteocore/issues/513)) ([#670](https://github.com/mrauhala/meteocore/issues/670)) ([4363d2b](https://github.com/mrauhala/meteocore/commit/4363d2bdc160e3014bac4699a97ad2526cd1585d))
+* **querydata:** EDR area and radius queries; api-edr README as the EDR status page ([#672](https://github.com/mrauhala/meteocore/issues/672)) ([1f4d030](https://github.com/mrauhala/meteocore/commit/1f4d03019fbe704b2b5a2bb377acf7b726c0f3e7))
+* **zarr:** EDR area and radius queries ([#674](https://github.com/mrauhala/meteocore/issues/674)) ([76d7c30](https://github.com/mrauhala/meteocore/commit/76d7c30ff9f2e2dfe2dac4f675e4f6c4fd81f1af))
+* **zarr:** forecast model runs as EDR instances and DIM_REFERENCE_TIME ([#337](https://github.com/mrauhala/meteocore/issues/337)) ([#677](https://github.com/mrauhala/meteocore/issues/677)) ([0423c54](https://github.com/mrauhala/meteocore/commit/0423c548f38d0c06b953da89b50e2cba73383ab1))
+
+
+### Bug Fixes
+
+* **clippy:** chunks_exact -> as_chunks across the workspace ([#607](https://github.com/mrauhala/meteocore/issues/607)) ([85ea8ba](https://github.com/mrauhala/meteocore/commit/85ea8ba286df64b0d0890a03c12d92cd5a662441))
+* **mcp:** accept the deployment's own Host, not just loopback ([#609](https://github.com/mrauhala/meteocore/issues/609)) ([226a1ef](https://github.com/mrauhala/meteocore/commit/226a1ef804adb57bccca02cfa06ee95e07217f79))
+* **cells:** stop asserting flags that were never computable ([#626](https://github.com/mrauhala/meteocore/issues/626)) ([31c8829](https://github.com/mrauhala/meteocore/commit/31c8829cdb98726a8ac3977d5d35ed999e6fb71c))
+* **cells:** a cell with no strikes has a zero split, not an unknown one ([#628](https://github.com/mrauhala/meteocore/issues/628)) ([adfd68b](https://github.com/mrauhala/meteocore/commit/adfd68bba268e61e22922ac1a1132c9533f49d17))
+* **cells:** damp severity and trend flapping on coherent tracks ([#623](https://github.com/mrauhala/meteocore/issues/623)) ([#627](https://github.com/mrauhala/meteocore/issues/627)) ([1893dac](https://github.com/mrauhala/meteocore/commit/1893dacf52784873ec2fa179272da25c4fc1944b))
+* **cells:** clutter must not flag an echo that travelled, and ranks must not hole ([#637](https://github.com/mrauhala/meteocore/issues/637)) ([653f28a](https://github.com/mrauhala/meteocore/commit/653f28a9c73c9e5c3255c33a8cb86f6a9c80b0a9))
+* **cells:** match on size and intensity similarity, not centroid distance alone ([#639](https://github.com/mrauhala/meteocore/issues/639)) ([#655](https://github.com/mrauhala/meteocore/issues/655)) ([96a3d0e](https://github.com/mrauhala/meteocore/commit/96a3d0e76c20ff5daf7c691b6c361e2822dcc3b7))
+* **cells:** predict aged tracks with their own velocity, not the ambient field ([#639](https://github.com/mrauhala/meteocore/issues/639)) ([#657](https://github.com/mrauhala/meteocore/issues/657)) ([becd1bb](https://github.com/mrauhala/meteocore/commit/becd1bbffd53938c4b0d7f8fccbd3c62f29f0fbd))
+* **cells:** rank on the rounded significance, so page order and rank agree ([#644](https://github.com/mrauhala/meteocore/issues/644)) ([#659](https://github.com/mrauhala/meteocore/issues/659)) ([4bb1a05](https://github.com/mrauhala/meteocore/commit/4bb1a0565242a955026d8a02588e21b771e2e3e4))
+* **cells:** flags become bonus terms outside the denominator; trend is signed and calibrated ([#645](https://github.com/mrauhala/meteocore/issues/645)) ([#660](https://github.com/mrauhala/meteocore/issues/660)) ([dcb8a1d](https://github.com/mrauhala/meteocore/commit/dcb8a1da219cfa7619098a8f016da90823322b5d))
+* **grib:** wrap longitude in extract_bbox; area queries on 180°-first global grids 502'd ([#663](https://github.com/mrauhala/meteocore/issues/663)) ([#664](https://github.com/mrauhala/meteocore/issues/664)) ([4253d39](https://github.com/mrauhala/meteocore/commit/4253d39133a838e8a97e6d8272b094b641b54fc1))
+* **edr:** declare EDR 1.1 queries/html/oas30 conformance classes; drop bogus PostGIS `location` query type ([#669](https://github.com/mrauhala/meteocore/issues/669)) ([769cf39](https://github.com/mrauhala/meteocore/commit/769cf3924a3ece73a4935036a1a601574f3843fd))
+* **edr:** area/radius mask the polygon on GRIB, nowcast and PostGIS observations mode ([#671](https://github.com/mrauhala/meteocore/issues/671)) ([#678](https://github.com/mrauhala/meteocore/issues/678)) ([b4f03d2](https://github.com/mrauhala/meteocore/commit/b4f03d261678a14524202a011e3d3de5d28ea75c))
+
+
+### security
+
+* **deps:** clear all RustSec advisories and gate on cargo-audit ([#595](https://github.com/mrauhala/meteocore/issues/595)) ([2ee3813](https://github.com/mrauhala/meteocore/commit/2ee381395c068ab9c8cdeb60193380b2a64904c3))
+
 ## [0.8.1](https://github.com/mrauhala/meteocore/compare/v0.8.0...v0.8.1) (2026-08-18)
 
 
