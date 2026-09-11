@@ -165,7 +165,7 @@ fn select_time_idx(
     cat: &Catalog,
     run: Option<usize>,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<(Vec<usize>, Vec<DateTime<Utc>>), DataServerError> {
+) -> Result<(Vec<usize>, &[DateTime<Utc>]), DataServerError> {
     let times = cat.valid_times(run);
     let time_idx: Vec<usize> = match datetime {
         None => (0..times.len()).collect(),
@@ -190,7 +190,7 @@ impl EdrEngine for ZarrEngine {
     /// non-forecast store.
     fn get_instances(&self) -> Vec<RunInfo> {
         let cat = self.catalog.load();
-        instances::build_instances(&cat.runs, |_, &idx| cat.valid_times(Some(idx)))
+        instances::build_instances(&cat.runs, |_, &idx| cat.valid_times(Some(idx)).to_vec())
     }
 
     fn has_instances(&self) -> bool {
@@ -201,7 +201,7 @@ impl EdrEngine for ZarrEngine {
         let cat = self.catalog.load();
         cat.runs.get(&reference_time).map(|&idx| RunInfo {
             reference_time,
-            valid_times: cat.valid_times(Some(idx)),
+            valid_times: cat.valid_times(Some(idx)).to_vec(),
         })
     }
 
@@ -587,7 +587,7 @@ impl MapEngine for ZarrEngine {
             )
         })?;
 
-        let time_idx = nearest_time_idx(&cat.valid_times(run), time)
+        let time_idx = nearest_time_idx(cat.valid_times(run), time)
             .ok_or_else(|| DataServerError::Engine("No Zarr data available".into()))?;
 
         let n = (width as usize) * (height as usize);
@@ -687,7 +687,7 @@ impl MapEngine for ZarrEngine {
             return time;
         };
         let times = cat.valid_times(run);
-        nearest_time_idx(&times, time).map(|i| times[i]).or(time)
+        nearest_time_idx(times, time).map(|i| times[i]).or(time)
     }
 
     fn resolve_reference_time(

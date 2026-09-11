@@ -101,8 +101,10 @@ pub struct Catalog {
     latest_run: Option<usize>,
     /// Decoded reference axis in axis order (forecast only).
     ref_times: Vec<DateTime<Utc>>,
-    /// Lead offsets in axis order (forecast only); valid = run + lead.
-    leads: Vec<chrono::Duration>,
+    /// Each run's valid times (run + leads), by reference-axis index —
+    /// built once here so [`Self::valid_times`] is an O(1) borrow per
+    /// request (Critical Rule 10). Empty for a non-forecast store.
+    run_valid_times: Vec<Vec<DateTime<Utc>>>,
     /// Latitude axis values (degrees north; may be ascending or descending).
     lats: Vec<f64>,
     /// Longitude axis values (degrees east).
@@ -138,14 +140,12 @@ impl Catalog {
     }
 
     /// The valid times of `run` (a reference-axis index from
-    /// [`Self::resolve_run`]); the shared [`Self::times`] otherwise.
-    pub fn valid_times(&self, run: Option<usize>) -> Vec<DateTime<Utc>> {
-        match run {
-            Some(r) if r < self.ref_times.len() => {
-                let base = self.ref_times[r];
-                self.leads.iter().map(|d| base + *d).collect()
-            }
-            _ => self.times.clone(),
+    /// [`Self::resolve_run`]); the shared [`Self::times`] otherwise. A
+    /// borrow of a per-run list built at catalog build — no per-call work.
+    pub fn valid_times(&self, run: Option<usize>) -> &[DateTime<Utc>] {
+        match run.and_then(|r| self.run_valid_times.get(r)) {
+            Some(v) => v,
+            None => &self.times,
         }
     }
 
@@ -835,6 +835,10 @@ pub fn build(
     let extent = [west, south, east, north];
 
     let reference_times: Vec<DateTime<Utc>> = runs.keys().copied().collect();
+    let run_valid_times: Vec<Vec<DateTime<Utc>>> = ref_times
+        .iter()
+        .map(|base| leads.iter().map(|d| *base + *d).collect())
+        .collect();
     let raster_info = build_raster_info(
         &vars,
         &times,
@@ -849,7 +853,7 @@ pub fn build(
         latest_run: ref_pin.as_ref().map(|(_, idx)| *idx),
         runs,
         ref_times,
-        leads,
+        run_valid_times,
         lats,
         lons,
         extent,
