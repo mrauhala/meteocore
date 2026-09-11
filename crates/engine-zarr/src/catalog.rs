@@ -15,6 +15,7 @@ use zarrs::array::{data_type, Array, ArraySubset, CodecOptions};
 use zarrs::group::Group;
 
 use ds_core::error::DataServerError;
+use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
@@ -44,11 +45,8 @@ pub struct Variable {
     /// forecast (reference + lead), this is the **lead** axis.
     pub time_axis: Option<usize>,
     /// For a forecast, the axis index of the **reference time** (model run).
-    /// Reads take the run as a parameter ([`Catalog::resolve_run`]);
-    /// [`latest_run`](Self::latest_run) is the default.
+    /// Reads take the resolved run ([`Catalog::resolve_run`]) as a parameter.
     ref_axis: Option<usize>,
-    /// The reference-axis index of the latest run; 0 when not a forecast.
-    latest_run: u64,
     /// Axis index of the latitude dimension.
     lat_axis: usize,
     /// Axis index of the longitude dimension.
@@ -97,8 +95,6 @@ pub struct Catalog {
     /// (the `ds_core::instances` contract, #337). Empty for a non-forecast
     /// store.
     pub runs: BTreeMap<DateTime<Utc>, usize>,
-    /// Reference-axis index of the latest run (`None` when not a forecast).
-    latest_run: Option<usize>,
     /// Decoded reference axis in axis order (forecast only).
     ref_times: Vec<DateTime<Utc>>,
     /// Each run's valid times (run + leads), by reference-axis index —
@@ -129,13 +125,15 @@ impl Catalog {
         if self.runs.is_empty() {
             return Ok(None);
         }
-        match reference_time {
-            None => Ok(self.latest_run),
-            Some(rt) => self.runs.get(&rt).copied().map(Some).ok_or_else(|| {
-                DataServerError::ReferenceTimeNotFound(format!(
-                    "no model run for reference time {rt}"
-                ))
-            }),
+        // The shared selection rule (`None` ⇒ latest, `Some` ⇒ exact) — the
+        // same call GRIB and QueryData make, so "latest" cannot drift from
+        // what `/instances` lists last.
+        match instances::select_run(&self.runs, reference_time) {
+            Some((_, &idx)) => Ok(Some(idx)),
+            None => Err(DataServerError::ReferenceTimeNotFound(format!(
+                "no model run for reference time {}",
+                reference_time.expect("None resolves to the latest run")
+            ))),
         }
     }
 
@@ -154,10 +152,15 @@ impl Catalog {
         run.and_then(|r| self.ref_times.get(r).copied())
     }
 
-    /// The reference-axis range a read of `run` selects for `var`.
-    fn ref_range(var: &Variable, run: Option<usize>) -> Range<u64> {
-        let r = run.map(|r| r as u64).unwrap_or(var.latest_run);
-        r..r + 1
+    /// The reference-axis range a read of `run` selects. Only reached for a
+    /// variable with a reference axis, whose caller must have resolved the
+    /// run: a `None` here is a programming error, reported rather than
+    /// silently defaulted.
+    fn ref_range(run: Option<usize>) -> Result<Range<u64>, DataServerError> {
+        let r = run.ok_or_else(|| {
+            DataServerError::Engine("forecast variable read without a resolved run".into())
+        })? as u64;
+        Ok(r..r + 1)
     }
 
     /// Read a 2-D spatial slab of `var` at `time_idx` covering the WGS84 render
@@ -215,7 +218,7 @@ impl Catalog {
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
             } else if Some(a) == var.ref_axis {
-                ranges.push(Self::ref_range(var, run));
+                ranges.push(Self::ref_range(run)?);
             } else {
                 ranges.push(0..1);
             }
@@ -305,7 +308,7 @@ impl Catalog {
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
             } else if Some(a) == var.ref_axis {
-                ranges.push(Self::ref_range(var, run));
+                ranges.push(Self::ref_range(run)?);
             } else {
                 ranges.push(0..1);
             }
@@ -623,25 +626,21 @@ pub fn build(
         }
         let decoded =
             cf::decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
-        let (idx, t) = decoded
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, t)| **t)
-            .ok_or_else(|| {
-                DataServerError::Engine(format!("reference-time coordinate '{rd}' is empty"))
-            })?;
+        for (i, rt) in decoded.iter().enumerate() {
+            // A duplicated reference time keeps its LAST axis position.
+            runs.insert(*rt, i);
+        }
+        // "Latest" comes from the same shared rule `resolve_run` applies.
+        let (t, idx) = instances::select_run(&runs, None).ok_or_else(|| {
+            DataServerError::Engine(format!("reference-time coordinate '{rd}' is empty"))
+        })?;
         tracing::info!(
             "collection '{collection_id}': forecast — latest run {t} (of {} runs); lead axis \
              '{primary_dim}' is the time dimension",
             decoded.len()
         );
         latest_ref_time = Some(*t);
-        ref_pin = Some((rd.clone(), idx));
-        for (i, rt) in decoded.iter().enumerate() {
-            // A duplicated reference time keeps its LAST axis position, the
-            // same "latest wins" rule `max_by_key` applied above.
-            runs.insert(*rt, i);
-        }
+        ref_pin = Some((rd.clone(), *idx));
         ref_times = decoded;
     }
 
@@ -723,12 +722,10 @@ pub fn build(
             continue;
         };
 
-        // Forecast: this variable's reference (run) axis, defaulting to the
-        // latest run.
-        let (ref_axis, latest_run) = match &ref_pin {
-            Some((rd, idx)) => (dims.iter().position(|d| d == rd), *idx as u64),
-            None => (None, 0),
-        };
+        // Forecast: this variable's reference (run) axis.
+        let ref_axis = ref_pin
+            .as_ref()
+            .and_then(|(rd, _)| dims.iter().position(|d| d == rd));
 
         // Skip variables whose data type the read path can't widen to f64 (e.g.
         // float16/bfloat16, complex, raw bytes) at build time, with a clear
@@ -814,7 +811,6 @@ pub fn build(
             label,
             time_axis,
             ref_axis,
-            latest_run,
             lat_axis,
             lon_axis,
             ndim,
@@ -850,7 +846,6 @@ pub fn build(
     Ok(Catalog {
         vars,
         times,
-        latest_run: ref_pin.as_ref().map(|(_, idx)| *idx),
         runs,
         ref_times,
         run_valid_times,
