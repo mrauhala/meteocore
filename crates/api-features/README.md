@@ -102,16 +102,17 @@ Pagination: every engine materializes the whole filtered set and slices it
 ## Known gaps, in suggested order
 
 1. Reject or honour `f`, `crs`, `filter`, `properties` and unknown property
-   filters on `/items` instead of dropping them (the #605 rule: an unknown
-   parameter must not silently do nothing). Same for `datetime` on engines
-   without a time dimension — 400 or advertise it.
-2. Declare Part 8 sorting + serve `/sortables`; declare Part 1 `html` once
-   `/items` negotiates HTML.
+   filters on `/items` instead of dropping them (#681, the #605 rule).
+   Same for `datetime` on engines without a time dimension — honour it or
+   400 (#682).
+2. Declare Part 8 sorting + serve `/sortables` (#683); HTML for `/items`
+   and declare Part 1 `html` (#684).
 3. PostGIS events shape as Features items with keyset pagination (#503).
 4. `Geometry::LineString` for storm tracks (#408); polygon cells.
 5. Part 2 CRS (`crs`, `bbox-crs` on `/items`) — engines hold CRS84 only, so
-   this is an output-transform concern in the API layer.
-6. Part 3 CQL2 filtering + `/queryables`; Part 5 `/schema`.
+   this is an output-transform concern in the API layer (#685).
+6. Part 3 CQL2 filtering + `/queryables`; Part 5 `/schema` (#686).
+7. GeoJSON engine `bbox` refines envelope hits against the geometry (#687).
 
 Related issues: #605 sortby · #532 pagination without materializing · #503
 PostGIS events items · #408 LineString · #119 ErrorReason · #127 MVT ·
