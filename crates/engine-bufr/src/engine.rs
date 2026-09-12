@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use ds_core::config::BufrConfig;
+use ds_core::config::{BufrConfig, Wis2Config};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
@@ -29,6 +29,7 @@ use crate::metadata::Snapshot;
 use crate::params::ParameterTable;
 use crate::source::LocalSource;
 use crate::store::{Ingest, ObsStore};
+use crate::wis2::Wis2Source;
 
 /// Stations an `area` query may touch (the postgis convention).
 pub const MAX_STATIONS_IN_POLYGON: usize = 10_001;
@@ -39,8 +40,9 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
 /// How often expired rows / surplus stations are pruned.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
-enum Source {
+pub(crate) enum Source {
     Local(Mutex<LocalSource>),
+    Wis2(Box<Wis2Source>),
 }
 
 pub struct BufrEngine {
@@ -70,11 +72,10 @@ impl BufrEngine {
         ));
         let source = match (&config.data_path, &config.wis2) {
             (Some(path), None) => Source::Local(Mutex::new(LocalSource::new(path)?)),
-            (None, Some(_)) => {
-                return Err(DataServerError::Config(format!(
-                    "Collection '{collection_id}': [bufr.wis2] is not supported yet — use data_path"
-                )))
-            }
+            (None, Some(w)) => Source::Wis2(Box::new(Wis2Source::new(
+                w.clone(),
+                parse_iso8601_duration(&config.stale_after)?,
+            ))),
             _ => {
                 return Err(DataServerError::Config(format!(
                     "Collection '{collection_id}': bufr requires exactly one of data_path or [bufr.wis2]"
@@ -95,9 +96,42 @@ impl BufrEngine {
             shutdown: Shutdown::new(),
             health: Health::new(),
         };
-        engine.scan_once();
+        // Local mode: best-effort initial scan so fixtures serve at once.
+        // WIS2 mode: nothing to load until the broker delivers — the
+        // pipeline starts in `poll_loop` (the constructor runs on the
+        // request runtime; see crates/ds-wis2/CLAUDE.md).
+        if matches!(engine.source, Source::Local(_)) {
+            engine.scan_once();
+        }
         engine.rebuild_snapshot();
         Ok(engine)
+    }
+
+    /// Whether this collection is fed by a WIS2 subscription.
+    pub fn is_wis2(&self) -> bool {
+        matches!(self.source, Source::Wis2(_))
+    }
+
+    /// WIS2 broker / pipeline counters for `/metrics` (`None` unless WIS2
+    /// mode and the pipeline has started).
+    pub fn wis2_status(&self) -> Option<ds_wis2::StatusSnapshot> {
+        match &self.source {
+            Source::Wis2(w) => w.status_snapshot(),
+            Source::Local(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// The WIS2 subscription config (WIS2 mode only).
+    pub fn wis2_config(&self) -> Option<&Wis2Config> {
+        match &self.source {
+            Source::Wis2(w) => Some(w.config()),
+            Source::Local(_) => None,
+        }
     }
 
     pub fn collection_id(&self) -> &str {
@@ -109,14 +143,20 @@ impl BufrEngine {
     pub fn live_health(&self) -> Option<LiveStatus> {
         match &self.source {
             Source::Local(_) => self.health.local_status(),
+            Source::Wis2(w) => Some(w.live_status(&self.health)),
         }
     }
 
-    /// Whether the first scan succeeded (boot readiness).
+    /// Whether the first scan succeeded (boot readiness; `Local` mode).
     pub fn is_loaded(&self) -> bool {
-        self.health.is_probed()
-            && self.health.scan_failures_total.load(Ordering::Relaxed)
-                < self.health.scans_total.load(Ordering::Relaxed).max(1)
+        match &self.source {
+            Source::Local(_) => {
+                self.health.is_probed()
+                    && self.health.scan_failures_total.load(Ordering::Relaxed)
+                        < self.health.scans_total.load(Ordering::Relaxed).max(1)
+            }
+            Source::Wis2(_) => self.health.is_probed(),
+        }
     }
 
     /// `(stations, reports)` currently held.
@@ -132,7 +172,9 @@ impl BufrEngine {
 
     /// One scan of the local source: fetch new files, decode, ingest.
     fn scan_once(&self) {
-        let Source::Local(src) = &self.source;
+        let Source::Local(src) = &self.source else {
+            return;
+        };
         let fetched = {
             let mut src = src.lock().unwrap_or_else(|e| e.into_inner());
             match src.scan() {
@@ -172,27 +214,37 @@ impl BufrEngine {
     /// of reports inserted or replaced. Shared by the local scan and the
     /// WIS2 source.
     pub fn ingest_bytes(&self, bytes: &[u8], label: &str, now: DateTime<Utc>) -> usize {
+        self.ingest_bytes_keyed(bytes, label, now)
+            .map(|k| k.len())
+            .unwrap_or(0)
+    }
+
+    /// [`Self::ingest_bytes`] returning the `(station_id, time)` of every
+    /// report inserted or replaced — the WIS2 source remembers them per
+    /// `data_id` so a later `rel=deletion` can withdraw exactly those rows.
+    /// Decode failures are counted here and returned for the caller to log.
+    pub fn ingest_bytes_keyed(
+        &self,
+        bytes: &[u8],
+        label: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<(String, DateTime<Utc>)>, DecodeError> {
         let decoded = match self.decoder.decode(bytes) {
             Ok(d) => d,
-            Err(DecodeError::Unsupported(m)) => {
-                self.health
-                    .decode_unsupported_total
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("[{}] bufr: '{label}' unsupported: {m}", self.collection_id);
-                return 0;
-            }
             Err(e) => {
-                self.health
-                    .decode_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("[{}] bufr: '{label}' failed: {e}", self.collection_id);
-                return 0;
+                match &e {
+                    DecodeError::Unsupported(_) => &self.health.decode_unsupported_total,
+                    _ => &self.health.decode_failures_total,
+                }
+                .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("[{}] bufr: '{label}' not decoded: {e}", self.collection_id);
+                return Err(e);
             }
         };
         self.health
             .subsets_skipped_total
             .fetch_add(decoded.skipped.len() as u64, Ordering::Relaxed);
-        let mut n = 0usize;
+        let mut keys = Vec::new();
         {
             let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
             for r in &decoded.reports {
@@ -201,13 +253,13 @@ impl BufrEngine {
                         self.health
                             .reports_ingested_total
                             .fetch_add(1, Ordering::Relaxed);
-                        n += 1;
+                        keys.push((r.station_id.clone(), r.time));
                     }
                     Ingest::Replaced => {
                         self.health
                             .reports_replaced_total
                             .fetch_add(1, Ordering::Relaxed);
-                        n += 1;
+                        keys.push((r.station_id.clone(), r.time));
                     }
                     Ingest::OutOfWindow => {
                         self.health
@@ -217,6 +269,17 @@ impl BufrEngine {
                 }
             }
         }
+        if !keys.is_empty() {
+            self.dirty.store(true, Ordering::Release);
+        }
+        Ok(keys)
+    }
+
+    /// Withdraw specific reports (WIS2 `rel=deletion`). Returns how many
+    /// existed.
+    pub fn remove_reports(&self, keys: &[(String, DateTime<Utc>)]) -> usize {
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+        let n = keys.iter().filter(|(id, t)| store.remove(id, *t)).count();
         if n > 0 {
             self.dirty.store(true, Ordering::Release);
         }
@@ -246,9 +309,19 @@ impl BufrEngine {
         }
     }
 
-    /// Background loop (poll runtime): scan the source, prune, and rebuild
-    /// the metadata snapshot when the store changed. Exits on `shutdown()`.
+    /// Background loop (poll runtime): feed the store from the source
+    /// (periodic scans, or the WIS2 pipeline started here), prune, and
+    /// rebuild the metadata snapshot when the store changed. Exits on
+    /// `shutdown()`.
     pub async fn poll_loop(&self) {
+        match &self.source {
+            Source::Local(_) => self.local_loop().await,
+            Source::Wis2(w) => w.run(self, &self.shutdown).await,
+        }
+        tracing::info!("[{}] bufr: poll loop shutting down", self.collection_id);
+    }
+
+    async fn local_loop(&self) {
         let mut scan = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
         let mut snap = self.shutdown.ticker(SNAPSHOT_INTERVAL, FirstTick::Skip);
         let mut prune = self.shutdown.ticker(PRUNE_INTERVAL, FirstTick::Skip);
@@ -258,15 +331,24 @@ impl BufrEngine {
                 _ = self.shutdown.wait() => break,
                 _ = scan.tick() => self.scan_once(),
                 _ = prune.tick() => self.prune(),
-                _ = snap.tick() => {
-                    if self.dirty.swap(false, Ordering::AcqRel) {
-                        self.rebuild_snapshot();
-                    }
-                }
+                _ = snap.tick() => self.snapshot_if_dirty(),
             }
         }
-        tracing::info!("[{}] bufr: poll loop shutting down", self.collection_id);
     }
+
+    /// Rebuild the snapshot when the store changed since the last build.
+    pub(crate) fn snapshot_if_dirty(&self) {
+        if self.dirty.swap(false, Ordering::AcqRel) {
+            self.rebuild_snapshot();
+        }
+    }
+
+    pub(crate) fn prune_now(&self) {
+        self.prune();
+    }
+
+    pub(crate) const SNAPSHOT_INTERVAL: Duration = SNAPSHOT_INTERVAL;
+    pub(crate) const PRUNE_INTERVAL: Duration = PRUNE_INTERVAL;
 
     pub fn shutdown(&self) {
         self.shutdown.shutdown();

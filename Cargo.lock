@@ -1363,6 +1363,7 @@ dependencies = [
  "ds-core",
  "ds-poll",
  "ds-storage",
+ "ds-wis2",
  "thiserror",
  "tinybufr",
  "tokio",
