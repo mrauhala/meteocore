@@ -62,17 +62,27 @@ memory. Things that differ from the pull sources:
   share one second. The forced rebuild keeps expiries evicting when the
   feed is quiet.
 - **Accumulator semantics** (`Wis2CapSource`): one entry per CAP
-  `<identifier>`, newest `pubtime` wins; `rel=deletion` withdraws the alert
-  its `data_id` produced and leaves a tombstone so a late copy from another
-  Global Cache cannot resurrect it (a genuinely newer re-issue can);
-  eviction once every info's validity end (`<expires>`, else onset +
-  `default_ttl`, else receipt + 7 d) is more than `retention_grace` (PT1H)
-  in the past; `max_alerts` (10 000) evicts oldest-received first.
+  `<identifier>`, newest `pubtime` wins and records its `current_data_id`;
+  `rel=deletion` withdraws an alert only when it names the data_id that
+  holds the *current* content (a deletion of a revision since replaced in
+  place just drops the stale index entry) and leaves a tombstone so a late
+  copy from another Global Cache cannot resurrect it (a genuinely newer
+  re-issue can); a document with several `<alert>`s is indexed per
+  identifier. `Update`/`Cancel` `<references>` are applied **at ingest**
+  (referenced identifiers removed + tombstoned at the message's pubtime);
+  `Cancel`/`Ack`/`Error` are never stored — a non-renderable message has no
+  validity of its own and would otherwise sit for the 7-day fallback
+  suppressing a re-issued identifier. Eviction once every info's validity
+  end (`<expires>`, else onset + `default_ttl`, else receipt + 7 d) is more
+  than `retention_grace` (PT1H) in the past; `max_alerts` (10 000) evicts
+  oldest-received first. `len()` is an atomic mirror — `/metrics` never
+  takes the accumulator lock from a request worker.
 - **Supersede/Cancel is NOT WIS2-specific.** `supersede::resolve_references`
   runs in `refresh()` for every source mode: newest `<sent>` per identifier,
   identifiers named in an `Update`/`Cancel` `<references>` are withdrawn,
   `Cancel`/`Ack`/`Error` are never rendered. Counted in
-  `cap_alerts_superseded_total`.
+  `cap_alerts_superseded_total` (rebuild-time withdrawals, deduplicated by
+  identifier, plus WIS2 ingest-time withdrawals).
 - **MeteoAlarm geometry.** The hub's CAP XML is geocode-only (NUTS3 /
   EMMA_ID, no `<polygon>`), but each notification (one per alert × info ×
   area, `indexInfo`/`indexArea` 0-based in document order) carries a
@@ -90,11 +100,19 @@ memory. Things that differ from the pull sources:
   (whole-document producers) fills every geometry-less area. Both the
   lookup file and the hints can be configured together.
 - `cap_alerts_superseded_total` counts each withdrawn identifier once
-  (`superseded_ids` = the set as of the last rebuild); a cancelled alert
-  lingering in the source/accumulator is not re-counted every rebuild.
-- Tests use `CapEngine::refresh_at(now)`: the WIS2 accumulator evicts by
-  clock, so a wall-clock `refresh()` empties a catalog built from captured
-  documents once they age past `<expires>` + grace (this bit CI at 17:16Z).
+  (`superseded_ids` is a bounded union over rebuilds, so a chain link
+  dropping out of the loaded set cannot cause a re-count).
+- `data_version()` hashes the geometry too (`geometry_source`, bbox, vertex
+  count): in WIS2 mode a shape can change between rebuilds with everything
+  else identical, and the MVT tile cache / Feature ETags key on it.
+- If the broker pipeline ends on its own, `wis2_loop` marks the session
+  disconnected and respawns it after 30 s — an unchanged-config reload
+  reuses the engine, so nothing else would restart it.
+- Tests use `CapEngine::refresh_with(|| fixed_time)`: the WIS2 accumulator
+  evicts by clock, so a wall-clock `refresh()` empties a catalog built from
+  captured documents once they age past `<expires>` + grace (this bit CI
+  at 17:16Z). `refresh_with` reads the clock before the load (eviction
+  instant) and after it (`as_of`), so `as_of` follows data acquisition.
 - **Fixtures** for the offline tests live in `tests/wis2-fixtures/` (NOT
   under `tests/fixtures/` — the directory source lists recursively and
   would pick the CAP XML up as a demo alert).

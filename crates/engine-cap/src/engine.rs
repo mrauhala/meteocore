@@ -29,6 +29,13 @@ pub const CAP_PARAMETER: &str = "severity";
 
 /// Upper bound on areas rasterized into one tile (pathological-input guard).
 const MAX_RENDER_RECORDS: usize = 50_000;
+/// Cap on remembered superseded identifiers (`cap_alerts_superseded_total`
+/// dedup set); beyond it the set resets and a very old identifier could be
+/// counted again — acceptable versus unbounded growth.
+const MAX_SUPERSEDED_IDS: usize = 100_000;
+/// WIS2 mode: back-off between attempts to (re)start the broker pipeline
+/// after it ended on its own.
+const WIS2_RESPAWN_DELAY: Duration = Duration::from_secs(30);
 /// WIS2 mode: how often the catalog is rebuilt when the accumulator is dirty.
 /// Also the floor between two rebuilds — every rebuild advances `as_of`, the
 /// TIME-less WMS cache key, so two catalogs must never share one second.
@@ -278,14 +285,17 @@ impl CapEngine {
     /// so the TIME-less "now" view tracks expiry). Keeps the previous snapshot
     /// on an I/O failure so a transient outage doesn't blank the alerts.
     pub fn refresh(&self) -> Result<(), DataServerError> {
-        self.refresh_at(Utc::now())
+        self.refresh_with(Utc::now)
     }
 
-    /// [`Self::refresh`] with an explicit "now" (the catalog's `as_of` and, in
-    /// WIS2 mode, the accumulator's eviction clock) — lets tests work with
-    /// captured documents whose validity has long expired.
-    pub fn refresh_at(&self, now: DateTime<Utc>) -> Result<(), DataServerError> {
-        let alerts = self.source.load_at(now)?;
+    /// [`Self::refresh`] with an explicit clock — lets tests work with
+    /// captured documents whose validity has long expired. The clock is read
+    /// once before the load (the WIS2 accumulator's eviction instant) and
+    /// again after it for the catalog's `as_of`, so `as_of` keeps following
+    /// data *acquisition*: a slow feed fetch must not judge expiries against
+    /// a clock that predates the data.
+    pub fn refresh_with(&self, clock: impl Fn() -> DateTime<Utc>) -> Result<(), DataServerError> {
+        let alerts = self.source.load_at(clock())?;
         // Apply CAP Update/Cancel chains for every source mode: a directory
         // or feed that keeps an alert next to its cancellation must not
         // render both.
@@ -295,13 +305,21 @@ impl CapEngine {
                 .superseded_ids
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let new = withdrawn.iter().filter(|id| !seen.contains(*id)).count();
-            *seen = withdrawn.into_iter().collect();
-            new
+            // Union, not replace: an identifier stays "already counted" even
+            // when the chain link that withdrew it drops out of the loaded
+            // set for a rebuild (bounded so a long-lived directory source
+            // cannot grow it without limit).
+            if seen.len() > MAX_SUPERSEDED_IDS {
+                seen.clear();
+            }
+            withdrawn
+                .into_iter()
+                .filter(|id| seen.insert(id.clone()))
+                .count()
         };
         self.superseded
             .fetch_add(superseded as u64, Ordering::Relaxed);
-        let as_of = now;
+        let as_of = clock();
         let catalog = Catalog::build(
             &alerts,
             &self.build_cfg,
@@ -346,64 +364,96 @@ impl CapEngine {
         tracing::info!("[{}] cap: poll loop shutting down", self.collection_id);
     }
 
+    /// WIS2 mode. The broker pipeline is (re)started here; if it ever ends on
+    /// its own (a non-transient subscriber error, a closed channel) it is
+    /// respawned after [`WIS2_RESPAWN_DELAY`] rather than leaving the
+    /// collection frozen — an unchanged-config reload reuses this engine, so
+    /// nothing else would restart it short of a process restart. While the
+    /// pipeline is down `live_health()` reports the last status it wrote,
+    /// which after a disconnect is `Degraded`.
     async fn wis2_loop(&self, w: &Wis2Runtime) {
         let Some(source) = self.source.wis2().cloned() else {
             return;
         };
-        let shutdown = Arc::new(Shutdown::new());
-        let mut pipeline =
-            match ds_wis2::spawn_pipeline(&w.config, &self.collection_id, shutdown.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(
-                        "[{}] cap/wis2: cannot start subscription: {e}",
-                        self.collection_id
-                    );
-                    return;
-                }
-            };
-        w.status.store(Arc::new(Some(pipeline.status.clone())));
-        let fetcher = pipeline.fetcher.clone();
         let mut dirty_ticker = self.shutdown.ticker(WIS2_DIRTY_REBUILD, FirstTick::Skip);
         let mut forced_ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
         let mut first_build_pending = true;
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.shutdown.wait() => break,
-                r = pipeline.receiver.recv() => {
-                    match r {
-                        Some(r) => source.apply(r, &fetcher, &self.collection_id).await,
-                        None => {
-                            tracing::warn!("[{}] cap/wis2: pipeline ended", self.collection_id);
-                            break;
+        'session: loop {
+            let shutdown = Arc::new(Shutdown::new());
+            let mut pipeline =
+                match ds_wis2::spawn_pipeline(&w.config, &self.collection_id, shutdown.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            "[{}] cap/wis2: cannot start subscription: {e} — retrying in {}s",
+                            self.collection_id,
+                            WIS2_RESPAWN_DELAY.as_secs()
+                        );
+                        if !self.shutdown.sleep(WIS2_RESPAWN_DELAY).await {
+                            break 'session;
+                        }
+                        continue 'session;
+                    }
+                };
+            w.status.store(Arc::new(Some(pipeline.status.clone())));
+            let fetcher = pipeline.fetcher.clone();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.wait() => {
+                        shutdown.shutdown();
+                        break 'session;
+                    }
+                    r = pipeline.receiver.recv() => {
+                        match r {
+                            Some(r) => source.apply(r, &fetcher, &self.collection_id).await,
+                            None => {
+                                tracing::warn!(
+                                    "[{}] cap/wis2: pipeline ended — restarting in {}s",
+                                    self.collection_id,
+                                    WIS2_RESPAWN_DELAY.as_secs()
+                                );
+                                // Mark the session down so /health degrades
+                                // while we wait, then respawn.
+                                pipeline.status.set_disconnected();
+                                shutdown.shutdown();
+                                if !self.shutdown.sleep(WIS2_RESPAWN_DELAY).await {
+                                    break 'session;
+                                }
+                                continue 'session;
+                            }
                         }
                     }
-                }
-                _ = dirty_ticker.tick() => {
-                    let subscribed = pipeline.status.is_subscribed();
-                    if source.take_dirty() || (first_build_pending && subscribed) {
-                        first_build_pending = false;
+                    _ = dirty_ticker.tick() => {
+                        let subscribed = pipeline.status.is_subscribed();
+                        if source.take_dirty() || (first_build_pending && subscribed) {
+                            first_build_pending = false;
+                            if let Err(e) = self.refresh() {
+                                tracing::warn!("[{}] cap: rebuild failed: {e}", self.collection_id);
+                            }
+                        }
+                    }
+                    _ = forced_ticker.tick() => {
                         if let Err(e) = self.refresh() {
-                            tracing::warn!("[{}] cap: rebuild failed: {e}", self.collection_id);
+                            tracing::warn!("[{}] cap: periodic rebuild failed: {e}", self.collection_id);
                         }
-                    }
-                }
-                _ = forced_ticker.tick() => {
-                    if let Err(e) = self.refresh() {
-                        tracing::warn!("[{}] cap: periodic rebuild failed: {e}", self.collection_id);
                     }
                 }
             }
         }
-        // Stop the broker task with the engine (the pipeline's own Shutdown is
-        // private to this loop so a reload cannot leave a subscriber behind).
-        shutdown.shutdown();
+        // The pipeline's own Shutdown is private to this loop, so a reload can
+        // never leave a subscriber behind.
     }
 
-    /// Alerts withdrawn by Update/Cancel chains since boot.
+    /// Alerts withdrawn by Update/Cancel chains since boot — at rebuild
+    /// (every source mode) plus at ingest (WIS2 accumulator).
     pub fn superseded_total(&self) -> u64 {
-        self.superseded.load(Ordering::Relaxed)
+        let at_ingest = self
+            .source
+            .wis2()
+            .map(|s| s.stats.superseded.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        self.superseded.load(Ordering::Relaxed) + at_ingest
     }
 
     /// Signal the poll loop to stop.

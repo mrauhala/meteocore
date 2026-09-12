@@ -115,7 +115,7 @@ fn meteoalarm_alert_gets_exact_zone_polygon_from_the_geometry_hint() {
         now,
     );
     assert!(src.take_dirty());
-    engine.refresh_at(T_TEST).unwrap();
+    engine.refresh_with(|| T_TEST).unwrap();
     assert!(engine.is_loaded());
 
     // Two infos (en-GB, mk-MKD) × one area each → two features; only the
@@ -180,7 +180,7 @@ fn per_area_notifications_merge_hints_and_bbox_fallback_fills_the_rest() {
         "t",
         t0 + chrono::Duration::seconds(30),
     );
-    engine.refresh_at(T_TEST).unwrap();
+    engine.refresh_with(|| T_TEST).unwrap();
 
     let a = engine.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
     assert_eq!(
@@ -250,7 +250,7 @@ fn language_filter_keeps_original_info_index_for_hint_keys() {
         "t",
         "2026-09-12T08:20:10Z".parse().unwrap(),
     );
-    engine.refresh_at(T_TEST).unwrap();
+    engine.refresh_with(|| T_TEST).unwrap();
     assert_eq!(engine.feature_count(), 1);
     let f = engine.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
     assert!(matches!(&*f.geometry, Geometry::Polygon { .. }));
@@ -269,7 +269,7 @@ fn expiry_and_deletion_flow_through_to_the_catalog() {
         "t",
         "2026-09-12T08:20:10Z".parse().unwrap(),
     );
-    engine.refresh_at(T_TEST).unwrap();
+    engine.refresh_with(|| T_TEST).unwrap();
     assert_eq!(engine.feature_count(), 2);
 
     // A deletion notification for the same data_id withdraws the alert.
@@ -292,7 +292,7 @@ fn expiry_and_deletion_flow_through_to_the_catalog() {
         "2026-09-12T08:21:00Z".parse().unwrap(),
     );
     assert!(src.take_dirty());
-    engine.refresh_at(T_TEST).unwrap();
+    engine.refresh_with(|| T_TEST).unwrap();
     assert_eq!(engine.feature_count(), 0);
     assert_eq!(engine.wis2_source_stats().unwrap()[2], 1, "deletions");
 
@@ -335,7 +335,7 @@ fn bbox_fallback_is_scoped_to_the_notified_area() {
     n.extra
         .insert("indexArea".into(), serde_json::Value::from(1u64));
     src.apply_with_hint(resolved(n, xml.into_bytes()), None, "t", T_TEST);
-    engine.refresh_at(T_TEST).unwrap();
+    engine.refresh_with(|| T_TEST).unwrap();
     let painted = engine.get_feature(&format!("{MK_IDENTIFIER}.0.1")).unwrap();
     assert_eq!(
         painted
@@ -369,16 +369,51 @@ fn superseded_counter_counts_each_withdrawal_once() {
     c.data_id = "eu-eumetnet-warnings/cancel".into();
     src.apply_with_hint(resolved(c, cancel.into_bytes()), None, "t", T_TEST);
 
-    engine.refresh_at(T_TEST).unwrap();
+    engine.refresh_with(|| T_TEST).unwrap();
     assert_eq!(engine.feature_count(), 0, "cancelled alert must not render");
     assert_eq!(engine.superseded_total(), 1);
     // Both documents linger in the accumulator: further rebuilds must not
     // re-count the same withdrawal.
     engine
-        .refresh_at(T_TEST + chrono::Duration::seconds(5))
+        .refresh_with(|| T_TEST + chrono::Duration::seconds(5))
         .unwrap();
     engine
-        .refresh_at(T_TEST + chrono::Duration::seconds(10))
+        .refresh_with(|| T_TEST + chrono::Duration::seconds(10))
         .unwrap();
     assert_eq!(engine.superseded_total(), 1);
+}
+
+#[test]
+fn data_version_changes_when_geometry_changes() {
+    // Same alert, same text/severity/window: only the shape changes (bbox
+    // fallback → exact polygon). The MVT cache keys on data_version, so it
+    // must change.
+    let engine = CapEngine::new(&config(None, true), "cap-wis2").unwrap();
+    let src = engine.wis2_source().unwrap();
+    let xml = fixture("meteoalarm-mk-alert.xml");
+    let n1 = notification("meteoalarm-mk-notification.json");
+    let mut bbox_only = n1.clone();
+    bbox_only.links.retain(|l| l.rel != "geometry");
+    src.apply_with_hint(resolved(bbox_only, xml.clone()), None, "t", T_TEST);
+    engine.refresh_with(|| T_TEST).unwrap();
+    let v_bbox = engine.data_version();
+    let f = engine.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
+    assert_eq!(
+        f.properties.get("geometry_source").and_then(|v| v.as_str()),
+        Some("bbox")
+    );
+
+    let hint = hint_from_bytes(&n1, &fixture("meteoalarm-mk-area.geojson")).unwrap();
+    let mut n2 = n1.clone();
+    n2.id = "second".into();
+    n2.data_id = "eu-eumetnet-warnings/second".into();
+    n2.pubtime = T_TEST + chrono::Duration::seconds(30);
+    src.apply_with_hint(resolved(n2, xml), Some((1, 0, hint)), "t", T_TEST);
+    engine.refresh_with(|| T_TEST).unwrap();
+    let f = engine.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
+    assert_eq!(
+        f.properties.get("geometry_source").and_then(|v| v.as_str()),
+        Some("notification")
+    );
+    assert_ne!(engine.data_version(), v_bbox);
 }

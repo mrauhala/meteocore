@@ -676,8 +676,41 @@ fn compute_version(records: &[AreaRecord]) -> u64 {
                 fnv1a(s.as_bytes(), &mut h);
             }
         }
+        // Geometry fingerprint: in WIS2 mode an area's shape can change
+        // between rebuilds with id/severity/window/text untouched (a bbox
+        // fallback replaced by the exact zone polygon, or a hint attached
+        // where there was none); the MVT tile cache and Feature ETags key on
+        // this version, so the shape must be part of it.
+        if let Some(PropertyValue::String(s)) = r.properties.get("geometry_source") {
+            fnv1a(s.as_bytes(), &mut h);
+        }
+        match r.bbox {
+            Some(b) => {
+                for v in b {
+                    fnv1a(&v.to_bits().to_le_bytes(), &mut h);
+                }
+            }
+            None => fnv1a(b"null", &mut h),
+        }
+        fnv1a(
+            &(geometry_vertex_count(&r.geometry) as u64).to_le_bytes(),
+            &mut h,
+        );
     }
     h
+}
+
+fn geometry_vertex_count(g: &Geometry) -> usize {
+    match g {
+        Geometry::Polygon { exterior, holes } => {
+            exterior.len() + holes.iter().map(Vec::len).sum::<usize>()
+        }
+        Geometry::MultiPolygon { polygons } => polygons
+            .iter()
+            .map(|(e, hs)| e.len() + hs.iter().map(Vec::len).sum::<usize>())
+            .sum(),
+        _ => 0,
+    }
 }
 
 fn base_raster_info(
