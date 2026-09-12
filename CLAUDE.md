@@ -30,6 +30,11 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   instances. `crates/api-edr/README.md` is the EDR support-status page
   (conformance classes, query types, per-engine matrix) — update it in
   every PR that touches EDR behaviour, including engine `EdrEngine` impls.
+- `crates/api-features/CLAUDE.md` — sortby/paging rules, caching twin.
+  `crates/api-features/README.md` is the Features support-status page
+  (conformance classes, `/items` parameters, per-engine matrix) — update it
+  in every PR that touches Features behaviour, including engine
+  `FeatureEngine` impls.
 - `crates/api-3dtiles/CLAUDE.md` — routes, representations, caching, viewer.
 - `crates/api-mcp/CLAUDE.md` — MCP tools, the auth boundary, why the tool
   set is restricted to nowcast collections.
