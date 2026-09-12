@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.0](https://github.com/mrauhala/meteocore/compare/v0.9.0...v0.10.0) (2026-09-12)
+
+
+### Features
+
+* **wis2:** ds-wis2 consumer client crate + Wis2Config ([#690](https://github.com/mrauhala/meteocore/issues/690)) ([fd24158](https://github.com/mrauhala/meteocore/commit/fd241588f390b27b101fd56a31ffed3c94ebd275))
+* **cap:** WIS2 push source — [cap.wis2] subscription, supersede/cancel, MeteoAlarm zone geometry ([#691](https://github.com/mrauhala/meteocore/issues/691)) ([7ebeb4d](https://github.com/mrauhala/meteocore/commit/7ebeb4d0769da6768e836c6121105f9728c20698))
+
+
+### Bug Fixes
+
+* **server:** spawn CAP poll loops at boot and shut down cap/postgis/nowcast gracefully ([#688](https://github.com/mrauhala/meteocore/issues/688)) ([f0136cd](https://github.com/mrauhala/meteocore/commit/f0136cd54bf1e5b956505cbe7e237d2e43345830))
+
 ## [0.9.0](https://github.com/mrauhala/meteocore/compare/v0.8.1...v0.9.0) (2026-09-11)
 
 
