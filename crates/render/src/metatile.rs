@@ -748,7 +748,7 @@ mod tests {
         // `encode_png_indexed` (always falling back to RGBA) is caught in the
         // metatile assembly path too, not only in the encoder unit tests.
         {
-            let decoder = png::Decoder::new(&bytes[..]);
+            let decoder = png::Decoder::new(std::io::Cursor::new(&bytes[..]));
             let reader = decoder.read_info().unwrap();
             assert_eq!(
                 reader.info().color_type,
@@ -974,10 +974,15 @@ mod tests {
     /// to the same per-pixel RGBA — handle both colour types here so the
     /// fidelity tests below don't constrain which branch ran.
     fn decode_rgba(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
-        let decoder = png::Decoder::new(bytes);
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         let mut reader = decoder.read_info().unwrap();
         let info_meta = reader.info().clone();
-        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let mut buf = vec![
+            0u8;
+            reader
+                .output_buffer_size()
+                .expect("png buffer size overflow")
+        ];
         let frame = reader.next_frame(&mut buf).unwrap();
         let w = frame.width;
         let h = frame.height;
@@ -1202,7 +1207,12 @@ mod tests {
         let mut dec = png::Decoder::new(std::io::Cursor::new(&bytes));
         dec.set_transformations(png::Transformations::EXPAND);
         let mut reader = dec.read_info().unwrap();
-        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let mut buf = vec![
+            0u8;
+            reader
+                .output_buffer_size()
+                .expect("png buffer size overflow")
+        ];
         let info = reader.next_frame(&mut buf).unwrap();
         let ch = info.color_type.samples();
         let (my_n, my_s) = (lat_to_y(bbox[3]), lat_to_y(bbox[1]));
