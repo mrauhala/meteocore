@@ -959,7 +959,7 @@ pub struct Wis2Config {
     #[serde(default = "default_wis2_keep_alive_secs")]
     pub keep_alive_secs: u64,
     /// Optional URL-prefix allowlist for notification downloads (each entry
-    /// `http(s)://…/`). Empty = the default policy (https only, public DNS
+    /// `https://…/`). Empty = the default policy (https only, public DNS
     /// host, no redirects). Non-empty = downloads must ALSO match a prefix —
     /// recommended for `origin/` subscriptions, whose canonical links point at
     /// arbitrary producer servers rather than the Global Caches.
@@ -1094,11 +1094,12 @@ pub fn validate_wis2(
             "Collection '{id}': [{section}].keep_alive_secs must be in 1..=3600"
         )));
     }
+    // https only: the download policy rejects every non-https URL before the
+    // allowlist is consulted, so an `http://` prefix could never match.
     for entry in &cfg.download_allowlist {
-        if !(entry.starts_with("https://") || entry.starts_with("http://")) || !entry.ends_with('/')
-        {
+        if !entry.starts_with("https://") || !entry.ends_with('/') {
             return Err(Config(format!(
-                "Collection '{id}': [{section}].download_allowlist entry '{entry}' must be an http(s) URL prefix ending with '/'"
+                "Collection '{id}': [{section}].download_allowlist entry '{entry}' must be an https:// URL prefix ending with '/'"
             )));
         }
     }
@@ -3393,12 +3394,16 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         assert!(bad("max_download_bytes = 0\ntopics = [\"cache/a\"]\n"));
         assert!(bad("degrade_after_secs = 0\ntopics = [\"cache/a\"]\n"));
         assert!(bad("dedup_window = \"1h\"\ntopics = [\"cache/a\"]\n"));
-        // Allowlist entries must be http(s) prefixes ending in '/'.
+        // Allowlist entries must be https prefixes ending in '/' (the download
+        // policy is https-only, so an http:// entry could never match).
         assert!(bad(
             "download_allowlist = [\"https://gc.example\"]\ntopics = [\"cache/a\"]\n"
         ));
         assert!(bad(
             "download_allowlist = [\"ftp://gc.example/\"]\ntopics = [\"cache/a\"]\n"
+        ));
+        assert!(bad(
+            "download_allowlist = [\"http://gc.example/\"]\ntopics = [\"cache/a\"]\n"
         ));
         assert!(validate_wis2(
             "c",
