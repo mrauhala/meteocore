@@ -1,0 +1,39 @@
+{
+ "topic": "cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop",
+ "message": {
+  "id": "08666d4c-3f1e-403a-8069-e37dad55e4a9",
+  "version": "v04",
+  "type": "Feature",
+  "geometry": {
+   "type": "Point",
+   "coordinates": [
+    18.983913,
+    57.440752
+   ]
+  },
+  "properties": {
+   "metadata_id": "urn:wmo:md:se-smhi:core.surface-based-observations.synop",
+   "pubtime": "2026-09-12T08:20:07Z",
+   "datetime": "2026-09-12T08:00:00Z",
+   "data_id": "origin/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop/0-20000-0-02598_2026-09-12T08:00:00_core",
+   "integrity": {
+    "method": "sha512",
+    "value": "pbKp4ygTOyRCrREhaxpO85qjXuwcXyU0WIrdnEOurV3R36IpiM9EVPBnvRMUx5vUT8JKZ/z93cNovGaClHGOpA=="
+   },
+   "content": {
+    "encoding": "base64",
+    "value": "QlVGUgABAQQAABYAAFIAAAAAAP8AIAAH6gkMCAAAAAAPAAABgMGWx1AEGQsqAADQAATiAAADAyNTk4AAAAAAAAAAAAAAAFKyepqiKpI6CpJymkJ6YmgAAAAAAAD9UmIAcH0FpfQC4P8f////////////////gGQ4qjf0T////////////////////4D////wD//////////////////////////+v/f+///9+j/4BkP6f/7//////7+kAH//v6QAf/+B9ECf2ZQFP39v//++J//////gA//3///////////////////79H/////////////////+ACAD90z/8Dc3Nzc=",
+    "size": 257
+   },
+   "global-cache": "cn-cma-global-cache"
+  },
+  "links": [
+   {
+    "href": "https://gc.wis.cma.cn/20260912/cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop/690408ca78d7a677fef05ef545b9d7f44a15d55a98ced3d6a7d4335754eb9bd9",
+    "rel": "canonical",
+    "type": "application/bufr",
+    "length": 257
+   }
+  ]
+ }
+}

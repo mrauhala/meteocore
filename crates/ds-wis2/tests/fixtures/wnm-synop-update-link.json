@@ -1,0 +1,49 @@
+{
+ "topic": "cache/a/wis2/ru-roshydromet/data/core/weather/surface-based-observations/synop",
+ "message": {
+  "id": "a3af80ec-d4a1-4b15-b581-e2fd0266b4e1",
+  "type": "Feature",
+  "conformsTo": [
+   "http://wis.wmo.int/spec/wnm/1/conf/core"
+  ],
+  "geometry": {
+   "coordinates": [
+    136.1833,
+    47.6667,
+    180
+   ],
+   "type": "Point"
+  },
+  "properties": {
+   "data_id": "ru-roshydromet:core.surface-based-observations.synop/WIGOS_0-20000-0-31801_20260912T030000",
+   "datetime": "2026-09-12T03:00:00Z",
+   "pubtime": "2026-09-12T09:21:01Z",
+   "integrity": {
+    "method": "sha512",
+    "value": "E8nO98vD5CqzV0Esrf1bMhhvZvsjSt1TFHJxi4RcDv+YIPF4SR8/UQgdDJ5ajlRP0J9hJ0a6WtLy84okq7dFfw=="
+   },
+   "metadata_id": "urn:wmo:md:ru-roshydromet:core.surface-based-observations.synop",
+   "content": {
+    "encoding": "base64",
+    "value": "QlVGUgAA9wQAABYAABoAAAEAAAEAHAAH6gkMAwAAAAALAAABgMGWx1AAAMoABOIAAAMzE4MDEAAAAAAAAAAAAAAD+Qo6sgqaUqo6SAAAAAAAAAAAAAAAAv1SYMBpCAc8TqNBaoC1RN9T5r3v//////+AZDkUt9n/AMg+gAZH////5kcg8TKFAAB/////////////////////////+HH/SBf//+/R/8AyH9P/9////AMh/SAD//39IAP//A+iBP7LQBT///////////////////////////////////////////////////////////////+ANzc3Nw==",
+    "size": 247
+   },
+   "wigos_station_identifier": "0-20000-0-31801",
+   "global-cache": "cn-cma-global-cache"
+  },
+  "links": [
+   {
+    "rel": "update",
+    "type": "application/bufr",
+    "href": "https://gc.wis.cma.cn/20260912/cache/a/wis2/ru-roshydromet/data/core/weather/surface-based-observations/synop/WIGOS_0-20000-0-31801_20260912T030000_R-20260912092101Z.bufr4",
+    "length": 247
+   },
+   {
+    "rel": "via",
+    "type": "text/html",
+    "href": "https://oscar.wmo.int/surface/#/search/station/stationReportDetails/0-20000-0-31801"
+   }
+  ],
+  "generated_by": "wis2box 1.3.0"
+ }
+}

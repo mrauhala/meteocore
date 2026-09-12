@@ -11,6 +11,9 @@ Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-poll` (shared poll-loop lifecycle: the `Shutdown` handle + `PollTicker`
 every engine's background poll loop uses — never hand-roll a
 `tokio::select!` shutdown signal, #481),
+`ds-wis2` (WMO WIS2 consumer client: Global Broker MQTT subscription,
+notification parsing, dedup, payload download — shared by every engine
+with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
@@ -40,6 +43,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   set is restricted to nowcast collections.
 - `crates/ds-3dtiles/CLAUDE.md` — .pnts / isosurface / echo-top / voxel
   encoders and their CesiumJS gotchas.
+- `crates/ds-wis2/CLAUDE.md` — WIS2 broker/session rules, the 6×-per-cache
+  duplicate fact, inline payloads, download policy.
 - `crates/engine-odim/CLAUDE.md` — PVOL per-site model, pixel pre-warm,
   resampling, storm cells.
 - `crates/engine-geotiff/CLAUDE.md`, `crates/engine-grib/CLAUDE.md`,
