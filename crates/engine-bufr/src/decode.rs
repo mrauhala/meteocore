@@ -14,7 +14,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
-use tinybufr::{DataEvent, DataReader, DataSpec, HeaderSections, Tables, Value, XY};
+use tinybufr::{DataEvent, DataReader, DataSpec, HeaderSections, TableBEntry, Tables, Value, XY};
 
 /// Table B id as `FXXYYY` digits (F is always 0 for elements).
 pub fn xy_from_code(code: &str) -> Option<XY> {
@@ -101,6 +101,42 @@ pub struct Decoded {
     pub messages: usize,
 }
 
+/// National (local) Table B elements seen in operational WIS2 feeds that
+/// the WMO master tables do not carry. A local element has no width in the
+/// master table, so without an entry the whole bit stream after it is
+/// misaligned and the message fails. Widths from the producers' published
+/// local tables (DWD: "BUFR table for software package BUFR tools").
+const LOCAL_TABLE_B: &[TableBEntry] = &[
+    // DWD SYNOP bulletins (de-dwd): meteorological optical range trio.
+    TableBEntry {
+        xy: XY { x: 20, y: 237 },
+        class_name: "local (DWD)",
+        element_name: "METEOROLOGICAL OPTICAL RANGE",
+        unit: "M",
+        scale: 0,
+        reference_value: 0,
+        bits: 18,
+    },
+    TableBEntry {
+        xy: XY { x: 20, y: 238 },
+        class_name: "local (DWD)",
+        element_name: "MINIMUM METEOROLOGICAL OPTICAL RANGE",
+        unit: "M",
+        scale: 0,
+        reference_value: 0,
+        bits: 18,
+    },
+    TableBEntry {
+        xy: XY { x: 20, y: 239 },
+        class_name: "local (DWD)",
+        element_name: "MAXIMUM METEOROLOGICAL OPTICAL RANGE",
+        unit: "M",
+        scale: 0,
+        reference_value: 0,
+        bits: 18,
+    },
+];
+
 /// Holds the (expensive to build) WMO tables — construct once per engine.
 pub struct Decoder {
     tables: Arc<Tables>,
@@ -131,8 +167,12 @@ struct Subset {
 
 impl Decoder {
     pub fn new() -> Self {
+        let mut tables = Tables::default();
+        for entry in LOCAL_TABLE_B {
+            tables.table_b.entry(entry.xy).or_insert(entry);
+        }
         Decoder {
-            tables: Arc::new(Tables::default()),
+            tables: Arc::new(tables),
         }
     }
 

@@ -4,9 +4,10 @@ WMO BUFR surface-observation engine (`engine_type = "bufr"`): SYNOP / SHIP
 station reports → an in-memory, time-windowed store → `EdrEngine`
 (`locations`, `position`, `area`, `radius`) + `FeatureEngine` (one Point
 feature per station). Source: a polled directory / object-store prefix of
-BUFR files (`data_path`); the WIS2 push source (`[bufr.wis2]`) is the next
-PR. Real fixtures: `testdata/bufr-synop/` (8 reports captured from the WIS2
-Global Broker, values cross-checked with ecCodes `bufr_dump`).
+BUFR files (`data_path`) or a WIS2 Global Broker subscription
+(`[bufr.wis2]`, `src/wis2.rs`). Real fixtures: `testdata/bufr-synop/` (8
+reports captured from the WIS2 Global Broker, values cross-checked with
+ecCodes `bufr_dump`).
 
 ## The decoder boundary
 
@@ -21,7 +22,13 @@ Global Broker, values cross-checked with ecCodes `bufr_dump`).
   the magic and uses the section-0 total length.
 - Unsupported operators / features are `DecodeError::Unsupported`
   (counted in `bufr_decode_failures_total{reason="unsupported"}`), other
-  failures `reason="error"`; neither is fatal to the scan.
+  failures `reason="error"`; neither is fatal to the scan. Known live gaps
+  (#693): compressed character fields (kz-kazhydromet), operator 2 08 YYY
+  (cy-dom), > 32-bit numeric reads (ca-eccc-msc).
+- National local descriptors have no width in the master tables, so one
+  unknown element misaligns the whole message. `LOCAL_TABLE_B` in
+  `decode.rs` registers the ones seen live (DWD 020237/238/239); add to it
+  when a centre logs `Table B entry not found for …`.
 
 ## Extraction rules (template-agnostic)
 
@@ -98,6 +105,38 @@ store row is a dense `Box<[f32]>` (`NaN` = missing); output widens through
 - The fixture retention in `collections.d/obs-bufr-local.toml` is
   `P36500D` only because the fixtures are dated; production keeps `PT24H`.
 
+## WIS2 mode (`[bufr.wis2]`, `src/wis2.rs`)
+
+Read `crates/ds-wis2/CLAUDE.md` first (sessions, the 6×-per-cache duplicate
+fact, download policy). Engine-side specifics:
+
+- `new()` does no network — the pipeline starts in `poll_loop()` (the only
+  entry point guaranteed to run on `poll_runtime()`); the collection boots
+  `Degraded("connecting to WIS2 broker")` and `/health` overrides it live.
+- **Most SYNOP payloads arrive inline** in the notification (a few hundred
+  bytes of BUFR), so the common path never opens an HTTP connection;
+  link-only producers (il-ims, us-noaa ship) are downloaded by ds-wis2.
+  Each accepted payload goes through the same `ingest_bytes_keyed` as a
+  scanned file.
+- **Deletions:** the `(station, time)` rows every `data_id` produced are
+  remembered (bounded, 200 k) so a `rel=deletion` withdraws exactly those
+  rows; an `update` (same station+time) simply replaces the row.
+- **Health:** `Ready` = subscribed ∧ not disconnected for longer than
+  `degrade_after_secs` ∧ a notification accepted within `stale_after`
+  (default PT2H — hourly SYNOP with slack) ∧ at least one report ever
+  decoded (fresh notifications whose payloads all fail to decode are
+  `Degraded`, not green-with-nothing-served). A quiet CAP feed is healthy;
+  a quiet observation feed is not, hence the extra knob.
+- Metrics: the shared `wis2_*` families (labelled by collection) plus the
+  `bufr_*` ingest counters; `bufr_files_total` counts payloads here.
+- The notification's `wigos_station_identifier` / Point geometry are NOT
+  used: the decoded BUFR is the authority for identity and position, so a
+  producer whose notification metadata disagrees with its data cannot
+  split a station in two. Subsets without an id or position are skipped
+  and counted (`bufr_reports_total{result="skipped"}`, ~0.1 % live).
+- A cold boot starts empty until the next synoptic hour (H+20 typically);
+  there is no Global Cache backfill (follow-up).
+
 ## Smoke test
 
 ```bash
@@ -108,4 +147,8 @@ curl 'localhost:8000/edr/collections/obs-bufr-local/position?coords=POINT(18.98 
 curl 'localhost:8000/edr/collections/obs-bufr-local/area?coords=POLYGON((10 55,30 55,30 70,10 70,10 55))&f=CoverageJSON'
 curl 'localhost:8000/features/collections/obs-bufr-local/items?bbox=10,55,30,70'
 curl -s localhost:8000/metrics | grep ^bufr_
+# WIS2 mode (live): wait for the next synoptic hour (+~20 min)
+cargo run -p server -- --collections=obs-synop-wis2
+curl 'localhost:8000/edr/collections/obs-synop-wis2/locations'      # Swedish WIGOS ids
+curl -s localhost:8000/metrics | grep -E '^(wis2_|bufr_)'          # duplicates ≈ 5× accepted
 ```

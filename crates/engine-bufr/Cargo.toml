@@ -8,6 +8,7 @@ description = "WMO BUFR surface-observation engine (SYNOP/SHIP station reports â
 ds-core = { path = "../core" }
 ds-poll = { path = "../ds-poll" }
 ds-storage = { path = "../storage" }
+ds-wis2 = { path = "../ds-wis2" }
 tinybufr = { version = "0.1", default-features = false }
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }

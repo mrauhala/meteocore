@@ -13,6 +13,7 @@ mod metadata;
 pub mod params;
 mod source;
 pub mod store;
+mod wis2;
 
 pub use decode::{Decoder, ObsReport};
 pub use engine::{BufrEngine, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON};
