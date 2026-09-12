@@ -126,6 +126,15 @@ impl Wis2CapSource {
         self.stats.held.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    fn index_len(&self) -> usize {
+        self.acc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .data_id_index
+            .len()
+    }
+
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -280,12 +289,21 @@ impl Wis2CapSource {
                     // per area for the same XML): merge hints from the stored
                     // copy into the new one so earlier areas keep theirs.
                     merge_hints(&mut alert, &existing.alert);
-                    *existing = Entry {
-                        alert,
-                        received: existing.received,
-                        pubtime: n.pubtime,
-                        current_data_id: n.data_id.clone(),
-                    };
+                    let previous =
+                        std::mem::replace(&mut existing.current_data_id, n.data_id.clone());
+                    existing.alert = alert;
+                    existing.pubtime = n.pubtime;
+                    // The superseded revision's index entry is dead for this
+                    // identifier: drop it now rather than letting a long-lived,
+                    // often-revised alert accumulate one entry per revision.
+                    if previous != n.data_id {
+                        if let Some(idents) = acc.data_id_index.get_mut(&previous) {
+                            idents.retain(|id| id != &identifier);
+                            if idents.is_empty() {
+                                acc.data_id_index.remove(&previous);
+                            }
+                        }
+                    }
                 }
                 None => {
                     acc.alerts.insert(
@@ -905,6 +923,37 @@ mod tests {
         .await;
         let snap = src.snapshot(wall);
         assert_eq!(snap.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revisions_do_not_leak_index_entries() {
+        let src = Wis2CapSource::new(cfg());
+        let f = fetcher();
+        let far = "2026-09-13T00:00:00+00:00";
+        for i in 0..50 {
+            src.apply_at(
+                resolved(
+                    &format!("rev-{i}"),
+                    i,
+                    Some(cap_xml("A", "Update", "", far)),
+                ),
+                &f,
+                "t",
+                at(i),
+            )
+            .await;
+        }
+        assert_eq!(src.len(), 1);
+        assert_eq!(
+            src.index_len(),
+            1,
+            "only the current revision stays indexed"
+        );
+        // The current revision is still deletable.
+        src.apply_at(resolved("rev-49", 60, None), &f, "t", at(60))
+            .await;
+        assert_eq!(src.len(), 0);
+        assert_eq!(src.index_len(), 0);
     }
 
     #[tokio::test]
