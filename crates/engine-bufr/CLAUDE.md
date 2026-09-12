@@ -123,8 +123,10 @@ fact, download policy). Engine-side specifics:
   rows; an `update` (same station+time) simply replaces the row.
 - **Health:** `Ready` = subscribed ∧ not disconnected for longer than
   `degrade_after_secs` ∧ a notification accepted within `stale_after`
-  (default PT2H — hourly SYNOP with slack). A quiet CAP feed is healthy; a
-  quiet observation feed is not, hence the extra knob.
+  (default PT2H — hourly SYNOP with slack) ∧ at least one report ever
+  decoded (fresh notifications whose payloads all fail to decode are
+  `Degraded`, not green-with-nothing-served). A quiet CAP feed is healthy;
+  a quiet observation feed is not, hence the extra knob.
 - Metrics: the shared `wis2_*` families (labelled by collection) plus the
   `bufr_*` ingest counters; `bufr_files_total` counts payloads here.
 - The notification's `wigos_station_identifier` / Point geometry are NOT

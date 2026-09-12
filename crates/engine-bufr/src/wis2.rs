@@ -111,7 +111,13 @@ impl Wis2Source {
             Some(age) if age as i64 > self.stale_after.num_seconds() => LiveStatus::Degraded {
                 reason: "no WIS2 notification within stale_after",
             },
-            Some(_) => LiveStatus::Ready,
+            // Fresh notifications alone are not health: a topic whose every
+            // payload fails to decode would otherwise stay green with nothing
+            // served. `probed` flips on the first successfully decoded report.
+            Some(_) if health.is_probed() => LiveStatus::Ready,
+            Some(_) => LiveStatus::Degraded {
+                reason: "no BUFR reports decoded from WIS2 yet",
+            },
         }
     }
 
@@ -375,7 +381,14 @@ mod tests {
                 reason: "waiting for first WIS2 notification"
             }
         );
+        // Notifications flowing but nothing decoded yet is not Ready.
         status.record_accepted(1);
+        assert_eq!(
+            src.live_status(&e.health),
+            LiveStatus::Degraded {
+                reason: "no BUFR reports decoded from WIS2 yet"
+            }
+        );
         e.health.mark_probed();
         assert_eq!(src.live_status(&e.health), LiveStatus::Ready);
         // A short disconnect keeps serving; a long one degrades.
