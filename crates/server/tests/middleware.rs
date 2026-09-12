@@ -90,6 +90,7 @@ fn make_collection(id: &str) -> CollectionConfig {
         cap: None,
         postgis: None,
         nowcast: None,
+        bufr: None,
         preview: None,
     }
 }
