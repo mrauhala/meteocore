@@ -663,7 +663,76 @@ struct CacheCounterState {
     /// Nowcast per-collection `(generations, failures)` last-scraped values —
     /// same reload-rebaseline scheme.
     nowcast: HashMap<String, (u64, u64)>,
+    /// Nowcast per-collection tracker counters `(births, deaths,
+    /// pass1_matches, pass2_matches, velocity_clamps)` last-scraped values
+    /// (#643).
+    nowcast_tracks: HashMap<String, (u64, u64, u64, u64, u64)>,
 }
+
+static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_cell_births_total",
+            "Storm-cell tracks born (blob matched no previous track) — #643",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static NOWCAST_CELL_DEATHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_cell_deaths_total",
+            "Storm-cell tracks retired (previous track matched no blob) — #643",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static NOWCAST_CELL_PASS1_MATCHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_cell_pass1_matches_total",
+            "Storm-cell matches made on the motion-compensated pass; the denominator for the pass-2 share",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static NOWCAST_CELL_PASS2_MATCHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_cell_pass2_matches_total",
+            "Storm-cell matches made on the raw-position fallback pass; a rising share of all matches is the first sign of identity swaps (#639)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_cell_velocity_clamps_total",
+            "Storm-cell displacements clamped at MAX_CELL_SPEED_MS before the velocity EMA — jumps the tracker already rejected as motion",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
 
 static NOWCAST_GENERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1027,6 +1096,10 @@ pub(crate) fn reusable_collections(
                 .impact_source
                 .as_deref()
                 .is_none_or(|is| base.contains(is))
+            && nc
+                .radar_source
+                .as_deref()
+                .is_none_or(|rs| base.contains(rs))
         {
             out.insert(c.id.clone());
         }
@@ -1162,7 +1235,7 @@ pub fn load_collections(
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
-            "nowcast" => &["wms", "maps", "tiles", "features"],
+            "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -2739,6 +2812,20 @@ pub fn load_collections(
             .iter()
             .map(|(id, e)| (id.clone(), e.clone()))
             .collect();
+    // Radar-site sources for the beam-geometry join (#642): every
+    // polar-volume network engine, keyed by its base collection id. Built
+    // from `odim_volume_engines`, which both the fresh and the reuse arms
+    // fill, so a reload keeps the wiring resolvable.
+    let radar_site_sources: HashMap<String, Arc<dyn ds_core::radar_sites::RadarSiteSource>> =
+        odim_volume_engines
+            .iter()
+            .map(|e| {
+                (
+                    e.collection_id().to_string(),
+                    e.clone() as Arc<dyn ds_core::radar_sites::RadarSiteSource>,
+                )
+            })
+            .collect();
     for collection in nowcast_pending {
         let mut fail = |error: String| {
             tracing::error!("Collection '{}': {error}, skipping", collection.id);
@@ -2851,12 +2938,39 @@ pub fn load_collections(
                     },
                     None => engine,
                 };
+                // Beam geometry (#642): a named radar source must be a
+                // polar-volume collection in the same config. Same stance as
+                // the other two joins.
+                let engine = match nowcast_config.radar_source.as_deref() {
+                    Some(src_id) => match radar_site_sources.get(src_id) {
+                        Some(sites) => engine.with_radar_source(sites.clone()),
+                        None => {
+                            fail(format!(
+                                "radar_source '{src_id}' not found or not an odim-volume \
+                                 collection (it must be defined in the same config)"
+                            ));
+                            continue;
+                        }
+                    },
+                    None => engine,
+                };
                 Arc::new(engine)
             }
         };
         engines_by_id.insert(collection.id.clone(), EngineHandle::Nowcast(engine.clone()));
         nowcast_engines.push(engine.clone());
 
+        // EDR serves the per-generation motion field (#661) — the block
+        // vectors in m/s, generations as instances. No styles: the product
+        // is a vector field, not a colourised layer.
+        if collection.apis.contains(&"edr".to_string()) {
+            edr_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            edr_collections.insert(collection.id.clone(), collection.clone());
+            info!("Collection '{}': wired to EDR API", collection.id);
+        }
         if collection.apis.contains(&"wms".to_string()) {
             map_engines.insert(
                 collection.id.clone(),
@@ -4353,6 +4467,32 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             NOWCAST_FRAMES
                 .with_label_values(&[collection])
                 .set(frames as i64);
+            let tracks = engine.track_metrics();
+            let t = counter_state
+                .nowcast_tracks
+                .entry(collection.to_string())
+                .or_insert((0, 0, 0, 0, 0));
+            if tracks.0 < t.0
+                || tracks.1 < t.1
+                || tracks.2 < t.2
+                || tracks.3 < t.3
+                || tracks.4 < t.4
+            {
+                *t = tracks;
+            } else {
+                for (delta, counter) in [
+                    (tracks.0 - t.0, &*NOWCAST_CELL_BIRTHS_TOTAL),
+                    (tracks.1 - t.1, &*NOWCAST_CELL_DEATHS_TOTAL),
+                    (tracks.2 - t.2, &*NOWCAST_CELL_PASS1_MATCHES_TOTAL),
+                    (tracks.3 - t.3, &*NOWCAST_CELL_PASS2_MATCHES_TOTAL),
+                    (tracks.4 - t.4, &*NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL),
+                ] {
+                    if delta > 0 {
+                        counter.with_label_values(&[collection]).inc_by(delta);
+                    }
+                }
+                *t = tracks;
+            }
             if let Some((csi, persistence)) = engine.skill_permille() {
                 NOWCAST_LEAD1_CSI
                     .with_label_values(&[collection])
@@ -4660,6 +4800,7 @@ mod tests {
                 impact_source: None,
                 impact_name_property: "name".into(),
                 impact_weight_property: None,
+                radar_source: None,
             }),
             preview: None,
         }
@@ -4756,6 +4897,34 @@ mod tests {
         );
         assert!(!result.wms_state.engines.contains_key("nc"));
         // The base collection is unaffected.
+        assert!(result.wms_state.engines.contains_key("radar"));
+    }
+
+    #[test]
+    fn nowcast_missing_radar_source_fails_that_collection() {
+        // #642: a radar_source that names no odim-volume collection fails
+        // the nowcast collection at load, never silently serving cells
+        // without beam geometry while advertising the sortables for it.
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.nowcast.as_mut().unwrap().radar_source = Some("no-such-pvol".into());
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[tm35_source_collection("radar"), nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "nc");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(
+            h.error.as_deref().unwrap_or("").contains("radar_source"),
+            "error should name the missing radar source: {:?}",
+            h.error
+        );
+        assert!(!result.wms_state.engines.contains_key("nc"));
         assert!(result.wms_state.engines.contains_key("radar"));
     }
 

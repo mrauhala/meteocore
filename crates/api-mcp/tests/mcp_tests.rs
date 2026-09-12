@@ -115,6 +115,35 @@ impl FeatureEngine for CellEngine {
     }
 }
 
+/// A cells engine with nothing retained yet — the state right after a boot or
+/// reload, before the first generation lands.
+struct EmptyCellEngine;
+
+impl FeatureEngine for EmptyCellEngine {
+    fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        Ok(FeaturePage {
+            features: vec![],
+            number_matched: 0,
+            number_returned: 0,
+            next_offset: None,
+        })
+    }
+
+    fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(id.into()))
+    }
+
+    fn feature_count(&self) -> usize {
+        0
+    }
+
+    fn temporal_extent(
+        &self,
+    ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+        None
+    }
+}
+
 fn collection(id: &str, engine_type: &str) -> CollectionConfig {
     CollectionConfig {
         id: id.to_string(),
@@ -142,9 +171,11 @@ fn app() -> axum::Router {
     let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
     engines.insert("cells".into(), Arc::new(CellEngine));
     engines.insert("places".into(), Arc::new(CellEngine));
+    engines.insert("empty".into(), Arc::new(EmptyCellEngine));
     let mut collections = HashMap::new();
     collections.insert("cells".to_string(), collection("cells", "nowcast"));
     collections.insert("places".to_string(), collection("places", "geojson"));
+    collections.insert("empty".to_string(), collection("empty", "nowcast"));
 
     api_mcp::router(
         Arc::new(ArcSwap::from_pointee(McpState {
@@ -346,6 +377,31 @@ async fn call_tool(app: &axum::Router, sid: &str, name: &str, args: Value) -> Va
         .as_str()
         .unwrap_or_else(|| panic!("no text content in {doc}"));
     serde_json::from_str(text).unwrap_or_else(|e| panic!("tool output is not JSON: {e}: {text}"))
+}
+
+/// Call a tool expecting a JSON-RPC error, returning its message.
+///
+/// Argument errors surface as `invalid_params` on the error channel rather
+/// than as `isError` tool content, so they need their own unwrapping.
+async fn call_tool_expect_error(app: &axum::Router, sid: &str, name: &str, args: Value) -> String {
+    let (status, _, body) = call(
+        app,
+        Some(TOKEN),
+        Some(sid),
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+               "params": {"name": name, "arguments": args}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "transport should still be 200: {body}"
+    );
+    let doc: Value = parse_rpc(&body);
+    doc["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a JSON-RPC error, got {doc}"))
+        .to_string()
 }
 
 #[tokio::test]
@@ -758,7 +814,7 @@ async fn reaching_retention_start_is_not_relabelled_as_samples_reached() {
     )
     .await;
     assert_eq!(
-        out["stopped_because"], "reached_retention_start",
+        out["stopped_because"], "reached_earliest_retained_frame",
         "the real reason must survive the post-loop default: {out}"
     );
 }
@@ -842,4 +898,279 @@ fn allowed_hosts_derives_from_base_url() {
     // A malformed base_url degrades to loopback rather than panicking.
     let hosts = api_mcp::allowed_hosts("not-a-url", &[]);
     assert!(hosts.contains(&"localhost".to_string()));
+}
+
+/// The retained window is published on every response, not only when the
+/// caller asked for a time outside it.
+///
+/// It was previously part of the out-of-range explanation, so a documented
+/// field read `null` in every successful response and a client had no way to
+/// learn how far back it could ask without first asking wrongly. Reported by
+/// a model consuming the live endpoint, 2026-08-24.
+#[tokio::test]
+async fn the_retained_window_is_published_on_successful_responses_too() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    let cells = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert_eq!(
+        cells["no_frame_for_requested_time"], false,
+        "this request is inside retention"
+    );
+    assert!(
+        cells["retained_frames"]["from"].is_string() && cells["retained_frames"]["to"].is_string(),
+        "the window must be present anyway: {cells}"
+    );
+
+    let track = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "42"}),
+    )
+    .await;
+    assert!(
+        track["retained_frames"]["from"].is_string(),
+        "a track walk must say how far back it could have gone: {track}"
+    );
+}
+
+/// Both cell tools carry `retained_frames` on EVERY response, including the
+/// paths where there is nothing to report.
+///
+/// Found in review on #626: `get_cell_track`'s early return for an engine with
+/// no retained frames omitted the key entirely, while `get_storm_cells`
+/// emitted an explicit null. A client testing key presence would have read the
+/// same situation two different ways depending on which tool it called.
+#[tokio::test]
+async fn retained_frames_is_present_even_when_nothing_is_retained() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    for (tool, args) in [
+        ("get_storm_cells", json!({"collection": "empty"})),
+        (
+            "get_cell_track",
+            json!({"collection": "empty", "cell_id": "42"}),
+        ),
+    ] {
+        let out = call_tool(&app, &sid, tool, args).await;
+        let obj = out.as_object().expect("object response");
+        assert!(
+            obj.contains_key("retained_frames"),
+            "{tool} dropped the key entirely: {out}"
+        );
+        assert!(
+            out["retained_frames"].is_null(),
+            "{tool} must report null, not a window: {out}"
+        );
+    }
+}
+
+/// #630: `sortable_properties` was advertised while `get_storm_cells` had no
+/// way to use it — a capability announced and withheld.
+#[tokio::test]
+async fn storm_cells_can_be_ordered_by_an_advertised_property() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    // Default is unchanged: most significant first.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    let sig: Vec<f64> = out["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["significance"].as_f64().unwrap())
+        .collect();
+    assert!(
+        sig.windows(2).all(|w| w[0] >= w[1]),
+        "default must stay significance-desc: {sig:?}"
+    );
+
+    // Ascending by an advertised key actually reorders.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "sort_by": "max_dbz", "order": "asc"}),
+    )
+    .await;
+    let dbz: Vec<f64> = out["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["max_dbz"].as_f64().unwrap())
+        .collect();
+    assert!(
+        dbz.windows(2).all(|w| w[0] <= w[1]),
+        "ascending max_dbz was ignored: {dbz:?}"
+    );
+}
+
+/// An unsortable key is an error naming the alternatives, never a silently
+/// different ordering.
+#[tokio::test]
+async fn an_unknown_sort_key_is_rejected_with_the_valid_ones() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "sort_by": "not_a_property"}),
+    )
+    .await;
+    assert!(err.contains("not_a_property"), "{err}");
+    assert!(
+        err.contains("significance") && err.contains("max_dbz"),
+        "the error must name what WOULD work: {err}"
+    );
+
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "sort_by": "max_dbz", "order": "sideways"}),
+    )
+    .await;
+    assert!(err.contains("sideways"), "{err}");
+
+    // `order` alone has nothing to apply to. Accepting it and returning the
+    // default ordering is the silent no-op this parameter set exists to
+    // prevent — the caller asked for ascending and would get descending.
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "order": "asc"}),
+    )
+    .await;
+    assert!(
+        err.contains("sort_by"),
+        "the error must name what is missing: {err}"
+    );
+}
+
+/// A significance floor narrows the result, and says how much it removed —
+/// "3 cells exist" and "7 were below your floor" are different answers.
+#[tokio::test]
+async fn a_significance_floor_reports_what_it_removed() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert!(
+        out["below_min_significance"].is_null(),
+        "absent unless a floor was set, so it cannot read as 'nothing filtered'"
+    );
+
+    // The mock's cells are 0.88 / 0.55 / 0.31.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "min_significance": 0.5}),
+    )
+    .await;
+    assert_eq!(out["returned"], 2);
+    assert_eq!(out["below_min_significance"], 1);
+    assert_eq!(
+        out["total_tracked"], 3,
+        "the frame still had three cells; the floor did not delete them"
+    );
+
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "min_significance": 1.5}),
+    )
+    .await;
+    assert!(err.contains("between 0 and 1"), "{err}");
+}
+
+/// The advertised input schema must match the parameters actually accepted.
+///
+/// Reported 2026-08-25: `get_storm_cells` was seen advertising only
+/// `collection`, `at` and `limit` with `additionalProperties: false`, while
+/// the server accepted `sort_by`, `order` and `min_significance`. A
+/// schema-conforming client can then only reach them by guessing a name its
+/// schema says is forbidden — and a NUMBER cannot survive that path at all,
+/// because an undeclared numeric gets serialised as a string and rejected.
+#[tokio::test]
+async fn the_storm_cells_schema_declares_every_parameter_it_accepts() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let (_, _, body) = call(
+        &app,
+        Some(TOKEN),
+        Some(&sid),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    let doc: Value = parse_rpc(&body);
+    let tool = doc["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "get_storm_cells")
+        .expect("get_storm_cells advertised");
+    let props = tool["inputSchema"]["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no properties in {tool}"));
+
+    for p in [
+        "collection",
+        "at",
+        "limit",
+        "sort_by",
+        "order",
+        "min_significance",
+    ] {
+        assert!(
+            props.contains_key(p),
+            "`{p}` is accepted but not advertised: {}",
+            serde_json::to_string(&props).unwrap()
+        );
+    }
+
+    // The numeric one is the case that fails silently in the wild: an
+    // undeclared number is serialised as a string by the client and rejected
+    // by serde, so the filter reads as broken rather than undiscovered.
+    // An Option<f64> renders as `type: ["number", "null"]`, which is valid.
+    // What matters is that "number" appears at all: a client that cannot see
+    // a numeric type sends the value as a string, and serde then rejects it —
+    // the filter reads as broken rather than as undiscovered.
+    let ty = &props["min_significance"];
+    let mentions_number = ty["type"]
+        .as_str()
+        .map(|t| t == "number")
+        .or_else(|| {
+            ty["type"]
+                .as_array()
+                .map(|v| v.iter().any(|t| t == "number"))
+        })
+        .unwrap_or(false);
+    assert!(
+        mentions_number,
+        "min_significance must advertise a numeric type: {ty}"
+    );
 }

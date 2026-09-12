@@ -5,7 +5,9 @@ Motion-extrapolated reflectivity from the FMI radar composite, with tracked
 storm cells ranked by significance and joined to municipality impact context.
 """
 engine_type = "nowcast"
-apis = ["wms", "maps", "tiles", "features"]
+# "edr" serves the motion field (area query → motion_u/motion_v m/s +
+# motion_quality) that drives a particle-animation client (#661).
+apis = ["wms", "maps", "tiles", "features", "edr"]
 keywords = ["radar", "nowcast", "storm cells", "Finland"]
 
 [collections.license]
@@ -25,6 +27,11 @@ max_generations = 2
 impact_source = "municipalities"
 impact_name_property = "nimi"
 impact_weight_property = "population"
+
+# Beam geometry (#642): nearest radar, range and lowest-beam height per cell,
+# from the polar-volume network collection's site catalog. Data-only join —
+# no volume decoding per generation.
+radar_source = "radar-fi-volume-s3-h5"
 
 # Significance weight overrides. Defaults live in
 # ds_core::cell_facts::DEFAULT_CELL_WEIGHTS; omitted terms keep theirs, and an

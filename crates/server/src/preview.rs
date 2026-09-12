@@ -605,14 +605,22 @@ fn resolve_temporal_extent(
     // reachable range. EDR's interval can otherwise span a wider horizon
     // (e.g. T-24h forecast bound) than the discrete raster timesteps cover,
     // leaving the user looking at a span the slider can't reach.
-    let (mut interval, mut values) = match (edr_values, raster_times) {
-        (Some(v), _) => {
-            let int = edr_interval.or_else(|| v.first().zip(v.last()).map(|(a, b)| (*a, *b)));
-            (int, Some(v))
-        }
-        (None, Some(t)) => {
+    //
+    // The slider drives the MAP surface, so when the collection has one its
+    // raster time axis wins: a derived collection can serve a different
+    // product over EDR (the nowcast's motion field is valid at generation
+    // anchors, while its WMS/Maps/Tiles axis is the forecast leads — #661),
+    // and taking the EDR instants there would collapse the slider onto the
+    // past anchors and hide every extrapolated frame. Collections whose two
+    // surfaces share one axis are unaffected.
+    let (mut interval, mut values) = match (raster_times, edr_values) {
+        (Some(t), _) => {
             let int = t.first().zip(t.last()).map(|(a, b)| (*a, *b));
             (int, Some(t))
+        }
+        (None, Some(v)) => {
+            let int = edr_interval.or_else(|| v.first().zip(v.last()).map(|(a, b)| (*a, *b)));
+            (int, Some(v))
         }
         (None, None) => (edr_interval, None),
     };
@@ -1393,6 +1401,53 @@ mod tests {
         );
         assert_eq!(temporal["truncated"], false);
         assert_eq!(temporal["total_values"], 0);
+    }
+
+    #[test]
+    fn temporal_extent_prefers_the_map_axis_when_edr_serves_a_different_product() {
+        // #661: a nowcast collection serves its motion field over EDR, valid
+        // at the generation ANCHORS (past), while its map axis is the
+        // forecast leads (future). The slider drives the map surface, so
+        // the map axis must win — taking the EDR instants would collapse
+        // the slider onto two past stops and hide every extrapolated frame.
+        let anchor = "2024-01-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let anchors = vec![anchor - chrono::Duration::minutes(5), anchor];
+        let leads: Vec<DateTime<Utc>> = (0..=12)
+            .map(|i| anchor + chrono::Duration::minutes(5 * i))
+            .collect();
+
+        let mut edr = empty_edr();
+        let edr_engine: Arc<dyn EdrEngine> = Arc::new(EdrMock {
+            extent: Some([0.0, 0.0, 10.0, 10.0]),
+            times: anchors.clone(),
+        });
+        edr.engines.insert("nowcast".into(), edr_engine);
+        edr.collections
+            .insert("nowcast".into(), config("nowcast", &["edr", "wms"]));
+
+        let mut wms = empty_wms();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
+            times: leads.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+        });
+        wms.engines.insert("nowcast".into(), raster);
+        wms.collections
+            .insert("nowcast".into(), config("nowcast", &["edr", "wms"]));
+
+        let state = make_state(edr, empty_features(), empty_maps(), empty_tiles(), wms);
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+
+        assert_eq!(temporal["start"], leads[0].to_rfc3339());
+        assert_eq!(temporal["end"], leads[12].to_rfc3339());
+        assert_eq!(
+            temporal["values"].as_array().map(|a| a.len()),
+            Some(13),
+            "slider stops must be the map axis (anchor + 12 leads), not the EDR anchors"
+        );
     }
 
     #[test]

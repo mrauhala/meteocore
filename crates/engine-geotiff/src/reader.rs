@@ -31,9 +31,6 @@ const MAX_RASTER_DIMENSION: u32 = 100_000;
 const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 const MAX_IFD_LEVELS: usize = 256;
 
-/// Maximum number of pixels in an area query result.
-const MAX_AREA_PIXELS: usize = 1_000_000;
-
 /// Compute tile index with overflow protection.
 fn safe_tile_index(
     tile_row: u32,
@@ -1861,13 +1858,8 @@ pub fn read_bbox(
     let nx = (col_end - col_start) as usize;
     let ny = (row_end - row_start) as usize;
     let total_pixels = nx * ny;
-
-    if total_pixels > MAX_AREA_PIXELS {
-        return Err(DataServerError::InvalidParameter(format!(
-            "Area query would return {} pixels, maximum is {}. Use a smaller bbox.",
-            total_pixels, MAX_AREA_PIXELS
-        )));
-    }
+    // The shared per-response budget (#673): one band at one timestep.
+    ds_core::feature::check_area_budget(1, ny, nx, 1)?;
 
     read_bbox_inner(
         source,
@@ -2960,10 +2952,11 @@ mod tests {
         let full_meta = TiffMetadata::from_source(&DataSource::from_path(&tif_path)).unwrap();
         let full_source = DataSource::from_path(&tif_path);
 
-        // Pick a bbox that spans multiple tiles but stays under MAX_AREA_PIXELS
+        // Pick a bbox that spans multiple tiles but stays under the area budget
         let col_start = 0;
         let row_start = 0;
-        let max_side = ((MAX_AREA_PIXELS as f64).sqrt() as u32).min(full_meta.tile_width * 2);
+        let max_side = ((ds_core::feature::MAX_AREA_VALUES as f64).sqrt() as u32)
+            .min(full_meta.tile_width * 2);
         let col_end = max_side.min(full_meta.width);
         let row_end = max_side.min(full_meta.height);
 

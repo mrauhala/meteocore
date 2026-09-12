@@ -254,6 +254,53 @@ async fn get(uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
+/// Raw response for the HTML representation (content type + body).
+async fn get_raw(uri: &str, accept: Option<&str>) -> (StatusCode, String, String) {
+    let app = api_edr::router(state());
+    let mut req = Request::builder().uri(uri);
+    if let Some(a) = accept {
+        req = req.header("accept", a);
+    }
+    let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+    let status = resp.status();
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, ctype, String::from_utf8_lossy(&body).into_owned())
+}
+
+// EDR 1.1 `html` conformance class: the instance resources negotiate HTML
+// like every other metadata page (review finding on #669).
+#[tokio::test]
+async fn instances_negotiate_html() {
+    for uri in [
+        "/collections/fc/instances?f=html",
+        "/collections/fc/instances/20260607T0000Z?f=html",
+    ] {
+        let (status, ctype, body) = get_raw(uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(ctype.starts_with("text/html"), "{uri}: {ctype}");
+        assert!(body.contains("20260607T0000Z"), "{uri} must name the run");
+        assert!(
+            body.contains("?f=json"),
+            "{uri} must link the JSON alternate"
+        );
+    }
+    // Accept header alone selects HTML too, and JSON stays the default.
+    let (status, ctype, _) = get_raw("/collections/fc/instances", Some("text/html")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(ctype.starts_with("text/html"), "{ctype}");
+    let (_, ctype, _) = get_raw("/collections/fc/instances", None).await;
+    assert!(ctype.starts_with("application/json"), "{ctype}");
+    // An unknown format is a 400, not silently JSON.
+    let (status, _, _) = get_raw("/collections/fc/instances?f=xml", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn instances_list_has_both_runs() {
     let (status, body) = get("/collections/fc/instances").await;

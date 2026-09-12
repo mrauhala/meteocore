@@ -66,10 +66,12 @@ Resident bytes ≈ `max_pixels × (leads + 1) × max_generations × bytes/px`
 (1 B/px for the U8 path, 4 B/px for the f32 fallback). At the defaults
 (4 Mpx, 24 leads, 6 generations) that is ~600 MB per U8 collection and
 ~2.4 GB for an f32-fallback source — PVOL-max_files territory (#493).
-Until phase 2 (#523) makes deep retention useful (EDR `/instances`; today
-only an explicit `DIM_REFERENCE_TIME` pin reads old generations), set
-`max_generations = 2` in production configs. A generation-thinning
-follow-up (full frames only for the latest generation) is scoped in #523.
+Old generations are read only by an explicit pin — WMS `DIM_REFERENCE_TIME`
+or an EDR instance (the #661 motion field, ~30 KB per generation, is the
+first product that makes deep retention cheap to WANT; the frames are what
+make it expensive to HAVE). Until the generation-thinning follow-up in #523
+(full frames only for the latest generation), set `max_generations = 2`
+in production configs.
 
 ## Verification (V2.1, #542)
 
@@ -119,6 +121,313 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   wired; null means "join skipped this generation" (source error — the
   generation itself never fails), 0 means measured-quiet.
 
+## Motion field as a data product (#661)
+
+- `EdrEngine` is implemented for ONE product: the per-generation motion
+  field, served by the `area` query as a CoverageJSON `Grid` (`[t, y, x]`,
+  one `t` = the generation anchor) with `motion_u` / `motion_v` (east/north
+  **m/s**) and `motion_quality` (1 block-matched, 0 filled) at the block
+  centres inside the query bbox. `motion_grid` is the pure conversion
+  (px/interval on the working grid → m/s; the row axis points SOUTH, so
+  `v` flips sign) — keep it I/O-free and unit-test any change against the
+  great-circle check there. Location/position queries are rejected;
+  reflectivity via EDR is still #523.
+- **It is precipitation motion, not wind.** Labels and observedProperty
+  ids say `precipitation_motion_*`; a client that renders it as wind is
+  misrepresenting steering-level echo motion as surface wind.
+- Generations are instances (`get_instances` = the same `reference_times`
+  WMS advertises), but an instance's `valid_times` is `[anchor]` — the
+  product has one valid time, NOT the forecast leads the WMS layer renders.
+  Selection: an instance pin resolves exactly or to the minute (the EDR id
+  is minute-precision; 404 otherwise) and a `datetime` excluding the
+  anchor is a 400; with no pin, `datetime` picks the NEWEST generation
+  anchored INSIDE the interval (the #548 cell-history rule, start bound
+  included); neither ⇒ latest. `Generation.interval_secs` is what turns
+  the vectors into m/s — it is the SOURCE interval the field was measured
+  over, not the nowcast `step`. The #524 EMA now rescales the previous
+  field by the interval ratio before blending, so a skipped composite no
+  longer biases the blended (and served) speed.
+- Block selection is by footprint overlap padded by one block each side
+  (a sub-block bbox still gets its block; edge bilinear sampling has both
+  neighbours — GRIB's enclosing-cell rule), a trailing partial block's
+  centre is clamped into the grid so served coordinates never leave the
+  spatial extent, and `y` ascends south→north like GRIB (ODIM/GeoTIFF are
+  north-first; a client must read `axes.y.values` either way).
+- **`/preview` coupling:** `server/src/preview.rs` prefers the MAP time
+  axis over EDR instants when both exist — because this collection's two
+  surfaces are different products (anchors vs leads). Do not make
+  `get_available_times` return the leads to "fix" a slider.
+- The whole-domain document is ~3k vectors (~30 KB before gzip) — no
+  tiling; a client uploads it as one texture and bilinear-samples it, which
+  reproduces the engine's own `MotionField::sample` field.
+
+## Lightning metrics (#616)
+
+- **`jump_sigma` replaces a bare boolean as the scoring input.** The 2σ test
+  already computed the magnitude and discarded it; a 5σ surge and a 2.1σ
+  nudge both set `lightning_jump` but are not the same fact. The bool stays,
+  now DERIVED from the magnitude so the two cannot disagree.
+- `jump_sigma` is `None` until there are ≥2 generations of history — **not
+  0.0**, which would claim "measured, no anomaly". A jump with no baseline
+  still scores (it happened; it just can't be graded).
+- A perfectly flat history has zero spread, making the true sigma infinite.
+  Clamped to `JUMP_SIGMA_FLAT_HISTORY` so it stays a renderable number.
+- `flash_density_per_km2` normalizes for cell size; guarded against a
+  degenerate zero-area cell producing `inf`.
+- `first_flash` is the track's FIRST ever, carried across generations, never
+  overwritten by a later one — electrification age, not "most recent".
+- Scoring ramps the jump between `JUMP_SIGMA_FLOOR` (2.0, the test
+  threshold) and `JUMP_SIGMA_CEILING` (6.0); beyond that the difference
+  shouldn't decide a ranking.
+### IC/CG split and polarity (part 2)
+
+- `EventPoint.attrs` (`ds_core::events::EventAttrs`) carries the per-event
+  scalars. **Flat and `Copy`** — up to `MAX_JOIN_STRIKES` (200k) events cross
+  this seam per generation, so a map or `Vec` per event would allocate 200k
+  times per cycle on the poll runtime.
+- The columns are **opt-in per source**: `[postgis.events]`
+  `cloud_indicator_col` / `peak_current_col`. A network that doesn't report
+  them declares nothing and nothing is selected. Do NOT add a column here
+  without a consumer — `multiplicity_col` was wired end-to-end in the first
+  draft of #618 and read by nothing, paying SQL and decode cost per strike
+  for a config knob that silently did nothing.
+- **A cell with NO strikes reports a zero split, not an unknown one.** The
+  split of zero flashes is zero flashes, whether or not the network could have
+  classified them. Gating on `saw_split` alone shipped `flash_count: 0` beside
+  `cg_count: null` — claiming ignorance about a total the same response
+  asserted was zero. `positive_cg_fraction` is the exception and stays null:
+  0 of 0 CG flashes has no share. (Coverage is separate: outside the network's
+  range `flash_count` should itself be null — #621 — and these follow it.)
+- **A three-way distinction, not two.** `cg_count`/`ic_count`/
+  `positive_cg_fraction` are absent when no source is wired, `null` when the
+  source reports no discriminator, and a number when measured. "This network
+  doesn't say" and "no CG flashes" are different facts and only one of them
+  licenses a statement.
+- **Presence flags must be exactly as fine-grained as the fact they gate.**
+  `Tallies` carries `saw_split` and `saw_polarity` PER TRACK. Review on #618
+  found the same mistake twice at two granularities:
+  - One flag for both facts made a split-only network report
+    `positive_cg_fraction: 0.0` for every CG-producing cell — "we checked and
+    found no positive flashes" about a question it never asked.
+  - A generation-global flag let a cell whose OWN strikes were all
+    unclassified report `Some(0)` because some OTHER cell's strikes were
+    classified. Degraded detections cluster by cell, so this is not exotic.
+- **`positive_cg_fraction`'s denominator is `cg_polarity_known`, not
+  `cg_count`.** Peak-current estimation fails on weak signals, so a network
+  can classify only part of its CG population; dividing 4 positives by all 10
+  CG flashes reports 0.4 where the measured share is 0.8. The denominator is
+  served as its own property so the sample size behind the share is visible —
+  "3 of 4" and "300 of 400" are the same fraction and not the same evidence.
+- **`positive_cg_fraction` is `None` when `cg_count == 0`**, never 0.0 — 0/0
+  is not 0%. A cell with only IC flashes has no CG polarity to report.
+- Polarity comes from the SIGN of `peak_current`, not its magnitude. A zero
+  current yields `None` (no polarity) rather than "positive".
+- `positive_cg` is weighted at 0.6 and ramps `POSITIVE_CG_FLOOR` 0.05 →
+  `POSITIVE_CG_CEILING` 0.5: a few +CG flashes are normal background, and a
+  CG population half positive is already the severe signature, so the term
+  saturates there rather than reserving its top half for shares that
+  essentially never occur. Test the RAMP, not just the ordering — a relative
+  `assert!(a > b)` passes with no ramp at all, which is how the missing one
+  reached review.
+
+## The clutter detector has two sides, and they are measured separately
+
+- **Recall** — `tests/fixtures/clutter-eval-2026-08-24T2025Z.json`, an
+  operator-labelled all-negative frame. Baseline 2 of 11.
+- **Precision** — `tests/fixtures/clutter-precision-2026-09-04T1245Z.json`,
+  a 274-cell widespread-rain frame. Labels are INFERRED, so only assert what
+  net displacement alone establishes.
+- **Neither fixture alone is a gate.** The all-negative one scores an
+  always-true detector at 100%; the rain frame scores an always-false one at
+  100%. Any change to `is_likely_clutter` must move one without wrecking the
+  other, which is the only reason both files exist.
+- **Speed cannot tell slow from stationary**, and on widespread slow-moving
+  precipitation that is the entire question. Measured 2026-09-04: 19 of 21
+  flagged cells had travelled more than 3 km net, up to 18.2 km, with
+  `clutter` LEADING their `significance_reasons` — severe cells demoted from a
+  median rank of 20 to ranks 135–197. `CLUTTER_MAX_NET_DISPLACEMENT_KM` vetoes
+  that: having gone somewhere disqualifies, whatever the speed.
+- **An unknown displacement is not a veto.** `None` falls back to the speed
+  and age test, or every snapshot predating #631 would escape the detector.
+
+## Path straightness, and why `track_age` is not evidence (#629)
+
+Observed 2026-08-24: one track id ping-ponging between two fixed echoes 6.3 km
+apart reported `track_age: 12`. An hour-long track reads as "definitely real";
+this one was two stationary ground echoes and an association failure.
+
+- **`track_age` can be manufactured. Displacement cannot.**
+  `net_displacement_km` is measured from `first_centroid` every frame, so an
+  association jump cannot inflate it — the jump moves the cell back and forth
+  around the same origin.
+- **`path_straightness` = net / path-integrated.** Real advection sits near 1;
+  the reported track scored ~0.2. The metric works because an association
+  failure inflates the PATH without inflating the NET, and nothing else in the
+  payload exposes that asymmetry.
+- **The two fields answer different questions and both are needed.** A
+  *wandering* track has a long path and a short net, so straightness catches
+  it. A *perfectly stationary* echo has both near zero, so the ratio is 0/0 and
+  straightness is `None` — `net_displacement_km` is what speaks there. Do not
+  collapse them into one field.
+- **`deviant_mover` is gated on coherence** (`DEVIANT_MIN_STRAIGHTNESS`).
+  A track whose own displacement is incoherent has motion estimates that
+  measure association noise, and the reported track's spurious
+  `deviant_mover: true` reached `significance_reasons` and inflated its rank.
+  Unknown straightness does NOT qualify: this awards a bonus, and an
+  unverifiable claim should not earn one.
+- Path length uses `PixelScale::distance`, the same anisotropy-aware helper
+  the matcher uses for its gates. A second hand-rolled copy is how the
+  Critical Rule 4 drift happened.
+
+## Association cost: distance plus similarity (#639)
+
+Observed 2026-09-07, still live after #629/#637: one track id hopping between
+three fixed wind-farm echoes at Kristiinankaupunki, with 11–12 m/s speeds on
+the jump frames, a spurious `deviant_mover`, rank 1 "severe" at 54 dBZ with no
+lightning, and `likely_clutter` flapping on alternate frames.
+
+- **Pure centroid distance is degenerate for symmetric geometry.** Two
+  stationary echoes `d` apart along a uniform flow `f ≥ d` cost the same
+  crossed (`(f−d) + (f+d)`) as straight (`2f`). Both predictions sit inside
+  the pass-1 gate, so no gate is involved and the assignment is a coin toss
+  per frame at ordinary wind speeds. (A swap WITHOUT the tie needs flow above
+  the pass-1 gate, > 20 m/s at 5-min cadence, after which pass 2 rematches the
+  leftover at raw position and the ids alternate.)
+- `objects::MatchCost` adds TITAN-style size and intensity penalties to the
+  cost (`AREA_MISMATCH_KM_PER_EFOLD` 2 km, `DBZ_MISMATCH_KM_PER_DB` 0.15 km).
+  Both are below `BASE_GATE_KM`, and the gate stays on distance only, so a
+  lone evolving cell always keeps its successor; similarity only decides
+  between competitors. Both tracker passes use it; the verification harness
+  keeps `match_cells` = distance only (Ritvanen centroid matching) so
+  object-CSI numbers stay comparable.
+- **Every clutter gate is downstream of association.** The swap kicks the
+  EMA speed above `CLUTTER_MAX_SPEED_MS` and manufactures 10–17 km of net
+  displacement, so `CLUTTER_MAX_NET_DISPLACEMENT_KM` reads a fixed target as
+  "travelled". Do not tune the clutter thresholds against a swapping track;
+  fix the association.
+- **Aged tracks predict with their own EMA velocity; only newborns borrow
+  the ambient field.** Displacing every track by the flow is what created
+  the tie for stationary echoes in the first place; a stationary track that
+  predicts onto itself has no tie to break, so even IDENTICAL fixed echoes
+  settle after at most one frame-2 swap
+  (`identical_fixed_echoes_settle_instead_of_ping_ponging`). The counter-flow
+  rescue in pass 2 is still needed for newborns.
+- Still open in #639: the padding constant makes the optimiser maximise the
+  NUMBER of in-gate matches before cost, so a gate-edge pairing beats a birth
+  plus a death. Pricing "unmatched" is the follow-up — and note the naive
+  version (unmatched cost ≈ gate) is a no-op, since a match at `d` beats two
+  unmatched entries iff `d < 2c`.
+- **Association is observable (#643):** `advance_tracks_with_stats` returns
+  births / deaths / pass-1 / pass-2 matches / velocity clamps per generation,
+  exported as `nowcast_cell_{births,deaths,pass1_matches,pass2_matches,velocity_clamps}_total`
+  (same reload-rebaseline delta scrape as `nowcast_generations_total`) with a
+  Grafana panel. A rising pass-2 share is the first sign of swaps; births and
+  deaths above real cell turnover mean dropouts (#649). Check these before
+  claiming a tracker change helped.
+- Test association by WALKING frames with two echoes
+  (`fixed_echoes_of_different_size_keep_their_ids_in_flow`); the straightness
+  test sets `path_length`/`net` by hand and pins the symptom, not the cause.
+
+## Severity and trend hysteresis (#623)
+
+Both fields flapped on coherent tracks. Reported 2026-08-24: one clean
+50-minute track, growing monotonically the whole time, changed `severity` nine
+times and alternated `volume_trend` six times. A client animates that as a
+storm exploding and collapsing every five minutes.
+
+- **Cause was hard binning, not bad data.** `max_dbz` noise runs about +/-2 dB
+  and the bins are steps at 45/50/55, so a cell parked near a boundary crosses
+  it every frame without changing physically. `volume_trend` was a bare
+  `volume >= prev.volume`, which forces an answer even when nothing moved and
+  lets noise pick it.
+- **Severity hysteresis is ASYMMETRIC and that is the point.** Rising is
+  immediate; falling must clear `SEVERITY_DOWNGRADE_DEADBAND_DBZ` below the
+  step. Under-calling a strengthening storm while a filter waits for
+  confirmation is the one failure mode worth avoiding, so the damping only
+  ever applies downward. A genuine collapse still drops in a single frame,
+  because the relaxed test is re-evaluated rather than a dwell counter.
+- **Cost: severity is now path-dependent.** Two cells with identical current
+  pixels can report different severity if they arrived from different
+  directions. Inherent to hysteresis, and the intended trade against a value
+  that changes for reasons unrelated to the weather. `severity()` stays
+  memoryless for cells with no history; `severity_hysteretic()` is for tracked
+  ones.
+- **`volume_trend` holds its previous verdict inside `TREND_FLIP_DEADBAND`,
+  measured from an ANCHOR — not from the previous frame.** The anchor is the
+  volume at which the current verdict was last confirmed, carried on the track
+  as `trend_anchor_volume` and reset only when the verdict is confirmed.
+  - Holding, not recomputing, is what stops the alternation.
+  - Anchoring is what stops the hold from becoming a trap. Measuring against
+    the previous frame meant a real trend whose per-frame change never cleared
+    the band could never flip the verdict — 5% growth per frame for twenty
+    frames is a 165% increase that would still have reported "decaying".
+    Caught in review on #627. Genuine noise oscillates around the anchor and
+    never accumulates; a real trend accrues until it clears the band.
+  - `TREND_MIN_VOLUME_CHANGE` is an absolute floor alongside the relative one.
+    A marginal cell has volume near zero, so 10% of it is also near zero and
+    any wobble flips the verdict. **Uncalibrated** — picked from the units,
+    not from measured marginal-cell traces.
+  - With no previous verdict AND a change too small to call, it stays `None` —
+    unknown beats a coin flip presented as a measurement.
+  - Test trend behaviour by WALKING a series, not with single steps. The
+    single-step tests in the first draft passed while the trap was present.
+- Severity feeds significance at weight 1.0, so stabilising it stabilises the
+  ranking too. Tests pin that the raw binner flaps 7 times on a sequence where
+  the hysteretic one flaps 0 — without that precondition assertion the fix
+  could be passing for the wrong reason.
+
+## The null contract, and why the scorer does not follow it
+
+Reported by a model consuming the live `/mcp` surface on 2026-08-24 (#620-#623;
+see `docs/cell-intelligence-plan-amendment.md`).
+
+- **A flag that cannot be computed is `null`, not `false`.** `deviant_mover`
+  is null until the track has a velocity; `lightning_jump` is null until two
+  prior generations give the 2sigma test a baseline. `false` claims the test ran
+  and cleared the cell.
+- **`significance_reasons` must not name a term that contributed nothing.**
+  Every weighted term lands in `contributions`, including flags that are false
+  or unknown, so an unfiltered top-3 cited `deviant_mover` as a reason on a
+  cell whose motion was unknown. Negative contributions stay: "demoted as
+  likely clutter" is a real reason a cell ranked where it did.
+- **Flags are BONUS terms, outside the denominator, bounded by construction
+  (#645).** The GRADED terms — severity, max_dbz, area, flash_rate,
+  positive_cg, vil, echo_top, beam_coverage, impact — form a weighted mean.
+  A positive bonus (`deviant_mover`, `lightning_jump`, `intensifying`) fills
+  the remaining headroom, `s += (1 − s)·w·v/D`, composing as a soft OR so
+  three signals at once cannot push the top cells past 1.0 into a clamped
+  tie ordered by id. A negative bonus weight is a multiplicative DISCOUNT,
+  `s *= 1 − |w|·v`, with `|w|` the fraction removed at full value: `clutter`
+  is −0.9 (keeps a tenth), `weakening` −0.15. Discounts are NOT relative to
+  the graded mass — an additive −1.5 over a mass of 3.4 removed 0.44 and
+  left the live Utajärvi clutter cell (60 dBZ under a 650 m beam) at rank 1.
+  `contributions` still sum to `raw`. Two things follow. A flag that did not
+  fire dilutes nothing: the old all-in-denominator mean capped a plain cell
+  at 0.51 and packed the weak class into a tenth of the range (#636). And an
+  UNKNOWN flag scored as 0 is identical to an absent one by construction, so
+  the old trap — dropping an unknown flag shrank the denominator and
+  promoted every newborn, i.e. every re-detected fixed echo — cannot
+  re-open. The payload still says `null` for what it does not know. Pinned
+  by `unknown_motion_scores_as_no_bonus_not_as_an_absent_term`,
+  `flags_that_did_not_fire_do_not_dilute_the_graded_mean`,
+  `bonuses_cannot_push_the_score_past_one` and
+  `a_discount_removes_its_fraction_whatever_else_is_wired`.
+- **Trend is two bonuses, `intensifying` (+0.5) and `weakening` (−0.15, a
+  discount), ramped 0..0.4 dBZ/min** — the tracker's own clamp, which
+  `MAX_CELL_TENDENCY_PER_S` now derives from
+  `ds_core::cell_facts::INTENSITY_TREND_CEILING_DBZ_MIN` so the two cannot
+  drift. Only the side that fires is emitted; a steady cell emits neither.
+  The old single `trend` term ramped ±2 dBZ/min around a 0.5 centre, so every
+  aged cell sat in 0.4..0.6 and a steady cell carried a constant half-credit
+  cited as a reason on 145 of 274 cells of a widespread-rain frame. `trend`
+  is no longer a weight name: a `[nowcast.significance] trend = …` line
+  fails the collection at load, as any unknown name does — and so does
+  zeroing severity, max_dbz and area together (nothing graded left).
+- **`significance_reasons` names demotions too.** `clutter` and `weakening`
+  in the list are reasons a cell ranked LOWER (the MCP tool text says so);
+  `significance_is_demoted()` is true whenever any discount fired, weakening
+  included. Signed contribution values are the #650 follow-up.
+
 ## Fact sheets + significance ranking
 
 - **`ds_core::cell_facts::CellFactSheet` is the one description of a cell.**
@@ -136,12 +445,18 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `cell_facts::DEFAULT_CELL_WEIGHTS`, overridable per collection via
   `[nowcast.significance]`; an unknown term name FAILS the collection at
   load rather than silently keeping a default nobody chose.
+- **Ranked on the rounded score** (#644): `score_cells` calls
+  `rank_quantized(.., SIGNIFICANCE_DECIMALS)`, so the 4-dp number a client
+  sorts on is the number the rank came from. Ranking raw and serving rounded
+  let two cells 3e-5 apart get distinct ranks in raw order but tie on the
+  wire, where the id-string tie-break can point the other way — a limited
+  page then held rank 2 without rank 1 (the #635 hole, second form).
 - Served as `significance` (0..=1), `significance_rank` (1-based within the
   snapshot) and `significance_reasons` (top 3 contributing terms). The
   reasons field is load-bearing: a weight table with no ground truth has to
   be arguable to be tunable.
-- **Absent terms renormalize.** A cell with no volume/impact/lightning data
-  simply omits those terms. That is why wiring a new source later needs no
+- **Absent GRADED terms renormalize.** A cell with no volume/impact/lightning
+  data simply omits those terms. That is why wiring a new source later needs no
   config flag day — but it also means `measured-quiet` ranks BELOW
   `unknown`, which is correct (measured zero is information) and worth
   remembering when a newly wired source appears to demote everything.
@@ -161,6 +476,33 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   to remove. Resolved once by `recompute_sortables()` whenever a source is
   wired and stored on the engine, so the accessor is a borrow and there is
   one list to maintain rather than one per source combination.
+## Clutter mitigation (#614)
+
+- A **persistent, near-stationary** echo is flagged `likely_clutter` and
+  demoted by a negative `clutter` term. Reported from production: wind
+  turbine clutter near Oulu ranked #1 on a quiet day, because every
+  significance term measures intensity, size, trend or impact and **none
+  asks whether the echo is meteorological**. Clutter is bright, compact,
+  persistent and usually over a town, so it scores well on nearly
+  everything.
+- Thresholds in `ds_core::cell_facts`: speed < `CLUTTER_MAX_SPEED_MS` (3.0,
+  matching `DEVIANT_MIN_CELL_SPEED_MS`) **and** age ≥ `CLUTTER_MIN_AGE` (6
+  frames ≈ 30 min). Both conditions matter — a real cell can crawl briefly
+  in weak flow, but one holding position *and* high reflectivity for half an
+  hour is a fixed object.
+- **A newborn track is never flagged.** `speed_ms` is `None` until the
+  second observation; reading that as "stationary" would flag every cell for
+  the first frames after a reload.
+- **Demoted, never dropped.** The flag is a served property, so a client can
+  say "persistent stationary echo, probably a wind farm" instead of either
+  "severe storm" or nothing. Excluding would let a false positive delete
+  real weather with no trace — the opposite of the absent/null/value
+  discipline everywhere else here.
+- **Mitigation, not detection.** Wind turbine clutter is a hard upstream QC
+  problem; this only stops a fixed echo dominating a ranking. A known-site
+  clutter mask (option B in #614) is the precise complement and is not
+  built.
+
 - `severity` is deliberately NOT sortable — as a string it orders
   `moderate < severe < very_severe < weak`, which looks almost right and
   buries the weakest cells at the end; use `significance`, which already
@@ -169,6 +511,34 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `ds_core::feature::sort_features`. Do not reorder those two steps.
 - NOT yet wired: a `min_significance` filter, and the `volume` /
   `environment` fact groups.
+
+## Beam geometry (`radar.rs`, #642)
+
+- `[nowcast] radar_source = "<id>"` names an `odim-volume` collection in the
+  same config (its NETWORK engine, e.g. `radar-fi-volume-s3-h5`). Wired
+  second-pass via `ds_core::radar_sites::RadarSiteSource`, exactly like the
+  lightning join; a missing or non-volume id FAILS the collection at load.
+- **Data-only.** `radar_sites()` is one catalog snapshot per generation — no
+  volume decoding, no S3. That is what makes this shippable before the full
+  3-D cell join (#642 step 2, blocked on #293).
+- Per cell: `nearest_radar_id` / `nearest_radar_name` /
+  `nearest_radar_distance_km` (nearest by great-circle distance, whether or
+  not it covers the cell), `in_radar_coverage` (null when the site advertised
+  no range — "cannot say" is not "not covered"), and — only within the
+  LOWEST sweep's own range, which can be shorter than the coverage radius —
+  `beam_height_m` (lowest sweep's centre, metres above MEAN SEA LEVEL:
+  antenna height + 4/3-Earth rise; there is no terrain model) and
+  `beam_elevation_deg`. Tri-state like the other groups: absent when no
+  source is wired, all null when the source advertised no sites yet.
+- The "no sites" warning fires once per empty stretch, not per generation
+  (`radar_empty_warned`), and an info line marks the resume.
+- Why it exists: a bright stationary echo under a beam a few hundred metres
+  up is a wind farm; the same echo under a beam 3 km up is weather. This is
+  the frame-one clutter evidence #620 needs, and the range context every
+  radar-derived number needs (Block A of #624). Not a significance term yet.
+- The beam math has ONE home: `ds_core::geo::{slant_to_ground_height,
+  beam_height_at_ground, FOUR_THIRDS_EARTH_M}`; engine-odim's voxel sampler
+  re-exports it. Do not re-derive it here.
 
 ## Impact context (`impact.rs`)
 

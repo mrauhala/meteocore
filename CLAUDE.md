@@ -27,7 +27,14 @@ of these crates, read its file — it holds that crate's rules and gotchas:
 - `crates/api-wms/CLAUDE.md` — BBOX axis order, meta-tiling, TIME/ELEVATION/
   reference_time dimensions.
 - `crates/api-edr/CLAUDE.md` — CoverageJSON schema compliance, domain types,
-  instances.
+  instances. `crates/api-edr/README.md` is the EDR support-status page
+  (conformance classes, query types, per-engine matrix) — update it in
+  every PR that touches EDR behaviour, including engine `EdrEngine` impls.
+- `crates/api-features/CLAUDE.md` — sortby/paging rules, caching twin.
+  `crates/api-features/README.md` is the Features support-status page
+  (conformance classes, `/items` parameters, per-engine matrix) — update it
+  in every PR that touches Features behaviour, including engine
+  `FeatureEngine` impls.
 - `crates/api-3dtiles/CLAUDE.md` — routes, representations, caching, viewer.
 - `crates/api-mcp/CLAUDE.md` — MCP tools, the auth boundary, why the tool
   set is restricted to nowcast collections.
@@ -335,9 +342,9 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
     reference time; implement `EdrEngine::get_instances()` (default empty =
     non-forecast); honour the trailing `reference_time` parameter on query
     methods and `MapEngine::get_raster_tile` (`None` ⇒ latest); populate
-    `RasterInfo.reference_times`. GRIB and QueryData implement this; other
-    engines accept-and-ignore. Zarr instances are a follow-up (it pins the
-    latest run internally).
+    `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores)
+    and Nowcast (generations = runs, #661) implement this; other engines
+    accept-and-ignore.
   - API surface: EDR `/instances`, `/instances/{id}`,
     `/instances/{id}/{position,area}` — gated on `get_instances()` being
     non-empty; no-instance routes default to the latest run. WMS exposes
@@ -350,16 +357,30 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   exposes it as `ELEVATION`, Maps/Tiles as `elevation`, EDR as `z`. The API
   layer rejects z/elevation against a collection with no vertical extent
   (HTTP 400). The ODIM PVOL engine uses it for radar elevation angle.
+- **`ds_core::radar_sites`** — `RadarSiteInfo` + the data-only
+  `RadarSiteSource` trait (one catalog snapshot per call, never I/O) that a
+  polar-volume engine implements and the nowcast's per-cell beam-geometry
+  join (#642) consumes. The 4/3-Earth beam model
+  (`geo::{slant_to_ground_height, beam_height_at_ground,
+  FOUR_THIRDS_EARTH_M}`) and `geo::great_circle_distance_m` live in
+  `ds_core::geo` — one home; engine-odim re-exports them.
 - **`ds_core::cells`** — storm-cell segmentation and tracking over
   `VoxelGrid` (see `crates/engine-odim/CLAUDE.md`).
 - **`ds_core::significance`** — domain-agnostic scoring/ranking: normalized
   `Term`s → a weighted mean with per-term `contributions` for
-  explainability. Absent terms renormalize (so wiring a new data source
-  needs no config flag day) and weights may be negative (a data-quality
-  discount must be able to demote). `WeightedScorer` is the baseline a
+  explainability. Graded terms form the denominator and absent ones
+  renormalize (so wiring a new data source needs no config flag day);
+  bonus terms (`Term::flag` / `Term::bonus`) compose outside it, bounded by
+  construction — a positive weight fills the remaining headroom, a negative
+  weight is a multiplicative discount (fraction removed at full value) — so a
+  signal that did not fire dilutes nothing and three firing at once cannot
+  clamp the top of the list into a tie (#645). `WeightedScorer` is the baseline a
   learned ranker has to beat; a GBDT/ONNX model is another
   `impl Significance<T>` behind the same interface. Reusable for CAP alert
   urgency and impact-event priority — do not fork it per domain.
+- **`ds_core::cell_facts`** — also `is_likely_clutter` (#614): a persistent
+  near-stationary echo is flagged and demoted, because no other significance
+  term asks whether an echo is meteorological at all.
 - **`ds_core::cell_facts`** — `CellFactSheet`: the one wide description of a
   tracked storm cell, plus `Severity` (owned here so the tracker, the
   ranking and any narrative cannot drift) and `DEFAULT_CELL_WEIGHTS`. Built
@@ -383,9 +404,9 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
-| QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position), WMS, Maps, Tiles; local + S3/HTTP |
-| Nowcast | `MapEngine` + `FeatureEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544). EDR + instances = #523 |
+| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
+| Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 
 ## Config Format
@@ -519,7 +540,9 @@ id = "radar-nowcast"
 engine_type = "nowcast"
 # "features" is what serves the tracked-cell layer — and what makes the
 # collection visible to the MCP tools, which read the Features registry.
-apis = ["wms", "maps", "tiles", "features"]
+# "edr" serves the motion field itself (area query → motion_u/motion_v in
+# m/s + motion_quality; one generation = one instance) for particle clients.
+apis = ["wms", "maps", "tiles", "features", "edr"]
 
 [collections.nowcast]
 source = "radar"        # collection id to extrapolate
@@ -533,6 +556,8 @@ horizon = "PT2H"        # how far into the future (default PT2H)
 # impact_name_property = "name"        # display-name property (default "name")
 # impact_weight_property = "population" # optional numeric property; log-weights
                                         # exposure. Omit ⇒ purely geometric
+# radar_source = "fi-radar-pvol"  # odim-volume collection: per-cell nearest
+                                  # radar, range, lowest-beam height (#642)
 
 # Optional per-term significance weight overrides for tracked storm cells.
 # Defaults live in ds_core::cell_facts::DEFAULT_CELL_WEIGHTS; omitted terms

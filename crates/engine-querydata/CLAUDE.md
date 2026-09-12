@@ -15,7 +15,12 @@ runtime).
   shared `ds_core::instances` contract (root CLAUDE.md).
 - **Grids:** WGS84, Stereographic, Rotated Lat-Lon.
 - EDR position queries use bilinear interpolation; map rendering uses
-  nearest-neighbour.
+  nearest-neighbour. EDR area (and radius via the shared default) returns a
+  CRS84 `Grid` over the polygon bbox at native resolution (≤ 256 cells per
+  axis, 1M-value budget across time × cells × parameters), every cell
+  bilinearly interpolated and cells outside the polygon masked to null
+  (`QueryPolygon::sample_grid` in ds-core, #671). One `t` axis when the
+  datetime window selects several steps.
 - Missing-value sentinel: `32700.0`.
 - Config: `wms_parameter`, `poll_interval_secs` (default 30), `max_runs`
   (default 4; set 1 for latest-only).

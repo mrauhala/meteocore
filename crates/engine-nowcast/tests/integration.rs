@@ -97,6 +97,137 @@ impl MapEngine for MockSource {
     }
 }
 
+/// Beam geometry (#642): a mock radar-site source must surface the
+/// nearest-radar group on every cell, an engine WITHOUT a source must not
+/// emit the keys at all, and a source that advertises no sites yet serves
+/// the group as null rather than absent.
+#[test]
+fn radar_source_exposes_beam_geometry() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use ds_core::radar_sites::{RadarSiteInfo, RadarSiteSource};
+
+    struct Sites(Vec<RadarSiteInfo>);
+    impl RadarSiteSource for Sites {
+        fn radar_sites(&self) -> Vec<RadarSiteInfo> {
+            self.0.clone()
+        }
+    }
+    // One radar at the grid's centre, 250 km range, 0.3° lowest tilt.
+    let centre_lon = (EXTENT[0] + EXTENT[2]) / 2.0;
+    let centre_lat = (EXTENT[1] + EXTENT[3]) / 2.0;
+    let site = RadarSiteInfo {
+        id: "mock1".into(),
+        name: Some("Mockville".into()),
+        lon: centre_lon,
+        lat: centre_lat,
+        antenna_height_m: 120.0,
+        max_range_m: Some(250_000.0),
+        lowest_sweep_range_m: Some(250_000.0),
+        lowest_elevation_deg: Some(0.3),
+    };
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: None,
+        significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
+        radar_source: Some("mock-pvol".into()),
+    };
+    let anchor1 = t0() + Duration::minutes(5);
+
+    // Wired, sites present.
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let engine = NowcastEngine::new("rs-nowcast", "mock", source, &config)
+        .expect("engine builds")
+        .with_radar_source(Arc::new(Sites(vec![site.clone()])));
+    engine.poll_once();
+    assert!(engine.sortables().contains(&"beam_height_m"));
+    assert!(engine.sortables().contains(&"nearest_radar_distance_km"));
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(
+        f.properties.get("nearest_radar_id"),
+        Some(&PropertyValue::String("mock1".into()))
+    );
+    assert_eq!(
+        f.properties.get("nearest_radar_name"),
+        Some(&PropertyValue::String("Mockville".into()))
+    );
+    assert_eq!(
+        f.properties.get("in_radar_coverage"),
+        Some(&PropertyValue::Bool(true))
+    );
+    let dist = match f.properties.get("nearest_radar_distance_km") {
+        Some(PropertyValue::Float(d)) => *d,
+        other => panic!("distance must be a number, got {other:?}"),
+    };
+    assert!((0.0..250.0).contains(&dist), "distance {dist}");
+    let beam = match f.properties.get("beam_height_m") {
+        Some(PropertyValue::Float(h)) => *h,
+        other => panic!("beam height must be a number in coverage, got {other:?}"),
+    };
+    assert!(
+        beam >= 120.0,
+        "beam height {beam} must sit above the antenna"
+    );
+    assert_eq!(
+        f.properties.get("beam_elevation_deg"),
+        Some(&PropertyValue::Float(0.3))
+    );
+
+    // Wired, but the source advertises no sites yet: the group is null,
+    // not absent — "join skipped", distinguishable from "not measured".
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let engine = NowcastEngine::new("rs-empty", "mock", source, &config)
+        .expect("engine builds")
+        .with_radar_source(Arc::new(Sites(Vec::new())));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(
+        f.properties.get("nearest_radar_id"),
+        Some(&PropertyValue::Null)
+    );
+    assert_eq!(
+        f.properties.get("in_radar_coverage"),
+        Some(&PropertyValue::Null)
+    );
+    assert_eq!(
+        f.properties.get("beam_height_m"),
+        Some(&PropertyValue::Null)
+    );
+
+    // Not wired: no keys at all, and no radar sortables advertised.
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let unwired = NowcastConfig {
+        radar_source: None,
+        ..config.clone()
+    };
+    let engine = NowcastEngine::new("rs-none", "mock", source, &unwired).expect("engine builds");
+    engine.poll_once();
+    assert!(!engine.sortables().contains(&"beam_height_m"));
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert!(!f.properties.contains_key("nearest_radar_id"));
+    assert!(!f.properties.contains_key("beam_height_m"));
+}
+
 /// Lightning join (#549): a mock event source dropping a fixed burst on
 /// the disc each window must surface flash properties on the cell —
 /// and an engine WITHOUT a source must not emit them at all.
@@ -122,7 +253,8 @@ fn lightning_join_exposes_flash_properties() {
                 EventPoint {
                     time: end,
                     lon,
-                    lat
+                    lat,
+                    attrs: Default::default(),
                 };
                 30
             ])
@@ -148,6 +280,7 @@ fn lightning_join_exposes_flash_properties() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine = NowcastEngine::new("lj-nowcast", "mock", source.clone(), &config)
         .expect("engine builds")
@@ -165,10 +298,14 @@ fn lightning_join_exposes_flash_properties() {
         f.properties.get("flash_rate_per_min"),
         Some(PropertyValue::Float(r)) if (r - 6.0).abs() < 1e-6
     ));
-    assert!(matches!(
+    // Null after ONE generation: the jump test needs a baseline of at least
+    // two, so no jump has been ruled out yet. It becomes `false` below, once
+    // a second generation gives it something to compare against — the two
+    // states are different claims and the payload distinguishes them.
+    assert_eq!(
         f.properties.get("lightning_jump"),
-        Some(PropertyValue::Bool(false))
-    ));
+        Some(&PropertyValue::Null)
+    );
 
     let anchor2 = anchor1 + Duration::minutes(5);
     source.times.write().unwrap().push(anchor2);
@@ -179,10 +316,27 @@ fn lightning_join_exposes_flash_properties() {
         f.properties.get("flash_count"),
         Some(PropertyValue::Integer(30))
     ));
-    assert!(matches!(
+    // Still null: the baseline is built from PRIOR generations, so after two
+    // there is exactly one historical rate — not enough spread to test.
+    assert_eq!(
         f.properties.get("lightning_jump"),
-        Some(PropertyValue::Bool(false))
-    ));
+        Some(&PropertyValue::Null)
+    );
+
+    // Third generation: two prior rates now exist, the test can run, and it
+    // says no — 6 flashes/min is under the 10/min operational floor. This is
+    // the transition that matters: "not testable" became "tested, no jump",
+    // and those are different claims about the same cell.
+    let anchor3 = anchor2 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor3);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(
+        f.properties.get("lightning_jump"),
+        Some(&PropertyValue::Bool(false)),
+        "with a baseline the flag becomes a measurement"
+    );
 
     // No source wired ⇒ the flash properties do not exist (absent, not
     // null — "not measured" is a different statement than "no strikes").
@@ -191,6 +345,105 @@ fn lightning_join_exposes_flash_properties() {
     let page = plain.get_features(&FeatureQuery::default()).unwrap();
     assert!(!page.features[0].properties.contains_key("flash_count"));
     assert!(!page.features[0].properties.contains_key("lightning_jump"));
+}
+
+/// #616 part 2 end-to-end: a network that reports the discriminator columns
+/// produces per-cell IC/CG counts and a positive-CG share, and every property
+/// the engine advertises as sortable is actually present on the feature.
+#[test]
+fn lightning_attributes_reach_the_feature_and_match_the_sortables() {
+    use ds_core::events::{EventAttrs, EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    /// 30 strikes: 20 CG (5 of them positive) and 10 IC.
+    struct MixedStrikes;
+    impl EventSource for MixedStrikes {
+        fn recent_events(
+            &self,
+            _start: DateTime<Utc>,
+            end: DateTime<Utc>,
+            _limit: usize,
+        ) -> Result<Vec<EventPoint>, ds_core::error::DataServerError> {
+            let (cx, cy) = disc_center(end);
+            let lon = EXTENT[0] + cx / f64::from(W) * (EXTENT[2] - EXTENT[0]);
+            let lat = EXTENT[3] - cy / f64::from(H) * (EXTENT[3] - EXTENT[1]);
+            let mk = |cloud, current| EventPoint {
+                time: end,
+                lon,
+                lat,
+                attrs: EventAttrs {
+                    cloud_indicator: Some(cloud),
+                    peak_current_ka: Some(current),
+                },
+            };
+            let mut v = vec![mk(0, -20.0); 15];
+            v.extend(vec![mk(0, 35.0); 5]);
+            v.extend(vec![mk(1, -8.0); 10]);
+            Ok(v)
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: Some("mock-lightning".into()),
+        significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
+        radar_source: None,
+    };
+    let engine = NowcastEngine::new("attr-nowcast", "mock", source, &config)
+        .expect("engine builds")
+        .with_lightning_source(Arc::new(MixedStrikes));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+
+    assert!(matches!(
+        f.properties.get("flash_count"),
+        Some(PropertyValue::Integer(30))
+    ));
+    assert!(matches!(
+        f.properties.get("cg_count"),
+        Some(PropertyValue::Integer(20))
+    ));
+    assert!(matches!(
+        f.properties.get("ic_count"),
+        Some(PropertyValue::Integer(10))
+    ));
+    // 5 of 20 CG are positive — a share of the CG flashes, NOT of all 30.
+    assert!(
+        matches!(
+            f.properties.get("positive_cg_fraction"),
+            Some(PropertyValue::Float(v)) if (v - 0.25).abs() < 1e-9
+        ),
+        "got {:?}",
+        f.properties.get("positive_cg_fraction")
+    );
+    assert!(f.properties.get("first_flash").is_some());
+
+    // Drift catcher: advertising a sortable the features don't carry makes
+    // `sortby` a silent no-op, which is the failure this surface exists to
+    // remove. Part 1 shipped three properties without extending the list.
+    for key in engine.sortables() {
+        assert!(
+            f.properties.contains_key(*key),
+            "advertised sortable `{key}` is not a property of the feature"
+        );
+    }
 }
 
 /// A failing event source degrades to null flash fields for that
@@ -225,7 +478,8 @@ fn lightning_source_error_degrades_to_null_fields() {
                 EventPoint {
                     time: end,
                     lon,
-                    lat
+                    lat,
+                    attrs: Default::default(),
                 };
                 10
             ])
@@ -251,6 +505,7 @@ fn lightning_source_error_degrades_to_null_fields() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let strikes = Arc::new(FlakyStrikes {
         fail: AtomicBool::new(false),
@@ -321,6 +576,7 @@ fn build_with_history(
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine =
         NowcastEngine::new("mock-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -547,6 +803,7 @@ fn excessive_lead_count_is_rejected_at_construction() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -593,6 +850,7 @@ fn oversized_history_frames_is_rejected() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -718,6 +976,7 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine =
         NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -753,10 +1012,13 @@ fn cell_features_are_served_and_tracks_persist() {
         f.properties.get("severity"),
         Some(PropertyValue::String(s)) if s == "moderate"
     ));
-    assert!(matches!(
+    // Null, not false: this is the first generation, so the track has no
+    // velocity and non-deviance cannot have been established. See
+    // `a_newborn_asserts_nothing_it_cannot_know`.
+    assert_eq!(
         f.properties.get("deviant_mover"),
-        Some(PropertyValue::Bool(false))
-    ));
+        Some(&PropertyValue::Null)
+    );
     let id1 = f.id.clone();
 
     let anchor2 = anchor1 + Duration::minutes(5);
@@ -896,6 +1158,7 @@ fn geometry_change_resets_cell_tracks() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine =
         NowcastEngine::new("mv-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -918,6 +1181,12 @@ fn geometry_change_resets_cell_tracks() {
         ),
         "track must restart as newborn after a geometry change"
     );
+    // The reset retired one live track and issued one newborn; both must
+    // reach the counters (#643 review: an empty `previous` cannot report
+    // the deaths itself).
+    let (births, deaths, _, _, _) = engine.track_metrics();
+    assert_eq!(births, 2, "one birth per generation: first frame + reset");
+    assert_eq!(deaths, 1, "the discarded track is a death");
 }
 
 /// Growth/decay application (#546): a source whose echo fades every frame
@@ -993,6 +1262,7 @@ fn growth_decay_dims_decaying_echo() {
             impact_source: None,
             impact_name_property: "name".into(),
             impact_weight_property: None,
+            radar_source: None,
         };
         let engine = NowcastEngine::new("fade", "mock", source.clone(), &config).expect("builds");
         engine.poll_once();
@@ -1150,6 +1420,37 @@ fn cells_are_ranked_by_significance_with_reasons() {
 
 /// A typo in a `[nowcast.significance]` weight name must fail the collection
 /// at load, not silently rank by defaults the operator never chose.
+/// Zeroing every graded term the tracker always emits leaves nothing for
+/// the bonus terms to scale (#645): every cell would score 0 with no reasons
+/// and rank by id, silently. That is a load error, not a ranking.
+#[test]
+fn zeroing_every_graded_weight_fails_the_collection() {
+    let mut config = base_config();
+    for term in ["severity", "max_dbz", "area"] {
+        config.significance.insert(term.into(), 0.0);
+    }
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    let err = match NowcastEngine::new("zeroed", "mock", source, &config) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an all-zero graded table must be rejected"),
+    };
+    assert!(
+        err.contains("severity") && err.contains("area"),
+        "error should name the graded terms: {err}"
+    );
+
+    // Zeroing two of the three is a legitimate single-term ranking.
+    let mut one_left = base_config();
+    one_left.significance.insert("max_dbz".into(), 0.0);
+    one_left.significance.insert("area".into(), 0.0);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    assert!(NowcastEngine::new("one-graded", "mock", source, &one_left).is_ok());
+}
+
 #[test]
 fn unknown_significance_weight_fails_the_collection() {
     let mut config = base_config();
@@ -1196,6 +1497,7 @@ fn base_config() -> NowcastConfig {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     }
 }
 
@@ -1386,7 +1688,17 @@ fn unwired_sources_are_not_advertised_as_sortable() {
     // Not wired ⇒ the conditional properties must NOT be advertised. A
     // property absent from every feature sorts to a no-op, so advertising it
     // would return 200 in id order — the silent-ignore this surface removes.
-    for absent in ["flash_count", "flash_rate_per_min", "impact_eta_minutes"] {
+    for absent in [
+        "flash_count",
+        "flash_rate_per_min",
+        "flash_density_per_km2",
+        "jump_sigma",
+        "first_flash",
+        "cg_count",
+        "ic_count",
+        "positive_cg_fraction",
+        "impact_eta_minutes",
+    ] {
         assert!(
             !base.contains(&absent),
             "{absent} must not be sortable without its source"
@@ -1451,5 +1763,582 @@ fn wiring_a_source_adds_exactly_its_sortables() {
     assert!(
         !with_impact.sortables().contains(&"flash_count"),
         "an impact source must not advertise lightning properties"
+    );
+}
+
+/// #614: a fixed echo (wind turbine clutter) outranked real weather on a
+/// quiet day. A stationary source produces a cell that never moves, so after
+/// enough frames it must be flagged and demoted — while a moving cell of the
+/// same intensity is untouched.
+#[test]
+fn a_stationary_echo_is_flagged_and_demoted() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    /// Same disc every frame, never moving — a mast or turbine farm.
+    struct FixedEchoSource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+    impl MapEngine for FixedEchoSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let mut data = vec![0u8; (width * height) as usize];
+            for (i, cell) in data.iter_mut().enumerate() {
+                let x = (i % width as usize) as f64 + 0.5;
+                let y = (i / width as usize) as f64 + 0.5;
+                if (x - 100.0).powi(2) + (y - 100.0).powi(2) <= 9.0 * 9.0 {
+                    *cell = 218; // ~57 dBZ: bright, like real clutter
+                }
+            }
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    let source = Arc::new(FixedEchoSource {
+        times: RwLock::new(vec![t0(), t0() + Duration::minutes(5)]),
+    });
+    let engine =
+        NowcastEngine::new("fixed", "mock", source.clone(), &base_config()).expect("builds");
+
+    // Walk enough generations for the track to become persistent.
+    let mut t = t0() + Duration::minutes(5);
+    for _ in 0..8 {
+        engine.poll_once();
+        t += Duration::minutes(5);
+        source.times.write().unwrap().push(t);
+    }
+    engine.poll_once();
+
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = page.features.first().expect("the fixed echo is tracked");
+    let p = &f.properties;
+
+    // It never moved, so it is not weather.
+    match p.get("speed_ms") {
+        Some(PropertyValue::Float(v)) => assert!(*v < 3.0, "should be stationary, got {v}"),
+        other => panic!("expected a measured speed by now, got {other:?}"),
+    }
+    assert!(
+        matches!(p.get("likely_clutter"), Some(PropertyValue::Bool(true))),
+        "a persistent stationary echo must be flagged: {p:?}"
+    );
+
+    // Flagged, but still present and inspectable — never silently dropped.
+    assert_eq!(page.number_matched, 1);
+    assert!(matches!(p.get("max_dbz"), Some(PropertyValue::Float(_))));
+
+    // And the demotion actually applied.
+    match p.get("significance_reasons") {
+        Some(PropertyValue::List(r)) => assert!(
+            r.iter()
+                .any(|x| matches!(x, PropertyValue::String(s) if s == "clutter")),
+            "clutter should be among the top reasons: {r:?}"
+        ),
+        other => panic!("missing reasons: {other:?}"),
+    }
+}
+
+/// Reported by a model consuming the live `/mcp` surface on 2026-08-24:
+/// every `track_age: 1` cell carried `speed_ms: null` and `bearing_deg: null`
+/// but `deviant_mover: false` — asserting non-deviance from unknown motion —
+/// and `significance_reasons` could name `deviant_mover` while it was false.
+#[test]
+fn a_newborn_asserts_nothing_it_cannot_know() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    // The first generation's cells are all newborns: they have been seen
+    // once, so no velocity has been estimated for any of them yet.
+    let (_s, engine) = build("PT30M", &[t0(), t0() + Duration::minutes(5)]);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = page.features.first().expect("a cell was tracked");
+
+    assert_eq!(
+        f.properties.get("track_age"),
+        Some(&PropertyValue::Integer(1)),
+        "precondition: this is a newborn"
+    );
+    assert_eq!(f.properties.get("speed_ms"), Some(&PropertyValue::Null));
+    assert_eq!(f.properties.get("bearing_deg"), Some(&PropertyValue::Null));
+    // The point of the test: unknown motion cannot yield a motion verdict.
+    assert_eq!(
+        f.properties.get("deviant_mover"),
+        Some(&PropertyValue::Null),
+        "false would claim the cell was shown to move with the flow"
+    );
+
+    // And no reason may name a term that contributed nothing.
+    let Some(PropertyValue::List(reasons)) = f.properties.get("significance_reasons") else {
+        panic!("reasons must be a list");
+    };
+    for r in reasons {
+        let PropertyValue::String(name) = r else {
+            panic!("reason must be a string")
+        };
+        assert_ne!(
+            name, "deviant_mover",
+            "an explanation must not cite a flag that is null or false"
+        );
+    }
+}
+
+/// A quiet cell reports a zero split, but still declines to invent a
+/// positive-CG share (#623 follow-up / D10).
+///
+/// From the 2026-08-24 deploy: cells carried `flash_count: 0` beside
+/// `cg_count: null`, claiming ignorance about a total the same response said
+/// was zero. The split of zero flashes is zero — but 0 of 0 CG flashes has no
+/// positive share, so that one field must stay null.
+#[test]
+fn a_quiet_cell_reports_a_zero_split_but_no_positive_share() {
+    use ds_core::events::{EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    struct NoStrikes;
+    impl EventSource for NoStrikes {
+        fn recent_events(
+            &self,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+            _limit: usize,
+        ) -> Result<Vec<EventPoint>, ds_core::error::DataServerError> {
+            Ok(vec![])
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: Some("mock-lightning".into()),
+        significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
+        radar_source: None,
+    };
+    let engine = NowcastEngine::new("quiet", "mock", source, &config)
+        .expect("engine builds")
+        .with_lightning_source(Arc::new(NoStrikes));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+
+    assert_eq!(
+        f.properties.get("flash_count"),
+        Some(&PropertyValue::Integer(0)),
+        "the join ran and attributed nothing"
+    );
+    for k in ["cg_count", "ic_count", "cg_polarity_known"] {
+        assert_eq!(
+            f.properties.get(k),
+            Some(&PropertyValue::Integer(0)),
+            "{k} must be a known zero, not null, when the total is a known zero"
+        );
+    }
+    assert_eq!(
+        f.properties.get("positive_cg_fraction"),
+        Some(&PropertyValue::Null),
+        "0 of 0 CG flashes has no positive share — this one stays null"
+    );
+}
+
+/// Rank and serving order must break ties identically (#635 / spec D14).
+///
+/// Reported 2026-09-04: two cells shared `significance: 0.2595`; the page
+/// returned them in one order while their ranks ran the other way, so a
+/// `limit: 30` request came back holding ranks 1-29 and 31 — a hole where
+/// nothing had been skipped. Ties are common because the score is published to
+/// four decimals over a narrow range, so this is routine, not exotic.
+///
+/// **The fixture must produce an actual tie.** Review on #637 caught the first
+/// version of this test using the single-disc mock: with one cell `ranks` is
+/// `[1]` whatever the code does, so it passed with and without the fix. Two
+/// IDENTICAL discs give identical terms, hence identical scores, hence a real
+/// tie for the two comparators to disagree about.
+#[test]
+fn ranks_are_monotonic_in_the_order_cells_are_served() {
+    use ds_core::feature::{FeatureQuery, PropertyValue, SortDirection, SortKey};
+    use ds_core::feature_engine::FeatureEngine;
+
+    /// A grid of identical discs — same size, same intensity, far enough apart
+    /// to stay separate connected components. Same area, same max dBZ, same
+    /// age, same everything the scorer reads, so their significance is equal
+    /// by construction rather than by luck.
+    struct TwinCellSource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+
+    impl MapEngine for TwinCellSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let mut data = vec![0u8; (width * height) as usize];
+            for (i, cell) in data.iter_mut().enumerate() {
+                let x = (i % width as usize) as f64 + 0.5;
+                let y = (i / width as usize) as f64 + 0.5;
+                // TWELVE identical discs, not two. Ten is the threshold that
+                // matters: with ids 1 and 2 the string order and the insertion
+                // order agree, so the two comparators cannot disagree and the
+                // bug stays invisible. Once id 10 exists, "10" sorts before
+                // "2" while being inserted after it — which is exactly the
+                // divergence #635 was about.
+                let hit = [25.0f64, 70.0, 115.0, 160.0].iter().any(|&cx| {
+                    [40.0f64, 100.0, 160.0]
+                        .iter()
+                        .any(|&cy| (x - cx).powi(2) + (y - cy).powi(2) <= 8.0 * 8.0)
+                });
+                if hit {
+                    *cell = ECHO_RAW;
+                }
+            }
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(TwinCellSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let engine = NowcastEngine::new("twins", "mock", source, &base_config()).expect("builds");
+    engine.poll_once();
+
+    let page = engine
+        .get_features(&FeatureQuery {
+            sortby: vec![SortKey {
+                property: "significance".into(),
+                direction: SortDirection::Descending,
+            }],
+            limit: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let scores: Vec<f64> = page
+        .features
+        .iter()
+        .map(|f| match f.properties.get("significance") {
+            Some(PropertyValue::Float(v)) => *v,
+            other => panic!("significance must be a float, got {other:?}"),
+        })
+        .collect();
+    // Two preconditions, and BOTH are needed. Review on #637 caught the first
+    // version using a single-cell mock, where `ranks` was `[1]` whatever the
+    // code did. The second version used two tied cells and STILL passed with
+    // the fix removed: with ids "1" and "2", string order and insertion order
+    // agree, so the comparators had nothing to disagree about.
+    assert!(
+        scores.len() >= 10,
+        "PRECONDITION: need enough cells for a two-digit id, since the bug is \
+         that \"10\" sorts before \"2\" while being inserted after it; got {}",
+        scores.len()
+    );
+    assert!(
+        scores.windows(2).all(|w| w[0] == w[1]),
+        "PRECONDITION: every cell must tie, or there is no tie to break: {scores:?}"
+    );
+
+    let ranks: Vec<i64> = page
+        .features
+        .iter()
+        .map(|f| match f.properties.get("significance_rank") {
+            Some(PropertyValue::Integer(r)) => *r,
+            other => panic!("rank must be an integer, got {other:?}"),
+        })
+        .collect();
+
+    // The bug: served order and rank order disagreed, so a prefix of the page
+    // was not a prefix of the ranking and `limit` produced a hole.
+    let expected: Vec<i64> = (1..=ranks.len() as i64).collect();
+    assert_eq!(
+        ranks, expected,
+        "ranks must run 1..=n down the served page with no holes, got {ranks:?}"
+    );
+}
+
+/// #661: the motion field as an EDR product. The mock disc moves +x only
+/// (DX_PER_FRAME px per 5-min frame), so the served eastward component
+/// must be positive and about the disc speed, the northward one ~0, the
+/// grid must be a `[t, y, x]` CoverageJSON Grid at the anchor, and the
+/// instance/datetime contracts must hold.
+#[test]
+fn edr_area_serves_the_motion_field_in_m_per_s() {
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::model::{CoverageResponse, DomainDescription};
+
+    let anchor = t0() + Duration::minutes(10);
+    let (_source, engine) =
+        build_with_history("PT1H", &[t0(), t0() + Duration::minutes(5), anchor], 3);
+    engine.poll_once();
+    assert!(engine.has_data());
+
+    // Instances = generations, with the product's single valid time.
+    let instances = engine.get_instances();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].reference_time, anchor);
+    assert_eq!(instances[0].valid_times, vec![anchor]);
+    assert!(engine.has_instances());
+    assert_eq!(
+        engine.find_instance(anchor).map(|r| r.valid_times),
+        Some(vec![anchor])
+    );
+    assert_eq!(engine.get_temporal_extent(), Some((anchor, anchor)));
+    assert_eq!(
+        engine.supported_query_types(),
+        vec!["area".to_string(), "radius".to_string()]
+    );
+
+    let coords = format!(
+        "POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))",
+        w = EXTENT[0],
+        s = EXTENT[1],
+        e = EXTENT[2],
+        n = EXTENT[3]
+    );
+    let CoverageResponse::Single(cov) = engine
+        .query_area(&coords, None, None, None, None)
+        .expect("area query")
+    else {
+        panic!("expected a single coverage");
+    };
+    let DomainDescription::Grid { x, y, t, z } = &cov.domain else {
+        panic!("expected a Grid domain");
+    };
+    assert_eq!(t.as_deref(), Some(&[anchor][..]));
+    assert!(z.is_none());
+    assert!(!x.is_empty() && !y.is_empty());
+    // Served coordinates never leave the collection extent (trailing
+    // partial block clamped).
+    assert!(x.iter().all(|v| (EXTENT[0]..=EXTENT[2]).contains(v)));
+    assert!(y.iter().all(|v| (EXTENT[1]..=EXTENT[3]).contains(v)));
+    // y ascends south→north, the GRIB convention a particle client already
+    // consumes for 10u/10v.
+    assert!(y.windows(2).all(|w| w[0] < w[1]));
+    for name in ["motion_u", "motion_v", "motion_quality"] {
+        let r = &cov.ranges[name];
+        assert_eq!(r.shape, vec![1, y.len(), x.len()]);
+        assert_eq!(r.axis_names, vec!["t", "y", "x"]);
+        assert_eq!(r.values.len(), x.len() * y.len());
+    }
+    assert_eq!(cov.parameters["motion_u"].unit, "m/s");
+    assert!(cov.parameters["motion_u"]
+        .label
+        .contains("Precipitation motion"));
+
+    // Units + sign: the disc moves east at DX_PER_FRAME px per 300 s on a
+    // grid EXTENT wide over W px. Measured blocks must agree.
+    let dlon = (EXTENT[2] - EXTENT[0]) / W as f64;
+    let mid_lat = (EXTENT[1] + EXTENT[3]) / 2.0;
+    let expect_u =
+        DX_PER_FRAME * dlon * engine_nowcast::KM_PER_DEG * 1000.0 * mid_lat.to_radians().cos()
+            / 300.0;
+    let q = &cov.ranges["motion_quality"].values;
+    let u = &cov.ranges["motion_u"].values;
+    let v = &cov.ranges["motion_v"].values;
+    let measured: Vec<usize> = (0..q.len()).filter(|&i| q[i] == Some(1.0)).collect();
+    assert!(!measured.is_empty(), "the disc must yield measured blocks");
+    for &i in &measured {
+        let (ui, vi) = (u[i].unwrap(), v[i].unwrap());
+        assert!(
+            (ui - expect_u).abs() < 0.35 * expect_u,
+            "eastward {ui} vs expected ~{expect_u} m/s"
+        );
+        assert!(vi.abs() < 0.35 * expect_u, "northward {vi} should be ~0");
+    }
+
+    // Parameter subset + unknown parameter.
+    let CoverageResponse::Single(sub) = engine
+        .query_area(&coords, None, Some(&["motion_v".to_string()]), None, None)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(sub.ranges.len(), 1);
+    assert!(matches!(
+        engine.query_area(&coords, None, Some(&["wind_u".to_string()]), None, None),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+
+    // Pinned instance: exact, and to the minute; a datetime excluding the
+    // anchor is a 400, one containing it is fine.
+    assert!(engine
+        .query_area(&coords, None, None, None, Some(anchor))
+        .is_ok());
+    assert!(engine
+        .query_area(
+            &coords,
+            None,
+            None,
+            None,
+            Some(anchor + Duration::seconds(30))
+        )
+        .is_ok());
+    assert!(matches!(
+        engine.query_area(&coords, None, None, None, Some(anchor + Duration::hours(1))),
+        Err(DataServerError::ReferenceTimeNotFound(_))
+    ));
+    assert!(matches!(
+        engine.query_area(
+            &coords,
+            Some((
+                anchor + Duration::minutes(5),
+                anchor + Duration::minutes(10)
+            )),
+            None,
+            None,
+            Some(anchor)
+        ),
+        Err(DataServerError::InvalidDatetime(_))
+    ));
+    assert!(engine
+        .query_area(
+            &coords,
+            Some((anchor, anchor + Duration::minutes(10))),
+            None,
+            None,
+            Some(anchor)
+        )
+        .is_ok());
+
+    // Unpinned datetime honours BOTH bounds (the #548 rule).
+    assert!(engine
+        .query_area(
+            &coords,
+            Some((anchor - Duration::minutes(1), anchor)),
+            None,
+            None,
+            None
+        )
+        .is_ok());
+    assert!(matches!(
+        engine.query_area(
+            &coords,
+            Some((anchor + Duration::minutes(1), anchor + Duration::hours(2))),
+            None,
+            None,
+            None
+        ),
+        Err(DataServerError::ReferenceTimeNotFound(_))
+    ));
+
+    // Sub-block bbox inside the grid still gets a block.
+    let tiny = format!(
+        "POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))",
+        w = 5.001,
+        s = 55.001,
+        e = 5.002,
+        n = 55.002
+    );
+    assert!(engine.query_area(&tiny, None, None, None, None).is_ok());
+
+    // #671: a non-rectangular polygon masks the blocks outside it. Right
+    // triangle with the right angle at the south-west corner of the extent.
+    let tri = format!(
+        "POLYGON(({w} {s},{e} {s},{w} {n},{w} {s}))",
+        w = EXTENT[0],
+        s = EXTENT[1],
+        e = EXTENT[2],
+        n = EXTENT[3]
+    );
+    let CoverageResponse::Single(tri_cov) = engine
+        .query_area(&tri, None, None, None, None)
+        .expect("triangle area query")
+    else {
+        panic!("expected a single coverage");
+    };
+    let DomainDescription::Grid { x: tx, y: ty, .. } = &tri_cov.domain else {
+        panic!("expected a Grid domain");
+    };
+    let tu = &tri_cov.ranges["motion_u"].values;
+    // y ascends: the NE corner is the last row's last column.
+    assert!(
+        tu[tu.len() - 1].is_none(),
+        "NE block outside the triangle must be null"
+    );
+    assert!(
+        tu[0].is_some(),
+        "SW block inside the triangle must have a value"
+    );
+    let inside = tu.iter().filter(|v| v.is_some()).count();
+    assert!(
+        inside > 0 && inside * 3 < tx.len() * ty.len() * 2,
+        "about half the bbox masked: {inside}/{}",
+        tx.len() * ty.len()
     );
 }

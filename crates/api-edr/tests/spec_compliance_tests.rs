@@ -478,16 +478,18 @@ async fn finding_11_position_query_returns_400_for_unsupported_engine() {
 }
 
 #[tokio::test]
-async fn finding_11b_radius_query_not_implemented() {
-    let (status, _) = get_json(
+async fn finding_11b_radius_query_returns_404_for_unsupported_engine() {
+    // The route exists; an engine that does not advertise `radius` gets the
+    // capability-guard 404 (the resource does not exist for this collection),
+    // and the OpenAPI document does not list the path for it.
+    let (status, json) = get_json(
         "/collections/weather/radius?coords=POINT%2824.9384%2060.1699%29&within=50&within-units=km",
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "Radius query endpoint is not implemented"
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["code"], "NotFound");
+    let (_, api) = get_json("/api").await;
+    assert!(api["paths"]["/edr/collections/weather/radius"].is_null());
 }
 
 #[tokio::test]
@@ -911,6 +913,32 @@ async fn finding_27_conformance_valid() {
             .as_str()
             .is_some_and(|s| s.ends_with("/conf/edr-geojson"))),
         "edr-geojson conformance class must not be advertised — data queries return HTTP 400 for f=GeoJSON"
+    );
+}
+
+// EDR 1.1 (19-086r6) declares one `queries` class for every query type,
+// plus `html` and `oas30` for the representations the server actually
+// serves. The two GeoJSON classes stay out (see finding 27).
+#[tokio::test]
+async fn declares_edr_queries_html_oas30_classes() {
+    let (_status, json) = get_json("/conformance").await;
+    let conforms_to = json["conformsTo"].as_array().unwrap();
+    let uris: Vec<&str> = conforms_to.iter().filter_map(|v| v.as_str()).collect();
+    for class in [
+        "core",
+        "collections",
+        "queries",
+        "json",
+        "covjson",
+        "html",
+        "oas30",
+    ] {
+        let uri = format!("http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/{class}");
+        assert!(uris.contains(&uri.as_str()), "must declare {uri}");
+    }
+    assert!(
+        !uris.iter().any(|u| u.ends_with("/conf/geojson")),
+        "geojson class must not be advertised — data queries cannot return GeoJSON"
     );
 }
 

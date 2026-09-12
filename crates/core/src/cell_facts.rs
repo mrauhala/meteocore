@@ -82,8 +82,50 @@ impl Trend {
 pub struct LightningFacts {
     pub flash_count: u32,
     pub flash_rate_per_min: f64,
-    /// Schultz-style 2σ jump fired this generation.
-    pub jump: bool,
+    /// Flashes per km² of cell footprint.
+    ///
+    /// Normalizes for size: a small intense cell and a large diffuse one can
+    /// share a flash count while meaning quite different things.
+    pub flash_density_per_km2: f64,
+    /// Schultz-style 2σ jump fired this generation. Derived from `jump_sigma`
+    /// so the two cannot disagree.
+    ///
+    /// `None` when there is no baseline to test against (fewer than two
+    /// generations of flash history) — a jump is not computable from a single
+    /// frame, and `false` would assert one was ruled out. Same
+    /// no-bonus-but-no-claim treatment as `deviant_mover`.
+    pub jump: Option<bool>,
+    /// How far above its own recent baseline this cell's flash rate sits, in
+    /// standard deviations.
+    ///
+    /// `None` until there is enough history to have a baseline — not 0.0,
+    /// which would claim "measured, no anomaly". A 4σ surge and a 2.1σ nudge
+    /// are different facts that `jump` alone cannot distinguish.
+    pub jump_sigma: Option<f64>,
+    /// Cloud-to-ground and intra-cloud counts, when the source reports the
+    /// discriminator. `None` = not reported, never a defaulted zero.
+    pub cg_count: Option<u32>,
+    pub ic_count: Option<u32>,
+    /// How many CG flashes had their polarity reported — the DENOMINATOR
+    /// behind `positive_cg_fraction`, and the sample size behind it.
+    ///
+    /// Exposed rather than kept private for the same reason `beam_coverage`
+    /// is: a share whose denominator is invisible invites confident statements
+    /// it cannot support. "3 of 4 positive" and "300 of 400 positive" are the
+    /// same fraction and not the same evidence.
+    pub cg_polarity_known: Option<u32>,
+    /// Share of POLARITY-KNOWN cloud-to-ground flashes that were positive,
+    /// 0..=1.
+    ///
+    /// `None` when polarity is not reported **or when no CG flash was
+    /// classifiable** — 0 of 0 is not 0%, and reporting it as 0% would invite
+    /// "no positive strikes" about a cell with no strikes to classify.
+    pub positive_cg_fraction: Option<f64>,
+    /// When this track was first attributed a flash.
+    ///
+    /// Electrification age: a cell producing its first flash now is a
+    /// different situation from one active for an hour.
+    pub first_flash: Option<DateTime<Utc>>,
 }
 
 /// Attributes derived from the 3-D polar volume, joined onto a 2-D track.
@@ -107,6 +149,36 @@ pub struct VolumeFacts {
     /// How many per-site cells were aggregated into this record — a composite
     /// mosaic cell can span several. 1 = clean one-to-one.
     pub contributing_cells: u32,
+}
+
+/// Beam geometry at the cell from the nearest radar (#642).
+///
+/// The cheapest evidence about whether an echo is meteorological: how far the
+/// nearest radar is, and how high its lowest beam passes over the cell. A
+/// bright stationary echo under a beam a few hundred metres up is a fixed
+/// target; the same echo under a beam 3 km up is weather. Also the range
+/// context every other radar-derived number needs (Block A of #624).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RadarFacts {
+    /// Site id of the nearest radar (ODIM `NOD`).
+    pub nearest_radar_id: String,
+    /// Its place name, when known.
+    pub nearest_radar_name: Option<String>,
+    /// Great-circle distance from that radar to the cell centroid, km.
+    pub nearest_radar_distance_km: f64,
+    /// Whether the cell lies inside that radar's surveyed range. `None` when
+    /// the source could not advertise a range at all (malformed sweep
+    /// geometry) — "cannot say" is not "not covered". Outside coverage every
+    /// per-cell radar number is a statement about a place the radar does
+    /// not see, so the beam fields below are `None` whenever this is not
+    /// `Some(true)`.
+    pub in_radar_coverage: Option<bool>,
+    /// Height of the lowest beam's centre over the cell, metres above mean
+    /// sea level (antenna height + 4/3-Earth beam rise). There is no terrain
+    /// model, so this is not "above ground" in hilly country.
+    pub beam_height_m: Option<f64>,
+    /// Elevation angle of that lowest sweep, degrees.
+    pub beam_elevation_deg: Option<f64>,
 }
 
 /// Where the cell is and what it is heading toward.
@@ -148,13 +220,43 @@ pub struct CellFactSheet {
     pub speed_ms: Option<f64>,
     /// Compass bearing the cell moves toward.
     pub bearing_deg: Option<f64>,
-    pub deviant_mover: bool,
+    /// Sustained motion off the ambient flow.
+    ///
+    /// `None` when the track has no velocity yet — a newborn cannot be shown
+    /// to move with the flow OR against it, and `false` would assert
+    /// non-deviance from unknown motion.
+    ///
+    /// **Scoring treats `None` as "no bonus" (0.0), NOT as an absent term.**
+    /// Absent would renormalize the denominator, making every other term
+    /// weigh more and handing every newborn a systematic score boost — and a
+    /// re-detected fixed echo is always a newborn. The payload must not claim
+    /// what it doesn't know; the scorer must not reward not knowing.
+    pub deviant_mover: Option<bool>,
+    /// Straight-line distance from where this track was first detected, km.
+    ///
+    /// The answer to "has it actually gone anywhere", which `track_age` is
+    /// routinely mistaken for. An association failure can manufacture a long
+    /// track out of stationary echoes; it cannot manufacture displacement.
+    pub net_displacement_km: Option<f64>,
+    /// Net displacement over path-integrated distance, 0..=1 (#629).
+    ///
+    /// Real advection sits near 1. A track that wanders without arriving —
+    /// the signature of an association failure swapping between co-located
+    /// fixed echoes — sits near 0. `None` when the path is too short to have
+    /// a direction; read `net_displacement_km` for that case.
+    pub path_straightness: Option<f64>,
+    /// Persistent, near-stationary echo — most likely ground clutter (wind
+    /// turbines, masts) rather than weather. See [`is_likely_clutter`].
+    pub likely_clutter: bool,
     pub trend: Option<Trend>,
     /// Measured intensity tendency, dBZ per minute.
     pub intensity_trend_dbz_min: Option<f64>,
     pub lightning: Option<LightningFacts>,
     pub volume: Option<VolumeFacts>,
     pub impact: Option<ImpactFacts>,
+    /// Nearest-radar beam geometry (#642). `None` when no radar source is
+    /// wired, or when the source has not advertised any site yet.
+    pub radar: Option<RadarFacts>,
     /// Empty when no environment source is wired.
     pub environment: Vec<EnvironmentFact>,
 }
@@ -168,7 +270,91 @@ const AREA_CEILING_KM2: f64 = 200.0;
 const FLASH_RATE_CEILING_PER_MIN: f64 = 60.0;
 const VIL_CEILING_KG_M2: f64 = 50.0;
 const ECHO_TOP_CEILING_M: f64 = 15_000.0;
-const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 2.0;
+/// Where the intensifying / weakening bonuses saturate, dBZ per minute.
+///
+/// Matches the tracker's per-interval clamp (`MAX_CELL_TENDENCY_PER_S` =
+/// 2 dBZ per 5 min = 0.4 dBZ/min): the old ±2 ramp spanned five times what
+/// the input could reach, so every aged cell scored 0.4..0.6 on "trend" and
+/// a steady cell carried a constant half-credit that was cited as a reason
+/// on half the cells of a widespread-rain frame (#645).
+pub const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 0.4;
+/// A jump only counts from the 2σ test threshold up; 6σ saturates, since the
+/// difference between a 6σ and a 9σ surge is not what should decide a rank.
+const JUMP_SIGMA_FLOOR: f64 = 2.0;
+const JUMP_SIGMA_CEILING: f64 = 6.0;
+/// Positive-CG share ramp. Roughly 10-20% of CG flashes are positive in
+/// ordinary storms, so a floor at 5% keeps normal background from scoring at
+/// all; a CG population half positive is already the anomalous severe-storm
+/// signature, so the term saturates there rather than reserving its top half
+/// for fractions that essentially never occur.
+const POSITIVE_CG_FLOOR: f64 = 0.05;
+const POSITIVE_CG_CEILING: f64 = 0.5;
+
+/// Speed below which an echo is "not going anywhere" (m/s).
+///
+/// Finnish convection typically tracks 5–20 m/s. Observed clutter sat at 0.1
+/// and 2.4 m/s while every real cell in the same frame ran 8.6–12.9 m/s on a
+/// single coherent bearing, so the populations separate cleanly here. Matches
+/// `DEVIANT_MIN_CELL_SPEED_MS` in cells2d, which already treats motion below
+/// this as too small to reason about.
+const CLUTTER_MAX_SPEED_MS: f64 = 3.0;
+
+/// Frames a cell must have been stationary for before it is called clutter.
+///
+/// Persistence is what separates clutter from weather, not slowness alone: a
+/// genuine cell can crawl for a few minutes in weak flow, but one that has
+/// held both position AND high reflectivity for half an hour is a fixed
+/// object. Six frames ≈ 30 min at the 5-minute cadence.
+const CLUTTER_MIN_AGE: u32 = 6;
+
+/// Net displacement (km) beyond which a cell cannot be a fixed target,
+/// whatever its speed.
+///
+/// Speed alone cannot tell *slow* from *stationary*, and on widespread
+/// slow-moving precipitation that distinction is the whole question. Measured
+/// on a 274-cell frame, 2026-09-04: of 21 cells flagged as clutter, **19 had
+/// moved more than 3 km net** — up to 18.2 km. A wind farm does not travel
+/// 18 km. Those were real echoes, and `clutter` was the LEADING entry in
+/// their `significance_reasons`, demoting severe cells from a median rank of
+/// 20 to ranks 135–197.
+///
+/// 3 km is chosen to sit above the jitter of a fixed target — whose centroid
+/// wanders within the extent of the scatterer cluster, a few km at most, and
+/// does NOT accumulate because net displacement is measured from first
+/// detection — while staying far below the distance any real system covers
+/// over the six frames the age gate already requires.
+const CLUTTER_MAX_NET_DISPLACEMENT_KM: f64 = 3.0;
+
+/// Whether a cell looks like ground clutter rather than weather.
+///
+/// **Mitigation, not detection.** Wind turbine clutter is a genuinely hard
+/// upstream QC problem; this only stops a fixed echo dominating a ranking on
+/// a quiet day. It will miss clutter that happens to sit under moving weather
+/// and could in principle flag a truly stalled storm — which is why the
+/// result is surfaced as a fact and demoted, never dropped.
+///
+/// A newborn track has no velocity yet. `None` means "not known", so it is
+/// never treated as stationary — the opposite reading would flag every cell
+/// for the first frames after a reload.
+pub fn is_likely_clutter(
+    speed_ms: Option<f64>,
+    age: u32,
+    net_displacement_km: Option<f64>,
+) -> bool {
+    // Having gone somewhere is disqualifying on its own. This is a veto, not
+    // another vote: no combination of low speed and long age should outweigh
+    // an echo that demonstrably travelled.
+    if net_displacement_km.is_some_and(|d| d > CLUTTER_MAX_NET_DISPLACEMENT_KM) {
+        return false;
+    }
+    // `None` means the displacement is not known — an older snapshot, or a
+    // track too young to have one. It must not act as a veto, or every cell
+    // predating the field would escape; the speed and age test still applies.
+    match speed_ms {
+        Some(speed) => speed < CLUTTER_MAX_SPEED_MS && age >= CLUTTER_MIN_AGE,
+        None => false,
+    }
+}
 
 /// Default significance weights for storm cells.
 ///
@@ -184,14 +370,28 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("severity", 1.0),
     ("max_dbz", 0.6),
     ("area", 0.3),
-    ("trend", 0.5),
+    // Trend is two BONUS terms (#645): steady contributes nothing and dilutes
+    // nothing. Weakening is a DISCOUNT (negative bonus weight = fraction of
+    // the score removed at full value): a cell fading at the tracker's clamp
+    // keeps 85% — a decaying severe cell is still a severe cell right now.
+    ("intensifying", 0.5),
+    ("weakening", -0.15),
     ("deviant_mover", 0.4),
     ("lightning_jump", 0.9),
     ("flash_rate", 0.5),
+    // A high positive-CG share is a well-established severe-storm signal,
+    // independent of how MUCH lightning there is.
+    ("positive_cg", 0.6),
     ("vil", 0.7),
     ("echo_top", 0.5),
     ("beam_coverage", 0.4),
     ("impact", 1.5),
+    // A DISCOUNT keeping a tenth of the score: a fixed echo maximizes
+    // severity, max_dbz and impact at once (it is bright, compact and usually
+    // over a town), and an additive penalty relative to the graded mass left
+    // the live Utajärvi clutter cell at rank 1 — 60 dBZ under a 650 m beam.
+    // Multiplicative, it sinks whatever else is wired.
+    ("clutter", -0.9),
 ];
 
 /// Map `value` onto 0..=1 across `floor..=ceiling`, saturating at both ends.
@@ -208,27 +408,62 @@ impl SignificanceTerms for CellFactSheet {
             Term::new("severity", f64::from(self.severity.rank()) / 3.0),
             Term::new("max_dbz", ramp(self.max_dbz, DBZ_FLOOR, DBZ_CEILING)),
             Term::new("area", ramp(self.area_km2, 0.0, AREA_CEILING_KM2)),
-            Term::flag("deviant_mover", self.deviant_mover),
+            // unwrap_or(false) = "no deviant-mover bonus", which is the
+            // right default for unknown motion. See the field docs for why
+            // this is NOT `if let Some(..)` like the trend term below.
+            Term::flag("deviant_mover", self.deviant_mover.unwrap_or(false)),
+            Term::flag("clutter", self.likely_clutter),
         ];
 
         // Prefer the measured tendency over the coarse growing/decaying flag;
         // fall back to the flag, and emit nothing for a newborn track (no
         // trend exists yet, so it should not be scored as "not growing").
+        // Two signed bonuses rather than one 0..1 term centred on 0.5: a
+        // steady cell then contributes exactly nothing and is never cited as
+        // "trend" among its reasons (#645).
+        // Only the side that fires is emitted: a present-at-zero bonus is
+        // the same as an absent one, so emitting both was a dead entry.
         if let Some(trend) = self.intensity_trend_dbz_min {
-            terms.push(Term::new(
-                "trend",
-                ramp(
-                    trend,
-                    -INTENSITY_TREND_CEILING_DBZ_MIN,
-                    INTENSITY_TREND_CEILING_DBZ_MIN,
-                ),
-            ));
+            if trend > 0.0 {
+                terms.push(Term::bonus(
+                    "intensifying",
+                    ramp(trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
+                ));
+            } else if trend < 0.0 {
+                terms.push(Term::bonus(
+                    "weakening",
+                    ramp(-trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
+                ));
+            }
         } else if let Some(trend) = self.trend {
-            terms.push(Term::flag("trend", trend == Trend::Growing));
+            match trend {
+                Trend::Growing => terms.push(Term::flag("intensifying", true)),
+                Trend::Decaying => terms.push(Term::flag("weakening", true)),
+            }
         }
 
         if let Some(lightning) = self.lightning {
-            terms.push(Term::flag("lightning_jump", lightning.jump));
+            // Scaled by magnitude rather than a flag: a 5σ surge should
+            // outrank a cell that merely crossed the threshold. A jump with
+            // no sigma still scores full — it happened, it just can't be
+            // graded. An UNKNOWN jump scores 0: no bonus, no claim.
+            terms.push(Term::bonus(
+                "lightning_jump",
+                match (lightning.jump, lightning.jump_sigma) {
+                    (Some(true), Some(sigma)) => ramp(sigma, JUMP_SIGMA_FLOOR, JUMP_SIGMA_CEILING),
+                    (Some(true), None) => 1.0,
+                    _ => 0.0,
+                },
+            ));
+            if let Some(frac) = lightning.positive_cg_fraction {
+                // Ramped like every other term: the raw fraction would let an
+                // ordinary 10% background share carry real weight while a 50%
+                // share — already the severe signature — scored only half.
+                terms.push(Term::new(
+                    "positive_cg",
+                    ramp(frac, POSITIVE_CG_FLOOR, POSITIVE_CG_CEILING),
+                ));
+            }
             terms.push(Term::new(
                 "flash_rate",
                 ramp(
@@ -293,14 +528,57 @@ mod tests {
             age: 5,
             speed_ms: Some(14.0),
             bearing_deg: Some(45.0),
-            deviant_mover: false,
+            deviant_mover: Some(false),
+            net_displacement_km: None,
+            path_straightness: None,
+            likely_clutter: false,
             trend: None,
             intensity_trend_dbz_min: None,
             lightning: None,
             volume: None,
             impact: None,
             environment: Vec::new(),
+            radar: None,
         }
+    }
+
+    #[test]
+    fn near_tie_cells_rank_in_served_order_when_quantized() {
+        // The #644 shape: two weak steady cells a tenth of a square kilometre
+        // apart whose raw scores land in ONE 4-dp bucket, ordered so that the
+        // raw comparator ranks them the other way from the served id-string
+        // order. The exact pair depends on the weight table, so search for
+        // one rather than pin numbers a weight change would silently invalidate.
+        let scorer = WeightedScorer::new(DEFAULT_CELL_WEIGHTS);
+        let mk = |id: u64, area: f64| {
+            let mut c = cell(id);
+            c.area_km2 = area;
+            c
+        };
+        let mut found = None;
+        for tenths in 100..400u32 {
+            let a = f64::from(tenths) / 10.0;
+            // id 10 sorts before id 9 as a string, so put the SMALLER cell on
+            // id 10: the raw comparator then prefers the second item.
+            let items = vec![mk(10, a), mk(9, a + 0.1)];
+            let raw = scorer.rank(&items);
+            // Ask the code under test whether the pair ties, rather than
+            // re-implementing its quantizer here.
+            let q = scorer.rank_quantized(&items, 4);
+            if q[0].score == q[1].score && raw[0].raw < raw[1].raw {
+                found = Some(items);
+                break;
+            }
+        }
+        let items = found.expect("some 0.1 km² step must land inside one 4-dp bucket");
+        let raw = scorer.rank(&items);
+        assert_eq!(
+            (raw[0].rank, raw[1].rank),
+            (2, 1),
+            "precondition: raw order disagrees"
+        );
+        let q = scorer.rank_quantized(&items, 4);
+        assert_eq!((q[0].rank, q[1].rank), (1, 2), "ranked in served order");
     }
 
     #[test]
@@ -311,9 +589,16 @@ mod tests {
         full.trend = Some(Trend::Growing);
         full.intensity_trend_dbz_min = Some(0.4);
         full.lightning = Some(LightningFacts {
+            cg_count: Some(8),
+            ic_count: Some(4),
+            cg_polarity_known: None,
+            positive_cg_fraction: Some(0.25),
             flash_count: 12,
             flash_rate_per_min: 4.0,
-            jump: true,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            first_flash: None,
+            jump: Some(true),
         });
         full.volume = Some(VolumeFacts {
             vil_kg_m2: 20.0,
@@ -331,8 +616,13 @@ mod tests {
             exposure: 0.6,
         });
 
+        // Trend emits only the side that fires, so the union needs a decaying
+        // twin to cover `weakening`.
+        let mut fading = full.clone();
+        fading.intensity_trend_dbz_min = Some(-0.4);
+
         let weighted: Vec<&str> = DEFAULT_CELL_WEIGHTS.iter().map(|(n, _)| *n).collect();
-        for term in full.terms() {
+        for term in full.terms().iter().chain(fading.terms().iter()) {
             assert!(
                 weighted.contains(&term.name),
                 "term '{}' has no default weight",
@@ -340,7 +630,12 @@ mod tests {
             );
         }
         // And the reverse: no weight names a term that is never emitted.
-        let emitted: Vec<&str> = full.terms().iter().map(|t| t.name).collect();
+        let emitted: Vec<&str> = full
+            .terms()
+            .iter()
+            .chain(fading.terms().iter())
+            .map(|t| t.name)
+            .collect();
         for name in &weighted {
             assert!(emitted.contains(name), "weight '{name}' matches no term");
         }
@@ -350,11 +645,78 @@ mod tests {
     fn newborn_track_emits_no_trend_term() {
         // A track with no measured trend must not be scored as "not growing".
         let newborn = cell(1);
-        assert!(!newborn.terms().iter().any(|t| t.name == "trend"));
+        let names = |c: &CellFactSheet| -> Vec<&str> { c.terms().iter().map(|t| t.name).collect() };
+        assert!(!names(&newborn).contains(&"intensifying"));
+        assert!(!names(&newborn).contains(&"weakening"));
 
         let mut aged = cell(2);
         aged.trend = Some(Trend::Decaying);
-        assert!(aged.terms().iter().any(|t| t.name == "trend"));
+        assert!(names(&aged).contains(&"weakening"));
+        assert!(
+            !names(&aged).contains(&"intensifying"),
+            "only the firing side is emitted"
+        );
+    }
+
+    #[test]
+    fn a_steady_cell_gets_no_trend_credit_and_no_trend_reason() {
+        // #645: the old single term scored a steady cell 0.5 and cited "trend"
+        // as a reason for doing nothing. Now steady contributes exactly what a
+        // newborn's absent trend contributes: nothing.
+        let newborn = cell(1);
+        let mut steady = cell(2);
+        steady.intensity_trend_dbz_min = Some(0.0);
+        let s = scorer();
+        let ns = s.score_one(&newborn);
+        let ss = s.score_one(&steady);
+        assert_eq!(ns.score, ss.score);
+        assert!(
+            !ss.contributions
+                .iter()
+                .any(|c| matches!(c.term, "intensifying" | "weakening")),
+            "a steady cell emits no trend term at all"
+        );
+    }
+
+    #[test]
+    fn trend_bonuses_saturate_at_the_tracker_clamp_and_are_signed() {
+        let s = scorer();
+        let with = |t: f64| {
+            let mut c = cell(1);
+            c.intensity_trend_dbz_min = Some(t);
+            s.score_one(&c).score
+        };
+        let steady = with(0.0);
+        assert!(
+            with(0.4) > with(0.2) && with(0.2) > steady,
+            "intensifying ramps up"
+        );
+        assert!(
+            (with(0.4) - with(2.0)).abs() < 1e-12,
+            "saturates at the clamp"
+        );
+        assert!(
+            with(-0.4) < with(-0.2) && with(-0.2) < steady,
+            "weakening ramps down"
+        );
+        assert!(
+            (with(0.4) - steady) > (steady - with(-0.4)),
+            "weakening is the smaller effect"
+        );
+    }
+
+    #[test]
+    fn flags_that_did_not_fire_do_not_dilute_the_graded_mean() {
+        // #645: a plain aged cell scores the mean of what was measured. With
+        // severity Moderate (1/3), 47 dBZ (12/25 of the ramp) and 40 km²
+        // (0.2 of the ramp), that is (1/3 + 0.6·0.48 + 0.3·0.2) / 1.9.
+        let c = cell(1);
+        let expected = (1.0 / 3.0 + 0.6 * 0.48 + 0.3 * 0.2) / 1.9;
+        let got = scorer().score_one(&c).score;
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "got {got}, expected {expected}"
+        );
     }
 
     #[test]
@@ -366,7 +728,14 @@ mod tests {
         quiet.lightning = Some(LightningFacts {
             flash_count: 0,
             flash_rate_per_min: 0.0,
-            jump: false,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+            jump: Some(false),
         });
         let s = scorer();
         let bare_score = s.score_one(&bare).score;
@@ -443,13 +812,27 @@ mod tests {
         quiet.lightning = Some(LightningFacts {
             flash_count: 2,
             flash_rate_per_min: 1.0,
-            jump: false,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+            jump: Some(false),
         });
         let mut jumping = cell(2);
         jumping.lightning = Some(LightningFacts {
             flash_count: 2,
             flash_rate_per_min: 1.0,
-            jump: true,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+            jump: Some(true),
         });
         let s = scorer();
         assert!(s.score_one(&jumping).score > s.score_one(&quiet).score);
@@ -464,12 +847,19 @@ mod tests {
         dangerous.severity = Severity::VerySevere;
         dangerous.max_dbz = 57.0;
         dangerous.area_km2 = 90.0;
-        dangerous.deviant_mover = true;
+        dangerous.deviant_mover = Some(true);
         dangerous.intensity_trend_dbz_min = Some(1.2);
         dangerous.lightning = Some(LightningFacts {
             flash_count: 40,
             flash_rate_per_min: 25.0,
-            jump: true,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+            jump: Some(true),
         });
         dangerous.impact = Some(ImpactFacts {
             over: Some("Nurmijärvi".into()),
@@ -500,5 +890,288 @@ mod tests {
         assert_eq!(ramp(500.0, 0.0, 100.0), 1.0);
         assert_eq!(ramp(f64::NAN, 0.0, 100.0), 0.0);
         assert_eq!(ramp(1.0, 5.0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn a_persistent_stationary_echo_is_flagged_as_clutter() {
+        // The reported case: wind turbine clutter near Oulu outranked real
+        // weather on a quiet day. Observed 0.1 and 2.4 m/s while every real
+        // cell in the same frame ran 8.6-12.9 m/s.
+        assert!(is_likely_clutter(Some(0.1), 10, None));
+        assert!(is_likely_clutter(Some(2.4), 6, None));
+    }
+
+    #[test]
+    fn clutter_needs_both_stationary_and_persistent() {
+        // Slow but young: a cell can crawl briefly in weak flow.
+        assert!(!is_likely_clutter(Some(0.1), 2, None));
+        // Persistent but moving: an ordinary long-lived storm.
+        assert!(!is_likely_clutter(Some(9.7), 20, None));
+    }
+
+    #[test]
+    fn a_newborn_track_is_never_clutter() {
+        // speed is None until the second observation. Reading that as
+        // "stationary" would flag every cell for the first frames after a
+        // reload, when every track is new.
+        assert!(!is_likely_clutter(None, 1, None));
+        assert!(!is_likely_clutter(None, 50, None));
+    }
+
+    #[test]
+    fn flagging_clutter_sinks_it_below_real_weather() {
+        // A bright, compact, well-placed fixed echo maximizes severity,
+        // max_dbz and impact at once — the demotion has to overcome all of
+        // them together.
+        let mut clutter = cell(1);
+        clutter.severity = Severity::Severe;
+        clutter.max_dbz = 54.5;
+        clutter.likely_clutter = true;
+        clutter.impact = Some(ImpactFacts {
+            over: Some("Oulu".into()),
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.9,
+        });
+
+        let mut weather = cell(2);
+        weather.severity = Severity::Moderate;
+        weather.max_dbz = 47.5;
+        weather.impact = Some(ImpactFacts {
+            over: Some("Tampere".into()),
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.7,
+        });
+
+        let scores = scorer().rank(&[clutter, weather]);
+        assert_eq!(
+            scores[1].rank, 1,
+            "real weather must outrank a brighter fixed echo"
+        );
+        assert!(
+            scores[0].significance_is_demoted(),
+            "and the clutter term should be the reason: {:?}",
+            scores[0].contributions
+        );
+    }
+
+    #[test]
+    fn jump_magnitude_outranks_a_bare_threshold_crossing() {
+        // The point of keeping sigma: a 5σ surge and a 2.1σ nudge both set
+        // `jump`, but they are not the same fact.
+        let mut small = cell(1);
+        small.lightning = Some(LightningFacts {
+            flash_count: 30,
+            flash_rate_per_min: 12.0,
+            flash_density_per_km2: 0.5,
+            jump: Some(true),
+            jump_sigma: Some(2.1),
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        });
+        let mut big = cell(2);
+        big.lightning = Some(LightningFacts {
+            jump_sigma: Some(5.5),
+            ..small.lightning.unwrap()
+        });
+        let s = scorer();
+        assert!(
+            s.score_one(&big).score > s.score_one(&small).score,
+            "a larger jump must score higher"
+        );
+    }
+
+    #[test]
+    fn a_jump_without_a_baseline_still_counts() {
+        // sigma is None until there is history. The cell still jumped; it
+        // just cannot be graded, so it must not score as if it had not.
+        let mut c = cell(1);
+        c.lightning = Some(LightningFacts {
+            flash_count: 40,
+            flash_rate_per_min: 20.0,
+            flash_density_per_km2: 1.0,
+            jump: Some(true),
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        });
+        let mut quiet = c.clone();
+        quiet.lightning = Some(LightningFacts {
+            jump: Some(false),
+            ..c.lightning.unwrap()
+        });
+        let s = scorer();
+        assert!(s.score_one(&c).score > s.score_one(&quiet).score);
+    }
+
+    #[test]
+    fn a_high_positive_cg_share_raises_significance() {
+        let base = LightningFacts {
+            flash_count: 20,
+            flash_rate_per_min: 8.0,
+            flash_density_per_km2: 0.5,
+            jump: Some(false),
+            jump_sigma: Some(0.5),
+            cg_count: Some(20),
+            ic_count: Some(0),
+            cg_polarity_known: None,
+            positive_cg_fraction: Some(0.05),
+            first_flash: None,
+        };
+        let mut ordinary = cell(1);
+        ordinary.lightning = Some(base);
+        let mut anomalous = cell(2);
+        anomalous.lightning = Some(LightningFacts {
+            cg_polarity_known: None,
+            positive_cg_fraction: Some(0.75),
+            ..base
+        });
+        let s = scorer();
+        assert!(
+            s.score_one(&anomalous).score > s.score_one(&ordinary).score,
+            "a positive-CG-dominated cell is the severe signal"
+        );
+    }
+
+    #[test]
+    fn an_unreported_polarity_share_is_not_scored_as_zero() {
+        // None must drop the term (renormalizing), not contribute 0.0 —
+        // otherwise wiring a network that omits polarity would silently
+        // penalize every cell.
+        let mut unknown = cell(1);
+        unknown.lightning = Some(LightningFacts {
+            flash_count: 20,
+            flash_rate_per_min: 8.0,
+            flash_density_per_km2: 0.5,
+            jump: Some(false),
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        });
+        assert!(
+            !unknown.terms().iter().any(|t| t.name == "positive_cg"),
+            "an unreported share must emit no term at all"
+        );
+    }
+
+    #[test]
+    fn positive_cg_saturates_at_the_documented_ceiling() {
+        // Pins the RAMP, which relative ordering alone cannot: a raw fraction
+        // and a ramped one both put 0.75 above 0.05.
+        let facts = |frac: f64| {
+            let mut c = cell(1);
+            c.lightning = Some(LightningFacts {
+                flash_count: 20,
+                flash_rate_per_min: 8.0,
+                flash_density_per_km2: 0.5,
+                jump: Some(false),
+                jump_sigma: None,
+                cg_count: Some(20),
+                ic_count: Some(0),
+                cg_polarity_known: None,
+                positive_cg_fraction: Some(frac),
+                first_flash: None,
+            });
+            c
+        };
+        let term = |c: &CellFactSheet| {
+            c.terms()
+                .iter()
+                .find(|t| t.name == "positive_cg")
+                .expect("term present")
+                .value
+        };
+        // Background share sits at the floor and contributes nothing.
+        assert_eq!(term(&facts(0.05)), 0.0);
+        assert_eq!(term(&facts(0.02)), 0.0);
+        // A half-positive CG population is already maximal, and anything
+        // beyond it stays there rather than needing 100% to saturate.
+        assert_eq!(term(&facts(0.5)), 1.0);
+        assert_eq!(term(&facts(0.9)), 1.0);
+        // Midpoint of the ramp, not of 0..1.
+        assert!((term(&facts(0.275)) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_motion_scores_as_no_bonus_not_as_an_absent_term() {
+        // Before #645 this was the subtle one: an unknown flag made ABSENT
+        // shrank the denominator and promoted every newborn, so unknown had
+        // to be present at 0. Bonus terms sit outside the denominator, so
+        // present-at-zero and absent are now the same thing by construction;
+        // this pins that no future change re-opens the gap.
+        let mut unknown = cell(1);
+        unknown.deviant_mover = None;
+        let mut known_not_deviant = cell(2);
+        known_not_deviant.deviant_mover = Some(false);
+
+        let terms_of = |c: &CellFactSheet| {
+            c.terms()
+                .iter()
+                .find(|t| t.name == "deviant_mover")
+                .map(|t| t.value)
+        };
+        assert_eq!(terms_of(&unknown), Some(0.0), "present, contributing zero");
+        assert_eq!(terms_of(&known_not_deviant), Some(0.0));
+
+        let s = scorer();
+        assert_eq!(
+            s.score_one(&unknown).score,
+            s.score_one(&known_not_deviant).score,
+            "not knowing must not out-score knowing the answer is no"
+        );
+    }
+
+    #[test]
+    fn a_deviant_mover_still_earns_its_bonus() {
+        let mut plain = cell(1);
+        plain.deviant_mover = Some(false);
+        let mut deviant = cell(2);
+        deviant.deviant_mover = Some(true);
+        let s = scorer();
+        assert!(s.score_one(&deviant).score > s.score_one(&plain).score);
+    }
+
+    #[test]
+    fn an_unknown_lightning_jump_scores_zero_but_a_baseline_free_jump_scores_full() {
+        let facts = |jump, sigma| LightningFacts {
+            flash_count: 30,
+            flash_rate_per_min: 12.0,
+            flash_density_per_km2: 1.0,
+            jump,
+            jump_sigma: sigma,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        };
+        let term_of = |l| {
+            let mut c = cell(1);
+            c.lightning = Some(l);
+            c.terms()
+                .iter()
+                .find(|t| t.name == "lightning_jump")
+                .map(|t| t.value)
+                .expect("term present")
+        };
+        // Unknown: no baseline existed, so the test never ran.
+        assert_eq!(term_of(facts(None, None)), 0.0);
+        // Known-no-jump: the test ran and said no.
+        assert_eq!(term_of(facts(Some(false), Some(0.5))), 0.0);
+        // A jump with no sigma still scores full — it happened, it just
+        // cannot be graded.
+        assert_eq!(term_of(facts(Some(true), None)), 1.0);
+        // Graded by magnitude once there is a baseline.
+        assert!(term_of(facts(Some(true), Some(6.0))) > term_of(facts(Some(true), Some(2.5))));
     }
 }

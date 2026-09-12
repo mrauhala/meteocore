@@ -2256,6 +2256,121 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Cell tracker — births, deaths, pass-2 matches, clamps per hour",
+      "description": "Association bookkeeping (#643). Births/deaths above the real cell turnover mean dropouts (#649); a rising pass-2 share of matches is the first sign of identity swaps between co-located echoes (#639); velocity clamps are displacements the tracker already rejected as motion. On a quiet frame all four sit at zero.",
+      "id": 51,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 129
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(nowcast_cell_births_total[$__rate_interval]) * 3600",
+          "refId": "A",
+          "legendFormat": "{{collection}} — births/h"
+        },
+        {
+          "expr": "rate(nowcast_cell_deaths_total[$__rate_interval]) * 3600",
+          "refId": "B",
+          "legendFormat": "{{collection}} — deaths/h"
+        },
+        {
+          "expr": "rate(nowcast_cell_pass1_matches_total[$__rate_interval]) * 3600",
+          "refId": "E",
+          "legendFormat": "{{collection}} — pass-1 matches/h"
+        },
+        {
+          "expr": "rate(nowcast_cell_pass2_matches_total[$__rate_interval]) * 3600",
+          "refId": "C",
+          "legendFormat": "{{collection}} — pass-2 matches/h"
+        },
+        {
+          "expr": "rate(nowcast_cell_velocity_clamps_total[$__rate_interval]) * 3600",
+          "refId": "D",
+          "legendFormat": "{{collection}} — velocity clamps/h"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cell tracker — pass-2 share of matches",
+      "description": "pass2 / (pass1 + pass2) over the rate window. Pass 2 is the raw-position fallback that rescues counter-flow cells AND completes an identity swap; a rising share with steady cell counts is the first sign of the #639 failure mode. Empty when no matches happened in the window.",
+      "id": 52,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 129
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(nowcast_cell_pass2_matches_total[$__rate_interval]) / (rate(nowcast_cell_pass1_matches_total[$__rate_interval]) + rate(nowcast_cell_pass2_matches_total[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{collection}} — pass-2 share"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Logs",
       "id": 37,
@@ -2264,7 +2379,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 129
+        "y": 137
       },
       "panels": []
     },
@@ -2277,7 +2392,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 130
+        "y": 138
       },
       "datasource": {
         "type": "loki",
@@ -2310,7 +2425,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 139
+        "y": 147
       },
       "datasource": {
         "type": "loki",

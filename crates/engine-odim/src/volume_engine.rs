@@ -346,26 +346,9 @@ pub fn destination_point(lon0: f64, lat0: f64, distance_m: f64, bearing_deg: f64
 // `polar_sample` (used by Map/WMS) stay on their ground-range interim —
 // migrating those is a separate ticket.
 
-/// 4/3 of the mean Earth radius, in metres — the effective radius used
-/// to model standard atmospheric refraction.
-pub(crate) const FOUR_THIRDS_EARTH_M: f64 = 4.0 / 3.0 * EARTH_RADIUS_M;
-
-/// Forward map: `(slant_range_m, elevation_angle_deg)` → `(ground_distance_m,
-/// height_above_antenna_m)` under the 4/3-Earth model.
-///
-/// `h = sqrt(r² + R'² + 2·r·R'·sin(el)) − R'`
-/// `s = R' · atan(r·cos(el) / (r·sin(el) + R'))`
-///
-/// where `R' = 4/3 · R_earth`. `r` is slant range in metres, `el` is in
-/// degrees.
-pub(crate) fn slant_to_ground_height(slant_range_m: f64, elangle_deg: f64) -> (f64, f64) {
-    let r = slant_range_m;
-    let el = elangle_deg.to_radians();
-    let rp = FOUR_THIRDS_EARTH_M;
-    let h = (r * r + rp * rp + 2.0 * r * rp * el.sin()).sqrt() - rp;
-    let s = rp * (r * el.cos() / (r * el.sin() + rp)).atan();
-    (s, h)
-}
+// The 4/3-Earth beam model lives in `ds_core::geo` (#642): the nowcast's
+// per-cell beam geometry and this sampler must use one formula.
+pub(crate) use ds_core::geo::{slant_to_ground_height, FOUR_THIRDS_EARTH_M};
 
 /// Inverse: `(ground_distance_m, height_above_antenna_m)` →
 /// `(slant_range_m, elevation_angle_deg)`. Closed-form companion to
@@ -692,9 +675,19 @@ pub(crate) struct SiteMeta {
     /// This site's circular coverage bbox `[w, s, e, n]` (WGS84).
     spatial_extent: Option<[f64; 4]>,
     /// This site's maximum ground-range coverage radius (metres) — the
-    /// lowest sweep's `nbins·rscale + rstart`. `None` for a malformed
-    /// `rscale`. Used to reject position queries clearly outside coverage.
+    /// MAXIMUM `nbins·rscale + rstart` across all sweeps, so a quantity that
+    /// lives only on a longer-range higher tilt still counts as in range.
+    /// `None` when no sweep has usable geometry. Used to reject position
+    /// queries clearly outside coverage, and as the coverage question of the
+    /// beam-geometry join; the lowest sweep's own reach is the next field.
     coverage_radius_m: Option<f64>,
+    /// The LOWEST sweep's own range-gate reach (metres) — what the
+    /// lowest-beam geometry join (#642) may extrapolate to. Distinct from
+    /// `coverage_radius_m`, which is the maximum across sweeps: a longer-range
+    /// higher tilt must not license a lowest-beam height past where the
+    /// lowest tilt ever samples. `None` when that sweep's geometry is
+    /// malformed.
+    lowest_sweep_range_m: Option<f64>,
     /// This site's sweep elevation angles (degrees).
     vertical: Option<VerticalDimension>,
     /// Pre-built 3D Tiles metadata snapshot, so `VolumeEngine::volume_info`
@@ -1506,6 +1499,17 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         })
         .max_by(f64::total_cmp);
     let spatial_extent = coverage_radius_m.map(|r| site_coverage_bbox(site.lon, site.lat, r));
+    let sweep_range = |s: &Sweep| {
+        let r = s.nbins as f64 * s.rscale + s.rstart;
+        (s.rscale.is_finite() && s.rscale > 0.0 && r.is_finite() && r > 0.0).then_some(r)
+    };
+    let lowest_sweep_range_m = latest
+        .volume
+        .sweeps
+        .iter()
+        .filter(|s| s.elangle.is_finite())
+        .min_by(|a, b| a.elangle.total_cmp(&b.elangle))
+        .and_then(sweep_range);
 
     let mut times: Vec<DateTime<Utc>> = list.iter().map(|e| e.volume.time).collect();
     times.sort_unstable();
@@ -1607,6 +1611,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         times,
         spatial_extent,
         coverage_radius_m,
+        lowest_sweep_range_m,
         vertical,
         volume_info,
     })
@@ -2671,10 +2676,7 @@ fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
 /// cells the volume actually observed. A negative-tilt floor correctly
 /// dips below antenna level before effective-Earth curvature lifts it.
 fn beam_height_at_ground(elangle_deg: f64, ground_distance_m: f64) -> f64 {
-    let cos_el = elangle_deg.to_radians().cos().max(1e-3);
-    let r = ground_distance_m / cos_el;
-    let (_, h) = slant_to_ground_height(r, elangle_deg);
-    h
+    ds_core::geo::beam_height_at_ground(elangle_deg, ground_distance_m)
 }
 
 /// Tolerance (degrees) for the sweep-envelope guard in
@@ -3190,6 +3192,34 @@ impl PolarVolumeEngine {
         out
     }
 
+    /// Radar sites for the storm-cell beam-geometry join (#642): one
+    /// catalog snapshot, no decoding, sorted by `nod`.
+    fn radar_sites_snapshot(&self) -> Vec<ds_core::radar_sites::RadarSiteInfo> {
+        let catalog = self.catalog.load();
+        let mut sites: Vec<ds_core::radar_sites::RadarSiteInfo> = catalog
+            .by_site_meta
+            .iter()
+            .map(|(nod, meta)| ds_core::radar_sites::RadarSiteInfo {
+                id: nod.clone(),
+                name: meta.plc.clone(),
+                lon: meta.lon,
+                lat: meta.lat,
+                antenna_height_m: meta.height_m,
+                max_range_m: meta.coverage_radius_m,
+                lowest_sweep_range_m: meta.lowest_sweep_range_m,
+                lowest_elevation_deg: meta.vertical.as_ref().and_then(|v| {
+                    v.levels
+                        .iter()
+                        .copied()
+                        .filter(|x| x.is_finite())
+                        .min_by(f64::total_cmp)
+                }),
+            })
+            .collect();
+        sites.sort_by(|a, b| a.id.cmp(&b.id));
+        sites
+    }
+
     /// Build a [`PolarVolumeSiteView`] scoped to radar `nod`, sharing this
     /// engine's live catalog (`ArcSwap`) so the view tracks poll-loop
     /// updates without re-parsing. `collection_id` is the per-site OGC
@@ -3379,6 +3409,12 @@ fn feature_version_of(nods: &[String], by_site_meta: &HashMap<String, SiteMeta>)
         }
     }
     h
+}
+
+impl ds_core::radar_sites::RadarSiteSource for PolarVolumeEngine {
+    fn radar_sites(&self) -> Vec<ds_core::radar_sites::RadarSiteInfo> {
+        self.radar_sites_snapshot()
+    }
 }
 
 impl FeatureEngine for PolarVolumeEngine {
@@ -4305,6 +4341,7 @@ impl EdrEngine for PolarVolumeSiteView {
             "locations".to_string(),
             "position".to_string(),
             "area".to_string(),
+            "radius".to_string(),
             "trajectory".to_string(),
         ]
     }
@@ -4620,6 +4657,26 @@ mod tests {
     /// the `ground/cos(el)` one-step over `slant_to_ground_height`, and
     /// matching the 0.3°-lowest-beam reference table from the issue
     /// (~0.4 km @ 50 km, ~1.1 km @ 100 km, ~5.0 km @ 250 km).
+    #[test]
+    fn ground_distance_agrees_with_ds_core_haversine() {
+        // #642 review: two haversines, one hot-loop with hoisted trig, one
+        // general. Pin them equal so a stability tweak to either cannot
+        // drift the other (the Critical Rule 4 lesson, one formula at a time).
+        for (lon0, lat0, lon1, lat1) in [
+            (24.5, 60.56, 24.94, 60.17),
+            (25.0, 60.0, 25.0, 61.0),
+            (24.5, 60.56, 24.5, 60.56),
+            (-179.9, 70.0, 179.9, 69.9),
+        ] {
+            let (d, _) = ground_distance_bearing(lon0, lat0, lon1, lat1);
+            let g = ds_core::geo::great_circle_distance_m(lon0, lat0, lon1, lat1);
+            assert!(
+                (d - g).abs() < 1.0,
+                "{d} vs {g} for ({lon0},{lat0})→({lon1},{lat1})"
+            );
+        }
+    }
+
     #[test]
     fn beam_height_at_ground_matches_reference_and_rises() {
         assert_eq!(beam_height_at_ground(0.3, 0.0), 0.0);
@@ -7080,6 +7137,7 @@ mod tests {
                 times: vec![],
                 spatial_extent: None,
                 coverage_radius_m: None,
+                lowest_sweep_range_m: None,
                 vertical: None,
                 volume_info: Arc::default(),
             }

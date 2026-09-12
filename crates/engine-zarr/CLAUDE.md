@@ -2,10 +2,19 @@
 
 Zarr V2/V3 multidimensional-array engine (cloud-native, CF conventions),
 tracked in #125. Phases 1–3 ship today: local + remote (S3/HTTP) stores,
-WGS84 lat-lon grids, multi-variable EDR position queries (bilinear),
-WMS/Maps/Tiles rendering, CF time decoding, CF packing, chunk LRU cache.
-NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5), EDR
-instances (#337 — the engine pins the latest run internally).
+WGS84 lat-lon grids, multi-variable EDR position queries (bilinear), EDR
+area/radius (a CRS84 `Grid` over the polygon bbox at native resolution,
+≤ 256 cells per axis, 1M-value budget, ONE `read_window_span` store read
+per variable for the whole timestep span — two across the antimeridian —
+cells outside the polygon masked to null — `QueryPolygon::sample_grid`,
+#671; the NATIVE read is budgeted too via `Catalog::window_dims`, and at
+most 8 variables per request since each is a sequential blocking read — up to 16 round trips across the antimeridian, a deliberate cap, not fan-out; across the seam the two windows do not
+bracket each other, so cells within half a native cell of ±180° on a
+periodic store are nearest-only or null, and a native 0..360 longitude
+axis is not normalised — position and area alike only answer requests in
+the store's own frame — #667), WMS/Maps/Tiles rendering, CF time decoding, CF
+packing, chunk LRU cache.
+NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5).
 
 ## The one load-bearing rule
 
@@ -47,10 +56,15 @@ through it.**
   so the read path branches on `data_type()` and widens every supported
   int/float to `f64`. Fill sentinels are compared against the RAW
   (pre-scale) value; NaN/±inf map to nodata.
-- **Forecast axes:** with a CF `forecast_reference_time` axis AND a
-  `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/ICON-EU), the
-  engine uses the latest run and exposes valid time = run + lead as the time
-  axis (`cf::parse_duration_seconds` decodes the lead units).
+- **Forecast axes / instances (#337):** with a CF `forecast_reference_time`
+  axis AND a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/
+  ICON-EU), every run on the reference axis is an EDR instance / WMS
+  `DIM_REFERENCE_TIME` value (`Catalog::runs`, `RasterInfo.reference_times`);
+  the latest run is the default and provides `Catalog::times`. Reads take the
+  run (`Catalog::resolve_run(reference_time)` → reference-axis index) and
+  each run's valid times are run + leads (`Catalog::valid_times`). The
+  render path and both cache-key resolvers (`resolve_time`,
+  `resolve_reference_time`) share that selection (#507/#521).
 - **Bad-chunking WARN:** `time=1, lat=full, lon=full` chunking is
   pathological for point queries; logged at startup, still served.
 
