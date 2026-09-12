@@ -77,3 +77,47 @@ fn grib_engine_serves_local_directory() {
         "rendered tile should contain data values"
     );
 }
+
+/// #671: an area query masks cells whose centre lies outside the polygon
+/// instead of returning the polygon's whole bounding box.
+#[test]
+fn grib_area_query_masks_outside_the_polygon() {
+    let engine = GribEngine::new("grib-local-test", &local_config()).expect("engine builds");
+    let [w, s, e, n] = engine.get_spatial_extent().expect("extent");
+    let (x0, x1) = (w + 0.25 * (e - w), w + 0.75 * (e - w));
+    let (y0, y1) = (s + 0.25 * (n - s), s + 0.75 * (n - s));
+    // Right triangle with the right angle at the south-west corner: the
+    // bbox's north-east cell is outside, its south-west cell inside.
+    let coords = format!("POLYGON(({x0} {y0}, {x1} {y0}, {x0} {y1}, {x0} {y0}))");
+    let param = engine.get_parameters()[0].clone();
+    let resp = engine
+        .query_area(
+            &coords,
+            None,
+            Some(std::slice::from_ref(&param)),
+            None,
+            None,
+        )
+        .expect("area query");
+    let ds_core::model::CoverageResponse::Single(res) = resp else {
+        panic!("expected a single Grid coverage");
+    };
+    let ds_core::model::DomainDescription::Grid { x, y, .. } = &res.domain else {
+        panic!("expected a Grid domain");
+    };
+    let arr = &res.ranges[&param];
+    assert_eq!(arr.shape, vec![y.len(), x.len()]);
+    assert!(x.len() >= 2 && y.len() >= 2, "grid {}×{}", x.len(), y.len());
+    // y ascends (south first): the last row / last column is the NE corner.
+    assert!(
+        arr.values[arr.values.len() - 1].is_none(),
+        "NE corner must be masked"
+    );
+    assert!(arr.values[0].is_some(), "SW corner must carry data");
+    let inside = arr.values.iter().filter(|v| v.is_some()).count();
+    assert!(
+        inside * 3 < arr.values.len() * 2,
+        "about half the bbox is masked: {inside}/{}",
+        arr.values.len()
+    );
+}

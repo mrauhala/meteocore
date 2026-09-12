@@ -175,35 +175,324 @@ impl QueryPolygon {
         if !self.bbox.contains(x, y) {
             return false;
         }
-        if !point_in_ring(x, y, &self.exterior) {
-            return false;
+        // An antimeridian-crossing polygon (bbox west > east, from the
+        // `west,south,east,north` form) is tested in a 0..360 longitude
+        // frame, where its ring is an ordinary planar shape.
+        let wrap = self.bbox.crosses_antimeridian();
+        let norm = |lon: f64| if wrap && lon < 0.0 { lon + 360.0 } else { lon };
+        let x = norm(x);
+        // The boundary belongs to the polygon (a station exactly on a bbox
+        // edge is inside it, as the inclusive `Bbox::contains` always said);
+        // ray casting alone is exclusive on the north/east edges. One ring
+        // walk per ring decides both.
+        match ring_side_by(x, y, &self.exterior, norm) {
+            RingSide::Outside => return false,
+            RingSide::OnBoundary => return true,
+            RingSide::Inside => {}
         }
         for hole in &self.holes {
-            if point_in_ring(x, y, hole) {
-                return false;
+            match ring_side_by(x, y, hole, norm) {
+                RingSide::Inside => return false,
+                RingSide::OnBoundary => return true, // a hole's edge is polygon
+                RingSide::Outside => {}
             }
         }
         true
+    }
+
+    /// Number of ring vertices (exterior + holes) — the per-cell cost of
+    /// [`Self::contains`].
+    pub fn vertex_count(&self) -> usize {
+        self.exterior.len() + self.holes.iter().map(Vec::len).sum::<usize>()
+    }
+
+    /// `true` when the polygon is exactly its bounding box (the
+    /// `west,south,east,north` form, or an axis-aligned rectangle ring with no
+    /// holes): every cell centre inside the bbox is inside the polygon, so
+    /// a mask is all-true without a ring walk.
+    pub fn is_rectangle(&self) -> bool {
+        if !self.holes.is_empty() {
+            return false;
+        }
+        let ring: Vec<[f64; 2]> = match self.exterior.as_slice() {
+            [a, b, c, d, e] if a == e => vec![*a, *b, *c, *d],
+            [a, b, c, d] => vec![*a, *b, *c, *d],
+            _ => return false,
+        };
+        let Bbox {
+            west,
+            south,
+            east,
+            north,
+        } = self.bbox;
+        // Exactly the four distinct corners, each once — a right triangle
+        // with its right angle at a corner also has every vertex ON a corner —
+        // AND every edge axis-aligned: the same four corners walked in bowtie
+        // order (sw, ne, se, nw) are a self-intersecting shape whose own
+        // `contains` excludes slivers near each corner.
+        let corners_once = [[west, south], [east, south], [east, north], [west, north]]
+            .iter()
+            .all(|corner| ring.iter().filter(|v| *v == corner).count() == 1);
+        let axis_aligned = (0..4).all(|i| {
+            let (a, b) = (ring[i], ring[(i + 1) % 4]);
+            a[0] == b[0] || a[1] == b[1]
+        });
+        corners_once && axis_aligned
+    }
+}
+
+/// Upper bound on `cells × ring vertices` a single area mask may cost —
+/// ~20 M edge tests (one ring walk per cell decides inside AND on-boundary),
+/// tens of milliseconds, on the request-serving runtime.
+pub const MAX_MASK_EDGE_TESTS: usize = 20_000_000;
+
+/// Enforce [`MAX_MASK_EDGE_TESTS`] for masking `cells` grid cells against
+/// `polygon` (a rectangle costs nothing — [`QueryPolygon::mask_cells`] takes
+/// its fast path). Every gridded engine calls this before the mask so a
+/// complex WKT polygon over a large native grid cannot stall a worker.
+pub fn check_mask_budget(cells: usize, polygon: &QueryPolygon) -> Result<(), DataServerError> {
+    if polygon.is_rectangle() {
+        return Ok(());
+    }
+    let tests = cells.saturating_mul(polygon.vertex_count());
+    if tests > MAX_MASK_EDGE_TESTS {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "Area query would test {cells} grid cells against a {}-vertex polygon ({tests} edge \
+             tests; the limit is {MAX_MASK_EDGE_TESTS}) — simplify the polygon or narrow the area",
+            polygon.vertex_count()
+        )));
+    }
+    Ok(())
+}
+
+/// Per-dimension cap of a gridded engine's EDR area grid (cells per axis);
+/// a wider bbox is *coarsened* to this, never refused.
+pub const MAX_AREA_DIM: usize = 256;
+/// Total value budget of one gridded area response across timesteps ×
+/// cells × parameters (≈ 8 MB of CoverageJSON). One home for every gridded
+/// engine — GRIB, GeoTIFF, ODIM, QueryData, Zarr, nowcast — so the budget
+/// cannot drift per engine (#672 review, #673). PostGIS keeps its own
+/// `MAX_RESPONSE_VALUES`: that bounds SQL rows fetched across *every* query
+/// type (position, location, area), not a grid.
+pub const MAX_AREA_VALUES: usize = 1_000_000;
+
+/// Enforce [`MAX_AREA_VALUES`] for a `timesteps × ny × nx × parameters`
+/// response, with the message every engine returns.
+pub fn check_area_budget(
+    timesteps: usize,
+    ny: usize,
+    nx: usize,
+    parameters: usize,
+) -> Result<(), DataServerError> {
+    let total = timesteps
+        .saturating_mul(ny)
+        .saturating_mul(nx)
+        .saturating_mul(parameters);
+    if total > MAX_AREA_VALUES {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "Area query would return {total} values ({timesteps} timesteps × {ny} × {nx} cells × \
+             {parameters} parameters); the limit is {MAX_AREA_VALUES} — narrow the datetime \
+             window, the polygon or the parameters"
+        )));
+    }
+    Ok(())
+}
+
+/// Cell-centre axes of a regular CRS84 grid over an area query's polygon
+/// bbox, at (roughly) a source's native resolution. The shared shape of a
+/// gridded engine's EDR *area* / *radius* result (#671): a CoverageJSON
+/// `Grid` must be rectangular, so the domain is the bbox and the engine
+/// masks cells outside the polygon to null via [`QueryPolygon::cell_mask`].
+///
+/// `x` ascends west→east, `y` descends north→south (index 0 = north),
+/// matching raster row order and the `[t, y, x]` NdArray layout. An
+/// antimeridian-crossing bbox (`west > east`, see [`Bbox`]) spans the seam:
+/// `x` keeps ascending through +180 and is wrapped into `(-180, 180]`, so
+/// the values are not monotonic in that one case. Each dimension is
+/// clamped to `[1, max_dim]`, so a bbox much wider than the source
+/// resolution allows is *coarsened*, never refused — the total-value
+/// budget is [`check_area_budget`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AreaGridAxes {
+    pub x: Vec<f64>,
+    pub y: Vec<f64>,
+}
+
+impl AreaGridAxes {
+    /// `(nx, ny)`.
+    pub fn dims(&self) -> (usize, usize) {
+        (self.x.len(), self.y.len())
+    }
+
+    /// Row-major cell index of `(ix, iy)` — `iy * nx + ix`, the layout of
+    /// [`QueryPolygon::cell_mask`] and of a `[y, x]` NdArray.
+    pub fn index(&self, ix: usize, iy: usize) -> usize {
+        iy * self.x.len() + ix
+    }
+}
+
+impl QueryPolygon {
+    /// See [`AreaGridAxes`]. `res_lon_deg` / `res_lat_deg` are the source's
+    /// cell sizes in degrees (non-positive or non-finite values are treated
+    /// as "one cell").
+    pub fn sample_grid(&self, res_lon_deg: f64, res_lat_deg: f64, max_dim: usize) -> AreaGridAxes {
+        let max_dim = max_dim.max(1);
+        let Bbox {
+            west,
+            south,
+            east,
+            north,
+        } = self.bbox;
+        let lon_span = if self.bbox.crosses_antimeridian() {
+            east + 360.0 - west
+        } else {
+            east - west
+        };
+        let cells = |span: f64, res: f64| -> usize {
+            if !(res.is_finite() && res > 0.0) {
+                return 1;
+            }
+            ((span / res).ceil() as usize).clamp(1, max_dim)
+        };
+        let nx = cells(lon_span, res_lon_deg);
+        let ny = cells(north - south, res_lat_deg);
+        let cell_w = lon_span / nx as f64;
+        let cell_h = (north - south) / ny as f64;
+        AreaGridAxes {
+            x: (0..nx)
+                .map(|ix| {
+                    let lon = west + (ix as f64 + 0.5) * cell_w;
+                    if lon > 180.0 {
+                        lon - 360.0
+                    } else {
+                        lon
+                    }
+                })
+                .collect(),
+            y: (0..ny)
+                .map(|iy| north - (iy as f64 + 0.5) * cell_h)
+                .collect(),
+        }
+    }
+
+    /// Which cells of `axes` an area query should fill — see
+    /// [`Self::mask_cells`] (row-major, `iy * nx + ix`).
+    pub fn cell_mask(&self, axes: &AreaGridAxes) -> Vec<bool> {
+        self.mask_cells(&axes.x, &axes.y)
+    }
+
+    /// Which cells of a regular grid with centre axes `x` and `y` (either
+    /// orientation; row-major `iy * nx + ix`) an area query should fill:
+    /// `true` where the cell centre is inside the polygon. When no centre is
+    /// inside — a sliver, an L, or a ring smaller than one cell whose bbox
+    /// collapsed to a single cell the shape misses — the cells nearest each
+    /// polygon vertex (within one cell spacing, see the rounding note in the
+    /// body) are used instead, so a small-but-real shape still returns its
+    /// data instead of a false "no cell inside" 404 (#671). A rectangle
+    /// (the bbox form) is all-true without a ring walk; bound the rest with
+    /// [`check_mask_budget`].
+    pub fn mask_cells(&self, x: &[f64], y: &[f64]) -> Vec<bool> {
+        let (nx, ny) = (x.len(), y.len());
+        if self.is_rectangle() {
+            // The axes were built inside this bbox, so every centre is in.
+            return vec![true; nx * ny];
+        }
+        let mut mask: Vec<bool> = y
+            .iter()
+            .flat_map(|&yy| x.iter().map(move |&xx| (xx, yy)))
+            .map(|(xx, yy)| self.contains(xx, yy))
+            .collect();
+        if mask.iter().any(|&m| m) || nx == 0 || ny == 0 {
+            return mask;
+        }
+        // One-cell tolerance from the axis spacing (a single-cell axis spans
+        // the whole bbox): every vertex lies inside the grid footprint, whose
+        // outermost centres are at most half a cell from its edge, so the
+        // nearest centre is always within one cell — the tolerance only
+        // rejects a vertex that is off the grid altogether. Half a cell would
+        // let a vertex exactly on the bbox edge miss by rounding.
+        let spacing = |axis: &[f64], lo: f64, hi: f64| -> f64 {
+            if axis.len() > 1 {
+                (axis[1] - axis[0]).abs().max(f64::EPSILON)
+            } else {
+                (hi - lo).abs().max(f64::EPSILON)
+            }
+        };
+        let hx = spacing(x, self.bbox.west, self.bbox.east);
+        let hy = spacing(y, self.bbox.south, self.bbox.north);
+        let nearest = |axis: &[f64], v: f64, tol: f64| -> Option<usize> {
+            axis.iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    // Longitude distance modulo 360 so a seam-wrapped axis
+                    // still finds its cell.
+                    let d = (c - v).abs();
+                    (i, d.min((d - 360.0).abs()))
+                })
+                .filter(|&(_, d)| d <= tol)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        };
+        for &[vx, vy] in self.exterior.iter().chain(self.holes.iter().flatten()) {
+            if let (Some(ix), Some(iy)) = (nearest(x, vx, hx), nearest(y, vy, hy)) {
+                mask[iy * nx + ix] = true;
+            }
+        }
+        mask
     }
 }
 
 /// Ray-casting point-in-polygon test for a single ring.
 fn point_in_ring(x: f64, y: f64, ring: &[[f64; 2]]) -> bool {
+    point_in_ring_by(x, y, ring, |lon| lon)
+}
+
+/// Where a point lies relative to a ring.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RingSide {
+    Outside,
+    Inside,
+    /// Exactly on a segment (collinear and within its extent) — exact rather
+    /// than tolerant on purpose: the case that matters is a coordinate
+    /// round-tripped verbatim onto an edge.
+    OnBoundary,
+}
+
+/// One walk of the ring: ray casting plus the on-segment test in the same
+/// loop, so `contains` costs `vertices` edge tests per cell — the unit
+/// [`check_mask_budget`] counts. Longitudes pass through `norm` (the
+/// antimeridian frame; the caller normalises `x` the same way).
+fn ring_side_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> RingSide {
     let n = ring.len();
     if n < 3 {
-        return false;
+        return RingSide::Outside;
     }
     let mut inside = false;
     let mut j = n - 1;
     for i in 0..n {
-        let (xi, yi) = (ring[i][0], ring[i][1]);
-        let (xj, yj) = (ring[j][0], ring[j][1]);
+        let (xi, yi) = (norm(ring[i][0]), ring[i][1]);
+        let (xj, yj) = (norm(ring[j][0]), ring[j][1]);
+        let cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
+        if cross == 0.0 && x >= xi.min(xj) && x <= xi.max(xj) && y >= yi.min(yj) && y <= yi.max(yj)
+        {
+            return RingSide::OnBoundary;
+        }
         if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
             inside = !inside;
         }
         j = i;
     }
-    inside
+    if inside {
+        RingSide::Inside
+    } else {
+        RingSide::Outside
+    }
+}
+
+/// [`point_in_ring`] with the ring's longitudes passed through `norm`; the
+/// boundary counts as inside.
+fn point_in_ring_by(x: f64, y: f64, ring: &[[f64; 2]], norm: impl Fn(f64) -> f64) -> bool {
+    ring_side_by(x, y, ring, norm) != RingSide::Outside
 }
 
 /// Parse a WKT ring string (comma-separated `lon lat` pairs) into coordinate pairs.
@@ -384,6 +673,70 @@ pub fn parse_point_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
         )));
     }
     Ok((lat, lon))
+}
+
+/// Number of vertices of the polygon [`radius_polygon_wkt`] builds. 64
+/// keeps the chord sag under 0.13 % of the radius (`1 - cos(π/64)`), well
+/// below any engine's sampling resolution.
+pub const RADIUS_POLYGON_VERTICES: usize = 64;
+
+/// Build the WKT `POLYGON` approximating a geodesic circle of `radius_m`
+/// metres around `(lon, lat)` — the shared translation of an EDR *radius*
+/// query into the *area* query every engine already answers, so the two
+/// query types cannot disagree about what "within" means.
+///
+/// Vertices are placed with [`crate::geo::destination_point`] (the same
+/// spherical geodesy the radar engines use) at equal bearings, clockwise
+/// from north, ring closed. Rejects a non-finite or non-positive radius,
+/// a circle that would contain a pole, and one that would cross the
+/// antimeridian: the resulting ring would fold over in lon/lat space and
+/// no area engine handles a bbox that wraps (#667).
+pub fn radius_polygon_wkt(lon: f64, lat: f64, radius_m: f64) -> Result<String, DataServerError> {
+    if !radius_m.is_finite() || radius_m <= 0.0 {
+        return Err(DataServerError::InvalidParameter(
+            "Radius must be a finite, positive distance".into(),
+        ));
+    }
+    if !lon.is_finite() || !lat.is_finite() || lon.abs() > 180.0 || lat.abs() > 90.0 {
+        return Err(DataServerError::InvalidParameter(
+            "Centre must be a finite lon/lat within ±180 / ±90".into(),
+        ));
+    }
+    // Angular radius in degrees of latitude; a circle reaching a pole has
+    // no single-ring lon/lat representation. The margin keeps every vertex
+    // at least ~1 km from the pole, where longitude is ill-conditioned and
+    // neighbouring vertices would otherwise get arbitrary longitudes that
+    // the bbox-span check below cannot detect.
+    const POLE_MARGIN_DEG: f64 = 0.01;
+    let ang_deg = (radius_m / crate::geo::EARTH_RADIUS_M).to_degrees();
+    if lat.abs() + ang_deg >= 90.0 - POLE_MARGIN_DEG {
+        return Err(DataServerError::InvalidParameter(
+            "Radius circle would contain a pole; use an area query instead".into(),
+        ));
+    }
+    let ring: Vec<[f64; 2]> = (0..RADIUS_POLYGON_VERTICES)
+        .map(|i| {
+            let bearing = 360.0 * i as f64 / RADIUS_POLYGON_VERTICES as f64;
+            let (x, y) = crate::geo::destination_point(lon, lat, radius_m, bearing);
+            [x, y]
+        })
+        .collect();
+    let bb = ring_bbox(&ring);
+    if bb[2] - bb[0] > 180.0 {
+        return Err(DataServerError::InvalidParameter(
+            "Radius circle would cross the antimeridian; use an area query instead".into(),
+        ));
+    }
+    let mut wkt = String::with_capacity(32 + 24 * (RADIUS_POLYGON_VERTICES + 1));
+    wkt.push_str("POLYGON((");
+    for (i, [x, y]) in ring.iter().chain(std::iter::once(&ring[0])).enumerate() {
+        if i > 0 {
+            wkt.push_str(", ");
+        }
+        wkt.push_str(&format!("{x} {y}"));
+    }
+    wkt.push_str("))");
+    Ok(wkt)
 }
 
 /// Parse a WKT `LINESTRING(lon lat, lon lat, ...)` into a `Vec<(lon, lat)>`
@@ -1356,5 +1709,200 @@ mod tests {
         ];
         sort_features(&mut fs, &[]);
         assert_eq!(ids(&fs), ["c", "a"]);
+    }
+
+    #[test]
+    fn radius_polygon_contains_inside_and_excludes_outside() {
+        let wkt = radius_polygon_wkt(24.9384, 60.1699, 10_000.0).unwrap();
+        let poly = parse_area_coords(&wkt).unwrap();
+        assert_eq!(poly.exterior.len(), RADIUS_POLYGON_VERTICES + 1);
+        // Every vertex sits on the circle (spherical distance == radius).
+        for [x, y] in &poly.exterior {
+            let d = crate::geo::great_circle_distance_m(24.9384, 60.1699, *x, *y);
+            assert!((d - 10_000.0).abs() < 1.0, "vertex at {d} m");
+        }
+        // Centre and a point at 0.9 r along an off-axis bearing are inside;
+        // 1.1 r is outside — in every direction, not just along the axes.
+        assert!(poly.contains(24.9384, 60.1699));
+        for bearing in [17.0, 100.0, 203.0, 311.0] {
+            let (xi, yi) = crate::geo::destination_point(24.9384, 60.1699, 9_000.0, bearing);
+            let (xo, yo) = crate::geo::destination_point(24.9384, 60.1699, 11_000.0, bearing);
+            assert!(poly.contains(xi, yi), "0.9 r at {bearing}° must be inside");
+            assert!(
+                !poly.contains(xo, yo),
+                "1.1 r at {bearing}° must be outside"
+            );
+        }
+    }
+
+    #[test]
+    fn antimeridian_polygon_contains_points_on_both_sides_of_the_seam() {
+        let poly = parse_area_coords("170,10,-170,20").unwrap();
+        assert!(poly.contains(175.0, 15.0));
+        assert!(poly.contains(-175.0, 15.0));
+        assert!(poly.contains(180.0, 15.0));
+        assert!(!poly.contains(0.0, 15.0));
+        assert!(!poly.contains(160.0, 15.0));
+        assert!(!poly.contains(175.0, 25.0));
+    }
+
+    #[test]
+    fn sample_grid_crosses_the_antimeridian() {
+        let poly = parse_area_coords("170,10,-170,20").unwrap();
+        assert!(poly.bbox.crosses_antimeridian());
+        let axes = poly.sample_grid(5.0, 5.0, 256);
+        assert_eq!(axes.x, vec![172.5, 177.5, -177.5, -172.5]);
+        assert_eq!(axes.y, vec![17.5, 12.5]);
+        let mask = poly.cell_mask(&axes);
+        assert!(mask.iter().all(|&m| m), "every centre lies in the bbox");
+        // Coarsened to one cell: its centre is the seam itself.
+        let one = poly.sample_grid(0.0, 0.0, 256);
+        assert_eq!(one.x, vec![180.0]);
+        assert!(poly.cell_mask(&one)[0]);
+    }
+
+    #[test]
+    fn cell_mask_falls_back_to_vertex_cells_for_sub_cell_shapes() {
+        // A ring (square with a square hole) whose bbox is one 1° cell and
+        // whose bbox centre (10.5, 50.5) is inside the hole.
+        let poly = parse_area_coords(
+            "POLYGON((10 50, 11 50, 11 51, 10 51, 10 50),(10.2 50.2, 10.8 50.2, 10.8 50.8, 10.2 50.8, 10.2 50.2))",
+        )
+        .unwrap();
+        let axes = poly.sample_grid(1.0, 1.0, 256);
+        assert_eq!(axes.dims(), (1, 1));
+        assert!(!poly.contains(axes.x[0], axes.y[0]));
+        assert_eq!(poly.cell_mask(&axes), vec![true]);
+        // At native resolution the centre test decides and no fallback fires.
+        let fine = poly.sample_grid(0.1, 0.1, 256);
+        let mask = poly.cell_mask(&fine);
+        assert!(mask.iter().any(|&m| m) && !mask.iter().all(|&m| m));
+    }
+
+    #[test]
+    fn mask_cells_vertex_fallback_on_a_multi_cell_grid() {
+        // A 3° ring whose hole swallows every one of the 3×3 cell centres:
+        // no centre is inside, so the fallback marks the cells nearest the
+        // vertices — the four corners (outer and hole corners alike) — and
+        // nothing else. Checked in both y orientations.
+        let poly = parse_area_coords(
+            "POLYGON((10 50, 13 50, 13 53, 10 53, 10 50),(10.1 50.1, 12.9 50.1, 12.9 52.9, 10.1 52.9, 10.1 50.1))",
+        )
+        .unwrap();
+        let axes = poly.sample_grid(1.0, 1.0, 256);
+        assert_eq!(axes.dims(), (3, 3));
+        assert!(!axes
+            .y
+            .iter()
+            .any(|&y| axes.x.iter().any(|&x| poly.contains(x, y))));
+        let expect = |m: &[bool]| {
+            assert_eq!(m.len(), 9);
+            let on: Vec<usize> = (0..9).filter(|&i| m[i]).collect();
+            assert_eq!(on, vec![0, 2, 6, 8], "corner cells only: {m:?}");
+        };
+        expect(&poly.cell_mask(&axes));
+        let y_asc: Vec<f64> = axes.y.iter().rev().copied().collect();
+        expect(&poly.mask_cells(&axes.x, &y_asc));
+        // A vertex exactly on the bbox edge (all of them here) must not be
+        // dropped by rounding — every vertex found a cell above.
+    }
+
+    #[test]
+    fn polygon_boundary_is_inclusive_on_every_edge() {
+        let rect = parse_area_coords("10,50,12,52").unwrap();
+        assert!(rect.is_rectangle());
+        for (x, y) in [
+            (10.0, 51.0),
+            (12.0, 51.0),
+            (11.0, 50.0),
+            (11.0, 52.0),
+            (12.0, 52.0),
+        ] {
+            assert!(rect.contains(x, y), "({x}, {y}) on the edge is inside");
+        }
+        assert!(!rect.contains(12.0000001, 51.0));
+        let tri = parse_area_coords("POLYGON((10 50, 12 50, 10 52, 10 50))").unwrap();
+        assert!(!tri.is_rectangle());
+        // Same four corners in bowtie order: self-intersecting, not a rectangle.
+        let bowtie = parse_area_coords("POLYGON((10 50, 12 52, 12 50, 10 52, 10 50))").unwrap();
+        assert!(!bowtie.is_rectangle());
+        // Its two lobes (west and east) meet at the centre; the north and
+        // south wedges are outside and must not be filled by a fast path.
+        assert!(
+            bowtie.contains(10.1, 51.0)
+                && !bowtie.contains(11.0, 50.1)
+                && !bowtie.contains(11.0, 51.9)
+        );
+        let ccw = parse_area_coords("POLYGON((10 50, 12 50, 12 52, 10 52, 10 50))").unwrap();
+        let cw = parse_area_coords("POLYGON((10 50, 10 52, 12 52, 12 50, 10 50))").unwrap();
+        assert!(ccw.is_rectangle() && cw.is_rectangle());
+        assert!(tri.contains(11.0, 51.0), "on the hypotenuse");
+        assert!(!tri.contains(11.0, 51.0000001));
+        // A rectangle mask is all-true without a ring walk.
+        let axes = rect.sample_grid(0.5, 0.5, 256);
+        assert!(rect.cell_mask(&axes).iter().all(|&m| m));
+    }
+
+    #[test]
+    fn mask_budget_bounds_cells_times_vertices() {
+        let rect = parse_area_coords("10,50,12,52").unwrap();
+        assert!(
+            check_mask_budget(usize::MAX, &rect).is_ok(),
+            "rectangles are free"
+        );
+        let tri = parse_area_coords("POLYGON((10 50, 12 50, 10 52, 10 50))").unwrap();
+        assert!(check_mask_budget(1_000_000, &tri).is_ok());
+        assert!(matches!(
+            check_mask_budget(MAX_MASK_EDGE_TESTS / tri.vertex_count() + 1, &tri),
+            Err(DataServerError::QueryTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn area_budget_rejects_over_limit() {
+        assert!(check_area_budget(4, 256, 256, 3).is_ok());
+        assert!(matches!(
+            check_area_budget(4, 256, 256, 4),
+            Err(DataServerError::QueryTooLarge(_))
+        ));
+        assert!(
+            check_area_budget(usize::MAX, 2, 2, 2).is_err(),
+            "no overflow"
+        );
+    }
+
+    #[test]
+    fn sample_grid_axes_match_resolution_and_orientation() {
+        let poly = parse_area_coords("POLYGON((10 50, 12 50, 12 51, 10 51, 10 50))").unwrap();
+        let axes = poly.sample_grid(0.5, 0.25, 256);
+        assert_eq!(axes.x, vec![10.25, 10.75, 11.25, 11.75]);
+        assert_eq!(axes.y, vec![50.875, 50.625, 50.375, 50.125]);
+        // Coarsened, never refused, when the bbox exceeds max_dim cells.
+        let coarse = poly.sample_grid(0.001, 0.001, 4);
+        assert_eq!((coarse.x.len(), coarse.y.len()), (4, 4));
+        // Degenerate resolution → one cell at the bbox centre.
+        let one = poly.sample_grid(0.0, f64::NAN, 256);
+        assert_eq!((one.x, one.y), (vec![11.0], vec![50.5]));
+    }
+
+    #[test]
+    fn radius_polygon_rejects_degenerate_input() {
+        assert!(radius_polygon_wkt(25.0, 60.0, 0.0).is_err());
+        assert!(radius_polygon_wkt(25.0, 60.0, -5.0).is_err());
+        assert!(radius_polygon_wkt(25.0, 60.0, f64::NAN).is_err());
+        assert!(radius_polygon_wkt(200.0, 60.0, 1000.0).is_err());
+        // Contains the pole.
+        assert!(radius_polygon_wkt(25.0, 89.5, 100_000.0).is_err());
+        // Just short of the pole (inside the ~1 km margin) is rejected too;
+        // 89.5° + 0.495° = 89.995°.
+        assert!(radius_polygon_wkt(25.0, 89.5, 55_050.0).is_err());
+        // Comfortably short of it is accepted and the ring stays sane.
+        let wkt = radius_polygon_wkt(25.0, 89.5, 50_000.0).unwrap();
+        let poly = parse_area_coords(&wkt).unwrap();
+        assert!(poly.contains(25.0, 89.5));
+        // Crosses the antimeridian.
+        assert!(radius_polygon_wkt(179.9, 0.0, 50_000.0).is_err());
+        // Same circle away from the seam is fine.
+        assert!(radius_polygon_wkt(170.0, 0.0, 50_000.0).is_ok());
     }
 }

@@ -48,17 +48,7 @@ use crate::reader::OdimComposite;
 /// over the whole grid would emit a multi-megabyte coverage per
 /// timestep. 256 keeps a single-timestep area response well under
 /// 1 MB while still being finer than most display use cases need.
-const MAX_AREA_DIM: usize = 256;
-
-/// Cap on the number of timesteps an area query may span. The area
-/// coverage is an `ny × nx` grid (each ≤ `MAX_AREA_DIM`) *per*
-/// timestep, so an unbounded count would let one request allocate
-/// hundreds of MB. 64 × 256 × 256 `Option<f64>` ≈ 67 MB worst case,
-/// which bounds a deliberate area-over-time query while still
-/// rejecting a "give me everything" request against a full
-/// 5-min-cadence catalog (~288 entries). A position query has no
-/// such cap because it yields only `N` scalars, not `N · ny · nx`.
-const MAX_AREA_TIMESTEPS: usize = 64;
+use ds_core::feature::MAX_AREA_DIM;
 
 /// Parse an EDR `coords` value for a position query into
 /// `(lat, lon)`. Accepts WKT `POINT(lon lat)` and the bare
@@ -312,20 +302,6 @@ impl OdimEngine {
             ));
         }
 
-        // Bound the response size. An area query produces an
-        // `ny × nx` grid per timestep (`ny`, `nx` ≤ `MAX_AREA_DIM`),
-        // so an unfiltered query over a full 5-min-cadence catalog
-        // (`max_files` up to ~288) would allocate hundreds of MB.
-        // Cap the timestep count and tell the client to narrow
-        // `datetime` rather than silently truncating their request.
-        if entries.len() > MAX_AREA_TIMESTEPS {
-            return Err(DataServerError::InvalidParameter(format!(
-                "Area query spans {} timesteps; the maximum is {MAX_AREA_TIMESTEPS}. \
-                 Narrow the `datetime` range.",
-                entries.len()
-            )));
-        }
-
         // Grid resolution comes from the seed composite's dimensions
         // (every timestep shares the same grid) — no probe load, so
         // a single unreadable first file no longer hard-fails the
@@ -336,26 +312,20 @@ impl OdimEngine {
         let deg_per_px_lat =
             ((ur_lat - ll_lat).abs() / self.seed_ysize as f64).max(f64::MIN_POSITIVE);
 
-        let west = polygon.bbox.west;
-        let south = polygon.bbox.south;
-        let east = polygon.bbox.east;
-        let north = polygon.bbox.north;
-
-        // Match the source resolution, clamped to [1, MAX_AREA_DIM].
-        let nx = (((east - west) / deg_per_px_lon).ceil() as usize).clamp(1, MAX_AREA_DIM);
-        let ny = (((north - south) / deg_per_px_lat).ceil() as usize).clamp(1, MAX_AREA_DIM);
-
-        // Cell centres. `x` ascends west→east, `y` descends
-        // north→south (index 0 = north), matching the row order the
-        // raster sampler and `NdArray` layout use.
-        let cell_w = (east - west) / nx as f64;
-        let cell_h = (north - south) / ny as f64;
-        let x_values: Vec<f64> = (0..nx)
-            .map(|ix| west + (ix as f64 + 0.5) * cell_w)
-            .collect();
-        let y_values: Vec<f64> = (0..ny)
-            .map(|iy| north - (iy as f64 + 0.5) * cell_h)
-            .collect();
+        // Shared cell-centre construction (ds-core, #671): x ascends
+        // west→east, y descends north→south, each ≤ `MAX_AREA_DIM`.
+        let axes = polygon.sample_grid(deg_per_px_lon, deg_per_px_lat, MAX_AREA_DIM);
+        let (nx, ny) = axes.dims();
+        // The shared per-response budget (#673) replaces the old 64-timestep
+        // cap: an unfiltered query over a full 5-min catalog (~288 entries ×
+        // 256 × 256 cells) is told to narrow `datetime` instead of
+        // allocating hundreds of MB; a position query has no such cap
+        // because it yields N scalars, not N · ny · nx.
+        ds_core::feature::check_area_budget(entries.len(), ny, nx, 1)?;
+        ds_core::feature::check_mask_budget(nx * ny, polygon)?;
+        let mask = polygon.cell_mask(&axes);
+        let x_values = axes.x;
+        let y_values = axes.y;
 
         let has_time = entries.len() > 1;
         let mut times = Vec::with_capacity(entries.len());
@@ -378,9 +348,9 @@ impl OdimEngine {
             let gain = self.gain_override.unwrap_or(composite.gain);
             let offset = self.offset_override.unwrap_or(composite.offset);
             let nodata = self.nodata_override.unwrap_or(composite.nodata);
-            for &y in &y_values {
-                for &x in &x_values {
-                    if polygon.contains(x, y) {
+            for (iy, &y) in y_values.iter().enumerate() {
+                for (ix, &x) in x_values.iter().enumerate() {
+                    if mask[iy * nx + ix] {
                         all_values.push(sample_bilinear(
                             &composite,
                             x,
@@ -501,7 +471,11 @@ impl EdrEngine for OdimEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string(), "area".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
     }
 
     fn query_position(

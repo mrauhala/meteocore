@@ -126,11 +126,22 @@ pub struct CollectionParam {
 pub struct StormCellsParams {
     /// Collection id serving tracked storm cells.
     pub collection: String,
-    /// How many cells to return, most significant first (default 10, max 50).
+    /// How many cells to return (default 10, max 50).
     pub limit: Option<usize>,
     /// RFC 3339 instant. Returns the cell situation at the newest analysis
     /// frame at or before this time. Omit for the latest frame.
     pub at: Option<String>,
+    /// Property to order by. Omit for significance, which is almost always
+    /// what you want. Must be one of the collection's sortable_properties
+    /// (get_collection_info lists them); anything else is an error naming the
+    /// valid options rather than a silently different ordering.
+    pub sort_by: Option<String>,
+    /// "desc" (default) or "asc". Requires sort_by — setting it alone is an
+    /// error, not a silent no-op.
+    pub order: Option<String>,
+    /// Drop cells below this significance, 0..=1. Applied after ordering, so
+    /// it narrows the result rather than changing what ranks first.
+    pub min_significance: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -238,7 +249,8 @@ impl MeteoCoreMcp {
         description = "Tracked storm cells at one analysis frame, most significant first. \
                        Significance combines radar intensity, size, trend, lightning and \
                        impact on populated areas — it is a ranking heuristic, NOT an official \
-                       warning. Each cell carries the reasons it ranked where it did."
+                       warning. Each cell carries the reasons it ranked where it did; \
+                       `clutter` and `weakening` among them are reasons it ranked LOWER."
     )]
     fn get_storm_cells(
         &self,
@@ -246,6 +258,9 @@ impl MeteoCoreMcp {
             collection,
             limit,
             at,
+            sort_by,
+            order,
+            min_significance,
         }): Parameters<StormCellsParams>,
     ) -> Result<String, ErrorData> {
         let state = self.state.load();
@@ -263,6 +278,57 @@ impl MeteoCoreMcp {
             Some(n) => n.min(MAX_CELLS),
             None => DEFAULT_CELLS,
         };
+        // Validated against what the engine can actually order by, and the
+        // error names the alternatives — an unknown key must not degrade to a
+        // different-but-plausible ordering (#605, #630).
+        let sortby = match sort_by.as_deref() {
+            // `order` alone cannot be honoured: there is nothing to order by
+            // except the default, and silently returning that default is the
+            // "plausible-but-different ordering with no way to notice"
+            // failure this whole parameter set exists to prevent. The caller
+            // asked for ascending and would have received descending.
+            None if order.is_some() => {
+                return Err(ErrorData::invalid_params(
+                    "order requires sort_by — on its own it has nothing to apply to. \
+                     Pass sort_by with one of the collection's sortable_properties, \
+                     or omit both for most-significant-first."
+                        .to_string(),
+                    None,
+                ))
+            }
+            None => vec![SortKey::descending("significance")],
+            Some(key) => {
+                let sortables = engine.sortables();
+                if !sortables.contains(&key) {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "Cannot sort by '{key}' on collection '{collection}'. \
+                             Sortable properties: {}",
+                            sortables.join(", ")
+                        ),
+                        None,
+                    ));
+                }
+                match order.as_deref() {
+                    None | Some("desc") => vec![SortKey::descending(key)],
+                    Some("asc") => vec![SortKey::ascending(key)],
+                    Some(other) => {
+                        return Err(ErrorData::invalid_params(
+                            format!("order must be \"asc\" or \"desc\", got '{other}'"),
+                            None,
+                        ))
+                    }
+                }
+            }
+        };
+        if let Some(min) = min_significance {
+            if !(0.0..=1.0).contains(&min) {
+                return Err(ErrorData::invalid_params(
+                    format!("min_significance must be between 0 and 1, got {min}"),
+                    None,
+                ));
+            }
+        }
         let requested_at = at.as_deref().map(parse_instant).transpose()?;
         let datetime = requested_at.map(|t| {
             // Newest frame at or before `at` — the same "which frame am I
@@ -281,9 +347,32 @@ impl MeteoCoreMcp {
                 limit,
                 offset: 0,
                 datetime,
-                sortby: vec![SortKey::descending("significance")],
+                sortby,
             })
             .map_err(query_failed)?;
+
+        // Applied AFTER the bounded page, so it narrows what was returned
+        // rather than reaching deeper into the ranking. The count of what it
+        // removed is reported: a model that asked for 10 and got 3 must be
+        // able to tell "only 3 cells exist" from "7 were below your floor".
+        let (cells, below_floor) = match min_significance {
+            None => (page.features.clone(), 0usize),
+            Some(min) => {
+                let kept: Vec<_> = page
+                    .features
+                    .iter()
+                    .filter(|f| {
+                        f.properties
+                            .get("significance")
+                            .and_then(|v| v.as_f64())
+                            .is_some_and(|v| v >= min)
+                    })
+                    .cloned()
+                    .collect();
+                let removed = page.features.len() - kept.len();
+                (kept, removed)
+            }
+        };
 
         let observed = page
             .features
@@ -299,22 +388,29 @@ impl MeteoCoreMcp {
         // and a model reading either as "no storms" states what it does not
         // know.
         let retained = engine.temporal_extent();
-        let outside_retention = match (requested_at, retained) {
-            (Some(t), Some((start, end))) if t < start => Some(json!({
-                "from": rfc3339(start),
-                "to": rfc3339(end),
-            })),
-            _ => None,
-        };
+        // The retained window is ALWAYS published, not only when a request
+        // fell outside it. It was previously part of the out-of-range
+        // explanation, which meant a documented field read `null` in every
+        // successful response — leaving a client no way to know how far back
+        // it may ask without first asking wrongly.
+        let retained_frames =
+            retained.map(|(start, end)| json!({ "from": rfc3339(start), "to": rfc3339(end) }));
+        let outside_retention = matches!(
+            (requested_at, retained),
+            (Some(t), Some((start, _))) if t < start
+        );
 
         Ok(json!({
             "collection": collection,
             "observed": observed,
-            "no_frame_for_requested_time": outside_retention.is_some(),
-            "retained_frames": outside_retention,
-            "returned": page.number_returned,
+            "no_frame_for_requested_time": outside_retention,
+            "retained_frames": retained_frames,
+            "returned": cells.len(),
             "total_tracked": page.number_matched,
-            "cells": page.features.iter().map(cell_json).collect::<Vec<_>>(),
+            // Present only when a floor was applied, so its absence cannot be
+            // read as "nothing was filtered" on a call that set no floor.
+            "below_min_significance": min_significance.map(|_| below_floor),
+            "cells": cells.iter().map(cell_json).collect::<Vec<_>>(),
             "note": "Ranking heuristic, not an official warning. Issued warnings come from \
                      the CAP alert collections.",
         })
@@ -352,6 +448,12 @@ impl MeteoCoreMcp {
                 "collection": collection,
                 "cell_id": cell_id,
                 "history": [],
+                // Explicit null, not an omitted key. Both cell tools carry
+                // this key on every response so a client can read the field
+                // the same way each time; dropping it here would make key
+                // presence mean something on one path and nothing on the
+                // other.
+                "retained_frames": Value::Null,
                 "note": "No analysis frames are retained yet.",
             })
             .to_string());
@@ -404,7 +506,7 @@ impl MeteoCoreMcp {
                 // Empty frame: probe further back rather than concluding the
                 // history ends here. Does not count against `samples`.
                 if cursor <= extent_start {
-                    stopped = Some("reached_retention_start");
+                    stopped = Some("reached_earliest_retained_frame");
                     break;
                 }
                 empty_probes += 1;
@@ -416,7 +518,7 @@ impl MeteoCoreMcp {
                 history.push(cell_json(f));
             }
             if frame_time <= extent_start {
-                stopped = Some("reached_retention_start");
+                stopped = Some("reached_earliest_retained_frame");
                 break;
             }
             cursor = frame_time - Duration::seconds(1);
@@ -433,9 +535,18 @@ impl MeteoCoreMcp {
             "collection": collection,
             "cell_id": cell_id,
             "frames_walked": frames,
-            // Which of the three exits happened. "gave_up_in_empty_gap" in
-            // particular must not be read as "the cell stopped existing".
+            // Which exit happened. "gave_up_in_empty_gap" in particular must
+            // not be read as "the cell stopped existing", and
+            // "reached_earliest_retained_frame" deliberately does not claim a
+            // retention POLICY limit: this layer cannot tell a full buffer
+            // from a server that started an hour ago, and the old
+            // "reached_retention_start" made short walks early in an
+            // archive's life read as a policy boundary. Compare
+            // `retained_frames.from` to see which it was.
             "stopped_because": stopped,
+            "retained_frames": engine
+                .temporal_extent()
+                .map(|(start, end)| json!({ "from": rfc3339(start), "to": rfc3339(end) })),
             "history": history,
             "note": if history.is_empty() {
                 "This cell id is not present in any retained frame. Track ids restart when the \

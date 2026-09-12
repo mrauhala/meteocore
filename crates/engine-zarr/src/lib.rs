@@ -32,6 +32,13 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, MAX_AREA_DIM};
+use ds_core::instances::{self, RunInfo};
+
+/// Most variables one EDR area request may address. Each is a separate
+/// blocking store round trip on the request thread (two across the
+/// antimeridian) and they cannot run concurrently (`concurrent_target(1)`).
+const MAX_AREA_VARIABLES: usize = 8;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -112,6 +119,7 @@ impl ZarrEngine {
             Ok(new_catalog) => {
                 let current = self.catalog.load();
                 if new_catalog.times != current.times
+                    || new_catalog.runs.len() != current.runs.len()
                     || new_catalog.vars.len() != current.vars.len()
                 {
                     log_loaded(&self.collection_id, &new_catalog);
@@ -129,7 +137,74 @@ impl ZarrEngine {
     }
 }
 
+/// The variables an EDR query addresses: every one when `parameters` is
+/// absent, else the case-insensitive name matches; none → 400. Shared by
+/// position and area so the two cannot drift.
+fn select_vars<'a>(
+    cat: &'a Catalog,
+    parameters: Option<&[String]>,
+) -> Result<Vec<&'a catalog::Variable>, DataServerError> {
+    let selected: Vec<&catalog::Variable> = cat
+        .vars
+        .iter()
+        .filter(|v| parameters.is_none_or(|f| f.iter().any(|p| p.eq_ignore_ascii_case(&v.name))))
+        .collect();
+    if selected.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "No matching parameters found".into(),
+        ));
+    }
+    Ok(selected)
+}
+
+/// The time-axis indices an EDR query addresses: every step when
+/// `datetime` is absent, else the closed interval; none → 400. Shared by
+/// position and area so the window semantics cannot drift.
+/// Returns `(indices, valid times of the run)`.
+fn select_time_idx(
+    cat: &Catalog,
+    run: Option<usize>,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<(Vec<usize>, &[DateTime<Utc>]), DataServerError> {
+    let times = cat.valid_times(run);
+    let time_idx: Vec<usize> = match datetime {
+        None => (0..times.len()).collect(),
+        Some((start, end)) => times
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t >= start && **t <= end)
+            .map(|(i, _)| i)
+            .collect(),
+    };
+    if time_idx.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "No data available for the requested time range".into(),
+        ));
+    }
+    Ok((time_idx, times))
+}
+
 impl EdrEngine for ZarrEngine {
+    /// Forecast model runs as EDR instances (#337): one per reference-axis
+    /// entry, each with its own valid times (run + leads). Empty for a
+    /// non-forecast store.
+    fn get_instances(&self) -> Vec<RunInfo> {
+        let cat = self.catalog.load();
+        instances::build_instances(&cat.runs, |_, &idx| cat.valid_times(Some(idx)).to_vec())
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.catalog.load().runs.is_empty()
+    }
+
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let cat = self.catalog.load();
+        cat.runs.get(&reference_time).map(|&idx| RunInfo {
+            reference_time,
+            valid_times: cat.valid_times(Some(idx)).to_vec(),
+        })
+    }
+
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
     }
@@ -193,7 +268,178 @@ impl EdrEngine for ZarrEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string()]
+        vec![
+            "position".to_string(),
+            "area".to_string(),
+            "radius".to_string(),
+        ]
+    }
+
+    /// Area query: a CRS84 `Grid` over the polygon's bbox at the store's
+    /// native resolution (each dimension ≤ `MAX_AREA_DIM`), every cell
+    /// bilinearly sampled from one windowed read per variable and timestep,
+    /// cells outside the polygon masked to null (#671). One `t` axis when the
+    /// datetime window selects more than one step.
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let polygon = parse_area_coords(coords)?;
+        let cat = self.catalog.load();
+        if cat.times.is_empty() {
+            return Err(DataServerError::Engine("No Zarr data available".into()));
+        }
+
+        let run = cat.resolve_run(reference_time)?;
+        let (time_idx, run_times) = select_time_idx(&cat, run, datetime)?;
+
+        let selected = select_vars(&cat, parameters)?;
+
+        // A polygon entirely outside the store's coverage is a 404, not an
+        // all-null 200 (GRIB and QueryData answer the same way).
+        if !polygon.bbox.intersects_bbox(&cat.extent) {
+            return Err(DataServerError::LocationNotFound(
+                "The polygon lies outside the collection's spatial extent".into(),
+            ));
+        }
+
+        // Native cell size in degrees from the (half-cell-expanded) extent and
+        // the grid dimensions; a store with no grid size gets one cell.
+        let [w, s, e, n] = cat.extent;
+        let (res_lon, res_lat) = match cat.raster_info.grid_size {
+            Some([nx, ny]) => ((e - w) / nx.max(1) as f64, (n - s) / ny.max(1) as f64),
+            None => (0.0, 0.0),
+        };
+        // Every variable is one blocking store round trip on this thread
+        // (zarrs retrieval is pinned to `concurrent_target(1)` — see the
+        // crate notes — so the reads cannot fan out), and an unfiltered
+        // request addresses every variable in the store. Cap the count and
+        // point at `parameter-name` rather than stall the worker N times.
+        if selected.len() > MAX_AREA_VARIABLES {
+            return Err(DataServerError::QueryTooLarge(format!(
+                "Area query addresses {} variables; at most {MAX_AREA_VARIABLES} per request — \
+                 select them with parameter-name",
+                selected.len()
+            )));
+        }
+
+        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
+        let (nx, ny) = axes.dims();
+        check_area_budget(time_idx.len(), ny, nx, selected.len())?;
+        check_mask_budget(nx * ny, &polygon)?;
+        let mask = polygon.cell_mask(&axes);
+
+        // An antimeridian-crossing bbox (west > east) is read as two
+        // windows, one per side of the seam — `axis_window` needs min ≤ max.
+        // Known gap: the windows do not bracket each other across ±180°, so
+        // on a periodic global store an output cell within half a native
+        // cell of the seam interpolates from one side only (nearest fallback)
+        // or is null. Periodic wrap-around sampling is #667's follow-up.
+        let b = &polygon.bbox;
+        let bboxes: Vec<[f64; 4]> = if b.crosses_antimeridian() {
+            vec![
+                [b.west, b.south, 180.0, b.north],
+                [-180.0, b.south, b.east, b.north],
+            ]
+        } else {
+            vec![[b.west, b.south, b.east, b.north]]
+        };
+        // One hyperslab per (variable, seam side) spanning the first..last
+        // matched index; steps are then addressed by offset, so the read is
+        // correct even if the axis were not strictly ascending (gaps just
+        // read a few unused steps).
+        let (t0, t1) = (
+            *time_idx.iter().min().expect("non-empty"),
+            *time_idx.iter().max().expect("non-empty"),
+        );
+        // The output grid is coarsened to MAX_AREA_DIM per axis, but the
+        // store read covers the bbox at NATIVE resolution × the whole span:
+        // budget that too, or a global bbox on a fine store would pull the
+        // entire array through the blocking bridge before the output budget
+        // ever applied.
+        let (read_cols, read_rows) = bboxes
+            .iter()
+            .filter_map(|bb| cat.window_dims(*bb))
+            .fold((0, 0), |(c, r), (nc, nr)| (c + nc, r.max(nr)));
+        check_area_budget(t1 - t0 + 1, read_rows, read_cols, selected.len()).map_err(|e| {
+            match e {
+                // Extend the inner message; re-wrapping the Display form would
+                // double the "Query too large:" prefix.
+                DataServerError::QueryTooLarge(m) => DataServerError::QueryTooLarge(format!(
+                    "{m} (native-resolution store read; the polygon covers {read_cols} × \
+                     {read_rows} source cells per timestep)"
+                )),
+                other => other,
+            }
+        })?;
+        let has_time = time_idx.len() > 1;
+        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| run_times[i]).collect();
+        let mut params_map = HashMap::new();
+        let mut ranges = HashMap::new();
+        for v in selected {
+            // One blocking store read per (variable, seam side) for the whole
+            // span (Performance rule 9) — `windows[side][step]`; a side
+            // entirely off the grid contributes nothing.
+            let windows: Vec<Vec<catalog::Window>> = bboxes
+                .iter()
+                .map(|bb| cat.read_window_span(v, run, t0..t1 + 1, *bb))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            let mut values: Vec<Option<f64>> = Vec::with_capacity(time_idx.len() * ny * nx);
+            for &ti in &time_idx {
+                let step = ti - t0;
+                for (iy, &y) in axes.y.iter().enumerate() {
+                    for (ix, &x) in axes.x.iter().enumerate() {
+                        values.push(if mask[axes.index(ix, iy)] {
+                            windows.iter().find_map(|side| side[step].sample(x, y))
+                        } else {
+                            None
+                        });
+                    }
+                }
+            }
+            params_map.insert(
+                v.name.clone(),
+                ParameterDescription {
+                    label: v.label.clone(),
+                    unit: v.units.clone(),
+                    observed_property: v.name.clone(),
+                },
+            );
+            let (shape, axis_names) = if has_time {
+                (
+                    vec![out_times.len(), ny, nx],
+                    vec!["t".to_string(), "y".to_string(), "x".to_string()],
+                )
+            } else {
+                (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
+            };
+            ranges.insert(
+                v.name.clone(),
+                NdArray {
+                    shape,
+                    axis_names,
+                    values,
+                },
+            );
+        }
+
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Grid {
+                x: axes.x,
+                y: axes.y,
+                t: has_time.then_some(out_times),
+                z: None,
+            },
+            parameters: params_map,
+            ranges,
+        }))
     }
 
     fn query_position(
@@ -202,7 +448,7 @@ impl EdrEngine for ZarrEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
-        _reference_time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
         let cat = self.catalog.load();
@@ -210,40 +456,16 @@ impl EdrEngine for ZarrEngine {
             return Err(DataServerError::Engine("No Zarr data available".into()));
         }
 
-        let time_idx: Vec<usize> = match datetime {
-            None => (0..cat.times.len()).collect(),
-            Some((start, end)) => cat
-                .times
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| **t >= start && **t <= end)
-                .map(|(i, _)| i)
-                .collect(),
-        };
-        if time_idx.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No data available for the requested time range".into(),
-            ));
-        }
-        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| cat.times[i]).collect();
+        let run = cat.resolve_run(reference_time)?;
+        let (time_idx, run_times) = select_time_idx(&cat, run, datetime)?;
+        let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| run_times[i]).collect();
 
-        let selected: Vec<&catalog::Variable> = cat
-            .vars
-            .iter()
-            .filter(|v| {
-                parameters.is_none_or(|f| f.iter().any(|p| p.eq_ignore_ascii_case(&v.name)))
-            })
-            .collect();
-        if selected.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No matching parameters found".into(),
-            ));
-        }
+        let selected = select_vars(&cat, parameters)?;
 
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
         for v in selected {
-            let values = cat.sample_series(v, lon, lat, &time_idx)?;
+            let values = cat.sample_series(v, run, lon, lat, &time_idx)?;
             params_map.insert(
                 v.name.clone(),
                 ParameterDescription {
@@ -350,9 +572,10 @@ impl MapEngine for ZarrEngine {
         output_crs: &OutputCrs,
         parameter: Option<&str>,
         _z: Option<f64>, // Zarr collections expose no vertical dimension yet
-        _reference_time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let cat = self.catalog.load();
+        let run = cat.resolve_run(reference_time)?;
         let var = match parameter {
             Some(p) => cat.vars.iter().find(|v| v.name.eq_ignore_ascii_case(p)),
             None => cat.vars.first(),
@@ -365,11 +588,11 @@ impl MapEngine for ZarrEngine {
             )
         })?;
 
-        let time_idx = nearest_time_idx(&cat.times, time)
+        let time_idx = nearest_time_idx(cat.valid_times(run), time)
             .ok_or_else(|| DataServerError::Engine("No Zarr data available".into()))?;
 
         let n = (width as usize) * (height as usize);
-        let Some(window) = cat.read_window(var, time_idx, bbox)? else {
+        let Some(window) = cat.read_window(var, run, time_idx, bbox)? else {
             // bbox entirely outside the grid → fully transparent tile.
             return Ok(RasterTile {
                 width,
@@ -453,16 +676,35 @@ impl MapEngine for ZarrEngine {
     fn resolve_time(
         &self,
         time: Option<DateTime<Utc>>,
-        _reference_time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
         // The cache-key authority (#507): the exact timestep
-        // `get_raster_tile` will render, via the SAME `nearest_time_idx`
-        // the render path uses. An empty time axis falls back to the
-        // requested time — the render errors and caches nothing.
+        // `get_raster_tile` will render, via the SAME run selection and
+        // `nearest_time_idx` the render path uses. An empty time axis (or an
+        // unknown run) falls back to the requested time — the render errors
+        // and caches nothing.
         let cat = self.catalog.load();
-        nearest_time_idx(&cat.times, time)
-            .map(|i| cat.times[i])
-            .or(time)
+        let Ok(run) = cat.resolve_run(reference_time) else {
+            return time;
+        };
+        let times = cat.valid_times(run);
+        nearest_time_idx(times, time).map(|i| times[i]).or(time)
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The run-axis cache key (#521): the concrete run `get_raster_tile`
+        // reads — `None` ⇒ the latest run's reference time. An unknown run
+        // echoes the request (the render 404s and caches nothing); a
+        // non-forecast store has no run.
+        let cat = self.catalog.load();
+        match cat.resolve_run(reference_time) {
+            Ok(run) => cat.run_time(run),
+            Err(_) => reference_time,
+        }
     }
 }
 
@@ -483,7 +725,7 @@ fn nearest_time_idx(times: &[DateTime<Utc>], time: Option<DateTime<Utc>>) -> Opt
 
 fn log_loaded(collection_id: &str, cat: &Catalog) {
     tracing::info!(
-        "[{}] Loaded Zarr store: {} variable(s) [{}], {} time step(s)",
+        "[{}] Loaded Zarr store: {} variable(s) [{}], {} time step(s), {} run(s)",
         collection_id,
         cat.vars.len(),
         cat.vars
@@ -492,6 +734,7 @@ fn log_loaded(collection_id: &str, cat: &Catalog) {
             .collect::<Vec<_>>()
             .join(", "),
         cat.times.len(),
+        cat.runs.len(),
     );
 }
 

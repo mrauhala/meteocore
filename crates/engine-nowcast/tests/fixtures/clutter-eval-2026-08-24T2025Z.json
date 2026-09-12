@@ -1,0 +1,83 @@
+{
+  "fixture": {
+    "id": "clutter-eval-2026-08-24T2025Z",
+    "purpose": "All-negative regression frame for the storm-cell clutter detector.",
+    "collection": "fmi-radar-nowcast",
+    "observed": "2026-08-24T20:25:00Z",
+    "captured_from": "get_storm_cells(collection=fmi-radar-nowcast, limit=30)",
+    "server_build": "post-2026-08-24T18:00Z deploy (null-contract fix, Block H lightning fields, likely_clutter introduced)",
+    "ground_truth": {
+      "label": "no_real_precipitation",
+      "scope": "all 11 tracked cells in this frame",
+      "provenance": "operator confirmation against radar imagery, 2026-08-24",
+      "note": "Every cell in this frame is non-meteorological. Any cell scored meteorological here is a false negative for the clutter detector."
+    },
+    "scoring": {
+      "field_under_test": "likely_clutter",
+      "expected_all": true,
+      "observed_true": 2,
+      "observed_false": 9,
+      "detection_rate": 0.18,
+      "failure_classes": {
+        "no_history": {
+          "count": 6,
+          "cells": ["101", "102", "103", "104", "105", "106"],
+          "description": "track_age == 1; a track-based test cannot judge a first-frame detection. Structural — not fixable by threshold tuning."
+        },
+        "insufficient_history": {
+          "count": 3,
+          "cells": ["91", "97", "100"],
+          "description": "track_age 2-5, missed; the two detections had track_age 6 and 16. Consistent with a ~6-frame (~30 min) minimum before the test can fire. Age separates hit from miss better than speed: cell 91 was slower (0.7 m/s) than the detected cell 86 (1.3 m/s) and was still missed."
+        }
+      },
+      "notes": [
+        "significance_rank 1 in this frame (cell 91, severity 'severe', 52.5 dBZ) is clutter.",
+        "Where the detector did fire it behaved correctly: 'clutter' led significance_reasons and significance was suppressed (cell 86 to 0.0, cell 51 demoted to rank 10 despite a 'very_severe' label).",
+        "No cell in the frame exceeds 2.7 m/s. The steering flow had collapsed, so motion alone is a weak discriminator at this hour — recurrence-at-location is the stronger signal here."
+      ]
+    },
+    "recurrence_sites_represented": {
+      "Oulu": {"cells": ["101"], "ids_observed_today": 6, "span": "10h20m", "spread_km": 2.5},
+      "Saarijarvi": {"cells": ["102"], "ids_observed_today": 4, "spread_km": 1.0},
+      "Pieksamaki": {"cells": ["104"], "ids_observed_today": 3, "frames": ["11:45Z", "16:55Z", "20:25Z"]},
+      "Soini": {"cells": ["103"], "ids_observed_today": 2, "frames": ["18:15Z", "20:25Z"]},
+      "Kristiinankaupunki_Isojoki": {"cells": ["91", "100", "105", "106", "86"], "note": "cells 91 and 100 sit on the two spots between which track 471 ID-swapped at 16:00-16:55Z (see spec D9)"},
+      "Siikalatva": {"cells": ["51"], "note": "new site, detected"},
+      "Eurajoki": {"cells": ["97"], "note": "new coastal site, missed"}
+    },
+    "expected_labels": {
+      "51": {"clutter": true, "detected": true},
+      "86": {"clutter": true, "detected": true},
+      "91": {"clutter": true, "detected": false},
+      "97": {"clutter": true, "detected": false},
+      "100": {"clutter": true, "detected": false},
+      "101": {"clutter": true, "detected": false},
+      "102": {"clutter": true, "detected": false},
+      "103": {"clutter": true, "detected": false},
+      "104": {"clutter": true, "detected": false},
+      "105": {"clutter": true, "detected": false},
+      "106": {"clutter": true, "detected": false}
+    }
+  },
+  "payload": {
+    "collection": "fmi-radar-nowcast",
+    "observed": "2026-08-24T20:25:00Z",
+    "no_frame_for_requested_time": false,
+    "retained_frames": {"from": "2026-08-24T18:00:00Z", "to": "2026-08-24T20:25:00Z"},
+    "returned": 11,
+    "total_tracked": 11,
+    "cells": [
+      {"id":"91","lon":21.59869,"lat":62.04451,"area_km2":10.2,"bearing_deg":196.0,"cg_count":null,"cg_polarity_known":null,"deviant_mover":false,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":"Merikarvia","impact_eta_minutes":60.0,"impact_over":"Kristiinankaupunki","intensity_trend_dbz_min":-0.099,"jump_sigma":0.0,"lightning_jump":false,"likely_clutter":false,"max_dbz":52.5,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"severe","significance":0.2827,"significance_rank":1,"significance_reasons":["impact","severity","max_dbz"],"speed_ms":0.7,"track_age":5,"volume_trend":"growing"},
+      {"id":"102","lon":25.20088,"lat":62.78345,"area_km2":4.7,"bearing_deg":null,"cg_count":null,"cg_polarity_known":null,"deviant_mover":null,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Saarijärvi","intensity_trend_dbz_min":null,"jump_sigma":null,"lightning_jump":null,"likely_clutter":false,"max_dbz":50.0,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"severe","significance":0.2673,"significance_rank":2,"significance_reasons":["impact","severity","max_dbz"],"speed_ms":null,"track_age":1,"volume_trend":null},
+      {"id":"103","lon":24.46154,"lat":62.72861,"area_km2":5.8,"bearing_deg":null,"cg_count":null,"cg_polarity_known":null,"deviant_mover":null,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Soini","intensity_trend_dbz_min":null,"jump_sigma":null,"lightning_jump":null,"likely_clutter":false,"max_dbz":51.0,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"severe","significance":0.2307,"significance_rank":3,"significance_reasons":["severity","impact","max_dbz"],"speed_ms":null,"track_age":1,"volume_trend":null},
+      {"id":"104","lon":26.9965,"lat":62.40366,"area_km2":6.5,"bearing_deg":null,"cg_count":null,"cg_polarity_known":null,"deviant_mover":null,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Pieksämäki","intensity_trend_dbz_min":null,"jump_sigma":null,"lightning_jump":null,"likely_clutter":false,"max_dbz":47.5,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"moderate","significance":0.2259,"significance_rank":4,"significance_reasons":["impact","severity","max_dbz"],"speed_ms":null,"track_age":1,"volume_trend":null},
+      {"id":"100","lon":21.59025,"lat":62.10324,"area_km2":4.7,"bearing_deg":48.0,"cg_count":null,"cg_polarity_known":null,"deviant_mover":false,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":"Isojoki","impact_eta_minutes":24.0,"impact_over":"Kristiinankaupunki","intensity_trend_dbz_min":0.019,"jump_sigma":null,"lightning_jump":null,"likely_clutter":false,"max_dbz":48.5,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"moderate","significance":0.224,"significance_rank":5,"significance_reasons":["impact","severity","max_dbz"],"speed_ms":2.7,"track_age":2,"volume_trend":"growing"},
+      {"id":"97","lon":21.66471,"lat":61.40493,"area_km2":8.0,"bearing_deg":263.0,"cg_count":null,"cg_polarity_known":null,"deviant_mover":false,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Eurajoki","intensity_trend_dbz_min":0.079,"jump_sigma":0.0,"lightning_jump":false,"likely_clutter":false,"max_dbz":45.0,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"moderate","significance":0.223,"significance_rank":6,"significance_reasons":["impact","severity","trend"],"speed_ms":1.5,"track_age":3,"volume_trend":"growing"},
+      {"id":"101","lon":26.05506,"lat":65.32697,"area_km2":4.0,"bearing_deg":null,"cg_count":null,"cg_polarity_known":null,"deviant_mover":null,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Oulu","intensity_trend_dbz_min":null,"jump_sigma":null,"lightning_jump":null,"likely_clutter":false,"max_dbz":41.0,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"weak","significance":0.2167,"significance_rank":7,"significance_reasons":["impact","max_dbz","area"],"speed_ms":null,"track_age":1,"volume_trend":null},
+      {"id":"106","lon":21.60401,"lat":62.1545,"area_km2":7.6,"bearing_deg":null,"cg_count":null,"cg_polarity_known":null,"deviant_mover":null,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Kristiinankaupunki","intensity_trend_dbz_min":null,"jump_sigma":null,"lightning_jump":null,"likely_clutter":false,"max_dbz":49.5,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"moderate","significance":0.2073,"significance_rank":8,"significance_reasons":["impact","max_dbz","severity"],"speed_ms":null,"track_age":1,"volume_trend":null},
+      {"id":"105","lon":21.69993,"lat":62.20231,"area_km2":5.1,"bearing_deg":null,"cg_count":null,"cg_polarity_known":null,"deviant_mover":null,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Isojoki","intensity_trend_dbz_min":null,"jump_sigma":null,"lightning_jump":null,"likely_clutter":false,"max_dbz":49.0,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"moderate","significance":0.1736,"significance_rank":9,"significance_reasons":["impact","max_dbz","severity"],"speed_ms":null,"track_age":1,"volume_trend":null},
+      {"id":"51","lon":26.43924,"lat":64.26693,"area_km2":8.7,"bearing_deg":25.0,"cg_count":null,"cg_polarity_known":null,"deviant_mover":false,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Siikalatva","intensity_trend_dbz_min":0.208,"jump_sigma":0.0,"lightning_jump":false,"likely_clutter":true,"max_dbz":55.5,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"very_severe","significance":0.1303,"significance_rank":10,"significance_reasons":["clutter","severity","impact"],"speed_ms":0.2,"track_age":16,"volume_trend":"growing"},
+      {"id":"86","lon":21.70795,"lat":62.16543,"area_km2":5.1,"bearing_deg":164.0,"cg_count":null,"cg_polarity_known":null,"deviant_mover":false,"first_flash":null,"flash_count":0,"flash_density_per_km2":0.0,"flash_rate_per_min":0.0,"ic_count":null,"impact_approaching":null,"impact_eta_minutes":null,"impact_over":"Isojoki","intensity_trend_dbz_min":-0.12,"jump_sigma":0.0,"lightning_jump":false,"likely_clutter":true,"max_dbz":47.0,"observed":"2026-08-24T20:25:00Z","positive_cg_fraction":null,"severity":"moderate","significance":0.0,"significance_rank":11,"significance_reasons":["clutter","impact","severity"],"speed_ms":1.3,"track_age":6,"volume_trend":"decaying"}
+    ]
+  }
+}

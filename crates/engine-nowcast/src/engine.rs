@@ -24,8 +24,8 @@
 //!   runtime; source fetches (which may do blocking storage I/O internally)
 //!   happen only there, never on a request worker.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -35,19 +35,27 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::cell_facts::{CellFactSheet, LightningFacts, ScoredCell, Trend, DEFAULT_CELL_WEIGHTS};
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
+use ds_core::instances::{build_instances, format_instance_id, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+};
 use ds_core::resample::ProjectionGrid;
 use ds_core::significance::WeightedScorer;
 
 use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{
-    advance_tracks, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
+    advance_tracks_with_stats, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
 };
 use crate::impact::ImpactIndex;
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
+use crate::motion_grid::{
+    self, param_spec, GridSpec, PARAM_QUALITY, PARAM_SPECS, PARAM_U, PARAM_V,
+};
 use crate::objects::{segment_cells_labeled, PixelScale};
 use crate::tendency::EFOLD_INTERVALS;
 use crate::Grid;
@@ -83,6 +91,10 @@ const MAX_HISTORY_FRAMES: usize = 8;
 const MAX_JOIN_STRIKES: usize = 200_000;
 
 /// Cell properties every nowcast instance can sort on (#605).
+/// Served precision of `significance`, and the precision it is RANKED at
+/// (#644): the two must be one number or ranks and page order disagree.
+const SIGNIFICANCE_DECIMALS: i32 = 4;
+
 const SORTABLES_BASE: &[&str] = &[
     "significance",
     "significance_rank",
@@ -92,9 +104,28 @@ const SORTABLES_BASE: &[&str] = &[
     "speed_ms",
     "bearing_deg",
     "intensity_trend_dbz_min",
+    "net_displacement_km",
+    "path_straightness",
+    // #630: served, therefore sortable. A field a client can see but cannot
+    // order by is a capability announced and withheld.
+    "likely_clutter",
 ];
 /// Extras that exist only with `lightning_source` wired.
-const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &["flash_count", "flash_rate_per_min"];
+///
+/// `first_flash` is sortable because it is emitted as fixed-width RFC 3339
+/// with a `Z` suffix, which makes the string order chronological. A property
+/// serialized with mixed offsets would NOT belong here.
+const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &[
+    "flash_count",
+    "flash_rate_per_min",
+    "flash_density_per_km2",
+    "jump_sigma",
+    "first_flash",
+    "cg_count",
+    "ic_count",
+    "cg_polarity_known",
+    "positive_cg_fraction",
+];
 /// Extras that exist only with `impact_source` wired.
 const SORTABLES_IMPACT_EXTRAS: &[&str] = &["impact_eta_minutes"];
 
@@ -172,6 +203,10 @@ struct Generation {
     /// The (blended) motion field this generation advected along — the
     /// EMA history for the NEXT generation (#524).
     field: MotionField,
+    /// The source interval the field's vectors are expressed over (pixels
+    /// per THIS many seconds) — what turns them into m/s for the EDR
+    /// motion product (#661).
+    interval_secs: f64,
     /// Tracked cells of this generation's analysis frame (#544/#546).
     cells: Arc<Vec<CellTrack>>,
 }
@@ -237,6 +272,18 @@ pub struct NowcastEngine {
     lead_persistence_csi_permille: AtomicU64,
     /// Monotonic id source for cell tracks (#544).
     next_track_id: AtomicU64,
+    /// Cumulative tracker bookkeeping (#643): births, deaths, pass-2
+    /// matches, velocity clamps. Scraped by /metrics with the same
+    /// reload-rebaseline delta scheme as `generations_total`.
+    track_births_total: AtomicU64,
+    track_deaths_total: AtomicU64,
+    track_pass1_matches_total: AtomicU64,
+    track_pass2_matches_total: AtomicU64,
+    track_velocity_clamps_total: AtomicU64,
+    /// Whether the "radar source advertised no sites" warning has fired
+    /// since the source last had sites. Logged on the transition, not every
+    /// 30 s generation while a volume engine bootstraps (#642 review).
+    radar_empty_warned: AtomicBool,
     /// Optional point-event source joined onto tracked cells per
     /// generation (#549) — lightning, wired by the server's second pass.
     lightning: Option<Arc<dyn ds_core::events::EventSource>>,
@@ -245,6 +292,10 @@ pub struct NowcastEngine {
     /// `impact` significance term — the one that makes a ranking
     /// operational rather than merely meteorological.
     impact: Option<ImpactCfg>,
+    /// Optional radar-site source for per-cell beam geometry (#642), wired
+    /// by the server's second pass like the two above. Data-only: one site
+    /// list per generation, no volume decoding.
+    radar: Option<Arc<dyn ds_core::radar_sites::RadarSiteSource>>,
     /// Sortable properties for THIS instance, resolved once whenever a
     /// source is wired. Stored rather than recomputed so the per-request
     /// accessor is a borrow — same effect as the four-constant version it
@@ -318,6 +369,19 @@ impl NowcastEngine {
             .map_err(|e| {
                 DataServerError::Config(format!("[nowcast.significance] for {collection_id}: {e}"))
             })?;
+        // Bonuses are relative to the graded mean (#645), and the three graded
+        // terms every cell emits are severity, max_dbz and area. Zeroing all
+        // three would score every cell 0 with no reasons and rank by id —
+        // silently. Refuse it at load instead.
+        if ["severity", "max_dbz", "area"]
+            .iter()
+            .all(|t| scorer.weight(t).unwrap_or(0.0) == 0.0)
+        {
+            return Err(DataServerError::Config(format!(
+                "[nowcast.significance] for {collection_id}: severity, max_dbz and area cannot \
+                 all be 0 — nothing graded would be left for the bonus terms to scale"
+            )));
+        }
 
         let source_info = source.raster_info();
         Ok(Self {
@@ -348,8 +412,15 @@ impl NowcastEngine {
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
             next_track_id: AtomicU64::new(1),
+            track_births_total: AtomicU64::new(0),
+            track_deaths_total: AtomicU64::new(0),
+            track_pass1_matches_total: AtomicU64::new(0),
+            track_pass2_matches_total: AtomicU64::new(0),
+            track_velocity_clamps_total: AtomicU64::new(0),
+            radar_empty_warned: AtomicBool::new(false),
             lightning: None,
             impact: None,
+            radar: None,
             sortables: SORTABLES_BASE.to_vec(),
             scorer,
         })
@@ -395,6 +466,19 @@ impl NowcastEngine {
         )
     }
 
+    /// Cumulative tracker counters (#643): `(births, deaths, pass1_matches,
+    /// pass2_matches, velocity_clamps)` since this engine was built. Both
+    /// passes are exported so the pass-2 SHARE of matches is derivable.
+    pub fn track_metrics(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.track_births_total.load(Ordering::Relaxed),
+            self.track_deaths_total.load(Ordering::Relaxed),
+            self.track_pass1_matches_total.load(Ordering::Relaxed),
+            self.track_pass2_matches_total.load(Ordering::Relaxed),
+            self.track_velocity_clamps_total.load(Ordering::Relaxed),
+        )
+    }
+
     /// Latest realized lead-1 skill (#542): `(nowcast_csi, persistence_csi)`
     /// as CSI ×1000, `None` before the second generation has been scored.
     pub fn skill_permille(&self) -> Option<(u64, u64)> {
@@ -436,6 +520,17 @@ impl NowcastEngine {
         self
     }
 
+    /// Attach the radar-site source for per-cell beam geometry (#642),
+    /// second pass like the other two.
+    pub fn with_radar_source(
+        mut self,
+        source: Arc<dyn ds_core::radar_sites::RadarSiteSource>,
+    ) -> Self {
+        self.radar = Some(source);
+        self.recompute_sortables();
+        self
+    }
+
     /// Rebuild the sortable set from whichever sources are wired.
     ///
     /// A property absent from every feature sorts to a no-op: `sort_features`
@@ -450,6 +545,9 @@ impl NowcastEngine {
         }
         if self.impact.is_some() {
             v.extend(SORTABLES_IMPACT_EXTRAS);
+        }
+        if self.radar.is_some() {
+            v.extend(crate::radar::SORTABLES_RADAR_EXTRAS);
         }
         self.sortables = v;
     }
@@ -535,6 +633,25 @@ impl NowcastEngine {
                         }
                     }
                 });
+                // Radar sites (#642): a snapshot read, never I/O. An empty
+                // list (source not yet populated) serves the group as null.
+                let radar_sites = self.radar.as_ref().map(|r| r.radar_sites());
+                if let Some(sites) = &radar_sites {
+                    if sites.is_empty() {
+                        if !self.radar_empty_warned.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                collection = %self.collection_id,
+                                "radar source advertised no sites; beam geometry skipped until it does"
+                            );
+                        }
+                    } else if self.radar_empty_warned.swap(false, Ordering::Relaxed) {
+                        tracing::info!(
+                            collection = %self.collection_id,
+                            sites = sites.len(),
+                            "radar source now advertises sites; beam geometry resumed"
+                        );
+                    }
+                }
                 let mut cell_history = old.cell_history.clone();
                 cell_history.push(CellSnapshot {
                     anchor,
@@ -544,6 +661,7 @@ impl NowcastEngine {
                         anchor,
                         &self.scorer,
                         impact_index.as_ref(),
+                        radar_sites.as_deref(),
                     )),
                 });
                 if cell_history.len() > CELL_HISTORY_SNAPSHOTS {
@@ -773,7 +891,21 @@ impl NowcastEngine {
         {
             let state = self.state.load();
             if let Some((_, latest)) = state.generations.iter().next_back() {
-                field.blend_with_previous(&latest.field, EMA_ALPHA_MEASURED, EMA_ALPHA_FILLED);
+                // Vectors are px per SOURCE interval, and the previous
+                // generation may have been measured over a different one
+                // (a skipped composite doubles it). Rescale before
+                // blending so the EMA mixes like units — otherwise the
+                // served m/s (#661) would be biased by the cadence ratio.
+                let ratio = (interval.num_seconds() as f32) / (latest.interval_secs as f32);
+                if (ratio - 1.0).abs() > 1e-6 && ratio.is_finite() {
+                    let mut prev = latest.field.clone();
+                    for v in prev.u.iter_mut().chain(prev.v.iter_mut()) {
+                        *v *= ratio;
+                    }
+                    field.blend_with_previous(&prev, EMA_ALPHA_MEASURED, EMA_ALPHA_FILLED);
+                } else {
+                    field.blend_with_previous(&latest.field, EMA_ALPHA_MEASURED, EMA_ALPHA_FILLED);
+                }
             }
         }
 
@@ -799,11 +931,15 @@ impl NowcastEngine {
         let displacement_secs = prev_latest
             .map(|(&p, _)| (anchor - p).num_seconds() as f32)
             .unwrap_or_else(|| interval.num_seconds() as f32);
-        let previous_cells: &[CellTrack] = match prev_latest {
-            Some((_, prev)) if prev.geom == geom => &prev.cells,
-            _ => &[],
+        // A geometry reset discards every live track (they restart as
+        // newborns). Those are deaths too, and the tracker cannot see them
+        // from an empty `previous`, so count them here (#643 review).
+        let (previous_cells, reset_deaths): (&[CellTrack], u64) = match prev_latest {
+            Some((_, prev)) if prev.geom == geom => (&prev.cells, 0),
+            Some((_, prev)) => (&[], prev.cells.len() as u64),
+            None => (&[], 0),
         };
-        let mut cells = advance_tracks(
+        let (mut cells, track_stats) = advance_tracks_with_stats(
             previous_cells,
             blobs,
             scale,
@@ -812,6 +948,16 @@ impl NowcastEngine {
             interval.num_seconds() as f32,
             || self.next_track_id.fetch_add(1, Ordering::Relaxed),
         );
+        self.track_births_total
+            .fetch_add(track_stats.births, Ordering::Relaxed);
+        self.track_deaths_total
+            .fetch_add(track_stats.deaths + reset_deaths, Ordering::Relaxed);
+        self.track_pass1_matches_total
+            .fetch_add(track_stats.pass1_matches, Ordering::Relaxed);
+        self.track_pass2_matches_total
+            .fetch_add(track_stats.pass2_matches, Ordering::Relaxed);
+        self.track_velocity_clamps_total
+            .fetch_add(track_stats.velocity_clamps, Ordering::Relaxed);
         // Lightning join (#549): one bounded event fetch per generation
         // (we are ON the background poll runtime — the EventSource sync
         // bridge is legal here, root rule 7), binned onto cells via the
@@ -828,10 +974,15 @@ impl NowcastEngine {
                             "lightning window hit the {MAX_JOIN_STRIKES}-row cap; flash counts may undercount this generation"
                         );
                     }
-                    let strikes_px: Vec<(f32, f32)> = events
+                    // Carry each strike's reported attributes through the
+                    // projection, so the per-cell IC/CG and polarity tallies
+                    // have something to count (#616).
+                    let strikes_px: Vec<((f32, f32), ds_core::events::EventAttrs)> = events
                         .iter()
-                        .filter_map(|e| geom.frac_px(e.lon, e.lat))
-                        .map(|(x, y)| (x as f32, y as f32))
+                        .filter_map(|e| {
+                            geom.frac_px(e.lon, e.lat)
+                                .map(|(x, y)| ((x as f32, y as f32), e.attrs))
+                        })
                         .collect();
                     apply_lightning(
                         &mut cells,
@@ -840,6 +991,7 @@ impl NowcastEngine {
                         geom.width as usize,
                         scale,
                         window_secs,
+                        anchor,
                     );
                     tracing::debug!(
                         collection = %self.collection_id,
@@ -982,6 +1134,7 @@ impl NowcastEngine {
             frames,
             geom,
             field,
+            interval_secs: interval.num_seconds() as f64,
             cells,
         })
     }
@@ -1307,7 +1460,7 @@ impl MapEngine for NowcastEngine {
 
 /// Round to `places` decimals — serde's shortest-roundtrip float printing
 /// then emits the short form (`14.3`, not `14.300000000000001`).
-fn round_to(v: f64, places: i32) -> f64 {
+pub(crate) fn round_to(v: f64, places: i32) -> f64 {
     let f = 10f64.powi(places);
     (v * f).round() / f
 }
@@ -1319,19 +1472,26 @@ fn round_to(v: f64, places: i32) -> f64 {
 /// (feature properties, ranking, narrative, learned models) — building it here
 /// means all four see identical numbers by construction.
 ///
-/// Input order is the track order, which `advance_tracks` derives
-/// deterministically; the scorer breaks score ties by that order, so repeated
-/// generations over unchanged data produce byte-identical rankings.
+/// Score ties break by **feature id string**, not by track order (#635). The
+/// scorer breaks ties by input position, so the input is sorted by id string
+/// first — matching `ds_core::feature::sort_features`, which is what serves
+/// these cells. When the two comparators disagreed, a limited page returned
+/// ranks 1-29 then 31: a hole where nothing had been skipped.
+///
+/// Determinism is unchanged — repeated generations over unchanged data still
+/// produce byte-identical rankings — but it now rests on the id ordering
+/// rather than on `advance_tracks`' track order.
 fn score_cells(
     cells: &[CellTrack],
     g: GridGeom,
     anchor: DateTime<Utc>,
     scorer: &WeightedScorer,
     impact: Option<&ImpactIndex>,
+    radar_sites: Option<&[ds_core::radar_sites::RadarSiteInfo]>,
 ) -> Vec<ScoredCell> {
     let (kx, ky) =
         crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
-    let facts: Vec<CellFactSheet> = cells
+    let mut facts: Vec<CellFactSheet> = cells
         .iter()
         .map(|t| {
             let lon =
@@ -1347,11 +1507,16 @@ fn score_cells(
             let speed_raw = t.speed_ms().map(f64::from);
             let bearing_raw = t.bearing_deg();
             let impact_facts = impact.map(|idx| idx.resolve(lon, lat, speed_raw, bearing_raw));
+            let radar_facts =
+                radar_sites.and_then(|sites| crate::radar::radar_facts(lon, lat, sites));
 
             // 5 decimals ≈ 1 m — the working grid is ~500 m, so raw f64s
             // would roughly double the payload to carry pure noise.
             let lon = round_to(lon, 5);
             let lat = round_to(lat, 5);
+            // Bound once: the fact sheet reports it and flash density
+            // divides by it, and the two must be the same number.
+            let area_km2 = round_to(t.blob.area as f64 * kx * ky, 1);
             CellFactSheet {
                 id: t.id,
                 observed: anchor,
@@ -1361,11 +1526,30 @@ fn score_cells(
                 // f32→f64 promotion of a gain-scaled byte prints noise for
                 // gains that aren't binary-exact (SMHI 0.4 ⇒ 36.400001525878906).
                 max_dbz: round_to(f64::from(t.blob.max_value), 1),
-                area_km2: round_to(t.blob.area as f64 * kx * ky, 1),
+                area_km2,
                 age: t.age,
                 speed_ms: speed_raw.map(|v| round_to(v, 1)),
                 bearing_deg: bearing_raw.map(|b| round_to(b, 0) % 360.0),
-                deviant_mover: t.deviant(),
+                // Only knowable once the track has a velocity. A newborn
+                // cannot be shown to move with the flow or against it, and
+                // `false` would assert non-deviance from unknown motion.
+                deviant_mover: t.velocity_kms.map(|_| t.deviant()),
+                // Only meaningful once there is a track: a newborn has not
+                // had the chance to go anywhere, which is not the same as
+                // having failed to.
+                net_displacement_km: (t.age > 1)
+                    .then(|| round_to(f64::from(t.net_displacement_km), 1)),
+                path_straightness: t.path_straightness().map(|v| round_to(f64::from(v), 2)),
+                // From the RAW speed, like the impact lookahead: the rounded
+                // value is for display and a threshold comparison should not
+                // depend on it.
+                likely_clutter: ds_core::cell_facts::is_likely_clutter(
+                    speed_raw,
+                    t.age,
+                    // Only once there is a track; a newborn's zero is "has
+                    // not had the chance to move", not "did not move".
+                    (t.age > 1).then(|| f64::from(t.net_displacement_km)),
+                ),
                 trend: match t.growing {
                     Some(true) => Some(Trend::Growing),
                     Some(false) => Some(Trend::Decaying),
@@ -1384,7 +1568,38 @@ fn score_cells(
                         .flash_rate_per_min
                         .map(|r| round_to(f64::from(r), 2))
                         .unwrap_or(0.0),
-                    jump: t.lightning_jump,
+                    // Guard the divide: a degenerate zero-area cell would
+                    // otherwise produce inf and poison every downstream
+                    // comparison.
+                    flash_density_per_km2: if area_km2 > 0.0 {
+                        round_to(f64::from(count) / area_km2, 4)
+                    } else {
+                        0.0
+                    },
+                    // Not computable from a single frame: with no baseline
+                    // the test never runs, so `false` would claim a jump was
+                    // ruled out rather than never tested.
+                    jump: t.jump_sigma.map(|_| t.lightning_jump),
+                    jump_sigma: t.jump_sigma.map(|v| round_to(f64::from(v), 2)),
+                    cg_count: t.cg_count,
+                    ic_count: t.ic_count,
+                    cg_polarity_known: t.cg_polarity_known_count,
+                    // Denominator is the CG flashes whose polarity was
+                    // REPORTED, not every CG flash. A network that classifies
+                    // only part of its CG population would otherwise have the
+                    // share divided by flashes it never looked at — 4 of 5
+                    // known positives reported as 0.4 instead of 0.8.
+                    //
+                    // Guarded against 0/0 either way: a cell with no
+                    // classifiable CG flashes has no positive share, which is
+                    // not the same as 0%.
+                    positive_cg_fraction: match (t.cg_polarity_known_count, t.cg_positive_count) {
+                        (Some(known), Some(pos)) if known > 0 => {
+                            Some(round_to(f64::from(pos) / f64::from(known), 3))
+                        }
+                        _ => None,
+                    },
+                    first_flash: t.first_flash,
                 }),
                 // Absent when no impact source is wired — the term then
                 // renormalizes out rather than scoring every cell as
@@ -1394,11 +1609,22 @@ fn score_cells(
                 // environment sampling.
                 volume: None,
                 environment: Vec::new(),
+                radar: radar_facts,
             }
         })
         .collect();
 
-    let scores = scorer.rank(&facts);
+    // Rank ties break by input position, and the Features layer breaks ties by
+    // feature id STRING (`sort_features`). Ordering the input the same way is
+    // what makes the two agree — otherwise a limited page can return ranks
+    // 1–29 then 31, a hole where nothing was skipped (#635).
+    //
+    // Compared as strings, not as numbers, because that is what the serving
+    // comparator does; matching it matters more than being numerically tidy.
+    facts.sort_by_cached_key(|f| f.id.to_string());
+    // Rank on the ROUNDED score (#644): the client sorts on the 4-dp served
+    // value, so near-ties must tie here too or a limited page holes again.
+    let scores = scorer.rank_quantized(&facts, SIGNIFICANCE_DECIMALS);
     facts
         .into_iter()
         .zip(scores)
@@ -1412,7 +1638,7 @@ fn score_cells(
 /// Build one cell feature from its fact sheet and score. Shared by
 /// `get_features` and `get_feature` so the two paths cannot drift (and the
 /// by-id path needn't materialize every cell).
-fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
+fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, Feature) {
     let t = &cell.facts;
     // Values were rounded to their MEANINGFUL precision when the fact sheet
     // was built (the working grid is ~500 m, so 5 lon/lat decimals ≈ 1 m;
@@ -1426,7 +1652,30 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
     props.insert("max_dbz".into(), PropertyValue::Float(t.max_dbz));
     props.insert("area_km2".into(), PropertyValue::Float(t.area_km2));
     props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
-    props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant_mover));
+    for (key, value) in [
+        ("net_displacement_km", t.net_displacement_km),
+        ("path_straightness", t.path_straightness),
+    ] {
+        props.insert(
+            key.into(),
+            value
+                .map(PropertyValue::Float)
+                .unwrap_or(PropertyValue::Null),
+        );
+    }
+    props.insert(
+        "deviant_mover".into(),
+        t.deviant_mover
+            .map(PropertyValue::Bool)
+            .unwrap_or(PropertyValue::Null),
+    );
+    // Surfaced, not hidden: a demoted cell stays inspectable so a client can
+    // say "persistent stationary echo, probably a wind farm" rather than
+    // either "severe storm" or nothing at all.
+    props.insert(
+        "likely_clutter".into(),
+        PropertyValue::Bool(t.likely_clutter),
+    );
     props.insert(
         "speed_ms".into(),
         t.speed_ms
@@ -1451,7 +1700,9 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
     // that matter. Served whether or not any narrative layer is wired.
     props.insert(
         "significance".into(),
-        PropertyValue::Float(round_to(cell.significance.score, 4)),
+        // Already quantized by `rank_quantized`; the round is a no-op kept so
+        // the served precision is stated where it is served.
+        PropertyValue::Float(round_to(cell.significance.score, SIGNIFICANCE_DECIMALS)),
     );
     props.insert(
         "significance_rank".into(),
@@ -1466,6 +1717,14 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
             cell.significance
                 .contributions
                 .iter()
+                // A term that contributed NOTHING is not a reason. Every
+                // weighted term appears in `contributions`, including flags
+                // that are false or unknown, so an unfiltered top-3 will
+                // name `deviant_mover` on a cell whose motion is unknown —
+                // an explanation citing a flag that is not set. Negative
+                // contributions stay: "demoted as likely clutter" is a real
+                // reason a cell ranked where it did.
+                .filter(|c| c.value != 0.0)
                 .take(3)
                 .map(|c| PropertyValue::String(c.term.into()))
                 .collect(),
@@ -1497,6 +1756,44 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
                 .eta_minutes
                 .map(PropertyValue::Float)
                 .unwrap_or(PropertyValue::Null),
+        );
+    }
+    // Beam geometry (#642). Same tri-state as the impact group: absent when
+    // no radar source is wired; every key null when the source advertised
+    // no sites this generation; inside coverage the beam fields are numbers,
+    // outside it they are null and `in_radar_coverage` says why.
+    if radar {
+        let r = t.radar.as_ref();
+        let opt_s = |v: Option<&String>| {
+            v.map(|s| PropertyValue::String(s.clone()))
+                .unwrap_or(PropertyValue::Null)
+        };
+        let opt_f = |v: Option<f64>| v.map(PropertyValue::Float).unwrap_or(PropertyValue::Null);
+        props.insert(
+            "nearest_radar_id".into(),
+            opt_s(r.map(|r| &r.nearest_radar_id)),
+        );
+        props.insert(
+            "nearest_radar_name".into(),
+            opt_s(r.and_then(|r| r.nearest_radar_name.as_ref())),
+        );
+        props.insert(
+            "nearest_radar_distance_km".into(),
+            opt_f(r.map(|r| r.nearest_radar_distance_km)),
+        );
+        props.insert(
+            "in_radar_coverage".into(),
+            r.and_then(|r| r.in_radar_coverage)
+                .map(PropertyValue::Bool)
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "beam_height_m".into(),
+            opt_f(r.and_then(|r| r.beam_height_m)),
+        );
+        props.insert(
+            "beam_elevation_deg".into(),
+            opt_f(r.and_then(|r| r.beam_elevation_deg)),
         );
     }
     // Lifecycle as DATA, not field modification: three gate runs showed
@@ -1531,13 +1828,62 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
                 .map(|l| PropertyValue::Float(l.flash_rate_per_min))
                 .unwrap_or(PropertyValue::Null),
         );
+        for (key, value) in [
+            ("cg_count", t.lightning.and_then(|l| l.cg_count)),
+            ("ic_count", t.lightning.and_then(|l| l.ic_count)),
+            // The denominator behind positive_cg_fraction. Served so a
+            // consumer can weigh "3 of 4" against "300 of 400".
+            (
+                "cg_polarity_known",
+                t.lightning.and_then(|l| l.cg_polarity_known),
+            ),
+        ] {
+            props.insert(
+                key.into(),
+                value
+                    .map(|v| PropertyValue::Integer(i64::from(v)))
+                    .unwrap_or(PropertyValue::Null),
+            );
+        }
+        props.insert(
+            "positive_cg_fraction".into(),
+            t.lightning
+                .and_then(|l| l.positive_cg_fraction)
+                .map(PropertyValue::Float)
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "flash_density_per_km2".into(),
+            t.lightning
+                .map(|l| PropertyValue::Float(l.flash_density_per_km2))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "jump_sigma".into(),
+            // Null covers both "no source this generation" and "no baseline
+            // yet" — in either case the magnitude is unknown, not zero.
+            t.lightning
+                .and_then(|l| l.jump_sigma)
+                .map(PropertyValue::Float)
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "first_flash".into(),
+            t.lightning
+                .and_then(|l| l.first_flash)
+                .map(|ts| {
+                    PropertyValue::String(ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                })
+                .unwrap_or(PropertyValue::Null),
+        );
         props.insert(
             "lightning_jump".into(),
             // Same tri-state as the counts: a skipped join is "unknown",
             // not "no jump" — the lightning group doubles as the
             // joined-this-generation marker.
             t.lightning
-                .map(|l| PropertyValue::Bool(l.jump))
+                .and_then(|l| l.jump)
+                .map(PropertyValue::Bool)
                 .unwrap_or(PropertyValue::Null),
         );
     }
@@ -1550,6 +1896,294 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
             properties: Arc::new(props),
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// EdrEngine: the motion field as a data product (#661)
+// ---------------------------------------------------------------------------
+
+/// Parameter metadata for the served motion field, from the one static
+/// table in `motion_grid` (see `PARAM_SPECS` for why the labels say
+/// "precipitation motion").
+fn motion_parameter_descriptions() -> HashMap<String, ParameterDescription> {
+    PARAM_SPECS
+        .iter()
+        .map(|p| (p.name.to_string(), describe_motion_param(p)))
+        .collect()
+}
+
+fn describe_motion_param(p: &motion_grid::ParamSpec) -> ParameterDescription {
+    ParameterDescription {
+        label: p.label.into(),
+        unit: p.unit.into(),
+        observed_property: p.observed_property.into(),
+    }
+}
+
+impl NowcastEngine {
+    /// Generation selection for the EDR motion product. `reference_time`
+    /// (an instance pin) wins: it must name a retained generation (404
+    /// otherwise), and because the product has exactly ONE valid time — the
+    /// anchor — a `datetime` that excludes the anchor is a 400. Without a
+    /// pin, `datetime` picks the NEWEST generation anchored INSIDE the
+    /// interval — the same rule `get_features` applies to cell snapshots
+    /// (#548), so a client animating source frames gets cells and motion
+    /// from the same anchor. Neither ⇒ latest.
+    fn select_motion_generation(
+        state: &NowcastState,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Arc<Generation>, DataServerError> {
+        if let Some(rt) = reference_time {
+            let generation = Self::generation_by_instance(state, rt).ok_or_else(|| {
+                DataServerError::ReferenceTimeNotFound(format!(
+                    "no retained nowcast generation with reference time {}",
+                    rt.to_rfc3339()
+                ))
+            })?;
+            if let Some((start, end)) = datetime {
+                let anchor = generation.reference_time;
+                if anchor < start || anchor > end {
+                    return Err(DataServerError::InvalidDatetime(format!(
+                        "instance {} has a single valid time, {}, outside the requested {} / {}",
+                        format_instance_id(anchor),
+                        anchor.to_rfc3339(),
+                        start.to_rfc3339(),
+                        end.to_rfc3339()
+                    )));
+                }
+            }
+            return Ok(generation);
+        }
+        if let Some((start, end)) = datetime {
+            if start > end {
+                // `BTreeMap::range` panics on an inverted range; the API layer
+                // normally rejects these, but the engine must not trust it.
+                return Err(DataServerError::InvalidDatetime(format!(
+                    "interval start {} is after end {}",
+                    start.to_rfc3339(),
+                    end.to_rfc3339()
+                )));
+            }
+        }
+        let picked = match datetime {
+            None => state.generations.iter().next_back(),
+            Some((start, end)) => state.generations.range(start..=end).next_back(),
+        };
+        picked.map(|(_, g)| g.clone()).ok_or_else(|| {
+            DataServerError::ReferenceTimeNotFound(match datetime {
+                None => "no nowcast generation available yet".to_string(),
+                Some((start, end)) => format!(
+                    "no nowcast generation anchored inside {} / {}",
+                    start.to_rfc3339(),
+                    end.to_rfc3339()
+                ),
+            })
+        })
+    }
+
+    /// Instance lookup: exact, then to the minute. The EDR instance id is
+    /// minute-precision (`ds_core::instances::format_instance_id`), so a
+    /// generation anchored on a source frame with a seconds component would
+    /// otherwise be advertised under an id that can never be resolved.
+    fn generation_by_instance(state: &NowcastState, rt: DateTime<Utc>) -> Option<Arc<Generation>> {
+        if let Some(g) = state.generations.get(&rt) {
+            return Some(g.clone());
+        }
+        let minute = rt.timestamp().div_euclid(60);
+        state
+            .generations
+            .iter()
+            .find(|(k, _)| k.timestamp().div_euclid(60) == minute)
+            .map(|(_, g)| g.clone())
+    }
+}
+
+impl EdrEngine for NowcastEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(Vec::new())
+    }
+
+    /// Every retained generation is an instance, exactly as WMS advertises
+    /// them via `reference_times` — one run list, two APIs. The instance's
+    /// valid times describe THIS product, though: the motion field is valid
+    /// at the anchor only, not at the forecast leads the WMS layer renders.
+    fn get_instances(&self) -> Vec<RunInfo> {
+        let state = self.state.load();
+        build_instances(&state.generations, |rt, _| vec![*rt])
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.state.load().generations.is_empty()
+    }
+
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let state = self.state.load();
+        Self::generation_by_instance(&state, reference_time).map(|g| RunInfo {
+            reference_time: g.reference_time,
+            valid_times: vec![g.reference_time],
+        })
+    }
+
+    fn query_location(
+        &self,
+        _location_id: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::InvalidParameter(
+            "Location queries are not supported by nowcast collections".into(),
+        ))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        PARAM_SPECS.iter().map(|p| p.name.to_string()).collect()
+    }
+
+    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+        motion_parameter_descriptions()
+    }
+
+    /// The motion field is an analysis product: one per generation, valid
+    /// at the anchor. The extent spans the retained generations, not the
+    /// forecast leads (those are the WMS layer's business).
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let state = self.state.load();
+        let first = state.generations.keys().next()?;
+        let last = state.generations.keys().next_back()?;
+        Some((*first, *last))
+    }
+
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        let state = self.state.load();
+        if state.generations.is_empty() {
+            return None;
+        }
+        Some(state.generations.keys().copied().collect())
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        self.state.load().info.spatial_extent
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["area".to_string(), "radius".to_string()]
+    }
+
+    /// The block-centre motion field inside the query polygon's bbox as a
+    /// CoverageJSON `Grid` (`[t, y, x]`, one `t` = the generation anchor).
+    /// The same shape a GRIB `10u`/`10v` area query returns, so one particle
+    /// renderer consumes either.
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let polygon = ds_core::feature::parse_area_coords(coords)?;
+        let bbox = polygon.bbox;
+
+        let wanted: Vec<&'static motion_grid::ParamSpec> = match parameters {
+            None => PARAM_SPECS.iter().collect(),
+            Some(list) => {
+                let mut out: Vec<&'static motion_grid::ParamSpec> = Vec::with_capacity(list.len());
+                for p in list {
+                    let Some(spec) = param_spec(p) else {
+                        let valid: Vec<&str> = PARAM_SPECS.iter().map(|p| p.name).collect();
+                        return Err(DataServerError::InvalidParameter(format!(
+                            "Unknown parameter '{p}'; valid: {}",
+                            valid.join(", ")
+                        )));
+                    };
+                    if !out.iter().any(|s| s.name == spec.name) {
+                        out.push(spec);
+                    }
+                }
+                if out.is_empty() {
+                    return Err(DataServerError::InvalidParameter(
+                        "No parameters specified for area query".into(),
+                    ));
+                }
+                out
+            }
+        };
+
+        let state = self.state.load();
+        let generation = Self::select_motion_generation(&state, datetime, reference_time)?;
+        let geom = &generation.geom;
+        let spec = GridSpec {
+            west: geom.west,
+            north: geom.north,
+            dlon: (geom.east - geom.west) / geom.width as f64,
+            dlat: (geom.north - geom.south) / geom.height as f64,
+            width: geom.width,
+            height: geom.height,
+        };
+        let grid = motion_grid::motion_grid(
+            &generation.field,
+            &spec,
+            generation.interval_secs,
+            [bbox.west, bbox.south, bbox.east, bbox.north],
+        )
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter(
+                "Bbox does not intersect the motion field grid".to_string(),
+            )
+        })?;
+
+        // Blocks whose centre falls outside the polygon are null (#671);
+        // `MotionGrid` is row-major over y × x.
+        ds_core::feature::check_mask_budget(grid.x.len() * grid.y.len(), &polygon)?;
+        let mask = polygon.mask_cells(&grid.x, &grid.y);
+        if !mask.iter().any(|&m| m) {
+            return Err(DataServerError::LocationNotFound(
+                "The polygon contains no motion block".into(),
+            ));
+        }
+
+        let mut param_descs = HashMap::new();
+        let mut ranges = HashMap::new();
+        let shape = vec![1, grid.y.len(), grid.x.len()];
+        let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];
+        for spec in wanted {
+            let values: &[f64] = match spec.name {
+                PARAM_U => &grid.u,
+                PARAM_V => &grid.v,
+                PARAM_QUALITY => &grid.quality,
+                other => unreachable!("PARAM_SPECS entry without a range: {other}"),
+            };
+            param_descs.insert(spec.name.to_string(), describe_motion_param(spec));
+            ranges.insert(
+                spec.name.to_string(),
+                NdArray {
+                    shape: shape.clone(),
+                    axis_names: axis_names.clone(),
+                    // 2 decimals of m/s is well inside the estimator's noise
+                    // and keeps the document small (#661: ~3k vectors).
+                    values: values
+                        .iter()
+                        .zip(&mask)
+                        .map(|(&v, &inside)| inside.then(|| round_to(v, 2)))
+                        .collect(),
+                },
+            );
+        }
+
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Grid {
+                x: grid.x.iter().map(|&v| round_to(v, 5)).collect(),
+                y: grid.y.iter().map(|&v| round_to(v, 5)).collect(),
+                t: Some(vec![generation.reference_time]),
+                z: None,
+            },
+            parameters: param_descs,
+            ranges,
+        }))
+    }
 }
 
 impl FeatureEngine for NowcastEngine {
@@ -1581,7 +2215,8 @@ impl FeatureEngine for NowcastEngine {
             .cells
             .iter()
             .filter_map(|t| {
-                let (lon, lat, feature) = cell_feature(t, self.lightning.is_some());
+                let (lon, lat, feature) =
+                    cell_feature(t, self.lightning.is_some(), self.radar.is_some());
                 if let Some(b) = &query.bbox {
                     if !b.contains(lon, lat) {
                         return None;
@@ -1645,7 +2280,7 @@ impl FeatureEngine for NowcastEngine {
             .iter()
             .find(|t| t.facts.id == id)
             .ok_or_else(not_found)?;
-        Ok(cell_feature(track, self.lightning.is_some()).2)
+        Ok(cell_feature(track, self.lightning.is_some(), self.radar.is_some()).2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on

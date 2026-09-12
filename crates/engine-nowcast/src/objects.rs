@@ -128,10 +128,81 @@ impl PixelScale {
     pub const UNIT: PixelScale = PixelScale { x: 1.0, y: 1.0 };
 
     #[inline]
-    fn distance(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+    /// Anisotropy-aware distance between two pixel coordinates, in the
+    /// scale's unit. `pub(crate)` so the tracker measures path length the
+    /// same way matching measures gates — a second hand-rolled copy is how
+    /// this kind of thing drifts.
+    pub(crate) fn distance(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
         let dx = (a.0 - b.0) * self.x;
         let dy = (a.1 - b.1) * self.y;
         (dx * dx + dy * dy).sqrt()
+    }
+}
+
+/// Assignment cost for [`match_cells_with`]: centroid distance (gated)
+/// plus TITAN-style similarity penalties, all in the units of the
+/// `PixelScale` (km on a real grid).
+///
+/// Distance alone cannot tell two echoes apart when the geometry is
+/// symmetric. Two stationary echoes `d` apart along a uniform flow `f ≥ d`
+/// cost exactly the same crossed (`(f−d) + (f+d)`) as straight (`2f`), so
+/// the assignment is a coin toss per frame and the ids ping-pong — observed
+/// on the Kristiinankaupunki wind-farm cluster (#639), with 11–12 m/s
+/// jump-frame speeds, a spurious `deviant_mover`, and a clutter flag that
+/// flapped because every clutter gate reads the manufactured motion.
+/// Size and intensity break the tie: fixed echoes differ in both, and a
+/// real cell keeps roughly its own size and peak from one frame to the next.
+///
+/// The penalties are deliberately smaller than `BASE_GATE_KM` (3 km): a
+/// cell that doubles in area costs ~1.4 km, a 10 dB peak change 1.5 km. So
+/// a lone evolving cell still matches its successor (the gate is on
+/// distance only), and similarity only decides between competitors.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchCost {
+    /// Hard distance gate; pairs further apart than this never match.
+    pub gate: f32,
+    /// Penalty per e-fold of area ratio (`|ln(area_b / area_a)|`).
+    pub area_per_efold: f32,
+    /// Penalty per dB of `max_value` difference.
+    pub per_db: f32,
+}
+
+/// Distance penalty per e-fold of area ratio, km.
+pub const AREA_MISMATCH_KM_PER_EFOLD: f32 = 2.0;
+/// Distance penalty per dB of peak-intensity difference, km.
+pub const DBZ_MISMATCH_KM_PER_DB: f32 = 0.15;
+
+impl MatchCost {
+    /// Centroid distance only — the verification harness's matcher
+    /// (Ritvanen-style centroid matching), unchanged by #639.
+    pub const fn distance_only(gate: f32) -> Self {
+        MatchCost {
+            gate,
+            area_per_efold: 0.0,
+            per_db: 0.0,
+        }
+    }
+
+    /// Distance plus the default similarity penalties — what the tracker
+    /// uses.
+    pub const fn with_similarity(gate: f32) -> Self {
+        MatchCost {
+            gate,
+            area_per_efold: AREA_MISMATCH_KM_PER_EFOLD,
+            per_db: DBZ_MISMATCH_KM_PER_DB,
+        }
+    }
+
+    /// Cost of pairing `a` with `b`, or `None` when the distance gate
+    /// rejects the pair.
+    pub fn cost(&self, scale: PixelScale, a: &CellBlob, b: &CellBlob) -> Option<f32> {
+        let d = scale.distance(a.centroid, b.centroid);
+        if d > self.gate {
+            return None;
+        }
+        let area_ratio = (b.area.max(1) as f32 / a.area.max(1) as f32).ln().abs();
+        let ddb = (b.max_value - a.max_value).abs();
+        Some(d + self.area_per_efold * area_ratio + self.per_db * ddb)
     }
 }
 
@@ -145,20 +216,34 @@ pub fn match_cells(
     scale: PixelScale,
     gate: f32,
 ) -> Vec<(usize, usize)> {
+    match_cells_with(a, b, scale, &MatchCost::distance_only(gate))
+}
+
+/// [`match_cells`] with an explicit [`MatchCost`] (similarity-aware
+/// matching for the tracker).
+pub fn match_cells_with(
+    a: &[CellBlob],
+    b: &[CellBlob],
+    scale: PixelScale,
+    costs: &MatchCost,
+) -> Vec<(usize, usize)> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
     // Square cost matrix padded with the forbidden cost; assignments at or
     // above `forbidden` are dropped afterwards, which is how the gate and
-    // the padding both work.
+    // the padding both work. Note the padding is a finite constant far
+    // above any admissible cost, so the optimiser maximises the NUMBER of
+    // in-gate matches before it minimises cost — a gate-edge pairing
+    // still beats a birth plus a death. Making "unmatched" a priced option
+    // is the follow-up scoped in #639.
     let n = a.len().max(b.len());
-    let forbidden = gate * 10.0 + 1e6;
+    let forbidden = costs.gate * 10.0 + 1e6;
     let mut cost = vec![forbidden; n * n];
     for (i, ca) in a.iter().enumerate() {
         for (j, cb) in b.iter().enumerate() {
-            let d = scale.distance(ca.centroid, cb.centroid);
-            if d <= gate {
-                cost[i * n + j] = d;
+            if let Some(c) = costs.cost(scale, ca, cb) {
+                cost[i * n + j] = c;
             }
         }
     }
@@ -556,5 +641,72 @@ mod tests {
         assert!((err - 6.0).abs() < 1.5, "centroid error ~6 px, got {err}");
         assert_eq!((growing.hits, growing.misses), (1, 0));
         assert_eq!((decaying.hits, decaying.misses), (0, 1));
+    }
+
+    #[test]
+    fn similarity_breaks_a_distance_tie_that_pure_distance_gets_wrong() {
+        // Two cells swap places between frames in a way that makes the
+        // CROSSED pairing cheaper on distance: small at x=0 and large at
+        // x=4 become large at x=1 and small at x=3. Crossed costs 1+1,
+        // straight costs 3+3. A cell does not turn from 10 px into 400 px
+        // and back in five minutes; the similarity term must prefer
+        // straight even at 2 km extra distance per pair.
+        let mk = |x: f32, area: usize, max: f32| CellBlob {
+            centroid: (x, 0.0),
+            area,
+            volume: area as f32 * 8.0,
+            max_value: max,
+        };
+        let a = vec![mk(0.0, 10, 40.0), mk(4.0, 400, 52.0)];
+        let b = vec![mk(1.0, 400, 52.0), mk(3.0, 10, 40.0)];
+        let mut plain = match_cells(&a, &b, PixelScale::UNIT, 20.0);
+        plain.sort_unstable();
+        assert_eq!(
+            plain,
+            vec![(0, 0), (1, 1)],
+            "distance alone picks the crossed pairing"
+        );
+        let mut sim = match_cells_with(&a, &b, PixelScale::UNIT, &MatchCost::with_similarity(20.0));
+        sim.sort_unstable();
+        assert_eq!(sim, vec![(0, 1), (1, 0)], "similarity keeps like with like");
+    }
+
+    #[test]
+    fn similarity_penalties_stay_below_the_jitter_allowance() {
+        // A lone cell that doubles in area and gains 10 dB must still cost
+        // less than BASE_GATE_KM (3 km) of extra distance, so an evolving
+        // cell with no competitor never loses its own successor.
+        let a = CellBlob {
+            centroid: (0.0, 0.0),
+            area: 20,
+            volume: 160.0,
+            max_value: 42.0,
+        };
+        let b = CellBlob {
+            centroid: (0.0, 0.0),
+            area: 40,
+            volume: 400.0,
+            max_value: 52.0,
+        };
+        let c = MatchCost::with_similarity(20.0)
+            .cost(PixelScale::UNIT, &a, &b)
+            .unwrap();
+        assert!(
+            c < 3.0,
+            "doubling + 10 dB costs {c} km, must stay under the 3 km base gate"
+        );
+        assert!(
+            MatchCost::with_similarity(1.0)
+                .cost(
+                    PixelScale::UNIT,
+                    &a,
+                    &CellBlob {
+                        centroid: (2.0, 0.0),
+                        ..b.clone()
+                    }
+                )
+                .is_none(),
+            "the gate is on distance only"
+        );
     }
 }

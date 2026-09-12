@@ -34,6 +34,42 @@ use std::collections::BTreeMap;
 
 use crate::error::DataServerError;
 
+/// How a term takes part in the score (#645).
+///
+/// A GRADED term measures how much of something an object has — intensity,
+/// size, exposure. Graded weights form the denominator, so the graded part
+/// of the score is a mean of what was measured and absent graded terms
+/// renormalize.
+///
+/// A BONUS term is a signal that either fires or does not — a deviant mover,
+/// a lightning jump, a clutter verdict, a trend. Its weight is NOT in the
+/// denominator, and it composes so the score stays inside `0..=1` by
+/// construction rather than by clamping:
+///
+/// - a bonus with a POSITIVE weight fills the remaining headroom:
+///   `s += (1 − s) · c`, with `c = w·v / denominator`. Several positive
+///   bonuses combine as a soft OR, so three signals firing at once cannot
+///   push the top cells past 1.0 into a clamped tie whose order is then
+///   decided by id;
+/// - a bonus with a NEGATIVE weight is a multiplicative DISCOUNT:
+///   `s *= 1 − |w| · v`, with `|w|` the fraction removed at full value
+///   (`−0.9` keeps a tenth). Not relative to the denominator: a fixed echo
+///   must sink whatever else was wired, and an additive `−1.5` over a
+///   graded mass of 3.4 only ever removed 0.44 of the score — the live
+///   Utajärvi clutter cell stayed at rank 1 that way.
+///
+/// `contributions` still sum to `raw`: each bonus's contribution is its
+/// share of the headroom filled or the score removed. A flag that did not
+/// fire contributes nothing and dilutes nothing — the reason the split
+/// exists. With every flag in the denominator, a plain cell with no flags
+/// set was capped at 0.51 and the weak class packed into a tenth of the
+/// range (#636).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermKind {
+    Graded,
+    Bonus,
+}
+
 /// One normalized input to a score, in `0.0..=1.0`.
 ///
 /// Normalization is the domain's job: it knows that 60 dBZ is the top of the
@@ -48,19 +84,31 @@ pub struct Term {
     /// at compile time.
     pub name: &'static str,
     pub value: f64,
+    pub kind: TermKind,
 }
 
 impl Term {
+    /// A graded term: in the denominator.
     pub fn new(name: &'static str, value: f64) -> Self {
-        Self { name, value }
-    }
-
-    /// A boolean signal as a term: present or not.
-    pub fn flag(name: &'static str, set: bool) -> Self {
         Self {
             name,
-            value: if set { 1.0 } else { 0.0 },
+            value,
+            kind: TermKind::Graded,
         }
+    }
+
+    /// A bonus term with a magnitude in `0..=1`: outside the denominator.
+    pub fn bonus(name: &'static str, value: f64) -> Self {
+        Self {
+            name,
+            value,
+            kind: TermKind::Bonus,
+        }
+    }
+
+    /// A boolean signal as a bonus term: fires or does not.
+    pub fn flag(name: &'static str, set: bool) -> Self {
+        Self::bonus(name, if set { 1.0 } else { 0.0 })
     }
 
     /// Clamped to `0.0..=1.0`, NaN → 0.0.
@@ -87,8 +135,10 @@ pub struct Contribution {
 pub struct SignificanceScore {
     /// Clamped to `0.0..=1.0` — what clients see and sort on.
     pub score: f64,
-    /// Unclamped weighted mean. `contributions` sum to THIS, not to `score`;
-    /// they differ only when discount terms push the total below zero.
+    /// Unclamped total. `contributions` sum to THIS, not to `score`; the two
+    /// differ only when a NEGATIVE graded weight pushes the graded mean below
+    /// zero (bonuses and discounts are bounded by construction, see
+    /// [`TermKind`]).
     pub raw: f64,
     /// 1-based, within the scored set. Ties break by input order.
     pub rank: usize,
@@ -98,6 +148,13 @@ pub struct SignificanceScore {
 }
 
 impl SignificanceScore {
+    /// Whether any term pulled this score DOWN — a discount actually applied
+    /// (clutter, weakening, a negative graded weight), rather than the object
+    /// merely scoring low.
+    pub fn significance_is_demoted(&self) -> bool {
+        self.contributions.iter().any(|c| c.value < 0.0)
+    }
+
     /// The score an object gets when nothing about it could be evaluated.
     pub fn zero(rank: usize) -> Self {
         Self {
@@ -181,6 +238,10 @@ impl WeightedScorer {
         let terms = item.terms();
         let mut contributions = Vec::with_capacity(terms.len());
         let mut denominator = 0.0f64;
+        // Bonuses are composed AFTER the graded mean is known (they scale
+        // with its headroom), so collect them first: (index into
+        // `contributions`, weight, normalized value).
+        let mut bonuses: Vec<(usize, f64, f64)> = Vec::new();
 
         for term in &terms {
             let Some(weight) = self.weights.get(term.name).copied() else {
@@ -189,20 +250,74 @@ impl WeightedScorer {
             if weight == 0.0 {
                 continue;
             }
-            denominator += weight.abs();
-            contributions.push(Contribution {
-                term: term.name,
-                value: weight * term.normalized(),
-            });
+            match term.kind {
+                TermKind::Graded => {
+                    denominator += weight.abs();
+                    contributions.push(Contribution {
+                        term: term.name,
+                        value: weight * term.normalized(),
+                    });
+                }
+                TermKind::Bonus => {
+                    bonuses.push((contributions.len(), weight, term.normalized()));
+                    contributions.push(Contribution {
+                        term: term.name,
+                        value: 0.0,
+                    });
+                }
+            }
         }
 
+        // Nothing measured ⇒ nothing to rank, whatever flags fired: a bonus
+        // is relative to a mean that does not exist.
         if denominator == 0.0 {
             return SignificanceScore::zero(0);
         }
 
-        for contribution in &mut contributions {
-            contribution.value /= denominator;
+        let mut graded_mean = 0.0f64;
+        for (i, contribution) in contributions.iter_mut().enumerate() {
+            if bonuses.iter().all(|&(bi, _, _)| bi != i) {
+                contribution.value /= denominator;
+                graded_mean += contribution.value;
+            }
         }
+
+        // Positive bonuses fill the headroom above the graded mean as a soft
+        // OR; each takes a share of the fill proportional to its own pull.
+        let base = graded_mean.clamp(0.0, 1.0);
+        let pulls: Vec<(usize, f64)> = bonuses
+            .iter()
+            .filter(|&&(_, w, _)| w > 0.0)
+            .map(|&(i, w, v)| (i, (w * v / denominator).clamp(0.0, 1.0)))
+            .collect();
+        let pull_total: f64 = pulls.iter().map(|&(_, c)| c).sum();
+        let mut score = base;
+        if pull_total > 0.0 {
+            let kept: f64 = pulls.iter().map(|&(_, c)| 1.0 - c).product();
+            let filled = (1.0 - base) * (1.0 - kept);
+            for &(i, c) in &pulls {
+                contributions[i].value = filled * c / pull_total;
+            }
+            score += filled;
+        }
+
+        // Discounts remove a fraction of what is left; each takes a share of
+        // the removal proportional to its own cut.
+        let cuts: Vec<(usize, f64)> = bonuses
+            .iter()
+            .filter(|&&(_, w, _)| w < 0.0)
+            .map(|&(i, w, v)| (i, (w.abs() * v).clamp(0.0, 1.0)))
+            .collect();
+        let cut_total: f64 = cuts.iter().map(|&(_, d)| d).sum();
+        if cut_total > 0.0 {
+            let kept: f64 = cuts.iter().map(|&(_, d)| 1.0 - d).product();
+            let removed = score * (1.0 - kept);
+            for &(i, d) in &cuts {
+                contributions[i].value = -removed * d / cut_total;
+            }
+            score -= removed;
+        }
+
         // Biggest reasons first — the order a narrative should lead with.
         // Total order (abs desc, then name) so equal-magnitude terms don't
         // reorder between runs and churn ETags.
@@ -214,13 +329,21 @@ impl WeightedScorer {
                 .then_with(|| a.term.cmp(b.term))
         });
 
-        let raw: f64 = contributions.iter().map(|c| c.value).sum();
+        // `raw` = graded mean (possibly below zero under a negative graded
+        // weight) plus the bounded bonus and discount parts, so it still
+        // equals the contribution sum.
+        let raw = graded_mean + (score - base);
         SignificanceScore {
             score: raw.clamp(0.0, 1.0),
             raw,
             rank: 0,
             contributions,
         }
+    }
+
+    /// The configured weight of `name`, if any.
+    pub fn weight(&self, name: &str) -> Option<f64> {
+        self.weights.get(name).copied()
     }
 
     /// Score and rank a set, returning scores PARALLEL TO THE INPUT (not
@@ -232,9 +355,51 @@ impl WeightedScorer {
     /// upstream would reshuffle equal-scoring objects between cycles and
     /// churn every downstream ETag.
     pub fn rank<T: SignificanceTerms>(&self, items: &[T]) -> Vec<SignificanceScore> {
+        self.rank_inner(items, None)
+    }
+
+    /// [`Self::rank`] with `score` rounded to `decimals` BEFORE ranking, so
+    /// the number a client sorts on is the number the rank was computed from.
+    ///
+    /// Ranking on the raw score and serving it rounded is a residual of the
+    /// #635 hole (#644): two cells whose raw scores differ by less than half
+    /// a unit in the last served decimal get distinct ranks in raw order but
+    /// tie on the wire, and the wire tie-break (input position) can point the
+    /// other way — a limited page then holds rank 2 without rank 1.
+    /// Rounding first makes the two comparators see one number. `raw` and
+    /// `contributions` stay unrounded.
+    pub fn rank_quantized<T: SignificanceTerms>(
+        &self,
+        items: &[T],
+        decimals: i32,
+    ) -> Vec<SignificanceScore> {
+        self.rank_inner(items, Some(decimals))
+    }
+
+    fn rank_inner<T: SignificanceTerms>(
+        &self,
+        items: &[T],
+        decimals: Option<i32>,
+    ) -> Vec<SignificanceScore> {
         let mut scores: Vec<SignificanceScore> =
             items.iter().map(|item| self.score_one(item)).collect();
+        if let Some(d) = decimals {
+            let f = 10f64.powi(d);
+            for s in &mut scores {
+                s.score = (s.score * f).round() / f;
+            }
+        }
 
+        // Ties break by INPUT POSITION, so the caller decides the tie-break by
+        // choosing the input order. That is load-bearing: whatever serves the
+        // ranked objects must sort ties the same way, or the rank a client
+        // reads and the order it receives disagree.
+        //
+        // Observed 2026-09-04 (#635): two cells shared significance 0.2595,
+        // the page returned them in one order and the ranks in the other, and
+        // a `limit: 30` page came back holding ranks 1–29 and 31 — a hole
+        // where nothing was actually skipped. Ties are common because the
+        // score is published to four decimals over a narrow range.
         let mut order: Vec<usize> = (0..scores.len()).collect();
         order.sort_by(|&a, &b| {
             scores[b]
@@ -264,6 +429,123 @@ mod tests {
 
     fn scorer() -> WeightedScorer {
         WeightedScorer::new(&[("severity", 1.0), ("impact", 1.5), ("beam_quality", -0.6)])
+    }
+
+    #[test]
+    fn rank_quantized_ranks_on_the_number_the_client_sees() {
+        // Two items 1e-6 apart in raw score, the LOWER one first in input
+        // order. Raw ranking puts the higher second item first; a client
+        // sorting on the 4-dp served value sees a tie and keeps input order.
+        // Quantized ranking agrees with the client; raw ranking does not.
+        let s = WeightedScorer::new(&[("severity", 1.0)]);
+        let items = vec![
+            Item(vec![Term::new("severity", 0.500_000)]),
+            Item(vec![Term::new("severity", 0.500_001)]),
+        ];
+        let raw = s.rank(&items);
+        assert_eq!(
+            (raw[0].rank, raw[1].rank),
+            (2, 1),
+            "precondition: raw order differs"
+        );
+        let q = s.rank_quantized(&items, 4);
+        assert_eq!(
+            (q[0].rank, q[1].rank),
+            (1, 2),
+            "tie on the wire ⇒ input order"
+        );
+        assert_eq!(q[0].score, q[1].score, "served scores are one number");
+        assert!((q[1].raw - 0.500_001).abs() < 1e-9, "raw stays unrounded");
+    }
+
+    #[test]
+    fn bonus_terms_stay_out_of_the_denominator() {
+        // A flag that did not fire leaves the graded mean untouched; one that
+        // fired adds its weight relative to the graded mass (#645).
+        let s = WeightedScorer::new(&[("severity", 1.0), ("area", 0.5), ("deviant", 0.3)]);
+        let plain = Item(vec![Term::new("severity", 0.5), Term::new("area", 0.5)]);
+        let quiet = Item(vec![
+            Term::new("severity", 0.5),
+            Term::new("area", 0.5),
+            Term::flag("deviant", false),
+        ]);
+        let fired = Item(vec![
+            Term::new("severity", 0.5),
+            Term::new("area", 0.5),
+            Term::flag("deviant", true),
+        ]);
+        assert_eq!(s.score_one(&plain).score, s.score_one(&quiet).score);
+        assert!((s.score_one(&quiet).score - 0.5).abs() < 1e-12);
+        // Fills 0.3 / (1.0 + 0.5) = 0.2 of the remaining headroom: 0.5 + 0.5·0.2
+        assert!((s.score_one(&fired).score - 0.6).abs() < 1e-12);
+        let sum: f64 = s
+            .score_one(&fired)
+            .contributions
+            .iter()
+            .map(|c| c.value)
+            .sum();
+        assert!((sum - s.score_one(&fired).raw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bonuses_cannot_push_the_score_past_one() {
+        // Three strong bonuses on a strong cell: the old additive form gave
+        // raw 1.27 and a clamped tie at the top of the list, ordered by id.
+        let s = WeightedScorer::new(&[("severity", 1.0), ("a", 0.9), ("b", 0.9), ("c", 0.9)]);
+        let item = Item(vec![
+            Term::new("severity", 0.8),
+            Term::flag("a", true),
+            Term::flag("b", true),
+            Term::flag("c", true),
+        ]);
+        let one = s.score_one(&item);
+        assert!(one.score < 1.0 && one.score > 0.99, "got {}", one.score);
+        assert!((one.raw - one.score).abs() < 1e-12, "raw is bounded too");
+        let sum: f64 = one.contributions.iter().map(|c| c.value).sum();
+        assert!((sum - one.raw).abs() < 1e-12);
+        // Two such cells with different severities still order by severity.
+        let weaker = Item(vec![
+            Term::new("severity", 0.7),
+            Term::flag("a", true),
+            Term::flag("b", true),
+            Term::flag("c", true),
+        ]);
+        assert!(s.score_one(&weaker).score < one.score);
+    }
+
+    #[test]
+    fn a_discount_removes_its_fraction_whatever_else_is_wired() {
+        // −0.9 keeps a tenth, with one graded term or with three: the
+        // denominator has no say in how hard a clutter verdict hits.
+        let narrow = WeightedScorer::new(&[("severity", 1.0), ("clutter", -0.9)]);
+        let wide = WeightedScorer::new(&[
+            ("severity", 1.0),
+            ("impact", 1.5),
+            ("max_dbz", 0.6),
+            ("clutter", -0.9),
+        ]);
+        let n = narrow.score_one(&Item(vec![
+            Term::new("severity", 0.8),
+            Term::flag("clutter", true),
+        ]));
+        assert!((n.score - 0.08).abs() < 1e-12, "got {}", n.score);
+        let w = wide.score_one(&Item(vec![
+            Term::new("severity", 0.8),
+            Term::new("impact", 0.8),
+            Term::new("max_dbz", 0.8),
+            Term::flag("clutter", true),
+        ]));
+        assert!((w.score - 0.08).abs() < 1e-12, "got {}", w.score);
+        assert!(w.significance_is_demoted());
+        let sum: f64 = w.contributions.iter().map(|c| c.value).sum();
+        assert!((sum - w.raw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_bonus_alone_cannot_score() {
+        let s = WeightedScorer::new(&[("deviant", 0.3)]);
+        let only_flag = Item(vec![Term::flag("deviant", true)]);
+        assert_eq!(s.score_one(&only_flag).score, 0.0);
     }
 
     #[test]

@@ -75,6 +75,22 @@ postgis engine issues a COUNT against the database.
 
 - `get_storm_cells` is one bounded query: server-side sorting (#605) means
   top-K doesn't mean fetching everything and sorting in the handler.
+- **`sort_by` / `order` / `min_significance` exist because the tool advertised
+  `sortable_properties` it gave no way to use** (#630) — a capability
+  announced and withheld, which is #605's silently-ignored-parameter bug
+  inverted. `sort_by` is validated against `engine.sortables()` and an unknown
+  key is an error NAMING the valid ones, never a plausible-but-different
+  ordering. **`order` without `sort_by` is also an error**, not an ignored
+  field: on its own it has nothing to apply to, so accepting it would return
+  significance-descending to a caller who asked for ascending — the same
+  silent no-op in a smaller box.
+- **`min_significance` filters the bounded page, it does not reach deeper into
+  the ranking.** Asking for 10 with a floor can return 3. The response carries
+  `below_min_significance` so a model can tell "only 3 cells exist" from
+  "7 were below your floor" — and that key is ABSENT when no floor was set,
+  so its absence never reads as "nothing was filtered".
+- The default is unchanged and should stay: no `sort_by` means most
+  significant first, which is what a caller almost always wants.
 - `get_cell_track` walks snapshots backward by asking for "newest frame at or
   before t", then stepping to just before that frame's instant. **No cadence
   is assumed** — the engine's retention decides the steps, so a source that

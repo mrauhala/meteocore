@@ -2,6 +2,16 @@
 
 OGC API - EDR HTTP layer. Read the root `CLAUDE.md` first.
 
+## README.md is the EDR status page — keep it current
+
+`crates/api-edr/README.md` holds the conformance-class, query-type,
+parameter and per-engine support matrices (what works, what is partial,
+what is missing, and the known-gap order). **Any change to EDR behaviour
+— this crate, `EdrEngine` in ds-core, an engine's `EdrEngine` impl or its
+`supported_query_types` — must update that README in the same PR.** A
+reviewer should be able to answer "does engine X support query type Y?"
+from the README alone, without reading code.
+
 ## CoverageJSON schema compliance (critical)
 
 All CoverageJSON output MUST validate against the OGC CoverageJSON 1.0 schema
@@ -53,6 +63,24 @@ owns the instance-id string form:
   advertises the instance paths — both gated on `get_instances()` being
   non-empty.
 - Unknown instance id → 404 (`select_run` returns `None`).
+
+## Radius queries (#513)
+
+`GET /collections/{id}/radius?coords=POINT(lon lat)&within=<n>&within-units=km|m|mi`
+(and the `/instances/{id}/radius` twin) is the area query in disguise:
+`EdrEngine::query_radius` has a default that turns the circle into a
+64-vertex geodesic `POLYGON` (`ds_core::feature::radius_polygon_wkt`) and
+calls `query_area`, so an engine gets radius for free by adding `"radius"`
+next to `"area"` in `supported_query_types` — do both or neither. Every
+gridded engine returns the circle's bbox as the `Grid` domain with the
+cells outside the disc masked to null (a CoverageJSON Grid must be
+rectangular); station engines test each point (#671). The
+handler 404s a collection that doesn't advertise `radius` (same capability
+guard as trajectory), rejects `PNG`, and `data_queries.radius.link.
+variables.within_units` advertises the accepted units (`params::WITHIN_UNITS`).
+The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
+containing a pole or crossing the antimeridian is a 400 (#667). Engine
+errors from all data-query handlers map through `map_query_error`.
 
 ## Misc
 

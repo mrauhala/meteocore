@@ -5,6 +5,7 @@
 //! it is swapped atomically via `ArcSwap`, so EDR queries read a consistent
 //! snapshot without locking.
 
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use zarrs::array::{data_type, Array, ArraySubset, CodecOptions};
 use zarrs::group::Group;
 
 use ds_core::error::DataServerError;
+use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
@@ -42,11 +44,9 @@ pub struct Variable {
     /// Axis index of the time dimension within this variable's dim order. For a
     /// forecast (reference + lead), this is the **lead** axis.
     pub time_axis: Option<usize>,
-    /// For a forecast, the axis index of the **reference time** (model run),
-    /// pinned to [`ref_index`](Self::ref_index) (the latest run).
+    /// For a forecast, the axis index of the **reference time** (model run).
+    /// Reads take the resolved run ([`Catalog::resolve_run`]) as a parameter.
     ref_axis: Option<usize>,
-    /// The reference-axis index to read (the latest run); 0 when not a forecast.
-    ref_index: u64,
     /// Axis index of the latitude dimension.
     lat_axis: usize,
     /// Axis index of the longitude dimension.
@@ -87,8 +87,20 @@ fn convert_sample(raw: f64, scale: f64, offset: f64, fills: &[f64]) -> Option<f6
 pub struct Catalog {
     /// Data variables in stable (sorted) order.
     pub vars: Vec<Variable>,
-    /// Decoded time axis (ascending), shared across all variables.
+    /// Decoded time axis (ascending), shared across all variables. For a
+    /// forecast this is the **latest run's** valid times (run + leads); other
+    /// runs' valid times come from [`Self::valid_times`].
     pub times: Vec<DateTime<Utc>>,
+    /// Forecast model runs: reference time → index on the reference axis
+    /// (the `ds_core::instances` contract, #337). Empty for a non-forecast
+    /// store.
+    pub runs: BTreeMap<DateTime<Utc>, usize>,
+    /// Decoded reference axis in axis order (forecast only).
+    ref_times: Vec<DateTime<Utc>>,
+    /// Each run's valid times (run + leads), by reference-axis index —
+    /// built once here so [`Self::valid_times`] is an O(1) borrow per
+    /// request (Critical Rule 10). Empty for a non-forecast store.
+    run_valid_times: Vec<Vec<DateTime<Utc>>>,
     /// Latitude axis values (degrees north; may be ascending or descending).
     lats: Vec<f64>,
     /// Longitude axis values (degrees east).
@@ -102,6 +114,55 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Resolve a requested model run to its reference-axis index: `None` ⇒
+    /// the latest run, `Some(rt)` ⇒ that exact run or `ReferenceTimeNotFound`.
+    /// A non-forecast store has no runs and answers `Ok(None)` for any
+    /// request (the shared accept-and-ignore contract).
+    pub fn resolve_run(
+        &self,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Option<usize>, DataServerError> {
+        if self.runs.is_empty() {
+            return Ok(None);
+        }
+        // The shared selection rule (`None` ⇒ latest, `Some` ⇒ exact) — the
+        // same call GRIB and QueryData make, so "latest" cannot drift from
+        // what `/instances` lists last.
+        match instances::select_run(&self.runs, reference_time) {
+            Some((_, &idx)) => Ok(Some(idx)),
+            None => Err(DataServerError::ReferenceTimeNotFound(format!(
+                "no model run for reference time {}",
+                reference_time.expect("None resolves to the latest run")
+            ))),
+        }
+    }
+
+    /// The valid times of `run` (a reference-axis index from
+    /// [`Self::resolve_run`]); the shared [`Self::times`] otherwise. A
+    /// borrow of a per-run list built at catalog build — no per-call work.
+    pub fn valid_times(&self, run: Option<usize>) -> &[DateTime<Utc>] {
+        match run.and_then(|r| self.run_valid_times.get(r)) {
+            Some(v) => v,
+            None => &self.times,
+        }
+    }
+
+    /// The reference time of `run`, for the run-axis cache key.
+    pub fn run_time(&self, run: Option<usize>) -> Option<DateTime<Utc>> {
+        run.and_then(|r| self.ref_times.get(r).copied())
+    }
+
+    /// The reference-axis range a read of `run` selects. Only reached for a
+    /// variable with a reference axis, whose caller must have resolved the
+    /// run: a `None` here is a programming error, reported rather than
+    /// silently defaulted.
+    fn ref_range(run: Option<usize>) -> Result<Range<u64>, DataServerError> {
+        let r = run.ok_or_else(|| {
+            DataServerError::Engine("forecast variable read without a resolved run".into())
+        })? as u64;
+        Ok(r..r + 1)
+    }
+
     /// Read a 2-D spatial slab of `var` at `time_idx` covering the WGS84 render
     /// `bbox` (`[west, south, east, north]`), expanded by one cell so edge
     /// pixels can interpolate. Returns `None` when the bbox lies entirely off
@@ -109,9 +170,36 @@ impl Catalog {
     pub fn read_window(
         &self,
         var: &Variable,
+        run: Option<usize>,
         time_idx: usize,
         bbox: [f64; 4],
     ) -> Result<Option<Window>, DataServerError> {
+        Ok(self
+            .read_window_span(var, run, time_idx..time_idx + 1, bbox)?
+            .and_then(|mut w| w.pop()))
+    }
+
+    /// Native cells `(ncols, nrows)` a [`Self::read_window_span`] of `bbox`
+    /// would fetch (including the one-cell margin), or `None` off-grid —
+    /// so a caller can budget the *read*, not just its output.
+    pub fn window_dims(&self, bbox: [f64; 4]) -> Option<(usize, usize)> {
+        let [west, south, east, north] = bbox;
+        let (i0, i1) = axis_window(&self.lons, west, east)?;
+        let (j0, j1) = axis_window(&self.lats, south, north)?;
+        Some((i1 - i0 + 1, j1 - j0 + 1))
+    }
+
+    /// [`Self::read_window`] for a contiguous span of timesteps in ONE store
+    /// read (one hyperslab, one trip through the blocking storage bridge —
+    /// not one per step), returning one [`Window`] per step in order. Used by
+    /// the EDR area path.
+    pub fn read_window_span(
+        &self,
+        var: &Variable,
+        run: Option<usize>,
+        time_span: Range<usize>,
+        bbox: [f64; 4],
+    ) -> Result<Option<Vec<Window>>, DataServerError> {
         let [west, south, east, north] = bbox;
         let (Some((i0, i1)), Some((j0, j1))) = (
             axis_window(&self.lons, west, east),
@@ -119,17 +207,18 @@ impl Catalog {
         ) else {
             return Ok(None); // bbox entirely outside the grid
         };
+        let nt = time_span.len().max(1);
 
         let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
         for a in 0..var.ndim {
             if Some(a) == var.time_axis {
-                ranges.push(time_idx as u64..time_idx as u64 + 1);
+                ranges.push(time_span.start as u64..time_span.start as u64 + nt as u64);
             } else if a == var.lat_axis {
                 ranges.push(j0 as u64..(j1 as u64) + 1);
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
             } else if Some(a) == var.ref_axis {
-                ranges.push(var.ref_index..var.ref_index + 1);
+                ranges.push(Self::ref_range(run)?);
             } else {
                 ranges.push(0..1);
             }
@@ -141,29 +230,43 @@ impl Catalog {
 
         let nrow = j1 - j0 + 1;
         let ncol = i1 - i0 + 1;
-        let mut data = vec![None; nrow * ncol];
-        for r in 0..nrow {
-            for c in 0..ncol {
-                let mut off = 0usize;
-                for (a, &len) in lens.iter().enumerate() {
-                    let idx = if a == var.lat_axis {
-                        r
-                    } else if a == var.lon_axis {
-                        c
-                    } else {
-                        0 // time + any pinned dims
-                    };
-                    off = off * len + idx;
+        let mut lons = self.lons[i0..=i1].to_vec();
+        let mut lats = self.lats[j0..=j1].to_vec();
+        let mut windows = Vec::with_capacity(nt);
+        for t in 0..nt {
+            // The last (for a render tile: the only) window takes the axes by
+            // move — no clone on the per-tile hot path.
+            let (wl, wla) = if t + 1 == nt {
+                (std::mem::take(&mut lons), std::mem::take(&mut lats))
+            } else {
+                (lons.clone(), lats.clone())
+            };
+            let mut data = vec![None; nrow * ncol];
+            for r in 0..nrow {
+                for c in 0..ncol {
+                    let mut off = 0usize;
+                    for (a, &len) in lens.iter().enumerate() {
+                        let idx = if a == var.lat_axis {
+                            r
+                        } else if a == var.lon_axis {
+                            c
+                        } else if Some(a) == var.time_axis {
+                            t
+                        } else {
+                            0 // pinned dims
+                        };
+                        off = off * len + idx;
+                    }
+                    data[r * ncol + c] = conv[off];
                 }
-                data[r * ncol + c] = conv[off];
             }
+            windows.push(Window {
+                data,
+                lons: wl,
+                lats: wla,
+            });
         }
-
-        Ok(Some(Window {
-            data,
-            lons: self.lons[i0..=i1].to_vec(),
-            lats: self.lats[j0..=j1].to_vec(),
-        }))
+        Ok(Some(windows))
     }
 
     /// Sample a variable's value at `(lon, lat)` for each requested time index,
@@ -173,6 +276,7 @@ impl Catalog {
     pub fn sample_series(
         &self,
         var: &Variable,
+        run: Option<usize>,
         lon: f64,
         lat: f64,
         time_idx: &[usize],
@@ -204,7 +308,7 @@ impl Catalog {
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
             } else if Some(a) == var.ref_axis {
-                ranges.push(var.ref_index..var.ref_index + 1);
+                ranges.push(Self::ref_range(run)?);
             } else {
                 ranges.push(0..1);
             }
@@ -499,9 +603,12 @@ pub fn build(
         ));
     };
 
-    // Resolve the latest run when a reference axis is pinned.
+    // Resolve the latest run when a reference axis is pinned, and keep every
+    // run: each is an EDR instance / WMS DIM_REFERENCE_TIME value (#337).
     let mut ref_pin: Option<(String, usize)> = None;
     let mut latest_ref_time: Option<DateTime<Utc>> = None;
+    let mut ref_times: Vec<DateTime<Utc>> = Vec::new();
+    let mut runs: BTreeMap<DateTime<Utc>, usize> = BTreeMap::new();
     if forecast {
         let rd = ref_role_dim.as_ref().unwrap();
         let ref_arr = by_name.get(rd).ok_or_else(|| {
@@ -519,26 +626,29 @@ pub fn build(
         }
         let decoded =
             cf::decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
-        let (idx, t) = decoded
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, t)| **t)
-            .ok_or_else(|| {
-                DataServerError::Engine(format!("reference-time coordinate '{rd}' is empty"))
-            })?;
+        for (i, rt) in decoded.iter().enumerate() {
+            // A duplicated reference time keeps its LAST axis position.
+            runs.insert(*rt, i);
+        }
+        // "Latest" comes from the same shared rule `resolve_run` applies.
+        let (t, idx) = instances::select_run(&runs, None).ok_or_else(|| {
+            DataServerError::Engine(format!("reference-time coordinate '{rd}' is empty"))
+        })?;
         tracing::info!(
             "collection '{collection_id}': forecast — latest run {t} (of {} runs); lead axis \
              '{primary_dim}' is the time dimension",
             decoded.len()
         );
         latest_ref_time = Some(*t);
-        ref_pin = Some((rd.clone(), idx));
+        ref_pin = Some((rd.clone(), *idx));
+        ref_times = decoded;
     }
 
     // Build the valid-time axis.
     let primary_arr = by_name.get(&primary_dim).ok_or_else(|| {
         DataServerError::Engine(format!("missing coordinate variable '{primary_dim}'"))
     })?;
+    let mut leads: Vec<chrono::Duration> = Vec::new();
     let times = if forecast {
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("lead coordinate '{primary_dim}' has no 'units'"))
@@ -551,7 +661,7 @@ pub fn build(
         let base = latest_ref_time.expect("forecast sets latest_ref_time");
         // Guard non-finite leads: `NaN as i64` is 0, which would silently yield
         // the run time (mirrors `cf::decode_times`'s finite check).
-        read_coord_f64(primary_arr)?
+        leads = read_coord_f64(primary_arr)?
             .iter()
             .map(|&v| {
                 if !v.is_finite() {
@@ -559,9 +669,12 @@ pub fn build(
                         "non-finite value in lead axis '{primary_dim}': {v}"
                     )));
                 }
-                Ok(base + chrono::Duration::milliseconds((v * secs * 1000.0).round() as i64))
+                Ok(chrono::Duration::milliseconds(
+                    (v * secs * 1000.0).round() as i64
+                ))
             })
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        leads.iter().map(|d| base + *d).collect()
     } else {
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("time coordinate '{primary_dim}' has no 'units'"))
@@ -609,11 +722,10 @@ pub fn build(
             continue;
         };
 
-        // Forecast: pin this variable's reference (run) axis to the latest run.
-        let (ref_axis, ref_index) = match &ref_pin {
-            Some((rd, idx)) => (dims.iter().position(|d| d == rd), *idx as u64),
-            None => (None, 0),
-        };
+        // Forecast: this variable's reference (run) axis.
+        let ref_axis = ref_pin
+            .as_ref()
+            .and_then(|(rd, _)| dims.iter().position(|d| d == rd));
 
         // Skip variables whose data type the read path can't widen to f64 (e.g.
         // float16/bfloat16, complex, raw bytes) at build time, with a clear
@@ -699,7 +811,6 @@ pub fn build(
             label,
             time_axis,
             ref_axis,
-            ref_index,
             lat_axis,
             lon_axis,
             ndim,
@@ -719,9 +830,15 @@ pub fn build(
     let (south, north) = axis_extent(&lats);
     let extent = [west, south, east, north];
 
+    let reference_times: Vec<DateTime<Utc>> = runs.keys().copied().collect();
+    let run_valid_times: Vec<Vec<DateTime<Utc>>> = ref_times
+        .iter()
+        .map(|base| leads.iter().map(|d| *base + *d).collect())
+        .collect();
     let raster_info = build_raster_info(
         &vars,
         &times,
+        &reference_times,
         extent,
         [lons.len() as u32, lats.len() as u32],
     );
@@ -729,6 +846,9 @@ pub fn build(
     Ok(Catalog {
         vars,
         times,
+        runs,
+        ref_times,
+        run_valid_times,
         lats,
         lons,
         extent,
@@ -741,6 +861,7 @@ pub fn build(
 fn build_raster_info(
     vars: &[Variable],
     times: &[DateTime<Utc>],
+    reference_times: &[DateTime<Utc>],
     extent: [f64; 4],
     grid_size: [u32; 2],
 ) -> RasterInfo {
@@ -758,7 +879,7 @@ fn build_raster_info(
         native_crs: "CRS:84".to_string(),
         spatial_extent: Some(extent),
         times: times.to_vec(),
-        reference_times: Vec::new(),
+        reference_times: reference_times.to_vec(),
         parameter,
         unit,
         parameters,
