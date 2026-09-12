@@ -237,6 +237,8 @@ pub struct CollectionConfig {
     /// Nowcast derived-collection configuration. Required when
     /// engine_type = "nowcast".
     pub nowcast: Option<NowcastConfig>,
+    /// BUFR surface-observation engine (`engine_type = "bufr"`).
+    pub bufr: Option<BufrConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
 }
@@ -874,6 +876,201 @@ fn default_geocode_property() -> String {
 
 fn default_status_filter() -> Vec<String> {
     vec!["Actual".to_string()]
+}
+
+fn default_bufr_poll_interval() -> u64 {
+    60
+}
+
+fn default_bufr_retention() -> String {
+    "PT24H".to_string()
+}
+
+fn default_bufr_max_stations() -> usize {
+    50_000
+}
+
+fn default_bufr_stale_after() -> String {
+    "PT2H".to_string()
+}
+
+fn default_bufr_position_radius_km() -> f64 {
+    25.0
+}
+
+/// Configuration for the BUFR surface-observation engine
+/// (`engine_type = "bufr"`, APIs `edr` + `features`).
+///
+/// Decodes WMO BUFR station reports (SYNOP / SHIP templates) into an
+/// in-memory, time-windowed store: one location per station, one row per
+/// report time, one column per configured parameter. The source is
+/// **exactly one** of a polled directory / object-store prefix of BUFR files
+/// (`data_path`) or a WIS2 Global Broker subscription (`[bufr.wis2]`). See
+/// `crates/engine-bufr/CLAUDE.md`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct BufrConfig {
+    /// Directory or object-store prefix of BUFR files (`*.bufr`, `*.bufr4`,
+    /// `*.bin`, `*.b`), re-listed every `poll_interval_secs`; only files not
+    /// seen before are fetched. Mutually exclusive with `wis2`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub data_path: Option<String>,
+    /// WIS2 subscription (typically
+    /// `cache/a/wis2/<centre-id>/data/core/weather/surface-based-observations/synop`).
+    /// Mutually exclusive with `data_path`.
+    #[serde(default)]
+    pub wis2: Option<Wis2Config>,
+    /// `data_path` mode: seconds between directory scans (default 60).
+    #[serde(default = "default_bufr_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// How long a report is kept, ISO 8601 duration (default `PT24H`). Also
+    /// bounds accepted report times: anything older than `now - retention`
+    /// (or more than an hour in the future) is rejected at ingest.
+    #[serde(default = "default_bufr_retention")]
+    pub retention: String,
+    /// Cap on stations held; the least-recently-reporting are evicted beyond
+    /// it (default 50 000 — a global SYNOP subscription is ~20 000).
+    #[serde(default = "default_bufr_max_stations")]
+    pub max_stations: usize,
+    /// WIS2 mode: report `degraded` when no notification has been accepted
+    /// for this long (ISO 8601, default `PT2H` — hourly SYNOP with slack).
+    /// A quiet CAP feed is healthy; a quiet observation feed is not.
+    #[serde(default = "default_bufr_stale_after")]
+    pub stale_after: String,
+    /// EDR `position` queries answer with the nearest station within this
+    /// distance (default 25 km) — beyond it, 404.
+    #[serde(default = "default_bufr_position_radius_km")]
+    pub position_radius_km: f64,
+    /// Whether the built-in SYNOP parameter table is loaded (default true).
+    /// With `false`, only `[[bufr.parameters]]` entries are served.
+    #[serde(default = "default_true")]
+    pub builtin_parameters: bool,
+    /// Extra / overriding parameters, matched by name against the built-in
+    /// table (same name ⇒ replaces the built-in entry).
+    #[serde(default)]
+    pub parameters: Vec<BufrParameterConfig>,
+}
+
+/// One parameter of a BUFR collection: which Table B element (and, for
+/// period-qualified elements, which period) feeds it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct BufrParameterConfig {
+    /// EDR parameter id (`^[a-z0-9_]+$`).
+    pub name: String,
+    /// Six-digit Table B descriptor `FXXYYY`, e.g. `"012101"` (air
+    /// temperature). Several may be listed (first match wins).
+    #[serde(default)]
+    pub descriptors: Vec<String>,
+    /// Unit as encoded in BUFR (no conversion is applied), e.g. `"K"`.
+    pub unit: String,
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub label: Option<String>,
+    /// Required period (hours) for period-qualified elements — precipitation
+    /// (013011), extremes (012111 / 012112), gusts (011041). Omit for
+    /// instantaneous elements.
+    #[serde(default)]
+    pub period_hours: Option<f64>,
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub observed_property: Option<String>,
+}
+
+/// Hard-fail validation for a [`BufrConfig`].
+pub fn validate_bufr(id: &str, cfg: &BufrConfig) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let has_local = cfg.data_path.is_some();
+    let has_wis2 = cfg.wis2.is_some();
+    if has_local && has_wis2 {
+        return Err(Config(format!(
+            "Collection '{id}': [bufr] 'data_path' and '[bufr.wis2]' are mutually exclusive"
+        )));
+    }
+    if !has_local && !has_wis2 {
+        return Err(Config(format!(
+            "Collection '{id}': [bufr] requires either 'data_path' or a [bufr.wis2] section"
+        )));
+    }
+    if let Some(w) = &cfg.wis2 {
+        validate_wis2(id, "bufr.wis2", w)?;
+    }
+    if cfg.poll_interval_secs == 0 {
+        return Err(Config(format!(
+            "Collection '{id}': [bufr].poll_interval_secs must be > 0"
+        )));
+    }
+    for (field, value) in [
+        ("retention", &cfg.retention),
+        ("stale_after", &cfg.stale_after),
+    ] {
+        crate::datetime::parse_iso8601_duration(value).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': [bufr].{field} is not a valid positive ISO 8601 duration: {e}"
+            ))
+        })?;
+    }
+    if cfg.max_stations == 0 {
+        return Err(Config(format!(
+            "Collection '{id}': [bufr].max_stations must be > 0"
+        )));
+    }
+    if !(cfg.position_radius_km > 0.0 && cfg.position_radius_km.is_finite()) {
+        return Err(Config(format!(
+            "Collection '{id}': [bufr].position_radius_km must be a positive number"
+        )));
+    }
+    let mut names = std::collections::HashSet::new();
+    for p in &cfg.parameters {
+        if p.name.is_empty()
+            || !p
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(Config(format!(
+                "Collection '{id}': [[bufr.parameters]] name '{}' must match [a-z0-9_]+",
+                p.name
+            )));
+        }
+        if !names.insert(p.name.as_str()) {
+            return Err(Config(format!(
+                "Collection '{id}': [[bufr.parameters]] name '{}' is listed twice",
+                p.name
+            )));
+        }
+        if p.descriptors.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': [[bufr.parameters]] '{}' needs at least one descriptor",
+                p.name
+            )));
+        }
+        for d in &p.descriptors {
+            if d.len() != 6 || !d.bytes().all(|b| b.is_ascii_digit()) || !d.starts_with('0') {
+                return Err(Config(format!(
+                    "Collection '{id}': [[bufr.parameters]] '{}' descriptor '{d}' must be a six-digit Table B id 0XXYYY",
+                    p.name
+                )));
+            }
+        }
+        if p.unit.trim().is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': [[bufr.parameters]] '{}' unit must not be empty",
+                p.name
+            )));
+        }
+        if let Some(h) = p.period_hours {
+            if !(h > 0.0 && h.is_finite()) {
+                return Err(Config(format!(
+                    "Collection '{id}': [[bufr.parameters]] '{}' period_hours must be positive",
+                    p.name
+                )));
+            }
+        }
+    }
+    if !cfg.builtin_parameters && cfg.parameters.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [bufr] builtin_parameters = false requires at least one [[bufr.parameters]] entry"
+        )));
+    }
+    Ok(())
 }
 
 /// Default WIS2 Global Broker (Météo-France). Any Global Broker carries the
@@ -3099,6 +3296,22 @@ impl ServerConfig {
                 }
             }
 
+            // BUFR engine requires bufr config section, and vice versa.
+            if collection.engine_type == "bufr" && collection.bufr.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'bufr' requires a [collections.bufr] config section"
+                )));
+            }
+            if collection.bufr.is_some() && collection.engine_type != "bufr" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.bufr] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(bufr) = &collection.bufr {
+                validate_bufr(id, bufr)?;
+            }
+
             // style_bundle: reference must resolve. Inline [wms] fields are
             // ALLOWED next to a bundle since bundles v2 — they merge
             // slot-wise, inline winning per slot (see
@@ -3390,6 +3603,77 @@ url = "https://creativecommons.org/licenses/by/4.0/"
                 .validate()
                 .is_ok()
         );
+    }
+
+    fn bufr_collection(body: &str) -> ServerConfig {
+        collection_with(&format!(
+            "engine_type = \"bufr\"\napis = [\"edr\", \"features\"]\n[collections.bufr]\n{body}"
+        ))
+    }
+
+    #[test]
+    fn bufr_section_pairs_with_engine_type() {
+        assert!(collection_with("[collections.bufr]\ndata_path = \"x\"\n")
+            .validate()
+            .is_err());
+        assert!(
+            collection_with("engine_type = \"bufr\"\napis = [\"edr\"]\n")
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bufr_defaults_and_source_exclusivity() {
+        let ok = bufr_collection("data_path = \"testdata/bufr-synop\"\n");
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        let b = ok.collections[0].bufr.as_ref().unwrap();
+        assert_eq!(b.poll_interval_secs, 60);
+        assert_eq!(b.retention, "PT24H");
+        assert_eq!(b.max_stations, 50_000);
+        assert_eq!(b.stale_after, "PT2H");
+        assert_eq!(b.position_radius_km, 25.0);
+        assert!(b.builtin_parameters);
+        assert!(b.parameters.is_empty());
+        let wis2 = bufr_collection("[collections.bufr.wis2]\ntopics = [\"cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop\"]\n");
+        assert!(wis2.validate().is_ok(), "{:?}", wis2.validate());
+        assert!(bufr_collection("").validate().is_err());
+        assert!(bufr_collection(
+            "data_path = \"x\"\n[collections.bufr.wis2]\ntopics = [\"cache/a\"]\n"
+        )
+        .validate()
+        .is_err());
+        assert!(bufr_collection("[collections.bufr.wis2]\ntopics = []\n")
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn bufr_field_validation() {
+        let bad = |body: &str| {
+            bufr_collection(&format!("data_path = \"x\"\n{body}"))
+                .validate()
+                .is_err()
+        };
+        assert!(bad("poll_interval_secs = 0\n"));
+        assert!(bad("retention = \"1d\"\n"));
+        assert!(bad("stale_after = \"soon\"\n"));
+        assert!(bad("max_stations = 0\n"));
+        assert!(bad("position_radius_km = 0\n"));
+        assert!(bad("builtin_parameters = false\n"));
+        assert!(bad("[[collections.bufr.parameters]]\nname = \"Bad Name\"\ndescriptors = [\"012101\"]\nunit = \"K\"\n"));
+        assert!(bad(
+            "[[collections.bufr.parameters]]\nname = \"t\"\ndescriptors = []\nunit = \"K\"\n"
+        ));
+        assert!(bad("[[collections.bufr.parameters]]\nname = \"t\"\ndescriptors = [\"12101\"]\nunit = \"K\"\n"));
+        assert!(bad("[[collections.bufr.parameters]]\nname = \"t\"\ndescriptors = [\"112101\"]\nunit = \"K\"\n"));
+        assert!(bad("[[collections.bufr.parameters]]\nname = \"t\"\ndescriptors = [\"012101\"]\nunit = \"\"\n"));
+        assert!(bad("[[collections.bufr.parameters]]\nname = \"t\"\ndescriptors = [\"012101\"]\nunit = \"K\"\nperiod_hours = -1\n"));
+        assert!(bad("[[collections.bufr.parameters]]\nname = \"t\"\ndescriptors = [\"012101\"]\nunit = \"K\"\n[[collections.bufr.parameters]]\nname = \"t\"\ndescriptors = [\"012103\"]\nunit = \"K\"\n"));
+        let ok = bufr_collection(
+            "data_path = \"x\"\nbuiltin_parameters = false\n[[collections.bufr.parameters]]\nname = \"rain_1h\"\ndescriptors = [\"013011\"]\nunit = \"kg m-2\"\nperiod_hours = 1\nlabel = \"Rain (1 h)\"\n",
+        );
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
     }
 
     #[test]
