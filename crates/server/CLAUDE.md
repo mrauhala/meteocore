@@ -144,5 +144,8 @@ client could spoof the emitted self-links (open-redirect risk downstream).
   bug.
 - Engine poll loops are spawned on `poll_runtime()` at boot (`main.rs`) and
   on reload (`admin.rs`), with `shutdown()` called on the old engines at
-  reload. When adding an engine with a poll loop, wire BOTH paths (a missing
-  reload-path spawn was bug #442).
+  reload. When adding an engine with a poll loop, wire ALL THREE places:
+  the boot spawn block in `main.rs`, `rotate_poll_loops!` in `admin.rs`,
+  and the graceful-shutdown block at the end of `main` (bug #442 was a
+  missing boot-path spawn for `cap_engines`; the shutdown block had also
+  silently skipped cap, postgis and nowcast).

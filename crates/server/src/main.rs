@@ -548,6 +548,15 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    // CAP alert refresh loop — re-reads the feed / directory so new, updated
+    // and expired alerts are picked up without a reload (#442: this block was
+    // missing, so CAP collections served a frozen alert set after a cold boot).
+    for engine in &result.cap_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
     // PostGIS metadata refresh loop — keeps the location list / extents / the
     // `locations_window` "currently reporting" set current without a reload.
     for engine in &result.postgis_engines {
@@ -878,6 +887,27 @@ async fn main() {
         .read()
         .unwrap_or_else(|e| e.into_inner());
     for engine in odim_volume.iter() {
+        engine.shutdown();
+    }
+    let cap = server_state
+        .cap_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in cap.iter() {
+        engine.shutdown();
+    }
+    let postgis = server_state
+        .postgis_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in postgis.iter() {
+        engine.shutdown();
+    }
+    let nowcast = server_state
+        .nowcast_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in nowcast.iter() {
         engine.shutdown();
     }
     info!("Server shut down gracefully");
