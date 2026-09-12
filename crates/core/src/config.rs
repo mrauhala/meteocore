@@ -876,6 +876,251 @@ fn default_status_filter() -> Vec<String> {
     vec!["Actual".to_string()]
 }
 
+/// Default WIS2 Global Broker (Météo-France). Any Global Broker carries the
+/// full notification stream, so the choice only affects latency.
+pub const DEFAULT_WIS2_BROKER: &str = "mqtts://globalbroker.meteo.fr:8883";
+/// Default WIS2 Global Broker credentials — public by design (WMO publishes
+/// them); only ever overridden for a private broker.
+pub const DEFAULT_WIS2_USERNAME: &str = "everyone";
+
+fn default_wis2_broker() -> String {
+    DEFAULT_WIS2_BROKER.to_string()
+}
+
+fn default_wis2_username() -> String {
+    DEFAULT_WIS2_USERNAME.to_string()
+}
+
+fn default_wis2_password() -> String {
+    "everyone".to_string()
+}
+
+fn default_wis2_session_expiry_secs() -> u32 {
+    900
+}
+
+fn default_wis2_keep_alive_secs() -> u64 {
+    30
+}
+
+fn default_wis2_max_download_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_wis2_dedup_window() -> String {
+    "PT1H".to_string()
+}
+
+fn default_wis2_degrade_after_secs() -> u64 {
+    120
+}
+
+/// A WMO WIS2 subscription: which Global Broker to connect to and which
+/// topics to consume. Shared by every engine that ingests data through WIS2
+/// notifications (`[collections.cap.wis2]`, `[collections.bufr.wis2]`); the
+/// client lives in the `ds-wis2` crate.
+///
+/// The Global Brokers are public: `everyone` / `everyone` is the documented
+/// read-only account, which is why a literal `password` is acceptable here
+/// (unlike database DSNs). `password_env` exists for private brokers.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Wis2Config {
+    /// Broker URL, `mqtts://host[:port]` (TLS, default) or `mqtt://host[:port]`.
+    #[serde(default = "default_wis2_broker")]
+    pub broker: String,
+    /// MQTT username (default `everyone`).
+    #[serde(default = "default_wis2_username")]
+    pub username: String,
+    /// MQTT password (default `everyone`). Ignored when `password_env` is set.
+    #[serde(default = "default_wis2_password")]
+    pub password: String,
+    /// Name of an environment variable holding the password (wins over
+    /// `password`). Use this for any non-public broker.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub password_env: Option<String>,
+    /// MQTT topic filters to subscribe to (QoS 1). Each must start with
+    /// `cache/` or `origin/` (the WIS2 topic hierarchy roots); shared
+    /// subscriptions (`$share/…`) are rejected because every MeteoCore
+    /// replica keeps its own in-memory store and needs the full stream.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// Prefix of the generated MQTT client id (`{prefix}-{collection}-{random}`;
+    /// default `meteocore`). The random suffix keeps replicas from evicting
+    /// each other's sessions.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub client_id_prefix: Option<String>,
+    /// MQTT 5 session expiry in seconds (default 900). A short reconnect
+    /// resumes the QoS-1 backlog the broker queued meanwhile; `0` = clean
+    /// start on every connect. Capped at one day so a retired replica does
+    /// not leave a long-lived orphan session on a public broker.
+    #[serde(default = "default_wis2_session_expiry_secs")]
+    pub session_expiry_secs: u32,
+    /// MQTT keep-alive interval in seconds (default 30).
+    #[serde(default = "default_wis2_keep_alive_secs")]
+    pub keep_alive_secs: u64,
+    /// Optional URL-prefix allowlist for notification downloads (each entry
+    /// `https://…/`). Empty = the default policy (https only, public DNS
+    /// host, no redirects). Non-empty = downloads must ALSO match a prefix —
+    /// recommended for `origin/` subscriptions, whose canonical links point at
+    /// arbitrary producer servers rather than the Global Caches.
+    #[serde(default)]
+    pub download_allowlist: Vec<String>,
+    /// Cap on a single downloaded (or inline-decoded) payload in bytes
+    /// (default 8 MiB).
+    #[serde(default = "default_wis2_max_download_bytes")]
+    pub max_download_bytes: u64,
+    /// How long to remember a `data_id` for duplicate suppression, ISO 8601
+    /// duration (default `PT1H`; the WIS2 guide recommends at least 60 min —
+    /// every notification is republished once per Global Cache).
+    #[serde(default = "default_wis2_dedup_window")]
+    pub dedup_window: String,
+    /// Seconds the broker connection may be down before the collection is
+    /// reported `degraded` (default 120).
+    #[serde(default = "default_wis2_degrade_after_secs")]
+    pub degrade_after_secs: u64,
+}
+
+impl Default for Wis2Config {
+    fn default() -> Self {
+        Wis2Config {
+            broker: default_wis2_broker(),
+            username: default_wis2_username(),
+            password: default_wis2_password(),
+            password_env: None,
+            topics: Vec::new(),
+            client_id_prefix: None,
+            session_expiry_secs: default_wis2_session_expiry_secs(),
+            keep_alive_secs: default_wis2_keep_alive_secs(),
+            download_allowlist: Vec::new(),
+            max_download_bytes: default_wis2_max_download_bytes(),
+            dedup_window: default_wis2_dedup_window(),
+            degrade_after_secs: default_wis2_degrade_after_secs(),
+        }
+    }
+}
+
+impl Wis2Config {
+    /// Split `broker` into `(tls, host, port)`. Only valid after
+    /// [`validate_wis2`] has accepted the config.
+    pub fn broker_parts(&self) -> Option<(bool, String, u16)> {
+        let (tls, rest) = match (
+            self.broker.strip_prefix("mqtts://"),
+            self.broker.strip_prefix("mqtt://"),
+        ) {
+            (Some(r), _) => (true, r),
+            (None, Some(r)) => (false, r),
+            (None, None) => return None,
+        };
+        let rest = rest.trim_end_matches('/');
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok().filter(|&p| p != 0)?),
+            None => (rest, if tls { 8883 } else { 1883 }),
+        };
+        if host.is_empty() || host.contains(['/', ':', '@']) {
+            return None;
+        }
+        Some((tls, host.to_string(), port))
+    }
+}
+
+/// Hard-fail validation for a [`Wis2Config`]. `section` names the TOML table
+/// for the error message (e.g. `cap.wis2`).
+pub fn validate_wis2(
+    id: &str,
+    section: &str,
+    cfg: &Wis2Config,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    if cfg.broker_parts().is_none() {
+        return Err(Config(format!(
+            "Collection '{id}': [{section}].broker must be mqtts://host[:port] or mqtt://host[:port] (got '{}')",
+            cfg.broker
+        )));
+    }
+    if cfg.username.trim().is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [{section}].username must not be empty"
+        )));
+    }
+    if let Some(env) = &cfg.password_env {
+        if !is_valid_env_var_name(env) {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].password_env '{env}' is not a valid environment variable name"
+            )));
+        }
+    }
+    if cfg.topics.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [{section}].topics must list at least one WIS2 topic filter"
+        )));
+    }
+    for t in &cfg.topics {
+        let t = t.trim();
+        if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c == '\0') {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].topics entries must be non-empty MQTT topic filters without whitespace"
+            )));
+        }
+        if t.starts_with("$share/") {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].topics '{t}': shared subscriptions are not supported (every replica needs the full stream)"
+            )));
+        }
+        if !(t.starts_with("cache/") || t.starts_with("origin/")) {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].topics '{t}' must start with 'cache/' or 'origin/' (WIS2 topic hierarchy roots)"
+            )));
+        }
+    }
+    if let Some(p) = &cfg.client_id_prefix {
+        if p.is_empty()
+            || !p
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].client_id_prefix must be non-empty [A-Za-z0-9_-]"
+            )));
+        }
+    }
+    if cfg.session_expiry_secs > 86_400 {
+        return Err(Config(format!(
+            "Collection '{id}': [{section}].session_expiry_secs must be <= 86400"
+        )));
+    }
+    if cfg.keep_alive_secs == 0 || cfg.keep_alive_secs > 3600 {
+        return Err(Config(format!(
+            "Collection '{id}': [{section}].keep_alive_secs must be in 1..=3600"
+        )));
+    }
+    // https only: the download policy rejects every non-https URL before the
+    // allowlist is consulted, so an `http://` prefix could never match.
+    for entry in &cfg.download_allowlist {
+        if !entry.starts_with("https://") || !entry.ends_with('/') {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].download_allowlist entry '{entry}' must be an https:// URL prefix ending with '/'"
+            )));
+        }
+    }
+    if cfg.max_download_bytes == 0 {
+        return Err(Config(format!(
+            "Collection '{id}': [{section}].max_download_bytes must be > 0"
+        )));
+    }
+    crate::datetime::parse_iso8601_duration(&cfg.dedup_window).map_err(|e| {
+        Config(format!(
+            "Collection '{id}': [{section}].dedup_window is not a valid positive ISO 8601 duration: {e}"
+        ))
+    })?;
+    if cfg.degrade_after_secs == 0 {
+        return Err(Config(format!(
+            "Collection '{id}': [{section}].degrade_after_secs must be > 0"
+        )));
+    }
+    Ok(())
+}
+
 /// Configuration for the CAP (Common Alerting Protocol) v1.2 alert engine
 /// (`engine_type = "cap"`).
 ///
@@ -3083,6 +3328,89 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         assert!(cap_collection("data_path = \"x\"\ncircle_segments = 2\n")
             .validate()
             .is_err());
+    }
+
+    fn wis2(body: &str) -> Wis2Config {
+        toml::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn wis2_defaults_and_broker_parts() {
+        let cfg = wis2("topics = [\"cache/a/wis2/se-smhi/#\"]\n");
+        assert_eq!(cfg.broker, DEFAULT_WIS2_BROKER);
+        assert_eq!(cfg.username, "everyone");
+        assert_eq!(cfg.password, "everyone");
+        assert_eq!(cfg.session_expiry_secs, 900);
+        assert_eq!(cfg.keep_alive_secs, 30);
+        assert_eq!(cfg.dedup_window, "PT1H");
+        assert_eq!(cfg.degrade_after_secs, 120);
+        assert_eq!(
+            cfg.broker_parts(),
+            Some((true, "globalbroker.meteo.fr".to_string(), 8883))
+        );
+        assert!(validate_wis2("c", "cap.wis2", &cfg).is_ok());
+
+        let plain = wis2("broker = \"mqtt://broker.local\"\ntopics = [\"origin/a/wis2/x/#\"]\n");
+        assert_eq!(
+            plain.broker_parts(),
+            Some((false, "broker.local".to_string(), 1883))
+        );
+        let with_port = wis2("broker = \"mqtts://gb.example:8884/\"\ntopics = [\"cache/a\"]\n");
+        assert_eq!(
+            with_port.broker_parts(),
+            Some((true, "gb.example".to_string(), 8884))
+        );
+    }
+
+    #[test]
+    fn wis2_validation_rejects_bad_fields() {
+        let bad = |body: &str| validate_wis2("c", "cap.wis2", &wis2(body)).is_err();
+        // Missing / empty topics.
+        assert!(bad(""));
+        assert!(bad("topics = []\n"));
+        assert!(bad("topics = [\" \"]\n"));
+        // Wrong roots and shared subscriptions.
+        assert!(bad("topics = [\"a/wis2/x/#\"]\n"));
+        assert!(bad("topics = [\"$share/g/cache/a/wis2/x/#\"]\n"));
+        assert!(bad("topics = [\"cache/a/wis2 /x\"]\n"));
+        // Broker scheme / host.
+        assert!(bad("broker = \"wss://host:443\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("broker = \"mqtts://\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad(
+            "broker = \"mqtts://host:notaport\"\ntopics = [\"cache/a\"]\n"
+        ));
+        assert!(bad(
+            "broker = \"mqtts://host/path\"\ntopics = [\"cache/a\"]\n"
+        ));
+        // Credentials / ids.
+        assert!(bad("username = \"\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("password_env = \"1BAD\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad(
+            "client_id_prefix = \"has space\"\ntopics = [\"cache/a\"]\n"
+        ));
+        // Numeric bounds.
+        assert!(bad("session_expiry_secs = 86401\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("keep_alive_secs = 0\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("max_download_bytes = 0\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("degrade_after_secs = 0\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("dedup_window = \"1h\"\ntopics = [\"cache/a\"]\n"));
+        // Allowlist entries must be https prefixes ending in '/' (the download
+        // policy is https-only, so an http:// entry could never match).
+        assert!(bad(
+            "download_allowlist = [\"https://gc.example\"]\ntopics = [\"cache/a\"]\n"
+        ));
+        assert!(bad(
+            "download_allowlist = [\"ftp://gc.example/\"]\ntopics = [\"cache/a\"]\n"
+        ));
+        assert!(bad(
+            "download_allowlist = [\"http://gc.example/\"]\ntopics = [\"cache/a\"]\n"
+        ));
+        assert!(validate_wis2(
+            "c",
+            "cap.wis2",
+            &wis2("download_allowlist = [\"https://gc.example/\"]\ntopics = [\"cache/a\"]\n")
+        )
+        .is_ok());
     }
 
     #[test]

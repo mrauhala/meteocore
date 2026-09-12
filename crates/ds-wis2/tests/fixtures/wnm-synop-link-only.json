@@ -1,0 +1,45 @@
+{
+ "topic": "cache/a/wis2/us-noaa-nws/data/core/weather/surface-based-observations/ship",
+ "message": {
+  "id": "53562196-9784-4c66-96c3-401dc71785ca",
+  "type": "Feature",
+  "conformsTo": [
+   "http://wis.wmo.int/spec/wnm/1/conf/core"
+  ],
+  "geometry": {
+   "type": "Point",
+   "coordinates": [
+    14.1,
+    -32.7
+   ]
+  },
+  "properties": {
+   "data_id": "origin/a/wis2/us-noaa-nws/data/core/weather/surface-based-observations/ship/SHIP_0-20000-0-9V5255_8ca18629-0c3c-4a11-9cee-57a84c32c081.bufr4",
+   "pubtime": "2026-09-12T09:20:08Z",
+   "integrity": {
+    "method": "sha512",
+    "value": "A4chUJLj4AeXDM5LFJi8JIIQHcMoa/pC1b1/sf/REZUWvCat/bqjW/H50fGfPNSugW8QvQYoS5B36FZfRuuxWQ=="
+   },
+   "datetime": "2026-09-12T09:00:00Z",
+   "metadata_id": "urn:wmo:md:us-noaa-nws:surface-weather-observations:ship",
+   "station_identifier": "0-20000-0-9V5255",
+   "origin": "A_SIVD01PANC120900RRD_C_PANC_20260912092005_00010-027076.txt",
+   "global-cache": "jp-jma-global-cache"
+  },
+  "links": [
+   {
+    "rel": "canonical",
+    "type": "application/bufr",
+    "href": "https://global-cache-of-japan.s3.ap-northeast-1.amazonaws.com/wis2/data/origin/a/wis2/us-noaa-nws/data/core/weather/surface-based-observations/ship/SHIP_0-20000-0-9V5255_8ca18629-0c3c-4a11-9cee-57a84c32c081.bufr4/1789204808/SHIP_0-20000-0-9V5255_8ca18629-0c3c-4a11-9cee-57a84c32c081.bufr4",
+    "length": 180
+   },
+   {
+    "type": "text/plain",
+    "rel": "alternate",
+    "title": "Incoming Report",
+    "href": "https://wis2node.globaldata.nws.noaa.gov/wis2-data/incoming/SIVD/01/PANC/A_SIVD01PANC120900RRD_C_PANC_20260912092005_00010-027076.txt",
+    "length": 7746
+   }
+  ]
+ }
+}

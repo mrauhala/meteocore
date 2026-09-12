@@ -48,4 +48,19 @@ ignore = [
     # window the advisory describes. No patched release exists yet.
     # Tracked in #594.
     "RUSTSEC-2026-0253",
+
+    # rumqttc 0.25.1 (the WIS2 MQTT client behind `ds-wis2`) pins
+    # `rustls-webpki 0.102.8` and the unmaintained `rustls-pemfile 2.2.0`
+    # through its `use-rustls` feature. Neither is reachable from our TLS
+    # path: `ds-wis2` passes a fully built `TlsConfiguration::Rustls(
+    # rustls::ClientConfig)`, so chain verification runs in rustls 0.23's own
+    # rustls-webpki 0.103 (patched); rumqttc's 0.102 copy is only an error
+    # type conversion, and rustls-pemfile is used solely by the
+    # `TlsConfiguration::Simple` PEM path we never construct. Upstream fix
+    # pending (bytebeamio/rumqtt#1067, #1010). Tracked in #689.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2025-0134",
 ]

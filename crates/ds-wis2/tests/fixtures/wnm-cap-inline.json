@@ -1,0 +1,35 @@
+{
+ "topic": "origin/a/wis2/in-imd/data/core/weather/advisories-warnings",
+ "message": {
+  "id": "3c20c899-cdf1-4907-9968-2325c36110b2",
+  "type": "Feature",
+  "conformsTo": [
+   "http://wis.wmo.int/spec/wnm/1/conf/core"
+  ],
+  "geometry": null,
+  "properties": {
+   "data_id": "in-imd:cap_alerts/cap_1789204806258020_20260912_092501",
+   "datetime": "2026-09-12T14:52:46Z",
+   "pubtime": "2026-09-12T09:25:02Z",
+   "integrity": {
+    "method": "sha512",
+    "value": "DkP+vR6M09MWO1pUDEHN+Z24hh0NryZir6mMbUHAPDWsK1Ti9VKPU8xQT7cVh2ZCTnp6jqYwAkbCPrSE7BRotg=="
+   },
+   "metadata_id": "urn:wmo:md:in-imd:cap_alerts",
+   "content": {
+    "encoding": "base64",
+    "value": "PGNhcDphbGVydCB4bWxuczpjYXA9InVybjpvYXNpczpuYW1lczp0YzplbWVyZ2VuY3k6Y2FwOjEuMiI+CjxjYXA6aWRlbnRpZmllcj5JTi0xNzg5MjA0ODA2MjU4MDIwXzIwPC9jYXA6aWRlbnRpZmllcj4KPGNhcDpzZW5kZXI+R3VqYXJhdC1TRE1BPC9jYXA6c2VuZGVyPgo8Y2FwOnNlbnQ+MjAyNi0wOS0xMlQxNDo1Mjo0NiswNTozMDwvY2FwOnNlbnQ+CjxjYXA6c3RhdHVzPkFjdHVhbDwvY2FwOnN0YXR1cz4KPGNhcDptc2dUeXBlPlVwZGF0ZTwvY2FwOm1zZ1R5cGU+CjxjYXA6c2NvcGU+UHVibGljPC9jYXA6c2NvcGU+CjxjYXA6cmVzdHJpY3Rpb24vPgo8Y2FwOmFkZHJlc3Nlcy8+CjxjYXA6bm90ZS8+CjxjYXA6cmVmZXJlbmNlcz5JTUQtQWhtZWRhYmFkLElOLTE3ODkyMDQ4MDYyNTgwMjBfNDksMjAyNi0wOS0xMlQxNDo0OTo0MiswNTozMDwvY2FwOnJlZmVyZW5jZXM+CjxjYXA6aW5jaWRlbnRzLz4KPGNhcDppbmZvPgo8Y2FwOmxhbmd1YWdlPmVuLUlOPC9jYXA6bGFuZ3VhZ2U+CjxjYXA6Y2F0ZWdvcnk+TWV0PC9jYXA6Y2F0ZWdvcnk+CjxjYXA6ZXZlbnQ+SGVhdnkgUmFpbjwvY2FwOmV2ZW50Pgo8Y2FwOnVyZ2VuY3k+RXhwZWN0ZWQ8L2NhcDp1cmdlbmN5Pgo8Y2FwOnNldmVyaXR5Pk1vZGVyYXRlPC9jYXA6c2V2ZXJpdHk+CjxjYXA6Y2VydGFpbnR5Pkxpa2VseTwvY2FwOmNlcnRhaW50eT4KPGNhcDphdWRpZW5jZT4xPC9jYXA6YXVkaWVuY2U+CjxjYXA6ZWZmZWN0aXZlPjIwMjYtMDktMTJUMTQ6NDk6MDArMDU6MzA8L2NhcDplZmZlY3RpdmU+CjxjYXA6b25zZXQ+MjAyNi0wOS0xMlQxNDo1Mjo0NiswNTozMDwvY2FwOm9uc2V0Pgo8Y2FwOmV4cGlyZXM+MjAyNi0wOS0xM1QxNDo0OTowMCswNTozMDwvY2FwOmV4cGlyZXM+CjxjYXA6aGVhZGxpbmU+SGVhdnkgUmFpbiBpcyB2ZXJ5IGxpa2VseSB0byBvY2N1ciBhdCBpc29sYXRlZCBwbGFjZXMgb3ZlciBBbmFuZCwgQmhhcnVjaCwgQ2hob3RhdWRlcHVyLCBOYXJtYWRhLCBTdXJhdCwgVGFwaSwgVmFkb2RhcmEgaW4gbmV4dCAyNCBob3Vycy48L2NhcDpoZWFkbGluZT4KPGNhcDpkZXNjcmlwdGlvbi8+CjxjYXA6aW5zdHJ1Y3Rpb24+UGxlYXNlIGZvbGxvdyBTRE1BIGd1aWRlbGluZXMuPC9jYXA6aW5zdHJ1Y3Rpb24+CjxjYXA6Y29udGFjdC8+CjxjYXA6cGFyYW1ldGVyPgo8Y2FwOnZhbHVlTmFtZT5Qb2x5Z29uIFVSTDwvY2FwOnZhbHVlTmFtZT4KPGNhcDp2YWx1ZT5odHRwczovL3NhY2hldC5uZG1hLmdvdi5pbi9jYXBfcHVibGljX3dlYnNpdGUvRmV0Y2hQb2x5Z29uWE1MRmlsZT9pZGVudGlmaWVyPTE3ODkyMDQ4MDYyNTgwMjA8L2NhcDp2YWx1ZT4KPC9jYXA6cGFyYW1ldGVyPgo8Y2FwOmFyZWE+CjxjYXA6YXJlYURlc2M+NyBkaXN0cmljdHMgb2YgR3VqYXJhdDwvY2FwOmFyZWFEZXNjPgo8Y2FwOmdlb2NvZGU+CjxjYXA6dmFsdWVOYW1lPkxHRCBEaXN0cmljdCBDb2RlPC9jYXA6dmFsdWVOYW1lPgo8Y2FwOnZhbHVlPjY2ODwvY2FwOnZhbHVlPgo8L2NhcDpnZW9jb2RlPgo8Y2FwOmdlb2NvZGU+CjxjYXA6dmFsdWVOYW1lPkxHRCBEaXN0cmljdCBDb2RlPC9jYXA6dmFsdWVOYW1lPgo8Y2FwOnZhbHVlPjQ2MTwvY2FwOnZhbHVlPgo8L2NhcDpnZW9jb2RlPgo8Y2FwOmdlb2NvZGU+CjxjYXA6dmFsdWVOYW1lPkxHRCBEaXN0cmljdCBDb2RlPC9jYXA6dmFsdWVOYW1lPgo8Y2FwOnZhbHVlPjQ0MjwvY2FwOnZhbHVlPgo8L2NhcDpnZW9jb2RlPgo8Y2FwOmdlb2NvZGU+CjxjYXA6dmFsdWVOYW1lPkxHRCBEaXN0cmljdCBDb2RlPC9jYXA6dmFsdWVOYW1lPgo8Y2FwOnZhbHVlPjY0MTwvY2FwOnZhbHVlPgo8L2NhcDpnZW9jb2RlPgo8Y2FwOmdlb2NvZGU+CjxjYXA6dmFsdWVOYW1lPkxHRCBEaXN0cmljdCBDb2RlPC9jYXA6dmFsdWVOYW1lPgo8Y2FwOnZhbHVlPjQ1OTwvY2FwOnZhbHVlPgo8L2NhcDpnZW9jb2RlPgo8Y2FwOmdlb2NvZGU+CjxjYXA6dmFsdWVOYW1lPkxHRCBEaXN0cmljdCBDb2RlPC9jYXA6dmFsdWVOYW1lPgo8Y2FwOnZhbHVlPjQ0MDwvY2FwOnZhbHVlPgo8L2NhcDpnZW9jb2RlPgo8Y2FwOmdlb2NvZGU+CjxjYXA6dmFsdWVOYW1lPkxHRCBEaXN0cmljdCBDb2RlPC9jYXA6dmFsdWVOYW1lPgo8Y2FwOnZhbHVlPjQ1MjwvY2FwOnZhbHVlPgo8L2NhcDpnZW9jb2RlPgo8Y2FwOmFsdGl0dWRlPjA8L2NhcDphbHRpdHVkZT4KPGNhcDpjZWlsaW5nPjA8L2NhcDpjZWlsaW5nPgo8L2NhcDphcmVhPgo8L2NhcDppbmZvPgo8L2NhcDphbGVydD4=",
+    "size": 2228
+   }
+  },
+  "links": [
+   {
+    "rel": "canonical",
+    "type": "application/xml",
+    "href": "https://wis2box.imd.gov.in/data/2026-09-12/wis/urn:wmo:md:in-imd:cap_alerts/cap_1789204806258020_20260912_092501.xml",
+    "length": 2228
+   }
+  ],
+  "generated_by": "wis2box 1.2.0"
+ }
+}
