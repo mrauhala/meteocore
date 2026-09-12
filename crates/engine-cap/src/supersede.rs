@@ -69,8 +69,11 @@ pub fn is_renderable(msg_type: Option<&str>) -> bool {
 /// 2. every identifier referenced by an `Update` or `Cancel` is withdrawn;
 /// 3. `Cancel` / `Ack` / `Error` messages are themselves dropped.
 ///
-/// Returns the survivors in input order plus the number withdrawn by (2).
-pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, usize) {
+/// Returns the survivors in input order plus the identifiers withdrawn by
+/// (2) (sorted, deduplicated) — the caller diffs them against the previous
+/// rebuild so a cancelled alert that lingers in the source is counted once,
+/// not on every rebuild.
+pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, Vec<String>) {
     // (1) newest per identifier.
     let mut newest: HashMap<&str, usize> = HashMap::new();
     for (i, a) in alerts.iter().enumerate() {
@@ -105,7 +108,7 @@ pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, usize) {
         }
     }
 
-    let mut superseded = 0usize;
+    let mut superseded: Vec<String> = Vec::new();
     let survivors = alerts
         .into_iter()
         .enumerate()
@@ -114,7 +117,7 @@ pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, usize) {
                 return None;
             }
             if withdrawn.contains(&a.identifier) {
-                superseded += 1;
+                superseded.push(a.identifier);
                 return None;
             }
             if !is_renderable(a.msg_type.as_deref()) {
@@ -123,6 +126,8 @@ pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, usize) {
             Some(a)
         })
         .collect();
+    superseded.sort();
+    superseded.dedup();
     (survivors, superseded)
 }
 
@@ -174,7 +179,7 @@ mod tests {
         let (out, superseded) = resolve_references(set);
         // A withdrawn by A2, B withdrawn by C; C (Cancel) and D (Ack) not rendered.
         assert_eq!(ids(&out), vec!["A2"]);
-        assert_eq!(superseded, 2);
+        assert_eq!(superseded, vec!["A", "B"]);
     }
 
     #[test]
@@ -188,7 +193,7 @@ mod tests {
         let (out, superseded) = resolve_references(set);
         assert_eq!(ids(&out), vec!["A", "B"]);
         assert_eq!(out[0].sent.unwrap().timestamp() % 1000, 100);
-        assert_eq!(superseded, 0);
+        assert!(superseded.is_empty());
     }
 
     #[test]
@@ -198,6 +203,6 @@ mod tests {
         let b = alert("B", "Update", Some("s@x,B,x"), 0);
         let (out, superseded) = resolve_references(vec![a, b]);
         assert_eq!(ids(&out), vec!["A", "B"]);
-        assert_eq!(superseded, 0);
+        assert!(superseded.is_empty());
     }
 }

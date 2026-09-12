@@ -93,8 +93,11 @@ impl Source {
     }
 
     /// Fetch and parse every CAP document this source exposes (WIS2: the
-    /// accumulated set after eviction).
-    pub fn load(&self) -> Result<Vec<CapAlert>, DataServerError> {
+    /// accumulated set after eviction as of `now`).
+    pub fn load_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<CapAlert>, DataServerError> {
         match self {
             Source::Local { store, base } => load_local(store, base),
             Source::Feed {
@@ -103,7 +106,7 @@ impl Source {
                 feed_url,
                 allowlist,
             } => load_feed(index_store, index_path, feed_url, allowlist),
-            Source::Wis2 { source, .. } => Ok(source.snapshot(chrono::Utc::now())),
+            Source::Wis2 { source, .. } => Ok(source.snapshot(now)),
         }
     }
 

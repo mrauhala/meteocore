@@ -84,8 +84,17 @@ memory. Things that differ from the pull sources:
   inline polygons/circles → `geocode_geometry` lookup → hint → (opt-in)
   notification bbox. `properties.geometry_source` says which
   (`inline|geocode|notification|bbox`). `bbox_fallback` is off by default:
-  a bounding box drawn as a warning area misleads; opt in per feed. Both
-  the lookup file and the hints can be configured together.
+  a bounding box drawn as a warning area misleads; opt in per feed. When
+  on, the bbox is scoped like the exact hint — only the `(indexInfo,
+  indexArea)` the notification names; a notification with no indices
+  (whole-document producers) fills every geometry-less area. Both the
+  lookup file and the hints can be configured together.
+- `cap_alerts_superseded_total` counts each withdrawn identifier once
+  (`superseded_ids` = the set as of the last rebuild); a cancelled alert
+  lingering in the source/accumulator is not re-counted every rebuild.
+- Tests use `CapEngine::refresh_at(now)`: the WIS2 accumulator evicts by
+  clock, so a wall-clock `refresh()` empties a catalog built from captured
+  documents once they age past `<expires>` + grace (this bit CI at 17:16Z).
 - **Fixtures** for the offline tests live in `tests/wis2-fixtures/` (NOT
   under `tests/fixtures/` — the directory source lists recursively and
   would pick the CAP XML up as a demo alert).

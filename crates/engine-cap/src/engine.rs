@@ -53,8 +53,13 @@ pub struct CapEngine {
     /// `poll_loop`, never from the constructor — see `crates/ds-wis2/CLAUDE.md`).
     wis2: Option<Wis2Runtime>,
     /// Alerts withdrawn by an Update/Cancel chain, cumulative over rebuilds
-    /// (`cap_alerts_superseded_total`).
+    /// (`cap_alerts_superseded_total`). Counts each identifier once per
+    /// withdrawal: `superseded_ids` holds the set as of the last rebuild and
+    /// only newly withdrawn identifiers increment the counter — a cancelled
+    /// alert that lingers in the source until eviction is not re-counted on
+    /// every rebuild.
     superseded: std::sync::atomic::AtomicU64,
+    superseded_ids: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// WIS2-mode state shared between `poll_loop` and the health/metrics readers.
@@ -150,6 +155,7 @@ impl CapEngine {
             loaded: AtomicBool::new(false),
             wis2,
             superseded: std::sync::atomic::AtomicU64::new(0),
+            superseded_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
         // Best-effort initial load (so local fixtures populate immediately).
@@ -272,14 +278,30 @@ impl CapEngine {
     /// so the TIME-less "now" view tracks expiry). Keeps the previous snapshot
     /// on an I/O failure so a transient outage doesn't blank the alerts.
     pub fn refresh(&self) -> Result<(), DataServerError> {
-        let alerts = self.source.load()?;
+        self.refresh_at(Utc::now())
+    }
+
+    /// [`Self::refresh`] with an explicit "now" (the catalog's `as_of` and, in
+    /// WIS2 mode, the accumulator's eviction clock) — lets tests work with
+    /// captured documents whose validity has long expired.
+    pub fn refresh_at(&self, now: DateTime<Utc>) -> Result<(), DataServerError> {
+        let alerts = self.source.load_at(now)?;
         // Apply CAP Update/Cancel chains for every source mode: a directory
         // or feed that keeps an alert next to its cancellation must not
         // render both.
-        let (alerts, superseded) = resolve_references(alerts);
+        let (alerts, withdrawn) = resolve_references(alerts);
+        let superseded = {
+            let mut seen = self
+                .superseded_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let new = withdrawn.iter().filter(|id| !seen.contains(*id)).count();
+            *seen = withdrawn.into_iter().collect();
+            new
+        };
         self.superseded
             .fetch_add(superseded as u64, Ordering::Relaxed);
-        let as_of = Utc::now();
+        let as_of = now;
         let catalog = Catalog::build(
             &alerts,
             &self.build_cfg,
@@ -288,7 +310,7 @@ impl CapEngine {
             as_of,
         );
         tracing::info!(
-            "[{}] cap: loaded {} alert area(s) ({} geocode-only, {} superseded) from {}",
+            "[{}] cap: loaded {} alert area(s) ({} geocode-only, {} newly superseded) from {}",
             self.collection_id,
             catalog.records.len(),
             catalog.geocode_only_count,

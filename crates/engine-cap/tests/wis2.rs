@@ -68,6 +68,10 @@ fn resolved(n: Notification, bytes: Vec<u8>) -> Resolved {
 }
 
 const MK_IDENTIFIER: &str = "2.49.0.0.807.0.MK.120926101959.8054";
+/// Fixed "now" inside the MK alert's validity (expires 16:16Z + 1 h grace):
+/// the accumulator evicts by clock, so a wall-clock `refresh()` would empty
+/// the catalog once the captured document aged out.
+const T_TEST: DateTime<Utc> = DateTime::from_timestamp(1_789_202_410, 0).unwrap(); // 2026-09-12T08:20:10Z
 
 #[test]
 fn constructor_does_no_network_and_starts_degraded() {
@@ -111,7 +115,7 @@ fn meteoalarm_alert_gets_exact_zone_polygon_from_the_geometry_hint() {
         now,
     );
     assert!(src.take_dirty());
-    engine.refresh().unwrap();
+    engine.refresh_at(T_TEST).unwrap();
     assert!(engine.is_loaded());
 
     // Two infos (en-GB, mk-MKD) × one area each → two features; only the
@@ -176,7 +180,7 @@ fn per_area_notifications_merge_hints_and_bbox_fallback_fills_the_rest() {
         "t",
         t0 + chrono::Duration::seconds(30),
     );
-    engine.refresh().unwrap();
+    engine.refresh_at(T_TEST).unwrap();
 
     let a = engine.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
     assert_eq!(
@@ -187,6 +191,18 @@ fn per_area_notifications_merge_hints_and_bbox_fallback_fills_the_rest() {
     assert_eq!(
         b.properties.get("geometry_source").and_then(|v| v.as_str()),
         Some("bbox")
+    );
+    // The first notification (info 1, exact hint attached) carried a bbox too
+    // but was scoped to its own area, so it never touched info 0 — only the
+    // info-0 notification's bbox landed there.
+    assert_eq!(
+        b.geometry.bbox(),
+        Some([
+            20.515594482421875,
+            41.49109217223111,
+            21.24481201171875,
+            42.20614200929954
+        ])
     );
     assert!(matches!(&*b.geometry, Geometry::Polygon { exterior, .. } if exterior.len() == 5));
     // Both areas now have geometry → both hit a bbox query over Macedonia.
@@ -234,7 +250,7 @@ fn language_filter_keeps_original_info_index_for_hint_keys() {
         "t",
         "2026-09-12T08:20:10Z".parse().unwrap(),
     );
-    engine.refresh().unwrap();
+    engine.refresh_at(T_TEST).unwrap();
     assert_eq!(engine.feature_count(), 1);
     let f = engine.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
     assert!(matches!(&*f.geometry, Geometry::Polygon { .. }));
@@ -253,7 +269,7 @@ fn expiry_and_deletion_flow_through_to_the_catalog() {
         "t",
         "2026-09-12T08:20:10Z".parse().unwrap(),
     );
-    engine.refresh().unwrap();
+    engine.refresh_at(T_TEST).unwrap();
     assert_eq!(engine.feature_count(), 2);
 
     // A deletion notification for the same data_id withdraws the alert.
@@ -276,7 +292,7 @@ fn expiry_and_deletion_flow_through_to_the_catalog() {
         "2026-09-12T08:21:00Z".parse().unwrap(),
     );
     assert!(src.take_dirty());
-    engine.refresh().unwrap();
+    engine.refresh_at(T_TEST).unwrap();
     assert_eq!(engine.feature_count(), 0);
     assert_eq!(engine.wis2_source_stats().unwrap()[2], 1, "deletions");
 
@@ -297,4 +313,72 @@ fn expiry_and_deletion_flow_through_to_the_catalog() {
     let gone = src.snapshot("2026-09-12T17:30:00Z".parse().unwrap());
     assert!(gone.is_empty());
     let _ = Arc::clone(src);
+}
+
+#[test]
+fn bbox_fallback_is_scoped_to_the_notified_area() {
+    // Two areas under one info; a notification for area 1 with no usable
+    // geometry link must not paint area 0 with its bbox.
+    let engine = CapEngine::new(&config(None, true), "cap-wis2").unwrap();
+    let src = engine.wis2_source().unwrap();
+    let xml = String::from_utf8(fixture("meteoalarm-mk-alert.xml"))
+        .unwrap()
+        .replacen(
+            "<area>",
+            "<area><areaDesc>Elsewhere</areaDesc><geocode><valueName>NUTS3</valueName><value>MK999</value></geocode></area><area>",
+            1,
+        );
+    let mut n = notification("meteoalarm-mk-notification.json");
+    n.links.retain(|l| l.rel != "geometry");
+    n.extra
+        .insert("indexInfo".into(), serde_json::Value::from(0u64));
+    n.extra
+        .insert("indexArea".into(), serde_json::Value::from(1u64));
+    src.apply_with_hint(resolved(n, xml.into_bytes()), None, "t", T_TEST);
+    engine.refresh_at(T_TEST).unwrap();
+    let painted = engine.get_feature(&format!("{MK_IDENTIFIER}.0.1")).unwrap();
+    assert_eq!(
+        painted
+            .properties
+            .get("geometry_source")
+            .and_then(|v| v.as_str()),
+        Some("bbox")
+    );
+    let untouched = engine.get_feature(&format!("{MK_IDENTIFIER}.0.0")).unwrap();
+    assert!(matches!(&*untouched.geometry, Geometry::Null));
+    assert!(untouched.properties.get("geometry_source").is_none());
+}
+
+#[test]
+fn superseded_counter_counts_each_withdrawal_once() {
+    let engine = CapEngine::new(&config(None, false), "cap-wis2").unwrap();
+    let src = engine.wis2_source().unwrap();
+    let xml = fixture("meteoalarm-mk-alert.xml");
+    let cancel = String::from_utf8(xml.clone())
+        .unwrap()
+        .replace(MK_IDENTIFIER, "cancel-1")
+        .replace("<msgType>Alert</msgType>", "<msgType>Cancel</msgType>")
+        .replace(
+            "<scope>Public</scope>",
+            &format!("<scope>Public</scope><references>uhmr@meteo.gov.mk,{MK_IDENTIFIER},2026-09-12T10:19:59+02:00</references>"),
+        );
+    let n = notification("meteoalarm-mk-notification.json");
+    src.apply_with_hint(resolved(n.clone(), xml), None, "t", T_TEST);
+    let mut c = n;
+    c.id = "c".into();
+    c.data_id = "eu-eumetnet-warnings/cancel".into();
+    src.apply_with_hint(resolved(c, cancel.into_bytes()), None, "t", T_TEST);
+
+    engine.refresh_at(T_TEST).unwrap();
+    assert_eq!(engine.feature_count(), 0, "cancelled alert must not render");
+    assert_eq!(engine.superseded_total(), 1);
+    // Both documents linger in the accumulator: further rebuilds must not
+    // re-count the same withdrawal.
+    engine
+        .refresh_at(T_TEST + chrono::Duration::seconds(5))
+        .unwrap();
+    engine
+        .refresh_at(T_TEST + chrono::Duration::seconds(10))
+        .unwrap();
+    assert_eq!(engine.superseded_total(), 1);
 }

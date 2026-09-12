@@ -157,6 +157,11 @@ impl Wis2CapSource {
                 return;
             }
         };
+        // Which (info, area) the notification is about, when it says.
+        let bbox_scope = match (n.extra_u64("indexInfo"), n.extra_u64("indexArea")) {
+            (Some(i), Some(a)) => Some((i as usize, a as usize)),
+            _ => None,
+        };
         let bbox_hint = if self.cfg.bbox_fallback {
             n.geometry
                 .as_ref()
@@ -237,14 +242,30 @@ impl Wis2CapSource {
                 }
             }
             // Bbox fallback last, so it never shadows an exact polygon that
-            // arrived on another notification for the same document.
+            // arrived on another notification for the same document — and
+            // scoped to the one area the notification describes when it says
+            // which (MeteoAlarm's indexInfo/indexArea); a notification for a
+            // whole document may fill every geometry-less area.
             if let Some(b) = &bbox_hint {
                 if let Some(entry) = acc.alerts.get_mut(&identifier) {
-                    for info in &mut entry.alert.infos {
-                        for area in &mut info.areas {
-                            if area.hint_geometry.is_none() {
-                                area.hint_geometry = Some(b.clone());
-                            }
+                    let mut targets: Vec<&mut crate::parser::CapArea> = match bbox_scope {
+                        Some((i, a)) => entry
+                            .alert
+                            .infos
+                            .get_mut(i)
+                            .and_then(|info| info.areas.get_mut(a))
+                            .into_iter()
+                            .collect(),
+                        None => entry
+                            .alert
+                            .infos
+                            .iter_mut()
+                            .flat_map(|info| info.areas.iter_mut())
+                            .collect(),
+                    };
+                    for area in targets.iter_mut() {
+                        if area.hint_geometry.is_none() {
+                            area.hint_geometry = Some(b.clone());
                         }
                     }
                 }
