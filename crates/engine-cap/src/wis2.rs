@@ -158,7 +158,10 @@ impl Wis2CapSource {
     ) {
         let n = r.notification;
         let Some(payload) = r.payload else {
-            self.delete(&n.data_id, now);
+            // Tombstone in pubtime space like every other ordering decision
+            // here: a QoS-1 backlog replays a deletion and a later re-issue
+            // within the same wall-clock instant, and the re-issue must win.
+            self.delete(&n.data_id, n.pubtime);
             return;
         };
         let alerts = match parse_payload(&payload, &n.data_id) {
@@ -342,7 +345,7 @@ impl Wis2CapSource {
     /// but only where that document is still the *current* content. A
     /// deletion of a revision that was since replaced in place by a newer
     /// `data_id` only drops the stale index entry.
-    fn delete(&self, data_id: &str, now: DateTime<Utc>) {
+    fn delete(&self, data_id: &str, pubtime: DateTime<Utc>) {
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
         let Some(identifiers) = acc.data_id_index.remove(data_id) else {
             return;
@@ -355,7 +358,7 @@ impl Wis2CapSource {
                 .map(|e| e.current_data_id == data_id)
                 .unwrap_or(false);
             if current && acc.alerts.remove(&identifier).is_some() {
-                acc.tombstones.insert(identifier, now);
+                acc.tombstones.insert(identifier, pubtime);
                 removed += 1;
             }
         }
@@ -860,6 +863,48 @@ mod tests {
         }
         assert_eq!(src.stats.hints_rejected.load(Ordering::Relaxed), 1);
         assert_eq!(src.stats.hints_attached.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn backlog_replay_reissue_after_deletion_survives() {
+        // A reconnect drains a QoS-1 backlog: deletion (pubtime T) and a
+        // genuine re-issue (T+30 s) are processed at the same wall-clock
+        // instant, long after both were published.
+        let src = Wis2CapSource::new(cfg());
+        let f = fetcher();
+        let far = "2026-09-13T00:00:00+00:00";
+        src.apply_at(
+            resolved("d1", 0, Some(cap_xml("A", "Alert", "", far))),
+            &f,
+            "t",
+            at(0),
+        )
+        .await;
+        let wall = at(3600);
+        src.apply_at(resolved("d1", 100, None), &f, "t", wall).await;
+        assert_eq!(src.len(), 0);
+        src.apply_at(
+            resolved("d2", 130, Some(cap_xml("A", "Alert", "", far))),
+            &f,
+            "t",
+            wall,
+        )
+        .await;
+        assert_eq!(
+            src.len(),
+            1,
+            "re-issue newer than the deletion must survive"
+        );
+        // …while a copy published before the deletion still cannot return.
+        src.apply_at(
+            resolved("d1-copy", 50, Some(cap_xml("A", "Alert", "", far))),
+            &f,
+            "t",
+            wall,
+        )
+        .await;
+        let snap = src.snapshot(wall);
+        assert_eq!(snap.len(), 1);
     }
 
     #[tokio::test]
