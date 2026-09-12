@@ -188,6 +188,23 @@ impl Wis2CapSource {
             None
         };
 
+        // A notification's hints (`indexInfo`/`indexArea`, its bbox) describe
+        // ONE alert. A document carrying several `<alert>`s makes them
+        // ambiguous — the same (info, area) position exists in each — so
+        // hints are only applied to single-alert documents.
+        let (hint, bbox_hint, bbox_scope) = if alerts.len() == 1 {
+            (hint, bbox_hint, bbox_scope)
+        } else {
+            if hint.is_some() || bbox_hint.is_some() {
+                self.stats.hints_rejected.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    "[{label}] cap/wis2: {} carries {} alerts — geometry hints ignored (ambiguous)",
+                    n.data_id,
+                    alerts.len()
+                );
+            }
+            (None, None, None)
+        };
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
         let mut contributed: Vec<String> = Vec::new();
         for mut alert in alerts {
@@ -800,6 +817,49 @@ mod tests {
         src.apply_at(resolved("d1", 5, None), &f, "t", at(5)).await;
         assert_eq!(src.len(), 0);
         assert_eq!(src.stats.deletions.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn hints_are_ignored_on_multi_alert_documents() {
+        let mut c = cfg();
+        c.bbox_fallback = true;
+        let src = Wis2CapSource::new(c);
+        let far = "2026-09-13T00:00:00+00:00";
+        let two = format!(
+            "{}{}",
+            cap_xml("A", "Alert", "", far),
+            cap_xml("B", "Alert", "", far).replacen("<?xml version=\"1.0\"?>", "", 1)
+        );
+        let mut r = resolved("d1", 0, Some(two));
+        r.notification.geometry = Some(ds_wis2::Geometry::Polygon(vec![
+            [20.5, 41.4],
+            [20.5, 42.2],
+            [21.2, 42.2],
+            [21.2, 41.4],
+            [20.5, 41.4],
+        ]));
+        r.notification
+            .extra
+            .insert("indexInfo".into(), serde_json::Value::from(0u64));
+        r.notification
+            .extra
+            .insert("indexArea".into(), serde_json::Value::from(0u64));
+        let exact = CapAreaHint {
+            geometry: Arc::new(bbox_polygon([1.0, 1.0, 2.0, 2.0])),
+            source: "notification",
+        };
+        src.apply_with_hint(r, Some((0, 0, exact)), "t", at(0));
+        let snap = src.snapshot(at(1));
+        assert_eq!(snap.len(), 2);
+        for a in &snap {
+            for info in &a.infos {
+                for area in &info.areas {
+                    assert!(area.hint_geometry.is_none(), "{} got a hint", a.identifier);
+                }
+            }
+        }
+        assert_eq!(src.stats.hints_rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(src.stats.hints_attached.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

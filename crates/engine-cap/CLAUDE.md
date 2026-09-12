@@ -90,7 +90,10 @@ memory. Things that differ from the pull sources:
   (default on) it is downloaded **on arrival** — the links are pre-signed
   and expire about an hour after publication, so a late replay cannot
   recover them — sanity-checked against the notification bbox, and attached
-  to that one area as `CapArea.hint_geometry`. `build_geometry` order:
+  to that one area as `CapArea.hint_geometry` — only for single-alert
+  documents (with several `<alert>`s the same (info, area) position exists
+  in each, so hints are dropped as ambiguous and counted as rejected).
+  `build_geometry` order:
   inline polygons/circles → `geocode_geometry` lookup → hint → (opt-in)
   notification bbox. `properties.geometry_source` says which
   (`inline|geocode|notification|bbox`). `bbox_fallback` is off by default:
