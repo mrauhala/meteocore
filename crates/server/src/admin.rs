@@ -467,6 +467,196 @@ static POSTGIS_PING_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
 });
+// WIS2 ingest (ds-wis2 pipeline) — one series set per collection with a
+// `[….wis2]` source (CAP today, BUFR observations next). Counters follow the
+// postgis delta scheme: engines are replaced on reload, detected as a backward
+// step and rebaselined (see `delta_counts`).
+static WIS2_BROKER_CONNECTED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "wis2_broker_connected",
+        "1 while the WIS2 Global Broker session is connected and subscribed, else 0",
+        &["collection"],
+    )
+});
+static WIS2_LAST_MESSAGE_AGE_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let gauge = GaugeVec::new(
+        Opts::new(
+            "wis2_last_message_age_seconds",
+            "Seconds since the last accepted WIS2 notification (absent until the first)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+static WIS2_NOTIFICATION_LAG_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let gauge = GaugeVec::new(
+        Opts::new(
+            "wis2_notification_lag_seconds",
+            "Receipt time minus pubtime of the last accepted WIS2 notification",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+static WIS2_MESSAGES_RECEIVED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "wis2_messages_received_total",
+        "WIS2 notifications received from the broker (before dedup)",
+        &["collection"],
+    )
+});
+static WIS2_MESSAGES_DROPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "wis2_messages_dropped_total",
+        "WIS2 notifications dropped before reaching the engine, by reason \
+         (parse, duplicate, policy, integrity, size, download, decode)",
+        &["collection", "reason"],
+    )
+});
+static WIS2_RECONNECTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "wis2_reconnects_total",
+        "WIS2 broker connections lost (each is followed by a backoff reconnect)",
+        &["collection"],
+    )
+});
+static WIS2_DOWNLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "wis2_downloads_total",
+        "HTTP downloads of WIS2 data objects / auxiliary links attempted",
+        &["collection"],
+    )
+});
+static WIS2_DOWNLOAD_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "wis2_download_failures_total",
+        "WIS2 downloads that failed (network, non-2xx, over the size cap)",
+        &["collection"],
+    )
+});
+static WIS2_INTEGRITY_UNVERIFIED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "wis2_integrity_unverified_total",
+        "WIS2 payloads accepted with an integrity method this build cannot check (sha3-*)",
+        &["collection"],
+    )
+});
+// CAP engine (every source mode).
+static CAP_ALERTS_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "cap_alerts_active",
+        "Alert areas in the current CAP catalog (after supersede resolution)",
+        &["collection"],
+    )
+});
+static CAP_ALERTS_HELD: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "cap_alerts_held",
+        "Alerts held in the WIS2 accumulator (WIS2 mode only)",
+        &["collection"],
+    )
+});
+static CAP_ALERTS_SUPERSEDED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "cap_alerts_superseded_total",
+        "Alerts withdrawn by a CAP Update/Cancel reference chain",
+        &["collection"],
+    )
+});
+static CAP_WIS2_DOCUMENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "cap_wis2_documents_total",
+        "CAP documents received over WIS2, by result (ingested, rejected, deleted)",
+        &["collection", "result"],
+    )
+});
+static CAP_WIS2_GEOMETRY_HINTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "cap_wis2_geometry_hints_total",
+        "rel=geometry hints from WIS2 notifications, by result (attached, rejected)",
+        &["collection", "result"],
+    )
+});
+static CAP_WIS2_EVICTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "cap_wis2_evicted_total",
+        "Alerts evicted from the WIS2 accumulator (expired + grace, or over max_alerts)",
+        &["collection"],
+    )
+});
+
+/// Emit the `wis2_*` series for one collection from a pipeline snapshot.
+fn scrape_wis2_status(
+    last: &mut HashMap<String, [u64; 12]>,
+    cid: &str,
+    snap: &ds_wis2::StatusSnapshot,
+) {
+    WIS2_BROKER_CONNECTED
+        .with_label_values(&[cid])
+        .set((snap.connected && snap.subscribed) as i64);
+    if let Some(age) = snap.last_message_age_secs {
+        WIS2_LAST_MESSAGE_AGE_SECONDS
+            .with_label_values(&[cid])
+            .set(age as f64);
+    }
+    if let Some(lag) = snap.last_lag_secs {
+        WIS2_NOTIFICATION_LAG_SECONDS
+            .with_label_values(&[cid])
+            .set(lag as f64);
+    }
+    let mut cur = [0u64; 12];
+    cur[0] = snap.messages_received_total;
+    cur[1..8].copy_from_slice(&snap.dropped_total);
+    cur[8] = snap.reconnects_total;
+    cur[9] = snap.downloads_total;
+    cur[10] = snap.download_failures_total;
+    cur[11] = snap.integrity_unverified_total;
+    let d = delta_counts(last, cid, cur);
+    WIS2_MESSAGES_RECEIVED_TOTAL
+        .with_label_values(&[cid])
+        .inc_by(d[0]);
+    for (i, reason) in ds_wis2::DropReason::ALL.iter().enumerate() {
+        WIS2_MESSAGES_DROPPED_TOTAL
+            .with_label_values(&[cid, reason.label()])
+            .inc_by(d[1 + i]);
+    }
+    WIS2_RECONNECTS_TOTAL.with_label_values(&[cid]).inc_by(d[8]);
+    WIS2_DOWNLOADS_TOTAL.with_label_values(&[cid]).inc_by(d[9]);
+    WIS2_DOWNLOAD_FAILURES_TOTAL
+        .with_label_values(&[cid])
+        .inc_by(d[10]);
+    WIS2_INTEGRITY_UNVERIFIED_TOTAL
+        .with_label_values(&[cid])
+        .inc_by(d[11]);
+}
+
+/// Increments to apply for a fixed set of per-collection counters read from
+/// an engine that may have been replaced (and reset to zero) by a reload:
+/// a backward step on any counter rebaselines all of them so the delta is
+/// never negative.
+fn delta_counts<const N: usize>(
+    last: &mut HashMap<String, [u64; N]>,
+    key: &str,
+    cur: [u64; N],
+) -> [u64; N] {
+    let prev = last.get(key).copied().unwrap_or([0; N]);
+    let base = if cur.iter().zip(prev.iter()).any(|(c, p)| c < p) {
+        [0; N]
+    } else {
+        prev
+    };
+    last.insert(key.to_string(), cur);
+    let mut out = [0; N];
+    for i in 0..N {
+        out[i] = cur[i] - base[i];
+    }
+    out
+}
+
 static POSTGIS_METADATA_REFRESH_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
     let gauge = GaugeVec::new(
         Opts::new(
@@ -667,6 +857,12 @@ struct CacheCounterState {
     /// pass1_matches, pass2_matches, velocity_clamps)` last-scraped values
     /// (#643).
     nowcast_tracks: HashMap<String, (u64, u64, u64, u64, u64)>,
+    /// WIS2 pipeline counters per collection (received, 7 drop reasons,
+    /// reconnects, downloads, download failures, integrity unverified).
+    wis2: HashMap<String, [u64; 12]>,
+    /// CAP engine counters per collection (superseded, wis2 ingested,
+    /// rejected, deletions, hints attached, hints rejected, evicted).
+    cap: HashMap<String, [u64; 7]>,
 }
 
 static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -2507,21 +2703,25 @@ pub fn load_collections(
                 // Ready once the first load *succeeded*, even with zero alerts —
                 // a reachable CAP source can legitimately have no active alerts.
                 // Degraded only when the initial load never succeeded (e.g. an
-                // unreachable feed at startup); the poll loop retries.
-                let loaded = engine.is_loaded();
+                // unreachable feed at startup); the poll loop retries. WIS2
+                // mode has no initial load: its live health (broker session)
+                // decides, and `health_handler` keeps overriding it at runtime.
+                let (status, error) = match engine.live_health() {
+                    Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
+                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
+                        (CollectionStatus::Degraded, Some(reason.to_string()))
+                    }
+                    None if engine.is_loaded() => (CollectionStatus::Ready, None),
+                    None => (
+                        CollectionStatus::Degraded,
+                        Some("initial load failed (will retry on poll)".into()),
+                    ),
+                };
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "cap".into(),
-                    status: if loaded {
-                        CollectionStatus::Ready
-                    } else {
-                        CollectionStatus::Degraded
-                    },
-                    error: if loaded {
-                        None
-                    } else {
-                        Some("initial load failed (will retry on poll)".into())
-                    },
+                    status,
+                    error,
                 });
             }
             "postgis" => {
@@ -3984,6 +4184,29 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         }
     }
 
+    // Generic live override for engines exposing `ds_core::health::LiveStatus`
+    // (CAP in WIS2 mode; `None` = no live signal, keep the boot snapshot).
+    {
+        let engines = state.cap_engines.read().unwrap_or_else(|e| e.into_inner());
+        let live: HashMap<&str, ds_core::health::LiveStatus> = engines
+            .iter()
+            .filter_map(|e| Some((e.collection_id(), e.live_health()?)))
+            .collect();
+        for h in health.iter_mut().filter(|h| h.engine_type == "cap") {
+            match live.get(h.id.as_str()) {
+                Some(ds_core::health::LiveStatus::Ready) => {
+                    h.status = CollectionStatus::Ready;
+                    h.error = None;
+                }
+                Some(ds_core::health::LiveStatus::Degraded { reason }) => {
+                    h.status = CollectionStatus::Degraded;
+                    h.error = Some(reason.to_string());
+                }
+                None => {}
+            }
+        }
+    }
+
     // Build per-collection metadata from concrete engine types.
     // Uses EDR-style temporal extent format: { interval, values? }
     let mut data_ages: HashMap<String, i64> = HashMap::new();
@@ -4500,6 +4723,55 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                 NOWCAST_LEAD1_PERSISTENCE_CSI
                     .with_label_values(&[collection])
                     .set(persistence as i64);
+            }
+        }
+    }
+
+    // CAP engines: catalog gauges + supersede counter for every mode, and the
+    // WIS2 pipeline / accumulator series for WIS2-mode collections.
+    if let Ok(engines) = state.cap_engines.read() {
+        for engine in engines.iter() {
+            let cid = engine.collection_id();
+            CAP_ALERTS_ACTIVE
+                .with_label_values(&[cid])
+                .set(engine.record_count() as i64);
+            let src = engine.wis2_source_stats().unwrap_or([0; 7]);
+            let cur = [
+                engine.superseded_total(),
+                src[0],
+                src[1],
+                src[2],
+                src[3],
+                src[4],
+                src[5],
+            ];
+            let d = delta_counts(&mut counter_state.cap, cid, cur);
+            CAP_ALERTS_SUPERSEDED_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(d[0]);
+            if engine.is_wis2() {
+                CAP_ALERTS_HELD.with_label_values(&[cid]).set(src[6] as i64);
+                CAP_WIS2_DOCUMENTS_TOTAL
+                    .with_label_values(&[cid, "ingested"])
+                    .inc_by(d[1]);
+                CAP_WIS2_DOCUMENTS_TOTAL
+                    .with_label_values(&[cid, "rejected"])
+                    .inc_by(d[2]);
+                CAP_WIS2_DOCUMENTS_TOTAL
+                    .with_label_values(&[cid, "deleted"])
+                    .inc_by(d[3]);
+                CAP_WIS2_GEOMETRY_HINTS_TOTAL
+                    .with_label_values(&[cid, "attached"])
+                    .inc_by(d[4]);
+                CAP_WIS2_GEOMETRY_HINTS_TOTAL
+                    .with_label_values(&[cid, "rejected"])
+                    .inc_by(d[5]);
+                CAP_WIS2_EVICTED_TOTAL
+                    .with_label_values(&[cid])
+                    .inc_by(d[6]);
+            }
+            if let Some(snap) = engine.wis2_status() {
+                scrape_wis2_status(&mut counter_state.wis2, cid, &snap);
             }
         }
     }

@@ -89,7 +89,7 @@ layer but has no effect on this engine.
 |---|---|---|---|---|---|---|---|
 | CSV | one station per distinct location (Point) | station point inside box | ignored | – (400) | – | – | 0 (static) |
 | GeoJSON file | file features as loaded | feature *bounding box* intersects query box (R-tree), not exact geometry test | ignored | – (400) | ✓ | – | ✓ |
-| CAP | one alert area (Polygon / MultiPolygon / null geometry) | area bbox intersects query box; null-geometry areas excluded when `bbox` is set | alert active window intersects the interval | – (400) | ✓ | ✓ (union of active windows; `None` when fully open) | ✓ |
+| CAP | one alert area (Polygon / MultiPolygon / null geometry); `properties.geometry_source` = `inline`/`geocode`/`notification`/`bbox`. Same semantics for the directory, feed and WIS2 (push) sources; Update/Cancel chains are resolved on every rebuild | area bbox intersects query box; null-geometry areas excluded when `bbox` is set | alert active window intersects the interval | – (400) | ✓ | ✓ (union of active windows; `None` when fully open) | ✓ |
 | PostGIS stations | one station (Point) from the cached location set | station point inside box (in memory, not SQL) | ignored | – (400) | ✓ | – | ✓ |
 | PostGIS events | — no `FeatureEngine` (EDR area + WMS only; Features items = #503) — | | | | | | |
 | ODIM PVOL network | one radar site (Point) — site inventory | site point inside box | sites with a volume inside the interval | – (400) | ✓ | – | ✓ (inventory-sensitive) |

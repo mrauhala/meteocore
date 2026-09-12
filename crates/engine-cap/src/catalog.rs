@@ -162,7 +162,7 @@ impl Catalog {
             }
             for (info_idx, info) in select_infos(alert, cfg.language.as_deref()) {
                 for (area_idx, area) in info.areas.iter().enumerate() {
-                    let geometry =
+                    let (geometry, geometry_source) =
                         build_geometry(area, cfg.circle_segments, cfg.geocode_lookup.as_deref());
                     if matches!(geometry, Geometry::Null) && area.has_geocode_only() {
                         geocode_only_count += 1;
@@ -179,8 +179,14 @@ impl Catalog {
                     let id = format!("{}.{}.{}", alert.identifier, info_idx, area_idx);
                     let window = build_window(alert, info, cfg.default_ttl);
                     let severity_code = severity_code(info.severity.as_deref());
-                    let properties =
+                    let mut properties =
                         build_properties(alert, info, area, window, geometry_kind_radius(area));
+                    if let Some(src) = geometry_source {
+                        properties.insert(
+                            "geometry_source".into(),
+                            PropertyValue::String(src.to_string()),
+                        );
+                    }
                     records.push(AreaRecord {
                         id,
                         geometry: Arc::new(geometry),
@@ -370,7 +376,11 @@ fn primary_subtag(tag: &str) -> String {
 
 /// Build the active window: start = onset ∨ effective ∨ sent;
 /// end = expires ∨ (start + default_ttl) ∨ open.
-fn build_window(alert: &CapAlert, info: &CapInfo, default_ttl: Option<Duration>) -> ActiveWindow {
+pub(crate) fn build_window(
+    alert: &CapAlert,
+    info: &CapInfo,
+    default_ttl: Option<Duration>,
+) -> ActiveWindow {
     let start = info.onset.or(info.effective).or(alert.sent);
     let end = info.expires.or_else(|| match (start, default_ttl) {
         (Some(s), Some(ttl)) => Some(s + ttl),
@@ -392,8 +402,15 @@ fn geometry_kind_radius(area: &CapArea) -> Option<f64> {
 /// Assemble an area's geometry from its polygons + circles (each circle → an
 /// N-gon). When the area has **no** inline geometry, fall back to resolving its
 /// `<geocode>`s through the optional [`GeocodeLookup`] (e.g. MeteoAlarm EMMA_ID
-/// zones). 0 shapes ⇒ `Null`, 1 ⇒ `Polygon`, >1 ⇒ `MultiPolygon`.
-fn build_geometry(area: &CapArea, segments: u32, lookup: Option<&GeocodeLookup>) -> Geometry {
+/// zones), then to a source-attached hint (WIS2 `rel=geometry` / bbox).
+/// 0 shapes ⇒ `Null`, 1 ⇒ `Polygon`, >1 ⇒ `MultiPolygon`. The second value is
+/// the provenance for the `geometry_source` property (`"inline"`, `"geocode"`,
+/// or the hint's label; `None` for null geometry).
+fn build_geometry(
+    area: &CapArea,
+    segments: u32,
+    lookup: Option<&GeocodeLookup>,
+) -> (Geometry, Option<&'static str>) {
     #[allow(clippy::type_complexity)]
     let mut polys: Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> = Vec::new();
     for ring in &area.polygons {
@@ -402,11 +419,28 @@ fn build_geometry(area: &CapArea, segments: u32, lookup: Option<&GeocodeLookup>)
     for c in &area.circles {
         polys.push((circle_ring(c, segments), Vec::new()));
     }
+    let mut source = if polys.is_empty() {
+        None
+    } else {
+        Some("inline")
+    };
     // Inline geometry wins; only resolve geocodes for an otherwise-empty area.
     if polys.is_empty() {
         if let Some(lk) = lookup {
             for geom in lk.resolve(&area.geocodes) {
                 polys.extend(polygon_parts(&geom));
+            }
+            if !polys.is_empty() {
+                source = Some("geocode");
+            }
+        }
+    }
+    // Still nothing: a hint the source attached (WIS2 notification geometry).
+    if polys.is_empty() {
+        if let Some(hint) = &area.hint_geometry {
+            polys.extend(polygon_parts(&hint.geometry));
+            if !polys.is_empty() {
+                source = Some(hint.source);
             }
         }
     }
@@ -421,14 +455,15 @@ fn build_geometry(area: &CapArea, segments: u32, lookup: Option<&GeocodeLookup>)
             orient_ring(hole, false);
         }
     }
-    match polys.len() {
+    let geometry = match polys.len() {
         0 => Geometry::Null,
         1 => {
             let (exterior, holes) = polys.pop().unwrap();
             Geometry::Polygon { exterior, holes }
         }
         _ => Geometry::MultiPolygon { polygons: polys },
-    }
+    };
+    (geometry, source)
 }
 
 /// Twice the signed area (shoelace). Positive ⇒ the ring is **counterclockwise**
@@ -641,8 +676,64 @@ fn compute_version(records: &[AreaRecord]) -> u64 {
                 fnv1a(s.as_bytes(), &mut h);
             }
         }
+        // Geometry fingerprint: in WIS2 mode an area's shape can change
+        // between rebuilds with id/severity/window/text untouched (a bbox
+        // fallback replaced by the exact zone polygon, a hint attached where
+        // there was none, or a corrected zone outline with the same vertex
+        // count and bbox); the MVT tile cache and Feature ETags key on this
+        // version, so every coordinate is part of it.
+        if let Some(PropertyValue::String(s)) = r.properties.get("geometry_source") {
+            fnv1a(s.as_bytes(), &mut h);
+        }
+        hash_geometry(&r.geometry, &mut h);
     }
     h
+}
+
+/// Fold a geometry's structure and every coordinate into `h`. Coordinates
+/// are mixed a word at a time (FNV-style over the f64 bit patterns) rather
+/// than byte-wise — a 10 k-area catalog of NUTS3 outlines is millions of
+/// vertices per rebuild, and this runs on every one.
+fn hash_geometry(g: &Geometry, h: &mut u64) {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn word(w: u64, h: &mut u64) {
+        *h ^= w;
+        *h = h.wrapping_mul(PRIME);
+    }
+    fn ring(r: &[[f64; 2]], h: &mut u64) {
+        word(r.len() as u64, h);
+        for [x, y] in r {
+            word(x.to_bits(), h);
+            word(y.to_bits(), h);
+        }
+    }
+    match g {
+        Geometry::Null => word(0, h),
+        Geometry::Point { x, y } => {
+            word(1, h);
+            word(x.to_bits(), h);
+            word(y.to_bits(), h);
+        }
+        Geometry::Polygon { exterior, holes } => {
+            word(2, h);
+            ring(exterior, h);
+            word(holes.len() as u64, h);
+            for hole in holes {
+                ring(hole, h);
+            }
+        }
+        Geometry::MultiPolygon { polygons } => {
+            word(3, h);
+            word(polygons.len() as u64, h);
+            for (exterior, holes) in polygons {
+                ring(exterior, h);
+                word(holes.len() as u64, h);
+                for hole in holes {
+                    ring(hole, h);
+                }
+            }
+        }
+    }
 }
 
 fn base_raster_info(

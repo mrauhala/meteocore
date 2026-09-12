@@ -126,7 +126,7 @@ fn value_as_string(v: &serde_json::Value) -> Option<String> {
 
 /// Parse a GeoJSON `Polygon`/`MultiPolygon` geometry into [`Geometry`]
 /// (`[lon, lat]`, no swap — GeoJSON is already lon-first). Other types → `None`.
-fn parse_geometry(g: &serde_json::Value) -> Option<Geometry> {
+pub(crate) fn parse_geometry(g: &serde_json::Value) -> Option<Geometry> {
     let mut coord_budget = MAX_COORDS_PER_GEOMETRY;
     match g.get("type").and_then(|t| t.as_str())? {
         "Polygon" => {

@@ -67,6 +67,21 @@ pub struct CapArea {
     pub circles: Vec<CapCircle>,
     /// `(valueName, value)` geocode pairs (no renderable geometry).
     pub geocodes: Vec<(String, String)>,
+    /// Geometry attached *after* parsing by the source (WIS2 mode: the
+    /// notification's `rel=geometry` GeoJSON, or its bbox). Used only when
+    /// the area has no inline polygon/circle and no geocode resolves; see
+    /// `catalog::build_geometry`.
+    pub hint_geometry: Option<CapAreaHint>,
+}
+
+/// Source-attached geometry for an area that carries none of its own.
+#[derive(Debug, Clone)]
+pub struct CapAreaHint {
+    pub geometry: std::sync::Arc<ds_core::feature::Geometry>,
+    /// Provenance label emitted as the `geometry_source` property
+    /// (`"notification"` for a `rel=geometry` link, `"bbox"` for the
+    /// notification extent).
+    pub source: &'static str,
 }
 
 /// A parsed `<circle>`: centre (`[lon, lat]`) + radius in kilometres.

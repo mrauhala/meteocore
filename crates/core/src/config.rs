@@ -879,6 +879,12 @@ fn default_status_filter() -> Vec<String> {
 /// Default WIS2 Global Broker (Météo-France). Any Global Broker carries the
 /// full notification stream, so the choice only affects latency.
 pub const DEFAULT_WIS2_BROKER: &str = "mqtts://globalbroker.meteo.fr:8883";
+/// Floor for `[cap] poll_interval_secs` when the source is `[cap.wis2]`: the
+/// engine rebuilds a dirty catalog at most this often (engine-cap derives its
+/// `WIS2_DIRTY_REBUILD` from it), and every rebuild advances `as_of`, the
+/// TIME-less WMS cache key — so nothing may ask for rebuilds closer together
+/// than this.
+pub const CAP_WIS2_MIN_POLL_INTERVAL_SECS: u64 = 5;
 /// Default WIS2 Global Broker credentials — public by design (WMO publishes
 /// them); only ever overridden for a private broker.
 pub const DEFAULT_WIS2_USERNAME: &str = "everyone";
@@ -1189,6 +1195,44 @@ pub struct CapConfig {
     /// (default) ⇒ entry links must share the feed's origin.
     #[serde(default)]
     pub feed_allowlist: Vec<String>,
+    /// Third source mode: a WIS2 Global Broker subscription (mutually
+    /// exclusive with `data_path` / `feed_url`). Alerts are pushed as
+    /// notifications, accumulated in memory, superseded/cancelled per CAP
+    /// `<references>`, and evicted after they expire. See
+    /// `crates/engine-cap/CLAUDE.md` "WIS2 mode".
+    #[serde(default)]
+    pub wis2: Option<Wis2Config>,
+    /// WIS2 mode: keep an alert this long past its resolved validity end
+    /// (`<expires>`, else onset + `default_ttl`) before evicting it from the
+    /// accumulator. ISO 8601 duration, default `PT1H`.
+    #[serde(default = "default_cap_retention_grace")]
+    pub retention_grace: String,
+    /// WIS2 mode: hard cap on alerts held in memory; the oldest-received are
+    /// evicted first. Default 10 000.
+    #[serde(default = "default_cap_max_alerts")]
+    pub max_alerts: usize,
+    /// WIS2 mode: follow a notification's `rel=geometry` link (a GeoJSON
+    /// Feature with the exact area polygon, as published by the MeteoAlarm
+    /// hub) to give geometry to geocode-only areas. Default `true`.
+    #[serde(default = "default_true")]
+    pub geometry_links: bool,
+    /// WIS2 mode: as a last resort, use the notification's own bbox polygon
+    /// for an area that still has no geometry. Default `false` — a bounding
+    /// box drawn as the warning area is misleading; opt in per feed.
+    #[serde(default)]
+    pub bbox_fallback: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_cap_retention_grace() -> String {
+    "PT1H".to_string()
+}
+
+fn default_cap_max_alerts() -> usize {
+    10_000
 }
 
 /// Resampling method for the ODIM **PVOL** (`engine_type = "odim-volume"`)
@@ -2930,19 +2974,49 @@ impl ServerConfig {
                     )));
                 }
 
-                // Data source: exactly one of local `data_path` or `feed_url`
-                // (mirrors the geotiff/grib/zarr local-vs-remote mutual exclusion).
+                // Data source: exactly one of local `data_path`, `feed_url` or a
+                // `[cap.wis2]` subscription (mirrors the geotiff/grib/zarr
+                // local-vs-remote mutual exclusion).
                 let has_local = cap.data_path.is_some();
                 let has_feed = cap.feed_url.is_some();
-                if has_local && has_feed {
+                let has_wis2 = cap.wis2.is_some();
+                let sources = [has_local, has_feed, has_wis2]
+                    .iter()
+                    .filter(|b| **b)
+                    .count();
+                if sources > 1 {
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': cap 'data_path' (local) is mutually exclusive with \
-                         'feed_url'"
+                        "Collection '{id}': cap 'data_path' (local), 'feed_url' and \
+                         '[cap.wis2]' are mutually exclusive"
                     )));
                 }
-                if !has_local && !has_feed {
+                if sources == 0 {
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': cap requires either 'data_path' (local) or 'feed_url'"
+                        "Collection '{id}': cap requires one of 'data_path' (local), \
+                         'feed_url' or a [cap.wis2] section"
+                    )));
+                }
+                if let Some(wis2) = &cap.wis2 {
+                    validate_wis2(id, "cap.wis2", wis2)?;
+                    // In WIS2 mode `poll_interval_secs` is the forced-rebuild
+                    // cadence, which must not undercut the dirty-rebuild floor.
+                    if cap.poll_interval_secs < CAP_WIS2_MIN_POLL_INTERVAL_SECS {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap poll_interval_secs must be >= \
+                             {CAP_WIS2_MIN_POLL_INTERVAL_SECS} with [cap.wis2] (the catalog \
+                             rebuild floor)"
+                        )));
+                    }
+                }
+                crate::datetime::parse_iso8601_duration(&cap.retention_grace).map_err(|e| {
+                    crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'retention_grace' is not a valid positive ISO \
+                         8601 duration: {e}"
+                    ))
+                })?;
+                if cap.max_alerts == 0 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'max_alerts' must be > 0"
                     )));
                 }
                 if let Some(url) = &cap.feed_url {
@@ -3260,6 +3334,62 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             "engine_type = \"cap\"\napis = [\"features\", \"wms\"]\n\
              [collections.cap]\n{cap_body}"
         ))
+    }
+
+    #[test]
+    fn cap_wis2_mode_validates_and_is_exclusive() {
+        let ok = cap_collection(
+            "[collections.cap.wis2]\ntopics = [\"cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnings\"]\n",
+        );
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        let cap = ok.collections[0].cap.as_ref().unwrap();
+        assert_eq!(cap.retention_grace, "PT1H");
+        assert_eq!(cap.max_alerts, 10_000);
+        assert!(cap.geometry_links);
+        assert!(!cap.bbox_fallback);
+        assert_eq!(cap.wis2.as_ref().unwrap().username, "everyone");
+        // Exclusive with the other two sources.
+        assert!(cap_collection(
+            "data_path = \"x\"\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n"
+        )
+        .validate()
+        .is_err());
+        assert!(cap_collection(
+            "feed_url = \"https://f/\"\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n"
+        )
+        .validate()
+        .is_err());
+        // Inner wis2 validation and the wis2-mode knobs are enforced.
+        assert!(cap_collection("[collections.cap.wis2]\ntopics = []\n")
+            .validate()
+            .is_err());
+        assert!(cap_collection(
+            "retention_grace = \"soon\"\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n"
+        )
+        .validate()
+        .is_err());
+        assert!(
+            cap_collection("max_alerts = 0\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n")
+                .validate()
+                .is_err()
+        );
+        // The forced-rebuild cadence may not undercut the dirty-rebuild floor
+        // (only in WIS2 mode — a 1 s feed poll is still allowed).
+        let fast = cap_collection(
+            "poll_interval_secs = 4\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n",
+        );
+        let err = fast.validate().unwrap_err().to_string();
+        assert!(err.contains("poll_interval_secs must be >= 5"), "{err}");
+        assert!(cap_collection(
+            "poll_interval_secs = 5\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n"
+        )
+        .validate()
+        .is_ok());
+        assert!(
+            cap_collection("poll_interval_secs = 1\nfeed_url = \"https://f/\"\n")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

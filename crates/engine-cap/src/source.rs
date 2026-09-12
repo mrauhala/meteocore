@@ -8,6 +8,7 @@
 //! concurrency, per-object timeout) rather than a sequential blocking loop.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -18,6 +19,7 @@ use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::{build_store, DataStore};
 
 use crate::parser::{parse_document, CapAlert};
+use crate::wis2::Wis2CapSource;
 
 /// Per-object byte cap for a CAP document / feed index (geometry-bomb guard).
 const MAX_DOC_BYTES: u64 = 8 * 1024 * 1024;
@@ -44,6 +46,13 @@ pub enum Source {
         /// SSRF allowlist of extra URL prefixes (the feed's own origin is always
         /// allowed); see [`CapConfig::feed_allowlist`](ds_core::config::CapConfig).
         allowlist: Vec<String>,
+    },
+    /// WIS2 Global Broker subscription: alerts pushed as notifications and
+    /// accumulated in memory (see [`crate::wis2`]). `load()` is a snapshot of
+    /// the accumulator — no I/O; the broker task feeds it from `poll_loop`.
+    Wis2 {
+        source: Arc<Wis2CapSource>,
+        topics: Vec<String>,
     },
 }
 
@@ -79,11 +88,16 @@ impl Source {
         match self {
             Source::Local { base, .. } => format!("local dir '{base}'"),
             Source::Feed { feed_url, .. } => format!("feed '{feed_url}'"),
+            Source::Wis2 { topics, .. } => format!("wis2 {} topic filter(s)", topics.len()),
         }
     }
 
-    /// Fetch and parse every CAP document this source exposes.
-    pub fn load(&self) -> Result<Vec<CapAlert>, DataServerError> {
+    /// Fetch and parse every CAP document this source exposes (WIS2: the
+    /// accumulated set after eviction as of `now`).
+    pub fn load_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<CapAlert>, DataServerError> {
         match self {
             Source::Local { store, base } => load_local(store, base),
             Source::Feed {
@@ -92,6 +106,15 @@ impl Source {
                 feed_url,
                 allowlist,
             } => load_feed(index_store, index_path, feed_url, allowlist),
+            Source::Wis2 { source, .. } => Ok(source.snapshot(now)),
+        }
+    }
+
+    /// The WIS2 accumulator, when this is a WIS2 source.
+    pub fn wis2(&self) -> Option<&Arc<Wis2CapSource>> {
+        match self {
+            Source::Wis2 { source, .. } => Some(source),
+            _ => None,
         }
     }
 }

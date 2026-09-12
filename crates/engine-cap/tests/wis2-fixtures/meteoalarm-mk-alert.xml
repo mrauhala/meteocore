@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes" ?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>2.49.0.0.807.0.MK.120926101959.8054</identifier>
+  <sender>uhmr@meteo.gov.mk</sender>
+  <sent>2026-09-12T10:19:59+02:00</sent>
+  <status>Actual</status>
+  <msgType>Alert</msgType>
+  <scope>Public</scope>
+  <info>
+    <language>en-GB</language>
+    <category>Met</category>
+    <event>Rain</event>
+    <responseType>Monitor</responseType>
+    <urgency>Immediate</urgency>
+    <severity>Moderate</severity>
+    <certainty>Likely</certainty>
+    <effective>2026-09-12T10:19:59+02:00</effective>
+    <onset>2026-09-12T10:16:00+02:00</onset>
+    <expires>2026-09-12T18:16:00+02:00</expires>
+    <senderName>National Hydrometeorological Service - Republic of Macedonia</senderName>
+    <headline>Rain</headline>
+    <description>Rain</description>
+    <web>https://uhmr.gov.mk/</web>
+    <contact>uhmr@meteo.gov.mk</contact>
+    <parameter>
+      <valueName>awareness_level</valueName>
+      <value>2; yellow; Moderate</value>
+    </parameter>
+    <parameter>
+      <valueName>awareness_type</valueName>
+      <value>10; Rain</value>
+    </parameter>
+    <area>
+      <areaDesc>Polog region</areaDesc>
+      <geocode>
+        <valueName>NUTS3</valueName>
+        <value>MK006</value>
+      </geocode>
+    </area>
+  </info>
+  <info>
+    <language>mk-MKD</language>
+    <category>Met</category>
+    <event>Rain</event>
+    <responseType>Monitor</responseType>
+    <urgency>Immediate</urgency>
+    <severity>Moderate</severity>
+    <certainty>Likely</certainty>
+    <effective>2026-09-12T10:19:59+02:00</effective>
+    <onset>2026-09-12T10:16:00+02:00</onset>
+    <expires>2026-09-12T18:16:00+02:00</expires>
+    <senderName>National Hydrometeorological Service - Republic of Macedonia</senderName>
+    <headline>????</headline>
+    <description>????</description>
+    <web>https://uhmr.gov.mk/</web>
+    <contact>uhmr@meteo.gov.mk</contact>
+    <parameter>
+      <valueName>awareness_level</valueName>
+      <value>2; yellow; Moderate</value>
+    </parameter>
+    <parameter>
+      <valueName>awareness_type</valueName>
+      <value>10; Rain</value>
+    </parameter>
+    <area>
+      <areaDesc>Polog region</areaDesc>
+      <geocode>
+        <valueName>NUTS3</valueName>
+        <value>MK006</value>
+      </geocode>
+    </area>
+  </info>
+</alert>

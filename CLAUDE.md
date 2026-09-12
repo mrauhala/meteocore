@@ -577,6 +577,28 @@ lightning_jump = 0.9
 
 [collections.wms]
 colormap = "radar_dbz"
+
+# CAP warnings pushed over WMO WIS2 (third cap source mode, XOR with
+# data_path / feed_url). `[….wis2]` is the shared ds-wis2 subscription
+# block (same shape for the coming engine-bufr); see crates/ds-wis2/CLAUDE.md.
+[[collections]]
+id = "cap-meteoalarm-wis2"
+engine_type = "cap"
+apis = ["features", "wms", "maps", "tiles"]
+
+[collections.cap]
+poll_interval_secs = 60     # forced rebuild cadence in wis2 mode (min 5)
+language = "en"
+retention_grace = "PT1H"    # keep an alert this long past <expires>
+max_alerts = 10000
+geometry_links = true       # MeteoAlarm rel=geometry zone polygons (fetched on arrival)
+bbox_fallback = false       # never draw the notification bbox as the area
+
+[collections.cap.wis2]
+topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnings"]
+# broker = "mqtts://globalbroker.meteo.fr:8883"   # default
+# username = "everyone"; password = "everyone"   # defaults (public); or password_env
+# download_allowlist = ["https://…/"]            # strict mode (recommended for origin/ topics)
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs`
