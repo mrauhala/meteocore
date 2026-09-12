@@ -9,6 +9,7 @@ pub mod events;
 pub mod feature;
 pub mod feature_engine;
 pub mod geo;
+pub mod health;
 pub mod html;
 pub mod http_cache;
 pub mod instances;

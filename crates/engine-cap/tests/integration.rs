@@ -28,6 +28,11 @@ fn config_for(dir: &str, language: Option<&str>) -> CapConfig {
         geocode_property: "code".to_string(),
         geocode_value_name: None,
         feed_allowlist: Vec::new(),
+        wis2: None,
+        retention_grace: "PT1H".to_string(),
+        max_alerts: 10_000,
+        geometry_links: true,
+        bbox_fallback: false,
     }
 }
 

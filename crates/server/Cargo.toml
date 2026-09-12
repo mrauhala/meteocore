@@ -11,6 +11,7 @@ icechunk = ["engine-zarr/icechunk"]
 [dependencies]
 toml = "1.1"
 ds-core = { path = "../core" }
+ds-wis2 = { path = "../ds-wis2" }
 engine-csv = { path = "../engine-csv" }
 engine-geojson = { path = "../engine-geojson" }
 engine-geotiff = { path = "../engine-geotiff" }

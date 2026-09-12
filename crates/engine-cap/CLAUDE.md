@@ -20,9 +20,10 @@ as a property.
 
 ## Source & SSRF guard
 
-- **Exactly one of `data_path`** (local dir of `*.xml`) **or `feed_url`**
-  (Atom/RSS index → linked CAP docs). Both go through `ds-storage` from the
-  background poll runtime only. The feed fetches the index then the linked
+- **Exactly one of `data_path`** (local dir of `*.xml`), **`feed_url`**
+  (Atom/RSS index → linked CAP docs) **or `[cap.wis2]`** (WIS2 push, see
+  below). The first two go through `ds-storage` from the background poll
+  runtime only. The feed fetches the index then the linked
   docs with `DataStore::get_many` (bounded concurrency, per-object timeout,
   origin-grouped) — never a sequential blocking loop.
 - **Feed SSRF guard:** an entry link is fetched only if it shares the feed's
@@ -34,10 +35,60 @@ as a property.
   responses (object_store's reqwest client follows redirects; still no
   disable knob as of object_store 0.14). A proper fix belongs in
   ds-storage (#431).
-- Config (`CapConfig` in ds-core) validated at load: `data_path` XOR
-  `feed_url`, `feed_url` http(s), non-empty `language`,
-  `poll_interval_secs > 0`, positive ISO 8601 `default_ttl`,
-  `circle_segments >= 3`.
+- Config (`CapConfig` in ds-core) validated at load: exactly one of
+  `data_path` / `feed_url` / `[cap.wis2]`, `feed_url` http(s), non-empty
+  `language`, `poll_interval_secs > 0`, positive ISO 8601 `default_ttl` /
+  `retention_grace`, `circle_segments >= 3`, `max_alerts > 0`,
+  `validate_wis2` for the subscription.
+
+## WIS2 mode (`[cap.wis2]`, `src/wis2.rs`)
+
+Push instead of poll: the engine subscribes to WIS2 Global Broker topics
+through `ds-wis2` (read `crates/ds-wis2/CLAUDE.md` first — sessions, the
+6×-per-cache duplicate fact, download policy) and accumulates alerts in
+memory. Things that differ from the pull sources:
+
+- **Lifecycle.** `new()` builds the accumulator only — no network — and the
+  collection boots `Degraded("connecting to WIS2 broker")`. `poll_loop()`
+  starts the pipeline (it is the only entry point guaranteed to run on
+  `poll_runtime()`; the constructor runs on the request runtime), applies
+  every resolved notification, rebuilds the catalog at most every 5 s when
+  dirty and unconditionally every `poll_interval_secs`. `live_health()`
+  reports the session (`/health` overrides the boot status at runtime;
+  a disconnect shorter than `degrade_after_secs` is not surfaced — the last
+  catalog keeps serving and the session resumes its QoS-1 backlog).
+- **The 5 s dirty floor is load-bearing.** Every rebuild sets `as_of =
+  now`, and `as_of` is the TIME-less WMS cache key; two catalogs must never
+  share one second. The forced rebuild keeps expiries evicting when the
+  feed is quiet.
+- **Accumulator semantics** (`Wis2CapSource`): one entry per CAP
+  `<identifier>`, newest `pubtime` wins; `rel=deletion` withdraws the alert
+  its `data_id` produced and leaves a tombstone so a late copy from another
+  Global Cache cannot resurrect it (a genuinely newer re-issue can);
+  eviction once every info's validity end (`<expires>`, else onset +
+  `default_ttl`, else receipt + 7 d) is more than `retention_grace` (PT1H)
+  in the past; `max_alerts` (10 000) evicts oldest-received first.
+- **Supersede/Cancel is NOT WIS2-specific.** `supersede::resolve_references`
+  runs in `refresh()` for every source mode: newest `<sent>` per identifier,
+  identifiers named in an `Update`/`Cancel` `<references>` are withdrawn,
+  `Cancel`/`Ack`/`Error` are never rendered. Counted in
+  `cap_alerts_superseded_total`.
+- **MeteoAlarm geometry.** The hub's CAP XML is geocode-only (NUTS3 /
+  EMMA_ID, no `<polygon>`), but each notification (one per alert × info ×
+  area, `indexInfo`/`indexArea` 0-based in document order) carries a
+  `rel=geometry` link to the exact zone polygon. With `geometry_links`
+  (default on) it is downloaded **on arrival** — the links are pre-signed
+  and expire about an hour after publication, so a late replay cannot
+  recover them — sanity-checked against the notification bbox, and attached
+  to that one area as `CapArea.hint_geometry`. `build_geometry` order:
+  inline polygons/circles → `geocode_geometry` lookup → hint → (opt-in)
+  notification bbox. `properties.geometry_source` says which
+  (`inline|geocode|notification|bbox`). `bbox_fallback` is off by default:
+  a bounding box drawn as a warning area misleads; opt in per feed. Both
+  the lookup file and the hints can be configured together.
+- **Fixtures** for the offline tests live in `tests/wis2-fixtures/` (NOT
+  under `tests/fixtures/` — the directory source lists recursively and
+  would pick the CAP XML up as a demo alert).
 
 ## Feature model
 
@@ -102,6 +153,6 @@ in `server/src/admin.rs` (`"cap" => ["features","wms","maps","tiles"]`);
 poll loop on `poll_runtime()`; `shutdown()` on reload. Demo:
 `collections.d/cap-alerts.toml` over `testdata/cap/`.
 
-Out of scope for v1 (follow-ups): reference-chain supersedes/cancel beyond
-latest-wins, XML-DSig verification, per-`event` sub-layers, conditional-GET
-feed caching, antimeridian splitting.
+Out of scope (follow-ups): XML-DSig verification, per-`event` sub-layers,
+conditional-GET feed caching, antimeridian splitting, Global Cache backfill
+on a cold WIS2 boot (the accumulator starts empty until alerts arrive).

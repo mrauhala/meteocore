@@ -6,7 +6,7 @@
     "meteocore"
   ],
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "refresh": "30s",
   "time": {
     "from": "now-3h",
@@ -2372,6 +2372,309 @@
     },
     {
       "type": "row",
+      "title": "WIS2 ingest (CAP over WIS2, BUFR observations)",
+      "collapsed": false,
+      "id": 53,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 137
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Broker session & notification age",
+      "description": "wis2_broker_connected is 1 while the MQTT session is connected AND subscribed (0 = reconnecting; /health degrades after degrade_after_secs). Message age climbs between publications — MeteoAlarm is sporadic (minutes to hours), SYNOP bursts at H+20. Lag = receipt − pubtime: seconds normally; a growing lag means the broker is replaying a queued backlog after a reconnect.",
+      "id": 54,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 138
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "wis2_broker_connected",
+          "refId": "A",
+          "legendFormat": "{{collection}} connected"
+        },
+        {
+          "expr": "wis2_last_message_age_seconds",
+          "refId": "B",
+          "legendFormat": "{{collection}} last message age (s)"
+        },
+        {
+          "expr": "wis2_notification_lag_seconds",
+          "refId": "C",
+          "legendFormat": "{{collection}} lag (s)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Notifications — accepted vs dropped per minute",
+      "description": "Every WIS2 notification is republished once per Global Cache (six copies in 2026), so dropped{reason=duplicate} ≈ 5× accepted is the healthy shape. Any other reason growing is a problem: parse = non-WNM payloads on the topic, policy = a producer link failed the SSRF policy (https + public DNS host; set download_allowlist), integrity = checksum mismatch, size = over max_download_bytes, download = HTTP failures, decode = bad inline base64/gzip.",
+      "id": 55,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 138
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (collection) (rate(wis2_messages_received_total[5m]) * 60) - sum by (collection) (rate(wis2_messages_dropped_total[5m]) * 60)",
+          "refId": "A",
+          "legendFormat": "{{collection}} accepted"
+        },
+        {
+          "expr": "sum by (collection, reason) (rate(wis2_messages_dropped_total[5m]) * 60)",
+          "refId": "B",
+          "legendFormat": "{{collection}} dropped {{reason}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Downloads, reconnects & unverified payloads per hour",
+      "description": "Downloads are only needed for link-only notifications (most SYNOP arrives inline). Reconnects should be rare; a steady rate means the broker keeps closing the session (check keep-alive / session expiry / client id collisions between replicas). integrity_unverified counts sha3-* checksums this build accepts without checking.",
+      "id": 56,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 138
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(wis2_downloads_total[1h]) * 3600",
+          "refId": "A",
+          "legendFormat": "{{collection}} downloads"
+        },
+        {
+          "expr": "rate(wis2_download_failures_total[1h]) * 3600",
+          "refId": "B",
+          "legendFormat": "{{collection}} download failures"
+        },
+        {
+          "expr": "rate(wis2_reconnects_total[1h]) * 3600",
+          "refId": "C",
+          "legendFormat": "{{collection}} reconnects"
+        },
+        {
+          "expr": "rate(wis2_integrity_unverified_total[1h]) * 3600",
+          "refId": "D",
+          "legendFormat": "{{collection}} unverified"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "CAP alerts — active vs held, supersede/evict per hour",
+      "description": "active = alert areas in the served catalog after Update/Cancel resolution (every source mode); held = alerts in the WIS2 accumulator before eviction (should track active loosely — a large gap means many expired-but-within-grace or superseded alerts). superseded = withdrawn by a CAP reference chain; evicted = expired past retention_grace or over max_alerts.",
+      "id": 57,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 146
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "cap_alerts_active",
+          "refId": "A",
+          "legendFormat": "{{collection}} active"
+        },
+        {
+          "expr": "cap_alerts_held",
+          "refId": "B",
+          "legendFormat": "{{collection}} held"
+        },
+        {
+          "expr": "rate(cap_alerts_superseded_total[1h]) * 3600",
+          "refId": "C",
+          "legendFormat": "{{collection}} superseded/h"
+        },
+        {
+          "expr": "rate(cap_wis2_evicted_total[1h]) * 3600",
+          "refId": "D",
+          "legendFormat": "{{collection}} evicted/h"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "CAP over WIS2 — documents & geometry hints per hour",
+      "description": "ingested/rejected/deleted CAP documents from notifications; rejected = unparseable XML (producer problem). Geometry hints are MeteoAlarm's rel=geometry zone polygons: attached = area got its exact polygon; rejected = link expired (they are pre-signed, ~1 h), not a polygon, or outside the notification bbox. A rising rejected share means alerts render with null geometry — check the download policy and hub link expiry.",
+      "id": 58,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 146
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (collection, result) (rate(cap_wis2_documents_total[1h]) * 3600)",
+          "refId": "A",
+          "legendFormat": "{{collection}} docs {{result}}"
+        },
+        {
+          "expr": "sum by (collection, result) (rate(cap_wis2_geometry_hints_total[1h]) * 3600)",
+          "refId": "B",
+          "legendFormat": "{{collection}} hints {{result}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
       "title": "Logs",
       "id": 37,
       "collapsed": false,
@@ -2379,7 +2682,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 137
+        "y": 154
       },
       "panels": []
     },
@@ -2392,7 +2695,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 138
+        "y": 155
       },
       "datasource": {
         "type": "loki",
@@ -2425,7 +2728,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 147
+        "y": 164
       },
       "datasource": {
         "type": "loki",

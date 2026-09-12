@@ -1,0 +1,36 @@
+id = "cap-meteoalarm-wis2"
+title = "MeteoAlarm warnings (WIS2)"
+description = "European national meteorological warnings from the EUMETNET MeteoAlarm hub, pushed as CAP v1.2 documents over WMO WIS2 (Global Broker subscription). Each alert area is a Feature and a severity-shaded map layer."
+engine_type = "cap"
+apis = ["features", "wms", "maps", "tiles"]
+keywords = ["alerts", "warnings", "CAP", "MeteoAlarm", "WIS2", "Europe"]
+
+[license]
+title = "CC-BY-4.0"
+
+[cap]
+poll_interval_secs = 60      # forced catalog rebuild cadence (advances "now",
+                             # evicts expired alerts); dirty rebuilds every 5 s
+language = "en"              # keep the English <info> per alert
+status_filter = ["Actual"]
+retention_grace = "PT1H"     # keep an alert 1 h past its <expires>
+max_alerts = 10000
+geometry_links = true        # fetch the hub's rel=geometry zone polygon per area
+                             # (the CAP XML itself is geocode-only) — links are
+                             # pre-signed and expire within ~1 h, hence on arrival
+bbox_fallback = false        # never draw a bounding box as the warning area
+# geocode_geometry = "testdata/cap/emma-fi.geojson"   # optional offline fallback
+# geocode_value_name = "EMMA_ID"
+
+# WIS2 push source (mutually exclusive with data_path / feed_url). The hub
+# publishes one notification per alert × info × area on the core topic; the
+# broker relays each once per Global Cache — ds-wis2 dedups by data_id.
+[cap.wis2]
+topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnings"]
+# broker = "mqtts://globalbroker.meteo.fr:8883"   # default; any Global Broker works
+# username = "everyone"                          # default (public account)
+# password = "everyone"                          # default; or password_env = "..."
+# download_allowlist = []                        # default policy: https + public DNS host
+
+[wms]
+colormap = "cap_severity"

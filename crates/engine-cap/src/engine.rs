@@ -9,15 +9,19 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_poll::{FirstTick, Shutdown};
 
-use ds_core::config::CapConfig;
+use ds_core::config::{CapConfig, Wis2Config};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery};
+use ds_core::health::LiveStatus;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_render::rasterize::{fill_polygon, Combine};
+use ds_wis2::{Status as Wis2Status, StatusSnapshot as Wis2StatusSnapshot};
 
 use crate::catalog::{BuildConfig, Catalog, CatalogStore};
 use crate::source::Source;
+use crate::supersede::resolve_references;
+use crate::wis2::{Wis2CapSource, Wis2SourceConfig};
 
 /// The single render parameter advertised by a CAP collection (one layer = the
 /// alert set, shaded by severity code 0–4).
@@ -25,6 +29,10 @@ pub const CAP_PARAMETER: &str = "severity";
 
 /// Upper bound on areas rasterized into one tile (pathological-input guard).
 const MAX_RENDER_RECORDS: usize = 50_000;
+/// WIS2 mode: how often the catalog is rebuilt when the accumulator is dirty.
+/// Also the floor between two rebuilds — every rebuild advances `as_of`, the
+/// TIME-less WMS cache key, so two catalogs must never share one second.
+const WIS2_DIRTY_REBUILD: Duration = Duration::from_secs(5);
 
 /// CAP alert engine. Polls a local directory or web feed, parses CAP v1.2
 /// documents into a [`Catalog`], and swaps it atomically.
@@ -41,6 +49,21 @@ pub struct CapEngine {
     /// healthy CAP source can legitimately have no active alerts, so "loaded"
     /// (not "non-empty") is the readiness signal; see [`Self::is_loaded`].
     loaded: AtomicBool,
+    /// WIS2 mode only: subscription config (the pipeline is started from
+    /// `poll_loop`, never from the constructor — see `crates/ds-wis2/CLAUDE.md`).
+    wis2: Option<Wis2Runtime>,
+    /// Alerts withdrawn by an Update/Cancel chain, cumulative over rebuilds
+    /// (`cap_alerts_superseded_total`).
+    superseded: std::sync::atomic::AtomicU64,
+}
+
+/// WIS2-mode state shared between `poll_loop` and the health/metrics readers.
+struct Wis2Runtime {
+    config: Wis2Config,
+    /// Broker/pipeline counters; swapped in by `poll_loop` once the pipeline
+    /// exists (`None` until then ⇒ "connecting").
+    status: ArcSwap<Option<Arc<Wis2Status>>>,
+    degrade_after: Duration,
 }
 
 impl CapEngine {
@@ -49,15 +72,39 @@ impl CapEngine {
     /// (degraded) and the poll loop fills it in, matching the file-backed
     /// raster engines.
     pub fn new(config: &CapConfig, collection_id: &str) -> Result<Self, DataServerError> {
-        let source = Source::build(
-            config.data_path.as_deref(),
-            config.feed_url.as_deref(),
-            &config.feed_allowlist,
-        )?;
-
         let default_ttl = match &config.default_ttl {
             Some(s) => Some(parse_iso8601_duration(s)?),
             None => None,
+        };
+        let (source, wis2) = match &config.wis2 {
+            Some(w) => {
+                let src = Arc::new(Wis2CapSource::new(Wis2SourceConfig {
+                    retention_grace: parse_iso8601_duration(&config.retention_grace)?,
+                    max_alerts: config.max_alerts.max(1),
+                    geometry_links: config.geometry_links,
+                    bbox_fallback: config.bbox_fallback,
+                    default_ttl,
+                }));
+                (
+                    Source::Wis2 {
+                        source: src,
+                        topics: w.topics.clone(),
+                    },
+                    Some(Wis2Runtime {
+                        config: w.clone(),
+                        status: ArcSwap::from_pointee(None),
+                        degrade_after: Duration::from_secs(w.degrade_after_secs.max(1)),
+                    }),
+                )
+            }
+            None => (
+                Source::build(
+                    config.data_path.as_deref(),
+                    config.feed_url.as_deref(),
+                    &config.feed_allowlist,
+                )?,
+                None,
+            ),
         };
         // Load the optional geocode → geometry lookup once (static reference
         // data). A misconfigured path is a hard error — it's local config, unlike
@@ -101,16 +148,111 @@ impl CapEngine {
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             shutdown: Shutdown::new(),
             loaded: AtomicBool::new(false),
+            wis2,
+            superseded: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Best-effort initial load (so local fixtures populate immediately).
-        if let Err(e) = engine.refresh() {
-            tracing::warn!(
-                "[{collection_id}] cap: initial load from {} failed: {e} (will retry on poll)",
-                engine.source.label()
-            );
+        // WIS2 mode has nothing to load until the broker delivers: it stays
+        // `Degraded("waiting for broker")` until the first rebuild after
+        // subscribing (see `poll_loop`).
+        if engine.wis2.is_none() {
+            if let Err(e) = engine.refresh() {
+                tracing::warn!(
+                    "[{collection_id}] cap: initial load from {} failed: {e} (will retry on poll)",
+                    engine.source.label()
+                );
+            }
         }
         Ok(engine)
+    }
+
+    /// Whether this collection is fed by a WIS2 subscription.
+    pub fn is_wis2(&self) -> bool {
+        self.wis2.is_some()
+    }
+
+    /// The WIS2 accumulator (WIS2 mode only) — lets tests feed notifications
+    /// without a broker.
+    pub fn wis2_source(&self) -> Option<&Arc<Wis2CapSource>> {
+        self.source.wis2()
+    }
+
+    /// Runtime health for the WIS2 mode: `None` for directory/feed sources
+    /// (the boot snapshot stands), otherwise whether the broker session is up.
+    /// A disconnect shorter than `degrade_after_secs` is not reported — the
+    /// last catalog keeps serving and the session resumes with its backlog.
+    pub fn live_health(&self) -> Option<LiveStatus> {
+        let w = self.wis2.as_ref()?;
+        let status = w.status.load();
+        let Some(status) = status.as_ref() else {
+            return Some(LiveStatus::Degraded {
+                reason: "connecting to WIS2 broker",
+            });
+        };
+        let snap = status.snapshot();
+        if !snap.connected {
+            return Some(match snap.disconnected_for_secs {
+                Some(secs) if secs >= w.degrade_after.as_secs() => LiveStatus::Degraded {
+                    reason: "WIS2 broker disconnected",
+                },
+                // Never connected yet, or a short blip inside the grace period.
+                Some(_) => {
+                    if self.is_loaded() {
+                        LiveStatus::Ready
+                    } else {
+                        LiveStatus::Degraded {
+                            reason: "connecting to WIS2 broker",
+                        }
+                    }
+                }
+                None => LiveStatus::Degraded {
+                    reason: "connecting to WIS2 broker",
+                },
+            });
+        }
+        if !snap.subscribed {
+            return Some(LiveStatus::Degraded {
+                reason: "WIS2 subscription not acknowledged",
+            });
+        }
+        Some(if self.is_loaded() {
+            LiveStatus::Ready
+        } else {
+            LiveStatus::Degraded {
+                reason: "waiting for first WIS2 catalog build",
+            }
+        })
+    }
+
+    /// WIS2 broker/pipeline counters for `/metrics` (`None` unless WIS2 mode
+    /// and the pipeline has started).
+    pub fn wis2_status(&self) -> Option<Wis2StatusSnapshot> {
+        let w = self.wis2.as_ref()?;
+        let guard = w.status.load();
+        guard.as_ref().as_ref().map(|s| s.snapshot())
+    }
+
+    /// WIS2 accumulator counters (`None` unless WIS2 mode). Values:
+    /// `(documents_ingested, documents_rejected, deletions, hints_attached,
+    /// hints_rejected, evicted, alerts_held)`.
+    pub fn wis2_source_stats(&self) -> Option<[u64; 7]> {
+        let src = self.source.wis2()?;
+        let st = &src.stats;
+        Some([
+            st.documents_ingested.load(Ordering::Relaxed),
+            st.documents_rejected.load(Ordering::Relaxed),
+            st.deletions.load(Ordering::Relaxed),
+            st.hints_attached.load(Ordering::Relaxed),
+            st.hints_rejected.load(Ordering::Relaxed),
+            st.evicted.load(Ordering::Relaxed),
+            src.len() as u64,
+        ])
+    }
+
+    /// Number of alert areas in the current catalog.
+    pub fn record_count(&self) -> usize {
+        self.snapshot().records.len()
     }
 
     /// Collection id (for logging / health).
@@ -131,6 +273,12 @@ impl CapEngine {
     /// on an I/O failure so a transient outage doesn't blank the alerts.
     pub fn refresh(&self) -> Result<(), DataServerError> {
         let alerts = self.source.load()?;
+        // Apply CAP Update/Cancel chains for every source mode: a directory
+        // or feed that keeps an alert next to its cancellation must not
+        // render both.
+        let (alerts, superseded) = resolve_references(alerts);
+        self.superseded
+            .fetch_add(superseded as u64, Ordering::Relaxed);
         let as_of = Utc::now();
         let catalog = Catalog::build(
             &alerts,
@@ -140,10 +288,11 @@ impl CapEngine {
             as_of,
         );
         tracing::info!(
-            "[{}] cap: loaded {} alert area(s) ({} geocode-only) from {}",
+            "[{}] cap: loaded {} alert area(s) ({} geocode-only, {} superseded) from {}",
             self.collection_id,
             catalog.records.len(),
             catalog.geocode_only_count,
+            superseded,
             self.source.label()
         );
         self.catalog.store(Arc::new(catalog));
@@ -152,14 +301,87 @@ impl CapEngine {
     }
 
     /// Run the poll loop on the background runtime. Exits on [`Self::shutdown`].
+    ///
+    /// Directory/feed: a fixed-cadence refresh. WIS2: starts the broker
+    /// pipeline (must happen here — this is the only entry point guaranteed
+    /// to run on `poll_runtime()`), applies every resolved notification to
+    /// the accumulator, rebuilds the catalog at most every
+    /// [`WIS2_DIRTY_REBUILD`] when something changed, and forces a rebuild
+    /// every `poll_interval_secs` so `as_of` advances and expired alerts
+    /// drop out of the "now" view while the feed is quiet.
     pub async fn poll_loop(&self) {
-        let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
-        while ticker.tick().await {
-            if let Err(e) = self.refresh() {
-                tracing::warn!("[{}] cap: poll refresh failed: {e}", self.collection_id);
+        match &self.wis2 {
+            None => {
+                let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+                while ticker.tick().await {
+                    if let Err(e) = self.refresh() {
+                        tracing::warn!("[{}] cap: poll refresh failed: {e}", self.collection_id);
+                    }
+                }
             }
+            Some(w) => self.wis2_loop(w).await,
         }
         tracing::info!("[{}] cap: poll loop shutting down", self.collection_id);
+    }
+
+    async fn wis2_loop(&self, w: &Wis2Runtime) {
+        let Some(source) = self.source.wis2().cloned() else {
+            return;
+        };
+        let shutdown = Arc::new(Shutdown::new());
+        let mut pipeline =
+            match ds_wis2::spawn_pipeline(&w.config, &self.collection_id, shutdown.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        "[{}] cap/wis2: cannot start subscription: {e}",
+                        self.collection_id
+                    );
+                    return;
+                }
+            };
+        w.status.store(Arc::new(Some(pipeline.status.clone())));
+        let fetcher = pipeline.fetcher.clone();
+        let mut dirty_ticker = self.shutdown.ticker(WIS2_DIRTY_REBUILD, FirstTick::Skip);
+        let mut forced_ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+        let mut first_build_pending = true;
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.wait() => break,
+                r = pipeline.receiver.recv() => {
+                    match r {
+                        Some(r) => source.apply(r, &fetcher, &self.collection_id).await,
+                        None => {
+                            tracing::warn!("[{}] cap/wis2: pipeline ended", self.collection_id);
+                            break;
+                        }
+                    }
+                }
+                _ = dirty_ticker.tick() => {
+                    let subscribed = pipeline.status.is_subscribed();
+                    if source.take_dirty() || (first_build_pending && subscribed) {
+                        first_build_pending = false;
+                        if let Err(e) = self.refresh() {
+                            tracing::warn!("[{}] cap: rebuild failed: {e}", self.collection_id);
+                        }
+                    }
+                }
+                _ = forced_ticker.tick() => {
+                    if let Err(e) = self.refresh() {
+                        tracing::warn!("[{}] cap: periodic rebuild failed: {e}", self.collection_id);
+                    }
+                }
+            }
+        }
+        // Stop the broker task with the engine (the pipeline's own Shutdown is
+        // private to this loop so a reload cannot leave a subscriber behind).
+        shutdown.shutdown();
+    }
+
+    /// Alerts withdrawn by Update/Cancel chains since boot.
+    pub fn superseded_total(&self) -> u64 {
+        self.superseded.load(Ordering::Relaxed)
     }
 
     /// Signal the poll loop to stop.

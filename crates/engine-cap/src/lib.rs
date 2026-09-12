@@ -23,6 +23,9 @@ mod engine;
 mod geocode;
 mod parser;
 mod source;
+mod supersede;
+pub mod wis2;
 
 pub use catalog::severity_code;
 pub use engine::{CapEngine, CAP_PARAMETER};
+pub use parser::{CapAlert, CapArea, CapAreaHint, CapInfo};
