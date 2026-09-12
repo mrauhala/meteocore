@@ -46,18 +46,27 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Explicitly allow the tools Claude needs to read the PR and
-          # post findings. Without this, the action's default allowlist
-          # does not include the commenting MCP tools on pull_request
-          # events, and Claude hits a permission denial on its first
-          # attempt to comment (run dies after ~4 turns / 6 seconds).
+          # In agent mode `--allowedTools` is the WHOLE allowlist — the
+          # action adds nothing to it — and a headless run denies every
+          # tool outside it. The previous list held only the four
+          # commenting/diff tools, so the reviewer could not Read/Grep the
+          # code it was reviewing: every run showed 10–30 permission
+          # denials, finished in two turns, and usually posted nothing
+          # (its verdict ended up as hidden text output). Grant the
+          # read-only exploration tools plus read-only git/gh, the inline
+          # comment MCP tool, and `gh pr comment` for the summary.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "Read,Glob,Grep,LS,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
           prompt: |
             Review this pull request for correctness, security, and
-            compliance with CLAUDE.md. Post a concise top-level PR
-            comment summarising findings, and add inline comments on
-            specific problem lines. Flag real issues only — do not
-            nitpick style.
+            compliance with CLAUDE.md (root and the per-crate files it
+            points to). Read the changed files and the code they touch,
+            not just the diff. Add inline comments on specific problem
+            lines, then ALWAYS post exactly one top-level PR comment via
+            `gh pr comment`: either a concise summary of the findings, or
+            "No issues found" with a one-line note of what you checked.
+            A run that posts nothing is indistinguishable from a broken
+            reviewer — never end without the top-level comment. Flag real
+            issues only; do not nitpick style.
             REPO: ${{ github.repository }}
             PR_NUMBER: ${{ github.event.pull_request.number }}
