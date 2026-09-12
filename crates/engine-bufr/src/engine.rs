@@ -2,6 +2,7 @@
 //! `FeatureEngine` (station = Point feature) over the in-memory store.
 
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -493,6 +494,15 @@ const SORTABLES: &[&str] = &["last_report", "first_report", "report_count", "nam
 impl FeatureEngine for BufrEngine {
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let snap = self.snapshot.load();
+        // `datetime`: a station matches when it has at least one report
+        // INSIDE the interval — `[first_report, last_report]` overlapping the
+        // interval is only the cheap prefilter (hourly SYNOP leaves gaps a
+        // narrow window can fall into), the rows themselves decide. One read
+        // lock for the whole filter; a BTreeMap range probe per candidate.
+        let store = query
+            .datetime
+            .as_ref()
+            .map(|_| self.store.read().unwrap_or_else(|e| e.into_inner()));
         let mut features: Vec<Feature> = snap
             .features
             .iter()
@@ -501,17 +511,22 @@ impl FeatureEngine for BufrEngine {
                 Some(b) => b.contains(s.lon, s.lat),
                 None => true,
             })
-            .filter(|(_, s)| match &query.datetime {
-                // A station matches when it has at least one report inside
-                // the interval.
-                Some(dt) => {
-                    dt.start.is_none_or(|start| s.last_report >= start)
-                        && dt.end.is_none_or(|end| s.first_report <= end)
+            .filter(|(_, s)| match (&query.datetime, &store) {
+                (Some(dt), Some(store)) => {
+                    let overlaps = dt.start.is_none_or(|start| s.last_report >= start)
+                        && dt.end.is_none_or(|end| s.first_report <= end);
+                    overlaps
+                        && store.get(&s.id).is_some_and(|series| {
+                            let lo = dt.start.map_or(Bound::Unbounded, Bound::Included);
+                            let hi = dt.end.map_or(Bound::Unbounded, Bound::Included);
+                            series.rows.range((lo, hi)).next().is_some()
+                        })
                 }
-                None => true,
+                _ => true,
             })
             .map(|(f, _)| f.clone())
             .collect();
+        drop(store);
         sort_features(&mut features, &query.sortby);
         let number_matched = features.len();
         let offset = query.offset.min(number_matched);
@@ -552,5 +567,78 @@ impl FeatureEngine for BufrEngine {
 
     fn data_version(&self) -> u64 {
         self.snapshot.load().version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use ds_core::config::BufrConfig;
+    use ds_core::feature::{DatetimeInterval, FeatureQuery};
+    use ds_core::feature_engine::FeatureEngine;
+
+    fn fixtures_dir() -> String {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/bufr-synop")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn report(id: &str, t: DateTime<Utc>) -> crate::decode::ObsReport {
+        crate::decode::ObsReport {
+            station_id: id.into(),
+            name: None,
+            lat: 60.0,
+            lon: 25.0,
+            elevation: None,
+            time: t,
+            elements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn features_datetime_requires_a_report_inside_the_interval() {
+        let cfg = BufrConfig {
+            data_path: Some(fixtures_dir()),
+            wis2: None,
+            poll_interval_secs: 60,
+            retention: "P36500D".to_string(),
+            max_stations: 50_000,
+            stale_after: "PT2H".to_string(),
+            position_radius_km: 25.0,
+            builtin_parameters: true,
+            parameters: Vec::new(),
+        };
+        let e = BufrEngine::new(&cfg, "bufr-gap").unwrap();
+        // One station reporting at 08:00 and 09:00 only.
+        let h = |hh: u32, mm: u32| Utc.with_ymd_and_hms(2026, 9, 12, hh, mm, 0).unwrap();
+        {
+            let mut store = e.store.write().unwrap();
+            store.ingest(&report("gap-station", h(8, 0)), &e.table, h(9, 0));
+            store.ingest(&report("gap-station", h(9, 0)), &e.table, h(9, 0));
+        }
+        e.rebuild_snapshot();
+        let matched = |start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>| {
+            e.get_features(&FeatureQuery {
+                datetime: Some(DatetimeInterval { start, end }),
+                ..FeatureQuery::default()
+            })
+            .unwrap()
+            .features
+            .iter()
+            .any(|f| f.id == "gap-station")
+        };
+        // A window in the gap between the two reports overlaps
+        // [first_report, last_report] but holds no report: no match.
+        assert!(!matched(Some(h(8, 15)), Some(h(8, 45))));
+        // Windows containing a report (bounds inclusive) do match.
+        assert!(matched(Some(h(8, 0)), Some(h(8, 30))));
+        assert!(matched(Some(h(8, 30)), Some(h(9, 0))));
+        assert!(matched(Some(h(8, 30)), None));
+        assert!(matched(None, Some(h(8, 0))));
+        // Entirely outside: no match.
+        assert!(!matched(Some(h(9, 1)), None));
+        assert!(!matched(None, Some(h(7, 59))));
     }
 }

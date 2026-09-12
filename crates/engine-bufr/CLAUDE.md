@@ -82,8 +82,11 @@ store row is a dense `Box<[f32]>` (`NaN` = missing); output widens through
   empty area is an empty `CoverageCollection`, not 404; `radius` is the
   trait default (point + `within` → area).
 - Features: `bbox` = station point inside; `datetime` = station has a
-  report inside the interval; `sortby` ∈ `last_report, first_report,
-  report_count, name` via `ds_core::feature::sort_features`;
+  report inside the interval — the snapshot's `[first_report, last_report]`
+  overlap is only the prefilter, the rows decide (one store read lock per
+  `datetime` query, a BTreeMap range probe per candidate; hourly SYNOP
+  leaves gaps a narrow window falls into); `sortby` ∈ `last_report,
+  first_report, report_count, name` via `ds_core::feature::sort_features`;
   `data_version` = snapshot version.
 
 ## Lifecycle & runtime rules
