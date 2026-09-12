@@ -92,13 +92,19 @@ impl SkipReason {
     }
 }
 
-/// Outcome of decoding one file: reports plus per-subset skips.
+/// Outcome of decoding one file: reports plus per-subset skips and
+/// per-message failures.
 #[derive(Debug, Default)]
 pub struct Decoded {
     pub reports: Vec<ObsReport>,
     pub skipped: Vec<SkipReason>,
-    /// Number of BUFR messages found in the byte stream.
+    /// Number of BUFR messages found in the byte stream (decoded or not).
     pub messages: usize,
+    /// Messages that failed to decode. A failure is scoped to its own
+    /// message: a concatenated file keeps every report from the messages
+    /// before and after it (the failing message contributes nothing — its
+    /// subsets are only emitted once the whole message has been read).
+    pub failed: Vec<DecodeError>,
 }
 
 /// Holds the (expensive to build) WMO tables — construct once per engine.
@@ -137,7 +143,10 @@ impl Decoder {
     }
 
     /// Decode every BUFR message in `bytes` (files may concatenate several
-    /// `BUFR…7777` messages; anything between messages is skipped).
+    /// `BUFR…7777` messages; anything between messages is skipped). Only a
+    /// stream with no `BUFR` magic at all is an `Err`; a message that fails
+    /// is recorded in [`Decoded::failed`] and the scan moves on to the next
+    /// one via the section-0 total length.
     pub fn decode(&self, bytes: &[u8]) -> Result<Decoded, DecodeError> {
         let mut out = Decoded::default();
         let mut pos = 0usize;
@@ -154,7 +163,9 @@ impl Decoder {
             } else {
                 bytes.len()
             };
-            self.decode_message(&bytes[start..end], &mut out)?;
+            if let Err(e) = self.decode_message(&bytes[start..end], &mut out) {
+                out.failed.push(e);
+            }
             out.messages += 1;
             pos = end.max(start + 4);
         }

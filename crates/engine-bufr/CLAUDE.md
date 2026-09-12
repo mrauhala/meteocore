@@ -18,10 +18,13 @@ Global Broker, values cross-checked with ecCodes `bufr_dump`).
   build **once per engine** (`Decoder::new`), never per message.
 - `Value::Decimal(v, s)` means `v · 10^s` with `s` negative for fractions.
 - Files may concatenate several `BUFR…7777` messages; `decode()` scans for
-  the magic and uses the section-0 total length.
+  the magic and uses the section-0 total length. A failure is scoped to
+  its own message (`Decoded::failed`): the reports of the messages before
+  and after it survive, and only a stream with no `BUFR` magic at all is
+  an `Err`. Pinned by `concatenated_file_keeps_the_good_messages_around_a_bad_one`.
 - Unsupported operators / features are `DecodeError::Unsupported`
-  (counted in `bufr_decode_failures_total{reason="unsupported"}`), other
-  failures `reason="error"`; neither is fatal to the scan.
+  (counted per message in `bufr_decode_failures_total{reason="unsupported"}`),
+  other failures `reason="error"`; neither is fatal to the file or the scan.
 
 ## Extraction rules (template-agnostic)
 
@@ -94,7 +97,11 @@ store row is a dense `Box<[f32]>` (`NaN` = missing); output widens through
   `rotate_poll_loops!` on reload.
 - `source.rs` uses `ds-storage` (`list` + `get_many`, bounded concurrency,
   16 MiB per file): **poll runtime only** (Critical Rule 7), never from a
-  request handler, never inside `spawn_blocking`.
+  request handler, never inside `spawn_blocking`. `scan()` fetches in
+  `FETCH_CHUNK`-sized `get_many` calls and streams each file to a sink
+  (the engine decodes + ingests it right there), so a 50 k-file backlog is
+  never resident at once — `get_many` buffers a whole batch, which is why
+  its doc says "a chunk, not thousands of paths" (engine-odim convention).
 - The fixture retention in `collections.d/obs-bufr-local.toml` is
   `P36500D` only because the fixtures are dated; production keeps `PT24H`.
 

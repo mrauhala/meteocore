@@ -130,42 +130,37 @@ impl BufrEngine {
         self.snapshot.load().temporal_extent.map(|(_, b)| b)
     }
 
-    /// One scan of the local source: fetch new files, decode, ingest.
+    /// One scan of the local source: fetch new files, decode, ingest. Files
+    /// are ingested as each fetch chunk lands, so a backlog is never held in
+    /// memory whole.
     fn scan_once(&self) {
         let Source::Local(src) = &self.source;
-        let fetched = {
-            let mut src = src.lock().unwrap_or_else(|e| e.into_inner());
-            match src.scan() {
-                Ok(f) => {
-                    self.health.record_scan(true);
-                    f
-                }
-                Err(e) => {
-                    self.health.record_scan(false);
-                    tracing::warn!(
-                        "[{}] bufr: scan of '{}' failed: {e}",
-                        self.collection_id,
-                        src.label()
-                    );
-                    return;
-                }
-            }
-        };
-        if fetched.is_empty() {
-            return;
-        }
         let now = Utc::now();
         let mut ingested = 0usize;
-        for f in &fetched {
+        let mut src = src.lock().unwrap_or_else(|e| e.into_inner());
+        let result = src.scan(|f| {
             self.health.files_total.fetch_add(1, Ordering::Relaxed);
             ingested += self.ingest_bytes(&f.bytes, &f.path, now);
+        });
+        match result {
+            Ok(0) => self.health.record_scan(true),
+            Ok(files) => {
+                self.health.record_scan(true);
+                tracing::info!(
+                    "[{}] bufr: {files} new file(s), {ingested} report(s) ingested from '{}'",
+                    self.collection_id,
+                    src.label()
+                );
+            }
+            Err(e) => {
+                self.health.record_scan(false);
+                tracing::warn!(
+                    "[{}] bufr: scan of '{}' failed: {e}",
+                    self.collection_id,
+                    src.label()
+                );
+            }
         }
-        tracing::info!(
-            "[{}] bufr: {} new file(s), {ingested} report(s) ingested from '{}'",
-            self.collection_id,
-            fetched.len(),
-            src.lock().unwrap_or_else(|e| e.into_inner()).label()
-        );
     }
 
     /// Decode one BUFR byte stream and ingest its reports. Returns the number
@@ -174,14 +169,8 @@ impl BufrEngine {
     pub fn ingest_bytes(&self, bytes: &[u8], label: &str, now: DateTime<Utc>) -> usize {
         let decoded = match self.decoder.decode(bytes) {
             Ok(d) => d,
-            Err(DecodeError::Unsupported(m)) => {
-                self.health
-                    .decode_unsupported_total
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("[{}] bufr: '{label}' unsupported: {m}", self.collection_id);
-                return 0;
-            }
             Err(e) => {
+                // No BUFR magic at all — the whole object is not a message.
                 self.health
                     .decode_failures_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -189,6 +178,24 @@ impl BufrEngine {
                 return 0;
             }
         };
+        // Per-message failures: the other messages of a concatenated file
+        // still ingest below.
+        for e in &decoded.failed {
+            match e {
+                DecodeError::Unsupported(m) => {
+                    self.health
+                        .decode_unsupported_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("[{}] bufr: '{label}' unsupported: {m}", self.collection_id);
+                }
+                e => {
+                    self.health
+                        .decode_failures_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("[{}] bufr: '{label}' failed: {e}", self.collection_id);
+                }
+            }
+        }
         self.health
             .subsets_skipped_total
             .fetch_add(decoded.skipped.len() as u64, Ordering::Relaxed);

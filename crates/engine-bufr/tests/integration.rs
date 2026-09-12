@@ -356,3 +356,62 @@ fn retention_window_rejects_stale_fixtures() {
         );
     }
 }
+
+/// A copy of `msg` whose first section-3 descriptor is replaced with the
+/// unassigned `3-63-255` (edition 4, no optional section 2 — true for every
+/// fixture), so tinybufr fails on that message and no other.
+fn corrupt_descriptor(msg: &[u8]) -> Vec<u8> {
+    let be24 = |o: usize| u32::from_be_bytes([0, msg[o], msg[o + 1], msg[o + 2]]) as usize;
+    assert_eq!(msg[7], 4, "edition 4 fixture");
+    assert_eq!(msg[8 + 9] & 0x80, 0, "no optional section 2");
+    let s3 = 8 + be24(8);
+    let mut out = msg.to_vec();
+    out[s3 + 7] = 0xFF;
+    out[s3 + 8] = 0xFF;
+    out
+}
+
+#[test]
+fn concatenated_file_keeps_the_good_messages_around_a_bad_one() {
+    // A bulletin of three messages; the middle one cannot be decoded. The
+    // reports before AND after it must survive (a per-message failure is
+    // not fatal to the file), and the failure is reported once.
+    let smhi = std::fs::read(fixtures().join("synop_se-smhi_20260912T0800Z.bufr")).unwrap();
+    let arg = std::fs::read(fixtures().join("synop_ar-smn_20260912T0800Z.bufr")).unwrap();
+    let mut file = smhi.clone();
+    file.extend_from_slice(&corrupt_descriptor(&smhi));
+    file.extend_from_slice(&arg);
+
+    let d = Decoder::new();
+    let out = d.decode(&file).unwrap();
+    assert_eq!(out.messages, 3);
+    assert_eq!(out.failed.len(), 1, "{:?}", out.failed);
+    let ids: Vec<&str> = out.reports.iter().map(|r| r.station_id.as_str()).collect();
+    assert_eq!(ids, vec![SMHI, ARG]);
+    // The bad message alone is still a decodable stream with one failure,
+    // never an `Err` (only a stream with no BUFR magic at all is).
+    let alone = d.decode(&corrupt_descriptor(&smhi)).unwrap();
+    assert_eq!(
+        (alone.messages, alone.failed.len(), alone.reports.len()),
+        (1, 1, 0)
+    );
+
+    // Through the engine: both good reports ingest, one failure counted.
+    let e = engine();
+    let before = e
+        .health
+        .decode_failures_total
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + e.health
+            .decode_unsupported_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(e.ingest_bytes(&file, "bulletin", t0800()), 2);
+    let after = e
+        .health
+        .decode_failures_total
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + e.health
+            .decode_unsupported_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(after - before, 1);
+}

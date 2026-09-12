@@ -14,6 +14,12 @@ use ds_storage::{build_store, DataStore};
 
 /// Concurrent object fetches per scan (Rule 9: never a sequential loop).
 const FETCH_CONCURRENCY: usize = 8;
+/// Files per `get_many` call. `get_many` buffers a whole batch's bytes
+/// before returning, so this — not the listing size — bounds both the
+/// length of one blocking call and peak memory (≤ `FETCH_CHUNK` ×
+/// `MAX_FILE_BYTES`); each chunk is handed to the sink and dropped before
+/// the next is fetched (the engine-odim convention).
+const FETCH_CHUNK: usize = FETCH_CONCURRENCY;
 /// Largest BUFR file fetched (a SYNOP bulletin is tens of KiB; a whole
 /// TEMP collective a few MiB).
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -56,8 +62,11 @@ impl LocalSource {
     }
 
     /// List the prefix and fetch every BUFR file not seen before (or whose
-    /// size / mtime changed). Blocking; poll runtime only.
-    pub fn scan(&mut self) -> Result<Vec<Fetched>, DataServerError> {
+    /// size / mtime changed), handing each file to `sink` chunk by chunk so
+    /// a backlog never sits in memory whole. Returns the number of files
+    /// fetched. Blocking; poll runtime only. `Err` when the listing fails
+    /// or when every fetch failed (nothing reached the sink).
+    pub fn scan(&mut self, mut sink: impl FnMut(Fetched)) -> Result<usize, DataServerError> {
         let mut listed = self.store.list(&self.base)?;
         if listed.len() > MAX_LISTED {
             tracing::warn!(
@@ -85,26 +94,44 @@ impl LocalSource {
             wanted.push((m.location.clone(), key.0, key.1));
         }
         if wanted.is_empty() {
-            return Ok(Vec::new());
+            return Ok(0);
         }
-        let paths: Vec<ObjectPath> = wanted.iter().map(|w| w.0.clone()).collect();
-        let results = self
-            .store
-            .get_many(&paths, FETCH_CONCURRENCY, Some(MAX_FILE_BYTES))?;
-        let mut out = Vec::with_capacity(paths.len());
-        for ((path, size, mtime), res) in wanted.into_iter().zip(results) {
-            match res {
-                Ok(bytes) => {
-                    self.remember(path.as_ref(), (size, mtime));
-                    out.push(Fetched {
-                        path: path.to_string(),
-                        bytes,
-                    });
+        let mut fetched = 0usize;
+        let mut failed_chunks = 0usize;
+        for chunk in wanted.chunks(FETCH_CHUNK) {
+            let paths: Vec<ObjectPath> = chunk.iter().map(|w| w.0.clone()).collect();
+            let results = match self
+                .store
+                .get_many(&paths, FETCH_CONCURRENCY, Some(MAX_FILE_BYTES))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    failed_chunks += 1;
+                    tracing::warn!("bufr: batch fetch under '{}' failed: {e}", self.label);
+                    continue;
                 }
-                Err(e) => tracing::warn!("bufr: fetch of '{path}' failed: {e}"),
+            };
+            for ((path, size, mtime), res) in chunk.iter().zip(results) {
+                match res {
+                    Ok(bytes) => {
+                        self.remember(path.as_ref(), (*size, *mtime));
+                        fetched += 1;
+                        sink(Fetched {
+                            path: path.to_string(),
+                            bytes,
+                        });
+                    }
+                    Err(e) => tracing::warn!("bufr: fetch of '{path}' failed: {e}"),
+                }
             }
         }
-        Ok(out)
+        if fetched == 0 && failed_chunks > 0 {
+            return Err(DataServerError::Storage(format!(
+                "every batch fetch under '{}' failed",
+                self.label
+            )));
+        }
+        Ok(fetched)
     }
 
     fn remember(&mut self, path: &str, key: (u64, i64)) {
@@ -116,5 +143,57 @@ impl LocalSource {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/bufr-synop")
+            .join(name);
+        std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+    }
+
+    #[test]
+    fn scan_streams_every_new_file_in_bounded_chunks_and_remembers_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let smhi = fixture("synop_se-smhi_20260912T0800Z.bufr");
+        // More files than one fetch chunk, plus a non-BUFR extension that
+        // must be ignored.
+        let n = FETCH_CHUNK * 3 + 1;
+        for i in 0..n {
+            std::fs::write(dir.path().join(format!("m{i:03}.bufr")), &smhi).unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+        let mut src = LocalSource::new(dir.path().to_str().unwrap()).unwrap();
+
+        let mut got: Vec<String> = Vec::new();
+        let fetched = src
+            .scan(|f| {
+                assert_eq!(f.bytes.len(), smhi.len());
+                got.push(f.path);
+            })
+            .unwrap();
+        assert_eq!(fetched, n);
+        assert_eq!(got.len(), n);
+        assert!(got.iter().all(|p| p.ends_with(".bufr")));
+
+        // Nothing new: the sink is never called.
+        let again = src
+            .scan(|_| panic!("unchanged files must not be refetched"))
+            .unwrap();
+        assert_eq!(again, 0);
+
+        // A rewritten file (different size) is fetched again, alone.
+        let mut changed = smhi.clone();
+        changed.extend_from_slice(b"7777");
+        std::fs::write(dir.path().join("m000.bufr"), &changed).unwrap();
+        let mut refetched = Vec::new();
+        let n2 = src.scan(|f| refetched.push(f.path)).unwrap();
+        assert_eq!(n2, 1);
+        assert!(refetched[0].ends_with("m000.bufr"));
     }
 }
