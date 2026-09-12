@@ -30,7 +30,7 @@ url = "2"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs"] }
 
 [[bench]]
 name = "geotiff_engine"
