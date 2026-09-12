@@ -10,7 +10,8 @@ title = "CC-BY-4.0"
 
 [cap]
 poll_interval_secs = 60      # forced catalog rebuild cadence (advances "now",
-                             # evicts expired alerts); dirty rebuilds every 5 s
+                             # evicts expired alerts); dirty rebuilds every 5 s,
+                             # which is also the floor for this value
 language = "en"              # keep the English <info> per alert
 status_filter = ["Actual"]
 retention_grace = "PT1H"     # keep an alert 1 h past its <expires>

@@ -1356,6 +1356,7 @@ dependencies = [
  "ds-render",
  "ds-storage",
  "ds-wis2",
+ "futures",
  "quick-xml",
  "rstar",
  "serde_json",

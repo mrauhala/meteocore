@@ -879,6 +879,12 @@ fn default_status_filter() -> Vec<String> {
 /// Default WIS2 Global Broker (Météo-France). Any Global Broker carries the
 /// full notification stream, so the choice only affects latency.
 pub const DEFAULT_WIS2_BROKER: &str = "mqtts://globalbroker.meteo.fr:8883";
+/// Floor for `[cap] poll_interval_secs` when the source is `[cap.wis2]`: the
+/// engine rebuilds a dirty catalog at most this often (engine-cap derives its
+/// `WIS2_DIRTY_REBUILD` from it), and every rebuild advances `as_of`, the
+/// TIME-less WMS cache key — so nothing may ask for rebuilds closer together
+/// than this.
+pub const CAP_WIS2_MIN_POLL_INTERVAL_SECS: u64 = 5;
 /// Default WIS2 Global Broker credentials — public by design (WMO publishes
 /// them); only ever overridden for a private broker.
 pub const DEFAULT_WIS2_USERNAME: &str = "everyone";
@@ -2992,6 +2998,15 @@ impl ServerConfig {
                 }
                 if let Some(wis2) = &cap.wis2 {
                     validate_wis2(id, "cap.wis2", wis2)?;
+                    // In WIS2 mode `poll_interval_secs` is the forced-rebuild
+                    // cadence, which must not undercut the dirty-rebuild floor.
+                    if cap.poll_interval_secs < CAP_WIS2_MIN_POLL_INTERVAL_SECS {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap poll_interval_secs must be >= \
+                             {CAP_WIS2_MIN_POLL_INTERVAL_SECS} with [cap.wis2] (the catalog \
+                             rebuild floor)"
+                        )));
+                    }
                 }
                 crate::datetime::parse_iso8601_duration(&cap.retention_grace).map_err(|e| {
                     crate::error::DataServerError::Config(format!(
@@ -3357,6 +3372,23 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             cap_collection("max_alerts = 0\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n")
                 .validate()
                 .is_err()
+        );
+        // The forced-rebuild cadence may not undercut the dirty-rebuild floor
+        // (only in WIS2 mode — a 1 s feed poll is still allowed).
+        let fast = cap_collection(
+            "poll_interval_secs = 4\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n",
+        );
+        let err = fast.validate().unwrap_err().to_string();
+        assert!(err.contains("poll_interval_secs must be >= 5"), "{err}");
+        assert!(cap_collection(
+            "poll_interval_secs = 5\n[collections.cap.wis2]\ntopics = [\"cache/a\"]\n"
+        )
+        .validate()
+        .is_ok());
+        assert!(
+            cap_collection("poll_interval_secs = 1\nfeed_url = \"https://f/\"\n")
+                .validate()
+                .is_ok()
         );
     }
 

@@ -12,6 +12,7 @@ use ds_core::config::{CapConfig, Wis2Config};
 use ds_core::feature::{FeatureQuery, Geometry};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::health::LiveStatus;
+use ds_core::map_engine::MapEngine;
 use ds_wis2::{parse_notification, Notification, Payload, PayloadSource, Resolved};
 use engine_cap::wis2::{hint_from_bytes, hint_key};
 use engine_cap::CapEngine;
@@ -416,4 +417,124 @@ fn data_version_changes_when_geometry_changes() {
         Some("notification")
     );
     assert_ne!(engine.data_version(), v_bbox);
+}
+
+#[test]
+fn update_chain_withdrawal_is_counted_once_across_rebuilds() {
+    // Unlike a Cancel, the Update document itself is stored and re-fed to
+    // `resolve_references` on every rebuild with its `<references>` intact.
+    // The withdrawn original is already gone from the accumulator, so the
+    // rebuild has nothing to withdraw — the ingest count must stand alone.
+    let engine = CapEngine::new(&config(None, false), "cap-wis2").unwrap();
+    let src = engine.wis2_source().unwrap();
+    let xml = fixture("meteoalarm-mk-alert.xml");
+    let update = String::from_utf8(xml.clone())
+        .unwrap()
+        .replace(MK_IDENTIFIER, "update-1")
+        .replace("<msgType>Alert</msgType>", "<msgType>Update</msgType>")
+        .replace(
+            "<scope>Public</scope>",
+            &format!("<scope>Public</scope><references>uhmr@meteo.gov.mk,{MK_IDENTIFIER},2026-09-12T10:19:59+02:00</references>"),
+        );
+    let n = notification("meteoalarm-mk-notification.json");
+    src.apply_with_hint(resolved(n.clone(), xml), None, "t", T_TEST);
+    let mut u = n;
+    u.id = "u".into();
+    u.data_id = "eu-eumetnet-warnings/update".into();
+    u.pubtime = T_TEST + chrono::Duration::seconds(1);
+    src.apply_with_hint(resolved(u, update.into_bytes()), None, "t", T_TEST);
+
+    engine.refresh_with(|| T_TEST).unwrap();
+    // Only the Update renders (both of its infos), the original is withdrawn.
+    assert_eq!(engine.feature_count(), 2);
+    assert!(engine.get_feature("update-1.0.0").is_ok());
+    assert!(engine.get_feature(&format!("{MK_IDENTIFIER}.0.0")).is_err());
+    assert_eq!(engine.superseded_total(), 1);
+    for i in 1..=3 {
+        engine
+            .refresh_with(|| T_TEST + chrono::Duration::seconds(5 * i))
+            .unwrap();
+    }
+    assert_eq!(
+        engine.superseded_total(),
+        1,
+        "re-fed Update must not re-count"
+    );
+}
+
+#[test]
+fn resolve_time_keys_the_default_view_on_the_rendered_as_of() {
+    // #507 / root CLAUDE.md step 7: the API layers key the no-TTL rendered
+    // caches on `resolve_time`; a TIME-less request must resolve to the
+    // `as_of` that `get_raster_tile` substitutes, and follow every rebuild.
+    let engine = CapEngine::new(&config(None, false), "cap-wis2").unwrap();
+    let src = engine.wis2_source().unwrap();
+    let n = notification("meteoalarm-mk-notification.json");
+    src.apply_with_hint(
+        resolved(n, fixture("meteoalarm-mk-alert.xml")),
+        None,
+        "t",
+        T_TEST,
+    );
+    engine.refresh_with(|| T_TEST).unwrap();
+    assert_eq!(engine.resolve_time(None, None), Some(T_TEST));
+    // `as_of` is also what the WMS handler picks as `times.last()`.
+    assert_eq!(engine.raster_info().times.last().copied(), Some(T_TEST));
+    let explicit: DateTime<Utc> = "2026-09-12T12:00:00Z".parse().unwrap();
+    assert_eq!(engine.resolve_time(Some(explicit), None), Some(explicit));
+
+    let later = T_TEST + chrono::Duration::seconds(5);
+    engine.refresh_with(|| later).unwrap();
+    assert_eq!(engine.resolve_time(None, None), Some(later));
+}
+
+#[test]
+fn data_version_changes_when_only_a_vertex_moves() {
+    // A corrected zone outline with the SAME vertex count and the SAME bbox
+    // (an interior vertex nudged) must still change data_version — tiles
+    // and ETags key on it.
+    let engine = CapEngine::new(&config(None, false), "cap-wis2").unwrap();
+    let src = engine.wis2_source().unwrap();
+    let xml = fixture("meteoalarm-mk-alert.xml");
+    let n1 = notification("meteoalarm-mk-notification.json");
+    let original = fixture("meteoalarm-mk-area.geojson");
+    let hint1 = hint_from_bytes(&n1, &original).unwrap();
+    src.apply_with_hint(
+        resolved(n1.clone(), xml.clone()),
+        Some((1, 0, hint1.clone())),
+        "t",
+        T_TEST,
+    );
+    engine.refresh_with(|| T_TEST).unwrap();
+    let v1 = engine.data_version();
+
+    // Nudge one vertex that touches none of the bbox edges.
+    let mut doc: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let bbox = hint1.geometry.bbox().unwrap();
+    let ring = doc["geometry"]["coordinates"][0].as_array_mut().unwrap();
+    let idx = ring
+        .iter()
+        .position(|c| {
+            let (x, y) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
+            x > bbox[0] + 0.01 && x < bbox[2] - 0.01 && y > bbox[1] + 0.01 && y < bbox[3] - 0.01
+        })
+        .expect("an interior vertex");
+    let x = ring[idx][0].as_f64().unwrap();
+    ring[idx][0] = serde_json::Value::from(x + 0.001);
+    let moved = serde_json::to_vec(&doc).unwrap();
+    let hint2 = hint_from_bytes(&n1, &moved).unwrap();
+    assert_eq!(hint2.geometry.bbox(), Some(bbox), "bbox must be unchanged");
+
+    let mut n2 = n1.clone();
+    n2.id = "second".into();
+    n2.data_id = "eu-eumetnet-warnings/second".into();
+    n2.pubtime = T_TEST + chrono::Duration::seconds(30);
+    src.apply_with_hint(resolved(n2, xml), Some((1, 0, hint2)), "t", T_TEST);
+    engine.refresh_with(|| T_TEST).unwrap();
+    let f = engine.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
+    assert!(
+        matches!(&*f.geometry, Geometry::Polygon { exterior, .. } if exterior.len() == 82),
+        "same vertex count"
+    );
+    assert_ne!(engine.data_version(), v1);
 }

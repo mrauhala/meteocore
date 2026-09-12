@@ -16,6 +16,7 @@ arc-swap = "1"
 rstar = "0.12"
 url = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+futures = "0.3"
 tracing = "0.1"
 
 [dev-dependencies]

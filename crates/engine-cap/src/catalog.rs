@@ -678,38 +678,61 @@ fn compute_version(records: &[AreaRecord]) -> u64 {
         }
         // Geometry fingerprint: in WIS2 mode an area's shape can change
         // between rebuilds with id/severity/window/text untouched (a bbox
-        // fallback replaced by the exact zone polygon, or a hint attached
-        // where there was none); the MVT tile cache and Feature ETags key on
-        // this version, so the shape must be part of it.
+        // fallback replaced by the exact zone polygon, a hint attached where
+        // there was none, or a corrected zone outline with the same vertex
+        // count and bbox); the MVT tile cache and Feature ETags key on this
+        // version, so every coordinate is part of it.
         if let Some(PropertyValue::String(s)) = r.properties.get("geometry_source") {
             fnv1a(s.as_bytes(), &mut h);
         }
-        match r.bbox {
-            Some(b) => {
-                for v in b {
-                    fnv1a(&v.to_bits().to_le_bytes(), &mut h);
-                }
-            }
-            None => fnv1a(b"null", &mut h),
-        }
-        fnv1a(
-            &(geometry_vertex_count(&r.geometry) as u64).to_le_bytes(),
-            &mut h,
-        );
+        hash_geometry(&r.geometry, &mut h);
     }
     h
 }
 
-fn geometry_vertex_count(g: &Geometry) -> usize {
-    match g {
-        Geometry::Polygon { exterior, holes } => {
-            exterior.len() + holes.iter().map(Vec::len).sum::<usize>()
+/// Fold a geometry's structure and every coordinate into `h`. Coordinates
+/// are mixed a word at a time (FNV-style over the f64 bit patterns) rather
+/// than byte-wise — a 10 k-area catalog of NUTS3 outlines is millions of
+/// vertices per rebuild, and this runs on every one.
+fn hash_geometry(g: &Geometry, h: &mut u64) {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn word(w: u64, h: &mut u64) {
+        *h ^= w;
+        *h = h.wrapping_mul(PRIME);
+    }
+    fn ring(r: &[[f64; 2]], h: &mut u64) {
+        word(r.len() as u64, h);
+        for [x, y] in r {
+            word(x.to_bits(), h);
+            word(y.to_bits(), h);
         }
-        Geometry::MultiPolygon { polygons } => polygons
-            .iter()
-            .map(|(e, hs)| e.len() + hs.iter().map(Vec::len).sum::<usize>())
-            .sum(),
-        _ => 0,
+    }
+    match g {
+        Geometry::Null => word(0, h),
+        Geometry::Point { x, y } => {
+            word(1, h);
+            word(x.to_bits(), h);
+            word(y.to_bits(), h);
+        }
+        Geometry::Polygon { exterior, holes } => {
+            word(2, h);
+            ring(exterior, h);
+            word(holes.len() as u64, h);
+            for hole in holes {
+                ring(hole, h);
+            }
+        }
+        Geometry::MultiPolygon { polygons } => {
+            word(3, h);
+            word(polygons.len() as u64, h);
+            for (exterior, holes) in polygons {
+                ring(exterior, h);
+                word(holes.len() as u64, h);
+                for hole in holes {
+                    ring(hole, h);
+                }
+            }
+        }
     }
 }
 

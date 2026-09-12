@@ -587,7 +587,7 @@ engine_type = "cap"
 apis = ["features", "wms", "maps", "tiles"]
 
 [collections.cap]
-poll_interval_secs = 60     # forced rebuild cadence in wis2 mode
+poll_interval_secs = 60     # forced rebuild cadence in wis2 mode (min 5)
 language = "en"
 retention_grace = "PT1H"    # keep an alert this long past <expires>
 max_alerts = 10000

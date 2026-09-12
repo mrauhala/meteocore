@@ -8,17 +8,19 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_poll::{FirstTick, Shutdown};
+use futures::stream::{FuturesOrdered, StreamExt};
 
-use ds_core::config::{CapConfig, Wis2Config};
+use ds_core::config::{CapConfig, Wis2Config, CAP_WIS2_MIN_POLL_INTERVAL_SECS};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery};
 use ds_core::health::LiveStatus;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_render::rasterize::{fill_polygon, Combine};
-use ds_wis2::{Status as Wis2Status, StatusSnapshot as Wis2StatusSnapshot};
+use ds_wis2::{Fetcher, Resolved, Status as Wis2Status, StatusSnapshot as Wis2StatusSnapshot};
 
 use crate::catalog::{BuildConfig, Catalog, CatalogStore};
+use crate::parser::CapAreaHint;
 use crate::source::Source;
 use crate::supersede::resolve_references;
 use crate::wis2::{Wis2CapSource, Wis2SourceConfig};
@@ -38,8 +40,17 @@ const MAX_SUPERSEDED_IDS: usize = 100_000;
 const WIS2_RESPAWN_DELAY: Duration = Duration::from_secs(30);
 /// WIS2 mode: how often the catalog is rebuilt when the accumulator is dirty.
 /// Also the floor between two rebuilds — every rebuild advances `as_of`, the
-/// TIME-less WMS cache key, so two catalogs must never share one second.
-const WIS2_DIRTY_REBUILD: Duration = Duration::from_secs(5);
+/// TIME-less WMS cache key (see [`MapEngine::resolve_time`] below), so two
+/// catalogs must never share one second. The forced `poll_interval_secs`
+/// rebuild is folded into this cadence (it only marks a rebuild due), and
+/// config validation keeps `poll_interval_secs` at or above it.
+const WIS2_DIRTY_REBUILD: Duration = Duration::from_secs(CAP_WIS2_MIN_POLL_INTERVAL_SECS);
+/// WIS2 mode: `rel=geometry` hint downloads in flight at once. MeteoAlarm
+/// publishes one notification per alert × info × area, so a multi-area
+/// document is a burst of downloads — overlapped up to this many (the
+/// fetcher's own concurrency cap), applied in arrival order; beyond it the
+/// pipeline channel backs up and the broker queues, as before.
+const WIS2_HINT_INFLIGHT: usize = 8;
 
 /// CAP alert engine. Polls a local directory or web feed, parses CAP v1.2
 /// documents into a [`Catalog`], and swaps it atomically.
@@ -375,9 +386,17 @@ impl CapEngine {
         let Some(source) = self.source.wis2().cloned() else {
             return;
         };
+        let label: Arc<str> = Arc::from(self.collection_id.as_str());
         let mut dirty_ticker = self.shutdown.ticker(WIS2_DIRTY_REBUILD, FirstTick::Skip);
-        let mut forced_ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+        let mut forced_ticker = self
+            .shutdown
+            .ticker(self.poll_interval.max(WIS2_DIRTY_REBUILD), FirstTick::Skip);
         let mut first_build_pending = true;
+        let mut rebuild_due = false;
+        // Notifications whose hint download is in flight, in arrival order
+        // (kept across a session respawn — nothing about them depends on the
+        // broker session).
+        let mut pending = FuturesOrdered::new();
         'session: loop {
             let shutdown = Arc::new(Shutdown::new());
             let mut pipeline =
@@ -398,15 +417,42 @@ impl CapEngine {
             w.status.store(Arc::new(Some(pipeline.status.clone())));
             let fetcher = pipeline.fetcher.clone();
             loop {
+                // `biased`: the rebuild tickers sit ahead of the message arms
+                // so a QoS-1 backlog replay (the channel continuously ready)
+                // cannot starve them — a ticker fires at most every 5 s, so
+                // checking it first costs nothing in the steady state.
                 tokio::select! {
                     biased;
                     _ = self.shutdown.wait() => {
                         shutdown.shutdown();
                         break 'session;
                     }
-                    r = pipeline.receiver.recv() => {
+                    _ = dirty_ticker.tick() => {
+                        let subscribed = pipeline.status.is_subscribed();
+                        if source.take_dirty() || rebuild_due || (first_build_pending && subscribed) {
+                            first_build_pending = false;
+                            rebuild_due = false;
+                            if let Err(e) = self.refresh() {
+                                tracing::warn!("[{}] cap: rebuild failed: {e}", self.collection_id);
+                            }
+                        }
+                    }
+                    _ = forced_ticker.tick() => {
+                        // Folded into the dirty cadence so two rebuilds can
+                        // never land in the same second.
+                        rebuild_due = true;
+                    }
+                    Some((r, hint)) = pending.next(), if !pending.is_empty() => {
+                        source.apply_with_hint(r, hint, &label, Utc::now());
+                    }
+                    r = pipeline.receiver.recv(), if pending.len() < WIS2_HINT_INFLIGHT => {
                         match r {
-                            Some(r) => source.apply(r, &fetcher, &self.collection_id).await,
+                            Some(r) => pending.push_back(resolve_for_apply(
+                                source.clone(),
+                                fetcher.clone(),
+                                label.clone(),
+                                r,
+                            )),
                             None => {
                                 tracing::warn!(
                                     "[{}] cap/wis2: pipeline ended — restarting in {}s",
@@ -422,20 +468,6 @@ impl CapEngine {
                                 }
                                 continue 'session;
                             }
-                        }
-                    }
-                    _ = dirty_ticker.tick() => {
-                        let subscribed = pipeline.status.is_subscribed();
-                        if source.take_dirty() || (first_build_pending && subscribed) {
-                            first_build_pending = false;
-                            if let Err(e) = self.refresh() {
-                                tracing::warn!("[{}] cap: rebuild failed: {e}", self.collection_id);
-                            }
-                        }
-                    }
-                    _ = forced_ticker.tick() => {
-                        if let Err(e) = self.refresh() {
-                            tracing::warn!("[{}] cap: periodic rebuild failed: {e}", self.collection_id);
                         }
                     }
                 }
@@ -464,6 +496,19 @@ impl CapEngine {
     fn snapshot(&self) -> arc_swap::Guard<Arc<Catalog>> {
         self.catalog.load()
     }
+}
+
+/// The network half of one WIS2 notification (hint download), paired with
+/// the notification so the loop can apply them in arrival order once the
+/// download settles.
+async fn resolve_for_apply(
+    source: Arc<Wis2CapSource>,
+    fetcher: Arc<Fetcher>,
+    label: Arc<str>,
+    r: Resolved,
+) -> (Resolved, Option<(usize, usize, CapAreaHint)>) {
+    let hint = source.resolve_hint(&r, &fetcher, &label).await;
+    (r, hint)
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +634,20 @@ fn encode_feature_id(id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 impl MapEngine for CapEngine {
+    /// The instant a render is keyed on. `None` (a TIME-less request) means
+    /// "now" — the snapshot's `as_of`, exactly what [`Self::get_raster_tile`]
+    /// substitutes — so the no-TTL rendered/meta-tile caches key the default
+    /// view on the catalog actually rendered and follow every rebuild
+    /// (root `CLAUDE.md`, "Adding a new engine" step 7; #507). An explicit
+    /// TIME is rendered as-is (active-at-instant, no snapping).
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        Some(time.unwrap_or_else(|| self.snapshot().as_of))
+    }
+
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],

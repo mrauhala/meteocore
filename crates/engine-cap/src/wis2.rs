@@ -29,7 +29,7 @@
 //! still runs on every rebuild for all source modes (it is what the
 //! directory and feed sources rely on).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +39,7 @@ use ds_wis2::{Fetcher, Notification, Payload, Resolved};
 
 use crate::catalog::build_window;
 use crate::parser::{parse_document, CapAlert, CapAreaHint};
-use crate::supersede::{is_renderable, parse_references};
+use crate::supersede::{is_renderable, references_withdrawn_by};
 
 /// Alerts with no computable validity end are kept this long after receipt.
 pub const FALLBACK_LIFETIME: Duration = Duration::days(7);
@@ -62,6 +62,9 @@ pub struct Wis2SourceConfig {
 #[derive(Debug, Clone)]
 struct Entry {
     alert: CapAlert,
+    /// When the *current* content arrived — refreshed by every in-place
+    /// revision, so the 7-day fallback lifetime and the `max_alerts` age
+    /// order follow the source's latest affirmation, not first sighting.
     received: DateTime<Utc>,
     pubtime: DateTime<Utc>,
     /// The `data_id` whose document currently holds this alert's content. A
@@ -77,9 +80,32 @@ struct Accumulator {
     /// identifier → when it was withdrawn (deleted or cancelled); a document
     /// published before that instant must not resurrect it.
     tombstones: HashMap<String, DateTime<Utc>>,
-    /// data_id → identifiers its document contributed (a document may carry
-    /// several `<alert>`s).
+    /// data_id → identifiers whose *current* content that document holds (a
+    /// document may carry several `<alert>`s). Invariant: exactly the
+    /// `(entry.current_data_id, identifier)` pairs of `alerts` — every path
+    /// that drops or re-homes an entry unindexes it, so the index cannot
+    /// outgrow the alert set.
     data_id_index: HashMap<String, Vec<String>>,
+}
+
+impl Accumulator {
+    /// Drop `identifier` from `data_id`'s index entry (and the entry itself
+    /// once empty).
+    fn unindex(&mut self, data_id: &str, identifier: &str) {
+        if let Some(idents) = self.data_id_index.get_mut(data_id) {
+            idents.retain(|id| id != identifier);
+            if idents.is_empty() {
+                self.data_id_index.remove(data_id);
+            }
+        }
+    }
+
+    /// Remove an alert and its index entry; `Some(entry)` when it was held.
+    fn remove_alert(&mut self, identifier: &str) -> Option<Entry> {
+        let entry = self.alerts.remove(identifier)?;
+        self.unindex(&entry.current_data_id, identifier);
+        Some(entry)
+    }
 }
 
 /// Ingest-side counters surfaced through `/metrics`.
@@ -135,6 +161,30 @@ impl Wis2CapSource {
             .len()
     }
 
+    /// Test oracle for the `data_id_index` invariant: the index holds exactly
+    /// the `(current_data_id, identifier)` pairs of the held alerts.
+    #[cfg(test)]
+    fn assert_index_consistent(&self) {
+        let acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
+        let mut expected: Vec<(String, String)> = acc
+            .alerts
+            .iter()
+            .map(|(id, e)| (e.current_data_id.clone(), id.clone()))
+            .collect();
+        expected.sort();
+        let mut actual: Vec<(String, String)> = acc
+            .data_id_index
+            .iter()
+            .flat_map(|(d, ids)| ids.iter().map(move |i| (d.clone(), i.clone())))
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected, "data_id_index drifted from the alert set");
+        assert!(
+            acc.data_id_index.values().all(|v| !v.is_empty()),
+            "empty index entry left behind"
+        );
+    }
+
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -147,12 +197,26 @@ impl Wis2CapSource {
     }
 
     pub async fn apply_at(&self, r: Resolved, fetcher: &Fetcher, label: &str, now: DateTime<Utc>) {
-        let hint = if self.cfg.geometry_links && r.payload.is_some() {
+        let hint = self.resolve_hint(&r, fetcher, label).await;
+        self.apply_with_hint(r, hint, label, now);
+    }
+
+    /// The network half of [`Self::apply`]: download the `rel=geometry` hint
+    /// this notification names (when `geometry_links` is on and there is a
+    /// document to attach it to). Separated from the accumulator update so
+    /// the engine can overlap several downloads and still apply
+    /// notifications in arrival order.
+    pub async fn resolve_hint(
+        &self,
+        r: &Resolved,
+        fetcher: &Fetcher,
+        label: &str,
+    ) -> Option<(usize, usize, CapAreaHint)> {
+        if self.cfg.geometry_links && r.payload.is_some() {
             self.fetch_hint(&r.notification, fetcher, label).await
         } else {
             None
-        };
-        self.apply_with_hint(r, hint, label, now);
+        }
     }
 
     /// [`Self::apply_at`] with the `rel=geometry` hint already resolved
@@ -222,26 +286,14 @@ impl Wis2CapSource {
         for mut alert in alerts {
             let identifier = alert.identifier.clone();
             // Update / Cancel: withdraw what the message references, now.
-            let msg_type = alert
-                .msg_type
-                .as_deref()
-                .map(|t| t.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if msg_type == "update" || msg_type == "cancel" {
-                if let Some(refs) = &alert.references {
-                    for r in parse_references(refs) {
-                        if r.identifier == identifier {
-                            continue;
-                        }
-                        if acc.alerts.remove(&r.identifier).is_some() {
-                            self.stats.superseded.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // Tombstone even if not held: a late copy of the
-                        // withdrawn document must not bring it back.
-                        let t = acc.tombstones.entry(r.identifier).or_insert(n.pubtime);
-                        *t = (*t).max(n.pubtime);
-                    }
+            for withdrawn in references_withdrawn_by(&alert) {
+                if acc.remove_alert(&withdrawn).is_some() {
+                    self.stats.superseded.fetch_add(1, Ordering::Relaxed);
                 }
+                // Tombstone even if not held: a late copy of the withdrawn
+                // document must not bring it back.
+                let t = acc.tombstones.entry(withdrawn).or_insert(n.pubtime);
+                *t = (*t).max(n.pubtime);
             }
             if !is_renderable(alert.msg_type.as_deref()) {
                 // Cancel / Ack / Error describe no hazard and have no validity
@@ -278,11 +330,15 @@ impl Wis2CapSource {
                     );
                 }
             }
-            match acc.alerts.get_mut(&alert.identifier) {
+            let holds_current = match acc.alerts.get_mut(&alert.identifier) {
                 Some(existing) if existing.pubtime > n.pubtime => {
                     // Older revision arriving late: keep the newer document but
-                    // still merge any per-area hints it carried.
+                    // still merge any per-area hints it carried. This document
+                    // is not the current content, so it is not indexed for
+                    // the identifier — a deletion naming it has nothing to
+                    // withdraw.
                     merge_hints(&mut existing.alert, &alert);
+                    false
                 }
                 Some(existing) => {
                     // Same or newer revision (MeteoAlarm sends one notification
@@ -293,17 +349,16 @@ impl Wis2CapSource {
                         std::mem::replace(&mut existing.current_data_id, n.data_id.clone());
                     existing.alert = alert;
                     existing.pubtime = n.pubtime;
+                    // The source just re-affirmed this alert: its fallback
+                    // lifetime and max_alerts age restart here.
+                    existing.received = now;
                     // The superseded revision's index entry is dead for this
                     // identifier: drop it now rather than letting a long-lived,
                     // often-revised alert accumulate one entry per revision.
                     if previous != n.data_id {
-                        if let Some(idents) = acc.data_id_index.get_mut(&previous) {
-                            idents.retain(|id| id != &identifier);
-                            if idents.is_empty() {
-                                acc.data_id_index.remove(&previous);
-                            }
-                        }
+                        acc.unindex(&previous, &identifier);
                     }
+                    true
                 }
                 None => {
                     acc.alerts.insert(
@@ -315,8 +370,9 @@ impl Wis2CapSource {
                             current_data_id: n.data_id.clone(),
                         },
                     );
+                    true
                 }
-            }
+            };
             // Bbox fallback last, so it never shadows an exact polygon that
             // arrived on another notification for the same document — and
             // scoped to the one area the notification describes when it says
@@ -346,13 +402,23 @@ impl Wis2CapSource {
                     }
                 }
             }
-            contributed.push(identifier);
+            if holds_current {
+                contributed.push(identifier);
+            }
             self.stats
                 .documents_ingested
                 .fetch_add(1, Ordering::Relaxed);
         }
         if !contributed.is_empty() {
-            acc.data_id_index.insert(n.data_id.clone(), contributed);
+            // Re-applying the same data_id (a Global Cache copy, or the next
+            // per-area notification for the same XML) must not duplicate
+            // the identifiers already listed under it.
+            let idents = acc.data_id_index.entry(n.data_id.clone()).or_default();
+            for id in contributed {
+                if !idents.contains(&id) {
+                    idents.push(id);
+                }
+            }
         }
         self.stats.held.store(acc.alerts.len(), Ordering::Relaxed);
         drop(acc);
@@ -370,6 +436,9 @@ impl Wis2CapSource {
         };
         let mut removed = 0usize;
         for identifier in identifiers {
+            // The index only ever lists an identifier under the data_id that
+            // holds its current content (see `Accumulator::data_id_index`),
+            // but check anyway: a mismatch here would withdraw newer content.
             let current = acc
                 .alerts
                 .get(&identifier)
@@ -430,38 +499,41 @@ impl Wis2CapSource {
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
         let grace = self.cfg.retention_grace;
         let default_ttl = self.cfg.default_ttl;
-        let before = acc.alerts.len();
-        acc.alerts.retain(|_, e| {
-            let end = validity_end(&e.alert, default_ttl).unwrap_or(e.received + FALLBACK_LIFETIME);
-            end + grace >= now
-        });
+        let mut expired: HashSet<String> = acc
+            .alerts
+            .iter()
+            .filter(|(_, e)| {
+                let end =
+                    validity_end(&e.alert, default_ttl).unwrap_or(e.received + FALLBACK_LIFETIME);
+                end + grace < now
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
         // Hard cap: oldest-received first.
-        if acc.alerts.len() > self.cfg.max_alerts {
-            let mut by_age: Vec<(DateTime<Utc>, String)> = acc
+        let live = acc.alerts.len() - expired.len();
+        if live > self.cfg.max_alerts {
+            let mut by_age: Vec<(DateTime<Utc>, &String)> = acc
                 .alerts
                 .iter()
-                .map(|(id, e)| (e.received, id.clone()))
+                .filter(|(id, _)| !expired.contains(*id))
+                .map(|(id, e)| (e.received, id))
                 .collect();
             by_age.sort();
-            let excess = acc.alerts.len() - self.cfg.max_alerts;
-            for (_, id) in by_age.into_iter().take(excess) {
-                acc.alerts.remove(&id);
-            }
+            let capped: Vec<String> = by_age
+                .into_iter()
+                .take(live - self.cfg.max_alerts)
+                .map(|(_, id)| id.clone())
+                .collect();
+            expired.extend(capped);
         }
-        let evicted = before - acc.alerts.len();
+        let evicted = expired.len();
+        for id in &expired {
+            acc.remove_alert(id);
+        }
         if evicted > 0 {
             self.stats
                 .evicted
                 .fetch_add(evicted as u64, Ordering::Relaxed);
-            let Accumulator {
-                alerts,
-                data_id_index,
-                ..
-            } = &mut *acc;
-            data_id_index.retain(|_, idents| {
-                idents.retain(|id| alerts.contains_key(id));
-                !idents.is_empty()
-            });
         }
         acc.tombstones.retain(|_, t| *t + grace >= now);
         self.stats.held.store(acc.alerts.len(), Ordering::Relaxed);
@@ -617,18 +689,24 @@ mod tests {
         Utc.timestamp_opt(1_789_200_000 + secs, 0).unwrap()
     }
 
+    /// `expires = ""` omits `<expires>` (no computable validity end).
     fn cap_xml(identifier: &str, msg_type: &str, refs: &str, expires: &str) -> String {
         let refs = if refs.is_empty() {
             String::new()
         } else {
             format!("<references>{refs}</references>")
         };
+        let expires = if expires.is_empty() {
+            String::new()
+        } else {
+            format!("<expires>{expires}</expires>")
+        };
         format!(
             r#"<?xml version="1.0"?><alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
 <identifier>{identifier}</identifier><sender>t@x</sender><sent>2026-09-12T10:00:00+00:00</sent>
 <status>Actual</status><msgType>{msg_type}</msgType><scope>Public</scope>{refs}
 <info><language>en-GB</language><category>Met</category><event>Rain</event><urgency>Immediate</urgency>
-<severity>Moderate</severity><certainty>Likely</certainty><expires>{expires}</expires>
+<severity>Moderate</severity><certainty>Likely</certainty>{expires}
 <area><areaDesc>Zone</areaDesc><geocode><valueName>NUTS3</valueName><value>MK006</value></geocode></area></info></alert>"#
         )
     }
@@ -954,6 +1032,171 @@ mod tests {
             .await;
         assert_eq!(src.len(), 0);
         assert_eq!(src.index_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn index_tracks_current_content_under_churn() {
+        // Every path that adds, re-homes or drops an alert keeps
+        // `data_id_index` equal to the (current_data_id, identifier) pairs.
+        let src = Wis2CapSource::new(cfg());
+        let f = fetcher();
+        let far = "2026-09-13T00:00:00+00:00";
+        let two = format!(
+            "{}{}",
+            cap_xml("A", "Alert", "", far),
+            cap_xml("B", "Alert", "", far).replacen("<?xml version=\"1.0\"?>", "", 1)
+        );
+        // One document holding A and B.
+        src.apply_at(resolved("d1", 10, Some(two.clone())), &f, "t", at(10))
+            .await;
+        src.assert_index_consistent();
+        // A Global Cache copy of the same data_id must not double-list A/B.
+        src.apply_at(resolved("d1", 10, Some(two)), &f, "t", at(11))
+            .await;
+        src.assert_index_consistent();
+        assert_eq!(src.index_len(), 1);
+        // An OLDER revision of A arriving late is not indexed (d1 stays
+        // current for A).
+        src.apply_at(
+            resolved("d0", 5, Some(cap_xml("A", "Alert", "", far))),
+            &f,
+            "t",
+            at(12),
+        )
+        .await;
+        src.assert_index_consistent();
+        assert_eq!(src.index_len(), 1);
+        // A newer revision re-homes A to d2; d1 keeps only B.
+        src.apply_at(
+            resolved("d2", 20, Some(cap_xml("A", "Update", "", far))),
+            &f,
+            "t",
+            at(20),
+        )
+        .await;
+        src.assert_index_consistent();
+        assert_eq!(src.index_len(), 2);
+        // An Update withdrawing B by reference unindexes it from d1.
+        src.apply_at(
+            resolved("d3", 30, Some(cap_xml("C", "Update", "t@x,B,2026", far))),
+            &f,
+            "t",
+            at(30),
+        )
+        .await;
+        src.assert_index_consistent();
+        assert_eq!(src.len(), 2); // A, C
+        assert_eq!(src.index_len(), 2); // d2, d3
+                                        // A Cancel withdrawing C (the Cancel itself is never stored).
+        src.apply_at(
+            resolved("d4", 40, Some(cap_xml("X", "Cancel", "t@x,C,2026", far))),
+            &f,
+            "t",
+            at(40),
+        )
+        .await;
+        src.assert_index_consistent();
+        assert_eq!(src.len(), 1);
+        assert_eq!(src.index_len(), 1);
+        // Expiry eviction unindexes without a full sweep.
+        src.apply_at(
+            resolved(
+                "d5",
+                50,
+                Some(cap_xml("E", "Alert", "", "2026-09-12T11:00:00+00:00")),
+            ),
+            &f,
+            "t",
+            at(50),
+        )
+        .await;
+        src.assert_index_consistent();
+        let t1230 = Utc.with_ymd_and_hms(2026, 9, 12, 12, 30, 0).unwrap();
+        assert_eq!(src.snapshot(t1230).len(), 1);
+        src.assert_index_consistent();
+        assert_eq!(src.index_len(), 1);
+        // And the survivor is still deletable through its current data_id.
+        src.apply_at(resolved("d2", 60, None), &f, "t", at(60))
+            .await;
+        src.assert_index_consistent();
+        assert_eq!(src.len(), 0);
+        assert_eq!(src.index_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_place_revision_refreshes_received() {
+        // No <expires>, no default_ttl: lifetime = received + 7 d. A source
+        // that keeps re-issuing the alert must keep it alive past 7 days
+        // from first sighting.
+        let src = Wis2CapSource::new(cfg());
+        let f = fetcher();
+        let day = 86_400;
+        src.apply_at(
+            resolved("d1", 0, Some(cap_xml("A", "Alert", "", ""))),
+            &f,
+            "t",
+            at(0),
+        )
+        .await;
+        src.apply_at(
+            resolved("d2", 5 * day, Some(cap_xml("A", "Update", "", ""))),
+            &f,
+            "t",
+            at(5 * day),
+        )
+        .await;
+        assert_eq!(src.snapshot(at(10 * day)).len(), 1, "re-affirmed at day 5");
+        assert!(
+            src.snapshot(at(13 * day)).is_empty(),
+            "gone 7 d after day 5"
+        );
+        src.assert_index_consistent();
+    }
+
+    #[tokio::test]
+    async fn max_alerts_evicts_least_recently_affirmed() {
+        // A revised alert is "younger" than one first seen later.
+        let mut c = cfg();
+        c.max_alerts = 2;
+        let src = Wis2CapSource::new(c);
+        let f = fetcher();
+        let far = "2026-09-13T00:00:00+00:00";
+        src.apply_at(
+            resolved("a1", 0, Some(cap_xml("A", "Alert", "", far))),
+            &f,
+            "t",
+            at(0),
+        )
+        .await;
+        src.apply_at(
+            resolved("b1", 1, Some(cap_xml("B", "Alert", "", far))),
+            &f,
+            "t",
+            at(1),
+        )
+        .await;
+        src.apply_at(
+            resolved("a2", 2, Some(cap_xml("A", "Update", "", far))),
+            &f,
+            "t",
+            at(2),
+        )
+        .await;
+        src.apply_at(
+            resolved("c1", 3, Some(cap_xml("C", "Alert", "", far))),
+            &f,
+            "t",
+            at(3),
+        )
+        .await;
+        let mut ids: Vec<String> = src
+            .snapshot(at(100))
+            .into_iter()
+            .map(|a| a.identifier)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["A", "C"]);
+        src.assert_index_consistent();
     }
 
     #[tokio::test]

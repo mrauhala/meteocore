@@ -63,6 +63,31 @@ pub fn is_renderable(msg_type: Option<&str>) -> bool {
     }
 }
 
+/// The identifiers this message withdraws: the `<references>` of an
+/// `Update` or `Cancel`, minus the message's own identifier (a self-reference
+/// is non-conformant but seen, and must not cancel the message itself).
+/// Empty for every other `msgType`. The ONE withdrawal decision — shared by
+/// the rebuild-time [`resolve_references`] and the WIS2 ingest path, so a
+/// tolerance added to one cannot silently miss the other.
+pub fn references_withdrawn_by(alert: &CapAlert) -> Vec<String> {
+    let t = alert
+        .msg_type
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if t != "update" && t != "cancel" {
+        return Vec::new();
+    }
+    let Some(refs) = &alert.references else {
+        return Vec::new();
+    };
+    parse_references(refs)
+        .into_iter()
+        .map(|r| r.identifier)
+        .filter(|id| id != &alert.identifier)
+        .collect()
+}
+
 /// Collapse a set of alerts to the ones still in force:
 ///
 /// 1. one alert per `identifier` — the newest `sent` wins (re-issued documents);
@@ -87,26 +112,12 @@ pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, Vec<String>)
     let keep: HashSet<usize> = newest.values().copied().collect();
 
     // (2) withdrawn identifiers, from the surviving messages' references.
-    let mut withdrawn: HashSet<String> = HashSet::new();
-    for (i, a) in alerts.iter().enumerate() {
-        if !keep.contains(&i) {
-            continue;
-        }
-        let t = a
-            .msg_type
-            .as_deref()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        if t == "update" || t == "cancel" {
-            if let Some(refs) = &a.references {
-                for r in parse_references(refs) {
-                    if r.identifier != a.identifier {
-                        withdrawn.insert(r.identifier);
-                    }
-                }
-            }
-        }
-    }
+    let withdrawn: HashSet<String> = alerts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .flat_map(|(_, a)| references_withdrawn_by(a))
+        .collect();
 
     let mut superseded: Vec<String> = Vec::new();
     let survivors = alerts
@@ -194,6 +205,23 @@ mod tests {
         assert_eq!(ids(&out), vec!["A", "B"]);
         assert_eq!(out[0].sent.unwrap().timestamp() % 1000, 100);
         assert!(superseded.is_empty());
+    }
+
+    #[test]
+    fn references_withdrawn_by_is_msgtype_gated_and_skips_self() {
+        let u = alert("U", "update", Some("s@x,A,t s@x,U,t B"), 0);
+        assert_eq!(references_withdrawn_by(&u), vec!["A", "B"]);
+        let c = alert("C", " Cancel ", Some("s@x,A,t"), 0);
+        assert_eq!(references_withdrawn_by(&c), vec!["A"]);
+        // Alert / Ack / Error / missing msgType never withdraw anything, even
+        // with references.
+        for t in ["Alert", "Ack", "Error"] {
+            assert!(references_withdrawn_by(&alert("X", t, Some("s@x,A,t"), 0)).is_empty());
+        }
+        let mut none = alert("X", "Update", Some("s@x,A,t"), 0);
+        none.msg_type = None;
+        assert!(references_withdrawn_by(&none).is_empty());
+        assert!(references_withdrawn_by(&alert("X", "Update", None, 0)).is_empty());
     }
 
     #[test]

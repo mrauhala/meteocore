@@ -53,14 +53,24 @@ memory. Things that differ from the pull sources:
   starts the pipeline (it is the only entry point guaranteed to run on
   `poll_runtime()`; the constructor runs on the request runtime), applies
   every resolved notification, rebuilds the catalog at most every 5 s when
-  dirty and unconditionally every `poll_interval_secs`. `live_health()`
+  dirty and at least every `poll_interval_secs` (the forced tick only marks
+  a rebuild due; the 5 s ticker performs it). `live_health()`
   reports the session (`/health` overrides the boot status at runtime;
   a disconnect shorter than `degrade_after_secs` is not surfaced — the last
   catalog keeps serving and the session resumes its QoS-1 backlog).
 - **The 5 s dirty floor is load-bearing.** Every rebuild sets `as_of =
-  now`, and `as_of` is the TIME-less WMS cache key; two catalogs must never
-  share one second. The forced rebuild keeps expiries evicting when the
-  feed is quiet.
+  now`, and `as_of` is the TIME-less WMS cache key (`resolve_time(None)` ⇒
+  `as_of`, the same substitution `get_raster_tile` makes — root `CLAUDE.md`
+  step 7); two catalogs must never share one second. Config validation
+  keeps `poll_interval_secs >= CAP_WIS2_MIN_POLL_INTERVAL_SECS` (ds-core, 5)
+  in WIS2 mode and `WIS2_DIRTY_REBUILD` derives from that constant. The
+  forced rebuild keeps expiries evicting when the feed is quiet.
+- **The ingest loop is `biased` with the tickers ahead of the message
+  arms**, so a QoS-1 backlog replay (channel continuously ready) cannot
+  starve rebuilds. `rel=geometry` downloads are overlapped up to
+  `WIS2_HINT_INFLIGHT` (8) in a `FuturesOrdered`, so notifications are
+  still applied in arrival order (a deletion never overtakes the document
+  it names); beyond that the pipeline channel backs up as before.
 - **Accumulator semantics** (`Wis2CapSource`): one entry per CAP
   `<identifier>`, newest `pubtime` wins and records its `current_data_id`;
   `rel=deletion` withdraws an alert only when it names the data_id that
@@ -75,14 +85,27 @@ memory. Things that differ from the pull sources:
   suppressing a re-issued identifier. Eviction once every info's validity
   end (`<expires>`, else onset + `default_ttl`, else receipt + 7 d) is more
   than `retention_grace` (PT1H) in the past; `max_alerts` (10 000) evicts
-  oldest-received first. `len()` is an atomic mirror — `/metrics` never
-  takes the accumulator lock from a request worker.
+  oldest-received first. `received` is refreshed by every in-place revision
+  (same-or-newer pubtime), so both anchors follow the source's latest
+  affirmation. **`data_id_index` invariant:** exactly the
+  `(current_data_id, identifier)` pairs of the held alerts — an older
+  revision arriving late is not indexed, and every removal path
+  (deletion, Update/Cancel withdrawal, expiry, `max_alerts`) unindexes
+  through `Accumulator::remove_alert`; `assert_index_consistent()` is the
+  test oracle. `len()` is an atomic mirror — `/metrics` never takes the
+  accumulator lock from a request worker.
 - **Supersede/Cancel is NOT WIS2-specific.** `supersede::resolve_references`
   runs in `refresh()` for every source mode: newest `<sent>` per identifier,
   identifiers named in an `Update`/`Cancel` `<references>` are withdrawn,
-  `Cancel`/`Ack`/`Error` are never rendered. Counted in
+  `Cancel`/`Ack`/`Error` are never rendered. The withdrawal decision lives
+  in ONE place, `supersede::references_withdrawn_by`, used by both the
+  rebuild and the WIS2 ingest path. Counted in
   `cap_alerts_superseded_total` (rebuild-time withdrawals, deduplicated by
-  identifier, plus WIS2 ingest-time withdrawals).
+  identifier, plus WIS2 ingest-time withdrawals). A stored `Update` is
+  re-fed to the rebuild with its `<references>` intact, but the rebuild
+  only reports identifiers it actually found and withdrew — the original
+  is already gone from the accumulator — so an Update chain counts once
+  (`update_chain_withdrawal_is_counted_once_across_rebuilds`).
 - **MeteoAlarm geometry.** The hub's CAP XML is geocode-only (NUTS3 /
   EMMA_ID, no `<polygon>`), but each notification (one per alert × info ×
   area, `indexInfo`/`indexArea` 0-based in document order) carries a
@@ -105,9 +128,10 @@ memory. Things that differ from the pull sources:
 - `cap_alerts_superseded_total` counts each withdrawn identifier once
   (`superseded_ids` is a bounded union over rebuilds, so a chain link
   dropping out of the loaded set cannot cause a re-count).
-- `data_version()` hashes the geometry too (`geometry_source`, bbox, vertex
-  count): in WIS2 mode a shape can change between rebuilds with everything
-  else identical, and the MVT tile cache / Feature ETags key on it.
+- `data_version()` hashes the geometry too (`geometry_source` + every
+  coordinate, word-wise): in WIS2 mode a shape can change between rebuilds
+  with everything else identical — even a corrected outline with the same
+  vertex count and bbox — and the MVT tile cache / Feature ETags key on it.
 - If the broker pipeline ends on its own, `wis2_loop` marks the session
   disconnected and respawns it after 30 s — an unchanged-config reload
   reuses the engine, so nothing else would restart it.
