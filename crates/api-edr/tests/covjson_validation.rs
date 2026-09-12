@@ -23,7 +23,7 @@ fn validate(json: &Value, schema: &Value) {
     if !errors.is_empty() {
         let error_messages: Vec<String> = errors
             .iter()
-            .map(|e| format!("  - {e} (at {})", e.instance_path))
+            .map(|e| format!("  - {e} (at {})", e.instance_path()))
             .collect();
         panic!(
             "CoverageJSON schema validation failed:\n{}\n\nJSON:\n{}",
