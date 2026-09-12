@@ -4991,6 +4991,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             BUFR_DECODE_FAILURES_TOTAL
                 .with_label_values(&[cid, "unsupported"])
                 .inc_by(d[8]);
+            if let Some(snap) = engine.wis2_status() {
+                scrape_wis2_status(&mut counter_state.wis2, cid, &snap);
+            }
         }
     }
 

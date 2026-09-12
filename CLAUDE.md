@@ -416,7 +416,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
-| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path`; WIS2 push next |
+| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
 
 ## Config Format
 
@@ -591,14 +591,17 @@ engine_type = "bufr"
 apis = ["edr", "features"]
 
 [collections.bufr]
-data_path = "testdata/bufr-synop"
+data_path = "testdata/bufr-synop"   # XOR with [collections.bufr.wis2]
 poll_interval_secs = 60
 retention = "PT24H"            # rows older than this are pruned (default)
 max_stations = 50000
+stale_after = "PT2H"           # wis2 mode: no notification this long ⇒ degraded
 position_radius_km = 25.0      # EDR position → nearest station within this
 # builtin_parameters = true    # SYNOP essentials; [[collections.bufr.parameters]]
 #                              # entries override by name or add (descriptors =
 #                              # ["013011"], unit, period_hours for accumulations)
+# [collections.bufr.wis2]      # push instead of poll; most SYNOP arrives inline
+# topics = ["cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop"]
 
 # CAP warnings pushed over WMO WIS2 (third cap source mode, XOR with
 # data_path / feed_url). `[….wis2]` is the shared ds-wis2 subscription

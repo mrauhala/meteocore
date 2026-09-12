@@ -1,0 +1,36 @@
+id = "obs-synop-wis2"
+title = "SYNOP surface observations (WIS2)"
+description = "Hourly SYNOP station reports pushed over WMO WIS2 (Global Broker subscription), decoded from BUFR into an in-memory 24 h store. One location per station, one PointSeries per station and time window; stations as Point features."
+engine_type = "bufr"
+apis = ["edr", "features"]
+keywords = ["observations", "SYNOP", "BUFR", "WIS2", "WMO", "stations"]
+
+[license]
+title = "CC-BY-4.0"
+
+[bufr]
+retention = "PT24H"          # rows older than this are pruned (bounded store)
+max_stations = 50000
+stale_after = "PT2H"         # degrade when no notification for this long
+position_radius_km = 25.0
+
+# Nordic core SYNOP. On 2026-09-12 only se-smhi is operational on WIS2;
+# fi-fmi and is-metoffice are pre-operational (no data yet) and are listed so
+# they light up when their nodes go live. Every notification is republished
+# once per Global Cache (~6 copies) — ds-wis2 dedups by data_id. Most SYNOP
+# payloads arrive inline (no HTTP); link-only producers are downloaded from
+# the Global Cache under the default policy (https + public DNS host).
+[bufr.wis2]
+topics = [
+  "cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop",
+  "cache/a/wis2/fi-fmi/data/core/weather/surface-based-observations/synop",
+  "cache/a/wis2/is-metoffice/data/core/weather/surface-based-observations/synop",
+]
+# Global variant (~10 msg/s, ~20 k stations, ~50 MB at 24 h):
+# topics = ["cache/a/wis2/+/data/core/weather/surface-based-observations/synop"]
+# SMHI's 10-minute "recommended" SYNOP is not cached — subscribe on origin/
+# and restrict downloads to its server if its payloads ever stop being inline:
+# topics = ["origin/a/wis2/se-smhi/data/recommended/weather/surface-based-observations/synop"]
+# download_allowlist = ["https://wis2.smhi.se/"]
+# broker = "mqtts://globalbroker.meteo.fr:8883"   # default
+# username = "everyone"; password = "everyone"   # defaults (public)
