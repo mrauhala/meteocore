@@ -79,6 +79,11 @@ fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
+        // png >= 0.18 makes `Compression::Fast` imply `Filter::Adaptive`
+        // (all five filters tried per row). Keep the single-pass `Sub`
+        // filter png 0.17 used so the hot encode path does not change
+        // cost or output. Must come AFTER `set_compression`, which resets it.
+        encoder.set_filter(png::Filter::Sub);
 
         let mut writer = encoder
             .write_header()
@@ -182,6 +187,7 @@ fn encode_png_indexed(
         encoder.set_color(png::ColorType::Indexed);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::Filter::Sub); // see encode_png
         encoder.set_palette(plte);
         // Move `trns` into the encoder rather than cloning — it's a local that
         // drops right after this block, and this fires on every indexed encode
@@ -401,10 +407,15 @@ mod tests {
     /// roundtrip assertions stay framework-agnostic. Returns the colour
     /// type too so a test can assert which branch (indexed vs RGBA) ran.
     fn decode_png_to_rgba(bytes: &[u8]) -> (u32, u32, png::ColorType, Vec<u8>) {
-        let decoder = png::Decoder::new(bytes);
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         let mut reader = decoder.read_info().unwrap();
         let info = reader.info().clone();
-        let mut raw = vec![0u8; reader.output_buffer_size()];
+        let mut raw = vec![
+            0u8;
+            reader
+                .output_buffer_size()
+                .expect("png buffer size overflow")
+        ];
         let frame = reader.next_frame(&mut raw).unwrap();
         let w = frame.width;
         let h = frame.height;
@@ -441,7 +452,7 @@ mod tests {
     /// can match inside the DEFLATE-compressed IDAT payload and fire
     /// spuriously on larger images.
     fn png_has_trns(bytes: &[u8]) -> bool {
-        let decoder = png::Decoder::new(bytes);
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         let reader = decoder.read_info().unwrap();
         reader.info().trns.is_some()
     }
@@ -603,7 +614,7 @@ mod tests {
         // Guard against a silent regression: if this test ever falls back to
         // RGBA (e.g. someone widens the colour range above 256), it would
         // stop testing the invariant it claims to.
-        let decoder = png::Decoder::new(&a[..]);
+        let decoder = png::Decoder::new(std::io::Cursor::new(&a[..]));
         let reader = decoder.read_info().unwrap();
         assert_eq!(
             reader.info().color_type,
@@ -642,7 +653,7 @@ mod tests {
             rgba.extend_from_slice(&[(i & 0xFF) as u8, (i >> 8) as u8, 0, 255]);
         }
         let bytes = encode_png(&rgba, 257, 1).unwrap();
-        let decoder = png::Decoder::new(&bytes[..]);
+        let decoder = png::Decoder::new(std::io::Cursor::new(&bytes[..]));
         let reader = decoder.read_info().unwrap();
         assert_eq!(
             reader.info().color_type,
