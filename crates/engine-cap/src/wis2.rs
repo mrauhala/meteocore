@@ -311,9 +311,14 @@ impl Wis2CapSource {
                 }
                 acc.tombstones.remove(&alert.identifier);
             }
-            // Attach geometry hints. The exact-polygon hint is keyed to one
-            // (info, area); the bbox fallback applies to every area lacking
-            // geometry.
+            // Attach this notification's hints to the freshly parsed
+            // document BEFORE it meets the stored copy: `merge_hints` below
+            // treats a bbox as replaceable and an exact polygon as final, so
+            // attaching first is what lets (a) an exact hint held from an
+            // earlier per-area notification beat this one's bbox and (b) a
+            // newer revision's bbox replace the previous revision's — a
+            // bbox attached only after the merge would find the old one
+            // already carried forward and stick to it forever.
             if let Some((info_idx, area_idx, h)) = &hint {
                 if let Some(area) = alert
                     .infos
@@ -328,6 +333,30 @@ impl Wis2CapSource {
                         "[{label}] cap/wis2: {} hint index ({info_idx},{area_idx}) out of range",
                         alert.identifier
                     );
+                }
+            }
+            // Bbox fallback: scoped to the one area the notification
+            // describes when it says which (MeteoAlarm's indexInfo /
+            // indexArea); a notification for a whole document may fill every
+            // geometry-less area. Never over the exact hint attached above.
+            if let Some(b) = &bbox_hint {
+                let targets: Vec<&mut crate::parser::CapArea> = match bbox_scope {
+                    Some((i, a)) => alert
+                        .infos
+                        .get_mut(i)
+                        .and_then(|info| info.areas.get_mut(a))
+                        .into_iter()
+                        .collect(),
+                    None => alert
+                        .infos
+                        .iter_mut()
+                        .flat_map(|info| info.areas.iter_mut())
+                        .collect(),
+                };
+                for area in targets {
+                    if area.hint_geometry.is_none() {
+                        area.hint_geometry = Some(b.clone());
+                    }
                 }
             }
             let holds_current = match acc.alerts.get_mut(&alert.identifier) {
@@ -373,35 +402,6 @@ impl Wis2CapSource {
                     true
                 }
             };
-            // Bbox fallback last, so it never shadows an exact polygon that
-            // arrived on another notification for the same document — and
-            // scoped to the one area the notification describes when it says
-            // which (MeteoAlarm's indexInfo/indexArea); a notification for a
-            // whole document may fill every geometry-less area.
-            if let Some(b) = &bbox_hint {
-                if let Some(entry) = acc.alerts.get_mut(&identifier) {
-                    let mut targets: Vec<&mut crate::parser::CapArea> = match bbox_scope {
-                        Some((i, a)) => entry
-                            .alert
-                            .infos
-                            .get_mut(i)
-                            .and_then(|info| info.areas.get_mut(a))
-                            .into_iter()
-                            .collect(),
-                        None => entry
-                            .alert
-                            .infos
-                            .iter_mut()
-                            .flat_map(|info| info.areas.iter_mut())
-                            .collect(),
-                    };
-                    for area in targets.iter_mut() {
-                        if area.hint_geometry.is_none() {
-                            area.hint_geometry = Some(b.clone());
-                        }
-                    }
-                }
-            }
             if holds_current {
                 contributed.push(identifier);
             }
@@ -581,7 +581,9 @@ pub fn hint_from_bytes(n: &Notification, bytes: &[u8]) -> Result<CapAreaHint, &'
 }
 
 /// Carry per-area hints from `from` into `into` where `into` has none or
-/// only a bbox fallback (an exact `notification` polygon always wins).
+/// only a bbox fallback. Precedence per area: an exact `notification`
+/// polygon (either side) beats any bbox; between two bboxes `into` — the
+/// side being kept, i.e. the newer revision — wins.
 fn merge_hints(into: &mut CapAlert, from: &CapAlert) {
     for (i, info) in into.infos.iter_mut().enumerate() {
         for (a, area) in info.areas.iter_mut().enumerate() {
@@ -1261,6 +1263,86 @@ mod tests {
         let hint = snap[0].infos[0].areas[0].hint_geometry.as_ref().unwrap();
         assert_eq!(hint.source, "bbox");
         assert_eq!(hint.geometry.bbox(), Some([20.5, 41.4, 21.2, 42.2]));
+    }
+
+    #[tokio::test]
+    async fn bbox_fallback_follows_the_latest_revision_but_never_an_exact_hint() {
+        let mut c = cfg();
+        c.bbox_fallback = true;
+        let src = Wis2CapSource::new(c);
+        let far = "2026-09-13T00:00:00+00:00";
+        let with_bbox = |data_id: &str, pub_secs: i64, msg_type: &str, b: [f64; 4]| {
+            let mut r = resolved(data_id, pub_secs, Some(cap_xml("A", msg_type, "", far)));
+            r.notification.geometry = Some(ds_wis2::Geometry::Polygon(vec![
+                [b[0], b[1]],
+                [b[0], b[3]],
+                [b[2], b[3]],
+                [b[2], b[1]],
+                [b[0], b[1]],
+            ]));
+            r
+        };
+        let hint_of = |src: &Wis2CapSource, t: i64| {
+            src.snapshot(at(t))[0].infos[0].areas[0]
+                .hint_geometry
+                .clone()
+                .unwrap()
+        };
+        // Revision 1 with bbox B1.
+        src.apply_with_hint(
+            with_bbox("d1", 0, "Alert", [20.0, 40.0, 21.0, 41.0]),
+            None,
+            "t",
+            at(0),
+        );
+        assert_eq!(
+            hint_of(&src, 1).geometry.bbox(),
+            Some([20.0, 40.0, 21.0, 41.0])
+        );
+        // Revision 2 republishes the area with a corrected extent B2: it
+        // must replace B1, not be blocked by it.
+        src.apply_with_hint(
+            with_bbox("d2", 10, "Update", [22.0, 42.0, 23.0, 43.0]),
+            None,
+            "t",
+            at(10),
+        );
+        let h = hint_of(&src, 11);
+        assert_eq!(h.source, "bbox");
+        assert_eq!(h.geometry.bbox(), Some([22.0, 42.0, 23.0, 43.0]));
+        // A late copy of the older revision (B1) does not roll it back.
+        src.apply_with_hint(
+            with_bbox("d1", 0, "Alert", [20.0, 40.0, 21.0, 41.0]),
+            None,
+            "t",
+            at(12),
+        );
+        assert_eq!(
+            hint_of(&src, 13).geometry.bbox(),
+            Some([22.0, 42.0, 23.0, 43.0])
+        );
+        // An exact polygon from a per-area notification beats every bbox …
+        let exact = CapAreaHint {
+            geometry: Arc::new(bbox_polygon([22.1, 42.1, 22.9, 42.9])),
+            source: "notification",
+        };
+        src.apply_with_hint(
+            with_bbox("d2", 10, "Update", [22.0, 42.0, 23.0, 43.0]),
+            Some((0, 0, exact)),
+            "t",
+            at(20),
+        );
+        assert_eq!(hint_of(&src, 21).source, "notification");
+        // … including a later bbox-only revision of the same document.
+        src.apply_with_hint(
+            with_bbox("d3", 30, "Update", [24.0, 44.0, 25.0, 45.0]),
+            None,
+            "t",
+            at(30),
+        );
+        let h = hint_of(&src, 31);
+        assert_eq!(h.source, "notification");
+        assert_eq!(h.geometry.bbox(), Some([22.1, 42.1, 22.9, 42.9]));
     }
 
     #[test]

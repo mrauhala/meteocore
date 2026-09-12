@@ -123,8 +123,12 @@ memory. Things that differ from the pull sources:
   a bounding box drawn as a warning area misleads; opt in per feed. When
   on, the bbox is scoped like the exact hint — only the `(indexInfo,
   indexArea)` the notification names; a notification with no indices
-  (whole-document producers) fills every geometry-less area. Both the
-  lookup file and the hints can be configured together.
+  (whole-document producers) fills every geometry-less area. Both hints
+  are attached to the freshly parsed document BEFORE `merge_hints` meets
+  the stored copy (bbox replaceable, exact polygon final): that is what
+  lets a newer revision's bbox replace the old one and an exact polygon
+  from any notification beat every bbox. Both the lookup file and the
+  hints can be configured together.
 - `cap_alerts_superseded_total` counts each withdrawn identifier once
   (`superseded_ids` is a bounded union over rebuilds, so a chain link
   dropping out of the loaded set cannot cause a re-count).
