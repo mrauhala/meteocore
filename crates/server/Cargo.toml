@@ -20,6 +20,7 @@ engine-grib = { path = "../engine-grib" }
 engine-zarr = { path = "../engine-zarr" }
 engine-odim = { path = "../engine-odim" }
 engine-cap = { path = "../engine-cap" }
+engine-bufr = { path = "../engine-bufr" }
 engine-postgis = { path = "../engine-postgis" }
 engine-nowcast = { path = "../engine-nowcast" }
 api-edr = { path = "../api-edr" }

@@ -1003,6 +1003,7 @@ mod tests {
             odim_engines: RwLock::new(Vec::new()),
             odim_volume_engines: RwLock::new(Vec::new()),
             cap_engines: RwLock::new(Vec::new()),
+            bufr_engines: RwLock::new(Vec::new()),
             postgis_engines: RwLock::new(Vec::new()),
             nowcast_engines: RwLock::new(Vec::new()),
             reload_lock: tokio::sync::Mutex::new(()),
@@ -1032,6 +1033,7 @@ mod tests {
             cap: None,
             postgis: None,
             nowcast: None,
+            bufr: None,
             preview: None,
         }
     }

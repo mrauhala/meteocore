@@ -420,6 +420,7 @@ mod tests {
             odim_engines: RwLock::new(result.odim_engines),
             odim_volume_engines: RwLock::new(result.odim_volume_engines),
             cap_engines: RwLock::new(result.cap_engines),
+            bufr_engines: RwLock::new(result.bufr_engines),
             postgis_engines: RwLock::new(result.postgis_engines),
             nowcast_engines: RwLock::new(result.nowcast_engines),
             reload_lock: tokio::sync::Mutex::new(()),

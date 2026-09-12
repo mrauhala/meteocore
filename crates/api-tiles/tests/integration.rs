@@ -138,6 +138,7 @@ fn build_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            bufr: None,
             preview: None,
         },
     );
@@ -220,6 +221,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            bufr: None,
             preview: None,
         },
     );
@@ -1042,6 +1044,7 @@ fn build_empty_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            bufr: None,
             preview: None,
         },
     );
@@ -1165,6 +1168,7 @@ fn build_multi_param_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            bufr: None,
             preview: None,
         },
     );
@@ -1511,6 +1515,7 @@ mod mvt {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                bufr: None,
                 preview: None,
             },
         );
@@ -1600,6 +1605,7 @@ mod mvt {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                bufr: None,
                 preview: None,
             },
         );
@@ -1915,6 +1921,7 @@ mod temporal_grid_jitter {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                bufr: None,
                 preview: None,
             },
         );
@@ -2087,6 +2094,7 @@ mod metadata_extras {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                bufr: None,
                 preview: None,
             },
         );
@@ -2386,6 +2394,7 @@ fn build_param_layer_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            bufr: None,
             preview: None,
         },
     );

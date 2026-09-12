@@ -1,0 +1,19 @@
+[package]
+name = "engine-bufr"
+version = "0.1.0"
+edition = "2021"
+description = "WMO BUFR surface-observation engine (SYNOP/SHIP station reports → EDR + Features)"
+
+[dependencies]
+ds-core = { path = "../core" }
+ds-poll = { path = "../ds-poll" }
+ds-storage = { path = "../storage" }
+tinybufr = { version = "0.1", default-features = false }
+arc-swap = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

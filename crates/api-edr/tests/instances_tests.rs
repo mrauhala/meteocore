@@ -218,6 +218,7 @@ fn config(id: &str, engine_type: &str) -> CollectionConfig {
         cap: None,
         postgis: None,
         nowcast: None,
+        bufr: None,
         preview: None,
     }
 }

@@ -17,7 +17,7 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
-`engine-zarr`, `engine-postgis`, `engine-cap`), API layers (`api-edr`,
+`engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`), API layers (`api-edr`,
 `api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`,
 `api-mcp` — Model Context Protocol tools over the storm-cell surface), and
 `server` (the binary).
@@ -47,6 +47,9 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   duplicate fact, inline payloads, download policy.
 - `crates/engine-odim/CLAUDE.md` — PVOL per-site model, pixel pre-warm,
   resampling, storm cells.
+- `crates/engine-bufr/CLAUDE.md` — BUFR decoder boundary (tinybufr only in
+  `decode.rs`), period-context + first-occurrence extraction rules, store
+  bounds, EDR/Features semantics.
 - `crates/engine-geotiff/CLAUDE.md`, `crates/engine-grib/CLAUDE.md`,
   `crates/engine-querydata/CLAUDE.md`, `crates/engine-zarr/CLAUDE.md`,
   `crates/engine-cap/CLAUDE.md`, `crates/engine-postgis/CLAUDE.md`,
@@ -413,6 +416,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
+| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path`; WIS2 push next |
 
 ## Config Format
 
@@ -577,6 +581,24 @@ lightning_jump = 0.9
 
 [collections.wms]
 colormap = "radar_dbz"
+
+# BUFR surface observations (SYNOP/SHIP station reports) — polled directory or
+# object-store prefix of *.bufr files; a WIS2 subscription ([bufr.wis2]) is
+# the alternative source. See crates/engine-bufr/CLAUDE.md.
+[[collections]]
+id = "obs-bufr-local"
+engine_type = "bufr"
+apis = ["edr", "features"]
+
+[collections.bufr]
+data_path = "testdata/bufr-synop"
+poll_interval_secs = 60
+retention = "PT24H"            # rows older than this are pruned (default)
+max_stations = 50000
+position_radius_km = 25.0      # EDR position → nearest station within this
+# builtin_parameters = true    # SYNOP essentials; [[collections.bufr.parameters]]
+#                              # entries override by name or add (descriptors =
+#                              # ["013011"], unit, period_hours for accumulations)
 
 # CAP warnings pushed over WMO WIS2 (third cap source mode, XOR with
 # data_path / feed_url). `[….wis2]` is the shared ds-wis2 subscription
