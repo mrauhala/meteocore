@@ -435,7 +435,7 @@ async fn api_definition_validates_against_the_openapi_30_metaschema() {
 
     if let Err(errors) = validator.validate(&doc) {
         let detail: Vec<String> = std::iter::once(errors)
-            .map(|e| format!("{} at {}", e, e.instance_path))
+            .map(|e| format!("{} at {}", e, e.instance_path()))
             .collect();
         panic!("/api is not valid OpenAPI 3.0:\n{}", detail.join("\n"));
     }

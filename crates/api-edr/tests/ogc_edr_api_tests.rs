@@ -602,7 +602,7 @@ mod collections {
             jsonschema::Validator::new(collections_schema).expect("compile collections schema");
         let errors: Vec<String> = validator
             .iter_errors(&json)
-            .map(|e| format!("- {} (at {})", e, e.instance_path))
+            .map(|e| format!("- {} (at {})", e, e.instance_path()))
             .collect();
         assert!(
             errors.is_empty(),
@@ -900,7 +900,7 @@ mod locations {
         if !errors.is_empty() {
             let msgs: Vec<String> = errors
                 .iter()
-                .map(|e| format!("  - {e} (at {})", e.instance_path))
+                .map(|e| format!("  - {e} (at {})", e.instance_path()))
                 .collect();
             panic!(
                 "Locations GeoJSON schema validation failed:\n{}\n\nJSON:\n{}",
