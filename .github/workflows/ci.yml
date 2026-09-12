@@ -124,7 +124,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.2.0
+        uses: docker/setup-buildx-action@v4.3.0
 
       # `load: true` puts the image in the local daemon so the boot gate
       # can actually exec it — a build alone cannot catch runtime-stage
@@ -169,7 +169,7 @@ jobs:
         uses: sigstore/cosign-installer@v4.1.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.2.0
+        uses: docker/setup-buildx-action@v4.3.0
 
       - name: Log into registry
         if: github.event_name != 'pull_request'
