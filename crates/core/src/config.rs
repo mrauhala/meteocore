@@ -960,7 +960,10 @@ pub struct BufrParameterConfig {
     /// temperature). Several may be listed (first match wins).
     #[serde(default)]
     pub descriptors: Vec<String>,
-    /// Unit as encoded in BUFR (no conversion is applied), e.g. `"K"`.
+    /// Unit as encoded in BUFR (Table B), e.g. `"K"`. The engine applies the
+    /// mechanical display conversion of `ds_core::units` on top (K → °C,
+    /// Pa → hPa, kg m-2 → mm; anything else served as-is), as engine-grib
+    /// does — so name the source unit here, not the wanted one.
     pub unit: String,
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub label: Option<String>,

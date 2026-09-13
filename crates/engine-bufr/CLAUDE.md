@@ -56,8 +56,7 @@ ecCodes `bufr_dump`).
 
 ## Parameter table
 
-Built-ins (`src/params.rs`, BUFR units, no conversion — the source
-metadata is authoritative): air_temperature (012101|012004),
+Built-ins (`src/params.rs`): air_temperature (012101|012004),
 dew_point_temperature, relative_humidity, pressure (010004), pressure_msl
 (010051), pressure_tendency_3h, wind_direction/speed/gust,
 precipitation_{1,3,6,12,24}h (013011 by period; 24 h also 013023),
@@ -66,7 +65,18 @@ cloud_cover_total, present_weather (code table), snow_depth.
 `[[bufr.parameters]]` replaces by name or appends; `builtin_parameters =
 false` serves only the config entries. Column order = table order; the
 store row is a dense `Box<[f32]>` (`NaN` = missing); output widens through
-`round_stored` so `290.12` stays `290.12`.
+`round_stored` so `16.97` stays `16.97`.
+
+**Units are source-driven, then mechanically converted for display.**
+Every entry (built-in or config) names the **BUFR Table B unit** the
+descriptor is encoded in (`K`, `Pa`, `kg m-2`, `m s-1`, …); the shared
+`ds_core::units::display_conversion` rule for that unit string — the same
+table engine-grib applies (K → °C, Pa → hPa, kg m-2 → mm, m2 s-2 → gpm;
+anything else unchanged) — is applied at row extraction, so the store
+holds and the API serves `°C` / `hPa` / `mm`. Never key a conversion on a
+parameter name (root `CLAUDE.md` rule): a config override with
+`unit = "K"` gets `°C` by construction, whatever it is called. There is
+no opt-out, as for GRIB; a client wanting kelvin converts back.
 
 ## Store & snapshot
 

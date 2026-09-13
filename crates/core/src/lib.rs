@@ -22,6 +22,7 @@ pub mod radar_sites;
 pub mod raster_paint;
 pub mod resample;
 pub mod significance;
+pub mod units;
 pub mod vertical;
 pub mod volume;
 pub mod web_mercator;

@@ -36,7 +36,9 @@ unlike GeoTIFF's one band per collection.
   (`src/units.rs`) plus per-center overlays for local parameter numbers
   192–254.
 - Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm, m² s⁻²→gpm,
-  proportion→%. Colormap ranges use display units.
+  proportion→%. Colormap ranges use display units. The string-keyed twin
+  of this table lives in `ds_core::units` (used by engine-bufr); keep the
+  two rule for rule.
 - **Per-provider vocabularies are not needed.** A new provider only needs
   overlay entries if it uses local parameter numbers. ECMWF-`tcc` vs
   GFS-`TCDC`, `z` vs `HGT` are handled by construction (different triples).

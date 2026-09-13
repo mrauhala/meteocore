@@ -2,13 +2,19 @@
 //! parameter. Built-ins cover the SYNOP essentials; `[[bufr.parameters]]`
 //! entries override by name or add.
 //!
-//! Units are the BUFR units, unconverted (K, Pa, m s-1, kg m-2, …): the
-//! source metadata is authoritative and clients convert.
+//! Units: each entry names the **BUFR Table B unit** (K, Pa, m s-1,
+//! kg m-2, …) — the source metadata is authoritative — and the mechanical
+//! display conversion of `ds_core::units` is applied on top at row
+//! extraction (K → °C, Pa → hPa, kg m-2 → mm; everything else unchanged),
+//! exactly as engine-grib does for its Code Table 4.2 units. The store
+//! therefore holds display units and `descriptions()` advertises them.
+//! The rule is keyed on the unit string, never on the parameter name.
 
 use std::collections::HashMap;
 
 use ds_core::config::BufrParameterConfig;
 use ds_core::model::ParameterDescription;
+use ds_core::units::{display_conversion, DisplayConversion};
 use tinybufr::XY;
 
 use crate::decode::{xy_from_code, ObsReport};
@@ -18,10 +24,42 @@ use crate::decode::{xy_from_code, ObsReport};
 pub struct ParamDef {
     pub name: String,
     pub descriptors: Vec<XY>,
+    /// The unit values are stored and served in: the mechanical display
+    /// unit of `source_unit` when a rule exists, else `source_unit` itself.
     pub unit: String,
+    /// The BUFR Table B unit the descriptor is encoded in.
+    pub source_unit: String,
+    /// `None` = identity (no rule for `source_unit`).
+    pub display: Option<DisplayConversion>,
     pub label: String,
     pub observed_property: String,
     pub period_hours: Option<f64>,
+}
+
+impl ParamDef {
+    fn new(
+        name: String,
+        descriptors: Vec<XY>,
+        source_unit: String,
+        label: String,
+        observed_property: String,
+        period_hours: Option<f64>,
+    ) -> Self {
+        let display = display_conversion(&source_unit);
+        let unit = display
+            .map(|d| d.unit.to_string())
+            .unwrap_or_else(|| source_unit.clone());
+        ParamDef {
+            name,
+            descriptors,
+            unit,
+            source_unit,
+            display,
+            label,
+            observed_property,
+            period_hours,
+        }
+    }
 }
 
 struct Builtin {
@@ -228,38 +266,37 @@ impl ParameterTable {
         let mut params: Vec<ParamDef> = if builtin {
             BUILTIN
                 .iter()
-                .map(|b| ParamDef {
-                    name: b.name.to_string(),
-                    descriptors: b
-                        .descriptors
-                        .iter()
-                        .filter_map(|c| xy_from_code(c))
-                        .collect(),
-                    unit: b.unit.to_string(),
-                    label: b.label.to_string(),
-                    observed_property: b.observed_property.to_string(),
-                    period_hours: b.period_hours,
+                .map(|b| {
+                    ParamDef::new(
+                        b.name.to_string(),
+                        b.descriptors
+                            .iter()
+                            .filter_map(|c| xy_from_code(c))
+                            .collect(),
+                        b.unit.to_string(),
+                        b.label.to_string(),
+                        b.observed_property.to_string(),
+                        b.period_hours,
+                    )
                 })
                 .collect()
         } else {
             Vec::new()
         };
         for o in overrides {
-            let def = ParamDef {
-                name: o.name.clone(),
-                descriptors: o
-                    .descriptors
+            let def = ParamDef::new(
+                o.name.clone(),
+                o.descriptors
                     .iter()
                     .filter_map(|c| xy_from_code(c))
                     .collect(),
-                unit: o.unit.clone(),
-                label: o.label.clone().unwrap_or_else(|| o.name.replace('_', " ")),
-                observed_property: o
-                    .observed_property
+                o.unit.clone(),
+                o.label.clone().unwrap_or_else(|| o.name.replace('_', " ")),
+                o.observed_property
                     .clone()
                     .unwrap_or_else(|| o.name.clone()),
-                period_hours: o.period_hours,
-            };
+                o.period_hours,
+            );
             match params.iter().position(|p| p.name == def.name) {
                 Some(i) => params[i] = def,
                 None => params.push(def),
@@ -305,7 +342,8 @@ impl ParameterTable {
             .collect()
     }
 
-    /// Extract one dense row (`NaN` = missing) from a report.
+    /// Extract one dense row (`NaN` = missing) from a report, in display
+    /// units (the conversion runs in f64 before the f32 narrowing).
     pub fn row(&self, report: &ObsReport) -> Box<[f32]> {
         self.params
             .iter()
@@ -313,7 +351,7 @@ impl ParameterTable {
                 p.descriptors
                     .iter()
                     .find_map(|&xy| report.value(xy, p.period_hours))
-                    .map(|v| v as f32)
+                    .map(|v| p.display.map_or(v, |d| d.convert(v)) as f32)
                     .unwrap_or(f32::NAN)
             })
             .collect()
@@ -365,5 +403,37 @@ mod tests {
         assert_eq!(t.index_of("rain_2h"), Some(t.len() - 1));
         let only = ParameterTable::build(false, &o);
         assert_eq!(only.len(), 2);
+        // An override names the BUFR unit; the display rule still applies.
+        assert_eq!(
+            (t.params[0].source_unit.as_str(), t.params[0].unit.as_str()),
+            ("K", "°C")
+        );
+        assert_eq!(
+            (last.source_unit.as_str(), last.unit.as_str()),
+            ("kg m-2", "mm")
+        );
+    }
+
+    #[test]
+    fn display_units_follow_the_source_unit_not_the_name() {
+        let t = ParameterTable::build(true, &[]);
+        let unit = |n: &str| t.params[t.index_of(n).unwrap()].unit.as_str();
+        for n in [
+            "air_temperature",
+            "dew_point_temperature",
+            "air_temperature_max_12h",
+            "air_temperature_min_24h",
+        ] {
+            assert_eq!(unit(n), "°C", "{n}");
+        }
+        for n in ["pressure", "pressure_msl", "pressure_tendency_3h"] {
+            assert_eq!(unit(n), "hPa", "{n}");
+        }
+        assert_eq!(unit("precipitation_24h"), "mm");
+        // No rule: the BUFR unit is served as-is.
+        assert_eq!(unit("wind_speed"), "m s-1");
+        assert_eq!(unit("relative_humidity"), "%");
+        assert_eq!(unit("snow_depth"), "m");
+        assert!(t.descriptions()["pressure_msl"].unit == "hPa");
     }
 }
