@@ -198,6 +198,13 @@ impl CacheKey {
             }
             None => fnv1a_mix(&mut h, &[0u8]),
         }
+        // Mixed only when set: `0` ("never revised", every immutable-timestep
+        // engine) leaves the ETag exactly as before this field existed, so a
+        // deploy does not invalidate every radar/NWP tile held downstream.
+        if self.content_version != 0 {
+            fnv1a_mix(&mut h, b"|v");
+            fnv1a_mix(&mut h, &self.content_version.to_le_bytes());
+        }
         format!("\"{h:016x}\"")
     }
 }
@@ -1536,6 +1543,14 @@ mod tests {
         let mut revised = base.clone();
         revised.content_version = 2;
         assert_ne!(base, revised);
+        assert_ne!(
+            base.etag(),
+            revised.etag(),
+            "the key ETag must follow the version"
+        );
+        let mut immutable = base.clone();
+        immutable.content_version = 0;
+        assert_ne!(base.etag(), immutable.etag());
         let cache = RenderedCache::new(1);
         cache.insert(
             base.clone(),
