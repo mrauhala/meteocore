@@ -44,6 +44,10 @@
       <valueName>severity</valueName>
       <value>a producer-defined severity that must not shadow the CAP one</value>
     </parameter>
+    <parameter>
+      <valueName>geometry_source</valueName>
+      <value>nor the engine's geometry provenance</value>
+    </parameter>
     <area>
       <areaDesc>Greater Helsinki</areaDesc>
       <polygon>60.10,24.90 60.10,25.10 60.30,25.10 60.30,24.90 60.10,24.90</polygon>

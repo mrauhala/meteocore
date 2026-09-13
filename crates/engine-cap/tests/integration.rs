@@ -137,6 +137,17 @@ fn feature_properties_carry_cap_metadata() {
             .and_then(|v| v.as_str()),
         Some("a producer-defined severity that must not shadow the CAP one")
     );
+    // …including the engine-added provenance key.
+    assert_eq!(
+        f.properties.get("geometry_source").and_then(|v| v.as_str()),
+        Some("inline")
+    );
+    assert_eq!(
+        f.properties
+            .get("parameter:geometry_source")
+            .and_then(|v| v.as_str()),
+        Some("nor the engine's geometry provenance")
+    );
     // Unknown feature → 404 mapping.
     assert!(eng.get_feature("does.not.exist").is_err());
 }

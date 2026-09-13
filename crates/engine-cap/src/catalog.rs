@@ -179,14 +179,14 @@ impl Catalog {
                     let id = format!("{}.{}.{}", alert.identifier, info_idx, area_idx);
                     let window = build_window(alert, info, cfg.default_ttl);
                     let severity_code = severity_code(info.severity.as_deref());
-                    let mut properties =
-                        build_properties(alert, info, area, window, geometry_kind_radius(area));
-                    if let Some(src) = geometry_source {
-                        properties.insert(
-                            "geometry_source".into(),
-                            PropertyValue::String(src.to_string()),
-                        );
-                    }
+                    let properties = build_properties(
+                        alert,
+                        info,
+                        area,
+                        window,
+                        geometry_kind_radius(area),
+                        geometry_source,
+                    );
                     records.push(AreaRecord {
                         id,
                         geometry: Arc::new(geometry),
@@ -520,12 +520,17 @@ fn circle_ring(c: &CapCircle, segments: u32) -> Vec<[f64; 2]> {
     ring
 }
 
+/// Every standard property goes in here, BEFORE the producer pairs at the
+/// end — the pairs' anti-shadowing check is `p.contains_key`, so a standard
+/// key inserted by a caller afterwards would silently overwrite a parameter
+/// of the same name.
 fn build_properties(
     alert: &CapAlert,
     info: &CapInfo,
     area: &CapArea,
     window: ActiveWindow,
     radius_km: Option<f64>,
+    geometry_source: Option<&'static str>,
 ) -> HashMap<String, PropertyValue> {
     let mut p: HashMap<String, PropertyValue> = HashMap::new();
     // alert-level
@@ -569,6 +574,12 @@ fn build_properties(
 
     if let Some(r) = radius_km {
         p.insert("radius_km".into(), PropertyValue::Float(r));
+    }
+    if let Some(src) = geometry_source {
+        p.insert(
+            "geometry_source".into(),
+            PropertyValue::String(src.to_string()),
+        );
     }
 
     // Producer-defined valueName/value pairs (CAP §3.2.2). `<parameter>`s
