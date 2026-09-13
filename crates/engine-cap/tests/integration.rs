@@ -108,8 +108,72 @@ fn feature_properties_carry_cap_metadata() {
     );
     // category is a flat List.
     assert!(matches!(f.properties.get("category"), Some(List(_))));
+    // <parameter>s surface under their own valueName (MeteoAlarm clients
+    // filter on awareness_type and read awareness_level); a repeated name
+    // (impacts) is a List in document order; <eventCode>s are namespaced;
+    // a parameter named like a standard property does not shadow it.
+    assert_eq!(
+        f.properties.get("awareness_level"),
+        Some(&String("3; orange; Severe".into()))
+    );
+    assert_eq!(
+        f.properties.get("awareness_type"),
+        Some(&String("12; Flooding".into()))
+    );
+    assert_eq!(
+        f.properties.get("impacts"),
+        Some(&List(vec![
+            String("Low-lying roads may flood.".into()),
+            String("Cellars may take in water.".into()),
+        ]))
+    );
+    assert_eq!(
+        f.properties.get("eventCode:OET"),
+        Some(&String("Rain; Flood".into()))
+    );
+    assert_eq!(
+        f.properties
+            .get("parameter:severity")
+            .and_then(|v| v.as_str()),
+        Some("a producer-defined severity that must not shadow the CAP one")
+    );
+    // …including the engine-added provenance key.
+    assert_eq!(
+        f.properties.get("geometry_source").and_then(|v| v.as_str()),
+        Some("inline")
+    );
+    assert_eq!(
+        f.properties
+            .get("parameter:geometry_source")
+            .and_then(|v| v.as_str()),
+        Some("nor the engine's geometry provenance")
+    );
     // Unknown feature → 404 mapping.
     assert!(eng.get_feature("does.not.exist").is_err());
+}
+
+#[test]
+fn data_version_changes_when_a_parameter_changes() {
+    // Same alert, only a <parameter> value differs: Feature ETags / the MVT
+    // cache key on data_version, so it must move.
+    let dir = tempfile::tempdir().unwrap();
+    let xml = std::fs::read_to_string(fixtures_dir().join("helsinki-flood.xml")).unwrap();
+    let version = |dir: &std::path::Path| {
+        CapEngine::new(&config_for(dir.to_str().unwrap(), None), "cap-version")
+            .unwrap()
+            .data_version()
+    };
+    std::fs::write(dir.path().join("a.xml"), &xml).unwrap();
+    let v1 = version(dir.path());
+    std::fs::write(
+        dir.path().join("a.xml"),
+        xml.replace("3; orange; Severe", "4; red; Extreme"),
+    )
+    .unwrap();
+    let v2 = version(dir.path());
+    assert_ne!(v1, v2);
+    // …and is stable when nothing changed.
+    assert_eq!(version(dir.path()), v2);
 }
 
 #[test]

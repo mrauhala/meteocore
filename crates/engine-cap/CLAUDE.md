@@ -132,10 +132,11 @@ memory. Things that differ from the pull sources:
 - `cap_alerts_superseded_total` counts each withdrawn identifier once
   (`superseded_ids` is a bounded union over rebuilds, so a chain link
   dropping out of the loaded set cannot cause a re-count).
-- `data_version()` hashes the geometry too (`geometry_source` + every
-  coordinate, word-wise): in WIS2 mode a shape can change between rebuilds
-  with everything else identical — even a corrected outline with the same
-  vertex count and bbox — and the MVT tile cache / Feature ETags key on it.
+- `data_version()` hashes the geometry too (every coordinate, word-wise,
+  plus the `geometry_source` property): in WIS2 mode a shape can change
+  between rebuilds with everything else identical — even a corrected
+  outline with the same vertex count and bbox — and the MVT tile cache /
+  Feature ETags key on it.
 - If the broker pipeline ends on its own, `wis2_loop` marks the session
   disconnected and respawns it after 30 s — an unchanged-config reload
   reuses the engine, so nothing else would restart it.
@@ -171,6 +172,18 @@ memory. Things that differ from the pull sources:
   RFC 7946 §3.2; listed, never on the map), counted as `geocode_only` in
   the load log. The lookup file loads once at construction; a bad path is a
   hard `new()` error.
+- **Producer `<parameter>`s are top-level properties under their own
+  valueName** (CAP §3.2.2 key/value pairs; content is producer-defined).
+  MeteoAlarm's `awareness_level` (`"2; yellow; Moderate"`) and
+  `awareness_type` (`"1; Wind"`) therefore appear exactly as clients of the
+  MeteoAlarm feeds expect them, and the flat shape is what the MVT tag
+  encoder and a future `<property>=value` filter need. A repeated name
+  (MeteoAlarm's `impacts`, one per bullet) becomes a List in document
+  order. A name colliding with a standard CAP property is namespaced
+  `parameter:<valueName>` instead of shadowing it. `<eventCode>`s (terse
+  system ids: MeteoAlarm `OET` event terms, NWS `SAME`) are always
+  namespaced `eventCode:<valueName>`. Values are passed through verbatim —
+  no MeteoAlarm-specific decoding of the `code; colour; label` convention.
 
 ## Time semantics
 
@@ -185,16 +198,19 @@ memory. Things that differ from the pull sources:
   256). The WMS handler resolves a TIME-less GetMap to `times.last()`, so
   `as_of` being last is what makes the default render "now".
 - `data_version()` (Feature ETags) hashes record ids + severity + window +
-  the text fields (event/headline/description/instruction/areaDesc) — an
-  in-place text correction invalidates the ETag — but NOT `as_of`, so it
-  stays stable across polls when content is unchanged.
-- **`MapEngine::content_version()` = `data_version`.** An alert set is
-  revised in place: a warning published at 10:00 is active at 09:00 too,
-  so every tile already rendered and cached for an explicit `TIME=09:00`
-  was wrong from then on (the preview sends the manifest's latest time
-  explicitly, so it froze at whatever had arrived at page load). The
-  API layers fold the content version into the rendered / meta-tile keys;
-  an unchanged rebuild keeps the caches warm. Pinned by api-wms's
+  every property in key order (text, producer parameters, geometry
+  provenance) + the geometry — any in-place correction invalidates the
+  ETag — but NOT `as_of`, so it stays stable across polls when content is
+  unchanged.
+- **`MapEngine::content_version()` = `data_version`** (non-zero by
+  contract). An alert set is revised in place: a warning published at
+  10:00 is active at 09:00 too, so every tile already rendered and cached
+  for an explicit `TIME=09:00` was wrong from then on (the preview sends
+  the manifest's latest time explicitly, so it froze at whatever had
+  arrived at page load). The API layers fold the content version into the
+  rendered / meta-tile keys and send a revalidating `Cache-Control`
+  instead of `immutable` for explicit-TIME responses; an unchanged rebuild
+  keeps the caches warm. Pinned by api-wms's
   `content_version_change_invalidates_rendered_and_metatile_caches`.
 
 ## Rendering & extents
