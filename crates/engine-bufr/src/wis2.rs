@@ -375,6 +375,40 @@ mod tests {
     }
 
     #[test]
+    fn undecodable_payload_does_not_probe_and_warns_once_per_centre() {
+        // A valid BUFR message whose first descriptor is the unassigned
+        // 3-63-255: `decode()` yields one per-message failure, no reports.
+        let mut bad = fixture("synop_se-smhi_20260912T0800Z.bufr");
+        let s3 = 8 + u32::from_be_bytes([0, bad[8], bad[9], bad[10]]) as usize;
+        bad[s3 + 7] = 0xFF;
+        bad[s3 + 8] = 0xFF;
+        let e = engine();
+        let Source::Wis2(src) = e.source() else {
+            panic!()
+        };
+        src.apply(&e, resolved("se-smhi/bad1", Some(bad.clone())));
+        src.apply(&e, resolved("se-smhi/bad2", Some(bad)));
+        src.apply(&e, resolved("se-smhi/junk", Some(b"not bufr".to_vec())));
+        assert!(
+            !e.is_loaded(),
+            "failures alone must not mark the feed probed"
+        );
+        assert_eq!(e.health.files_total.load(Ordering::Relaxed), 3);
+        assert_eq!(e.health.decode_failures_total.load(Ordering::Relaxed), 3);
+        // Three failures of one kind ("error") from one centre: one warning.
+        assert_eq!(src.warned.lock().unwrap().len(), 1);
+        // One decoded report flips it.
+        src.apply(
+            &e,
+            resolved(
+                "se-smhi/good",
+                Some(fixture("synop_se-smhi_20260912T0800Z.bufr")),
+            ),
+        );
+        assert!(e.is_loaded());
+    }
+
+    #[test]
     fn live_status_state_machine() {
         let e = engine();
         let Source::Wis2(src) = e.source() else {
