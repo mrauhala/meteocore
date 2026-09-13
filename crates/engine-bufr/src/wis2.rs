@@ -29,6 +29,9 @@ use crate::health::Health;
 /// `data_id` → rows it produced, remembered for deletions. Bounded by
 /// count (a global feed is ~10 messages/s; 200 k ≈ 5 h).
 const MAX_REMEMBERED: usize = 200_000;
+/// Back-off between attempts to (re)start the broker pipeline after it
+/// failed to start or ended on its own.
+const RESPAWN_DELAY: Duration = Duration::from_secs(30);
 
 pub struct Wis2Source {
     config: Wis2Config,
@@ -175,39 +178,67 @@ impl Wis2Source {
     }
 
     /// Drive the subscription until `shutdown` fires. Called from
-    /// `BufrEngine::poll_loop` (background runtime).
+    /// `BufrEngine::poll_loop` (background runtime). If the pipeline cannot
+    /// be started, or ends on its own (a non-transient subscriber error, a
+    /// closed channel), it is respawned after [`RESPAWN_DELAY`] rather than
+    /// leaving the collection frozen — an unchanged-config reload reuses
+    /// this engine, so nothing else would restart it short of a process
+    /// restart (the engine-cap `wis2_loop` pattern).
     pub async fn run(&self, engine: &BufrEngine, shutdown: &Shutdown) {
         let label = engine.collection_id().to_string();
-        let pipeline_shutdown = Arc::new(Shutdown::new());
-        let mut pipeline =
-            match ds_wis2::spawn_pipeline(&self.config, &label, pipeline_shutdown.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("[{label}] bufr/wis2: cannot start subscription: {e}");
-                    return;
-                }
-            };
-        self.status.store(Arc::new(Some(pipeline.status.clone())));
         let mut snap = shutdown.ticker(BufrEngine::SNAPSHOT_INTERVAL, FirstTick::Skip);
         let mut prune = shutdown.ticker(BufrEngine::PRUNE_INTERVAL, FirstTick::Skip);
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.wait() => break,
-                r = pipeline.receiver.recv() => match r {
-                    Some(r) => self.apply(engine, r),
-                    None => {
-                        tracing::warn!("[{label}] bufr/wis2: pipeline ended");
-                        break;
+        'session: loop {
+            let pipeline_shutdown = Arc::new(Shutdown::new());
+            let mut pipeline =
+                match ds_wis2::spawn_pipeline(&self.config, &label, pipeline_shutdown.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            "[{label}] bufr/wis2: cannot start subscription: {e} — retrying in {}s",
+                            RESPAWN_DELAY.as_secs()
+                        );
+                        if !shutdown.sleep(RESPAWN_DELAY).await {
+                            break 'session;
+                        }
+                        continue 'session;
                     }
-                },
-                _ = prune.tick() => engine.prune_now(),
-                _ = snap.tick() => engine.snapshot_if_dirty(),
+                };
+            self.status.store(Arc::new(Some(pipeline.status.clone())));
+            loop {
+                // `biased` with the tickers ahead of the message arm: a QoS-1
+                // backlog replay (channel continuously ready) must not starve
+                // pruning and snapshots.
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => {
+                        pipeline_shutdown.shutdown();
+                        break 'session;
+                    }
+                    _ = prune.tick() => engine.prune_now(),
+                    _ = snap.tick() => engine.snapshot_if_dirty(),
+                    r = pipeline.receiver.recv() => match r {
+                        Some(r) => self.apply(engine, r),
+                        None => {
+                            tracing::warn!(
+                                "[{label}] bufr/wis2: pipeline ended — restarting in {}s",
+                                RESPAWN_DELAY.as_secs()
+                            );
+                            // Mark the session down so /health degrades while
+                            // we wait, then respawn.
+                            pipeline.status.set_disconnected();
+                            pipeline_shutdown.shutdown();
+                            if !shutdown.sleep(RESPAWN_DELAY).await {
+                                break 'session;
+                            }
+                            continue 'session;
+                        }
+                    },
+                }
             }
         }
         // The pipeline's own Shutdown is private to this loop so a reload can
         // never leave a subscriber behind.
-        pipeline_shutdown.shutdown();
     }
 
     fn apply(&self, engine: &BufrEngine, r: Resolved) {

@@ -141,6 +141,12 @@ fact, download policy). Engine-side specifics:
   decoded (fresh notifications whose payloads all fail to decode are
   `Degraded`, not green-with-nothing-served). A quiet CAP feed is healthy;
   a quiet observation feed is not, hence the extra knob.
+- **Lifecycle:** `Wis2Source::run` is a `'session` loop like engine-cap's
+  `wis2_loop` — if the pipeline cannot start or ends on its own it is
+  marked disconnected (so `/health` degrades) and respawned after 30 s;
+  an unchanged-config reload reuses the engine, so nothing else would
+  restart it. The prune/snapshot tickers sit ahead of the message arm
+  under `biased` so a backlog replay cannot starve them.
 - Metrics: the shared `wis2_*` families (labelled by collection) plus the
   `bufr_*` ingest counters; `bufr_files_total` counts payloads here.
 - The notification's `wigos_station_identifier` / Point geometry are NOT
