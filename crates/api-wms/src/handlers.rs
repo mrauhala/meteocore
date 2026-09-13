@@ -252,6 +252,10 @@ pub async fn wms_handler(
             // longer mix timesteps within a single response. Exact-match
             // engines keep the identity default.
             let time = engine.resolve_time(time, reference_time);
+            // Content revised in place under the same instant (a push-fed
+            // alert set) must not hit a stale entry: the engine's content
+            // version is part of every rendered/meta-tile key.
+            let content_version = engine.content_version();
 
             // Build cache key
             let cache_key = CacheKey {
@@ -286,6 +290,7 @@ pub async fn wms_handler(
                 // The forecast run pinned via the `reference_time` dimension
                 // (None ⇒ latest), so runs don't collide in the rendered cache.
                 reference_time,
+                content_version,
             };
 
             let cache_control = cache_control_value(has_explicit_time);
@@ -411,6 +416,7 @@ pub async fn wms_handler(
                             time,
                             z: z_q,
                             reference_time,
+                            content_version,
                         };
                         // `bbox` is in WGS84 degrees here — the params layer
                         // converts EPSG:3857 metres to degrees before this point;

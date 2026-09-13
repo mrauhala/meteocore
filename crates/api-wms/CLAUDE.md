@@ -55,6 +55,12 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   `get_raster_tile` and into the rendered + meta-tile cache keys
   (`CacheKey.reference_time`, `TileKeyPrefix.reference_time`) so distinct
   runs don't collide.
+- **Content version.** Both keys also carry the engine's
+  `MapEngine::content_version()` (`CacheKey.content_version`,
+  `TileKeyPrefix.content_version`), read right after `resolve_time`. It is
+  `0` for immutable-timestep engines; an engine whose content for a fixed
+  instant is revised in place (engine-cap) bumps it, so an explicit
+  `TIME=` render can't be served stale forever from the no-TTL caches.
 
 ## Capabilities niceties
 

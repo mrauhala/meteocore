@@ -188,6 +188,14 @@ memory. Things that differ from the pull sources:
   the text fields (event/headline/description/instruction/areaDesc) — an
   in-place text correction invalidates the ETag — but NOT `as_of`, so it
   stays stable across polls when content is unchanged.
+- **`MapEngine::content_version()` = `data_version`.** An alert set is
+  revised in place: a warning published at 10:00 is active at 09:00 too,
+  so every tile already rendered and cached for an explicit `TIME=09:00`
+  was wrong from then on (the preview sends the manifest's latest time
+  explicitly, so it froze at whatever had arrived at page load). The
+  API layers fold the content version into the rendered / meta-tile keys;
+  an unchanged rebuild keeps the caches warm. Pinned by api-wms's
+  `content_version_change_invalidates_rendered_and_metatile_caches`.
 
 ## Rendering & extents
 

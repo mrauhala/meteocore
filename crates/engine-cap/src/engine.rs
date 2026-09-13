@@ -648,6 +648,15 @@ impl MapEngine for CapEngine {
         Some(time.unwrap_or_else(|| self.snapshot().as_of))
     }
 
+    /// An alert set is revised in place: a warning published at 10:00 is
+    /// active at 09:00 too, so every tile already rendered for an explicit
+    /// `TIME=09:00` is wrong from then on. The catalog's `data_version`
+    /// (content only — never `as_of`) keys the rendered caches, so a changed
+    /// alert set gets fresh tiles and an unchanged rebuild keeps them.
+    fn content_version(&self) -> u64 {
+        self.snapshot().data_version
+    }
+
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],

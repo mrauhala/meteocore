@@ -1681,6 +1681,9 @@ async fn render_tile(
         // The engine's latest run, pinned above (#521); a `reference_time`
         // query parameter is a follow-up (#337 Phase 4).
         reference_time,
+        // Content revised in place under the same instant (a push-fed alert
+        // set) must not hit a stale entry.
+        content_version: engine.content_version(),
     };
 
     let cache_control = cache_control_value(has_explicit_time);

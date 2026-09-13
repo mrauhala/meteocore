@@ -470,6 +470,27 @@ pub trait MapEngine: Send + Sync {
         let _ = time;
         reference_time
     }
+
+    /// A value that changes whenever the pixels this engine would render for
+    /// a **fixed** `(time, reference_time, z, parameter)` can change. The
+    /// API layers fold it into the no-TTL rendered / meta-tile cache keys,
+    /// so an engine whose content for a given instant is *revised in place*
+    /// invalidates its cached tiles by returning a new value.
+    ///
+    /// Most engines never need this: a radar frame, a forecast step or a
+    /// COG timestep is immutable once ingested, so `(time, reference_time)`
+    /// already keys the pixels exactly — keep the default `0`. Override it
+    /// for content that accumulates or is corrected under the same
+    /// timestamps — a push-fed alert set (engine-cap: a warning published
+    /// later is active at instants that were already rendered and cached,
+    /// so every explicit `TIME=` tile went stale) — with a cheap snapshot
+    /// read (e.g. the `FeatureEngine::data_version` the engine already
+    /// keeps). It must NOT change on a rebuild that changed nothing, or
+    /// the caches would churn for no reason. **O(1) from a snapshot** —
+    /// this runs on the hot render path before the cache lookup.
+    fn content_version(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(test)]
