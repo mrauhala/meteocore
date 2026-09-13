@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes" ?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>2.49.0.0.246.0.FI.260913145444.hTwsi2Z20lXyoHTJB1og</identifier>
+  <sender>cap@fmi.fi</sender>
+  <sent>2026-09-13T17:54:44+03:00</sent>
+  <status>Actual</status>
+  <msgType>Update</msgType>
+  <scope>Public</scope>
+  <references>cap@fmi.fi,2.49.0.0.246.0.FI.260913114353.hTwsi2Z20lXyoHTJB1og,2026-09-13T14:43:53+03:00 cap@fmi.fi,2.49.0.0.246.0.FI.260913082204.hTwsi2Z20lXyoHTJB1og,2026-09-13T11:22:04+03:00</references>
+  <info>
+    <language>fi-FI</language>
+    <category>Met</category>
+    <event>Huomautus veneilijöille</event>
+    <urgency>Future</urgency>
+    <severity>Moderate</severity>
+    <certainty>Possible</certainty>
+    <effective>2026-09-13T17:54:44+03:00</effective>
+    <onset>2026-09-13T21:00:00+03:00</onset>
+    <expires>2026-09-14T06:00:00+03:00</expires>
+    <senderName>Ilmatieteen laitos</senderName>
+    <description>Huomautus veneilijöille: Lännen ja luoteen välistä tuulta iltayöstä alkaen 11 m/s.</description>
+    <web>https://www.ilmatieteenlaitos.fi/varoitukset</web>
+    <contact>Ilmatieteen laitos - Turvallisuussääpäivystys</contact>
+    <parameter>
+      <valueName>awareness_level</valueName>
+      <value>2; yellow; Moderate</value>
+    </parameter>
+    <parameter>
+      <valueName>awareness_type</valueName>
+      <value>1; wind</value>
+    </parameter>
+    <area>
+      <areaDesc>Selkämeren pohjoisosa, Perämeren eteläosa, Perämeren pohjoisosa</areaDesc>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI802</value>
+      </geocode>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI810</value>
+      </geocode>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI809</value>
+      </geocode>
+    </area>
+  </info>
+  <info>
+    <language>sv-SE</language>
+    <category>Met</category>
+    <event>Meddelande för båtförare</event>
+    <urgency>Future</urgency>
+    <severity>Moderate</severity>
+    <certainty>Possible</certainty>
+    <effective>2026-09-13T17:54:44+03:00</effective>
+    <onset>2026-09-13T21:00:00+03:00</onset>
+    <expires>2026-09-14T06:00:00+03:00</expires>
+    <senderName>Meteorologiska institutet</senderName>
+    <description>Meddelande för båtförare: Från och med förnatten västlig till nordvästlig vind 11 m/s.</description>
+    <web>https://sv.ilmatieteenlaitos.fi/varningar</web>
+    <contact>Meteorologiska institutet - Väder- och säkerhetscentralen</contact>
+    <parameter>
+      <valueName>awareness_level</valueName>
+      <value>2; yellow; Moderate</value>
+    </parameter>
+    <parameter>
+      <valueName>awareness_type</valueName>
+      <value>1; wind</value>
+    </parameter>
+    <area>
+      <areaDesc>Selkämeren pohjoisosa, Perämeren eteläosa, Perämeren pohjoisosa</areaDesc>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI802</value>
+      </geocode>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI810</value>
+      </geocode>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI809</value>
+      </geocode>
+    </area>
+  </info>
+  <info>
+    <language>en-GB</language>
+    <category>Met</category>
+    <event>Strong wind advisory</event>
+    <urgency>Future</urgency>
+    <severity>Moderate</severity>
+    <certainty>Possible</certainty>
+    <effective>2026-09-13T17:54:44+03:00</effective>
+    <onset>2026-09-13T21:00:00+03:00</onset>
+    <expires>2026-09-14T06:00:00+03:00</expires>
+    <senderName>Finnish Meteorological Institute</senderName>
+    <description>Strong wind advisory: West to northwest wind 11 m/s from the late evening on.</description>
+    <web>https://en.ilmatieteenlaitos.fi/warnings</web>
+    <contact>Finnish Meteorological Institute - Safety Weather Service</contact>
+    <parameter>
+      <valueName>awareness_level</valueName>
+      <value>2; yellow; Moderate</value>
+    </parameter>
+    <parameter>
+      <valueName>awareness_type</valueName>
+      <value>1; wind</value>
+    </parameter>
+    <area>
+      <areaDesc>Selkämeren pohjoisosa, Perämeren eteläosa, Perämeren pohjoisosa</areaDesc>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI802</value>
+      </geocode>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI810</value>
+      </geocode>
+      <geocode>
+        <valueName>EMMA_ID</valueName>
+        <value>FI809</value>
+      </geocode>
+    </area>
+  </info>
+</alert>

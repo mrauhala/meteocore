@@ -40,6 +40,10 @@ struct Args {
     /// Print every accepted notification (default: first 20).
     #[arg(long)]
     verbose: bool,
+    /// Also print the notification's non-standard properties (`extra`) and
+    /// geometry type — e.g. MeteoAlarm's indexInfo/indexArea/indexFeature.
+    #[arg(long)]
+    extra: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -105,6 +109,13 @@ async fn main() {
                             n.topic, n.data_id, n.content.is_some(),
                             n.canonical_link().map(|l| l.href.as_str()).unwrap_or("-")
                         );
+                        if args.extra {
+                            println!(
+                                "    extra={} geometry={:?}",
+                                serde_json::Value::Object(n.extra.clone()),
+                                n.geometry.as_ref().map(|g| g.bbox())
+                            );
+                        }
                     }
                 }
             }
