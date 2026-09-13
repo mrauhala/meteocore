@@ -107,15 +107,23 @@ memory. Things that differ from the pull sources:
   is already gone from the accumulator — so an Update chain counts once
   (`update_chain_withdrawal_is_counted_once_across_rebuilds`).
 - **MeteoAlarm geometry.** The hub's CAP XML is geocode-only (NUTS3 /
-  EMMA_ID, no `<polygon>`), but each notification (one per alert × info ×
-  area, `indexInfo`/`indexArea` 0-based in document order) carries a
-  `rel=geometry` link to the exact zone polygon. With `geometry_links`
-  (default on) it is downloaded **on arrival** — the links are pre-signed
-  and expire about an hour after publication, so a late replay cannot
-  recover them — sanity-checked against the notification bbox, and attached
-  to that one area as `CapArea.hint_geometry` — only for single-alert
-  documents (with several `<alert>`s the same (info, area) position exists
-  in each, so hints are dropped as ambiguous and counted as rejected).
+  EMMA_ID, no `<polygon>`), but each notification — one per alert × info ×
+  area × **geocode** (`indexInfo`/`indexArea`/`indexFeature`, 0-based in
+  document order) — carries a `rel=geometry` link to that one zone's exact
+  polygon. With `geometry_links` (default on) it is downloaded **on
+  arrival** — the links are pre-signed and expire about an hour after
+  publication, so a late replay cannot recover them — sanity-checked
+  against the notification bbox, and attached to that area as one **part**
+  of `CapArea.hint_geometry` (`CapAreaHint.parts`, keyed by
+  `indexFeature`, else by a polygon fingerprint). An area that is several
+  zones — FMI's "Selkämeren pohjoisosa, Perämeren eteläosa, Perämeren
+  pohjoisosa" is ONE `<area>` with three EMMA_IDs — renders the union of
+  its parts; keeping only the first hint drew one sea area under a
+  description naming three. A redelivery of a feature replaces its part
+  (`merge_hints`: the newer revision wins a part both carry). Hints apply
+  only to single-alert documents (with several `<alert>`s the same
+  (info, area) position exists in each, so hints are dropped as ambiguous
+  and counted as rejected).
   `build_geometry` order:
   inline polygons/circles → `geocode_geometry` lookup → hint → (opt-in)
   notification bbox. `properties.geometry_source` says which

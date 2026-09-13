@@ -438,7 +438,10 @@ fn build_geometry(
     // Still nothing: a hint the source attached (WIS2 notification geometry).
     if polys.is_empty() {
         if let Some(hint) = &area.hint_geometry {
-            polys.extend(polygon_parts(&hint.geometry));
+            // Every part: an area that is several zones renders their union.
+            for g in hint.geometries() {
+                polys.extend(polygon_parts(g));
+            }
             if !polys.is_empty() {
                 source = Some(hint.source);
             }
@@ -775,6 +778,15 @@ fn hash_property(v: &PropertyValue, h: &mut u64) {
             }
         }
     }
+}
+
+/// Content fingerprint of a geometry (structure + every coordinate) — the
+/// key a WIS2 hint part falls back to when the notification carries no
+/// feature index, so identical polygons collapse and distinct ones union.
+pub(crate) fn geometry_fingerprint(g: &Geometry) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    hash_geometry(g, &mut h);
+    h
 }
 
 /// Fold a geometry's structure and every coordinate into `h`. Coordinates

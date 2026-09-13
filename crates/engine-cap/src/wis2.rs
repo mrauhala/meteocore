@@ -31,14 +31,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
 use ds_core::feature::Geometry;
 use ds_wis2::{Fetcher, Notification, Payload, Resolved};
 
-use crate::catalog::build_window;
-use crate::parser::{parse_document, CapAlert, CapAreaHint};
+use crate::catalog::{build_window, geometry_fingerprint};
+use crate::parser::{parse_document, CapAlert, CapAreaHint, HintPart};
 use crate::supersede::{is_renderable, references_withdrawn_by};
 
 /// Alerts with no computable validity end are kept this long after receipt.
@@ -256,10 +256,7 @@ impl Wis2CapSource {
             n.geometry
                 .as_ref()
                 .and_then(|g| g.bbox())
-                .map(|b| CapAreaHint {
-                    geometry: Arc::new(bbox_polygon(b)),
-                    source: "bbox",
-                })
+                .map(|b| CapAreaHint::single(HintPart::Content(0), bbox_polygon(b), "bbox"))
         } else {
             None
         };
@@ -574,34 +571,43 @@ pub fn hint_from_bytes(n: &Notification, bytes: &[u8]) -> Result<CapAreaHint, &'
             return Err("polygon lies outside the notification bbox");
         }
     }
-    Ok(CapAreaHint {
-        geometry: Arc::new(geometry),
-        source: "notification",
-    })
+    // MeteoAlarm publishes one notification per geocode of an area
+    // (`indexFeature`); the part key lets the zones of one area union and a
+    // redelivery of the same zone replace rather than duplicate.
+    let part = match n.extra_u64("indexFeature") {
+        Some(i) => HintPart::Feature(i),
+        None => HintPart::Content(geometry_fingerprint(&geometry)),
+    };
+    Ok(CapAreaHint::single(part, geometry, "notification"))
 }
 
-/// Carry per-area hints from `from` into `into` where `into` has none or
-/// only a bbox fallback. Precedence per area: an exact `notification`
-/// polygon (either side) beats any bbox; between two bboxes `into` — the
-/// side being kept, i.e. the newer revision — wins.
+/// Carry per-area hints from `from` into `into`. Precedence per area: an
+/// exact `notification` hint (either side) beats any bbox; two exact hints
+/// union their parts (one notification per zone of a multi-zone area),
+/// `into` — the side being kept, i.e. the newer revision — winning a part
+/// both carry; between two bboxes `into` wins.
 fn merge_hints(into: &mut CapAlert, from: &CapAlert) {
     for (i, info) in into.infos.iter_mut().enumerate() {
         for (a, area) in info.areas.iter_mut().enumerate() {
-            let replaceable = match &area.hint_geometry {
-                None => true,
-                Some(h) => h.source == "bbox",
-            };
-            if !replaceable {
-                continue;
-            }
-            if let Some(h) = from
+            let Some(h) = from
                 .infos
                 .get(i)
                 .and_then(|fi| fi.areas.get(a))
-                .and_then(|fa| fa.hint_geometry.clone())
-            {
-                if area.hint_geometry.is_none() || h.source != "bbox" {
-                    area.hint_geometry = Some(h);
+                .and_then(|fa| fa.hint_geometry.as_ref())
+            else {
+                continue;
+            };
+            match &mut area.hint_geometry {
+                None => area.hint_geometry = Some(h.clone()),
+                Some(mine) if mine.source == "bbox" => {
+                    if h.source != "bbox" {
+                        area.hint_geometry = Some(h.clone());
+                    }
+                }
+                Some(mine) => {
+                    if h.source != "bbox" {
+                        mine.absorb(h);
+                    }
                 }
             }
         }
@@ -667,6 +673,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use ds_wis2::{DownloadPolicy, PayloadSource, Status};
+    use std::sync::Arc;
 
     fn fetcher() -> Fetcher {
         Fetcher::new(
@@ -945,10 +952,11 @@ mod tests {
         r.notification
             .extra
             .insert("indexArea".into(), serde_json::Value::from(0u64));
-        let exact = CapAreaHint {
-            geometry: Arc::new(bbox_polygon([1.0, 1.0, 2.0, 2.0])),
-            source: "notification",
-        };
+        let exact = CapAreaHint::single(
+            HintPart::Content(0),
+            bbox_polygon([1.0, 1.0, 2.0, 2.0]),
+            "notification",
+        );
         src.apply_with_hint(r, Some((0, 0, exact)), "t", at(0));
         let snap = src.snapshot(at(1));
         assert_eq!(snap.len(), 2);
@@ -1262,7 +1270,7 @@ mod tests {
         let snap = src.snapshot(at(1));
         let hint = snap[0].infos[0].areas[0].hint_geometry.as_ref().unwrap();
         assert_eq!(hint.source, "bbox");
-        assert_eq!(hint.geometry.bbox(), Some([20.5, 41.4, 21.2, 42.2]));
+        assert_eq!(hint.bbox(), Some([20.5, 41.4, 21.2, 42.2]));
     }
 
     #[tokio::test]
@@ -1295,10 +1303,7 @@ mod tests {
             "t",
             at(0),
         );
-        assert_eq!(
-            hint_of(&src, 1).geometry.bbox(),
-            Some([20.0, 40.0, 21.0, 41.0])
-        );
+        assert_eq!(hint_of(&src, 1).bbox(), Some([20.0, 40.0, 21.0, 41.0]));
         // Revision 2 republishes the area with a corrected extent B2: it
         // must replace B1, not be blocked by it.
         src.apply_with_hint(
@@ -1309,7 +1314,7 @@ mod tests {
         );
         let h = hint_of(&src, 11);
         assert_eq!(h.source, "bbox");
-        assert_eq!(h.geometry.bbox(), Some([22.0, 42.0, 23.0, 43.0]));
+        assert_eq!(h.bbox(), Some([22.0, 42.0, 23.0, 43.0]));
         // A late copy of the older revision (B1) does not roll it back.
         src.apply_with_hint(
             with_bbox("d1", 0, "Alert", [20.0, 40.0, 21.0, 41.0]),
@@ -1317,15 +1322,13 @@ mod tests {
             "t",
             at(12),
         );
-        assert_eq!(
-            hint_of(&src, 13).geometry.bbox(),
-            Some([22.0, 42.0, 23.0, 43.0])
-        );
+        assert_eq!(hint_of(&src, 13).bbox(), Some([22.0, 42.0, 23.0, 43.0]));
         // An exact polygon from a per-area notification beats every bbox …
-        let exact = CapAreaHint {
-            geometry: Arc::new(bbox_polygon([22.1, 42.1, 22.9, 42.9])),
-            source: "notification",
-        };
+        let exact = CapAreaHint::single(
+            HintPart::Content(0),
+            bbox_polygon([22.1, 42.1, 22.9, 42.9]),
+            "notification",
+        );
         src.apply_with_hint(
             with_bbox("d2", 10, "Update", [22.0, 42.0, 23.0, 43.0]),
             Some((0, 0, exact)),
@@ -1342,7 +1345,63 @@ mod tests {
         );
         let h = hint_of(&src, 31);
         assert_eq!(h.source, "notification");
-        assert_eq!(h.geometry.bbox(), Some([22.1, 42.1, 22.9, 42.9]));
+        assert_eq!(h.bbox(), Some([22.1, 42.1, 22.9, 42.9]));
+    }
+
+    #[tokio::test]
+    async fn per_feature_hints_union_and_a_corrected_feature_replaces_its_part() {
+        // One area, two hub features (indexFeature 0 and 1): the hints
+        // union; a redelivery of feature 1 with a corrected polygon replaces
+        // that part only.
+        let src = Wis2CapSource::new(cfg());
+        let far = "2026-09-13T00:00:00+00:00";
+        let hint = |feature: u64, b: [f64; 4]| {
+            CapAreaHint::single(HintPart::Feature(feature), bbox_polygon(b), "notification")
+        };
+        let doc = || resolved("d1", 0, Some(cap_xml("A", "Alert", "", far)));
+        src.apply_with_hint(
+            doc(),
+            Some((0, 0, hint(1, [10.0, 60.0, 11.0, 61.0]))),
+            "t",
+            at(0),
+        );
+        src.apply_with_hint(
+            doc(),
+            Some((0, 0, hint(0, [12.0, 62.0, 13.0, 63.0]))),
+            "t",
+            at(1),
+        );
+        let h = src.snapshot(at(2))[0].infos[0].areas[0]
+            .hint_geometry
+            .clone()
+            .unwrap();
+        assert_eq!(h.parts.len(), 2);
+        assert_eq!(h.bbox(), Some([10.0, 60.0, 13.0, 63.0]));
+        // Corrected feature 1.
+        src.apply_with_hint(
+            doc(),
+            Some((0, 0, hint(1, [10.5, 60.5, 11.5, 61.5]))),
+            "t",
+            at(3),
+        );
+        let h = src.snapshot(at(4))[0].infos[0].areas[0]
+            .hint_geometry
+            .clone()
+            .unwrap();
+        assert_eq!(h.parts.len(), 2, "replaced, not stacked");
+        assert_eq!(h.bbox(), Some([10.5, 60.5, 13.0, 63.0]));
+        // A late older revision cannot roll a part back.
+        src.apply_with_hint(
+            resolved("d0", -5, Some(cap_xml("A", "Alert", "", far))),
+            Some((0, 0, hint(1, [10.0, 60.0, 11.0, 61.0]))),
+            "t",
+            at(5),
+        );
+        let h = src.snapshot(at(6))[0].infos[0].areas[0]
+            .hint_geometry
+            .clone()
+            .unwrap();
+        assert_eq!(h.bbox(), Some([10.5, 60.5, 13.0, 63.0]));
     }
 
     #[test]

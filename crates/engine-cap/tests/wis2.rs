@@ -101,7 +101,7 @@ fn meteoalarm_alert_gets_exact_zone_polygon_from_the_geometry_hint() {
     assert!(href.contains("/features/4f7e90d1-925f-4b3b-b288-afb475bbe056.geojson"));
     let hint = hint_from_bytes(&n, &fixture("meteoalarm-mk-area.geojson")).unwrap();
     assert_eq!(hint.source, "notification");
-    let hb = hint.geometry.bbox().unwrap();
+    let hb = hint.bbox().unwrap();
     // 82-vertex NUTS3 polygon inside the notification's bbox.
     assert!(
         hb[0] >= 20.5 && hb[2] <= 21.25 && hb[1] >= 41.49 && hb[3] <= 42.21,
@@ -521,7 +521,7 @@ fn data_version_changes_when_only_a_vertex_moves() {
 
     // Nudge one vertex that touches none of the bbox edges.
     let mut doc: serde_json::Value = serde_json::from_slice(&original).unwrap();
-    let bbox = hint1.geometry.bbox().unwrap();
+    let bbox = hint1.bbox().unwrap();
     let ring = doc["geometry"]["coordinates"][0].as_array_mut().unwrap();
     let idx = ring
         .iter()
@@ -534,7 +534,7 @@ fn data_version_changes_when_only_a_vertex_moves() {
     ring[idx][0] = serde_json::Value::from(x + 0.001);
     let moved = serde_json::to_vec(&doc).unwrap();
     let hint2 = hint_from_bytes(&n1, &moved).unwrap();
-    assert_eq!(hint2.geometry.bbox(), Some(bbox), "bbox must be unchanged");
+    assert_eq!(hint2.bbox(), Some(bbox), "bbox must be unchanged");
 
     let mut n2 = n1.clone();
     n2.id = "second".into();
@@ -548,4 +548,128 @@ fn data_version_changes_when_only_a_vertex_moves() {
         "same vertex count"
     );
     assert_ne!(engine.data_version(), v1);
+}
+
+const FI_IDENTIFIER: &str = "2.49.0.0.246.0.FI.260913145444.hTwsi2Z20lXyoHTJB1og";
+/// Inside the FI alert's validity (onset 18:00Z 09-13, expires 03:00Z 09-14).
+const T_FI: DateTime<Utc> = DateTime::from_timestamp(1_789_326_000, 0).unwrap(); // 2026-09-13T19:00:00Z
+
+/// A MeteoAlarm-style notification for one feature (geocode) of the FI
+/// alert's area: `indexInfo`/`indexArea`/`indexFeature` plus the feature's
+/// own bbox, exactly as the hub publishes them.
+fn fi_notification(feature: usize, zone: &serde_json::Value) -> Notification {
+    let mut n = notification("meteoalarm-mk-notification.json");
+    n.id = format!("fi-{feature}");
+    n.data_id = "eu-eumetnet-warnings/fi-19a060e9".into();
+    n.pubtime = T_FI - chrono::Duration::hours(4);
+    n.extra
+        .insert("indexInfo".into(), serde_json::Value::from(2u64));
+    n.extra
+        .insert("indexArea".into(), serde_json::Value::from(0u64));
+    n.extra.insert(
+        "indexFeature".into(),
+        serde_json::Value::from(feature as u64),
+    );
+    // The hub's notification geometry is the feature's bbox.
+    let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    for poly in zone["geometry"]["coordinates"].as_array().unwrap() {
+        for c in poly[0].as_array().unwrap() {
+            let (x, y) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
+            b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+        }
+    }
+    n.geometry = Some(ds_wis2::Geometry::Polygon(vec![
+        [b[0], b[1]],
+        [b[0], b[3]],
+        [b[2], b[3]],
+        [b[2], b[1]],
+        [b[0], b[1]],
+    ]));
+    n
+}
+
+#[test]
+fn multi_zone_area_renders_the_union_of_its_per_feature_hints() {
+    // The real FMI document: ONE <area> ("Selkämeren pohjoisosa, Perämeren
+    // eteläosa, Perämeren pohjoisosa") with THREE EMMA_ID geocodes. The hub
+    // publishes one notification — one rel=geometry polygon — per geocode.
+    // Keeping only the first would draw one sea area under a description
+    // naming three.
+    let engine = CapEngine::new(&config(Some("en"), false), "cap-wis2").unwrap();
+    let src = engine.wis2_source().unwrap();
+    let xml = fixture("meteoalarm-fi-alert.xml");
+    let zones: Vec<serde_json::Value> = (0..3)
+        .map(|i| {
+            serde_json::from_slice(&fixture(&format!("meteoalarm-fi-zone-{i}.geojson"))).unwrap()
+        })
+        .collect();
+    // Deliberately out of order, like Global Cache delivery.
+    for feature in [1usize, 0, 2] {
+        let n = fi_notification(feature, &zones[feature]);
+        let hint = hint_from_bytes(&n, &serde_json::to_vec(&zones[feature]).unwrap()).unwrap();
+        src.apply_with_hint(resolved(n, xml.clone()), Some((2, 0, hint)), "t", T_FI);
+    }
+    engine.refresh_with(|| T_FI).unwrap();
+    let f = engine.get_feature(&format!("{FI_IDENTIFIER}.2.0")).unwrap();
+    assert_eq!(
+        f.properties.get("areaDesc").and_then(|v| v.as_str()),
+        Some("Selkämeren pohjoisosa, Perämeren eteläosa, Perämeren pohjoisosa")
+    );
+    let expected: usize = zones
+        .iter()
+        .map(|z| z["geometry"]["coordinates"].as_array().unwrap().len())
+        .sum();
+    match &*f.geometry {
+        Geometry::MultiPolygon { polygons } => {
+            assert_eq!(polygons.len(), expected, "all three zones' polygons");
+        }
+        other => panic!("expected a MultiPolygon, got {other:?}"),
+    }
+    // The union spans the whole Gulf of Bothnia (all three zones), not one.
+    let b = f.geometry.bbox().unwrap();
+    assert!(b[3] - b[1] > 3.0, "bbox {b:?} must span three sea areas");
+    assert_eq!(
+        f.properties.get("geometry_source").and_then(|v| v.as_str()),
+        Some("notification")
+    );
+
+    // A redelivery of one feature (same polygon) adds nothing; a corrected
+    // polygon for that feature replaces it rather than stacking.
+    let v1 = engine.data_version();
+    let n = fi_notification(1, &zones[1]);
+    let hint = hint_from_bytes(&n, &serde_json::to_vec(&zones[1]).unwrap()).unwrap();
+    src.apply_with_hint(resolved(n, xml.clone()), Some((2, 0, hint)), "t", T_FI);
+    engine.refresh_with(|| T_FI).unwrap();
+    assert_eq!(
+        engine.data_version(),
+        v1,
+        "an identical redelivery changes nothing"
+    );
+    let f = engine.get_feature(&format!("{FI_IDENTIFIER}.2.0")).unwrap();
+    assert!(
+        matches!(&*f.geometry, Geometry::MultiPolygon { polygons } if polygons.len() == expected)
+    );
+
+    // Feed mode with the EMMA zone lookup must agree: same document, same
+    // polygon count.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fi.xml"), &xml).unwrap();
+    let mut feed_cfg = config(Some("en"), false);
+    feed_cfg.wis2 = None;
+    feed_cfg.data_path = Some(dir.path().to_string_lossy().into_owned());
+    feed_cfg.geocode_geometry = Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/cap/emma-fi.geojson")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    feed_cfg.geocode_value_name = Some("EMMA_ID".into());
+    let via_lookup = CapEngine::new(&feed_cfg, "cap-feed").unwrap();
+    via_lookup.refresh_with(|| T_FI).unwrap();
+    let g = via_lookup
+        .get_feature(&format!("{FI_IDENTIFIER}.2.0"))
+        .unwrap();
+    assert!(
+        matches!(&*g.geometry, Geometry::MultiPolygon { polygons } if polygons.len() == expected)
+    );
 }

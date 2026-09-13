@@ -83,13 +83,68 @@ pub struct CapArea {
 }
 
 /// Source-attached geometry for an area that carries none of its own.
+///
+/// An area is often several zones: MeteoAlarm's FMI feed puts one `<area>`
+/// with three EMMA_ID geocodes ("Selkämeren pohjoisosa, Perämeren eteläosa,
+/// Perämeren pohjoisosa") in a document and publishes one notification —
+/// one `rel=geometry` polygon — **per geocode** (`indexFeature`). The hint
+/// therefore holds one part per feature and renders their union; a
+/// redelivery of the same feature replaces its part instead of drawing it
+/// twice.
 #[derive(Debug, Clone)]
 pub struct CapAreaHint {
-    pub geometry: std::sync::Arc<ds_core::feature::Geometry>,
+    pub parts: std::collections::BTreeMap<HintPart, std::sync::Arc<ds_core::feature::Geometry>>,
     /// Provenance label emitted as the `geometry_source` property
     /// (`"notification"` for a `rel=geometry` link, `"bbox"` for the
     /// notification extent).
     pub source: &'static str,
+}
+
+/// What identifies one part of a [`CapAreaHint`]: the hub's feature index
+/// when the notification carries one (`indexFeature`), else a fingerprint
+/// of the polygon itself (so duplicates collapse and distinct shapes union).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HintPart {
+    Feature(u64),
+    Content(u64),
+}
+
+impl CapAreaHint {
+    pub fn single(
+        part: HintPart,
+        geometry: ds_core::feature::Geometry,
+        source: &'static str,
+    ) -> Self {
+        let mut parts = std::collections::BTreeMap::new();
+        parts.insert(part, std::sync::Arc::new(geometry));
+        CapAreaHint { parts, source }
+    }
+
+    /// The parts in key order.
+    pub fn geometries(&self) -> impl Iterator<Item = &ds_core::feature::Geometry> {
+        self.parts.values().map(|g| g.as_ref())
+    }
+
+    /// Union bbox over the parts.
+    pub fn bbox(&self) -> Option<[f64; 4]> {
+        self.geometries().filter_map(|g| g.bbox()).reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ]
+        })
+    }
+
+    /// Add the parts of `other` this hint does not have yet (an existing
+    /// part wins — the caller decides which side is "newer" by which hint
+    /// absorbs which).
+    pub fn absorb(&mut self, other: &CapAreaHint) {
+        for (k, g) in &other.parts {
+            self.parts.entry(*k).or_insert_with(|| g.clone());
+        }
+    }
 }
 
 /// A parsed `<circle>`: centre (`[lon, lat]`) + radius in kilometres.
