@@ -486,8 +486,12 @@ pub trait MapEngine: Send + Sync {
     /// so every explicit `TIME=` tile went stale) — with a cheap snapshot
     /// read (e.g. the `FeatureEngine::data_version` the engine already
     /// keeps). It must NOT change on a rebuild that changed nothing, or
-    /// the caches would churn for no reason. **O(1) from a snapshot** —
-    /// this runs on the hot render path before the cache lookup.
+    /// the caches would churn for no reason. `0` is reserved for "never
+    /// revised" — an overriding engine must return a non-zero value, as the
+    /// API layers also use it to decide between an `immutable` and a
+    /// revalidating `Cache-Control` for explicit-`TIME` responses. **O(1)
+    /// from a snapshot** — this runs on the hot render path before the
+    /// cache lookup.
     fn content_version(&self) -> u64 {
         0
     }

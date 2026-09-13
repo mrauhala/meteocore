@@ -76,10 +76,16 @@ fn render_error_tile(width: u32, height: u32) -> Result<Vec<u8>, WmsError> {
 
 /// Cache-Control header value for a WMS response.
 ///
-/// - Requests with explicit TIME: immutable data, cache for 24 hours
-/// - Requests without TIME (latest): short cache (60s) since "latest" changes
-fn cache_control_value(has_explicit_time: bool) -> &'static str {
-    if has_explicit_time {
+/// - Explicit TIME over immutable content (`content_version == 0`): the
+///   pixels for that instant never change — cache for 24 hours, `immutable`
+///   (no revalidation at all).
+/// - Otherwise — no TIME ("latest" moves), or content the engine revises in
+///   place under a fixed instant (`content_version != 0`, e.g. a push-fed
+///   alert set): short cache (60 s) and revalidate, so a browser/CDN that
+///   holds a pre-revision tile for the same URL asks again (the ETag is
+///   content-derived, so an unchanged tile is a cheap 304).
+fn cache_control_value(has_explicit_time: bool, content_version: u64) -> &'static str {
+    if has_explicit_time && content_version == 0 {
         "public, max-age=86400, immutable"
     } else {
         "public, max-age=60, must-revalidate"
@@ -293,7 +299,7 @@ pub async fn wms_handler(
                 content_version,
             };
 
-            let cache_control = cache_control_value(has_explicit_time);
+            let cache_control = cache_control_value(has_explicit_time, content_version);
             // Read If-None-Match into an owned String so it survives the move
             // into spawn_blocking and the cache-hit/miss branches below.
             let if_none_match = headers

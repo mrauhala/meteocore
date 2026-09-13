@@ -253,6 +253,14 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    including any cross-run fallback) — the caches key the run axis on it
    (#521). Skipping this freezes the first-rendered run's pixels when a
    newer run re-covers the same valid times.
+   **If the engine's content for a fixed `(time, reference_time)` can be
+   revised in place** (a push-fed alert set: a warning published later is
+   active at instants already rendered), it MUST override
+   `MapEngine::content_version` with a value that moves with the content
+   (engine-cap returns its `data_version`) — the no-TTL rendered and
+   meta-tile caches key on it, and explicit-`TIME` responses then carry a
+   short, revalidating `Cache-Control` instead of `immutable`.
+   Immutable-timestep engines keep the default `0`.
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.

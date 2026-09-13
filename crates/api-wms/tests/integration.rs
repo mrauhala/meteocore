@@ -873,36 +873,51 @@ async fn content_version_change_invalidates_rendered_and_metatile_caches() {
              &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64\
              &TIME=2024-01-01T00:00:00Z"
         );
+        // Returns (x-cache, cache-control).
         let get = |app: axum::Router, uri: String| async move {
             let resp = app
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            resp.headers()
-                .get("x-cache")
-                .map(|v| v.to_str().unwrap().to_string())
+            let h = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            (h("x-cache"), h("cache-control"))
         };
-        assert_eq!(get(app.clone(), uri.clone()).await.as_deref(), Some("MISS"));
+        // content_version 0 = immutable timesteps: explicit TIME may be
+        // cached downstream without revalidation.
+        let (x, cc) = get(app.clone(), uri.clone()).await;
+        assert_eq!(x, "MISS");
+        assert!(cc.contains("immutable"), "{crs}: {cc}");
         let after_first = calls.load(Ordering::Relaxed);
         assert!(after_first > 0);
         // Same content: served from cache, engine not called.
-        assert_eq!(get(app.clone(), uri.clone()).await.as_deref(), Some("HIT"));
+        assert_eq!(get(app.clone(), uri.clone()).await.0, "HIT");
         assert_eq!(
             calls.load(Ordering::Relaxed),
             after_first,
             "{crs}: cache must hit"
         );
-        // Revised content under the same TIME: re-rendered.
+        // Revised content under the same TIME: re-rendered, and downstream
+        // caches are told to revalidate rather than keep the old tile 24 h.
         version.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(get(app.clone(), uri.clone()).await.as_deref(), Some("MISS"));
+        let (x, cc) = get(app.clone(), uri.clone()).await;
+        assert_eq!(x, "MISS");
+        assert!(
+            cc.contains("must-revalidate") && !cc.contains("immutable"),
+            "{crs}: {cc}"
+        );
         assert!(
             calls.load(Ordering::Relaxed) > after_first,
             "{crs}: a new content_version must reach the engine"
         );
         // …and the revised render is cached under the new version.
         let after_revised = calls.load(Ordering::Relaxed);
-        assert_eq!(get(app, uri).await.as_deref(), Some("HIT"));
+        assert_eq!(get(app, uri).await.0, "HIT");
         assert_eq!(calls.load(Ordering::Relaxed), after_revised);
     }
 }

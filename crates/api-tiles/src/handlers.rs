@@ -112,9 +112,13 @@ fn layer_style_map<'a>(
         .map(|m| (collection_id.to_string(), m))
 }
 
-fn cache_control_value(has_explicit_time: bool) -> &'static str {
-    if has_explicit_time {
-        // Tiles at fixed z/x/y + timestamp are truly immutable
+/// `immutable` (24 h) only for an explicit timestamp over content the engine
+/// never revises (`content_version == 0`): a tile at fixed z/x/y + time is
+/// then truly immutable. "Latest" and in-place-revised content (a push-fed
+/// alert set) get 60 s + revalidation so a browser/CDN holding a
+/// pre-revision tile asks again.
+fn cache_control_value(has_explicit_time: bool, content_version: u64) -> &'static str {
+    if has_explicit_time && content_version == 0 {
         "public, max-age=86400, immutable"
     } else {
         "public, max-age=60, must-revalidate"
@@ -1686,7 +1690,7 @@ async fn render_tile(
         content_version: engine.content_version(),
     };
 
-    let cache_control = cache_control_value(has_explicit_time);
+    let cache_control = cache_control_value(has_explicit_time, cache_key.content_version);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
