@@ -606,7 +606,15 @@ fn merge_hints(into: &mut CapAlert, from: &CapAlert) {
                 }
                 Some(mine) => {
                     if h.source != "bbox" {
-                        mine.absorb(h);
+                        let shed = mine.absorb(h);
+                        if shed > 0 {
+                            tracing::debug!(
+                                "cap/wis2: {} info {i} area {a}: {shed} geometry part(s) over the \
+                                 {} cap dropped",
+                                into.identifier,
+                                crate::parser::MAX_HINT_PARTS
+                            );
+                        }
                     }
                 }
             }
@@ -1402,6 +1410,31 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(h.bbox(), Some([10.5, 60.5, 13.0, 63.0]));
+    }
+
+    #[test]
+    fn hint_parts_are_capped_shedding_fingerprint_parts_first() {
+        use crate::parser::MAX_HINT_PARTS;
+        let mut h = CapAreaHint::single(
+            HintPart::Feature(0),
+            bbox_polygon([0.0, 0.0, 1.0, 1.0]),
+            "notification",
+        );
+        // A producer without indexFeature that keeps redrawing the outline.
+        for i in 0..(MAX_HINT_PARTS as u64 + 50) {
+            let jitter = i as f64 * 1e-4;
+            let other = CapAreaHint::single(
+                HintPart::Content(1 + i),
+                bbox_polygon([10.0 + jitter, 10.0, 11.0, 11.0]),
+                "notification",
+            );
+            h.absorb(&other);
+        }
+        assert_eq!(h.parts.len(), MAX_HINT_PARTS);
+        assert!(
+            h.parts.contains_key(&HintPart::Feature(0)),
+            "feature-indexed parts survive; fingerprint parts are shed first"
+        );
     }
 
     #[test]

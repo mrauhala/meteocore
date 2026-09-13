@@ -120,7 +120,11 @@ memory. Things that differ from the pull sources:
   pohjoisosa" is ONE `<area>` with three EMMA_IDs — renders the union of
   its parts; keeping only the first hint drew one sea area under a
   description naming three. A redelivery of a feature replaces its part
-  (`merge_hints`: the newer revision wins a part both carry). Hints apply
+  (`merge_hints`: the newer revision wins a part both carry). Parts are
+  capped at `MAX_HINT_PARTS` (256), shedding fingerprint-keyed parts
+  first, so a producer without `indexFeature` that keeps redrawing an
+  outline cannot grow one area's geometry for the alert's lifetime. Hints
+  apply
   only to single-alert documents (with several `<alert>`s the same
   (info, area) position exists in each, so hints are dropped as ambiguous
   and counted as rejected).

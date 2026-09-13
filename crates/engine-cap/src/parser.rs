@@ -103,11 +103,20 @@ pub struct CapAreaHint {
 /// What identifies one part of a [`CapAreaHint`]: the hub's feature index
 /// when the notification carries one (`indexFeature`), else a fingerprint
 /// of the polygon itself (so duplicates collapse and distinct shapes union).
+/// The variant order matters: `Feature` sorts before `Content`, so when a
+/// hint overflows [`MAX_HINT_PARTS`] the fingerprint-keyed parts — the ones
+/// a producer that redraws the same zone could multiply — are shed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HintPart {
     Feature(u64),
     Content(u64),
 }
+
+/// Parts one area's hint may hold. An area is at most a few dozen zones
+/// (NUTS3 / EMMA_ID); the cap keeps a chatty producer that keeps
+/// republishing a slightly different outline without `indexFeature` from
+/// growing one area's geometry for the alert's whole lifetime.
+pub const MAX_HINT_PARTS: usize = 256;
 
 impl CapAreaHint {
     pub fn single(
@@ -139,11 +148,19 @@ impl CapAreaHint {
 
     /// Add the parts of `other` this hint does not have yet (an existing
     /// part wins — the caller decides which side is "newer" by which hint
-    /// absorbs which).
-    pub fn absorb(&mut self, other: &CapAreaHint) {
+    /// absorbs which). Returns how many parts were shed to stay within
+    /// [`MAX_HINT_PARTS`] (highest keys first: fingerprint-keyed parts
+    /// before feature-indexed ones).
+    pub fn absorb(&mut self, other: &CapAreaHint) -> usize {
         for (k, g) in &other.parts {
             self.parts.entry(*k).or_insert_with(|| g.clone());
         }
+        let mut shed = 0;
+        while self.parts.len() > MAX_HINT_PARTS {
+            self.parts.pop_last();
+            shed += 1;
+        }
+        shed
     }
 }
 
