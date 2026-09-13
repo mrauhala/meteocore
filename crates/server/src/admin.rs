@@ -589,6 +589,50 @@ static CAP_WIS2_EVICTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
 });
 
+// BUFR observation engine.
+static BUFR_STATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "bufr_stations",
+        "Stations held in the BUFR observation store",
+        &["collection"],
+    )
+});
+static BUFR_REPORTS_STORED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "bufr_reports_stored",
+        "Station reports (rows) held in the BUFR observation store",
+        &["collection"],
+    )
+});
+static BUFR_SCANS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "bufr_scans_total",
+        "Source scans (data_path mode), by result (ok, failed)",
+        &["collection", "result"],
+    )
+});
+static BUFR_FILES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "bufr_files_total",
+        "BUFR files / payloads fetched for decoding",
+        &["collection"],
+    )
+});
+static BUFR_REPORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "bufr_reports_total",
+        "Decoded station reports, by result (ingested, replaced, out_of_window, skipped)",
+        &["collection", "result"],
+    )
+});
+static BUFR_DECODE_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "bufr_decode_failures_total",
+        "BUFR payloads that could not be decoded, by reason (error, unsupported)",
+        &["collection", "reason"],
+    )
+});
+
 /// Emit the `wis2_*` series for one collection from a pipeline snapshot.
 fn scrape_wis2_status(
     last: &mut HashMap<String, [u64; 12]>,
@@ -863,6 +907,8 @@ struct CacheCounterState {
     /// CAP engine counters per collection (superseded, wis2 ingested,
     /// rejected, deletions, hints attached, hints rejected, evicted).
     cap: HashMap<String, [u64; 7]>,
+    /// BUFR engine counters per collection (`Health::counters` order).
+    bufr: HashMap<String, [u64; 9]>,
 }
 
 static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1114,6 +1160,7 @@ pub struct ServerState {
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
     pub cap_engines: RwLock<Vec<Arc<engine_cap::CapEngine>>>,
+    pub bufr_engines: RwLock<Vec<Arc<engine_bufr::BufrEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     pub nowcast_engines: RwLock<Vec<Arc<engine_nowcast::NowcastEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
@@ -1164,6 +1211,7 @@ pub struct LoadResult {
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
     pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
+    pub bufr_engines: Vec<Arc<engine_bufr::BufrEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
     pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
     /// Every successfully built (or reused) poll-loop engine, keyed by
@@ -1201,6 +1249,7 @@ pub enum EngineHandle {
     Odim(Arc<engine_odim::OdimEngine>),
     OdimVolume(Arc<engine_odim::PolarVolumeEngine>),
     Cap(Arc<engine_cap::CapEngine>),
+    Bufr(Arc<engine_bufr::BufrEngine>),
     Postgis(Arc<engine_postgis::PostgisEngine>),
     Nowcast(Arc<engine_nowcast::NowcastEngine>),
 }
@@ -1236,6 +1285,7 @@ impl EngineReuse {
     reuse_take!(take_odim, Odim, engine_odim::OdimEngine);
     reuse_take!(take_odim_volume, OdimVolume, engine_odim::PolarVolumeEngine);
     reuse_take!(take_cap, Cap, engine_cap::CapEngine);
+    reuse_take!(take_bufr, Bufr, engine_bufr::BufrEngine);
     reuse_take!(take_postgis, Postgis, engine_postgis::PostgisEngine);
     reuse_take!(take_nowcast, Nowcast, engine_nowcast::NowcastEngine);
 }
@@ -1376,6 +1426,7 @@ pub fn load_collections(
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
     let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
+    let mut bufr_engines: Vec<Arc<engine_bufr::BufrEngine>> = Vec::new();
     let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
     let mut nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>> = Vec::new();
     // Point-event sources (#549): events-shape postgis collections, keyed
@@ -1430,6 +1481,7 @@ pub fn load_collections(
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
+            "bufr" => &["edr", "features"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
             _ => &[],
@@ -2724,6 +2776,96 @@ pub fn load_collections(
                     error,
                 });
             }
+            "bufr" => {
+                let bufr_config = match collection.bufr.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'bufr' but missing [collections.bufr] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "bufr".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.bufr] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let engine = match engine_reuse.take_bufr(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
+                        );
+                        e
+                    }
+                    None => match engine_bufr::BufrEngine::new(bufr_config, &collection.id) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize BUFR engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "bufr".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
+                };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Bufr(engine.clone()));
+                bufr_engines.push(engine.clone());
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                    info!("Collection '{}': wired to EDR API", collection.id);
+                }
+                if collection.apis.contains(&"features".to_string()) {
+                    feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    feature_collections.insert(collection.id.clone(), collection.clone());
+                    info!("Collection '{}': wired to Features API", collection.id);
+                }
+
+                // Ready once the source has been scanned successfully — even
+                // with zero reports (an empty directory is a valid, quiet
+                // source); `health_handler` keeps the live status current.
+                let (status, error) = match engine.live_health() {
+                    Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
+                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
+                        (CollectionStatus::Degraded, Some(reason.to_string()))
+                    }
+                    None if engine.is_loaded() => (CollectionStatus::Ready, None),
+                    None => (
+                        CollectionStatus::Degraded,
+                        Some("initial scan failed (will retry on poll)".into()),
+                    ),
+                };
+                let (stations, reports) = engine.gauges();
+                info!(
+                    "Collection '{}': bufr holds {stations} station(s), {reports} report(s)",
+                    collection.id
+                );
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "bufr".into(),
+                    status,
+                    error,
+                });
+            }
             "postgis" => {
                 let postgis_cfg = match collection.postgis.as_ref() {
                     Some(c) => c,
@@ -3373,6 +3515,7 @@ pub fn load_collections(
         odim_engines,
         odim_volume_engines,
         cap_engines,
+        bufr_engines,
         postgis_engines,
         nowcast_engines,
         engines_by_id,
@@ -3979,6 +4122,7 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     rotate_poll_loops!(odim_engines);
     rotate_poll_loops!(odim_volume_engines);
     rotate_poll_loops!(cap_engines);
+    rotate_poll_loops!(bufr_engines);
     rotate_poll_loops!(postgis_engines);
     rotate_poll_loops!(nowcast_engines);
     info!(
@@ -4106,6 +4250,10 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         .unwrap_or_else(|e| e.into_inner()) = result.odim_volume_engines;
     *state.cap_engines.write().unwrap_or_else(|e| e.into_inner()) = result.cap_engines;
     *state
+        .bufr_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.bufr_engines;
+    *state
         .postgis_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.postgis_engines;
@@ -4185,14 +4333,33 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     }
 
     // Generic live override for engines exposing `ds_core::health::LiveStatus`
-    // (CAP in WIS2 mode; `None` = no live signal, keep the boot snapshot).
+    // (CAP in WIS2 mode, BUFR; `None` = no live signal, keep the boot snapshot).
     {
-        let engines = state.cap_engines.read().unwrap_or_else(|e| e.into_inner());
-        let live: HashMap<&str, ds_core::health::LiveStatus> = engines
+        let mut live: HashMap<String, ds_core::health::LiveStatus> = HashMap::new();
+        for e in state
+            .cap_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter_map(|e| Some((e.collection_id(), e.live_health()?)))
-            .collect();
-        for h in health.iter_mut().filter(|h| h.engine_type == "cap") {
+        {
+            if let Some(s) = e.live_health() {
+                live.insert(e.collection_id().to_string(), s);
+            }
+        }
+        for e in state
+            .bufr_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if let Some(s) = e.live_health() {
+                live.insert(e.collection_id().to_string(), s);
+            }
+        }
+        for h in health
+            .iter_mut()
+            .filter(|h| h.engine_type == "cap" || h.engine_type == "bufr")
+        {
             match live.get(h.id.as_str()) {
                 Some(ds_core::health::LiveStatus::Ready) => {
                     h.status = CollectionStatus::Ready;
@@ -4266,6 +4433,19 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             let id = engine.collection_id().to_string();
             if let Some(age) = engine.data_age() {
                 data_ages.insert(id.clone(), age.num_seconds());
+            }
+            if let Some(temporal) = build_temporal(engine.as_ref()) {
+                temporal_info.insert(id, temporal);
+            }
+        }
+    }
+    {
+        // BUFR: data age = newest report held; temporal extent from the store.
+        let engines = state.bufr_engines.read().unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            if let Some(latest) = engine.latest_report() {
+                data_ages.insert(id.clone(), (chrono::Utc::now() - latest).num_seconds());
             }
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
@@ -4776,6 +4956,44 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
+    // BUFR engines: store gauges + ingest counters.
+    if let Ok(engines) = state.bufr_engines.read() {
+        for engine in engines.iter() {
+            let cid = engine.collection_id();
+            let (stations, reports) = engine.gauges();
+            BUFR_STATIONS.with_label_values(&[cid]).set(stations as i64);
+            BUFR_REPORTS_STORED
+                .with_label_values(&[cid])
+                .set(reports as i64);
+            let d = delta_counts(&mut counter_state.bufr, cid, engine.health.counters());
+            BUFR_SCANS_TOTAL
+                .with_label_values(&[cid, "ok"])
+                .inc_by(d[0].saturating_sub(d[1]));
+            BUFR_SCANS_TOTAL
+                .with_label_values(&[cid, "failed"])
+                .inc_by(d[1]);
+            BUFR_FILES_TOTAL.with_label_values(&[cid]).inc_by(d[2]);
+            BUFR_REPORTS_TOTAL
+                .with_label_values(&[cid, "ingested"])
+                .inc_by(d[3]);
+            BUFR_REPORTS_TOTAL
+                .with_label_values(&[cid, "replaced"])
+                .inc_by(d[4]);
+            BUFR_REPORTS_TOTAL
+                .with_label_values(&[cid, "out_of_window"])
+                .inc_by(d[5]);
+            BUFR_REPORTS_TOTAL
+                .with_label_values(&[cid, "skipped"])
+                .inc_by(d[6]);
+            BUFR_DECODE_FAILURES_TOTAL
+                .with_label_values(&[cid, "error"])
+                .inc_by(d[7]);
+            BUFR_DECODE_FAILURES_TOTAL
+                .with_label_values(&[cid, "unsupported"])
+                .inc_by(d[8]);
+        }
+    }
+
     drop(counter_state);
 
     let encoder = TextEncoder::new();
@@ -5057,6 +5275,7 @@ mod tests {
             odim: None,
             cap: None,
             postgis: None,
+            bufr: None,
             nowcast: source.map(|s| ds_core::config::NowcastConfig {
                 source: s.to_string(),
                 horizon: "PT1H".to_string(),

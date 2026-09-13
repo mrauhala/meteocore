@@ -1,0 +1,27 @@
+id = "obs-bufr-local"
+title = "Surface observations (BUFR, local demo)"
+description = "SYNOP station reports decoded from WMO BUFR files — eight real reports captured from the WIS2 Global Broker on 2026-09-12 08:00Z. One location per station, one PointSeries per station and time window; stations as Point features."
+engine_type = "bufr"
+apis = ["edr", "features"]
+keywords = ["observations", "SYNOP", "BUFR", "WMO", "stations"]
+
+[license]
+title = "CC-BY-4.0"
+
+[bufr]
+# Directory or object-store prefix of *.bufr files, re-listed every
+# poll_interval_secs; only files not seen before are fetched. Swap for a WIS2
+# subscription with [bufr.wis2] (mutually exclusive) — see the docs.
+data_path = "testdata/bufr-synop"
+poll_interval_secs = 60
+# The demo fixtures are from 2026-09-12 — a production feed keeps the default
+# PT24H so the store stays bounded (retention × cadence × stations).
+retention = "P36500D"
+max_stations = 50000
+position_radius_km = 25.0   # EDR position → nearest station within this radius
+# builtin_parameters = true  # the SYNOP essentials (air_temperature, pressure_msl, …)
+# [[bufr.parameters]]         # override a built-in by name, or add your own
+# name = "rain_2h"
+# descriptors = ["013011"]    # Table B FXXYYY (first match wins)
+# unit = "kg m-2"
+# period_hours = 2            # for period-qualified elements

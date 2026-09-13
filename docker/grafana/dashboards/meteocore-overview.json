@@ -6,7 +6,7 @@
     "meteocore"
   ],
   "schemaVersion": 39,
-  "version": 4,
+  "version": 5,
   "refresh": "30s",
   "time": {
     "from": "now-3h",
@@ -2674,6 +2674,117 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "BUFR store — stations & reports held",
+      "description": "bufr_stations / bufr_reports_stored = the observation store after pruning (retention window × max_stations). A global SYNOP subscription levels off around 20 k stations × 24 hourly rows; a step down means a prune or an engine rebuild on reload (counters rebaseline). Flat at 0 with a Ready collection = the source is empty or every report is out of the retention window (check bufr_reports_total{result=out_of_window}).",
+      "id": 59,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 154
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "bufr_stations",
+          "refId": "A",
+          "legendFormat": "{{collection}} stations"
+        },
+        {
+          "expr": "bufr_reports_stored",
+          "refId": "B",
+          "legendFormat": "{{collection}} reports"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "BUFR ingest — reports & decode failures per hour",
+      "description": "ingested = new (station, time) rows; replaced = corrections / re-sent reports; out_of_window = report time outside now−retention−1h … now+1h (clock skew or a stale feed); skipped = subsets without station id / position / time. Decode failures: error = malformed BUFR, unsupported = a tinybufr gap (compressed strings, operators 203/204/207/22x) — a steady unsupported rate from one centre means its template needs the decoder extended (see crates/engine-bufr/CLAUDE.md).",
+      "id": 60,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 154
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (collection, result) (rate(bufr_reports_total[1h]) * 3600)",
+          "refId": "A",
+          "legendFormat": "{{collection}} {{result}}"
+        },
+        {
+          "expr": "sum by (collection, reason) (rate(bufr_decode_failures_total[1h]) * 3600)",
+          "refId": "B",
+          "legendFormat": "{{collection}} decode {{reason}}"
+        },
+        {
+          "expr": "rate(bufr_scans_total{result=\"failed\"}[1h]) * 3600",
+          "refId": "C",
+          "legendFormat": "{{collection}} scan failures"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Logs",
       "id": 37,
@@ -2682,7 +2793,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 154
+        "y": 162
       },
       "panels": []
     },
@@ -2695,7 +2806,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 155
+        "y": 163
       },
       "datasource": {
         "type": "loki",
@@ -2728,7 +2839,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 164
+        "y": 172
       },
       "datasource": {
         "type": "loki",

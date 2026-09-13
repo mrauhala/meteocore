@@ -11,6 +11,7 @@ members = [
     "crates/engine-nowcast",
     "crates/engine-odim",
     "crates/engine-cap",
+    "crates/engine-bufr",
     "crates/engine-zarr",
     "crates/storage",
     "crates/render",

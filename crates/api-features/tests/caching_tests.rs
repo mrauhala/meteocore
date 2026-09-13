@@ -111,6 +111,7 @@ fn build_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            bufr: None,
             preview: None,
         },
     );

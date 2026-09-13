@@ -557,6 +557,15 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    // BUFR observation loop — scans the source, prunes expired reports and
+    // rebuilds the station snapshot (blocking ds-storage I/O; background
+    // runtime only).
+    for engine in &result.bufr_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
     // PostGIS metadata refresh loop — keeps the location list / extents / the
     // `locations_window` "currently reporting" set current without a reload.
     for engine in &result.postgis_engines {
@@ -694,6 +703,7 @@ async fn main() {
         odim_engines: RwLock::new(result.odim_engines),
         odim_volume_engines: RwLock::new(result.odim_volume_engines),
         cap_engines: RwLock::new(result.cap_engines),
+        bufr_engines: RwLock::new(result.bufr_engines),
         postgis_engines: RwLock::new(result.postgis_engines),
         nowcast_engines: RwLock::new(result.nowcast_engines),
         reload_lock: tokio::sync::Mutex::new(()),
@@ -894,6 +904,13 @@ async fn main() {
         .read()
         .unwrap_or_else(|e| e.into_inner());
     for engine in cap.iter() {
+        engine.shutdown();
+    }
+    let bufr = server_state
+        .bufr_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in bufr.iter() {
         engine.shutdown();
     }
     let postgis = server_state

@@ -393,6 +393,7 @@ fn mk_collection(
         wms: None,
         postgis: None,
         nowcast: None,
+        bufr: None,
         preview: None,
     }
 }
