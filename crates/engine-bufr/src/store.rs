@@ -247,7 +247,8 @@ mod tests {
         assert_eq!(s.row_count(), 3);
         assert_eq!(s.station_count(), 2);
         let a = s.get("A").unwrap();
-        assert_eq!(a.rows[&t(8)][0], 281.0);
+        // Column 0 is air_temperature: stored in display units (K → °C).
+        assert!((a.rows[&t(8)][0] - (281.0 - 273.15)).abs() < 1e-3);
         assert_eq!(a.info.first_report, t(8));
         assert_eq!(a.info.last_report, t(9));
 

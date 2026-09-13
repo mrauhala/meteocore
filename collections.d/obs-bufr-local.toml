@@ -23,5 +23,5 @@ position_radius_km = 25.0   # EDR position → nearest station within this radiu
 # [[bufr.parameters]]         # override a built-in by name, or add your own
 # name = "rain_2h"
 # descriptors = ["013011"]    # Table B FXXYYY (first match wins)
-# unit = "kg m-2"
+# unit = "kg m-2"               # the BUFR Table B unit; K/Pa/kg m-2 are served as °C/hPa/mm
 # period_hours = 2            # for period-qualified elements

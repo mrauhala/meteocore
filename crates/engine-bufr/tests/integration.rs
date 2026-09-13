@@ -137,7 +137,11 @@ fn edr_locations_parameters_and_extents() {
     assert_eq!(params[0], "air_temperature");
     assert!(params.contains(&"precipitation_24h".to_string()));
     let d = e.get_parameter_descriptions();
-    assert_eq!(d["air_temperature"].unit, "K");
+    // Display units (BUFR K / Pa → °C / hPa, mechanically from the unit).
+    assert_eq!(d["air_temperature"].unit, "°C");
+    assert_eq!(d["pressure_msl"].unit, "hPa");
+    assert_eq!(d["precipitation_24h"].unit, "mm");
+    assert_eq!(d["wind_speed"].unit, "m s-1");
     assert_eq!(
         d["pressure_msl"].observed_property,
         "air_pressure_at_mean_sea_level"
@@ -176,9 +180,11 @@ fn edr_location_series_position_and_parameter_filter() {
     assert_eq!(q.ranges.len(), e.get_parameters().len());
     let temp = &q.ranges["air_temperature"];
     assert_eq!(temp.shape, vec![1]);
-    assert!((temp.values[0].unwrap() - 290.12).abs() < 1e-3);
+    // 290.12 K, served as 16.97 °C.
+    assert!((temp.values[0].unwrap() - 16.97).abs() < 1e-3);
     assert_eq!(q.ranges["pressure_msl"].values[0], None);
     assert_eq!(q.parameters["relative_humidity"].unit, "%");
+    assert_eq!(q.parameters["air_temperature"].unit, "°C");
 
     // Parameter filter keeps only known names.
     let CoverageResponse::Single(q) = e
@@ -203,7 +209,7 @@ fn edr_location_series_position_and_parameter_filter() {
     else {
         panic!()
     };
-    assert!((q.ranges["air_temperature"].values[0].unwrap() - 290.12).abs() < 1e-3);
+    assert!((q.ranges["air_temperature"].values[0].unwrap() - 16.97).abs() < 1e-3);
     assert!(matches!(
         e.query_position("POINT(20.0 58.5)", None, None, None, None),
         Err(DataServerError::LocationNotFound(_))
@@ -218,6 +224,12 @@ fn edr_location_series_position_and_parameter_filter() {
         e.query_location(SMHI, Some((later, later)), None, None, None),
         Err(DataServerError::LocationNotFound(_))
     ));
+    // Pressure: 010004 = 92650 Pa in the ZA report, served as 926.5 hPa.
+    let CoverageResponse::Single(q) = e.query_location(ZA, None, None, None, None).unwrap() else {
+        panic!()
+    };
+    assert!((q.ranges["pressure"].values[0].unwrap() - 926.5).abs() < 1e-3);
+    assert_eq!(q.parameters["pressure"].unit, "hPa");
 }
 
 #[test]
@@ -332,8 +344,10 @@ fn custom_parameter_table_and_builtin_opt_out() {
     else {
         panic!()
     };
-    assert!((q.ranges["t2m"].values[0].unwrap() - 290.12).abs() < 1e-3);
+    // The override names the BUFR unit (K); the display rule still applies.
+    assert!((q.ranges["t2m"].values[0].unwrap() - 16.97).abs() < 1e-3);
     assert_eq!(q.parameters["t2m"].label, "2 m temperature");
+    assert_eq!(q.parameters["t2m"].unit, "°C");
 }
 
 #[test]
