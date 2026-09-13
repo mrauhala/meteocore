@@ -140,6 +140,17 @@ fn meteoalarm_alert_gets_exact_zone_polygon_from_the_geometry_hint() {
     let plain = engine.get_feature(&format!("{MK_IDENTIFIER}.0.0")).unwrap();
     assert!(matches!(&*plain.geometry, Geometry::Null));
     assert!(plain.properties.get("geometry_source").is_none());
+    // MeteoAlarm's <parameter>s ride along under their own names.
+    for f in [&hinted, &plain] {
+        assert_eq!(
+            f.properties.get("awareness_level").and_then(|v| v.as_str()),
+            Some("2; yellow; Moderate")
+        );
+        assert_eq!(
+            f.properties.get("awareness_type").and_then(|v| v.as_str()),
+            Some("10; Rain")
+        );
+    }
     // The spatial extent comes from the hinted polygon alone.
     let ext = engine.spatial_extent().unwrap();
     assert!(

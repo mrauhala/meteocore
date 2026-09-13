@@ -55,6 +55,14 @@ pub struct CapInfo {
     pub description: Option<String>,
     pub instruction: Option<String>,
     pub web: Option<String>,
+    /// `<eventCode>` `(valueName, value)` pairs in document order (CAP §3.2.2:
+    /// system-specific event codes — MeteoAlarm's `OET` event terms, NWS
+    /// `SAME`). Names may repeat.
+    pub event_codes: Vec<(String, String)>,
+    /// `<parameter>` `(valueName, value)` pairs in document order (CAP §3.2.2:
+    /// producer-defined key/value data — MeteoAlarm's `awareness_level` /
+    /// `awareness_type` / repeated `impacts`). Names may repeat.
+    pub parameters: Vec<(String, String)>,
     pub areas: Vec<CapArea>,
 }
 
@@ -113,8 +121,10 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
     let mut alert: Option<CapAlert> = None;
     let mut info: Option<CapInfo> = None;
     let mut area: Option<CapArea> = None;
-    let mut geocode_name: Option<String> = None;
-    let mut geocode_value: Option<String> = None;
+    // The three CAP valueName/value pair elements share one scratch pair;
+    // they never nest, so the closing tag knows which list it belongs to.
+    let mut pair_name: Option<String> = None;
+    let mut pair_value: Option<String> = None;
 
     loop {
         match reader.read_event() {
@@ -124,9 +134,9 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
                     "alert" => alert = Some(CapAlert::default()),
                     "info" => info = Some(CapInfo::default()),
                     "area" => area = Some(CapArea::default()),
-                    "geocode" => {
-                        geocode_name = None;
-                        geocode_value = None;
+                    "geocode" | "parameter" | "eventCode" => {
+                        pair_name = None;
+                        pair_value = None;
                     }
                     _ => {}
                 }
@@ -192,18 +202,29 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
                             a.circles.push(c);
                         }
                     }
-                    // ----- geocode children -----
-                    ("geocode", "valueName") => geocode_name = some(&leaf),
-                    ("geocode", "value") => geocode_value = some(&leaf),
+                    // ----- valueName/value pair children -----
+                    ("geocode" | "parameter" | "eventCode", "valueName") => pair_name = some(&leaf),
+                    ("geocode" | "parameter" | "eventCode", "value") => pair_value = some(&leaf),
                     _ => {}
                 }
 
                 // ----- close containers -----
                 match name.as_str() {
                     "geocode" => {
-                        if let (Some(a), Some(n)) = (area.as_mut(), geocode_name.take()) {
-                            a.geocodes
-                                .push((n, geocode_value.take().unwrap_or_default()));
+                        if let (Some(a), Some(n)) = (area.as_mut(), pair_name.take()) {
+                            a.geocodes.push((n, pair_value.take().unwrap_or_default()));
+                        }
+                    }
+                    "parameter" => {
+                        if let (Some(i), Some(n)) = (info.as_mut(), pair_name.take()) {
+                            i.parameters
+                                .push((n, pair_value.take().unwrap_or_default()));
+                        }
+                    }
+                    "eventCode" => {
+                        if let (Some(i), Some(n)) = (info.as_mut(), pair_name.take()) {
+                            i.event_codes
+                                .push((n, pair_value.take().unwrap_or_default()));
                         }
                     }
                     "area" => {
@@ -423,6 +444,22 @@ mod tests {
     <description>Heavy rain.</description>
     <instruction>Move to higher ground.</instruction>
     <web>https://example.org/alert/1</web>
+    <eventCode>
+      <valueName>OET</valueName>
+      <value>Rain; Flood</value>
+    </eventCode>
+    <parameter>
+      <valueName>awareness_level</valueName>
+      <value>2; yellow; Moderate</value>
+    </parameter>
+    <parameter>
+      <valueName>impacts</valueName>
+      <value>Roads may flood.</value>
+    </parameter>
+    <parameter>
+      <valueName>impacts</valueName>
+      <value>Cellars may flood.</value>
+    </parameter>
     <area>
       <areaDesc>Test County</areaDesc>
       <polygon>60.0,24.0 60.0,25.0 61.0,25.0 61.0,24.0 60.0,24.0</polygon>
@@ -450,10 +487,27 @@ mod tests {
         assert_eq!(i.categories, vec!["Met".to_string()]);
         assert_eq!(i.response_types, vec!["Prepare".to_string()]);
         assert!(i.onset.is_some() && i.expires.is_some());
+        // valueName/value pairs at info level, in document order, repeats kept.
+        assert_eq!(
+            i.event_codes,
+            vec![("OET".to_string(), "Rain; Flood".to_string())]
+        );
+        assert_eq!(
+            i.parameters,
+            vec![
+                (
+                    "awareness_level".to_string(),
+                    "2; yellow; Moderate".to_string()
+                ),
+                ("impacts".to_string(), "Roads may flood.".to_string()),
+                ("impacts".to_string(), "Cellars may flood.".to_string()),
+            ]
+        );
         assert_eq!(i.areas.len(), 1);
         let ar = &i.areas[0];
         assert_eq!(ar.area_desc.as_deref(), Some("Test County"));
         assert_eq!(ar.polygons.len(), 1);
+        // The area's own pair element is untouched by the info-level ones.
         assert_eq!(ar.geocodes, vec![("UGC".to_string(), "FIC001".to_string())]);
     }
 
