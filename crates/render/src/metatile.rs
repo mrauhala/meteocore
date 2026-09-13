@@ -141,6 +141,9 @@ pub struct TileKeyPrefix {
     /// Forecast model run (reference time); `None` = the engine's latest run.
     /// Keeps tiles for distinct runs from colliding in the meta-tile cache.
     pub reference_time: Option<DateTime<Utc>>,
+    /// `MapEngine::content_version()` at request time — see
+    /// [`crate::CacheKey::content_version`].
+    pub content_version: u64,
 }
 
 /// Cache key for one rendered+colorized meta-tile.
@@ -152,6 +155,7 @@ pub struct TileKey {
     time: Option<DateTime<Utc>>,
     z: Option<i64>,
     reference_time: Option<DateTime<Utc>>,
+    content_version: u64,
     level: i32,
     col: i64,
     row: i64,
@@ -378,6 +382,7 @@ where
                 time: prefix.time,
                 z: prefix.z,
                 reference_time: prefix.reference_time,
+                content_version: prefix.content_version,
                 level,
                 col,
                 row,
@@ -564,6 +569,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
             level: 3,
             col: 1,
             row: 2,
@@ -720,6 +726,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         // A modest viewport around Helsinki at ~zoom 6.
         let bbox = [20.0, 58.0, 30.0, 64.0];
@@ -786,6 +793,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         let empty_tile = |_b: [f64; 4], w: u32, h: u32| {
             Ok(RasterTile {
@@ -827,6 +835,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         // The pathology the budget guards (#491): a whole-world-wide bbox on a
         // tall, narrow image. The fine y-resolution snaps the ladder deep, so
@@ -860,6 +869,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         // Regression pin for #491: a square-pixel 4K-retina viewport whose
         // requested resolution sits just above a ladder step, so the half-
@@ -929,6 +939,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         // ~1 µm/px viewport (tiny bbox, large image).
         let out = render_metatiled(
@@ -1035,6 +1046,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
 
         // --- X axis: value = mercator-X, constant down each column. ---
@@ -1181,6 +1193,7 @@ mod tests {
             time: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         let bbox = [-150.0, -30.0, 150.0, 87.0]; // north well past the 85° limit
         let (w, h) = (400u32, 400u32);

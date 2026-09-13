@@ -109,6 +109,11 @@ pub struct CacheKey {
     /// the same (layer, time, bbox, …) when a client pins a non-latest run via
     /// the WMS `reference_time` dimension. `None` = the engine's latest run.
     pub reference_time: Option<DateTime<Utc>>,
+    /// The engine's `MapEngine::content_version()` at request time: content
+    /// revised in place under the same `(time, reference_time)` (a push-fed
+    /// alert set) gets a fresh entry instead of serving the stale one
+    /// forever. `0` for engines whose timesteps are immutable.
+    pub content_version: u64,
 }
 
 /// Quantize a vertical level for use in a [`CacheKey`] — millidegrees /
@@ -192,6 +197,13 @@ impl CacheKey {
                 fnv1a_mix(&mut h, &ts.to_le_bytes());
             }
             None => fnv1a_mix(&mut h, &[0u8]),
+        }
+        // Mixed only when set: `0` ("never revised", every immutable-timestep
+        // engine) leaves the ETag exactly as before this field existed, so a
+        // deploy does not invalidate every radar/NWP tile held downstream.
+        if self.content_version != 0 {
+            fnv1a_mix(&mut h, b"|v");
+            fnv1a_mix(&mut h, &self.content_version.to_le_bytes());
         }
         format!("\"{h:016x}\"")
     }
@@ -911,6 +923,7 @@ mod tests {
             parameter: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         let cache = RenderedCache::new(1);
         cache.insert(
@@ -1432,6 +1445,7 @@ mod tests {
             parameter: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         let mut later = base.clone();
         later.time = Some(
@@ -1456,6 +1470,7 @@ mod tests {
             parameter: Some("2t".into()),
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         let mut other = base.clone();
         other.parameter = Some("10u".into());
@@ -1487,6 +1502,7 @@ mod tests {
                     .unwrap()
                     .with_timezone(&chrono::Utc),
             ),
+            content_version: 0,
         };
         let mut other = base.clone();
         other.reference_time = Some(
@@ -1499,6 +1515,49 @@ mod tests {
         let mut absent = base.clone();
         absent.reference_time = None;
         assert_ne!(base.etag(), absent.etag());
+    }
+
+    #[test]
+    fn cache_key_distinguishes_content_versions() {
+        // A push-fed alert set revises the pixels under the same TIME; the
+        // engine's content_version is what keeps a revised render from
+        // hitting the stale entry.
+        let base = CacheKey {
+            layer: "cap".into(),
+            style: "default".into(),
+            format: 0,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-13T07:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            parameter: None,
+            z: None,
+            reference_time: None,
+            content_version: 1,
+        };
+        let mut revised = base.clone();
+        revised.content_version = 2;
+        assert_ne!(base, revised);
+        assert_ne!(
+            base.etag(),
+            revised.etag(),
+            "the key ETag must follow the version"
+        );
+        let mut immutable = base.clone();
+        immutable.content_version = 0;
+        assert_ne!(base.etag(), immutable.etag());
+        let cache = RenderedCache::new(1);
+        cache.insert(
+            base.clone(),
+            CachedRendered::new(Bytes::from_static(b"stale")),
+        );
+        assert!(cache.get(&base).is_some());
+        assert!(cache.get(&revised).is_none());
     }
 
     #[test]
@@ -1519,6 +1578,7 @@ mod tests {
             parameter: None,
             z: None,
             reference_time: None,
+            content_version: 0,
         };
         // Pinned after introducing the `reference_time` field (cache-bust event).
         assert_eq!(key.etag(), "\"92a1d2349689898e\"");

@@ -709,6 +709,9 @@ async fn if_none_match_on_error_tile_returns_304_with_x_cache_error() {
 /// bypass meta-tiling entirely.
 struct CountingMockMapEngine {
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// `MapEngine::content_version` — bumped by a test to simulate content
+    /// revised in place under the same TIME (a push-fed alert set).
+    content_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MapEngine for CountingMockMapEngine {
@@ -750,6 +753,11 @@ impl MapEngine for CountingMockMapEngine {
             reference_times: Vec::new(),
         }
     }
+
+    fn content_version(&self) -> u64 {
+        self.content_version
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Build a WMS router over a single `data` collection backed by a counting
@@ -763,9 +771,25 @@ fn build_counting_router(
     Arc<ds_render::TilePixelCache>,
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let (router, tile_cache, calls, _) = build_counting_router_versioned(metatile_mb);
+    (router, tile_cache, calls)
+}
+
+/// [`build_counting_router`] also handing out the engine's content-version
+/// knob.
+fn build_counting_router_versioned(
+    metatile_mb: u64,
+) -> (
+    axum::Router,
+    Arc<ds_render::TilePixelCache>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let content_version = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let engine: Arc<dyn MapEngine> = Arc::new(CountingMockMapEngine {
         calls: calls.clone(),
+        content_version: content_version.clone(),
     });
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -828,7 +852,74 @@ fn build_counting_router(
         base_url: String::new(),
         trust_proxy_headers: false,
     }));
-    (api_wms::router(state), tile_cache, calls)
+    (api_wms::router(state), tile_cache, calls, content_version)
+}
+
+/// Content revised in place under the same TIME (a push-fed alert set: a
+/// warning published later is active at instants already rendered) must
+/// not be served from the no-TTL caches — on BOTH render paths. The
+/// engine's `content_version` is part of the rendered key and the
+/// meta-tile key; an unchanged version keeps hitting.
+#[tokio::test]
+async fn content_version_change_invalidates_rendered_and_metatile_caches() {
+    use std::sync::atomic::Ordering;
+    for (crs, bbox, metatile_mb) in [
+        ("CRS:84", "10,55,30,70", 64), // direct path (rendered cache)
+        ("EPSG:3857", "1113194,7361866,3339584,11068715", 64), // meta-tiled
+    ] {
+        let (app, _tiles, calls, version) = build_counting_router_versioned(metatile_mb);
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=\
+             &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64\
+             &TIME=2024-01-01T00:00:00Z"
+        );
+        // Returns (x-cache, cache-control).
+        let get = |app: axum::Router, uri: String| async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let h = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            (h("x-cache"), h("cache-control"))
+        };
+        // content_version 0 = immutable timesteps: explicit TIME may be
+        // cached downstream without revalidation.
+        let (x, cc) = get(app.clone(), uri.clone()).await;
+        assert_eq!(x, "MISS");
+        assert!(cc.contains("immutable"), "{crs}: {cc}");
+        let after_first = calls.load(Ordering::Relaxed);
+        assert!(after_first > 0);
+        // Same content: served from cache, engine not called.
+        assert_eq!(get(app.clone(), uri.clone()).await.0, "HIT");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            after_first,
+            "{crs}: cache must hit"
+        );
+        // Revised content under the same TIME: re-rendered, and downstream
+        // caches are told to revalidate rather than keep the old tile 24 h.
+        version.fetch_add(1, Ordering::Relaxed);
+        let (x, cc) = get(app.clone(), uri.clone()).await;
+        assert_eq!(x, "MISS");
+        assert!(
+            cc.contains("must-revalidate") && !cc.contains("immutable"),
+            "{crs}: {cc}"
+        );
+        assert!(
+            calls.load(Ordering::Relaxed) > after_first,
+            "{crs}: a new content_version must reach the engine"
+        );
+        // …and the revised render is cached under the new version.
+        let after_revised = calls.load(Ordering::Relaxed);
+        assert_eq!(get(app, uri).await.0, "HIT");
+        assert_eq!(calls.load(Ordering::Relaxed), after_revised);
+    }
 }
 
 async fn get_map(app: &axum::Router, crs: &str, bbox: &str, w: u32, h: u32) -> StatusCode {
