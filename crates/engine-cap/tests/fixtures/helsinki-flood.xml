@@ -20,6 +20,30 @@
     <description>Heavy rainfall may cause flooding of low-lying areas.</description>
     <instruction>Avoid riverbanks and move valuables to higher floors.</instruction>
     <web>https://meteocore.example/alerts/helsinki-flood-1</web>
+    <eventCode>
+      <valueName>OET</valueName>
+      <value>Rain; Flood</value>
+    </eventCode>
+    <parameter>
+      <valueName>awareness_level</valueName>
+      <value>3; orange; Severe</value>
+    </parameter>
+    <parameter>
+      <valueName>awareness_type</valueName>
+      <value>12; Flooding</value>
+    </parameter>
+    <parameter>
+      <valueName>impacts</valueName>
+      <value>Low-lying roads may flood.</value>
+    </parameter>
+    <parameter>
+      <valueName>impacts</valueName>
+      <value>Cellars may take in water.</value>
+    </parameter>
+    <parameter>
+      <valueName>severity</valueName>
+      <value>a producer-defined severity that must not shadow the CAP one</value>
+    </parameter>
     <area>
       <areaDesc>Greater Helsinki</areaDesc>
       <polygon>60.10,24.90 60.10,25.10 60.30,25.10 60.30,24.90 60.10,24.90</polygon>

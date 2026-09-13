@@ -570,7 +570,60 @@ fn build_properties(
     if let Some(r) = radius_km {
         p.insert("radius_km".into(), PropertyValue::Float(r));
     }
+
+    // Producer-defined valueName/value pairs (CAP §3.2.2). `<parameter>`s
+    // are exposed under their own valueName — MeteoAlarm clients expect
+    // `awareness_level` / `awareness_type` as plain top-level properties, and
+    // the MVT tag encoder and any future `<property>=value` filter are flat
+    // too. `<eventCode>`s are namespaced (`eventCode:<valueName>`) because
+    // their names are terse system ids (`OET`, `SAME`). A name that repeats
+    // (MeteoAlarm's `impacts`) becomes a List in document order; a parameter
+    // whose name collides with a standard property above is namespaced as
+    // `parameter:<valueName>` rather than shadowing it.
+    for (key, value) in group_pairs(&info.event_codes, |n| format!("eventCode:{n}")) {
+        p.insert(key, value);
+    }
+    for (key, value) in group_pairs(&info.parameters, |n| n.to_string()) {
+        let key = if p.contains_key(&key) {
+            format!("parameter:{key}")
+        } else {
+            key
+        };
+        p.insert(key, value);
+    }
     p
+}
+
+/// Group `(valueName, value)` pairs by name (first-seen order): one value
+/// stays a String, repeats become a List of Strings in document order.
+fn group_pairs(
+    pairs: &[(String, String)],
+    key: impl Fn(&str) -> String,
+) -> Vec<(String, PropertyValue)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut values: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, value) in pairs {
+        let k = key(name);
+        match values.get_mut(&k) {
+            Some(v) => v.push(value.clone()),
+            None => {
+                order.push(k.clone());
+                values.insert(k, vec![value.clone()]);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|k| {
+            let mut v = values.remove(&k).unwrap_or_default();
+            let pv = if v.len() == 1 {
+                PropertyValue::String(v.remove(0))
+            } else {
+                str_list(&v)
+            };
+            (k, pv)
+        })
+        .collect()
 }
 
 fn put_str(p: &mut HashMap<String, PropertyValue>, key: &str, v: &Option<String>) {
@@ -641,16 +694,6 @@ fn fnv1a(bytes: &[u8], h: &mut u64) {
 }
 
 fn compute_version(records: &[AreaRecord]) -> u64 {
-    // Text fields whose in-place correction must invalidate Feature ETags (a
-    // re-issued alert can fix a headline/description without touching severity
-    // or expiry, so id+severity+window alone would 304 stale text).
-    const TEXT_KEYS: [&str; 5] = [
-        "event",
-        "headline",
-        "description",
-        "instruction",
-        "areaDesc",
-    ];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
     fnv1a(&(records.len() as u64).to_le_bytes(), &mut h);
     for r in records {
@@ -671,23 +714,56 @@ fn compute_version(records: &[AreaRecord]) -> u64 {
                 .to_le_bytes(),
             &mut h,
         );
-        for key in TEXT_KEYS {
-            if let Some(PropertyValue::String(s)) = r.properties.get(key) {
-                fnv1a(s.as_bytes(), &mut h);
-            }
+        // Every property, in key order: an in-place correction of any text
+        // (headline, description, …), a producer parameter (MeteoAlarm
+        // `awareness_level`) or the geometry provenance must invalidate
+        // Feature ETags — a re-issued alert can change any of them without
+        // touching id, severity or window. Keys are sorted because the map
+        // iterates in hash order.
+        let mut keys: Vec<&String> = r.properties.keys().collect();
+        keys.sort_unstable();
+        for key in keys {
+            fnv1a(key.as_bytes(), &mut h);
+            fnv1a(&[0], &mut h);
+            hash_property(&r.properties[key], &mut h);
         }
         // Geometry fingerprint: in WIS2 mode an area's shape can change
-        // between rebuilds with id/severity/window/text untouched (a bbox
-        // fallback replaced by the exact zone polygon, a hint attached where
-        // there was none, or a corrected zone outline with the same vertex
-        // count and bbox); the MVT tile cache and Feature ETags key on this
-        // version, so every coordinate is part of it.
-        if let Some(PropertyValue::String(s)) = r.properties.get("geometry_source") {
-            fnv1a(s.as_bytes(), &mut h);
-        }
+        // between rebuilds with everything else untouched (a bbox fallback
+        // replaced by the exact zone polygon, a hint attached where there was
+        // none, or a corrected zone outline with the same vertex count and
+        // bbox); the MVT tile cache and Feature ETags key on this version, so
+        // every coordinate is part of it.
         hash_geometry(&r.geometry, &mut h);
     }
     h
+}
+
+/// Fold a property value into `h`, tagging each variant so `"1"` and `1`
+/// (and a one-element list) hash differently.
+fn hash_property(v: &PropertyValue, h: &mut u64) {
+    match v {
+        PropertyValue::String(s) => {
+            fnv1a(&[1], h);
+            fnv1a(s.as_bytes(), h);
+        }
+        PropertyValue::Float(f) => {
+            fnv1a(&[2], h);
+            fnv1a(&f.to_bits().to_le_bytes(), h);
+        }
+        PropertyValue::Integer(i) => {
+            fnv1a(&[3], h);
+            fnv1a(&i.to_le_bytes(), h);
+        }
+        PropertyValue::Bool(b) => fnv1a(&[4, *b as u8], h),
+        PropertyValue::Null => fnv1a(&[5], h),
+        PropertyValue::List(items) => {
+            fnv1a(&[6], h);
+            fnv1a(&(items.len() as u64).to_le_bytes(), h);
+            for item in items {
+                hash_property(item, h);
+            }
+        }
+    }
 }
 
 /// Fold a geometry's structure and every coordinate into `h`. Coordinates
