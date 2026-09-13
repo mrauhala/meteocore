@@ -130,7 +130,11 @@ fact, download policy). Engine-side specifics:
   scanned file.
 - **Deletions:** the `(station, time)` rows every `data_id` produced are
   remembered (bounded, 200 k) so a `rel=deletion` withdraws exactly those
-  rows; an `update` (same station+time) simply replaces the row.
+  rows. The store keys rows by `(station, time)` alone, so ownership is
+  tracked **per key** (`Produced::owner`) and moves to the latest producer:
+  when a second `data_id` re-produces a key (overlapping bulletins, a
+  correction under a new id) the row is replaced and a later deletion of
+  the first, stale `data_id` leaves it alone; deleting the owner removes it.
 - **Health:** `Ready` = subscribed ∧ not disconnected for longer than
   `degrade_after_secs` ∧ a notification accepted within `stale_after`
   (default PT2H — hourly SYNOP with slack) ∧ at least one report ever

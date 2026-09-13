@@ -42,10 +42,63 @@ pub struct Wis2Source {
     warned: Mutex<HashSet<(String, &'static str)>>,
 }
 
+/// Which `(station, time)` rows each `data_id` is responsible for, so a
+/// `rel=deletion` withdraws exactly those. The store keys rows by
+/// `(station, time)` alone and a second `data_id` re-producing a key (an
+/// overlapping bulletin, a correction re-issued under a new id) replaces
+/// the row — so ownership is tracked per key and moves to the latest
+/// producer: deleting the earlier, now-stale `data_id` leaves the live row
+/// alone. Invariant: `owner[k] == d` ⇔ `k ∈ by_data_id[d]`.
 #[derive(Default)]
 struct Produced {
     by_data_id: HashMap<String, Vec<(String, DateTime<Utc>)>>,
+    owner: HashMap<(String, DateTime<Utc>), String>,
     order: VecDeque<String>,
+}
+
+impl Produced {
+    /// Record that `data_id` now holds `keys`, taking each key over from
+    /// whichever `data_id` produced it before.
+    fn record(&mut self, data_id: String, keys: Vec<(String, DateTime<Utc>)>) {
+        for k in &keys {
+            if let Some(prev) = self.owner.insert(k.clone(), data_id.clone()) {
+                if prev != data_id {
+                    if let Some(list) = self.by_data_id.get_mut(&prev) {
+                        list.retain(|x| x != k);
+                    }
+                }
+            }
+        }
+        match self.by_data_id.get_mut(&data_id) {
+            Some(list) => {
+                for k in keys {
+                    if !list.contains(&k) {
+                        list.push(k);
+                    }
+                }
+            }
+            None => {
+                self.by_data_id.insert(data_id.clone(), keys);
+                self.order.push_back(data_id);
+                while self.order.len() > MAX_REMEMBERED {
+                    if let Some(old) = self.order.pop_front() {
+                        self.forget(&old);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop `data_id`'s bookkeeping, returning the keys it still owns.
+    fn forget(&mut self, data_id: &str) -> Vec<(String, DateTime<Utc>)> {
+        let keys = self.by_data_id.remove(data_id).unwrap_or_default();
+        for k in &keys {
+            if self.owner.get(k).is_some_and(|d| d == data_id) {
+                self.owner.remove(k);
+            }
+        }
+        keys
+    }
 }
 
 impl Wis2Source {
@@ -184,15 +237,10 @@ impl Wis2Source {
         if keys.is_empty() {
             return;
         }
-        let mut p = self.produced.lock().unwrap_or_else(|e| e.into_inner());
-        if p.by_data_id.insert(n.data_id.clone(), keys).is_none() {
-            p.order.push_back(n.data_id);
-            while p.order.len() > MAX_REMEMBERED {
-                if let Some(old) = p.order.pop_front() {
-                    p.by_data_id.remove(&old);
-                }
-            }
-        }
+        self.produced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(n.data_id, keys);
     }
 
     /// WARN once per (centre, failure kind) — a centre whose payloads hit a
@@ -220,11 +268,12 @@ impl Wis2Source {
     }
 
     fn delete(&self, engine: &BufrEngine, data_id: &str) {
-        let keys = {
-            let mut p = self.produced.lock().unwrap_or_else(|e| e.into_inner());
-            p.by_data_id.remove(data_id)
-        };
-        if let Some(keys) = keys {
+        let keys = self
+            .produced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(data_id);
+        if !keys.is_empty() {
             let n = engine.remove_reports(&keys);
             tracing::debug!(
                 "[{}] bufr/wis2: deletion of {data_id} removed {n} report(s)",
@@ -372,6 +421,47 @@ mod tests {
         src.apply(&e, resolved("never-seen", None));
         e.snapshot_if_dirty();
         assert_eq!(e.get_locations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deletion_of_a_superseded_data_id_leaves_the_replacing_row_alone() {
+        // Two data_ids produce the same (station, time): the second replaces
+        // the row and takes ownership; deleting the first must not remove it.
+        let e = engine();
+        let Source::Wis2(src) = e.source() else {
+            panic!()
+        };
+        let smhi = fixture("synop_se-smhi_20260912T0800Z.bufr");
+        src.apply(&e, resolved("se-smhi/first", Some(smhi.clone())));
+        src.apply(&e, resolved("se-smhi/second", Some(smhi.clone())));
+        e.snapshot_if_dirty();
+        assert_eq!(e.get_locations().unwrap().len(), 1);
+        {
+            let p = src.produced.lock().unwrap();
+            assert!(p.by_data_id["se-smhi/first"].is_empty());
+            assert_eq!(p.by_data_id["se-smhi/second"].len(), 1);
+        }
+        src.apply(&e, resolved("se-smhi/first", None));
+        e.snapshot_if_dirty();
+        assert_eq!(
+            e.get_locations().unwrap().len(),
+            1,
+            "the live row belongs to 'second'"
+        );
+        src.apply(&e, resolved("se-smhi/second", None));
+        e.snapshot_if_dirty();
+        assert_eq!(e.get_locations().unwrap().len(), 0);
+        assert!(src.produced.lock().unwrap().owner.is_empty());
+
+        // The other order: deleting the owner removes the row; the stale
+        // data_id's deletion is then a no-op.
+        src.apply(&e, resolved("a", Some(smhi.clone())));
+        src.apply(&e, resolved("b", Some(smhi)));
+        src.apply(&e, resolved("b", None));
+        e.snapshot_if_dirty();
+        assert_eq!(e.get_locations().unwrap().len(), 0);
+        src.apply(&e, resolved("a", None));
+        assert!(src.produced.lock().unwrap().by_data_id.is_empty());
     }
 
     #[test]
