@@ -25,7 +25,14 @@ as a property.
   below). The first two go through `ds-storage` from the background poll
   runtime only. The feed fetches the index then the linked
   docs with `DataStore::get_many` (bounded concurrency, per-object timeout,
-  origin-grouped) — never a sequential blocking loop.
+  origin-grouped). Each source keeps its last successfully parsed copy per
+  document URL/path. Failed downloads/parses keep that copy while successful
+  documents update normally; a document absent from a successfully read index
+  is removed. Partial refreshes publish usable data and return an error, with
+  live health degraded until a complete refresh succeeds. An empty valid
+  index clears the collection; malformed/truncated/non-feed indexes fail.
+  Listing/index failures preserve the catalog but still advance `as_of`,
+  TIME metadata and cache time keys, so expiry continues during an outage.
 - **Feed SSRF guard:** an entry link is fetched only if it shares the feed's
   EXACT origin (scheme+host+port — not a prefix; `https://feed` rejects
   `https://feed.evil.com`) or matches an explicit `feed_allowlist` URL
@@ -69,17 +76,24 @@ memory. Things that differ from the pull sources:
   arms**, so a QoS-1 backlog replay (channel continuously ready) cannot
   starve rebuilds. `rel=geometry` downloads are overlapped up to
   `WIS2_HINT_INFLIGHT` (8) in a `FuturesOrdered`, so notifications are
-  still applied in arrival order (a deletion never overtakes the document
-  it names); beyond that the pipeline channel backs up as before.
+  applied in resolver completion order; the upstream payload resolver can
+  already have reordered them, so ingestion must still handle deletion
+  before document. Beyond that the pipeline channel backs up as before.
 - **Accumulator semantics** (`Wis2CapSource`): one entry per CAP
-  `<identifier>`, newest `pubtime` wins and records its `current_data_id`;
+  `(sender, identifier)`, newest `pubtime` wins and records its `current_data_id`;
   `rel=deletion` withdraws an alert only when it names the data_id that
-  holds the *current* content (a deletion of a revision since replaced in
-  place just drops the stale index entry) and leaves a tombstone so a late
-  copy from another Global Cache cannot resurrect it (a genuinely newer
-  re-issue can); a document with several `<alert>`s is indexed per
-  identifier. `Update`/`Cancel` `<references>` are applied **at ingest**
-  (referenced identifiers removed + tombstoned at the message's pubtime);
+  holds the *current* content and is not older than that content. Deletion
+  always records a `data_id` tombstone, including unknown data IDs: the
+  upstream concurrent resolver can finish a deletion before its document.
+  Known withdrawn messages are also tombstoned by `(sender, identifier,
+  sent)` to prevent resurrection through another cache URL. Ordering uses
+  publication time; retention uses receipt time (at least one hour, or
+  `retention_grace` when longer). Both tombstone maps are capped at 100,000
+  entries per rebuild. A genuinely newer reissue can return. Documents with
+  several `<alert>`s are indexed per sender/identifier.
+  `Update`/`Cancel` references are applied **at ingest** using the exact CAP
+  triple and publication ordering; a stale cancellation cannot remove newer
+  content. Status filtering happens before any withdrawal or replacement;
   `Cancel`/`Ack`/`Error` are never stored — a non-renderable message has no
   validity of its own and would otherwise sit for the 7-day fallback
   suppressing a re-issued identifier. Eviction once every info's validity
@@ -88,24 +102,24 @@ memory. Things that differ from the pull sources:
   oldest-received first. `received` is refreshed by every in-place revision
   (same-or-newer pubtime), so both anchors follow the source's latest
   affirmation. **`data_id_index` invariant:** exactly the
-  `(current_data_id, identifier)` pairs of the held alerts — an older
+  `(current_data_id, (sender, identifier))` pairs of the held alerts — an older
   revision arriving late is not indexed, and every removal path
   (deletion, Update/Cancel withdrawal, expiry, `max_alerts`) unindexes
   through `Accumulator::remove_alert`; `assert_index_consistent()` is the
   test oracle. `len()` is an atomic mirror — `/metrics` never takes the
   accumulator lock from a request worker.
 - **Supersede/Cancel is NOT WIS2-specific.** `supersede::resolve_references`
-  runs in `refresh()` for every source mode: newest `<sent>` per identifier,
-  identifiers named in an `Update`/`Cancel` `<references>` are withdrawn,
-  `Cancel`/`Ack`/`Error` are never rendered. The withdrawal decision lives
-  in ONE place, `supersede::references_withdrawn_by`, used by both the
-  rebuild and the WIS2 ingest path. Counted in
-  `cap_alerts_superseded_total` (rebuild-time withdrawals, deduplicated by
-  identifier, plus WIS2 ingest-time withdrawals). A stored `Update` is
-  re-fed to the rebuild with its `<references>` intact, but the rebuild
-  only reports identifiers it actually found and withdrew — the original
-  is already gone from the accumulator — so an Update chain counts once
-  (`update_chain_withdrawal_is_counted_once_across_rebuilds`).
+  runs in `refresh()` for directory/feed sources after status filtering:
+  newest `<sent>` per `(sender, identifier)`, exact `(sender, identifier,
+  sent)` references withdrawn, and `Cancel`/`Ack`/`Error` never rendered.
+  Timestamps compare as UTC instants. Malformed/incomplete references are
+  warned and ignored; they must never act as sender/revision wildcards.
+  `references_withdrawn_by` is shared with WIS2 ingestion. WIS2 rebuilds
+  do **not** reapply stored Update references: their original publication
+  ordering has already been applied, and replaying them would suppress a
+  later reissue. References remain present in feature properties.
+  Withdrawals are counted once by full message identity for pull sources;
+  WIS2 counts actual ingest-time removals.
 - **MeteoAlarm geometry.** The hub's CAP XML is geocode-only (NUTS3 /
   EMMA_ID, no `<polygon>`), but each notification — one per alert × info ×
   area × **geocode** (`indexInfo`/`indexArea`/`indexFeature`, 0-based in
@@ -141,7 +155,7 @@ memory. Things that differ from the pull sources:
   lets a newer revision's bbox replace the old one and an exact polygon
   from any notification beat every bbox. Both the lookup file and the
   hints can be configured together.
-- `cap_alerts_superseded_total` counts each withdrawn identifier once
+- `cap_alerts_superseded_total` counts each withdrawn message identity once
   (`superseded_ids` is a bounded union over rebuilds, so a chain link
   dropping out of the loaded set cannot cause a re-count).
 - `data_version()` hashes the geometry too (every coordinate, word-wise,
@@ -163,16 +177,20 @@ memory. Things that differ from the pull sources:
 
 ## Feature model
 
-- **One Feature per `(alert, info, area)`**, id =
-  `{identifier}.{infoIdx}.{areaIdx}` (stable, URL-safe). The emitted
-  `Feature.id` is **percent-encoded** to a single URL path segment so the
-  api-features verbatim self-link routes; axum's `Path` decodes it back.
-  **Clients must use `Feature.id` as-is, not re-percent-encode it**; the raw
-  CAP `<identifier>` is in `properties.identifier`.
+- **One Feature per `(alert, info, area)`**. Canonical id before URL encoding:
+  `cap:{senderByteLength}:{sender}{identifier}.{infoIdx}.{areaIdx}`. The
+  sender length makes the prefix unambiguous even with punctuation in either
+  identity component, and the ID remains stable when other senders arrive.
+  The emitted `Feature.id` is percent-encoded to one URL path segment;
+  clients use it as-is in self links. Raw identity remains in `properties`.
+  Legacy `{identifier}.{infoIdx}.{areaIdx}` URLs still resolve when exactly
+  one sender has that ID; ambiguous legacy aliases return 404. Canonical
+  IDs take precedence over aliases.
 - Multiple `<info>` (languages) and multiple `<area>` per info each fan out.
   `language` config keeps matching `<info>`s (primary-subtag,
   case-insensitive), falling back to the first info. `status_filter`
-  (default `["Actual"]`) drops Test/Exercise/Draft at the alert level.
+  (default `["Actual"]`) drops Test/Exercise/Draft before chain resolution
+  and WIS2 state mutation; filtered cancellations cannot suppress Actual alerts.
 - **Geocode-only areas** (UGC/EMMA_ID/FIPS, no polygon/circle) get geometry
   from the optional `geocode_geometry` lookup — a GeoJSON FeatureCollection
   mapping zone codes → polygons (`geocode_property`, default `"code"`;
@@ -244,7 +262,8 @@ memory. Things that differ from the pull sources:
 `CapEngine::new` does a best-effort initial load (never fails on an
 empty/unreachable source — starts degraded, the poll loop fills in). Wired
 in `server/src/admin.rs` (`"cap" => ["features","wms","maps","tiles"]`);
-poll loop on `poll_runtime()`; `shutdown()` on reload. Demo:
+poll loop on `poll_runtime()`; `shutdown()` on reload. Pull-source live
+health tracks refresh failures/recovery instead of keeping boot status. Demo:
 `collections.d/cap-alerts.toml` over `testdata/cap/`.
 
 Out of scope (follow-ups): XML-DSig verification, per-`event` sub-layers,

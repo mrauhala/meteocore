@@ -8,7 +8,7 @@
 //! concurrency, per-object timeout) rather than a sequential blocking loop.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -34,12 +34,17 @@ const MAX_FEED_ENTRIES: usize = 2_000;
 const MAX_QUERY_ENTRIES: usize = 64;
 
 /// A resolved CAP data source. Constructed without any network I/O; the actual
-/// scan/fetch happens in [`Source::load`].
+/// scan/fetch happens in [`Source::load_at`].
 pub enum Source {
     /// Local directory of CAP `.xml` files.
-    Local { store: DataStore, base: ObjectPath },
+    Local {
+        store: DataStore,
+        base: ObjectPath,
+        cache: Mutex<DocumentCache>,
+    },
     /// Atom/RSS feed index → linked CAP documents.
     Feed {
+        cache: Mutex<DocumentCache>,
         index_store: DataStore,
         index_path: ObjectPath,
         feed_url: String,
@@ -66,11 +71,16 @@ impl Source {
         match (data_path, feed_url) {
             (Some(path), None) => {
                 let (store, base) = build_store(path)?;
-                Ok(Source::Local { store, base })
+                Ok(Source::Local {
+                    store,
+                    base,
+                    cache: Mutex::default(),
+                })
             }
             (None, Some(url)) => {
                 let (index_store, index_path) = build_store(url)?;
                 Ok(Source::Feed {
+                    cache: Mutex::default(),
                     index_store,
                     index_path,
                     feed_url: url.to_string(),
@@ -97,16 +107,20 @@ impl Source {
     pub fn load_at(
         &self,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<CapAlert>, DataServerError> {
+    ) -> Result<SourceLoad, DataServerError> {
         match self {
-            Source::Local { store, base } => load_local(store, base),
+            Source::Local { store, base, cache } => load_local(store, base, cache),
             Source::Feed {
+                cache,
                 index_store,
                 index_path,
                 feed_url,
                 allowlist,
-            } => load_feed(index_store, index_path, feed_url, allowlist),
-            Source::Wis2 { source, .. } => Ok(source.snapshot(now)),
+            } => load_feed(index_store, index_path, feed_url, allowlist, cache),
+            Source::Wis2 { source, .. } => Ok(SourceLoad {
+                alerts: source.snapshot(now),
+                failed_documents: 0,
+            }),
         }
     }
 
@@ -120,7 +134,11 @@ impl Source {
 }
 
 /// List `.xml` files under `base`, fetch them (bounded), and parse each.
-fn load_local(store: &DataStore, base: &ObjectPath) -> Result<Vec<CapAlert>, DataServerError> {
+fn load_local(
+    store: &DataStore,
+    base: &ObjectPath,
+    cache: &Mutex<DocumentCache>,
+) -> Result<SourceLoad, DataServerError> {
     let mut paths: Vec<ObjectPath> = store
         .list(base)?
         .into_iter()
@@ -135,7 +153,11 @@ fn load_local(store: &DataStore, base: &ObjectPath) -> Result<Vec<CapAlert>, Dat
         );
         paths.truncate(MAX_LOCAL_FILES);
     }
-    Ok(fetch_and_parse(store, &paths))
+    let documents = fetch_and_parse(store, &paths, "");
+    Ok(cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .update(documents))
 }
 
 /// Fetch the feed index, extract CAP document links, and fetch + parse them.
@@ -144,7 +166,8 @@ fn load_feed(
     index_path: &ObjectPath,
     feed_url: &str,
     allowlist: &[String],
-) -> Result<Vec<CapAlert>, DataServerError> {
+    cache: &Mutex<DocumentCache>,
+) -> Result<SourceLoad, DataServerError> {
     // SSRF note: the index fetch (and the entry fetches below) go through
     // `ds-storage`'s HTTP store, which uses object_store's reqwest client with
     // its DEFAULT redirect policy (follows up to 10 redirects) — object_store
@@ -166,9 +189,14 @@ fn load_feed(
     {
         Some(Ok(bytes)) => bytes,
         Some(Err(e)) => return Err(e),
-        None => return Ok(Vec::new()),
+        None => {
+            return Err(DataServerError::Engine(
+                "empty CAP feed fetch result".into(),
+            ))
+        }
     };
     let index_xml = String::from_utf8_lossy(&index_bytes);
+    validate_feed(&index_xml)?;
 
     let base = Url::parse(feed_url)
         .map_err(|e| DataServerError::Engine(format!("invalid cap feed_url '{feed_url}': {e}")))?;
@@ -209,7 +237,10 @@ fn load_feed(
 
     if resolved.is_empty() {
         tracing::warn!("cap feed '{feed_url}' yielded no CAP document links");
-        return Ok(Vec::new());
+        return Ok(cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update(Vec::new()));
     }
 
     // Group query-less URLs by origin so each origin's docs fetch via one
@@ -244,11 +275,14 @@ fn load_feed(
     // is a single origin (the feed's own), so this is one client per poll cycle
     // (every `poll_interval_secs`, default 300s) — negligible. `DataStore` has no
     // cross-call client reuse; pooling across polls is a future optimisation.
-    let mut alerts: Vec<CapAlert> = Vec::new();
+    let mut documents = Vec::new();
     for (origin, paths) in by_origin {
         match build_store(&origin) {
-            Ok((store, _)) => alerts.extend(fetch_and_parse(&store, &paths)),
-            Err(e) => tracing::warn!("cap feed: cannot build store for origin '{origin}': {e}"),
+            Ok((store, _)) => documents.extend(fetch_and_parse(&store, &paths, &origin)),
+            Err(e) => {
+                tracing::warn!("cap feed: cannot build store for origin '{origin}': {e}");
+                documents.extend(paths.iter().map(|p| (format!("{origin}/{p}"), None)));
+            }
         }
     }
     // Rare query-bearing links: fetch individually through the size-guarded
@@ -262,56 +296,140 @@ fn load_feed(
                 .next()
                 .unwrap_or_else(|| Err(DataServerError::Engine("empty fetch result".into())))
         });
-        match fetched {
-            Ok(bytes) => parse_into(&bytes, &mut alerts, u.as_str()),
-            Err(e) => tracing::warn!("cap feed doc '{u}' fetch failed: {e}"),
-        }
+        let parsed = match fetched {
+            Ok(bytes) => parse_bytes(&bytes, u.as_str()),
+            Err(e) => {
+                tracing::warn!("cap feed doc '{u}' fetch failed: {e}");
+                None
+            }
+        };
+        documents.push((u.to_string(), parsed));
     }
 
-    Ok(alerts)
+    Ok(cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .update(documents))
 }
 
-/// Concurrently fetch `paths` from `store` and parse each as a CAP document.
-/// Per-object failures are logged and skipped (one bad doc never sinks the batch).
-fn fetch_and_parse(store: &DataStore, paths: &[ObjectPath]) -> Vec<CapAlert> {
+/// Last good document copies. A failed GET keeps that document's previous
+/// alerts; an object absent from a successfully read index is actually removed.
+#[derive(Default)]
+pub struct DocumentCache {
+    documents: BTreeMap<String, Vec<CapAlert>>,
+}
+
+pub struct SourceLoad {
+    pub alerts: Vec<CapAlert>,
+    pub failed_documents: usize,
+}
+
+type DocumentResult = (String, Option<Vec<CapAlert>>);
+
+impl DocumentCache {
+    fn update(&mut self, results: Vec<DocumentResult>) -> SourceLoad {
+        let listed: std::collections::HashSet<_> =
+            results.iter().map(|(key, _)| key.as_str()).collect();
+        self.documents
+            .retain(|key, _| listed.contains(key.as_str()));
+        let mut failed_documents = 0;
+        for (key, result) in results {
+            if let Some(alerts) = result {
+                self.documents.insert(key, alerts);
+            } else {
+                failed_documents += 1;
+            }
+        }
+        SourceLoad {
+            alerts: self.documents.values().flatten().cloned().collect(),
+            failed_documents,
+        }
+    }
+}
+
+/// Fetch documents concurrently, retaining an explicit failure for each URL.
+fn fetch_and_parse(store: &DataStore, paths: &[ObjectPath], origin: &str) -> Vec<DocumentResult> {
     if paths.is_empty() {
         return Vec::new();
     }
-    let mut alerts: Vec<CapAlert> = Vec::new();
     match store.get_many(paths, FETCH_CONCURRENCY, Some(MAX_DOC_BYTES)) {
-        Ok(results) => {
-            for (path, res) in paths.iter().zip(results) {
-                match res {
-                    Ok(bytes) => parse_into(&bytes, &mut alerts, path.as_ref()),
-                    Err(e) => tracing::warn!("cap: fetch of '{path}' failed: {e}"),
-                }
-            }
+        Ok(results) => paths
+            .iter()
+            .zip(results)
+            .map(|(path, result)| {
+                let parsed = match result {
+                    Ok(bytes) => parse_bytes(&bytes, path.as_ref()),
+                    Err(e) => {
+                        tracing::warn!("cap: fetch of '{path}' failed: {e}");
+                        None
+                    }
+                };
+                (format!("{origin}/{path}"), parsed)
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("cap: batch fetch failed: {e}");
+            paths
+                .iter()
+                .map(|p| (format!("{origin}/{p}"), None))
+                .collect()
         }
-        Err(e) => tracing::warn!("cap: batch fetch failed: {e}"),
     }
-    alerts
 }
 
-fn parse_into(bytes: &[u8], out: &mut Vec<CapAlert>, label: &str) {
-    // CAP v1.2 mandates UTF-8. A non-UTF-8 (e.g. Latin-1) document is
-    // non-conformant: WARN so it's not *silent*, but still parse it lossily
-    // rather than dropping a real emergency alert — the load-bearing fields
-    // (geometry, severity, times) are ASCII/numeric and survive; only free text
-    // may carry a U+FFFD.
-    let xml = match std::str::from_utf8(bytes) {
-        Ok(s) => std::borrow::Cow::Borrowed(s),
-        Err(e) => {
-            tracing::warn!(
-                "cap: '{label}' is not valid UTF-8 ({e}) — parsing lossily (CAP requires UTF-8); \
-                 free-text fields may be garbled"
-            );
-            String::from_utf8_lossy(bytes)
-        }
-    };
-    match parse_document(&xml) {
-        Ok(parsed) => out.extend(parsed),
-        Err(e) => tracing::warn!("cap: parse of '{label}' failed: {e}"),
+fn parse_bytes(bytes: &[u8], label: &str) -> Option<Vec<CapAlert>> {
+    if let Err(e) = std::str::from_utf8(bytes) {
+        tracing::warn!("cap: '{label}' is not valid UTF-8 ({e}) — parsing lossily; free-text fields may be garbled");
     }
+    let xml = String::from_utf8_lossy(bytes);
+    match parse_document(&xml) {
+        Ok(parsed) if !parsed.is_empty() => Some(parsed),
+        Ok(_) => {
+            tracing::warn!("cap: '{label}' contained no CAP alerts");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("cap: parse of '{label}' failed: {e}");
+            None
+        }
+    }
+}
+
+/// Never interpret a truncated index or an HTML error response as an empty
+/// alert feed. Link extraction remains tolerant of individual malformed links.
+fn validate_feed(xml: &str) -> Result<(), DataServerError> {
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut root = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if root.is_none() {
+                    root = Some(local(e.local_name().as_ref()));
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(e)) if root.is_none() => {
+                root = Some(local(e.local_name().as_ref()));
+            }
+            Ok(Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(DataServerError::Engine(format!(
+                    "invalid CAP feed XML: {e}"
+                )))
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || !matches!(root.as_deref(), Some("feed" | "rss" | "RDF")) {
+        return Err(DataServerError::Engine(
+            "invalid or incomplete CAP feed index".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn origin_of(u: &Url) -> String {
@@ -447,6 +565,21 @@ fn looks_like_url(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_index_is_not_a_successful_empty_feed() {
+        for xml in [
+            "<feed><entry>",
+            "<html>Unavailable</html>",
+            "",
+            "<feed><entry></feed>",
+        ] {
+            assert!(validate_feed(xml).is_err(), "{xml}");
+        }
+        for xml in ["<feed/>", "<feed></feed>", "<rss><channel/></rss>"] {
+            assert!(validate_feed(xml).is_ok(), "{xml}");
+        }
+    }
 
     #[test]
     fn atom_prefers_cap_typed_link() {
