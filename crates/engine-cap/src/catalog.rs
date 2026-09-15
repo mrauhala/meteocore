@@ -16,6 +16,7 @@ use ds_core::map_engine::RasterInfo;
 
 use crate::geocode::GeocodeLookup;
 use crate::parser::{CapAlert, CapArea, CapCircle, CapInfo};
+use crate::supersede::AlertKey;
 
 /// Cap on advertised TIME-dimension values (keeps WMS GetCapabilities bounded).
 const MAX_TIME_VALUES: usize = 256;
@@ -69,6 +70,7 @@ impl ActiveWindow {
 }
 
 /// One renderable/queryable alert area = one OGC Feature.
+#[derive(Clone)]
 pub struct AreaRecord {
     pub id: String,
     pub geometry: Arc<Geometry>,
@@ -81,6 +83,7 @@ pub struct AreaRecord {
 }
 
 /// rstar index entry over an area's bbox.
+#[derive(Clone)]
 struct IndexedArea {
     index: usize,
     envelope: AABB<[f64; 2]>,
@@ -94,6 +97,7 @@ impl RTreeObject for IndexedArea {
 }
 
 /// An immutable snapshot of the parsed alert set.
+#[derive(Clone)]
 pub struct Catalog {
     pub records: Vec<AreaRecord>,
     id_index: HashMap<String, usize>,
@@ -168,15 +172,7 @@ impl Catalog {
                         geocode_only_count += 1;
                     }
                     let bbox = geometry.bbox();
-                    // Feature id `{identifier}.{infoIdx}.{areaIdx}`. This is
-                    // collision-free even when the CAP identifier contains dots:
-                    // `info_idx`/`area_idx` render as digits only, so the final
-                    // two dots are unambiguous delimiters — peel `.{digits}`
-                    // twice from the right and the remainder is exactly the
-                    // identifier. (A `/` separator would be unambiguous too but
-                    // is unsafe here: the id is a single URL path segment in
-                    // `/items/{featureId}`, where `/` would split the route.)
-                    let id = format!("{}.{}.{}", alert.identifier, info_idx, area_idx);
+                    let id = AlertKey::of(alert).feature_id(info_idx, area_idx);
                     let window = build_window(alert, info, cfg.default_ttl);
                     let severity_code = severity_code(info.severity.as_deref());
                     let properties = build_properties(
@@ -209,29 +205,40 @@ impl Catalog {
         // Deterministic order for stable pagination.
         records.sort_by(|a, b| a.id.cmp(&b.id));
 
-        // Drop duplicate feature ids, keeping the first. The CAP spec requires
-        // `<identifier>` to be unique, but a malformed file or a feed serving the
-        // same alert under two entry URLs can produce duplicates; without this,
-        // `records` would list both while `id_index` (a HashMap) silently kept
-        // only the last — a split-brain where listed features are unreachable via
-        // `get_feature`. Records are sorted by id, so duplicates are adjacent;
-        // `dedup_by_key` keeps the first occurrence (clearer than `dedup_by`'s
-        // drop-`a`/keep-`b` argument order).
+        // Duplicate source documents of the same sender/message collapse.
         let before = records.len();
         records.dedup_by_key(|r| r.id.clone());
         let dropped = before - records.len();
         if dropped > 0 {
             tracing::warn!(
                 "[{collection_id}] cap: dropped {dropped} record(s) with duplicate feature id(s) \
-                 — CAP <identifier> must be unique"
+                 — sender-scoped CAP identifier must be unique"
             );
         }
 
-        let id_index = records
+        let mut id_index: HashMap<String, usize> = records
             .iter()
             .enumerate()
             .map(|(i, r)| (r.id.clone(), i))
             .collect();
+
+        // Keep legacy identifier.info.area URLs reachable only if unambiguous.
+        // Canonical IDs always win; aliases never redirect a canonical URL.
+        let mut aliases: HashMap<String, Option<usize>> = HashMap::new();
+        for (i, record) in records.iter().enumerate() {
+            let suffix = record.id.rsplitn(3, '.').take(2).collect::<Vec<_>>();
+            let identifier = record.properties["identifier"].as_str().unwrap();
+            let alias = format!("{}.{}.{}", identifier, suffix[1], suffix[0]);
+            aliases
+                .entry(alias)
+                .and_modify(|v| *v = None)
+                .or_insert(Some(i));
+        }
+        for (alias, index) in aliases {
+            if let Some(index) = index {
+                id_index.entry(alias).or_insert(index);
+            }
+        }
 
         let tree = RTree::bulk_load(
             records
@@ -267,14 +274,35 @@ impl Catalog {
 
     /// Record indices whose bbox intersects `bbox` (geometry areas only).
     pub fn query_bbox(&self, bbox: &Bbox) -> Vec<usize> {
-        let aabb = AABB::from_corners([bbox.west, bbox.south], [bbox.east, bbox.north]);
-        let mut idx: Vec<usize> = self
-            .tree
-            .locate_in_envelope_intersecting(&aabb)
-            .map(|e| e.index)
-            .collect();
+        let ranges = if bbox.crosses_antimeridian() {
+            vec![(bbox.west, 180.0), (-180.0, bbox.east)]
+        } else {
+            vec![(bbox.west, bbox.east)]
+        };
+        let mut idx = Vec::new();
+        for (west, east) in ranges {
+            let aabb = AABB::from_corners([west, bbox.south], [east, bbox.north]);
+            idx.extend(
+                self.tree
+                    .locate_in_envelope_intersecting(&aabb)
+                    .map(|e| e.index),
+            );
+        }
         idx.sort_unstable();
+        idx.dedup();
         idx
+    }
+
+    /// Advance the default render time without changing retained content. Used
+    /// after source I/O failures so stale data cannot freeze alert expiry.
+    pub fn at_time(&self, as_of: DateTime<Utc>) -> Self {
+        let mut next = self.clone();
+        next.as_of = as_of;
+        let mut info = (*self.info).clone();
+        info.times = build_times(&self.records, as_of);
+        next.info = Arc::new(info);
+        next.temporal_extent = compute_temporal_extent(&self.records, as_of);
+        next
     }
 
     /// Lookup a record by feature id.
@@ -894,7 +922,7 @@ mod tests {
         let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
         assert_eq!(cat.records.len(), 1);
         let r = &cat.records[0];
-        assert_eq!(r.id, "A1.0.0");
+        assert!(cat.get("A1.0.0").is_some());
         assert_eq!(r.severity_code, 3.0);
         // Geometry is in [lon, lat]: bbox west≈24, south≈60.
         let b = r.bbox.unwrap();
@@ -947,7 +975,7 @@ mod tests {
         c.language = Some("en".to_string());
         let cat = Catalog::build(&alerts, &c, "cap", "severity", at(2026, 6, 15, 12));
         assert_eq!(cat.records.len(), 1);
-        assert_eq!(cat.records[0].id, "L1.0.0"); // first (en) info index preserved
+        assert!(cat.get("L1.0.0").is_some()); // first (en) info index preserved
     }
 
     #[test]

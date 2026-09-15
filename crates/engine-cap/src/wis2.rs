@@ -3,7 +3,7 @@
 //! Unlike the directory and feed sources, which re-list everything on every
 //! poll, WIS2 only ever tells us about *new* documents. The source therefore
 //! keeps an in-memory accumulator of every alert seen, keyed by CAP
-//! `<identifier>`, and hands the catalog a snapshot of it. Two things the
+//! `(sender, identifier)`, and hands the catalog a snapshot of it. Two things the
 //! pull sources get for free have to be explicit here:
 //!
 //! - **eviction** — an alert leaves the accumulator once every info's
@@ -26,8 +26,8 @@
 //! non-renderable message has no validity of its own, and keeping it around
 //! for the 7-day fallback would let it suppress a re-issued identifier long
 //! after the alert it targeted was gone. `supersede::resolve_references`
-//! still runs on every rebuild for all source modes (it is what the
-//! directory and feed sources rely on).
+//! runs on rebuilds for directory/feed sources; WIS2 does not reapply old
+//! references after ingestion, since a newer publication may have reissued them.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -39,7 +39,9 @@ use ds_wis2::{Fetcher, Notification, Payload, Resolved};
 
 use crate::catalog::{build_window, geometry_fingerprint};
 use crate::parser::{parse_document, CapAlert, CapAreaHint, HintPart};
-use crate::supersede::{is_renderable, references_withdrawn_by};
+use crate::supersede::{
+    accepts_status, is_renderable, references_withdrawn_by, AlertKey, MessageKey,
+};
 
 /// Alerts with no computable validity end are kept this long after receipt.
 pub const FALLBACK_LIFETIME: Duration = Duration::days(7);
@@ -52,6 +54,7 @@ const HINT_BBOX_TOLERANCE_DEG: f64 = 0.05;
 
 #[derive(Debug, Clone)]
 pub struct Wis2SourceConfig {
+    pub status_filter: Vec<String>,
     pub retention_grace: Duration,
     pub max_alerts: usize,
     pub geometry_links: bool,
@@ -74,24 +77,65 @@ struct Entry {
     current_data_id: String,
 }
 
+/// Ordering uses source publication time; retention uses receipt time so a
+/// broker backlog does not immediately expire freshly received tombstones.
+#[derive(Debug)]
+struct Tombstone {
+    pubtime: DateTime<Utc>,
+    received: DateTime<Utc>,
+}
+
+fn remember<K: Eq + std::hash::Hash>(
+    map: &mut HashMap<K, Tombstone>,
+    key: K,
+    pubtime: DateTime<Utc>,
+    now: DateTime<Utc>,
+) {
+    let t = map.entry(key).or_insert(Tombstone {
+        pubtime,
+        received: now,
+    });
+    t.pubtime = t.pubtime.max(pubtime);
+    t.received = now;
+}
+
+fn prune_tombstones<K: Eq + std::hash::Hash + Clone>(
+    map: &mut HashMap<K, Tombstone>,
+    now: DateTime<Utc>,
+    grace: Duration,
+) {
+    let lifetime = grace.max(Duration::hours(1));
+    map.retain(|_, t| t.received + lifetime >= now);
+    // Same cadence as the alert cap: bound retained withdrawal history even
+    // for a feed that only sends cancellations/deletions of unknown objects.
+    const MAX_TOMBSTONES: usize = 100_000;
+    if map.len() > MAX_TOMBSTONES {
+        let mut oldest: Vec<_> = map.iter().map(|(k, t)| (t.received, k.clone())).collect();
+        oldest.sort_by_key(|(received, _)| *received);
+        for (_, key) in oldest.into_iter().take(map.len() - MAX_TOMBSTONES) {
+            map.remove(&key);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Accumulator {
-    alerts: HashMap<String, Entry>,
-    /// identifier → when it was withdrawn (deleted or cancelled); a document
-    /// published before that instant must not resurrect it.
-    tombstones: HashMap<String, DateTime<Utc>>,
+    alerts: HashMap<AlertKey, Entry>,
+    /// Full message identity → withdrawal ordering and receipt-time retention.
+    tombstones: HashMap<MessageKey, Tombstone>,
+    data_tombstones: HashMap<String, Tombstone>,
     /// data_id → identifiers whose *current* content that document holds (a
     /// document may carry several `<alert>`s). Invariant: exactly the
     /// `(entry.current_data_id, identifier)` pairs of `alerts` — every path
     /// that drops or re-homes an entry unindexes it, so the index cannot
     /// outgrow the alert set.
-    data_id_index: HashMap<String, Vec<String>>,
+    data_id_index: HashMap<String, Vec<AlertKey>>,
 }
 
 impl Accumulator {
     /// Drop `identifier` from `data_id`'s index entry (and the entry itself
     /// once empty).
-    fn unindex(&mut self, data_id: &str, identifier: &str) {
+    fn unindex(&mut self, data_id: &str, identifier: &AlertKey) {
         if let Some(idents) = self.data_id_index.get_mut(data_id) {
             idents.retain(|id| id != identifier);
             if idents.is_empty() {
@@ -101,7 +145,7 @@ impl Accumulator {
     }
 
     /// Remove an alert and its index entry; `Some(entry)` when it was held.
-    fn remove_alert(&mut self, identifier: &str) -> Option<Entry> {
+    fn remove_alert(&mut self, identifier: &AlertKey) -> Option<Entry> {
         let entry = self.alerts.remove(identifier)?;
         self.unindex(&entry.current_data_id, identifier);
         Some(entry)
@@ -166,13 +210,13 @@ impl Wis2CapSource {
     #[cfg(test)]
     fn assert_index_consistent(&self) {
         let acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
-        let mut expected: Vec<(String, String)> = acc
+        let mut expected: Vec<(String, AlertKey)> = acc
             .alerts
             .iter()
             .map(|(id, e)| (e.current_data_id.clone(), id.clone()))
             .collect();
         expected.sort();
-        let mut actual: Vec<(String, String)> = acc
+        let mut actual: Vec<(String, AlertKey)> = acc
             .data_id_index
             .iter()
             .flat_map(|(d, ids)| ids.iter().map(move |i| (d.clone(), i.clone())))
@@ -234,7 +278,7 @@ impl Wis2CapSource {
             // Tombstone in pubtime space like every other ordering decision
             // here: a QoS-1 backlog replays a deletion and a later re-issue
             // within the same wall-clock instant, and the re-issue must win.
-            self.delete(&n.data_id, n.pubtime);
+            self.delete(&n.data_id, n.pubtime, now);
             return;
         };
         let alerts = match parse_payload(&payload, &n.data_id) {
@@ -279,34 +323,51 @@ impl Wis2CapSource {
             (None, None, None)
         };
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
-        let mut contributed: Vec<String> = Vec::new();
+        if acc
+            .data_tombstones
+            .get(&n.data_id)
+            .is_some_and(|t| n.pubtime <= t.pubtime)
+        {
+            return;
+        }
+        let mut contributed: Vec<AlertKey> = Vec::new();
         for mut alert in alerts {
-            let identifier = alert.identifier.clone();
-            // Update / Cancel: withdraw what the message references, now.
-            for withdrawn in references_withdrawn_by(&alert) {
-                if acc.remove_alert(&withdrawn).is_some() {
-                    self.stats.superseded.fetch_add(1, Ordering::Relaxed);
+            // Filtering must precede duplicate selection and every withdrawal.
+            if !accepts_status(&alert, &self.cfg.status_filter) {
+                continue;
+            }
+            let identifier = AlertKey::of(&alert);
+            let message = MessageKey::of(&alert);
+            if acc
+                .tombstones
+                .get(&message)
+                .is_some_and(|t| n.pubtime <= t.pubtime)
+            {
+                continue;
+            }
+            let stale = acc
+                .alerts
+                .get(&identifier)
+                .is_some_and(|e| e.pubtime > n.pubtime);
+            if !stale {
+                for withdrawn in references_withdrawn_by(&alert) {
+                    // A delayed cancellation must not remove a newer reissue,
+                    // or another sender's message with the same identifier.
+                    let current = acc.alerts.get(&withdrawn.alert).is_some_and(|e| {
+                        MessageKey::of(&e.alert) == withdrawn && e.pubtime <= n.pubtime
+                    });
+                    if current {
+                        acc.remove_alert(&withdrawn.alert);
+                        self.stats.superseded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    remember(&mut acc.tombstones, withdrawn, n.pubtime, now);
                 }
-                // Tombstone even if not held: a late copy of the withdrawn
-                // document must not bring it back.
-                let t = acc.tombstones.entry(withdrawn).or_insert(n.pubtime);
-                *t = (*t).max(n.pubtime);
             }
             if !is_renderable(alert.msg_type.as_deref()) {
-                // Cancel / Ack / Error describe no hazard and have no validity
-                // of their own — applied above, never stored.
                 self.stats
                     .documents_ingested
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
-            if let Some(&deleted_at) = acc.tombstones.get(&alert.identifier) {
-                // A document published before the deletion is stale; a newer
-                // one (re-issue after a withdrawal) revives the identifier.
-                if n.pubtime <= deleted_at {
-                    continue;
-                }
-                acc.tombstones.remove(&alert.identifier);
             }
             // Attach this notification's hints to the freshly parsed
             // document BEFORE it meets the stored copy: `merge_hints` below
@@ -356,7 +417,7 @@ impl Wis2CapSource {
                     }
                 }
             }
-            let holds_current = match acc.alerts.get_mut(&alert.identifier) {
+            let holds_current = match acc.alerts.get_mut(&identifier) {
                 Some(existing) if existing.pubtime > n.pubtime => {
                     // Older revision arriving late: keep the newer document but
                     // still merge any per-area hints it carried. This document
@@ -388,7 +449,7 @@ impl Wis2CapSource {
                 }
                 None => {
                     acc.alerts.insert(
-                        alert.identifier.clone(),
+                        identifier.clone(),
                         Entry {
                             alert,
                             received: now,
@@ -426,30 +487,32 @@ impl Wis2CapSource {
     /// but only where that document is still the *current* content. A
     /// deletion of a revision that was since replaced in place by a newer
     /// `data_id` only drops the stale index entry.
-    fn delete(&self, data_id: &str, pubtime: DateTime<Utc>) {
+    fn delete(&self, data_id: &str, pubtime: DateTime<Utc>, now: DateTime<Utc>) {
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(identifiers) = acc.data_id_index.remove(data_id) else {
-            return;
-        };
-        let mut removed = 0usize;
+        // The resolver downloads concurrently: deletion may finish before the
+        // document. Remember it even when no identifier has been indexed yet.
+        remember(&mut acc.data_tombstones, data_id.to_owned(), pubtime, now);
+        self.dirty.store(true, Ordering::Release);
+        let identifiers = acc.data_id_index.get(data_id).cloned().unwrap_or_default();
+        let mut removed = 0;
         for identifier in identifiers {
-            // The index only ever lists an identifier under the data_id that
-            // holds its current content (see `Accumulator::data_id_index`),
-            // but check anyway: a mismatch here would withdraw newer content.
             let current = acc
                 .alerts
                 .get(&identifier)
-                .map(|e| e.current_data_id == data_id)
-                .unwrap_or(false);
-            if current && acc.alerts.remove(&identifier).is_some() {
-                acc.tombstones.insert(identifier, pubtime);
+                .is_some_and(|e| e.current_data_id == data_id && e.pubtime <= pubtime);
+            if current {
+                let entry = acc.remove_alert(&identifier).unwrap();
+                remember(
+                    &mut acc.tombstones,
+                    MessageKey::of(&entry.alert),
+                    pubtime,
+                    now,
+                );
                 removed += 1;
             }
         }
         if removed > 0 {
-            self.stats
-                .deletions
-                .fetch_add(removed as u64, Ordering::Relaxed);
+            self.stats.deletions.fetch_add(removed, Ordering::Relaxed);
             self.stats.held.store(acc.alerts.len(), Ordering::Relaxed);
             self.dirty.store(true, Ordering::Release);
         }
@@ -496,7 +559,7 @@ impl Wis2CapSource {
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
         let grace = self.cfg.retention_grace;
         let default_ttl = self.cfg.default_ttl;
-        let mut expired: HashSet<String> = acc
+        let mut expired: HashSet<AlertKey> = acc
             .alerts
             .iter()
             .filter(|(_, e)| {
@@ -509,14 +572,14 @@ impl Wis2CapSource {
         // Hard cap: oldest-received first.
         let live = acc.alerts.len() - expired.len();
         if live > self.cfg.max_alerts {
-            let mut by_age: Vec<(DateTime<Utc>, &String)> = acc
+            let mut by_age: Vec<(DateTime<Utc>, &AlertKey)> = acc
                 .alerts
                 .iter()
                 .filter(|(id, _)| !expired.contains(*id))
                 .map(|(id, e)| (e.received, id))
                 .collect();
             by_age.sort();
-            let capped: Vec<String> = by_age
+            let capped: Vec<AlertKey> = by_age
                 .into_iter()
                 .take(live - self.cfg.max_alerts)
                 .map(|(_, id)| id.clone())
@@ -532,7 +595,8 @@ impl Wis2CapSource {
                 .evicted
                 .fetch_add(evicted as u64, Ordering::Relaxed);
         }
-        acc.tombstones.retain(|_, t| *t + grace >= now);
+        prune_tombstones(&mut acc.tombstones, now, grace);
+        prune_tombstones(&mut acc.data_tombstones, now, grace);
         self.stats.held.store(acc.alerts.len(), Ordering::Relaxed);
         acc.alerts.values().map(|e| e.alert.clone()).collect()
     }
@@ -694,6 +758,7 @@ mod tests {
 
     fn cfg() -> Wis2SourceConfig {
         Wis2SourceConfig {
+            status_filter: vec!["Actual".into()],
             retention_grace: Duration::hours(1),
             max_alerts: 100,
             geometry_links: false,
@@ -886,7 +951,16 @@ mod tests {
         )
         .await;
         src.apply_at(
-            resolved("d2", 10, Some(cap_xml("C", "Cancel", "t@x,A,2026", far))),
+            resolved(
+                "d2",
+                10,
+                Some(cap_xml(
+                    "C",
+                    "Cancel",
+                    "t@x,A,2026-09-12T10:00:00+00:00",
+                    far,
+                )),
+            ),
             &f,
             "t",
             at(10),
@@ -1096,7 +1170,16 @@ mod tests {
         assert_eq!(src.index_len(), 2);
         // An Update withdrawing B by reference unindexes it from d1.
         src.apply_at(
-            resolved("d3", 30, Some(cap_xml("C", "Update", "t@x,B,2026", far))),
+            resolved(
+                "d3",
+                30,
+                Some(cap_xml(
+                    "C",
+                    "Update",
+                    "t@x,B,2026-09-12T10:00:00+00:00",
+                    far,
+                )),
+            ),
             &f,
             "t",
             at(30),
@@ -1107,7 +1190,16 @@ mod tests {
         assert_eq!(src.index_len(), 2); // d2, d3
                                         // A Cancel withdrawing C (the Cancel itself is never stored).
         src.apply_at(
-            resolved("d4", 40, Some(cap_xml("X", "Cancel", "t@x,C,2026", far))),
+            resolved(
+                "d4",
+                40,
+                Some(cap_xml(
+                    "X",
+                    "Cancel",
+                    "t@x,C,2026-09-12T10:00:00+00:00",
+                    far,
+                )),
+            ),
             &f,
             "t",
             at(40),

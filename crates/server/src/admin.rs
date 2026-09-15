@@ -2736,6 +2736,11 @@ pub fn load_collections(
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    tiles_feature_collections.insert(collection.id.clone(), collection.clone());
                     tiles_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
@@ -2754,10 +2759,9 @@ pub fn load_collections(
 
                 // Ready once the first load *succeeded*, even with zero alerts —
                 // a reachable CAP source can legitimately have no active alerts.
-                // Degraded only when the initial load never succeeded (e.g. an
-                // unreachable feed at startup); the poll loop retries. WIS2
-                // mode has no initial load: its live health (broker session)
-                // decides, and `health_handler` keeps overriding it at runtime.
+                // Live health tracks pull-source acquisition failures/recovery,
+                // or the broker session in WIS2 mode; the health handler keeps
+                // overriding the boot snapshot at runtime.
                 let (status, error) = match engine.live_health() {
                     Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
                     Some(ds_core::health::LiveStatus::Degraded { reason }) => {
@@ -5336,6 +5340,153 @@ mod tests {
             .iter()
             .find(|h| h.id == id)
             .unwrap_or_else(|| panic!("no health entry for {id}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cap_features_discovery_and_vector_tiles_use_registered_engine() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let xml = include_str!("../../engine-cap/tests/fixtures/helsinki-flood.xml")
+            .replace("urn:test:helsinki-flood-1", "warning/with[brackets]")
+            .replace("test@meteocore.example", "sender/with:punctuation@example");
+        std::fs::write(fixture.path().join("warning.xml"), xml).unwrap();
+        let cfg: CollectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "cap-test", "title": "Warnings", "description": "CAP API regression", "engine_type": "cap",
+            "apis": ["features", "tiles"], "cap": {"data_path": fixture.path()}
+        }))
+        .unwrap();
+        let load = |cfg| {
+            super::load_collections(
+                &ds_render::StyleContext::with_builtins(),
+                &[cfg],
+                &[],
+                "http://x",
+                false,
+                0,
+                super::ReusableCaches::default(),
+                super::EngineReuse::default(),
+            )
+        };
+        let result = load(cfg.clone());
+        let features = api_features::router(Arc::new(arc_swap::ArcSwap::from_pointee(
+            result.features_state,
+        )));
+        let tiles = api_tiles::router(Arc::new(arc_swap::ArcSwap::from_pointee(
+            result.tiles_state,
+        )));
+        let json = |response: axum::response::Response| async {
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let response = features
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/cap-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let metadata = json(response).await;
+        assert!(metadata["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["rel"] == "http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector"));
+        let listing = tiles
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/cap-test/tiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listing = json(listing).await;
+        assert!(listing["tilesets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|set| set["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["type"] == "application/vnd.mapbox-vector-tile")));
+        let response = tiles
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/cap-test/tiles/WebMercatorQuad/4/4/9?f=mvt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.mapbox-vector-tile"
+        );
+        assert!(!axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap()
+            .is_empty());
+        let response = features
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/cap-test/items?bbox=170,-90,-170,90")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await["numberMatched"], 0);
+        let response = features
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/cap-test/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let items = json(response).await;
+        for feature in items["features"].as_array().unwrap() {
+            let uri = format!(
+                "/collections/cap-test/items/{}",
+                feature["id"].as_str().unwrap()
+            );
+            let response = features
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "canonical feature id must round trip through HTTP"
+            );
+            assert_eq!(json(response).await["id"], feature["id"]);
+        }
+        // Tiles must work even if the operator disables the Features router.
+        let mut cfg = cfg;
+        cfg.apis = vec!["tiles".into()];
+        let result = load(cfg);
+        assert!(result.features_state.engines.is_empty());
+        assert!(result.tiles_state.feature_engines.contains_key("cap-test"));
     }
 
     #[test]

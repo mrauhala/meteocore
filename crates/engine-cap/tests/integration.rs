@@ -217,7 +217,10 @@ fn bbox_filter_selects_by_location() {
         ..Default::default()
     };
     let got = ids(&eng.get_features(&lahti).unwrap());
-    assert_eq!(got, vec!["urn:test:storm-window-1.0.0".to_string()]);
+    assert_eq!(
+        got,
+        vec!["cap:22:test@meteocore.exampleurn:test:storm-window-1.0.0".to_string()]
+    );
 }
 
 #[test]
@@ -452,7 +455,10 @@ fn refresh_picks_up_added_and_removed_files() {
     rm("helsinki-flood.xml");
     eng.refresh().unwrap();
     let got = ids(&eng.get_features(&FeatureQuery::default()).unwrap());
-    assert_eq!(got, vec!["urn:test:storm-window-1.0.0".to_string()]);
+    assert_eq!(
+        got,
+        vec!["cap:22:test@meteocore.exampleurn:test:storm-window-1.0.0".to_string()]
+    );
 }
 
 /// A minimal one-area CAP document with the given identifier (XML-escaped, since

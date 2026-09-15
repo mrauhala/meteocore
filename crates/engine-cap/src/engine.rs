@@ -21,8 +21,8 @@ use ds_wis2::{Fetcher, Resolved, Status as Wis2Status, StatusSnapshot as Wis2Sta
 
 use crate::catalog::{BuildConfig, Catalog, CatalogStore};
 use crate::parser::CapAreaHint;
-use crate::source::Source;
-use crate::supersede::resolve_references;
+use crate::source::{Source, SourceLoad};
+use crate::supersede::{accepts_status, resolve_references, MessageKey};
 use crate::wis2::{Wis2CapSource, Wis2SourceConfig};
 
 /// The single render parameter advertised by a CAP collection (one layer = the
@@ -67,6 +67,7 @@ pub struct CapEngine {
     /// healthy CAP source can legitimately have no active alerts, so "loaded"
     /// (not "non-empty") is the readiness signal; see [`Self::is_loaded`].
     loaded: AtomicBool,
+    refresh_failed: AtomicBool,
     /// WIS2 mode only: subscription config (the pipeline is started from
     /// `poll_loop`, never from the constructor — see `crates/ds-wis2/CLAUDE.md`).
     wis2: Option<Wis2Runtime>,
@@ -77,7 +78,7 @@ pub struct CapEngine {
     /// alert that lingers in the source until eviction is not re-counted on
     /// every rebuild.
     superseded: std::sync::atomic::AtomicU64,
-    superseded_ids: std::sync::Mutex<std::collections::HashSet<String>>,
+    superseded_ids: std::sync::Mutex<std::collections::HashSet<MessageKey>>,
 }
 
 /// WIS2-mode state shared between `poll_loop` and the health/metrics readers.
@@ -102,6 +103,7 @@ impl CapEngine {
         let (source, wis2) = match &config.wis2 {
             Some(w) => {
                 let src = Arc::new(Wis2CapSource::new(Wis2SourceConfig {
+                    status_filter: config.status_filter.clone(),
                     retention_grace: parse_iso8601_duration(&config.retention_grace)?,
                     max_alerts: config.max_alerts.max(1),
                     geometry_links: config.geometry_links,
@@ -171,6 +173,7 @@ impl CapEngine {
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             shutdown: Shutdown::new(),
             loaded: AtomicBool::new(false),
+            refresh_failed: AtomicBool::new(false),
             wis2,
             superseded: std::sync::atomic::AtomicU64::new(0),
             superseded_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -202,12 +205,22 @@ impl CapEngine {
         self.source.wis2()
     }
 
-    /// Runtime health for the WIS2 mode: `None` for directory/feed sources
-    /// (the boot snapshot stands), otherwise whether the broker session is up.
+    /// Live health: latest acquisition outcome for directory/feed sources,
+    /// or broker session readiness in WIS2 mode.
     /// A disconnect shorter than `degrade_after_secs` is not reported — the
     /// last catalog keeps serving and the session resumes with its backlog.
     pub fn live_health(&self) -> Option<LiveStatus> {
-        let w = self.wis2.as_ref()?;
+        let Some(w) = self.wis2.as_ref() else {
+            return Some(
+                if self.refresh_failed.load(Ordering::Relaxed) || !self.is_loaded() {
+                    LiveStatus::Degraded {
+                        reason: "CAP source refresh failed",
+                    }
+                } else {
+                    LiveStatus::Ready
+                },
+            );
+        };
         let status = w.status.load();
         let Some(status) = status.as_ref() else {
             return Some(LiveStatus::Degraded {
@@ -306,11 +319,39 @@ impl CapEngine {
     /// data *acquisition*: a slow feed fetch must not judge expiries against
     /// a clock that predates the data.
     pub fn refresh_with(&self, clock: impl Fn() -> DateTime<Utc>) -> Result<(), DataServerError> {
-        let alerts = self.source.load_at(clock())?;
-        // Apply CAP Update/Cancel chains for every source mode: a directory
-        // or feed that keeps an alert next to its cancellation must not
-        // render both.
-        let (alerts, withdrawn) = resolve_references(alerts);
+        let load = self.source.load_at(clock());
+        self.publish_load(load, clock())
+    }
+
+    fn publish_load(
+        &self,
+        load: Result<SourceLoad, DataServerError>,
+        as_of: DateTime<Utc>,
+    ) -> Result<(), DataServerError> {
+        let load = match load {
+            Ok(load) => load,
+            Err(e) => {
+                // Keep the warning data but advance the render/metadata clock:
+                // failed acquisition must not freeze TIME-less expiry or caches.
+                self.catalog.store(Arc::new(self.snapshot().at_time(as_of)));
+                self.refresh_failed.store(true, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        let failed_documents = load.failed_documents;
+        let usable = failed_documents == 0 || !load.alerts.is_empty();
+        let alerts = load
+            .alerts
+            .into_iter()
+            .filter(|a| accepts_status(a, &self.build_cfg.status_filter))
+            .collect();
+        // WIS2 resolves at ingest using pubtime as well as CAP identity. Running
+        // old Update references again here would withdraw a later reissue.
+        let (alerts, withdrawn) = if self.is_wis2() {
+            (alerts, Vec::new())
+        } else {
+            resolve_references(alerts)
+        };
         let superseded = {
             let mut seen = self
                 .superseded_ids
@@ -330,7 +371,6 @@ impl CapEngine {
         };
         self.superseded
             .fetch_add(superseded as u64, Ordering::Relaxed);
-        let as_of = clock();
         let catalog = Catalog::build(
             &alerts,
             &self.build_cfg,
@@ -347,8 +387,16 @@ impl CapEngine {
             self.source.label()
         );
         self.catalog.store(Arc::new(catalog));
-        self.loaded.store(true, Ordering::Relaxed);
-        Ok(())
+        if usable {
+            self.loaded.store(true, Ordering::Relaxed);
+        }
+        self.refresh_failed
+            .store(failed_documents > 0, Ordering::Relaxed);
+        if failed_documents > 0 {
+            Err(DataServerError::Engine(format!("CAP refresh: {failed_documents} document(s) unavailable; retained last good copies")))
+        } else {
+            Ok(())
+        }
     }
 
     /// Run the poll loop on the background runtime. Exits on [`Self::shutdown`].
@@ -738,6 +786,66 @@ impl MapEngine for CapEngine {
 #[cfg(test)]
 mod tests {
     use super::encode_feature_id;
+
+    #[test]
+    fn failed_acquisition_advances_expiry_and_cache_time_without_changing_content() {
+        use super::*;
+        use ds_core::feature_engine::FeatureEngine;
+        let cfg: CapConfig = serde_json::from_value(serde_json::json!({"data_path": "."})).unwrap();
+        // A WIS2 constructor is network-free; publish the captured alert directly.
+        let cfg = CapConfig {
+            data_path: None,
+            wis2: Some(Wis2Config::default()),
+            ..cfg
+        };
+        let engine = CapEngine::new(&cfg, "test").unwrap();
+        let before: DateTime<Utc> = "2026-09-13T10:00:00Z".parse().unwrap();
+        let after = before + chrono::Duration::hours(2);
+        let xml = include_str!("../tests/fixtures/helsinki-flood.xml").replace(
+            "<severity>Severe</severity>",
+            "<severity>Severe</severity><expires>2026-09-13T11:00:00+00:00</expires>",
+        );
+        engine
+            .publish_load(
+                Ok(SourceLoad {
+                    alerts: crate::parser::parse_document(&xml).unwrap(),
+                    failed_documents: 0,
+                }),
+                before,
+            )
+            .unwrap();
+        let version = engine.content_version();
+        let render = || {
+            engine
+                .get_raster_tile(
+                    [24.8, 60.0, 25.2, 60.4],
+                    16,
+                    16,
+                    None,
+                    &OutputCrs::Wgs84,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        assert!(render().values.iter_values().any(|v| v.is_some()));
+        assert!(engine
+            .publish_load(
+                Err(DataServerError::Engine("source unavailable".into())),
+                after
+            )
+            .is_err());
+        assert!(!render().values.iter_values().any(|v| v.is_some()));
+        assert_eq!(engine.resolve_time(None, None), Some(after));
+        assert_eq!(engine.raster_info().times.last(), Some(&after));
+        assert_eq!(engine.content_version(), version);
+        assert_eq!(
+            engine.feature_count(),
+            1,
+            "Features keeps the retained warning history"
+        );
+    }
 
     #[test]
     fn encode_feature_id_handles_path_unsafe_chars() {

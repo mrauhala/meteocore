@@ -1,61 +1,88 @@
-//! CAP message-chain resolution: `msgType` Update / Cancel + `<references>`.
-//!
-//! CAP v1.2 §3.2.1: `<references>` holds the extended identifiers
-//! (`sender,identifier,sent`) of earlier messages this one refers to,
-//! whitespace-separated. An `Update` replaces them, a `Cancel` withdraws
-//! them; `Ack` and `Error` are administrative and describe no hazard.
-//!
-//! Applied to the whole alert set on every catalog rebuild, for **every**
-//! source mode: a directory or feed that keeps the original alert next to
-//! its cancellation must not render both.
+//! CAP Update/Cancel resolution. Identity is scoped to the sender; references
+//! address an exact `(sender, identifier, sent)` message, never a bare id.
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
+
 use crate::parser::CapAlert;
 
-/// One `sender,identifier,sent` triple from `<references>`. Only the
-/// identifier is used for matching — `sender` and `sent` are informational
-/// (and frequently malformed in the wild).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reference {
+/// A producer's identifier, shared by its in-place revisions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct AlertKey {
     pub sender: String,
     pub identifier: String,
-    pub sent: String,
 }
 
-/// Parse a `<references>` value. Tolerates the common deviations: missing
-/// `sent`, bare identifiers, multiple whitespace.
-pub fn parse_references(s: &str) -> Vec<Reference> {
-    s.split_whitespace()
-        .filter_map(|triple| {
-            let mut parts = triple.splitn(3, ',');
-            let a = parts.next()?.trim();
-            match (parts.next(), parts.next()) {
-                (Some(ident), sent) => {
-                    let ident = ident.trim();
-                    if ident.is_empty() {
-                        return None;
-                    }
-                    Some(Reference {
-                        sender: a.to_string(),
-                        identifier: ident.to_string(),
-                        sent: sent.map(|x| x.trim().to_string()).unwrap_or_default(),
-                    })
-                }
-                // Bare identifier (non-conformant but seen).
-                (None, _) if !a.is_empty() => Some(Reference {
-                    sender: String::new(),
-                    identifier: a.to_string(),
-                    sent: String::new(),
-                }),
-                _ => None,
-            }
+impl AlertKey {
+    pub fn of(alert: &CapAlert) -> Self {
+        Self {
+            sender: alert.sender.clone().unwrap_or_default(),
+            identifier: alert.identifier.clone(),
+        }
+    }
+
+    /// Length-prefix the sender so arbitrary identifier punctuation cannot
+    /// collide with the namespace separator. The API percent-encodes the id.
+    pub fn feature_id(&self, info: usize, area: usize) -> String {
+        format!(
+            "cap:{}:{}{}.{}.{}",
+            self.sender.len(),
+            self.sender,
+            self.identifier,
+            info,
+            area
+        )
+    }
+}
+
+/// Full CAP message identity. Missing sent is tolerated for renderable input,
+/// but a cancellation must supply all three mandatory reference components.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct MessageKey {
+    pub alert: AlertKey,
+    pub sent: Option<DateTime<Utc>>,
+}
+
+impl MessageKey {
+    pub fn of(alert: &CapAlert) -> Self {
+        Self {
+            alert: AlertKey::of(alert),
+            sent: alert.sent,
+        }
+    }
+}
+
+pub(crate) fn accepts_status(alert: &CapAlert, filter: &[String]) -> bool {
+    filter.is_empty()
+        || alert.status.as_ref().is_some_and(|status| {
+            filter
+                .iter()
+                .any(|s| s.trim().eq_ignore_ascii_case(status.trim()))
         })
-        .collect()
 }
 
-/// Whether an alert of this `msgType` describes a hazard and should be
-/// rendered (Alert / Update; a missing msgType is treated as Alert).
+/// Reject incomplete/malformed references instead of broadening a withdrawal
+/// to another sender or revision. Timestamps compare as instants, not text.
+fn parse_reference(value: &str) -> Option<MessageKey> {
+    let mut parts = value.split(',');
+    let sender = parts.next()?;
+    let identifier = parts.next()?;
+    let sent = DateTime::parse_from_rfc3339(parts.next()?)
+        .ok()?
+        .with_timezone(&Utc);
+    if sender.is_empty() || identifier.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(MessageKey {
+        alert: AlertKey {
+            sender: sender.into(),
+            identifier: identifier.into(),
+        },
+        sent: Some(sent),
+    })
+}
+
 pub fn is_renderable(msg_type: Option<&str>) -> bool {
     match msg_type.map(|s| s.trim().to_ascii_lowercase()) {
         None => true,
@@ -63,78 +90,67 @@ pub fn is_renderable(msg_type: Option<&str>) -> bool {
     }
 }
 
-/// The identifiers this message withdraws: the `<references>` of an
-/// `Update` or `Cancel`, minus the message's own identifier (a self-reference
-/// is non-conformant but seen, and must not cancel the message itself).
-/// Empty for every other `msgType`. The ONE withdrawal decision — shared by
-/// the rebuild-time [`resolve_references`] and the WIS2 ingest path, so a
-/// tolerance added to one cannot silently miss the other.
-pub fn references_withdrawn_by(alert: &CapAlert) -> Vec<String> {
-    let t = alert
-        .msg_type
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if t != "update" && t != "cancel" {
+/// Shared withdrawal decision for pull-source rebuilds and WIS2 ingestion.
+pub(crate) fn references_withdrawn_by(alert: &CapAlert) -> Vec<MessageKey> {
+    if !alert.msg_type.as_deref().is_some_and(|t| {
+        t.trim().eq_ignore_ascii_case("update") || t.trim().eq_ignore_ascii_case("cancel")
+    }) {
         return Vec::new();
     }
-    let Some(refs) = &alert.references else {
-        return Vec::new();
-    };
-    parse_references(refs)
-        .into_iter()
-        .map(|r| r.identifier)
-        .filter(|id| id != &alert.identifier)
+    let own = MessageKey::of(alert);
+    alert
+        .references
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|value| {
+            let key = parse_reference(value);
+            if key.is_none() {
+                tracing::warn!(
+                    "cap: ignoring malformed reference '{value}' in '{}'",
+                    alert.identifier
+                );
+            }
+            key
+        })
+        .filter(|key| key != &own)
         .collect()
 }
 
-/// Collapse a set of alerts to the ones still in force:
-///
-/// 1. one alert per `identifier` — the newest `sent` wins (re-issued documents);
-/// 2. every identifier referenced by an `Update` or `Cancel` is withdrawn;
-/// 3. `Cancel` / `Ack` / `Error` messages are themselves dropped.
-///
-/// Returns the survivors in input order plus the identifiers withdrawn by
-/// (2) (sorted, deduplicated) — the caller diffs them against the previous
-/// rebuild so a cancelled alert that lingers in the source is counted once,
-/// not on every rebuild.
-pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, Vec<String>) {
-    // (1) newest per identifier.
-    let mut newest: HashMap<&str, usize> = HashMap::new();
-    for (i, a) in alerts.iter().enumerate() {
-        match newest.get(a.identifier.as_str()) {
-            Some(&j) if alerts[j].sent >= a.sent => {}
+/// Latest sent per sender/identifier, followed by exact-reference withdrawal.
+/// Status filtering must precede this function (including duplicate selection).
+pub(crate) fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, Vec<MessageKey>) {
+    let mut newest: HashMap<AlertKey, usize> = HashMap::new();
+    for (i, alert) in alerts.iter().enumerate() {
+        let key = AlertKey::of(alert);
+        match newest.get(&key) {
+            Some(&j) if alerts[j].sent >= alert.sent => {}
             _ => {
-                newest.insert(a.identifier.as_str(), i);
+                newest.insert(key, i);
             }
         }
     }
     let keep: HashSet<usize> = newest.values().copied().collect();
-
-    // (2) withdrawn identifiers, from the surviving messages' references.
-    let withdrawn: HashSet<String> = alerts
+    let withdrawn: HashSet<_> = alerts
         .iter()
         .enumerate()
         .filter(|(i, _)| keep.contains(i))
-        .flat_map(|(_, a)| references_withdrawn_by(a))
+        .flat_map(|(_, alert)| references_withdrawn_by(alert))
         .collect();
-
-    let mut superseded: Vec<String> = Vec::new();
+    let mut superseded = Vec::new();
     let survivors = alerts
         .into_iter()
         .enumerate()
-        .filter_map(|(i, a)| {
+        .filter_map(|(i, alert)| {
             if !keep.contains(&i) {
                 return None;
             }
-            if withdrawn.contains(&a.identifier) {
-                superseded.push(a.identifier);
+            let key = MessageKey::of(&alert);
+            if withdrawn.contains(&key) {
+                superseded.push(key);
                 return None;
             }
-            if !is_renderable(a.msg_type.as_deref()) {
-                return None;
-            }
-            Some(a)
+            is_renderable(alert.msg_type.as_deref()).then_some(alert)
         })
         .collect();
     superseded.sort();
@@ -145,92 +161,71 @@ pub fn resolve_references(alerts: Vec<CapAlert>) -> (Vec<CapAlert>, Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
 
-    fn alert(id: &str, msg_type: &str, refs: Option<&str>, sent_secs: i64) -> CapAlert {
+    fn alert(sender: &str, id: &str, sent: &str) -> CapAlert {
         CapAlert {
+            sender: Some(sender.into()),
             identifier: id.into(),
-            sender: Some("s@x".into()),
-            sent: Some(Utc.timestamp_opt(1_700_000_000 + sent_secs, 0).unwrap()),
+            sent: Some(sent.parse().unwrap()),
             status: Some("Actual".into()),
-            msg_type: Some(msg_type.into()),
-            scope: Some("Public".into()),
-            references: refs.map(str::to_string),
-            infos: vec![],
+            msg_type: Some("Alert".into()),
+            ..Default::default()
         }
     }
+    const T: &str = "2026-09-13T10:00:00Z";
 
-    fn ids(v: &[CapAlert]) -> Vec<&str> {
-        v.iter().map(|a| a.identifier.as_str()).collect()
+    #[test]
+    fn senders_and_reference_timestamps_are_distinct() {
+        let a = alert("one", "A", T);
+        let b = alert("two", "A", T);
+        let mut cancel = alert("one", "C", T);
+        cancel.msg_type = Some("Cancel".into());
+        cancel.references = Some("one,A,2026-09-13T12:00:00+02:00".into());
+        let (out, withdrawn) = resolve_references(vec![a, b.clone(), cancel.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sender, b.sender);
+        assert_eq!(withdrawn.len(), 1);
+        let newer = alert("one", "A", "2026-09-13T11:00:00Z");
+        let (out, _) = resolve_references(vec![newer, cancel]);
+        assert_eq!(
+            out.len(),
+            1,
+            "a reference to an old sent cannot cancel a reissue"
+        );
     }
 
     #[test]
-    fn parses_triples_and_deviations() {
-        let r =
-            parse_references("s@x,A1,2026-09-12T10:00:00+02:00  s@x,A2,2026-09-12T11:00:00Z\nB3");
-        assert_eq!(r.len(), 3);
-        assert_eq!(r[0].identifier, "A1");
-        assert_eq!(r[0].sender, "s@x");
-        assert_eq!(r[1].sent, "2026-09-12T11:00:00Z");
-        assert_eq!(r[2].identifier, "B3");
-        assert!(r[2].sender.is_empty());
-        assert!(parse_references("   ").is_empty());
-        assert!(parse_references("s@x,,t").is_empty());
+    fn invalid_references_never_broaden_to_identifier_only() {
+        let mut cancel = alert("one", "C", T);
+        cancel.msg_type = Some("Cancel".into());
+        cancel.references = Some("A one,A one,A,invalid ,A,2026-09-13T10:00:00Z".into());
+        assert!(references_withdrawn_by(&cancel).is_empty());
     }
 
     #[test]
-    fn update_and_cancel_chain() {
-        let set = vec![
-            alert("A", "Alert", None, 0),
-            alert("B", "Alert", None, 0),
-            alert("A2", "Update", Some("s@x,A,2026"), 10),
-            alert("C", "Cancel", Some("s@x,B,2026"), 20),
-            alert("D", "Ack", Some("s@x,A2,2026"), 30),
-        ];
-        let (out, superseded) = resolve_references(set);
-        // A withdrawn by A2, B withdrawn by C; C (Cancel) and D (Ack) not rendered.
-        assert_eq!(ids(&out), vec!["A2"]);
-        assert_eq!(superseded, vec!["A", "B"]);
+    fn update_chain_withdraws_original_and_ack_does_not_withdraw_update() {
+        let a = alert("one", "A", T);
+        let mut update = alert("one", "U", T);
+        update.msg_type = Some("Update".into());
+        update.references = Some("one,A,2026-09-13T10:00:00Z one,U,2026-09-13T10:00:00Z".into());
+        let mut ack = alert("one", "ACK", T);
+        ack.msg_type = Some("Ack".into());
+        ack.references = Some("one,U,2026-09-13T10:00:00Z".into());
+        let (out, withdrawn) = resolve_references(vec![a, update, ack]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].identifier, "U");
+        assert_eq!(withdrawn.len(), 1);
     }
 
     #[test]
-    fn newest_sent_wins_per_identifier_and_stale_update_is_ignored() {
-        let set = vec![
-            alert("A", "Alert", None, 100), // re-issued, newer
-            alert("A", "Alert", None, 0),
-            alert("B", "Update", Some("s@x,A,x"), 50), // stale duplicate of B
-            alert("B", "Alert", None, 60),             // newest B has no references
-        ];
-        let (out, superseded) = resolve_references(set);
-        assert_eq!(ids(&out), vec!["A", "B"]);
-        assert_eq!(out[0].sent.unwrap().timestamp() % 1000, 100);
-        assert!(superseded.is_empty());
-    }
-
-    #[test]
-    fn references_withdrawn_by_is_msgtype_gated_and_skips_self() {
-        let u = alert("U", "update", Some("s@x,A,t s@x,U,t B"), 0);
-        assert_eq!(references_withdrawn_by(&u), vec!["A", "B"]);
-        let c = alert("C", " Cancel ", Some("s@x,A,t"), 0);
-        assert_eq!(references_withdrawn_by(&c), vec!["A"]);
-        // Alert / Ack / Error / missing msgType never withdraw anything, even
-        // with references.
-        for t in ["Alert", "Ack", "Error"] {
-            assert!(references_withdrawn_by(&alert("X", t, Some("s@x,A,t"), 0)).is_empty());
-        }
-        let mut none = alert("X", "Update", Some("s@x,A,t"), 0);
-        none.msg_type = None;
-        assert!(references_withdrawn_by(&none).is_empty());
-        assert!(references_withdrawn_by(&alert("X", "Update", None, 0)).is_empty());
-    }
-
-    #[test]
-    fn self_reference_does_not_withdraw_itself_and_missing_msgtype_renders() {
-        let mut a = alert("A", "Update", Some("s@x,A,x"), 0);
-        a.msg_type = None;
-        let b = alert("B", "Update", Some("s@x,B,x"), 0);
-        let (out, superseded) = resolve_references(vec![a, b]);
-        assert_eq!(ids(&out), vec!["A", "B"]);
-        assert!(superseded.is_empty());
+    fn newest_revision_controls_references() {
+        let a = alert("one", "A", T);
+        let mut old = alert("one", "U", T);
+        old.msg_type = Some("Update".into());
+        old.references = Some("one,A,2026-09-13T10:00:00Z".into());
+        let new = alert("one", "U", "2026-09-13T11:00:00Z");
+        let (out, withdrawn) = resolve_references(vec![a, old, new]);
+        assert_eq!(out.len(), 2);
+        assert!(withdrawn.is_empty());
     }
 }
