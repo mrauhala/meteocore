@@ -267,5 +267,5 @@ health tracks refresh failures/recovery instead of keeping boot status. Demo:
 `collections.d/cap-alerts.toml` over `testdata/cap/`.
 
 Out of scope (follow-ups): XML-DSig verification, per-`event` sub-layers,
-conditional-GET feed caching, antimeridian splitting, Global Cache backfill
+conditional-GET feed caching, Global Cache backfill
 on a cold WIS2 boot (the accumulator starts empty until alerts arrive).
