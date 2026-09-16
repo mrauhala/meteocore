@@ -344,13 +344,22 @@ pub async fn wms_handler(
 
             // Acquire render semaphore (with timeout to shed load under pressure)
             let t_sem = std::time::Instant::now();
-            let _permit =
-                tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
-                    .await
-                    .map_err(|_| {
-                        WmsError::ServiceUnavailable("Server busy, try again later".to_string())
-                    })?
-                    .map_err(|_| WmsError::Internal("Render semaphore closed".to_string()))?;
+            let cpu_permit = tokio::time::timeout(
+                ds_render::RENDER_TIMEOUT,
+                state.render_semaphore.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| WmsError::ServiceUnavailable("Server busy, try again later".to_string()))?
+            .map_err(|_| WmsError::Internal("Render semaphore closed".to_string()))?;
+            let memory_permit = Arc::new(
+                ds_render::budget::RENDER_MEMORY
+                    .try_acquire(params.width, params.height)
+                    .ok_or_else(|| {
+                        WmsError::ServiceUnavailable("Render memory budget exhausted".into())
+                    })?,
+            );
+            let worker_memory = memory_permit.clone();
+
             let sem_wait_ms = t_sem.elapsed().as_millis() as u64;
 
             // Render on a blocking thread
@@ -386,6 +395,9 @@ pub async fn wms_handler(
             let t_render = std::time::Instant::now();
             let render_outcome = tokio::task::spawn_blocking(
                 move || -> Result<(Option<Vec<u8>>, RenderPath), DataServerError> {
+                    let _cpu_permit = cpu_permit;
+                    let _memory_permit = worker_memory;
+
                     // Direct single-shot render: one get_raster_tile → colorize → encode.
                     let direct = || -> Result<Option<Vec<u8>>, DataServerError> {
                         let tile = engine.get_raster_tile(

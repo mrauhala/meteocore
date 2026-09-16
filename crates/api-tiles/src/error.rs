@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
@@ -54,6 +54,12 @@ impl IntoResponse for TilesError {
             Json(json!({ "code": code, "description": description })),
         )
             .into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
         response.extensions_mut().insert(reason);
         response
     }

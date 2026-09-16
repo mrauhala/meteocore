@@ -154,6 +154,7 @@ not re-scan the auto roots.
 | `LOG_FORMAT` | human-readable | Set to `json` for newline-delimited JSON logs (production / Loki ingestion) |
 | `RUST_LOG` | `info` | Log level filter, e.g. `server=debug,engine_geotiff=warn` |
 | `ADMIN_TOKEN` | _(none — unauthenticated)_ | Bearer token required for `POST /admin/collections/reload`. When unset, the admin endpoint is open. |
+| `MC_RENDER_MEMORY_MB` | `1024` | Process-wide transient raster render admission budget (MiB), shared by WMS/Maps/Tiles and retained across reloads. Estimate: 32 bytes/output pixel. Exhaustion returns 503 + Retry-After; 0 rejects uncached renders. Restart to change. Source decoding and resident caches are separate budgets. |
 | `MC_3DTILES_CONTENT_CACHE_MB` | `512` | 3D Tiles encoded-content cache size in MB. `0` disables. |
 | `MC_PVOL_VOXEL_GRID_CACHE_MB` | `512` | PVOL polar-resampled voxel-grid cache size in MB. `0` disables. |
 | `MC_PVOL_PIXEL_CACHE_MB` | `1024` | PVOL per-moment decoded-pixel cache size in MB. `0` disables. |
@@ -1587,6 +1588,9 @@ Returns HTTP 503 only when all collections have failed.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `render_semaphore_available` | gauge | — | Available render permits |
+| `render_budget_available_bytes` | gauge | — | Available transient render memory estimate |
+| `render_budget_total_bytes` | gauge | — | Configured transient render memory budget |
+| `render_budget_rejected_total` | counter | — | Requests rejected at memory admission |
 | `render_semaphore_total` | gauge | — | Total render permits (2× CPU cores, min 8) |
 | `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
 

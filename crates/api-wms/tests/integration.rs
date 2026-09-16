@@ -2962,6 +2962,16 @@ fn capabilities_legend_url_carries_the_full_layer_name() {
     );
 }
 
+#[tokio::test]
+async fn oversized_render_is_rejected_before_engine_dispatch() {
+    let (app, _, calls) = build_counting_router(16);
+    let request = Request::builder().uri("/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=&CRS=CRS:84&BBOX=20,60,30,70&WIDTH=8000&HEIGHT=8000&FORMAT=image/png").body(Body::empty()).unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
 struct AlertDefaultMock {
     requested: Arc<std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
 }

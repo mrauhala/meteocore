@@ -1739,10 +1739,21 @@ async fn render_tile(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
-    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
-        .await
-        .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
-        .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
+    let cpu_permit = tokio::time::timeout(
+        ds_render::RENDER_TIMEOUT,
+        state.render_semaphore.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
+    .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
+    let memory_permit = Arc::new(
+        ds_render::budget::RENDER_MEMORY
+            .try_acquire(tile_size, tile_size)
+            .ok_or_else(|| {
+                TilesError::ServiceUnavailable("Render memory budget exhausted".into())
+            })?,
+    );
+    let worker_memory = memory_permit.clone();
 
     // Render on a blocking thread
     let engine = engine.clone();
@@ -1755,6 +1766,9 @@ async fn render_tile(
     let render_z = validated.z;
 
     let render_result = tokio::task::spawn_blocking(move || {
+        let _cpu_permit = cpu_permit;
+        let _memory_permit = worker_memory;
+
         let tile = engine.get_raster_tile(
             bbox,
             tile_size,

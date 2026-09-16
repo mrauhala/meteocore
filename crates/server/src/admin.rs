@@ -1098,6 +1098,25 @@ static RENDER_SEMAPHORE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+static RENDER_MEMORY_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_budget_available_bytes",
+        "Available transient raster render budget",
+    )
+});
+static RENDER_MEMORY_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_budget_total_bytes",
+        "Total transient raster render budget",
+    )
+});
+static RENDER_MEMORY_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "render_budget_rejected_total",
+        "Raster requests rejected by memory admission",
+    )
+});
+
 static STORAGE_BYTES_READ: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -4575,6 +4594,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
+    let memory = &*ds_render::budget::RENDER_MEMORY;
+    RENDER_MEMORY_AVAILABLE.set(memory.available().min(i64::MAX as u64) as i64);
+    RENDER_MEMORY_TOTAL.set(memory.capacity().min(i64::MAX as u64) as i64);
     update_memory_gauges();
 
     // Delta-tracked cache counters: cache implementations expose cumulative
@@ -4585,6 +4607,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     let mut counter_state = CACHE_COUNTER_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    RENDER_MEMORY_REJECTED.feed(memory.rejected());
 
     // Rendered image cache: global (single cache shared across collections).
     RENDERED_CACHE_METRICS.update(
