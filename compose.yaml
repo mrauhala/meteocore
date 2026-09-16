@@ -21,6 +21,10 @@ name: meteocore
 #   open http://localhost:3000         # Grafana — MeteoCore dashboard
 #   open http://localhost:8000/health  # server health
 #
+# Host ports are loopback-only. This is a development manifest, not a
+# production security boundary: Alloy has Docker API access via the socket.
+# A :ro socket mount does not restrict Docker API operations.
+#
 # Tear down (including volumes):
 #   docker compose down -v
 
@@ -32,7 +36,7 @@ services:
       LOG_FORMAT: json
       RUST_LOG: info
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       # Docker-specific config: binds to 0.0.0.0, only references tracked
       # test data so a fresh checkout works without copying anything else.
@@ -60,7 +64,7 @@ services:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/var/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     restart: unless-stopped
     depends_on:
       - meteocore
@@ -73,7 +77,7 @@ services:
       - ./docker/loki/config.yml:/etc/loki/config.yml:ro
       - loki-data:/loki
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     restart: unless-stopped
 
   alloy:
@@ -99,7 +103,7 @@ services:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - alloy-data:/var/lib/alloy/data
     ports:
-      - "12345:12345"
+      - "127.0.0.1:12345:12345"
     restart: unless-stopped
     depends_on:
       - loki
@@ -122,7 +126,7 @@ services:
       - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     restart: unless-stopped
     depends_on:
       - prometheus
