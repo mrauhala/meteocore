@@ -2,6 +2,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DataServerError {
+    /// Shared transient resource admission failed; retry later (HTTP 503).
+    #[error("Server busy, try again later")]
+    ResourceExhausted,
     #[error("Collection not found: {0}")]
     CollectionNotFound(String),
 

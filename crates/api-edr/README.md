@@ -116,6 +116,9 @@ antimeridian bboxes · #668 400-vs-404 on unsupported query types · #666
 shared parameter-name validation · #665 GRIB value rounding · #523 nowcast
 reflectivity via EDR · #673 shared area budget.
 
+GeoTIFF cold source decodes share a byte budget across APIs; exhausted decode
+admission returns HTTP 503 without a partial CoverageJSON result.
+
 GRIB wgrib2 accumulation and average fields use duration-qualified parameter
 names, for example `APCP_acc_6h`, `APCP_acc_3h` and `DSWRF_avg_6h`. The time axis
 is the **window end**, with the duration in the parameter label/name; the start

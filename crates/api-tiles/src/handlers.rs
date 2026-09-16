@@ -1799,6 +1799,7 @@ async fn render_tile(
         // parameter, bad bbox/datetime) is a 400 with the engine's message,
         // not a 500 that hides it.
         match e {
+            DSE::ResourceExhausted => TilesError::ServiceUnavailable(e.to_string()),
             DSE::InvalidParameter(_)
             | DSE::InvalidBbox(_)
             | DSE::InvalidDatetime(_)
