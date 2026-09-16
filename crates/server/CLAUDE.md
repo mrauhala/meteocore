@@ -179,5 +179,6 @@ an explicit reload or enabled watcher remains the configuration control plane.
 The task shares the reload mutex and ds-poll shutdown handle lifecycle. Source
 configuration errors remain visible and logged; remote failures may include
 permanent endpoint/bucket mistakes, so repeated failed health needs operator
-attention. Local missing files and structurally missing source config retain
+attention. The all-failed startup exception requires every configured collection to be
+remote radar; mixed local/remote failures still exit. Local missing files and structurally missing source config retain
 startup fail-fast behavior. Runtime scan errors still retain the good catalog.

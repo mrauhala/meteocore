@@ -495,7 +495,7 @@ async fn main() {
                 "Starting with no collections. The server responds to /health and an empty \
                  /collections; add collections via config + POST /admin/collections/reload."
             );
-        } else if admin::has_pending_radar(&config.collections, &result.health) {
+        } else if admin::can_start_failed_radar(&config.collections) {
             tracing::warn!("Remote radar startup failed; starting with failed health and background retry (30–300 s). Check endpoint/bucket/credentials if failures persist.");
         } else {
             tracing::error!(

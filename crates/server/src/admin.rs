@@ -4022,6 +4022,50 @@ pub(crate) fn has_pending_radar(
     })
 }
 
+/// Only an all-remote-radar deployment may boot with every collection failed.
+/// A pending remote radar must not conceal a failed local/configured collection.
+pub(crate) fn can_start_failed_radar(collections: &[CollectionConfig]) -> bool {
+    !collections.is_empty() && collections.iter().all(remote_radar)
+}
+
+#[cfg(test)]
+mod radar_startup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_local_failures_do_not_gain_the_remote_startup_exception() {
+        let remote: CollectionConfig = toml::from_str(
+            r#"
+id = "radar"
+title = "radar"
+description = "test"
+engine_type = "odim"
+[odim]
+endpoint = "https://example.com"
+bucket = "radar"
+"#,
+        )
+        .unwrap();
+        let local: CollectionConfig = toml::from_str(
+            r#"
+id = "local"
+title = "local"
+description = "test"
+data_path = "/missing/weather.csv"
+"#,
+        )
+        .unwrap();
+        assert!(can_start_failed_radar(std::slice::from_ref(&remote)));
+        assert!(!can_start_failed_radar(&[remote.clone(), local]));
+        let mut local_radar = remote.clone();
+        local_radar.odim.as_mut().unwrap().endpoint = None;
+        local_radar.odim.as_mut().unwrap().bucket = None;
+        local_radar.data_path = Some("/missing/radar".into());
+        assert!(!can_start_failed_radar(&[remote, local_radar]));
+        assert!(!can_start_failed_radar(&[]));
+    }
+}
+
 /// Retry failed startup scans and re-expand empty PVOL inventories. The existing
 /// loader wires per-site routes and dependent nowcasts, not just an engine catalog.
 /// Run only on the background runtime, serialized with manual/watcher reloads.
