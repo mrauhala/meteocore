@@ -229,3 +229,61 @@ async fn error_responses_are_left_alone() {
     assert!(resp.headers().get(header::ETAG).is_none());
     assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
 }
+
+#[tokio::test]
+async fn feature_representations_have_distinct_stable_etags_and_vary() {
+    for path in [
+        "/collections/cities/items",
+        "/collections/cities/items/helsinki",
+    ] {
+        let json = get_response(path, None).await;
+        let json_etag = header_str(&json, header::ETAG).unwrap().to_owned();
+        assert_eq!(header_str(&json, header::VARY), Some("accept"));
+        // Same URL, selected by Accept: this catches shared-cache poisoning.
+        let request = |etag: &str| {
+            Request::builder()
+                .uri(path)
+                .header(header::ACCEPT, "text/html")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let html = build_router().oneshot(request(&json_etag)).await.unwrap();
+        assert_eq!(html.status(), StatusCode::OK);
+        assert_eq!(header_str(&html, header::VARY), Some("accept"));
+        assert_eq!(
+            header_str(&html, header::CACHE_CONTROL),
+            Some("public, max-age=60")
+        );
+        let html_etag = header_str(&html, header::ETAG).unwrap().to_owned();
+        assert_ne!(html_etag, json_etag);
+        let cached = build_router().oneshot(request(&html_etag)).await.unwrap();
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(header_str(&cached, header::VARY), Some("accept"));
+        assert_eq!(header_str(&cached, header::ETAG), Some(html_etag.as_str()));
+        assert_eq!(
+            header_str(&cached, header::CACHE_CONTROL),
+            Some("public, max-age=60")
+        );
+        assert!(cached
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+        assert_eq!(
+            get_response(path, Some(&html_etag)).await.status(),
+            StatusCode::OK
+        );
+    }
+    let html = get_response(
+        "/collections/cities/items?f=html&datetime=2020-01-01T00:00:00Z/2020-01-02T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(
+        header_str(&html, header::CACHE_CONTROL),
+        Some(ds_core::http_cache::CACHE_CONTROL_SETTLED)
+    );
+}

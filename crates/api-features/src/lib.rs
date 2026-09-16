@@ -1,5 +1,6 @@
 pub mod caching;
 pub mod handlers;
+mod html;
 pub mod params;
 pub mod response;
 
