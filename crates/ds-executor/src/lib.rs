@@ -122,7 +122,9 @@ impl RenderJob {
         let result = tokio::time::timeout_at(deadline.into(), task)
             .await
             .map_err(|_| timeout_error())??;
-        if Instant::now() >= deadline {
+        // Count at the request boundary, exactly once. Counting inside the
+        // worker would race the outer timeout and could count one expiry twice.
+        if matches!(&result, Err(ExecutionError::Timeout)) || Instant::now() >= deadline {
             return Err(timeout_error());
         }
         result
@@ -143,6 +145,43 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_dispatch_is_counted_once_per_request() {
+        const CHILD: &str = "MC_TEST_RENDER_DEADLINE_COUNTER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::expired_dispatch_is_counted_once_per_request",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // Process isolation makes the cumulative counter assertion independent
+        // of timeout tests running concurrently elsewhere in this test binary.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let before = metrics().timed_out;
+            for completed in 1..=20 {
+                let job = RenderJob::acquire_on(
+                    Arc::new(Semaphore::new(1)),
+                    Arc::new(Semaphore::new(0)),
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    job.run(|| panic!("expired work ran")).await,
+                    Err(ExecutionError::Timeout)
+                ));
+                assert_eq!(metrics().timed_out, before + completed);
+            }
+        });
+    }
 
     #[tokio::test]
     async fn queue_overflow_sheds_immediately_and_disconnect_releases_waiter() {
