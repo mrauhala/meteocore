@@ -2176,7 +2176,6 @@ fn read_bbox_tiles(
         Batch(crate::range_batch::Batch),
     }
     let mut chunks = Vec::with_capacity(coords.len());
-    let mut cached = Vec::with_capacity(coords.len());
     let mut jobs = Vec::new();
     let mut misses = Vec::new();
     for (i, &(row, col)) in coords.iter().enumerate() {
@@ -2198,7 +2197,9 @@ fn read_bbox_tiles(
             misses.push((i, offset..offset + count));
         }
         chunks.push(chunk);
-        cached.push(hit);
+        // Drop the planning lookup here. Retaining Bytes until worker admission
+        // could pin entries after LRU eviction without a decode reservation.
+        // The worker rechecks; a hit evicted meanwhile becomes a single read.
     }
     for batch in crate::range_batch::plan(misses, batch_limit) {
         if batch.tiles.len() == 1 {
@@ -2221,9 +2222,6 @@ fn read_bbox_tiles(
                     band_index,
                     ifd_index,
                     &|range| {
-                        if let Some(bytes) = &cached[i] {
-                            return Ok(bytes.clone());
-                        }
                         // Recheck planned misses after admission/queueing, also
                         // preserving the established cache-backed retry path.
                         if let Some(bytes) = cache.and_then(|c| c.get(file_path, chunk, ifd_index))
