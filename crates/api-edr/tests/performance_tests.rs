@@ -11,7 +11,7 @@
 // 1. COMPLETE INVENTORY on /collections/{id}/locations.
 //    EDR 1.1 does not define locations paging. Direct serialization avoids a
 //    second JSON tree and stays within bounded query execution (#533), but the
-//    final response bytes still scale with the number of locations.
+//    final response bytes are capped per response and admitted process-wide.
 //
 // 2. FULL IN-MEMORY RESPONSE CONSTRUCTION.
 //    CoverageJSON responses build a serde_json::Value tree before serialization.
@@ -274,6 +274,86 @@ async fn locations_metadata_runs_off_http_worker_and_etag_matches_response() {
         .await
         .unwrap()
         .is_empty());
+}
+
+// Run with isolated environment settings: the production budget is process-wide.
+#[test]
+fn locations_budget_errors_are_complete_json_and_memory_recovers() {
+    const CHILD: &str = "MC_TEST_LOCATIONS_BUDGET";
+    let Ok(mode) = std::env::var(CHILD) else {
+        for mode in ["size", "memory"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "locations_budget_errors_are_complete_json_and_memory_recovers",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .env("MC_EDR_LOCATIONS_MEMORY_MB", "1")
+                .env(
+                    "MC_EDR_LOCATIONS_MAX_BYTES",
+                    if mode == "size" { "128" } else { "1048576" },
+                );
+            assert!(child.status().unwrap().success(), "{mode} child failed");
+        }
+        return;
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let app = build_app(ScalableEngine {
+                location_count: 100,
+                timestep_count: 1,
+                parameter_count: 1,
+            });
+            let request = || {
+                Request::builder()
+                    .uri("/collections/weather/locations")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let mut held = Vec::new();
+            // Each body occupies at least 64 KiB; holding 16 exhausts a 1 MiB pool.
+            let expected = if mode == "size" {
+                "ResponseLimit"
+            } else {
+                "ServerBusy"
+            };
+            for _ in 0..=16 {
+                let response = app.clone().oneshot(request()).await.unwrap();
+                if response.status() == StatusCode::OK {
+                    assert_eq!(mode, "memory");
+                    held.push(response);
+                } else {
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(error["code"], expected);
+                    assert!(
+                        error.get("features").is_none(),
+                        "never send a truncated inventory"
+                    );
+                    if mode == "memory" {
+                        assert_eq!(held.len(), 16);
+                        drop(held);
+                        let recovered = app.oneshot(request()).await.unwrap();
+                        assert_eq!(recovered.status(), StatusCode::OK);
+                        let bytes = axum::body::to_bytes(recovered.into_body(), 1048576)
+                            .await
+                            .unwrap();
+                        let inventory: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(inventory["features"].as_array().unwrap().len(), 100);
+                    }
+                    return;
+                }
+            }
+            panic!("budget never rejected a response");
+        });
 }
 
 // ===========================================================================
