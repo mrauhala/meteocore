@@ -1685,7 +1685,7 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - WMS/Maps/Tiles: nearest-neighbor resampling only
 - STAC: no retry logic, no HTTP caching (ETag/Last-Modified)
 - Tiles: WebMercatorQuad and WorldCRS84Quad only; fixed 256x256 raster tiles; MVT is supported via `?f=mvt` for `FeatureEngine`-backed collections
-- GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files; accumulated/averaged aggregate fields (`APCP`, `acc fcst`) are dropped
+- GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files. Wgrib2 hour-window accumulation/average fields use duration-qualified keys (e.g. `APCP_acc_6h`, `DSWRF_avg_6h`) at the window end; source units are preserved without division by duration. ECMWF JSON sidecars retain their existing naming and semantics.
 - QueryData: no compressed files, EDR position only, level 0 only; retains up to `max_runs` (default 4) most-recent files as model runs
 - Zarr: geographic (WGS84 lat/lon) grids only, EDR position only; forecast model-run selection pins the latest run (#337); STAC per-item-CRS and kerchunk modes not yet implemented
 - Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only, new snapshots picked up on reload (not poll)
