@@ -33,7 +33,7 @@ Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
 | Query type | Route | Status | Notes |
 |---|---|---|---|
 | `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list + CoverageJSON/PNG series per location |
-| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; fan-out unbounded, #585) |
+| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined; all coordinates finite and within CRS84 bounds) |
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667) |
 | `trajectory` | `/collections/{id}/trajectory` | partial | 2-D `LINESTRING` only, meaning a *vertical cross-section* (PVOL sites). `LINESTRINGZ/M` (per-node z/time) not accepted; no along-path sampling on gridded engines |
@@ -64,6 +64,14 @@ Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
 | `limit` | ✓ | `/collections` and `/locations` pagination only |
+
+Data queries execute on a dedicated, bounded runtime, including radius and
+instance routes. Admission is capped at 2–8 concurrent queries (available CPUs,
+clamped), with room for 32 additional admitted requests waiting for a slot;
+further requests receive 503 immediately. A 30-second deadline (including queue time) returns
+504. Synchronous work already in progress retains its slot until it finishes;
+a cancelled/timed-out MULTIPOINT stops before its next engine call. This bounds
+concurrency without claiming that synchronous engine I/O is preemptible.
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499).
 
