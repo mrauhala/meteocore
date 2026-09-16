@@ -54,6 +54,21 @@ impl TileCache {
         self.inner.get(&key)
     }
 
+    /// Speculative planning lookup: counters belong to the later worker read.
+    pub(crate) fn contains_untracked(
+        &self,
+        file_path: &Path,
+        chunk_index: u32,
+        ifd_index: u16,
+    ) -> bool {
+        let key = TileCacheKey {
+            file_path: Arc::from(file_path.to_string_lossy().as_ref()),
+            chunk_index,
+            ifd_index,
+        };
+        self.inner.contains_key(&key)
+    }
+
     /// Insert compressed tile bytes into the cache.
     /// `ifd_index` distinguishes full-resolution (0) from overview tiles (1+).
     pub fn insert(&self, file_path: &Path, chunk_index: u32, ifd_index: u16, data: Bytes) {

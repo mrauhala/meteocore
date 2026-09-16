@@ -3,6 +3,7 @@ mod catalog;
 pub mod decode_budget;
 mod decoded_cache;
 mod parse;
+mod range_batch;
 mod reader;
 
 /// Snapshot of the process-global decoded-chunk cache (#463) for `/metrics`:
