@@ -15,11 +15,24 @@ use crate::loader::CsvDataStore;
 
 pub struct CsvEngine {
     store: CsvDataStore,
+    /// Immutable station inventory in first-observation order. Observation
+    /// history must not be scanned or turned into Features on each page request.
+    stations: Vec<Feature>,
 }
 
 impl CsvEngine {
     pub fn new(store: CsvDataStore) -> Self {
-        Self { store }
+        let mut first_rows: Vec<_> = store
+            .location_index
+            .values()
+            .filter_map(|indices| indices.first().copied())
+            .collect();
+        first_rows.sort_unstable();
+        let stations = first_rows
+            .into_iter()
+            .map(|index| station_feature(&store.rows[index]))
+            .collect();
+        Self { store, stations }
     }
 
     /// Build a `PointSeries` coverage for one location. Shared by
@@ -313,48 +326,37 @@ impl FeatureEngine for CsvEngine {
     }
 
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
-        // Build unique locations as features
-        let mut seen = HashMap::new();
-        let mut all_features = Vec::new();
-
-        for row in &self.store.rows {
-            if seen.contains_key(&row.location) {
-                continue;
-            }
-            seen.insert(&row.location, true);
-
-            // Apply bbox filter
-            if let Some(bbox) = &query.bbox {
-                if !bbox.contains(row.longitude, row.latitude) {
+        let (page, number_matched) = if query.bbox.is_none() && query.property_filters.is_empty() {
+            let total = self.stations.len();
+            let start = query.offset.min(total);
+            let end = start.saturating_add(query.limit).min(total);
+            (self.stations[start..end].to_vec(), total)
+        } else {
+            let mut page = Vec::new();
+            let mut matched = 0;
+            for station in &self.stations {
+                if let Some(bbox) = &query.bbox {
+                    let Geometry::Point { x, y } = *station.geometry else {
+                        unreachable!("CSV station geometry is always Point");
+                    };
+                    if !bbox.contains(x, y) {
+                        continue;
+                    }
+                }
+                if !ds_core::feature::matches_property_filters(station, &query.property_filters) {
                     continue;
                 }
+                if matched >= query.offset && page.len() < query.limit {
+                    page.push(station.clone());
+                }
+                // Continue counting after filling the page, without cloning
+                // more features or scanning any station's observation rows.
+                matched += 1;
             }
-
-            let mut properties = HashMap::new();
-            properties.insert(
-                "name".to_string(),
-                PropertyValue::String(row.location.clone()),
-            );
-            properties.insert("latitude".to_string(), PropertyValue::Float(row.latitude));
-            properties.insert("longitude".to_string(), PropertyValue::Float(row.longitude));
-
-            all_features.push(Feature {
-                id: row.location.clone(),
-                geometry: Arc::new(Geometry::Point {
-                    x: row.longitude,
-                    y: row.latitude,
-                }),
-                properties: Arc::new(properties),
-            });
-        }
-
-        all_features
-            .retain(|f| ds_core::feature::matches_property_filters(f, &query.property_filters));
-        let number_matched = all_features.len();
-        let offset = query.offset.min(number_matched);
-        let end = offset.saturating_add(query.limit).min(number_matched);
-        let page = all_features[offset..end].to_vec();
+            (page, matched)
+        };
         let number_returned = page.len();
+        let end = query.offset.min(number_matched) + number_returned;
         let next_offset = if end < number_matched {
             Some(end)
         } else {
@@ -377,24 +379,22 @@ impl FeatureEngine for CsvEngine {
             .get(feature_id)
             .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))?;
 
-        let row = &self.store.rows[indices[0]];
+        Ok(station_feature(&self.store.rows[indices[0]]))
+    }
+}
 
-        let mut properties = HashMap::new();
-        properties.insert(
-            "name".to_string(),
-            PropertyValue::String(row.location.clone()),
-        );
-        properties.insert("latitude".to_string(), PropertyValue::Float(row.latitude));
-        properties.insert("longitude".to_string(), PropertyValue::Float(row.longitude));
-
-        Ok(Feature {
-            id: row.location.clone(),
-            geometry: Arc::new(Geometry::Point {
-                x: row.longitude,
-                y: row.latitude,
-            }),
-            properties: Arc::new(properties),
-        })
+fn station_feature(row: &crate::loader::CsvRow) -> Feature {
+    Feature {
+        id: row.location.clone(),
+        geometry: Arc::new(Geometry::Point {
+            x: row.longitude,
+            y: row.latitude,
+        }),
+        properties: Arc::new(HashMap::from([
+            ("name".into(), PropertyValue::String(row.location.clone())),
+            ("latitude".into(), PropertyValue::Float(row.latitude)),
+            ("longitude".into(), PropertyValue::Float(row.longitude)),
+        ])),
     }
 }
 
@@ -405,6 +405,65 @@ mod tests {
 
     fn test_store() -> CsvDataStore {
         CsvDataStore::load("../../testdata/weather.csv").unwrap()
+    }
+
+    #[test]
+    fn station_pages_preserve_first_observation_order_and_filter_counts() {
+        let engine = CsvEngine::new(
+            CsvDataStore::load(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/station_history.csv"
+            ))
+            .unwrap(),
+        );
+        let all = engine.get_features(&FeatureQuery::default()).unwrap();
+        assert_eq!(
+            all.features
+                .iter()
+                .map(|f| f.id.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta", "alpha", "beta"]
+        );
+        let mut query = FeatureQuery {
+            bbox: Some(Bbox::new(23.0, 59.0, 27.0, 62.0).unwrap()),
+            property_filters: vec![("latitude".into(), "60,62".into())],
+            limit: 1,
+            ..Default::default()
+        };
+        let first = engine.get_features(&query).unwrap();
+        assert_eq!(first.number_matched, 2);
+        assert_eq!(first.features[0].id, "zeta");
+        assert_eq!(first.next_offset, Some(1));
+        query.offset = 1;
+        let last = engine.get_features(&query).unwrap();
+        assert_eq!(last.number_matched, 2);
+        assert_eq!(last.features[0].id, "beta");
+        assert_eq!(last.next_offset, None);
+
+        // Later observations with changed coordinates do not move a station's
+        // inventory geometry. Listing and by-id use the same representative.
+        assert!(matches!(
+            *engine.get_feature("zeta").unwrap().geometry,
+            Geometry::Point { x: 24.0, y: 60.0 }
+        ));
+        for filtered in [false, true] {
+            let mut query = if filtered {
+                query.clone()
+            } else {
+                FeatureQuery::default()
+            };
+            query.offset = usize::MAX;
+            query.limit = usize::MAX;
+            let beyond = engine.get_features(&query).unwrap();
+            assert!(beyond.features.is_empty());
+            assert_eq!(beyond.number_matched, if filtered { 2 } else { 3 });
+            assert_eq!(beyond.next_offset, None);
+            query.offset = 0;
+            query.limit = 0;
+            let zero = engine.get_features(&query).unwrap();
+            assert!(zero.features.is_empty());
+            assert_eq!(zero.number_matched, beyond.number_matched);
+        }
     }
 
     #[test]

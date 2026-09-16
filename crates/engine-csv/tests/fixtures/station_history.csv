@@ -1,0 +1,6 @@
+location,latitude,longitude,time,temperature
+zeta,60,24,2026-01-01T00:00:00Z,1
+alpha,61,25,2026-01-01T00:00:00Z,2
+zeta,70,30,2026-01-01T01:00:00Z,3
+beta,60,26,2026-01-01T00:00:00Z,4
+alpha,61,25,2026-01-01T01:00:00Z,5

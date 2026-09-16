@@ -765,10 +765,35 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
 pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let state = state.load_full();
     let spec_url = format!("{}/maps/api", request_base_url(&state, &headers));
-    axum::response::Html(ds_core::openapi::swagger_ui_html(
-        "MeteoCore - Maps API",
-        &spec_url,
-    ))
+    (
+        [
+            (
+                header::CONTENT_SECURITY_POLICY,
+                ds_core::openapi::SWAGGER_UI_CSP,
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        axum::response::Html(ds_core::openapi::swagger_ui_html(
+            "MeteoCore - Maps API",
+            &spec_url,
+        )),
+    )
+}
+
+/// Pinned Swagger assets embedded in ds-core, available under each API root.
+pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
+    match ds_core::openapi::swagger_ui_asset(&asset) {
+        Some((content_type, bytes)) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// GET /maps/conformance

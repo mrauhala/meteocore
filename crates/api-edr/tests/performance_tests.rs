@@ -8,17 +8,14 @@
 //
 // Key concerns identified in the current implementation:
 //
-// 1. NO PAGINATION on /collections/{id}/locations endpoint.
-//    The OGC EDR 1.1 spec does not mandate pagination on the locations
-//    endpoint, but returning unbounded results is a denial-of-service vector.
-//    The Features API sibling already supports limit/offset. The locations
-//    endpoint serializes ALL locations into a single GeoJSON FeatureCollection
-//    in memory via serde_json::json!, meaning both CPU and RAM scale linearly
-//    with location count.
+// 1. COMPLETE INVENTORY on /collections/{id}/locations.
+//    EDR 1.1 does not define locations paging. Direct serialization avoids a
+//    second JSON tree and stays within bounded query execution (#533), but the
+//    final response bytes still scale with the number of locations.
 //
 // 2. FULL IN-MEMORY RESPONSE CONSTRUCTION.
-//    Both locations_to_geojson() and query_result_to_coverage_json() build
-//    the entire serde_json::Value tree before serialization. For large time
+//    CoverageJSON responses build a serde_json::Value tree before serialization.
+//    Locations use direct serialization. For large time
 //    series (e.g., 1 year of hourly data = 8760 timesteps x N parameters),
 //    this creates significant allocation pressure. Streaming serialization
 //    (e.g., via axum::body::Body::from_stream) would reduce peak memory.
@@ -195,6 +192,90 @@ fn build_app(engine: ScalableEngine) -> axum::Router {
     api_edr::router(make_edr_state(engine))
 }
 
+struct WorkerMetadataEngine {
+    request_thread: std::thread::ThreadId,
+}
+
+impl EdrEngine for WorkerMetadataEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(vec![Location {
+            id: "one".into(),
+            label: "Station one".into(),
+            latitude: 60.0,
+            longitude: 24.0,
+        }])
+    }
+
+    fn query_location(
+        &self,
+        _: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        unreachable!("inventory requests do not query observations")
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        assert_ne!(std::thread::current().id(), self.request_thread);
+        vec!["temperature".into()]
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        assert_ne!(std::thread::current().id(), self.request_thread);
+        None
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        None
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn locations_metadata_runs_off_http_worker_and_etag_matches_response() {
+    let app = api_edr::router(make_edr_state(Arc::new(WorkerMetadataEngine {
+        request_thread: std::thread::current().id(),
+    })));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/collections/weather/locations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(etag, ds_core::http_cache::etag_of(&bytes));
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["features"][0]["properties"]["parameter-name"][0],
+        "temperature"
+    );
+    assert_eq!(body["features"][0]["properties"]["datetime"], "");
+    let cached = app
+        .oneshot(
+            Request::builder()
+                .uri("/collections/weather/locations")
+                .header("if-none-match", etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+    assert!(axum::body::to_bytes(cached.into_body(), 1_000_000)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 // ===========================================================================
 // 1. Response Size Tests
 // ===========================================================================
@@ -202,7 +283,7 @@ fn build_app(engine: ScalableEngine) -> axum::Router {
 /// Verify that the locations endpoint can handle a large number of locations
 /// without panicking or producing malformed JSON.
 ///
-/// This exercises the `locations_to_geojson` serializer with 10,000 features.
+/// This exercises the direct locations serializer with 10,000 features.
 /// Validates that:
 /// - The response status is 200
 /// - The response is valid JSON
@@ -306,20 +387,11 @@ async fn location_query_many_parameters_returns_all_ranges() {
 }
 
 // ===========================================================================
-// 2. Pagination Gap - Locations Endpoint
+// 2. EDR 1.1 Complete Locations Inventory
 // ===========================================================================
 
-/// The OGC EDR 1.1 spec does not strictly require pagination on the locations
-/// endpoint, but operational deployments need it. This test documents the
-/// current behavior: ALL locations are returned in a single response with no
-/// limit/offset support.
-///
-/// When pagination is implemented, this test should be updated to verify:
-/// - Default limit is applied (e.g., 100)
-/// - `limit` query parameter caps the feature count
-/// - `offset` skips features
-/// - `next` link is present when more results exist
-/// - `numberMatched` / `numberReturned` properties are present
+/// Preserve the EDR 1.1 complete-inventory contract while optimizing response
+/// construction. Optional EDR 1.2 paging is a separate API contract change.
 #[tokio::test]
 async fn locations_endpoint_returns_all_results_without_pagination() {
     let app = build_app(ScalableEngine {
@@ -351,7 +423,7 @@ async fn locations_endpoint_returns_all_results_without_pagination() {
         "locations endpoint currently returns ALL locations without pagination"
     );
 
-    // Pagination links are absent (spec gap)
+    // No continuation is needed: every location was returned.
     assert!(
         json.get("links").is_none()
             || json["links"]
