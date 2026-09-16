@@ -47,6 +47,7 @@ struct ParamMetadata {
     /// `None` for types where no numeric value applies (e.g. 1 surface,
     /// 101 MSL, 200 entire atmosphere).
     first_surface_value: Option<f64>,
+    window_qualifier: Option<String>,
 }
 
 impl ParamMetadata {
@@ -64,6 +65,7 @@ impl ParamMetadata {
             },
             first_surface_type: None,
             first_surface_value: None,
+            window_qualifier: None,
         }
     }
 
@@ -73,7 +75,8 @@ impl ParamMetadata {
         let qualifier = self
             .first_surface_type
             .and_then(|t| units::format_level_qualifier(t, self.first_surface_value));
-        units::compose_label(&self.base_label, qualifier.as_deref())
+        let label = units::compose_label(&self.base_label, qualifier.as_deref());
+        units::compose_label(&label, self.window_qualifier.as_deref())
     }
 }
 
@@ -481,7 +484,8 @@ impl GribEngine {
 
             // Parse according to format. For wgrib2 this also resolves the
             // last-record length via a HEAD request on the data file.
-            let Some(parsed) = self.parse_and_resolve(self.index_format, content, &grib_url) else {
+            let Some(parsed) = Self::parse_and_resolve(self.index_format, content, &grib_url)
+            else {
                 continue;
             };
 
@@ -492,7 +496,11 @@ impl GribEngine {
                 parsed
                     .messages
                     .into_iter()
-                    .filter(|m| filter.contains(&m.param))
+                    .filter(|m| {
+                        filter
+                            .iter()
+                            .any(|p| *p == m.param || m.step_kind.parameter_name(p) == m.param)
+                    })
                     .collect()
             } else {
                 parsed.messages
@@ -560,6 +568,7 @@ impl GribEngine {
             total_steps
         );
 
+        new_catalog.refresh_parameters();
         self.catalog.store(Arc::new(new_catalog));
 
         // Probe one message per distinct short name in the newest run to
@@ -583,43 +592,29 @@ impl GribEngine {
         let Some(run) = catalog.latest_run() else {
             return;
         };
-        let Some(step_file) = run.steps.values().next() else {
-            return;
-        };
-
-        // For each distinct short name not yet in the metadata cache,
-        // pick the message at the most canonical surface level (see
-        // `MessageEntry::surface_priority`). This ensures that when a
-        // short name appears at multiple levels (e.g. GFS `TMP` at 1
-        // hybrid / 2 m AGL / 500 hPa / 2 hPa / ...), the probed metadata
-        // reflects the conventional default — 2 m temperature, 10 m wind,
-        // surface pressure — instead of whichever level happens to come
-        // first in the index file.
-        //
-        // We carry the index of the winning message so that the fetch can
-        // bypass `find_message`'s `(param, level)`-only lookup — which
-        // would otherwise collide between, e.g., `hag=2 m` and `pl=2 hPa`
-        // for GFS `TMP` (both have the numeric level 2).
-        let todo: Vec<usize> = {
+        // A parameter may first appear after f000 (accumulations/averages).
+        // Choose its canonical surface across all steps, then retain the same
+        // bounded probe budget used for instantaneous products.
+        let todo = {
             let cache = self.param_meta.read().unwrap();
-            // short_name → (best_priority, index in step_file.messages)
-            let mut chosen: std::collections::HashMap<String, (u8, usize)> =
-                std::collections::HashMap::new();
-            for (i, m) in step_file.messages.iter().enumerate() {
-                if cache.contains_key(&m.param) {
-                    continue;
+            let mut chosen: std::collections::BTreeMap<&str, (&StepFile, &catalog::MessageEntry)> =
+                std::collections::BTreeMap::new();
+            for sf in run.steps.values() {
+                for m in &sf.messages {
+                    if cache.contains_key(&m.param) {
+                        continue;
+                    }
+                    chosen
+                        .entry(&m.param)
+                        .and_modify(|entry| {
+                            if m.surface_priority() < entry.1.surface_priority() {
+                                *entry = (sf, m);
+                            }
+                        })
+                        .or_insert((sf, m));
                 }
-                let prio = m.surface_priority();
-                chosen
-                    .entry(m.param.clone())
-                    .and_modify(|existing| {
-                        if prio < existing.0 {
-                            *existing = (prio, i);
-                        }
-                    })
-                    .or_insert((prio, i));
             }
-            chosen.into_values().map(|(_, i)| i).collect()
+            chosen.into_values().collect::<Vec<_>>()
         };
 
         if todo.is_empty() {
@@ -636,8 +631,7 @@ impl GribEngine {
         // wgrib2 catalog. Users are expected to set `parameters` when using
         // wgrib2 — see the warning emitted elsewhere.
         const MAX_PROBES_PER_SCAN: usize = 32;
-        for i in todo.into_iter().take(MAX_PROBES_PER_SCAN) {
-            let entry = &step_file.messages[i];
+        for (step_file, entry) in todo.into_iter().take(MAX_PROBES_PER_SCAN) {
             let name = entry.param.clone();
             if let Err(e) = self.fetch_grid_by_entry(&step_file.grib_url, entry, &name) {
                 tracing::debug!(
@@ -660,10 +654,9 @@ impl GribEngine {
     /// record that users typically never query. Instead, the length is
     /// resolved lazily on the first actual fetch of the tail message.
     fn parse_and_resolve(
-        &self,
         format: index::IndexFormat,
         content: &str,
-        _grib_url: &str,
+        grib_url: &str,
     ) -> Option<index::IndexResult> {
         match format {
             index::IndexFormat::EcmwfJson => index::parse_ecmwf_json(content),
@@ -674,6 +667,16 @@ impl GribEngine {
                 // derive the nominal step from the first message (all
                 // messages in the same file share it after aggregate filter).
                 let nominal_step = parsed.messages.first()?.nominal_step;
+                if parsed
+                    .messages
+                    .iter()
+                    .any(|m| m.nominal_step != nominal_step)
+                {
+                    tracing::warn!(
+                        "wgrib2 index contains mixed valid times; refusing to mislabel aggregates"
+                    );
+                    return None;
+                }
 
                 // Convert ParsedMessage → MessageEntry directly. The tail
                 // record keeps `length = None` and is resolved lazily in
@@ -682,7 +685,8 @@ impl GribEngine {
                     .messages
                     .into_iter()
                     .map(|m| catalog::MessageEntry {
-                        param: m.short_name,
+                        param: m.step_kind.parameter_name(&m.short_name),
+                        step_kind: m.step_kind,
                         levtype: m.levtype.to_string(),
                         level: m.level,
                         offset: m.offset,
@@ -692,6 +696,18 @@ impl GribEngine {
 
                 if messages.is_empty() {
                     return None;
+                }
+
+                for (first, duplicate) in catalog::duplicate_message_keys(&messages) {
+                    tracing::warn!(
+                        source = grib_url,
+                        parameter = %first.param,
+                        level_type = %first.levtype,
+                        level = ?first.level,
+                        first_offset = first.offset,
+                        duplicate_offset = duplicate.offset,
+                        "ambiguous wgrib2 catalog key; queries select the first record; payload equivalence is unknown"
+                    );
                 }
 
                 Some(index::IndexResult {
@@ -732,7 +748,7 @@ impl GribEngine {
         // Check cache (keyed by url + offset — unique per message)
         if let Some(cache) = &self.grid_cache {
             if let Some(grid) = cache.get(grib_url, entry.offset) {
-                self.populate_metadata(param, &grid);
+                self.populate_metadata(param, &grid, entry.step_kind);
                 return Ok(grid);
             }
         }
@@ -742,7 +758,7 @@ impl GribEngine {
         let grid = reader::read_message(&self.store, &path, entry)?;
         let grid = Arc::new(grid);
 
-        self.populate_metadata(param, &grid);
+        self.populate_metadata(param, &grid, entry.step_kind);
 
         if let Some(cache) = &self.grid_cache {
             cache.insert(grib_url, entry.offset, grid.clone());
@@ -755,7 +771,12 @@ impl GribEngine {
     /// WMO triple *and* the Code Table 4.5 surface type carried by the
     /// message itself (not a hardcoded short-name table). No-op if the
     /// short name is already cached.
-    fn populate_metadata(&self, short_name: &str, grid: &DecodedGrid) {
+    fn populate_metadata(
+        &self,
+        short_name: &str,
+        grid: &DecodedGrid,
+        step_kind: wgrib2_index::StepKind,
+    ) {
         {
             let cache = self.param_meta.read().unwrap();
             if cache.contains_key(short_name) {
@@ -772,6 +793,7 @@ impl GribEngine {
                 display: units::default_display(info.source_unit),
                 first_surface_type: None,
                 first_surface_value: None,
+                window_qualifier: None,
             },
             None => {
                 tracing::debug!(
@@ -786,6 +808,7 @@ impl GribEngine {
         // otherwise-identical parameters at different levels (e.g. msl vs
         // sp, both under WMO triple (0, 3, 0) "Pressure") can be told apart
         // in the rendered label.
+        meta.window_qualifier = step_kind.qualifier();
         meta.first_surface_type = Some(grid.first_surface_type);
         meta.first_surface_value = grid.first_surface_value;
 
@@ -1041,15 +1064,14 @@ impl EdrEngine for GribEngine {
         }
 
         // Determine which parameters to query
-        let first_step = &steps_to_query[0].1;
         let query_params: Vec<String> = match parameters {
             Some(p) => p.to_vec(),
             None => {
                 // Default to near-surface parameters only (surface + 2m/10m/etc.)
                 let mut seen = std::collections::HashSet::new();
-                first_step
-                    .messages
+                steps_to_query
                     .iter()
+                    .flat_map(|(_, sf)| &sf.messages)
                     .filter(|m| m.is_near_surface())
                     .filter(|m| seen.insert(m.param.clone()))
                     .map(|m| m.param.clone())
@@ -1145,16 +1167,10 @@ impl EdrEngine for GribEngine {
         // Default to first near-surface parameter
         let query_params: Vec<&str> = match parameters {
             Some(p) => p.iter().map(|s| s.as_str()).collect(),
-            None => {
-                let surface: Vec<_> = step_file
-                    .messages
-                    .iter()
-                    .filter(|m| m.is_near_surface())
-                    .map(|m| m.param.as_str())
-                    .take(1)
-                    .collect();
-                surface
-            }
+            None => step_file
+                .default_message()
+                .map(|m| vec![m.param.as_str()])
+                .unwrap_or_default(),
         };
 
         if query_params.is_empty() {
@@ -1301,9 +1317,7 @@ impl MapEngine for GribEngine {
         let param_name = parameter.unwrap_or_else(|| {
             // Default to first near-surface parameter
             step_file
-                .messages
-                .iter()
-                .find(|m| m.is_near_surface())
+                .default_message()
                 .map(|m| m.param.as_str())
                 .unwrap_or("2t")
         });
@@ -1389,9 +1403,11 @@ impl MapEngine for GribEngine {
             })
             .collect();
 
-        let default_param = params
-            .first()
-            .map(|(name, _)| name.clone())
+        let default_param = catalog
+            .latest_run()
+            .and_then(|run| run.steps.values().next_back())
+            .and_then(StepFile::default_message)
+            .map(|m| m.param.clone())
             .unwrap_or_else(|| "2t".to_string());
 
         let default_unit = self
@@ -1560,6 +1576,194 @@ fn settle_completed_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_gfs_index_converts_to_qualified_catalog_and_rejects_mixed_end_times() {
+        let fixture = include_str!("../../../testdata/gfs/gfs.t00z.pgrb2.0p25.f006.idx");
+        let parsed =
+            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, fixture, "fixture").unwrap();
+        assert_eq!(parsed.step, 6);
+        assert!(parsed.messages.iter().any(|m| m.param == "APCP_acc_6h"));
+        assert!(parsed.messages.iter().any(|m| m.param == "DSWRF_avg_6h"));
+        let duplicates: Vec<_> = catalog::duplicate_message_keys(&parsed.messages).collect();
+        let (first, duplicate) = duplicates
+            .iter()
+            .find(|(first, _)| first.param == "APCP_acc_6h")
+            .unwrap();
+        assert_eq!((first.offset, duplicate.offset), (426827357, 427200871));
+        assert_eq!(first.length, Some(373514));
+        assert_eq!(duplicate.length, Some(373514));
+        let step = StepFile {
+            grib_url: "fixture".into(),
+            messages: parsed.messages.clone(),
+        };
+        assert_eq!(
+            step.find_message("APCP_acc_6h", None).unwrap().offset,
+            426827357
+        );
+        let mixed = fixture.replace("0-6 hour acc fcst", "0-12 hour acc fcst");
+        assert!(
+            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, &mixed, "fixture").is_none()
+        );
+    }
+
+    #[test]
+    fn aggregate_windows_coexist_and_reach_edr_and_maps() {
+        let cfg: GribConfig = serde_json::from_value(serde_json::json!({
+            "data_path": "../../testdata/grib-local", "index_format": "ecmwf-json",
+            "grid_cache_mb": 16
+        }))
+        .unwrap();
+        let engine = GribEngine::new("aggregate-test", &cfg).unwrap();
+        let index = "1:0:d=2026040800:APCP:surface:6 hour fcst:\n2:100:d=2026040800:APCP:surface:0-6 hour acc fcst:\n3:200:d=2026040800:APCP:surface:3-6 hour acc fcst:\n4:300:d=2026040800:DSWRF:surface:0-6 hour ave fcst:\n";
+        let parsed =
+            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, index, "synthetic").unwrap();
+        assert_eq!(catalog::duplicate_message_keys(&parsed.messages).count(), 0);
+        let rt = parsed.reference_time;
+        let mut sf = StepFile {
+            grib_url: "synthetic".into(),
+            messages: parsed.messages,
+        };
+        for (i, entry) in sf.messages.iter().enumerate() {
+            // Decoded-grid injection isolates catalog/statistic selection from
+            // binary packing. The committed GFS index separately covers real
+            // APCP/DSWRF descriptors; source units still come from WMO triples.
+            engine.grid_cache.as_ref().unwrap().insert(
+                "synthetic",
+                entry.offset,
+                Arc::new(DecodedGrid {
+                    ni: 2,
+                    nj: 2,
+                    lon_first: 0.0,
+                    lat_first: 1.0,
+                    lon_inc: 1.0,
+                    lat_inc: -1.0,
+                    values: Arc::new(vec![(i + 1) as f64 * 10.0; 4]),
+                    triple: if i == 3 { (0, 4, 7) } else { (0, 1, 8) },
+                    centre: 7,
+                    first_surface_type: 1,
+                    first_surface_value: None,
+                }),
+            );
+        }
+        sf.messages.rotate_left(1); // aggregate records precede the instant in the index
+        let empty_analysis = StepFile {
+            grib_url: "analysis".into(),
+            messages: vec![],
+        };
+        let mut catalog = Catalog::new();
+        catalog.runs.insert(
+            rt,
+            ForecastRun {
+                reference_time: rt,
+                steps: [(0, empty_analysis), (6, sf)].into_iter().collect(),
+            },
+        );
+        catalog.refresh_parameters();
+        engine.catalog.store(Arc::new(catalog));
+        let params = engine.get_parameters();
+        assert!(
+            params.contains(&"APCP_acc_6h".to_owned()),
+            "aggregate absent from f000 must be advertised"
+        );
+        assert!(params.contains(&"APCP_acc_3h".to_owned()));
+        let CoverageResponse::Single(response) = engine
+            .query_position("POINT(0.5 0.5)", None, None, None, None)
+            .unwrap()
+        else {
+            panic!("expected point series")
+        };
+        assert_eq!(
+            response.ranges["APCP_acc_6h"].values,
+            vec![None, Some(20.0)]
+        );
+        assert_eq!(
+            response.ranges["APCP_acc_3h"].values,
+            vec![None, Some(30.0)]
+        );
+        assert_eq!(response.ranges["APCP"].values, vec![None, Some(10.0)]);
+        assert_eq!(
+            response.ranges["DSWRF_avg_6h"].values,
+            vec![None, Some(40.0)],
+            "averages are not divided by duration"
+        );
+        assert!(response.parameters["APCP_acc_6h"]
+            .label
+            .contains("6 h accumulation"));
+        assert!(response.parameters["DSWRF_avg_6h"]
+            .label
+            .contains("6 h average"));
+        let tile = engine
+            .get_raster_tile(
+                [0.0, 0.0, 1.0, 1.0],
+                2,
+                2,
+                Some(rt + chrono::Duration::hours(6)),
+                &OutputCrs::Wgs84,
+                Some("APCP_acc_3h"),
+                None,
+                Some(rt),
+            )
+            .unwrap();
+        assert_eq!(engine.raster_info().parameter, "APCP");
+        let default = engine
+            .get_raster_tile(
+                [0.0, 0.0, 1.0, 1.0],
+                2,
+                2,
+                Some(rt + chrono::Duration::hours(6)),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                Some(rt),
+            )
+            .unwrap();
+        assert_eq!(
+            default.values.value_at(0),
+            Some(10.0),
+            "default remains instant despite index ordering"
+        );
+        let CoverageResponse::Single(area) = engine
+            .query_area("0,0,1,1", None, None, None, Some(rt))
+            .unwrap()
+        else {
+            panic!("grid")
+        };
+        assert!(area.parameters.contains_key("APCP"));
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 2);
+        assert!((tile.values.value_at(0).unwrap() - 30.0).abs() < 1e-9);
+        let DomainDescription::PointSeries { t, .. } = response.domain else {
+            panic!("time axis")
+        };
+        assert_eq!(t, vec![rt, rt + chrono::Duration::hours(6)]);
+        let mut catalog = (*engine.catalog.load_full()).clone();
+        catalog
+            .runs
+            .get_mut(&rt)
+            .unwrap()
+            .steps
+            .get_mut(&6)
+            .unwrap()
+            .messages
+            .retain(|m| m.step_kind != wgrib2_index::StepKind::Instant);
+        catalog.refresh_parameters();
+        engine.catalog.store(Arc::new(catalog));
+        assert_eq!(engine.raster_info().parameter, "APCP_acc_6h");
+        let aggregate_only = engine
+            .get_raster_tile(
+                [0.0, 0.0, 1.0, 1.0],
+                2,
+                2,
+                Some(rt + chrono::Duration::hours(6)),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                Some(rt),
+            )
+            .unwrap();
+        assert_eq!(aggregate_only.values.value_at(0), Some(20.0));
+    }
 
     fn win<'a>(prefixes: &'a [&'a str]) -> HashSet<&'a str> {
         prefixes.iter().copied().collect()

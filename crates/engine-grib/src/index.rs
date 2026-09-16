@@ -92,6 +92,7 @@ pub fn parse_ecmwf_json(content: &str) -> Option<IndexResult> {
         let level = entry.levelist.and_then(|l| l.parse::<u32>().ok());
 
         messages.push(MessageEntry {
+            step_kind: crate::wgrib2_index::StepKind::Instant,
             param: entry.param,
             levtype: entry.levtype,
             level,
