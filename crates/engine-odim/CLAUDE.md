@@ -75,6 +75,13 @@ around `ds-storage` calls (Critical Rules 6–7).
   `PixelCache::contains` skips already-resident moments); bounded by the
   pixel-cache byte LRU (`MC_PVOL_PIXEL_CACHE_MB`). `0` disables; default `1`
   warms the base tilt (the standard reflectivity animation view).
+- **Cold pixel batches (#293):** a request-time miss fetches and opens the
+  source-qualified file once, decoding the requested moment first and then
+  uncached siblings (same quantity first). Speculation is capped at a quarter
+  of the pixel-cache capacity, using a conservative four bytes/sample. The
+  visitor inserts one array at a time; no raw-file cache is retained. Per-file
+  locks coalesce concurrent misses and callers recheck caches under the lock.
+  Optional corrupt siblings never fail the requested moment.
 - Undetect vs nodata: `RawPixels::sample_class` (`src/reader.rs`)
   distinguishes `Value`/`Undetect`/`Masked` — clear air (`undetect`) is a
   measurement, the cone of silence (`nodata`) is not. `voxel_grid_from_volume`
