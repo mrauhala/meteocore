@@ -125,7 +125,7 @@ impl Catalog {
     pub fn empty(parameter: &str, as_of: DateTime<Utc>) -> Self {
         Catalog {
             records: Vec::new(),
-            filterables: Default::default(),
+            filterables: Arc::new(["awareness_type_code".to_string()].into_iter().collect()),
             id_index: HashMap::new(),
             tree: RTree::new(),
             spatial_extent: None,
@@ -261,8 +261,11 @@ impl Catalog {
         let temporal_extent = compute_temporal_extent(&records, as_of);
         let info = Arc::new(base_raster_info(parameter, spatial_extent, times));
 
-        let filterables =
+        let mut filterables =
             ds_core::feature::property_names(records.iter().map(|r| r.properties.as_ref()));
+        // A derived, known property stays queryable even when no current
+        // alerts have a valid code (or the collection is empty).
+        Arc::make_mut(&mut filterables).insert("awareness_type_code".into());
         Catalog {
             filterables,
             records,
@@ -618,10 +621,28 @@ fn build_properties(
         );
     }
 
+    // Keep producer text verbatim, and expose its numeric awareness identifier
+    // separately so label capitalization/localization cannot change selection.
+    let codes: Vec<_> = info
+        .parameters
+        .iter()
+        .filter(|(name, _)| name == "awareness_type")
+        .filter_map(|(_, value)| awareness_type_code(value))
+        .map(PropertyValue::Integer)
+        .collect();
+    if !codes.is_empty() {
+        let value = if codes.len() == 1 {
+            codes.into_iter().next().unwrap()
+        } else {
+            PropertyValue::List(codes)
+        };
+        p.insert("awareness_type_code".into(), value);
+    }
+
     // Producer-defined valueName/value pairs (CAP §3.2.2). `<parameter>`s
     // are exposed under their own valueName — MeteoAlarm clients expect
     // `awareness_level` / `awareness_type` as plain top-level properties, and
-    // the MVT tag encoder and any future `<property>=value` filter are flat
+    // the MVT tag encoder and `<property>=value` filters are flat
     // too. `<eventCode>`s are namespaced (`eventCode:<valueName>`) because
     // their names are terse system ids (`OET`, `SAME`). A name that repeats
     // (MeteoAlarm's `impacts`) becomes a List in document order; a parameter
@@ -631,7 +652,7 @@ fn build_properties(
         p.insert(key, value);
     }
     for (key, value) in group_pairs(&info.parameters, |n| n.to_string()) {
-        let key = if p.contains_key(&key) {
+        let key = if p.contains_key(&key) || key == "awareness_type_code" {
             format!("parameter:{key}")
         } else {
             key
@@ -639,6 +660,19 @@ fn build_properties(
         p.insert(key, value);
     }
     p
+}
+
+/// MeteoAlarm's `code; label` convention. Only derive a code from an
+/// unambiguous positive integer prefix and a nonempty label; leave malformed
+/// producer values untouched without inventing a numeric value. Do not infer
+/// the code from the label or freeze the set of codes to a particular edition.
+fn awareness_type_code(value: &str) -> Option<i64> {
+    let (code, label) = value.split_once(';')?;
+    let code = code.trim();
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) || label.trim().is_empty() {
+        return None;
+    }
+    code.parse::<i64>().ok().filter(|&n| n > 0)
 }
 
 /// Group `(valueName, value)` pairs by name (first-seen order): one value
@@ -930,6 +964,60 @@ mod tests {
         <onset>2026-06-15T10:00:00Z</onset><expires>2026-06-15T16:00:00Z</expires>
         <area><areaDesc>County</areaDesc><polygon>60,24 60,25 61,25 61,24 60,24</polygon></area>
       </info></alert>"#;
+
+    #[test]
+    fn awareness_code_derivation_preserves_text_lists_and_producer_collisions() {
+        let mut alerts = parse_document(DOC).unwrap();
+        alerts[0].infos[0].parameters = vec![
+            ("awareness_type".into(), "3; Thunderstorm".into()),
+            ("awareness_type".into(), " 12 ; flooding".into()),
+            ("awareness_type".into(), "not-a-code; Wind".into()),
+            ("awareness_type_code".into(), "99".into()),
+        ];
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        let properties = &cat.records[0].properties;
+        assert_eq!(
+            properties["awareness_type_code"],
+            PropertyValue::List(vec![PropertyValue::Integer(3), PropertyValue::Integer(12)])
+        );
+        assert_eq!(
+            properties["parameter:awareness_type_code"],
+            PropertyValue::String("99".into())
+        );
+        assert_eq!(
+            properties["awareness_type"],
+            PropertyValue::List(vec![
+                PropertyValue::String("3; Thunderstorm".into()),
+                PropertyValue::String(" 12 ; flooding".into()),
+                PropertyValue::String("not-a-code; Wind".into())
+            ])
+        );
+        for value in [
+            "3",
+            "3;",
+            "3;  ",
+            "-3; label",
+            "+3; label",
+            "0; label",
+            "3.0; label",
+            "٣; label",
+            "999999999999999999999999; label",
+        ] {
+            assert_eq!(awareness_type_code(value), None, "{value}");
+        }
+        alerts[0].infos[0].parameters = vec![
+            ("awareness_type".into(), "malformed".into()),
+            ("awareness_type_code".into(), "3".into()),
+        ];
+        let empty = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        assert!(!empty.records[0]
+            .properties
+            .contains_key("awareness_type_code"));
+        assert_eq!(
+            empty.records[0].properties["parameter:awareness_type_code"],
+            PropertyValue::String("3".into())
+        );
+    }
 
     #[test]
     fn builds_record_with_swapped_geometry() {

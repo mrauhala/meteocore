@@ -68,15 +68,19 @@ tiles render the selected instant. Not part of this crate.
 | `crs`, `bbox-crs` (on `/items`) | ✗ | 400; CRS84 only |
 | `filter`, `filter-lang`, `filter-crs` | ✗ | 400 (CQL2 is not implemented) |
 | `properties` | ✗ | 400; every property is always returned |
-| `<property>=value` (Part 1 §7.15.5–6 optional property filters) | ✓ | validated against `FeatureEngine::filterables`; unknown names → 400 listing valid ones; exact strings, list membership, canonical numbers/bools; ANDed before counting/sorting/paging |
+| `<property>=value` (Part 1 §7.15.5–6 optional property filters) | ✓ | validated against `FeatureEngine::filterables`; unknown names → 400 listing valid ones; exact strings, list membership, canonical numbers/bools; numeric comma-separated alternatives; predicates ANDed before counting/sorting/paging |
 
 Property filter names are case-sensitive. Values are exact (no wildcards,
-substring search or numeric coercion); integers/floats use Rust's shortest
+substring search or numeric coercion). Numeric properties additionally accept
+comma-separated alternatives: `size=10,30` means 10 OR 30, with no spaces.
+Commas remain literal in string properties; this is not generic text OR or CQL2.
+Integers/floats use Rust's shortest
 `Display` string (`12`, `1.5`), booleans `true`/`false`; missing, null and
 non-finite values never match. Multiple predicates, including repeated names,
 are ANDed with each other and with `bbox`/`datetime`. For a list, each predicate
 can match a different element. Empty strings remain valid literal values.
-Names and values are URL-encoded in every `self`/`next`/`prev` link.
+Names and values are URL-encoded in every `self`/`next`/`prev` link, including
+numeric alternative lists.
 
 `/features/api` lists the accepted property parameters per collection from
 cached engine catalogs. CAP, GeoJSON and PostGIS advertise names present in
@@ -89,6 +93,22 @@ cannot be used as property filters. Duplicate control parameters return 400.
 This does not declare Part 3 conformance or add `/queryables`.
 
 Example: `/features/collections/cap-meteoalarm-wis2/items?awareness_type=1%3B%20Wind&severity=Severe`.
+
+CAP also exposes `awareness_type_code`, derived from the positive integer
+prefix of MeteoAlarm's `code; label` convention. Original `awareness_type`
+values remain unchanged. Repeated awareness types produce a list of numeric
+codes; malformed values contribute no code. A producer parameter named
+`awareness_type_code` is preserved as `parameter:awareness_type_code`.
+The derived code remains queryable when the collection has no valid codes or
+no alerts, returning no matches rather than an unknown-property error.
+
+One request selects three types across label capitalization variants:
+`/features/collections/cap-meteoalarm-wis2/items?awareness_type_code=1,3,5`.
+A single code is `?awareness_type_code=3`; add `&severity=Severe` for an AND
+condition. This remains exact numeric equality, not a text prefix match.
+The code convention is defined in the
+[MeteoAlarm CAP profile](https://gitlab.com/meteoalarm-pm-group/documents/-/raw/master/MeteoAlarm_CAP_Profile_v2.0.pdf), §2.2.17.
+
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304
 (#499). Both feature routes send `Vary: Accept`, explicit-format pagination and alternate

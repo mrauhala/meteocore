@@ -206,13 +206,21 @@ memory. Things that differ from the pull sources:
   MeteoAlarm's `awareness_level` (`"2; yellow; Moderate"`) and
   `awareness_type` (`"1; Wind"`) therefore appear exactly as clients of the
   MeteoAlarm feeds expect them, and the flat shape is what the MVT tag
-  encoder and a future `<property>=value` filter need. A repeated name
+  encoder and `<property>=value` filters need. A repeated name
   (MeteoAlarm's `impacts`, one per bullet) becomes a List in document
   order. A name colliding with a standard CAP property is namespaced
   `parameter:<valueName>` instead of shadowing it. `<eventCode>`s (terse
   system ids: MeteoAlarm `OET` event terms, NWS `SAME`) are always
   namespaced `eventCode:<valueName>`. Values are passed through verbatim —
-  no MeteoAlarm-specific decoding of the `code; colour; label` convention.
+  the original fields are never normalized. An additional `awareness_type_code`
+  property extracts a positive integer prefix from each `awareness_type`
+  `code; label` value (nonempty label required); repeated values produce an
+  integer list, malformed values add no code. It never infers codes from labels
+  or changes their capitalization. Reserve the derived name: a producer's own
+  `awareness_type_code` goes under `parameter:awareness_type_code` even when
+  no valid derived code exists. Filtering `awareness_type_code=1,3,5` uses the
+  shared matcher's numeric alternatives; original text filters stay exact.
+  The derived field stays in `filterables` even for an empty catalog.
 
 ## Time semantics
 
