@@ -484,7 +484,8 @@ impl GribEngine {
 
             // Parse according to format. For wgrib2 this also resolves the
             // last-record length via a HEAD request on the data file.
-            let Some(parsed) = self.parse_and_resolve(self.index_format, content, &grib_url) else {
+            let Some(parsed) = Self::parse_and_resolve(self.index_format, content, &grib_url)
+            else {
                 continue;
             };
 
@@ -653,7 +654,6 @@ impl GribEngine {
     /// record that users typically never query. Instead, the length is
     /// resolved lazily on the first actual fetch of the tail message.
     fn parse_and_resolve(
-        &self,
         format: index::IndexFormat,
         content: &str,
         _grib_url: &str,
@@ -1155,16 +1155,10 @@ impl EdrEngine for GribEngine {
         // Default to first near-surface parameter
         let query_params: Vec<&str> = match parameters {
             Some(p) => p.iter().map(|s| s.as_str()).collect(),
-            None => {
-                let surface: Vec<_> = step_file
-                    .messages
-                    .iter()
-                    .filter(|m| m.is_near_surface())
-                    .map(|m| m.param.as_str())
-                    .take(1)
-                    .collect();
-                surface
-            }
+            None => step_file
+                .default_message()
+                .map(|m| vec![m.param.as_str()])
+                .unwrap_or_default(),
         };
 
         if query_params.is_empty() {
@@ -1311,9 +1305,7 @@ impl MapEngine for GribEngine {
         let param_name = parameter.unwrap_or_else(|| {
             // Default to first near-surface parameter
             step_file
-                .messages
-                .iter()
-                .find(|m| m.is_near_surface())
+                .default_message()
                 .map(|m| m.param.as_str())
                 .unwrap_or("2t")
         });
@@ -1399,9 +1391,11 @@ impl MapEngine for GribEngine {
             })
             .collect();
 
-        let default_param = params
-            .first()
-            .map(|(name, _)| name.clone())
+        let default_param = catalog
+            .latest_run()
+            .and_then(|run| run.steps.values().next_back())
+            .and_then(StepFile::default_message)
+            .map(|m| m.param.clone())
             .unwrap_or_else(|| "2t".to_string());
 
         let default_unit = self
@@ -1572,6 +1566,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn real_gfs_index_converts_to_qualified_catalog_and_rejects_mixed_end_times() {
+        let fixture = include_str!("../../../testdata/gfs/gfs.t00z.pgrb2.0p25.f006.idx");
+        let parsed =
+            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, fixture, "fixture").unwrap();
+        assert_eq!(parsed.step, 6);
+        assert!(parsed.messages.iter().any(|m| m.param == "APCP_acc_6h"));
+        assert!(parsed.messages.iter().any(|m| m.param == "DSWRF_avg_6h"));
+        let mixed = fixture.replace("0-6 hour acc fcst", "0-12 hour acc fcst");
+        assert!(
+            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, &mixed, "fixture").is_none()
+        );
+    }
+
+    #[test]
     fn aggregate_windows_coexist_and_reach_edr_and_maps() {
         let cfg: GribConfig = serde_json::from_value(serde_json::json!({
             "data_path": "../../testdata/grib-local", "index_format": "ecmwf-json",
@@ -1580,11 +1588,10 @@ mod tests {
         .unwrap();
         let engine = GribEngine::new("aggregate-test", &cfg).unwrap();
         let index = "1:0:d=2026040800:APCP:surface:6 hour fcst:\n2:100:d=2026040800:APCP:surface:0-6 hour acc fcst:\n3:200:d=2026040800:APCP:surface:3-6 hour acc fcst:\n4:300:d=2026040800:DSWRF:surface:0-6 hour ave fcst:\n";
-        let parsed = engine
-            .parse_and_resolve(index::IndexFormat::Wgrib2, index, "synthetic")
-            .unwrap();
+        let parsed =
+            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, index, "synthetic").unwrap();
         let rt = parsed.reference_time;
-        let sf = StepFile {
+        let mut sf = StepFile {
             grib_url: "synthetic".into(),
             messages: parsed.messages,
         };
@@ -1610,6 +1617,7 @@ mod tests {
                 }),
             );
         }
+        sf.messages.rotate_left(1); // aggregate records precede the instant in the index
         let empty_analysis = StepFile {
             grib_url: "analysis".into(),
             messages: vec![],
@@ -1668,6 +1676,31 @@ mod tests {
                 Some(rt),
             )
             .unwrap();
+        assert_eq!(engine.raster_info().parameter, "APCP");
+        let default = engine
+            .get_raster_tile(
+                [0.0, 0.0, 1.0, 1.0],
+                2,
+                2,
+                Some(rt + chrono::Duration::hours(6)),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                Some(rt),
+            )
+            .unwrap();
+        assert_eq!(
+            default.values.value_at(0),
+            Some(10.0),
+            "default remains instant despite index ordering"
+        );
+        let CoverageResponse::Single(area) = engine
+            .query_area("0,0,1,1", None, None, None, Some(rt))
+            .unwrap()
+        else {
+            panic!("grid")
+        };
+        assert!(area.parameters.contains_key("APCP"));
         assert_eq!(tile.width, 2);
         assert_eq!(tile.height, 2);
         assert!((tile.values.value_at(0).unwrap() - 30.0).abs() < 1e-9);
@@ -1675,6 +1708,32 @@ mod tests {
             panic!("time axis")
         };
         assert_eq!(t, vec![rt, rt + chrono::Duration::hours(6)]);
+        let mut catalog = (*engine.catalog.load_full()).clone();
+        catalog
+            .runs
+            .get_mut(&rt)
+            .unwrap()
+            .steps
+            .get_mut(&6)
+            .unwrap()
+            .messages
+            .retain(|m| m.step_kind != wgrib2_index::StepKind::Instant);
+        catalog.refresh_parameters();
+        engine.catalog.store(Arc::new(catalog));
+        assert_eq!(engine.raster_info().parameter, "APCP_acc_6h");
+        let aggregate_only = engine
+            .get_raster_tile(
+                [0.0, 0.0, 1.0, 1.0],
+                2,
+                2,
+                Some(rt + chrono::Duration::hours(6)),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                Some(rt),
+            )
+            .unwrap();
+        assert_eq!(aggregate_only.values.value_at(0), Some(20.0));
     }
 
     fn win<'a>(prefixes: &'a [&'a str]) -> HashSet<&'a str> {

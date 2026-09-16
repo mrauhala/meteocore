@@ -117,3 +117,7 @@ advertised qualified keys. Missing windows at a step are null. Values use the
 source WMO unit and existing display conversion (precipitation kg/m² → mm);
 there is no implicit division by duration or conversion of energy into flux.
 ECMWF JSON naming remains unchanged.
+
+An area query without `parameter-name` prefers the existing near-surface
+instant/max/min products before newly supported acc/ave records. If only
+aggregates are configured, the first available aggregate is the default.

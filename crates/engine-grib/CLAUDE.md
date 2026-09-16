@@ -71,3 +71,9 @@ implements the shared `ds_core::instances` contract (see root CLAUDE.md).
 - Strongly advise a `parameters` filter with `index_format = "wgrib2"` — a
   single GFS 0.25° file has ~700 messages.
 - CCSDS/AEC compression needs the `libaec` C library (via `libaec-sys`).
+
+Default Maps/area parameter selection preserves the first previously supported
+near-surface product before considering acc/ave records, regardless of index
+ordering. Aggregate-only collections fall back to their first aggregate;
+upper-air-only collections to their first message. Raster metadata and actual
+rendering share `StepFile::default_message` so default labels/units agree.

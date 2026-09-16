@@ -81,6 +81,24 @@ pub struct StepFile {
 }
 
 impl StepFile {
+    /// Preserve the existing surface default when newly supported acc/ave
+    /// records precede it in an index. An aggregate-only collection still
+    /// has a useful default, as does a collection containing only upper air.
+    pub fn default_message(&self) -> Option<&MessageEntry> {
+        self.messages
+            .iter()
+            .find(|m| {
+                m.is_near_surface()
+                    && !matches!(
+                        m.step_kind,
+                        crate::wgrib2_index::StepKind::Accumulation { .. }
+                            | crate::wgrib2_index::StepKind::Average { .. }
+                    )
+            })
+            .or_else(|| self.messages.iter().find(|m| m.is_near_surface()))
+            .or_else(|| self.messages.first())
+    }
+
     /// Find a message by parameter short name and optional level.
     /// For surface parameters, level should be None.
     pub fn find_message(&self, param: &str, level: Option<u32>) -> Option<&MessageEntry> {
