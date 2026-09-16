@@ -200,8 +200,8 @@ impl ObsStore {
 mod tests {
     use super::*;
     use crate::decode::Element;
+    use crate::decode::XY;
     use chrono::TimeZone;
-    use tinybufr::XY;
 
     fn t(h: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 12, h, 0, 0).unwrap()

@@ -1,6 +1,6 @@
-//! BUFR → station reports. The **only** module that touches `tinybufr`, so
+//! BUFR → station reports. The **only** module that touches `ds_bufr`, so
 //! the decoder can be vendored or replaced in one place if a real feed hits
-//! one of its gaps (compressed character strings, operators 203/204/207/22x).
+//! one of its gaps (operators 203/204/207/22x).
 //!
 //! Extraction is template-agnostic: it walks the decoded element stream and
 //! picks values by Table B descriptor, tracking the period context
@@ -14,7 +14,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
-use tinybufr::{DataEvent, DataReader, DataSpec, HeaderSections, TableBEntry, Tables, Value, XY};
+pub use ds_bufr::XY;
+use ds_bufr::{DataEvent, DataReader, DataSpec, HeaderSections, TableBEntry, Tables, Value};
 
 /// Table B id as `FXXYYY` digits (F is always 0 for elements).
 pub fn xy_from_code(code: &str) -> Option<XY> {
@@ -65,10 +66,10 @@ pub enum DecodeError {
     Unsupported(String),
 }
 
-impl From<tinybufr::Error> for DecodeError {
-    fn from(e: tinybufr::Error) -> Self {
+impl From<ds_bufr::Error> for DecodeError {
+    fn from(e: ds_bufr::Error) -> Self {
         match e {
-            tinybufr::Error::NotSupported(m) => DecodeError::Unsupported(m),
+            ds_bufr::Error::NotSupported(m) => DecodeError::Unsupported(m),
             other => DecodeError::Bufr(other.to_string()),
         }
     }
@@ -143,9 +144,22 @@ const LOCAL_TABLE_B: &[TableBEntry] = &[
     },
 ];
 
+// DWD local versions 2–8, verified against ecCodes' originating-centre 78 tables.
+const DWD_ACTUAL_HOUR: TableBEntry = TableBEntry {
+    xy: XY { x: 4, y: 214 },
+    class_name: "local (DWD)",
+    element_name: "ACTUAL HOUR OF OBSERVATION",
+    unit: "h",
+    scale: 0,
+    reference_value: 0,
+    bits: 5,
+};
+
 /// Holds the (expensive to build) WMO tables — construct once per engine.
 pub struct Decoder {
     tables: Arc<Tables>,
+    dwd_tables: Arc<Tables>,
+    dwd_legacy_tables: Arc<Tables>,
 }
 
 impl Default for Decoder {
@@ -173,12 +187,19 @@ struct Subset {
 
 impl Decoder {
     pub fn new() -> Self {
-        let mut tables = Tables::default();
+        let tables = Tables::default();
+        let mut dwd_legacy = tables.clone();
+        dwd_legacy
+            .table_b
+            .insert(DWD_ACTUAL_HOUR.xy, &DWD_ACTUAL_HOUR);
+        let mut dwd = dwd_legacy.clone();
         for entry in LOCAL_TABLE_B {
-            tables.table_b.entry(entry.xy).or_insert(entry);
+            dwd.table_b.insert(entry.xy, entry);
         }
         Decoder {
             tables: Arc::new(tables),
+            dwd_tables: Arc::new(dwd),
+            dwd_legacy_tables: Arc::new(dwd_legacy),
         }
     }
 
@@ -218,7 +239,13 @@ impl Decoder {
     fn decode_message(&self, msg: &[u8], out: &mut Decoded) -> Result<(), DecodeError> {
         let mut reader = Cursor::new(msg);
         let header = HeaderSections::read(&mut reader)?;
-        let spec = DataSpec::from_data_description(&header.data_description_section, &self.tables)?;
+        let id = &header.identification_section;
+        let tables = match (id.centre, id.local_tables_version) {
+            (78, 8) => &self.dwd_tables,
+            (78, 2..=7) => &self.dwd_legacy_tables,
+            _ => &self.tables,
+        };
+        let spec = DataSpec::from_data_description(&header.data_description_section, tables)?;
         let n_subsets = spec.number_of_subsets as usize;
         let mut dr = DataReader::new(&mut reader, &spec)?;
 

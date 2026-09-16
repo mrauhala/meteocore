@@ -1157,6 +1157,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
+            coverage_bbox: None,
             columns: vec![],
             tables: vec![PostgisObservationTable {
                 parameter: "t2m".into(),
@@ -1451,6 +1452,7 @@ mod tests {
     /// builder's behaviour with and without them is both testable.
     fn lightning_shape_with(cloud: Option<&str>, current: Option<&str>) -> EventsShape {
         EventsShape {
+            coverage_bbox: None,
             cloud_indicator_col: cloud.map(str::to_string),
             peak_current_col: current.map(str::to_string),
             table: QualifiedTable {

@@ -33,7 +33,7 @@ Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
 | Query type | Route | Status | Notes |
 |---|---|---|---|
 | `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list + CoverageJSON/PNG series per location |
-| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; fan-out unbounded, #585) |
+| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined; all coordinates finite and within CRS84 bounds) |
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667) |
 | `trajectory` | `/collections/{id}/trajectory` | partial | 2-D `LINESTRING` only, meaning a *vertical cross-section* (PVOL sites). `LINESTRINGZ/M` (per-node z/time) not accepted; no along-path sampling on gridded engines |
@@ -64,6 +64,14 @@ Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
 | `limit` | ✓ | `/collections` and `/locations` pagination only |
+
+Data queries execute on a dedicated, bounded runtime, including radius and
+instance routes. Admission is capped at 2–8 concurrent queries (available CPUs,
+clamped), with room for 32 additional admitted requests waiting for a slot;
+further requests receive 503 immediately. A 30-second deadline (including queue time) returns
+504. Synchronous work already in progress retains its slot until it finishes;
+a cancelled/timed-out MULTIPOINT stops before its next engine call. This bounds
+concurrency without claiming that synchronous engine I/O is preemptible.
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499).
 
@@ -107,3 +115,31 @@ Related issues: #585 MULTIPOINT fan-out bound · #510 `f` aliases · #667
 antimeridian bboxes · #668 400-vs-404 on unsupported query types · #666
 shared parameter-name validation · #665 GRIB value rounding · #523 nowcast
 reflectivity via EDR · #673 shared area budget.
+
+GeoTIFF cold source decodes share a byte budget across APIs; exhausted decode
+admission returns HTTP 503 without a partial CoverageJSON result.
+
+GRIB wgrib2 accumulation and average fields use duration-qualified parameter
+names, for example `APCP_acc_6h`, `APCP_acc_3h` and `DSWRF_avg_6h`. The time axis
+is the **window end**, with the duration in the parameter label/name; the start
+is that valid time minus the duration. A source parameter filter such as
+`parameters = ["APCP"]` includes its available windows; clients query the
+advertised qualified keys. Missing windows at a step are null. Values use the
+source WMO unit and existing display conversion (precipitation kg/m² → mm);
+there is no implicit division by duration or conversion of energy into flux.
+ECMWF JSON naming remains unchanged.
+
+If a wgrib2 index repeats the same parameter/level/window at different offsets,
+the scan warns and queries select the first record. Duration-qualified names
+separate different windows; they cannot recover product distinctions omitted
+from the source sidecar, or prove that repeated records contain identical data.
+
+An area query without `parameter-name` prefers the existing near-surface
+instant/max/min products before newly supported acc/ave records. If only
+aggregates are configured, the first available aggregate is the default.
+
+BUFR decoding supports compressed character fields, operator 208, and numeric
+fields through 64 bits. Unsupported operators or unknown national descriptors
+skip the affected message (counted in `bufr_decode_failures_total`); other
+messages in the same file remain available. See
+[`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).

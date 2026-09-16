@@ -252,6 +252,7 @@ pub struct CellFactSheet {
     /// Measured intensity tendency, dBZ per minute.
     pub intensity_trend_dbz_min: Option<f64>,
     pub lightning: Option<LightningFacts>,
+    pub lightning_coverage: Option<bool>,
     pub volume: Option<VolumeFacts>,
     pub impact: Option<ImpactFacts>,
     /// Nearest-radar beam geometry (#642). `None` when no radar source is
@@ -535,6 +536,7 @@ mod tests {
             trend: None,
             intensity_trend_dbz_min: None,
             lightning: None,
+            lightning_coverage: None,
             volume: None,
             impact: None,
             environment: Vec::new(),

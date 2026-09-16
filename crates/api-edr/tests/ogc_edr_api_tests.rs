@@ -1668,3 +1668,113 @@ mod metadata_extras {
             .all(|l| l["rel"] != "license"));
     }
 }
+
+mod request_budget {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingEngine {
+        calls: Arc<AtomicUsize>,
+        values_per_point: usize,
+    }
+    impl EdrEngine for CountingEngine {
+        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            MockEngine.get_locations()
+        }
+        fn get_parameters(&self) -> Vec<String> {
+            MockEngine.get_parameters()
+        }
+        fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+            MockEngine.get_temporal_extent()
+        }
+        fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+            MockEngine.get_spatial_extent()
+        }
+        fn supported_query_types(&self) -> Vec<String> {
+            vec!["position".into()]
+        }
+        fn query_location(
+            &self,
+            id: &str,
+            dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+            p: Option<&[String]>,
+            z: Option<&[f64]>,
+            rt: Option<DateTime<Utc>>,
+        ) -> Result<CoverageResponse, DataServerError> {
+            MockEngine.query_location(id, dt, p, z, rt)
+        }
+        fn query_position(
+            &self,
+            _coords: &str,
+            _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+            _p: Option<&[String]>,
+            _z: Option<&[f64]>,
+            _rt: Option<DateTime<Utc>>,
+        ) -> Result<CoverageResponse, DataServerError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut result = MockEngine::sample_query_result();
+            if self.values_per_point > 0 {
+                let range = result.ranges.get_mut("temperature").unwrap();
+                range.values = vec![None; self.values_per_point];
+                range.shape = vec![self.values_per_point];
+            }
+            Ok(CoverageResponse::Single(result))
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinate_limits_reject_before_any_engine_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = api_edr::router(make_edr_state(Arc::new(CountingEngine {
+            calls: calls.clone(),
+            values_per_point: 0,
+        })));
+        let max = api_edr::params::MAX_POSITION_POINTS;
+        let mut cases = vec![
+            format!("MULTIPOINT({})", vec!["1%202"; max + 1].join(",")),
+            format!(
+                "POINT(1%202){}",
+                "%20".repeat(api_edr::params::MAX_POSITION_COORD_BYTES)
+            ),
+            "POINT(NaN%202)".into(),
+            "POINT(1%20inf)".into(),
+            "POINT(181%202)".into(),
+            "POINT(1%20-91)".into(),
+            "MULTIPOINT(1%202,NaN%202)".into(),
+        ];
+        for coords in cases.drain(..) {
+            let request = Request::builder()
+                .uri(format!("/collections/weather/position?coords={coords}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+        let coords = format!("MULTIPOINT({})", vec!["1%202"; max].join(","));
+        let request = Request::builder()
+            .uri(format!("/collections/weather/position?coords={coords}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), max);
+    }
+
+    #[tokio::test]
+    async fn response_budget_stops_later_point_queries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = api_edr::router(make_edr_state(Arc::new(CountingEngine {
+            calls: calls.clone(),
+            values_per_point: api_edr::params::MAX_POSITION_VALUES / 2 + 1,
+        })));
+        let request = Request::builder()
+            .uri("/collections/weather/position?coords=MULTIPOINT(1%202,3%204,5%206)")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+}

@@ -592,12 +592,14 @@ fn resolve_temporal_extent(
         (e.get_temporal_extent(), e.get_available_times())
     });
 
-    let raster_times = maps
+    let raster_engine = maps
         .engines
         .get(id)
+        .or_else(|| tiles.map_engines.get(id))
+        .or_else(|| wms.engines.get(id));
+    let default_time = raster_engine.and_then(|e| e.default_time());
+    let raster_times = raster_engine
         .map(|e| e.raster_info().times)
-        .or_else(|| tiles.map_engines.get(id).map(|e| e.raster_info().times))
-        .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times))
         .filter(|t| !t.is_empty());
 
     // Pick the source that backs `values`, then derive `interval` from the
@@ -636,7 +638,7 @@ fn resolve_temporal_extent(
                 Ok(duration) => {
                     if let Some(latest) = vs.iter().max().copied() {
                         let cutoff = latest - duration;
-                        vs.retain(|t| *t >= cutoff);
+                        vs.retain(|t| *t >= cutoff || Some(*t) == default_time);
                         interval = vs.first().zip(vs.last()).map(|(a, b)| (*a, *b));
                     }
                 }
@@ -653,7 +655,11 @@ fn resolve_temporal_extent(
     }
 
     if interval.is_some() || values.is_some() {
-        return Some(serialize_temporal(interval, values.as_deref()));
+        let mut temporal = serialize_temporal(interval, values.as_deref());
+        if let Some(default) = default_time {
+            temporal["default"] = json!(default.to_rfc3339());
+        }
+        return Some(temporal);
     }
     None
 }
@@ -839,6 +845,7 @@ mod tests {
 
     /// Mock MapEngine that rebuilds RasterInfo on each call (it isn't `Clone`).
     struct RasterMock {
+        default_time: Option<DateTime<Utc>>,
         spatial_extent: Option<[f64; 4]>,
         times: Vec<DateTime<Utc>>,
         parameter: String,
@@ -853,6 +860,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 spatial_extent: None,
+                default_time: None,
                 times: Vec::new(),
                 parameter: "value".into(),
                 unit: String::new(),
@@ -862,6 +870,9 @@ mod tests {
     }
 
     impl MapEngine for RasterMock {
+        fn default_time(&self) -> Option<DateTime<Utc>> {
+            self.default_time
+        }
         #[allow(clippy::too_many_arguments)]
         fn get_raster_tile(
             &self,
@@ -994,6 +1005,8 @@ mod tests {
                 base_url: String::new(),
                 trust_proxy_headers: false,
             })),
+            accepted_load: RwLock::new(None),
+            recovery_shutdown: ds_poll::Shutdown::new(),
             config_path: String::new(),
             health: RwLock::new(Vec::new()),
             geotiff_engines: RwLock::new(Vec::new()),
@@ -1136,6 +1149,7 @@ mod tests {
         // regression that drops the base from the URL template.
         tiles.base_url = "https://api.example.com".into();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: Some([-180.0, -85.0, 180.0, 85.0]),
             times: vec![],
             parameter: "reflectivity".into(),
@@ -1224,6 +1238,7 @@ mod tests {
         tiles.base_url = "http://127.0.0.1:8000".into();
         tiles.trust_proxy_headers = true;
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: Some([-180.0, -85.0, 180.0, 85.0]),
             times: vec![],
             parameter: "reflectivity".into(),
@@ -1429,6 +1444,7 @@ mod tests {
 
         let mut wms = empty_wms();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
             times: leads.clone(),
             parameter: "reflectivity".into(),
@@ -1516,6 +1532,7 @@ mod tests {
 
         let mut tiles = empty_tiles();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
             times: times.clone(),
             parameter: "reflectivity".into(),
@@ -1559,6 +1576,7 @@ mod tests {
             "2024-01-01T01:00:00Z".parse::<DateTime<Utc>>().unwrap(),
         ];
         let engine: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
             times: times.clone(),
             parameter: "reflectivity".into(),
@@ -1617,6 +1635,36 @@ mod tests {
         assert!(c.get("tiles").is_none());
     }
 
+    #[test]
+    fn alert_default_survives_future_axis_and_preview_window() {
+        let now = "2026-09-16T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let future = now + chrono::Duration::days(2);
+        let mut wms = empty_wms();
+        wms.engines.insert(
+            "alerts".into(),
+            Arc::new(RasterMock {
+                default_time: Some(now),
+                times: vec![now, future],
+                ..RasterMock::default()
+            }),
+        );
+        let config = config_with_window("alerts", &["wms"], "PT1H");
+        let temporal = resolve_temporal_extent(
+            "alerts",
+            Some(&config),
+            &empty_edr(),
+            &empty_maps(),
+            &empty_tiles(),
+            &wms,
+        )
+        .unwrap();
+        assert_eq!(temporal["default"], now.to_rfc3339());
+        assert_eq!(
+            temporal["values"],
+            json!([now.to_rfc3339(), future.to_rfc3339()])
+        );
+    }
+
     // -----------------------------------------------------------------------
     // [collections.preview] tests
     // -----------------------------------------------------------------------
@@ -1642,6 +1690,7 @@ mod tests {
 
         let mut tiles = empty_tiles();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: Some([0.0, 0.0, 1.0, 1.0]),
             times: times.clone(),
             parameter: "reflectivity".into(),
@@ -1692,6 +1741,7 @@ mod tests {
 
         let mut tiles = empty_tiles();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: None,
             times: times.clone(),
             parameter: "reflectivity".into(),
@@ -1728,6 +1778,7 @@ mod tests {
 
         let mut tiles = empty_tiles();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             spatial_extent: None,
             times: times.clone(),
             parameter: "reflectivity".into(),
@@ -1827,6 +1878,7 @@ mod tests {
 
         let mut tiles = empty_tiles();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            default_time: None,
             parameter: "2t".into(),
             unit: "K".into(),
             // GRIB shape: raster exposes the same param set as EDR.

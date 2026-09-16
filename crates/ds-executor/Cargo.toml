@@ -1,0 +1,12 @@
+[package]
+name = "ds-executor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

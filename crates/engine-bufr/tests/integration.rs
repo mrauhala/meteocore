@@ -429,3 +429,98 @@ fn concatenated_file_keeps_the_good_messages_around_a_bad_one() {
             .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(after - before, 1);
 }
+
+fn decoder_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(fixtures().join("../bufr-decoder").join(name)).unwrap()
+}
+
+#[test]
+fn eccodes_compressed_strings_wide_numbers_and_missing_increments() {
+    let decoder = Decoder::new();
+    for constant in [false, true] {
+        let name = if constant {
+            "constant-string-missing-increment.bufr"
+        } else {
+            "compressed-strings-wide.bufr"
+        };
+        let decoded = decoder.decode(&decoder_fixture(name)).unwrap();
+        assert!(decoded.failed.is_empty(), "{:?}", decoded.failed);
+        assert!(decoded.skipped.is_empty());
+        assert_eq!(decoded.reports.len(), 3);
+        for (i, report) in decoded.reports.iter().enumerate() {
+            assert_eq!(report.station_id, format!("0-20000-0-01{}", 101 + i));
+            let expected_name = if constant {
+                "SAME STATION"
+            } else {
+                ["NORTH STATION", "SOUTH STATION", "EAST STATION"][i]
+            };
+            assert_eq!(report.name.as_deref(), Some(expected_name));
+            assert_eq!(
+                report.time,
+                Utc.with_ymd_and_hms(2026, 9, 16, 10, 0, 0).unwrap()
+            );
+            assert!((report.lat - (60.0 + i as f64)).abs() < 1e-8);
+            assert!((report.lon - (24.0 + i as f64)).abs() < 1e-8);
+            assert_eq!(
+                report.value(xy_from_code("010004").unwrap(), None),
+                Some(101300.0 + 10.0 * i as f64)
+            );
+            let temperature = report.value(xy_from_code("012101").unwrap(), None);
+            if constant && i == 1 {
+                assert_eq!(temperature, None);
+            } else {
+                assert!((temperature.unwrap() - (280.15 + i as f64)).abs() < 1e-8);
+            }
+        }
+    }
+}
+
+#[test]
+fn eccodes_short_character_field_and_value_above_u32() {
+    let decoded = Decoder::new()
+        .decode(&decoder_fixture("short-string-wide-number.bufr"))
+        .unwrap();
+    assert!(decoded.failed.is_empty(), "{:?}", decoded.failed);
+    assert_eq!(decoded.reports.len(), 1);
+    let report = &decoded.reports[0];
+    assert_eq!(report.station_id, "0-20000-0-01104");
+    assert_eq!(report.name.as_deref(), Some("ABC"));
+    assert!((report.lat - 63.0).abs() < 1e-8 && (report.lon - 27.0).abs() < 1e-8);
+    assert_eq!(
+        report.value(xy_from_code("010004").unwrap(), None),
+        Some(42949672960.0)
+    );
+    assert!((report.value(xy_from_code("012101").unwrap(), None).unwrap() - 283.15).abs() < 1e-8);
+}
+
+#[test]
+fn dwd_local_descriptors_are_scoped_to_centre_and_version() {
+    let decoder = Decoder::new();
+    let mut bytes = decoder_fixture("dwd-local-hour.bufr");
+    // Edition 4 section 1: centre at bytes 12–13, local-table version at 22.
+    assert_eq!(&bytes[12..14], &78u16.to_be_bytes());
+    assert_eq!(bytes[22], 8);
+    for version in 2..=8 {
+        bytes[22] = version;
+        let decoded = decoder.decode(&bytes).unwrap();
+        assert!(decoded.failed.is_empty(), "{:?}", decoded.failed);
+        assert_eq!(decoded.reports.len(), 1);
+        assert_eq!(
+            decoded.reports[0].value(xy_from_code("004214").unwrap(), None),
+            Some(10.0)
+        );
+        assert!(
+            (decoded.reports[0].lat - 63.0).abs() < 1e-8
+                && (decoded.reports[0].lon - 27.0).abs() < 1e-8
+        );
+    }
+    bytes[12..14].copy_from_slice(&98u16.to_be_bytes());
+    let decoded = decoder.decode(&bytes).unwrap();
+    assert_eq!(decoded.failed.len(), 1);
+    assert!(decoded.reports.is_empty());
+    bytes[12..14].copy_from_slice(&78u16.to_be_bytes());
+    bytes[22] = 1;
+    let decoded = decoder.decode(&bytes).unwrap();
+    assert_eq!(decoded.failed.len(), 1);
+    assert!(decoded.reports.is_empty());
+}

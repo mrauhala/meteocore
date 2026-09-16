@@ -38,10 +38,9 @@ as a property.
   `https://feed.evil.com`) or matches an explicit `feed_allowlist` URL
   prefix; others are dropped with a WARN. Stops a compromised feed pivoting
   the server to `http://169.254.169.254/…` or internal hosts.
-- Known limitation: the allowlist constrains request URLs, not redirect
-  responses (object_store's reqwest client follows redirects; still no
-  disable knob as of object_store 0.14). A proper fix belongs in
-  ds-storage (#431).
+- Generic HTTP feed/index/document fetches through ds-storage reject redirects
+  (#431), including same-origin redirects. Configure final URLs directly; a
+  redirect is a refresh error and last-good documents follow normal retention.
 - Config (`CapConfig` in ds-core) validated at load: exactly one of
   `data_path` / `feed_url` / `[cap.wis2]`, `feed_url` http(s), non-empty
   `language`, `poll_interval_secs > 0`, positive ISO 8601 `default_ttl` /
@@ -207,13 +206,21 @@ memory. Things that differ from the pull sources:
   MeteoAlarm's `awareness_level` (`"2; yellow; Moderate"`) and
   `awareness_type` (`"1; Wind"`) therefore appear exactly as clients of the
   MeteoAlarm feeds expect them, and the flat shape is what the MVT tag
-  encoder and a future `<property>=value` filter need. A repeated name
+  encoder and `<property>=value` filters need. A repeated name
   (MeteoAlarm's `impacts`, one per bullet) becomes a List in document
   order. A name colliding with a standard CAP property is namespaced
   `parameter:<valueName>` instead of shadowing it. `<eventCode>`s (terse
   system ids: MeteoAlarm `OET` event terms, NWS `SAME`) are always
   namespaced `eventCode:<valueName>`. Values are passed through verbatim —
-  no MeteoAlarm-specific decoding of the `code; colour; label` convention.
+  the original fields are never normalized. An additional `awareness_type_code`
+  property extracts a positive integer prefix from each `awareness_type`
+  `code; label` value (nonempty label required); repeated values produce an
+  integer list, malformed values add no code. It never infers codes from labels
+  or changes their capitalization. Reserve the derived name: a producer's own
+  `awareness_type_code` goes under `parameter:awareness_type_code` even when
+  no valid derived code exists. Filtering `awareness_type_code=1,3,5` uses the
+  shared matcher's numeric alternatives; original text filters stay exact.
+  The derived field stays in `filterables` even for an empty catalog.
 
 ## Time semantics
 
@@ -223,10 +230,11 @@ memory. Things that differ from the pull sources:
   all loaded areas. Map/WMS `TIME` selects areas active at that instant;
   **no TIME ⇒ active now** (the snapshot's `as_of`, advanced each poll so
   expired alerts drop out).
-- **WMS TIME shape (load-bearing):** `RasterInfo.times` = distinct window
-  boundaries ≤ `as_of` plus `as_of` itself (always the max entry, capped to
-  256). The WMS handler resolves a TIME-less GetMap to `times.last()`, so
-  `as_of` being last is what makes the default render "now".
+- **WMS TIME shape:** `RasterInfo.times` advertises window boundaries through
+  `as_of + 7 days`, plus `as_of`, capped to 256 nearest boundaries. The sorted
+  axis always retains `as_of`. `MapEngine::default_time()` returns `as_of`:
+  WMS/Maps/Tiles and the preview use that default independently of the latest
+  advertised time. Never restore the old "last advertised time means now" rule.
 - `data_version()` (Feature ETags) hashes record ids + severity + window +
   every property in key order (text, producer parameters, geometry
   provenance) + the geometry — any in-place correction invalidates the

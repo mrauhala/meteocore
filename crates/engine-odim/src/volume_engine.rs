@@ -80,7 +80,7 @@ use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, Time
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
 use crate::pixel_cache::{MomentPixels, PixelCache};
-use crate::pvol::{read_moment_pixels, read_polar_volume, PolarMoment, PolarVolume, Sweep};
+use crate::pvol::{read_polar_volume, PolarMoment, PolarVolume, Sweep};
 use crate::quantities;
 use crate::reader::{PixelClass, RawPixels};
 
@@ -512,7 +512,7 @@ pub(crate) fn pixel_cache_id<'a>(source: &Source, file_id: &'a str) -> std::borr
 /// Capture the current runtime handle for the lazy pixel fetch. Call ONLY
 /// from a `spawn_blocking` context (`get_raster_tile` / `query_trajectory`),
 /// where `handle.block_on` is valid and `block_in_place` would panic; the
-/// request-worker query paths pass `None` instead. Uses `try_current` (not
+/// dedicated EDR runtime worker paths pass `None` instead. Uses `try_current` (not
 /// `current`) so unit tests that invoke the trait methods outside any runtime
 /// — always with a `Local` source that ignores the handle — don't panic.
 pub(crate) fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
@@ -526,7 +526,7 @@ pub(crate) fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
 /// runtime context (see [`Pixels::handle`]): `Some(handle)` drives the fetch
 /// via `handle.block_on` (valid on a `spawn_blocking` pool thread, where
 /// `block_in_place` *panics*); `None` uses the plain [`DataStore::get`],
-/// whose `block_in_place` is valid on a request-worker thread. A local read
+/// whose `block_in_place` is valid on a multi-thread runtime worker. A local read
 /// never touches a runtime, so the handle is irrelevant there.
 fn fetch_file_bytes(
     source: &Source,
@@ -562,12 +562,48 @@ struct Pixels<'a> {
     /// `Some(handle)` when the caller runs inside `spawn_blocking`
     /// (`get_raster_tile` / `query_trajectory`) — the fetch then uses
     /// `handle.block_on` because `block_in_place` panics on a `spawn_blocking`
-    /// pool thread. `None` on a request worker (EDR position / area /
+    /// pool thread. `None` on a dedicated EDR runtime worker (position / area /
     /// locations), where the fetch must use `block_in_place` via the plain
     /// `DataStore::get`. Irrelevant for a `Local` source.
     handle: Option<&'a tokio::runtime::Handle>,
     /// Complete requested quantity for a 3D render, retained across LRU eviction.
     moments: Option<&'a MomentPixels>,
+}
+
+/// Requested moment first, then uncached siblings (same quantity first).
+/// Speculative decodes consume at most a quarter of the pixel-cache capacity,
+/// preventing a large cold volume from evicting the entire warm working set.
+/// Pixel storage uses at most four bytes/sample (floats are downcast to f32).
+fn cold_batch_requests<'a>(
+    volume: &'a PolarVolume,
+    requested: &'a PolarMoment,
+    nrays: usize,
+    nbins: usize,
+    cache_id: &str,
+) -> Vec<(&'a str, usize, usize)> {
+    let mut requests = vec![(requested.dataset_path.as_str(), nrays, nbins)];
+    let mut remaining = PIXEL_CACHE.capacity() / 4;
+    let mut siblings: Vec<_> = volume
+        .sweeps
+        .iter()
+        .flat_map(|sweep| sweep.moments.iter().map(move |moment| (sweep, moment)))
+        .filter(|(_, moment)| {
+            moment.dataset_path != requested.dataset_path
+                && !PIXEL_CACHE.contains(cache_id, &moment.dataset_path)
+        })
+        .collect();
+    siblings.sort_by_key(|(_, moment)| moment.quantity != requested.quantity);
+    for (sweep, moment) in siblings {
+        let bytes = (sweep.nrays as u64)
+            .checked_mul(sweep.nbins as u64)
+            .and_then(|n| n.checked_mul(4))
+            .unwrap_or(u64::MAX);
+        if bytes <= remaining {
+            remaining -= bytes;
+            requests.push((moment.dataset_path.as_str(), sweep.nrays, sweep.nbins));
+        }
+    }
+    requests
 }
 
 impl Pixels<'_> {
@@ -603,14 +639,14 @@ impl Pixels<'_> {
         pixels
     }
 
-    /// Fetch a moment's decoded pixel array — cache hit, or read the one
-    /// `/datasetN/dataM/data` dataset from the (re-fetched) file bytes and
-    /// cache it. `None` on any I/O / decode error (the caller treats a
+    /// Fetch a decoded moment, batching bounded uncached siblings from the
+    /// same file on a cold miss. Concurrent sibling misses share a file lock. `None` on any I/O / decode error (the caller treats a
     /// missing array as nodata, so a single corrupt file degrades to
     /// transparent rather than failing the whole request).
     fn moment(
         &self,
         file_id: &str,
+        volume: &PolarVolume,
         moment: &PolarMoment,
         nrays: usize,
         nbins: usize,
@@ -631,32 +667,43 @@ impl Pixels<'_> {
         if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
             return None;
         }
-        // Genuine positive-cache miss (not a known-bad skip) — count it here so
-        // the miss metric reflects real fetches, then fetch + decode.
-        PIXEL_CACHE.record_miss();
-        // Single-moment fallback for raster/EDR callers. 3D volume requests
-        // populate `moments` in one batch before sampling, so they never take
-        // this whole-file read once per sweep.
-        let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
-            read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
-                .map_err(|e| format!("decode `{}`: {e}", moment.dataset_path))
-        });
-        match decoded {
-            Ok(raw) => {
-                let arc = Arc::new(raw);
-                PIXEL_CACHE.insert(&cache_id, &moment.dataset_path, arc.clone());
-                Some(arc)
+        PIXEL_CACHE.with_file_load(&cache_id, || {
+            if let Some(p) = PIXEL_CACHE.get(&cache_id, &moment.dataset_path) {
+                return Some(p);
             }
-            Err(e) => {
-                // Count + log once per key; subsequent cells short-circuit on
-                // `is_known_bad` above.
-                if PIXEL_CACHE.mark_bad(&cache_id, &moment.dataset_path) {
-                    PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!("PVOL lazy pixel read failed for `{file_id}`: {e}");
+            if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
+                return None;
+            }
+            PIXEL_CACHE.record_miss();
+            let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
+                let requests = cold_batch_requests(volume, moment, nrays, nbins, &cache_id);
+                let mut requested = None;
+                crate::pvol::visit_moments_pixels(&bytes, requests, |path, result| match result {
+                    Ok(raw) => {
+                        let pixels = Arc::new(raw);
+                        if path == moment.dataset_path {
+                            requested = Some(pixels.clone());
+                        }
+                        PIXEL_CACHE.insert(&cache_id, path, pixels);
+                    }
+                    Err(e) => tracing::debug!("PVOL cold batch skipped `{path}`: {e}"),
+                })
+                .map_err(|e| format!("open volume: {e}"))?;
+                requested.ok_or_else(|| format!("decode `{}` failed", moment.dataset_path))
+            });
+            match decoded {
+                Ok(pixels) => Some(pixels),
+                Err(e) => {
+                    // Count + log once per key; subsequent cells short-circuit on
+                    // `is_known_bad` above.
+                    if PIXEL_CACHE.mark_bad(&cache_id, &moment.dataset_path) {
+                        PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!("PVOL lazy pixel read failed for `{file_id}`: {e}");
+                    }
+                    None
                 }
-                None
             }
-        }
+        })
     }
 }
 
@@ -2185,7 +2232,7 @@ fn polar_sample(
     // per-pixel loop. A read failure yields an all-transparent tile rather
     // than a 500: the file may have rotated out from under us, and the next
     // poll/request recovers.
-    let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
         return Ok(RasterTile {
             width,
             height,
@@ -2437,7 +2484,8 @@ fn volume_profile(
                     })
                     .and_then(|sweep| {
                         let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
-                        let pixels = pix.moment(&entry.id, moment, sweep.nrays, sweep.nbins)?;
+                        let pixels =
+                            pix.moment(&entry.id, &entry.volume, moment, sweep.nrays, sweep.nbins)?;
                         sample_sweep_moment(sweep, moment, &pixels, site_lon, site_lat, lon, lat)
                     })
             })
@@ -2497,7 +2545,8 @@ fn level_series(
                 let class = nearest_sweep(&e.volume, level)
                     .and_then(|sweep| {
                         let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
-                        let pixels = pix.moment(&e.id, moment, sweep.nrays, sweep.nbins)?;
+                        let pixels =
+                            pix.moment(&e.id, &e.volume, moment, sweep.nrays, sweep.nbins)?;
                         Some(sample_sweep_moment_class(
                             sweep,
                             moment,
@@ -2830,7 +2879,7 @@ fn sample_polar_slant_class(
         return PixelClass::Masked;
     }
     let ray = (azimuth_deg / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
-    let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
         return PixelClass::Masked;
     };
     pixels.sample_class(
@@ -3800,7 +3849,7 @@ fn volume_point_cloud(
         let Some(moment) = sweep.moments.iter().find(|m| m.quantity == quantity) else {
             continue;
         };
-        let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+        let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
             continue;
         };
         let deg_per_ray = 360.0 / sweep.nrays as f64;
@@ -3960,7 +4009,7 @@ fn resolve_column(
     if bin < 0 || bin >= sweep.nbins as i64 {
         return ColumnTarget::Masked;
     }
-    let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
         return ColumnTarget::Masked;
     };
     ColumnTarget::Gate {
@@ -4169,7 +4218,7 @@ impl PolarVolumeSiteView {
     /// storm-cell path (`cells.rs`) can drive it from **either** runtime
     /// context: `handle` is the async→sync bridge selector for a remote
     /// pixel fetch (`Some` on a `spawn_blocking` pool thread, where
-    /// `block_in_place` panics; `None` on a request worker, where
+    /// `block_in_place` panics; `None` on a multi-thread runtime worker, where
     /// `block_in_place` is the valid bridge — see [`Pixels::handle`]).
     ///
     /// Returns the shared grid plus its echo-cell count; the caller owns the
@@ -4359,8 +4408,8 @@ impl EdrEngine for PolarVolumeSiteView {
             .volume
             .site;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
-        // EDR `query_location` runs directly on the request worker (the
-        // generic api-edr handler does not `spawn_blocking`), so any S3 pixel
+        // EDR `query_location` runs on the executor's dedicated multi-thread
+        // runtime worker (not its blocking pool), so any S3 pixel
         // fetch must use `block_in_place` (the plain `DataStore::get`) — pass
         // `None`. `handle.block_on` would panic in this async context.
         let pix = Pixels {
@@ -4470,7 +4519,7 @@ impl EdrEngine for PolarVolumeSiteView {
             ))
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
-        // Request-worker path (no `spawn_blocking`) — `None` selects the
+        // Dedicated EDR worker path — `None` selects the
         // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
             moments: None,
@@ -4513,7 +4562,7 @@ impl EdrEngine for PolarVolumeSiteView {
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
         let levels = resolve_levels(canonical, z)?;
-        // Request-worker path (no `spawn_blocking`) — `None` selects the
+        // Dedicated EDR worker path — `None` selects the
         // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
             moments: None,
@@ -5244,6 +5293,46 @@ mod tests {
     }
 
     #[test]
+    fn cold_miss_primes_siblings_without_another_file_read() {
+        let bytes = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let volume = crate::pvol::read_polar_volume(bytes).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume.h5");
+        std::fs::write(&path, bytes).unwrap();
+        let id = path.to_str().unwrap();
+        let pixels = test_pixels();
+        let first = &volume.sweeps[0];
+        let raw = pixels.moment(id, &volume, &first.moments[0], 4, 8).unwrap();
+        assert_eq!(raw.shape(), (4, 8));
+        // The source disappears: every sibling must still be available from
+        // the single cold load, including the higher sweep.
+        std::fs::remove_file(&path).unwrap();
+        for sweep in &volume.sweeps {
+            for moment in &sweep.moments {
+                assert!(pixels.moment(id, &volume, moment, 4, 8).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn cold_batch_skips_oversize_siblings_but_always_requests_target() {
+        let mut volume = synthetic_volume(24.5, 60.3);
+        let mut sibling = volume.sweeps[0].clone();
+        sibling.nrays = usize::MAX;
+        sibling.nbins = usize::MAX;
+        sibling.moments[0].dataset_path = "/huge".into();
+        volume.sweeps.push(sibling);
+        let requests = cold_batch_requests(
+            &volume,
+            &volume.sweeps[0].moments[0],
+            360,
+            100,
+            &unique_file_id(),
+        );
+        assert_eq!(requests, vec![(SYNTHETIC_DS, 360, 100)]);
+    }
+
+    #[test]
     fn moment_failure_marks_known_bad_and_returns_none() {
         // An unseeded id over the `/nonexistent` Local source → the fetch
         // fails. The failure must be negatively cached so a per-cell loop
@@ -5258,13 +5347,17 @@ mod tests {
             dataset_path: SYNTHETIC_DS.to_string(),
         };
         let pix = test_pixels();
-        assert!(pix.moment(&file_id, &mom, 360, 100).is_none());
+        assert!(pix
+            .moment(&file_id, &synthetic_volume(24.5, 60.3), &mom, 360, 100)
+            .is_none());
         assert!(
             pixel_cache().is_known_bad(&file_id, &mom.dataset_path),
             "a failed read must be negatively cached"
         );
         // Repeat returns None via the negative-cache short-circuit.
-        assert!(pix.moment(&file_id, &mom, 360, 100).is_none());
+        assert!(pix
+            .moment(&file_id, &synthetic_volume(24.5, 60.3), &mom, 360, 100)
+            .is_none());
     }
 
     /// A dummy file source for the lazy-pixel context; never actually read,

@@ -407,15 +407,27 @@ pub fn read_moments_pixels<'a>(
     bytes: &[u8],
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
 ) -> Result<Vec<(String, RawPixels)>, ReadError> {
-    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
     let mut out = Vec::new();
-    for (path, nrays, nbins) in requests {
-        match read_moment_array(&file, path, nrays, nbins) {
-            Ok(px) => out.push((path.to_string(), px)),
-            Err(e) => tracing::debug!("read_moments_pixels: skipping moment `{path}`: {e}"),
-        }
-    }
+    visit_moments_pixels(bytes, requests, |path, result| match result {
+        Ok(px) => out.push((path.to_string(), px)),
+        Err(e) => tracing::debug!("read_moments_pixels: skipping moment `{path}`: {e}"),
+    })?;
     Ok(out)
+}
+
+/// Stream decoded moments from one HDF5 open, retaining at most one decode
+/// outside the caller's bounded cache. A corrupt optional sibling does not
+/// prevent the requested moment from being returned.
+pub fn visit_moments_pixels<'a>(
+    bytes: &[u8],
+    requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
+    mut visit: impl FnMut(&str, Result<RawPixels, ReadError>),
+) -> Result<(), ReadError> {
+    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+    for (path, nrays, nbins) in requests {
+        visit(path, read_moment_array(&file, path, nrays, nbins));
+    }
+    Ok(())
 }
 
 /// Combine ODIM's split `/what/date` (`YYYYMMDD`) and `/what/time`
@@ -442,6 +454,25 @@ fn parse_odim_timestamp(date: &str, time: &str) -> Result<DateTime<Utc>, ReadErr
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn batch_continues_after_bad_sibling() {
+        let bytes = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let requests = [
+            ("/dataset1/data1/data", 4, 8),
+            ("/missing", 4, 8),
+            ("/dataset2/data2/data", 4, 8),
+        ];
+        let mut results = Vec::new();
+        visit_moments_pixels(bytes, requests, |path, result| {
+            results.push((path.to_owned(), result.is_ok()));
+        })
+        .unwrap();
+        assert_eq!(
+            results.iter().map(|(_, ok)| *ok).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+    }
 
     /// The canonical FMI `/what/source` string carries all three
     /// identifiers we care about, plus `WIGOS` and `RAD` tokens we

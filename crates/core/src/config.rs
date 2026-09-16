@@ -1877,6 +1877,10 @@ pub struct PostgisObservationsConfig {
     /// table on every metadata refresh is a full-scan trap.
     #[serde(default)]
     pub extent_bbox: Option<[f64; 4]>,
+    /// Guaranteed event detection footprint, independent of advertised extent.
+    /// Unconfigured coverage is unknown; never infer it from event positions.
+    #[serde(default)]
+    pub coverage_bbox: Option<[f64; 4]>,
 }
 
 impl PostgisObservationsConfig {
@@ -2096,6 +2100,7 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
             ("id_col", o.id_col.is_some()),
             ("default_datetime", o.default_datetime.is_some()),
             ("extent_bbox", o.extent_bbox.is_some()),
+            ("coverage_bbox", o.coverage_bbox.is_some()),
         ] {
             if present {
                 return Err(Config(format!(
@@ -2262,6 +2267,20 @@ fn validate_observations_events(
         return Err(Config(format!(
             "Collection '{id}': observations.extent_bbox must be [west, south, east, north] in CRS84 with west < east and south < north"
         )));
+    }
+
+    if let Some([w, s, e, n]) = o.coverage_bbox {
+        if !(w < e
+            && s < n
+            && (-180.0..=180.0).contains(&w)
+            && (-180.0..=180.0).contains(&e)
+            && (-90.0..=90.0).contains(&s)
+            && (-90.0..=90.0).contains(&n))
+        {
+            return Err(Config(format!(
+                "Collection '{id}': observations.coverage_bbox must be a finite CRS84 bbox"
+            )));
+        }
     }
 
     Ok(())
@@ -5100,6 +5119,26 @@ unit = "1"
             err.contains("station_fk_col is not valid for shape 'events'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn postgis_events_rejects_invalid_coverage_bbox() {
+        for coverage in [
+            "[42.0, 54.0, 4.0, 72.0]",
+            "[4.0, -91.0, 42.0, 72.0]",
+            "[nan, 54.0, 42.0, 72.0]",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let toml = lightning_events_toml().replace(
+                "extent_bbox =",
+                &format!("coverage_bbox = {coverage}\nextent_bbox ="),
+            );
+            let path = write_config(tmp.path(), "config.toml", &toml);
+            let error = ServerConfig::from_file(path.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("coverage_bbox"), "{error}");
+        }
     }
 
     #[test]

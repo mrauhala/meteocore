@@ -1225,7 +1225,10 @@ async fn render_map(
     // hoisting still saves one Arc-clone-sized allocation per request on
     // engines that materialise `RasterInfo` lazily.
     let raster_info = engine.raster_info();
-    let time = validated.time.or_else(|| raster_info.times.last().copied());
+    let time = validated
+        .time
+        .or_else(|| engine.default_time())
+        .or_else(|| raster_info.times.last().copied());
     // #521: resolve the run axis to the CONCRETE run the engine will render
     // before the cache key is built. The Maps `reference_time` query
     // parameter is still a follow-up (#337 Phase 4) — the handler never pins
@@ -1366,10 +1369,17 @@ async fn render_map(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
-    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
+    let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
         .await
-        .map_err(|_| MapsError::ServiceUnavailable("Server busy, try again later".to_string()))?
-        .map_err(|_| MapsError::Internal("Render semaphore closed".to_string()))?;
+        .map_err(MapsError::from)?;
+    let memory_permit = Arc::new(
+        ds_render::budget::RENDER_MEMORY
+            .try_acquire(validated.width, validated.height)
+            .ok_or_else(|| {
+                MapsError::ServiceUnavailable("Render memory budget exhausted".into())
+            })?,
+    );
+    let worker_memory = memory_permit.clone();
 
     // Render on a blocking thread
     let engine = engine.clone();
@@ -1383,28 +1393,31 @@ async fn render_map(
     let render_parameter = effective_parameter;
     let render_z = validated.z;
 
-    let render_result = tokio::task::spawn_blocking(move || {
-        let tile = engine.get_raster_tile(
-            bbox,
-            width,
-            height,
-            time,
-            &output_crs,
-            render_parameter.as_deref(),
-            render_z,
-            // The run pinned before keying (#521): `Some(latest)` renders the
-            // same pixels as `None` by the engine contract, but survives a
-            // run swap mid-render without mixing runs in one response.
-            reference_time,
-        )?;
-        // If every pixel is nodata, skip colorization + encoding entirely.
-        if tile.is_empty() {
-            return Ok(None);
-        }
-        ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
-    })
-    .await
-    .map_err(|e| MapsError::Internal(format!("Render task failed: {e}")))?;
+    let render_result = job
+        .run(move || {
+            let _memory_permit = worker_memory;
+
+            let tile = engine.get_raster_tile(
+                bbox,
+                width,
+                height,
+                time,
+                &output_crs,
+                render_parameter.as_deref(),
+                render_z,
+                // The run pinned before keying (#521): `Some(latest)` renders the
+                // same pixels as `None` by the engine contract, but survives a
+                // run swap mid-render without mixing runs in one response.
+                reference_time,
+            )?;
+            // If every pixel is nodata, skip colorization + encoding entirely.
+            if tile.is_empty() {
+                return Ok(None);
+            }
+            ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
+        })
+        .await
+        .map_err(MapsError::from)?;
 
     // The EMPTY fast path skips the format-aware encoder and emits PNG
     // bytes directly. Track the actual Content-Type per branch so the
@@ -1437,6 +1450,9 @@ async fn render_map(
             // bbox/datetime) is a 400 with the engine's helpful message —
             // not a 500 that hides it behind "Internal server error".
             return Err(match e {
+                DSE::ResourceExhausted | DSE::DeadlineExceeded => {
+                    MapsError::ServiceUnavailable(e.to_string())
+                }
                 DSE::InvalidParameter(_)
                 | DSE::InvalidBbox(_)
                 | DSE::InvalidDatetime(_)
@@ -1504,4 +1520,13 @@ async fn render_map(
         .body(axum::body::Body::from(cached.into_bytes()))
         .unwrap()
         .into_response())
+}
+
+impl From<ds_executor::ExecutionError> for MapsError {
+    fn from(error: ds_executor::ExecutionError) -> Self {
+        match error {
+            ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
+            other => Self::ServiceUnavailable(other.to_string()),
+        }
+    }
 }

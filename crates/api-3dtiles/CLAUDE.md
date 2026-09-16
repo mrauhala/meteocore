@@ -116,3 +116,9 @@ colormaps are follow-ups.
 Viewer regression tests: `node --test crates/api-3dtiles/tests/viewer.test.cjs`
 (delay metadata/content and check scheduling, failure, cancellation, refresh).
 These run in CI; WebGL/render verification remains a separate check.
+
+Point/mesh computations now use `ds-executor` admission: the shared bounded
+render queue and a 30 s queue/compute deadline. The raster 3 s default does not
+apply to these larger products. Their workers (and the separate voxel worker)
+retain CPU permits on client disconnection. Admission/deadline failures are
+503 + Retry-After. Coalesced cache waiters share the cache-owned result flight.

@@ -2567,3 +2567,38 @@ mod parameter_styles {
         );
     }
 }
+
+/// Run the zero-budget case in a fresh process: RENDER_MEMORY is process-wide,
+/// and mutating its environment in the parallel test suite would race.
+#[tokio::test]
+async fn exhausted_memory_budget_rejects_uncached_tile() {
+    const CHILD: &str = "MC_TILE_MEMORY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exhausted_memory_budget_rejects_uncached_tile",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("MC_RENDER_MEMORY_MB", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let (status, headers, body) = get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers.get("retry-after").unwrap(), "1");
+    assert!(
+        serde_json::from_slice::<Value>(&body).is_ok(),
+        "structured error response"
+    );
+    assert_eq!(ds_render::budget::RENDER_MEMORY.available(), 0);
+    assert_eq!(ds_render::budget::RENDER_MEMORY.rejected(), 1);
+}

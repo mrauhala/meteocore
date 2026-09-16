@@ -45,7 +45,7 @@ reason `MapEngine::resolve_reference_time` exists (#521).
   (4 B/px — the FMI S3 COG path lands here until #475-style typed paths).
 - Motion is estimated on a coarsened grid sized so the physical search
   window (40 m/s × source interval) fits `TARGET_SEARCH_PX` (48 — keeps
-  the FMI 500 m grid uncoarsened), then the field is scaled back —
+  typical kilometre-scale working grids uncoarsened), then the field is scaled back —
   deliberate scale handling; do NOT rely on the pixel budget to do this
   implicitly.
 - **Motion stabilization (#524 part 1)** — two mechanisms against the
@@ -118,8 +118,13 @@ in production configs.
   (`MIN_JUMP_RATE_PER_MIN` floor — revisit against Nordic storm data if
   jumps never fire). Feature properties `flash_count` /
   `flash_rate_per_min` / `lightning_jump` exist ONLY when a source is
-  wired; null means "join skipped this generation" (source error — the
-  generation itself never fails), 0 means measured-quiet.
+  wired; null means unavailable (unknown/outside coverage, source error or
+  truncated window). `lightning_coverage` is independently null/false/true.
+  A measured zero requires the source to cover the entire labeled footprint
+  AND centroid fallback radius. Configure the events source's
+  `observations.coverage_bbox` as a guaranteed detection footprint; the
+  advertised `extent_bbox` is NOT coverage. Missing coverage config fails
+  closed. Coverage gaps clear the jump baseline, never append fake zeros.
 
 ## Motion field as a data product (#661)
 
@@ -438,7 +443,8 @@ see `docs/cell-intelligence-plan-amendment.md`).
   — so all four see identical numbers by construction. Do NOT reconstruct
   cell attributes at request time; that is how two of them drift.
 - Rounding to meaningful precision happens in `score_cells`, not in
-  `cell_feature`: the working grid is ~500 m, so 5 lon/lat decimals ≈ 1 m,
+  `cell_feature`: 5 lon/lat decimals ≈ 1 m, much finer than the
+  source-dependent, pixel-budget-coarsened working grid,
   and raw f64s roughly double the GeoJSON payload to carry noise.
 - **Ranking is `ds_core::significance`** (domain-agnostic: it sees normalized
   `Term`s, never a storm cell). Weights come from
@@ -622,3 +628,40 @@ see `docs/cell-intelligence-plan-amendment.md`).
   `max_pixels` (4 M), `min_echo` (10.0), `[nowcast.significance]` weight
   overrides (all optional; unknown names rejected), `impact_source` +
   `impact_name_property` (default `"name"`) + `impact_weight_property`.
+
+## Track continuity (#649)
+
+Observed tracks get first association priority. An unmatched track is retained
+for one generation for reassociation only; it never appears in features,
+lightning joins, ranking, or growth/decay labels. Rescue uses elapsed time since
+the last actual observation, so velocity is not doubled and age increments
+only once. Death telemetry is delayed until the coast expires.
+
+At startup, replay at most the last eight retained source frames before the newest
+anchor, one frame at a time, using segmentation and association only. Replay
+uses the same blocking-fetch ceiling as motion history; replaying the whole
+48-snapshot serving history would multiply startup I/O stalls. Replay
+publishes no forecast runs and changes no generation/association metrics. It
+recovers motion, observed age and hysteresis; sustained deviation from ambient
+flow starts afresh because replay does not estimate that field. Historical lightning is not
+requeried. Unreadable frames break replay continuity. IDs use an epoch-based
+seed instead of restarting at one. Long-term clutter climatology/persistence
+and split/merge lineage remain separate work (#620/#551).
+
+## Physical cell scale (#647)
+
+Live segmentation and startup replay use `CELL_MIN_AREA_KM2 = 2.5`, summing
+member-pixel areas with each row's latitude. The old 10-pixel floor was about
+14 km² on the coarsened FMI grid; source resolution and `max_pixels` determine
+working resolution, never a universal 500 m. Small retained cells can therefore
+increase in number. Row areas are computed once before segmentation.
+
+`PixelScale::lonlat` uses row latitude for east-west distances; centroid
+matching, velocity, path length, lightning attribution and coverage bounds all
+share it. Severity, served area and flash density use the summed footprint area,
+not the intensity-weighted centroid's latitude. The motion estimator's global
+search/coarsening scale remains a mid-latitude approximation; its EDR output
+already converts each vector at its own latitude. Pixel-only verification
+segmentation and its uniform matching scale stay unchanged for comparability.
+These unit corrections do not recalibrate clutter thresholds or establish
+classifier precision on confirmed convective examples.

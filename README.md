@@ -154,6 +154,9 @@ not re-scan the auto roots.
 | `LOG_FORMAT` | human-readable | Set to `json` for newline-delimited JSON logs (production / Loki ingestion) |
 | `RUST_LOG` | `info` | Log level filter, e.g. `server=debug,engine_geotiff=warn` |
 | `ADMIN_TOKEN` | _(none — unauthenticated)_ | Bearer token required for `POST /admin/collections/reload`. When unset, the admin endpoint is open. |
+| `MC_RENDER_TIMEOUT_MS` | `3000` | Absolute queue + raster render deadline for WMS/Maps/Tiles (and MVT encoding), in milliseconds; 0 rejects uncached work, maximum one day. Timeout returns 503 + Retry-After. In-flight CPU work keeps its permits until completion; remote GeoTIFF reads stop at the same deadline. Restart to change. |
+| `MC_RENDER_QUEUE_CAPACITY` | `3 × render slots` | Process-wide cap on requests waiting for a shared render slot. A full queue returns immediate 503 + Retry-After; 0 allows only immediately available slots. Cached responses bypass admission. Restart to change. |
+| `MC_RENDER_MEMORY_MB` | `1024` | Process-wide transient raster render admission budget (MiB), shared by WMS/Maps/Tiles and retained across reloads. Estimate: 32 bytes/output pixel. Exhaustion returns 503 + Retry-After; 0 rejects uncached renders. Restart to change. Source decoding and resident caches are separate budgets. |
 | `MC_3DTILES_CONTENT_CACHE_MB` | `512` | 3D Tiles encoded-content cache size in MB. `0` disables. |
 | `MC_PVOL_VOXEL_GRID_CACHE_MB` | `512` | PVOL polar-resampled voxel-grid cache size in MB. `0` disables. |
 | `MC_PVOL_PIXEL_CACHE_MB` | `1024` | PVOL per-moment decoded-pixel cache size in MB. `0` disables. |
@@ -1587,6 +1590,9 @@ Returns HTTP 503 only when all collections have failed.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `render_semaphore_available` | gauge | — | Available render permits |
+| `render_budget_available_bytes` | gauge | — | Available transient render memory estimate |
+| `render_budget_total_bytes` | gauge | — | Configured transient render memory budget |
+| `render_budget_rejected_total` | counter | — | Requests rejected at memory admission |
 | `render_semaphore_total` | gauge | — | Total render permits (2× CPU cores, min 8) |
 | `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
 
@@ -1647,11 +1653,21 @@ docker compose up -d
 open http://localhost:3000    # Grafana (anonymous admin for local dev)
 ```
 
+All published host ports bind to `127.0.0.1`; other containers use the internal
+Compose network. The stack is for local development, not a production manifest.
+Alloy retains access to the Docker API: mounting its socket `:ro` does not make
+API operations read-only. Only run this stack with trusted local users.
+
 Tear down including volumes: `docker compose down -v`.
 
 Alloy promotes a bounded set of labels to Loki: `level`, `api`, `query_type`, `status_class` (`2xx` / `4xx` / `5xx`). High-cardinality fields like `collection`, `path`, `request_id`, and the raw query string stay in the log body and are queryable via `| json` in LogQL — this keeps Loki's index bounded as the number of collections grows.
 
 The bundled Grafana dashboard at `docker/grafana/dashboards/meteocore-overview.json` has a **Logs** row with four Loki-backed panels: request rate by `(api, query_type)`, error rate by `status_class`, live request stream, and a dedicated 4xx/5xx stream. All panels work with the Prometheus and Loki datasources that are auto-provisioned from `docker/grafana/provisioning/`.
+
+Privileged GitHub workflows pin actions to commit SHAs, updated by Dependabot.
+Claude comment triggers require an owner, member or collaborator; automatic
+reviews additionally require a branch in this repository. Fork PRs still run
+normal CI without the review credential.
 
 > Production note: the compose stack is intended for local dev. It uses anonymous admin Grafana, filesystem-backed Loki, no retention beyond 7 days, and runs Alloy as root so it can tail the Docker socket. Do not deploy it as-is.
 
@@ -1673,17 +1689,17 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 ## Known Limitations
 
 - CSV/GeoJSON data loaded into memory at startup; GeoTIFF reads tiles on demand
-- CSV engine supports only the `locations` query type
+- CSV EDR supports `locations`, `area` and `radius`; arbitrary `position` queries are not supported. See the [EDR query-type matrix](crates/api-edr/README.md#per-engine-query-type-matrix).
 - GeoJSON engine implements `FeatureEngine` only (not EDR or WMS)
 - GeoTIFF engine implements `EdrEngine` + `MapEngine` only (not Features)
 - GeoTIFF: one band per collection; strip-based TIFFs not supported
-- WMS: single LAYERS only, no SLD/SE styling, no GetFeatureInfo
-- WMS/Maps/Tiles: nearest-neighbor resampling only
-- STAC: no retry logic, no HTTP caching (ETag/Last-Modified)
+- WMS: one `LAYERS` value per request; no external SLD/SE styling or GetFeatureInfo. Local SLD ColorMap palette import is supported.
+- Raster sampling is engine-specific: GRIB, QueryData and Zarr use bilinear sampling; GeoTIFF and nowcast use nearest-neighbor. WMS meta-tile assembly uses nearest-neighbor to preserve discrete palettes; there is no request-level resampling selector.
+- STAC metadata discovery retries transport failures and server errors up to three times with backoff; it does not use conditional HTTP caching (ETag/Last-Modified).
 - Tiles: WebMercatorQuad and WorldCRS84Quad only; fixed 256x256 raster tiles; MVT is supported via `?f=mvt` for `FeatureEngine`-backed collections
-- GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files; accumulated/averaged aggregate fields (`APCP`, `acc fcst`) are dropped
-- QueryData: no compressed files, EDR position only, level 0 only; retains up to `max_runs` (default 4) most-recent files as model runs
-- Zarr: geographic (WGS84 lat/lon) grids only, EDR position only; forecast model-run selection pins the latest run (#337); STAC per-item-CRS and kerchunk modes not yet implemented
+- GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files. Wgrib2 hour-window accumulation/average fields use duration-qualified keys (e.g. `APCP_acc_6h`, `DSWRF_avg_6h`) at the window end; source units are preserved without division by duration. ECMWF JSON sidecars retain their existing naming and semantics.
+- QueryData: uncompressed `.sqd` files only; EDR supports position, area and radius, but only level index 0 is exposed (no selectable vertical dimension). Retains up to `max_runs` (default 4) most-recent files as model runs.
+- Zarr: geographic (WGS84 lat/lon) grids only; EDR supports position, area and radius. Forecast stores expose runs as EDR instances and WMS `DIM_REFERENCE_TIME`, defaulting to the latest run. Native 0–360° longitude axes are not normalized; STAC per-item-CRS and kerchunk modes are not implemented.
 - Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only, new snapshots picked up on reload (not poll)
 - 3D Tiles: only `odim-volume` collections support `VolumeEngine`; voxel representation (`EXT_primitive_voxels`) requires CesiumJS ≥ 1.142 and is a CesiumGS draft extension (not in the Khronos registry); voxel octree/time-dynamic voxels are follow-ups; the 3D Tiles API has no `reference_time` parameter yet (model-run pinning; `datetime` selects valid time only)
 

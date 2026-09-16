@@ -398,7 +398,14 @@ impl MapEngine for PopulatedMockMapEngine {
 }
 
 fn build_populated_router() -> axum::Router {
-    let engine: Arc<dyn MapEngine> = Arc::new(PopulatedMockMapEngine);
+    build_populated_router_with_engine(Arc::new(PopulatedMockMapEngine))
+}
+
+fn build_populated_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
+    api_wms::router(build_populated_state(engine))
+}
+
+fn build_populated_state(engine: Arc<dyn MapEngine>) -> Arc<ArcSwap<WmsState>> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -449,7 +456,7 @@ fn build_populated_router() -> axum::Router {
     );
     styles_map.insert("radar".to_string(), layer_styles);
 
-    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+    Arc::new(ArcSwap::from_pointee(WmsState {
         engines,
         collections,
         styles: styles_map,
@@ -458,8 +465,7 @@ fn build_populated_router() -> axum::Router {
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
-    }));
-    api_wms::router(state)
+    }))
 }
 
 const GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar\
@@ -2957,4 +2963,224 @@ fn capabilities_legend_url_carries_the_full_layer_name() {
         "LegendURL must keep the /param segment (the key GetLegendGraphic \
          resolves); got:\n{vradh}"
     );
+}
+
+#[tokio::test]
+async fn oversized_render_is_rejected_before_engine_dispatch() {
+    let (app, _, calls) = build_counting_router(16);
+    let request = Request::builder().uri("/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=&CRS=CRS:84&BBOX=20,60,30,70&WIDTH=8000&HEIGHT=8000&FORMAT=image/png").body(Body::empty()).unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+struct AlertDefaultMock {
+    requested: Arc<std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+}
+impl MapEngine for AlertDefaultMock {
+    fn raster_info(&self) -> RasterInfo {
+        let mut info = PopulatedMockMapEngine.raster_info();
+        let now = self.default_time().unwrap();
+        info.times = vec![now, now + chrono::Duration::days(1)];
+        info
+    }
+    fn default_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some("2024-01-01T00:00:00Z".parse().unwrap())
+    }
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        crs: &OutputCrs,
+        param: Option<&str>,
+        z: Option<f64>,
+        rt: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        *self.requested.lock().unwrap() = time;
+        PopulatedMockMapEngine.get_raster_tile(bbox, width, height, time, crs, param, z, rt)
+    }
+}
+
+#[tokio::test]
+async fn engine_default_is_used_for_capabilities_and_timeless_map() {
+    let requested = Arc::new(std::sync::Mutex::new(None));
+    let engine = Arc::new(AlertDefaultMock {
+        requested: requested.clone(),
+    });
+    let expected = engine.default_time();
+    let app = build_populated_router_with_engine(engine);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/?SERVICE=WMS&REQUEST=GetCapabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let xml = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(xml.contains("default=\"2024-01-01T00:00:00+00:00\""));
+    assert!(xml.contains("2024-01-02T00:00:00+00:00"));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(GETMAP_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*requested.lock().unwrap(), expected);
+}
+
+struct ExhaustedEngine;
+impl MapEngine for ExhaustedEngine {
+    fn get_raster_tile(
+        &self,
+        _: [f64; 4],
+        _: u32,
+        _: u32,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+        _: &OutputCrs,
+        _: Option<&str>,
+        _: Option<f64>,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Err(DataServerError::ResourceExhausted)
+    }
+    fn raster_info(&self) -> RasterInfo {
+        PopulatedMockMapEngine.raster_info()
+    }
+}
+
+#[tokio::test]
+async fn decode_exhaustion_is_503_not_a_successful_error_image() {
+    let app = build_populated_router_with_engine(Arc::new(ExhaustedEngine));
+    let response = app.oneshot(Request::builder()
+        .uri("/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&CRS=CRS:84&BBOX=20,60,25,65&WIDTH=32&HEIGHT=32&FORMAT=image/png")
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(response.headers().get("etag").is_none());
+}
+
+struct DeadlineMockEngine {
+    stalled: std::sync::atomic::AtomicBool,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl MapEngine for DeadlineMockEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        crs: &OutputCrs,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        if self.stalled.load(std::sync::atomic::Ordering::SeqCst) {
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            ds_core::deadline::check()?;
+        }
+        PopulatedMockMapEngine.get_raster_tile(
+            bbox,
+            width,
+            height,
+            time,
+            crs,
+            parameter,
+            z,
+            reference_time,
+        )
+    }
+    fn raster_info(&self) -> RasterInfo {
+        PopulatedMockMapEngine.raster_info()
+    }
+}
+
+#[test]
+fn render_deadline_queue_shedding_and_cache_bypass() {
+    const CHILD: &str = "MC_TEST_RENDER_DEADLINE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "render_deadline_queue_shedding_and_cache_bypass",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("MC_RENDER_TIMEOUT_MS", "100")
+            .env("MC_RENDER_QUEUE_CAPACITY", "0")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (release, wait) = std::sync::mpsc::channel();
+        let engine = Arc::new(DeadlineMockEngine {
+            stalled: std::sync::atomic::AtomicBool::new(false),
+            release: std::sync::Mutex::new(wait),
+        });
+        let state = build_populated_state(engine.clone());
+        let slots = state.load().render_semaphore.clone();
+        let app = api_wms::router(state);
+        let request = |uri: &str| Request::builder().uri(uri).body(Body::empty()).unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(GETMAP_URI))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let held = slots.clone().acquire_many_owned(4).await.unwrap();
+        let hit = app.clone().oneshot(request(GETMAP_URI)).await.unwrap();
+        assert_eq!(hit.status(), StatusCode::OK);
+        assert_eq!(hit.headers()["x-cache"], "HIT");
+        let miss_uri = GETMAP_URI.replace("WIDTH=64", "WIDTH=65");
+        let shed = app.clone().oneshot(request(&miss_uri)).await.unwrap();
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(shed.headers()["retry-after"], "1");
+        assert!(shed.headers().get("etag").is_none());
+        drop(held);
+        engine
+            .stalled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let response = app.oneshot(request(&miss_uri)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        assert!(response.headers().get("etag").is_none());
+        assert_eq!(
+            slots.available_permits(),
+            3,
+            "running worker must keep its permit after timeout"
+        );
+        release.send(()).unwrap();
+        let _all_released =
+            tokio::time::timeout(std::time::Duration::from_secs(2), slots.acquire_many(4))
+                .await
+                .unwrap()
+                .unwrap();
+    });
 }

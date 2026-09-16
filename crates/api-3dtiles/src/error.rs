@@ -30,7 +30,14 @@ impl IntoResponse for Tiles3dError {
                 "Internal server error".to_string(),
             ),
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        let mut response = (status, Json(json!({ "error": message }))).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }
 
@@ -38,6 +45,9 @@ impl From<ds_core::error::DataServerError> for Tiles3dError {
     fn from(e: ds_core::error::DataServerError) -> Self {
         use ds_core::error::DataServerError as E;
         match e {
+            E::ResourceExhausted | E::DeadlineExceeded => {
+                Tiles3dError::ServiceUnavailable(e.to_string())
+            }
             E::InvalidParameter(m)
             | E::InvalidBbox(m)
             | E::InvalidDatetime(m)
@@ -46,6 +56,15 @@ impl From<ds_core::error::DataServerError> for Tiles3dError {
                 Tiles3dError::NotFound(m)
             }
             other => Tiles3dError::Internal(other.to_string()),
+        }
+    }
+}
+
+impl From<ds_executor::ExecutionError> for Tiles3dError {
+    fn from(error: ds_executor::ExecutionError) -> Self {
+        match error {
+            ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
+            other => Self::ServiceUnavailable(other.to_string()),
         }
     }
 }

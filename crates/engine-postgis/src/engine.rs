@@ -311,6 +311,11 @@ impl PostgisEngine {
 // ─── EventSource (#549): recent point events for cross-engine joins ─────────
 
 impl ds_core::events::EventSource for PostgisEngine {
+    fn covers(&self, bbox: [f64; 4]) -> Option<bool> {
+        let [w, s, e, n] = self.config.events()?.coverage_bbox?;
+        Some(bbox[0] >= w && bbox[1] >= s && bbox[2] <= e && bbox[3] <= n)
+    }
+
     /// Events-shape window fetch for consumers in OTHER engines (the
     /// nowcast per-cell lightning join): the half-open window `(start,
     /// end]` across the whole table extent, ascending by time, NEWEST kept
@@ -1577,6 +1582,7 @@ mod tests {
             metadata_refresh_secs: 300,
             location_source: crate::schema::LocationSource::None,
             observations: ObservationSchema::Events(EventsShape {
+                coverage_bbox: None,
                 table: QualifiedTable {
                     schema: "public".into(),
                     table: "lightning".into(),
@@ -1641,6 +1647,7 @@ mod tests {
             metadata_refresh_secs: 300,
             location_source: crate::schema::LocationSource::None,
             observations: ObservationSchema::Events(EventsShape {
+                coverage_bbox: None,
                 table: QualifiedTable {
                     schema: "public".into(),
                     table: "lightning".into(),

@@ -25,10 +25,10 @@ pub use ds_core::cell_facts::Severity;
 /// Cell threshold (dBZ) for intelligence tracking — the Ritvanen-style
 /// convective contour, matching the verification harness default.
 pub const CELL_THRESHOLD_DBZ: f32 = 35.0;
-/// Minimum component size in pixels. 10 px ≈ 2.5 km² on the FMI 500 m
-/// grid — below that, 35 dBZ specks churn between generations and flood
-/// the Features layer with unmatched one-generation "cells".
-pub const CELL_MIN_AREA_PX: usize = 10;
+/// Minimum component area, independent of source resolution and working-grid
+/// coarsening. This is the intended 2.5 km² floor; the old 10-pixel floor
+/// accidentally required ~14 km² on the coarsened FMI composite.
+pub const CELL_MIN_AREA_KM2: f64 = 2.5;
 /// Speed-based matching gates (like `ds_core::cells::track_cells`):
 /// `gate_km = speed × elapsed + BASE_GATE_KM`, so the implied velocity of
 /// ANY accepted match is physically bounded. The old flat 20 km / 5 min
@@ -280,6 +280,7 @@ pub struct CellTrack {
     /// Lightning join (#549): strikes attributed to this cell over the
     /// last inter-generation window. `None` = no event source configured,
     /// or the join was skipped this generation (source error).
+    pub lightning_coverage: Option<bool>,
     pub flash_count: Option<u32>,
     /// The same window's strikes per minute.
     pub flash_rate_per_min: Option<f32>,
@@ -409,6 +410,67 @@ pub fn advance_tracks(
     .0
 }
 
+/// Advance observed tracks first; only unmatched detections may reclaim a
+/// track missing from the previous frame. Returned coasts are association-only:
+/// never serve, score, join lightning onto, or count them as observations.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_tracks_coasting(
+    previous: &[CellTrack],
+    coasting: &[CellTrack],
+    blobs: Vec<CellBlob>,
+    scale: PixelScale,
+    field: &MotionField,
+    displacement_secs: f32,
+    coast_displacement_secs: f32,
+    field_interval_secs: f32,
+    mut next_id: impl FnMut() -> u64,
+) -> (Vec<CellTrack>, Vec<CellTrack>, TrackStats) {
+    let (mut tracks, mut stats) = advance_tracks_with_stats(
+        previous,
+        blobs,
+        scale,
+        field,
+        displacement_secs,
+        field_interval_secs,
+        &mut next_id,
+    );
+    let previous_ids: std::collections::HashSet<_> = previous.iter().map(|t| t.id).collect();
+    let current_ids: std::collections::HashSet<_> = tracks.iter().map(|t| t.id).collect();
+    let next_coasts = previous
+        .iter()
+        .filter(|t| !current_ids.contains(&t.id))
+        .cloned()
+        .collect();
+    let births: Vec<_> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !previous_ids.contains(&t.id))
+        .map(|(i, _)| i)
+        .collect();
+    let (rescued, rescue_stats) = advance_tracks_with_stats(
+        coasting,
+        births.iter().map(|&i| tracks[i].blob.clone()).collect(),
+        scale,
+        field,
+        coast_displacement_secs,
+        field_interval_secs,
+        &mut next_id,
+    );
+    let coast_ids: std::collections::HashSet<_> = coasting.iter().map(|t| t.id).collect();
+    for (i, track) in births.into_iter().zip(rescued) {
+        if coast_ids.contains(&track.id) {
+            tracks[i] = track;
+        }
+    }
+    let matched = rescue_stats.pass1_matches + rescue_stats.pass2_matches;
+    stats.births -= matched;
+    stats.deaths = coasting.len() as u64 - matched;
+    stats.pass1_matches += rescue_stats.pass1_matches;
+    stats.pass2_matches += rescue_stats.pass2_matches;
+    stats.velocity_clamps += rescue_stats.velocity_clamps;
+    (tracks, next_coasts, stats)
+}
+
 /// `next_id` supplies ids for newborn tracks.
 #[allow(clippy::too_many_arguments)]
 pub fn advance_tracks_with_stats(
@@ -447,8 +509,9 @@ pub fn advance_tracks_with_stats(
             let mut b = t.blob.clone();
             match t.velocity_kms {
                 Some((vx, vy)) => {
-                    b.centroid.0 += vx * ds / scale.x;
-                    b.centroid.1 += vy * ds / scale.y;
+                    let next_y = b.centroid.1 + vy * ds / scale.y;
+                    b.centroid.0 += vx * ds / scale.x_at((b.centroid.1 + next_y) * 0.5);
+                    b.centroid.1 = next_y;
                 }
                 None => {
                     let (fu, fv) = field.sample(b.centroid.0, b.centroid.1);
@@ -507,7 +570,7 @@ pub fn advance_tracks_with_stats(
         .into_iter()
         .zip(matched_prev)
         .map(|(blob, prev_idx)| {
-            let area_km2 = blob.area as f64 * f64::from(scale.x) * f64::from(scale.y);
+            let area_km2 = blob.area_km2(scale);
             // Severity is hysteretic for a tracked cell (#623), so it can only
             // be computed once the predecessor is known — see each arm below.
             match prev_idx {
@@ -524,6 +587,7 @@ pub fn advance_tracks_with_stats(
                     deviant_streak: 0,
                     growing: None,
                     intensity_tendency: 0.0,
+                    lightning_coverage: None,
                     flash_count: None,
                     flash_rate_per_min: None,
                     flash_history: Vec::new(),
@@ -539,8 +603,8 @@ pub fn advance_tracks_with_stats(
                     let prev = &previous[pi];
                     // Track displacement over one interval, km in grid axes.
                     let ds = displacement_secs.max(1.0);
-                    let mut dx = (blob.centroid.0 - prev.blob.centroid.0) * scale.x / ds;
-                    let mut dy = (blob.centroid.1 - prev.blob.centroid.1) * scale.y / ds;
+                    let (dx, dy) = scale.delta(prev.blob.centroid, blob.centroid);
+                    let (mut dx, mut dy) = (dx / ds, dy / ds);
                     // Physical clamp before the EMA fold: a centroid jump
                     // past MAX_CELL_SPEED_MS (merge/split shifting the
                     // intensity-weighted centroid, or a residual mismatch)
@@ -566,7 +630,7 @@ pub fn advance_tracks_with_stats(
                     // Ambient flow at the cell: px/field-interval → km/s.
                     let fs = field_interval_secs.max(1.0);
                     let (fu, fv) = field.sample(blob.centroid.0, blob.centroid.1);
-                    let (fx_km, fy_km) = (fu * scale.x / fs, fv * scale.y / fs);
+                    let (fx_km, fy_km) = (fu * scale.x_at(blob.centroid.1) / fs, fv * scale.y / fs);
                     let to_ms = 1000.0;
                     let residual_ms =
                         (((vx_km - fx_km).powi(2) + (vy_km - fy_km).powi(2)).sqrt()) * to_ms;
@@ -624,6 +688,7 @@ pub fn advance_tracks_with_stats(
                         // The join (apply_lightning) fills this generation's
                         // stats after matching; the baseline history rides
                         // the track.
+                        lightning_coverage: None,
                         flash_count: None,
                         flash_rate_per_min: None,
                         flash_history: prev.flash_history.clone(),
@@ -769,9 +834,7 @@ pub fn apply_lightning(
         let gate2 = LIGHTNING_JOIN_RADIUS_KM * LIGHTNING_JOIN_RADIUS_KM;
         let mut best: Option<(usize, f32)> = None;
         for (k, t) in tracks.iter().enumerate() {
-            let dx = (sx - t.blob.centroid.0) * scale.x;
-            let dy = (sy - t.blob.centroid.1) * scale.y;
-            let d2 = dx * dx + dy * dy;
+            let d2 = scale.distance((sx, sy), t.blob.centroid).powi(2);
             if d2 <= gate2 && best.is_none_or(|(_, b)| d2 < b) {
                 best = Some((k, d2));
             }
@@ -784,6 +847,12 @@ pub fn apply_lightning(
 
     let window_min = (window_secs / 60.0).max(f32::EPSILON);
     for (idx, (t, &n)) in tracks.iter_mut().zip(&counts).enumerate() {
+        if t.lightning_coverage != Some(true) {
+            // A coverage gap also breaks the jump baseline: missing windows
+            // cannot become measured zeros or an adjacent-rate history.
+            t.flash_history.clear();
+            continue;
+        }
         let rate = n as f32 / window_min;
         // Keep the magnitude instead of collapsing it to the threshold test.
         // None while there is no baseline to measure against — 0.0 would
@@ -867,6 +936,7 @@ mod tests {
             blob: CellBlob {
                 centroid: (cx, cy),
                 area: 10,
+                physical_area_km2: None,
                 volume: 400.0,
                 max_value: 40.0,
             },
@@ -880,6 +950,7 @@ mod tests {
             growing: None,
             trend_anchor_volume: 0.0,
             intensity_tendency: 0.0,
+            lightning_coverage: Some(true),
             flash_count: None,
             flash_rate_per_min: None,
             flash_history: Vec::new(),
@@ -891,6 +962,114 @@ mod tests {
             cg_polarity_known_count: None,
             first_flash: None,
         }
+    }
+
+    #[test]
+    fn geographic_tracks_preserve_physical_speed_at_both_composite_edges() {
+        let scale = PixelScale::lonlat([6.7, 56.0, 43.0, 72.0], 1240, 1829);
+        let field = MotionField {
+            block: 1,
+            bw: 1,
+            bh: 1,
+            u: vec![0.0],
+            v: vec![0.0],
+            measured: vec![false],
+        };
+        for row in [0.5, 1828.5] {
+            let mut tracks = vec![bare_track(42, 400.0, row)];
+            for step in 1..5 {
+                let mut blob = tracks[0].blob.clone();
+                blob.centroid.0 += 3.0 / scale.x_at(row); // 10 m/s for 300 s
+                tracks = advance_tracks(&tracks, vec![blob], scale, &field, 300.0, 300.0, || 99);
+                assert_eq!(tracks[0].id, 42);
+                assert!((tracks[0].speed_ms().unwrap() - 10.0).abs() < 0.001);
+                assert!((tracks[0].net_displacement_km - 3.0 * step as f32).abs() < 0.001);
+            }
+            // Same physical attribution gate at both edges, including unlabeled strikes.
+            tracks[0].lightning_coverage = Some(true);
+            let x = tracks[0].blob.centroid.0;
+            apply_lightning(
+                &mut tracks,
+                &[
+                    (
+                        (x + (LIGHTNING_JOIN_RADIUS_KM - 0.1) / scale.x_at(row), row),
+                        EventAttrs::default(),
+                    ),
+                    (
+                        (x + (LIGHTNING_JOIN_RADIUS_KM + 0.1) / scale.x_at(row), row),
+                        EventAttrs::default(),
+                    ),
+                ],
+                &[],
+                1240,
+                scale,
+                300.0,
+                test_instant(),
+            );
+            assert_eq!(tracks[0].flash_count, Some(1));
+        }
+    }
+
+    #[test]
+    fn one_missing_frame_reassociates_without_serving_or_aging_the_coast() {
+        let field = MotionField {
+            block: 1,
+            bw: 1,
+            bh: 1,
+            u: vec![0.0],
+            v: vec![0.0],
+            measured: vec![false],
+        };
+        let scale = PixelScale::uniform(1.0, 1.0);
+        let mut initial = bare_track(42, 0.0, 0.0);
+        initial.age = 7;
+        initial.velocity_kms = Some((0.01, 0.0));
+        initial.first_flash = Some(test_instant());
+        let (missing, coast, stats) = advance_tracks_coasting(
+            &[initial.clone()],
+            &[],
+            vec![],
+            scale,
+            &field,
+            300.0,
+            600.0,
+            300.0,
+            || 100,
+        );
+        assert!(missing.is_empty(), "coasts are never observed cells");
+        assert_eq!(coast[0].age, 7);
+        assert_eq!(stats.deaths, 0);
+        let mut blob = initial.blob.clone();
+        blob.centroid = (6.0, 0.0);
+        let (returned, _, stats) = advance_tracks_coasting(
+            &[],
+            &coast,
+            vec![blob],
+            scale,
+            &field,
+            300.0,
+            600.0,
+            300.0,
+            || 100,
+        );
+        assert_eq!(returned[0].id, 42);
+        assert_eq!(returned[0].age, 8);
+        assert_eq!(returned[0].first_flash, initial.first_flash);
+        assert!((returned[0].velocity_kms.unwrap().0 - 0.01).abs() < 1e-6);
+        assert_eq!(stats.births, 0);
+        let (_, expired, stats) = advance_tracks_coasting(
+            &[],
+            &coast,
+            vec![],
+            scale,
+            &field,
+            300.0,
+            600.0,
+            300.0,
+            || 100,
+        );
+        assert!(expired.is_empty());
+        assert_eq!(stats.deaths, 1);
     }
 
     #[test]
@@ -906,7 +1085,7 @@ mod tests {
             }
         }
         let mut tracks = vec![bare_track(1, 3.0, 3.0), bare_track(2, 30.0, 10.0)];
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
         let strikes: Vec<((f32, f32), EventAttrs)> = [
             (3.5, 3.5),   // labeled footprint → track 1
             (30.0, 10.0), // unlabeled px → nearest centroid (track 2, 0 km)
@@ -942,7 +1121,7 @@ mod tests {
     fn lightning_jump_needs_baseline_floor_and_two_sigma() {
         let (w, h) = (10usize, 10usize);
         let labels = vec![0u32; w * h];
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
         let strike = (5.0f32, 5.0f32); // radius-joins the only track
         let mut tracks = vec![bare_track(1, 5.0, 5.0)];
 
@@ -1011,7 +1190,7 @@ mod tests {
             v: vec![0.0; 4],
             measured: vec![true; 4],
         };
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
 
         // 15 km jump in 300 s (50 m/s implied): outside the 13.5 km raw
         // gate — the track dies and the blob is born fresh.
@@ -1019,6 +1198,7 @@ mod tests {
         let far = CellBlob {
             centroid: (15.0, 0.0),
             area: 20,
+            physical_area_km2: None,
             volume: 800.0,
             max_value: 42.0,
         };
@@ -1036,6 +1216,7 @@ mod tests {
         let near = CellBlob {
             centroid: (12.0, 0.0),
             area: 20,
+            physical_area_km2: None,
             volume: 800.0,
             max_value: 42.0,
         };
@@ -1063,6 +1244,7 @@ mod tests {
         let blob = CellBlob {
             centroid: (50.0, 50.0),
             area: 20,
+            physical_area_km2: None,
             volume: 800.0,
             max_value: 42.0,
         };
@@ -1079,6 +1261,7 @@ mod tests {
             growing: None,
             trend_anchor_volume: 0.0,
             intensity_tendency: 0.0,
+            lightning_coverage: Some(true),
             flash_count: None,
             flash_rate_per_min: None,
             flash_history: Vec::new(),
@@ -1103,7 +1286,7 @@ mod tests {
             v: vec![0.0; 4],
             measured: vec![true; 4],
         };
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
         let mut next = 100u64;
         let tracks = advance_tracks(&previous, vec![blob], scale, &field, 300.0, 300.0, || {
             next += 1;
@@ -1137,6 +1320,7 @@ mod tests {
         let weak = CellBlob {
             centroid: (0.0, 0.0),
             area: 10,
+            physical_area_km2: None,
             volume: 10.0,
             max_value: 40.0,
         };
@@ -1154,7 +1338,7 @@ mod tests {
     fn tracks_carry_id_age_velocity_and_flag_deviant_movers() {
         // Ambient field: everything (the big disc) moves +4 px/interval in x.
         // The small disc moves -4 px/interval — against the flow.
-        let scale = PixelScale { x: 1.0, y: 1.0 }; // 1 km/px, interval 300 s
+        let scale = PixelScale::uniform(1.0, 1.0); // 1 km/px, interval 300 s
         let f0 = |big_x: f32, small_x: f32| {
             let mut g = disc(300, 120, big_x, 60.0, 25.0, 45.0);
             let s = disc(300, 120, small_x, 30.0, 5.0, 50.0);
@@ -1174,7 +1358,7 @@ mod tests {
         };
         let t0 = advance_tracks(
             &[],
-            segment_cells(&frame_a, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX),
+            segment_cells(&frame_a, CELL_THRESHOLD_DBZ, 10),
             scale,
             &field,
             300.0,
@@ -1189,7 +1373,7 @@ mod tests {
             let fa = f0(150.0 + 4.0 * step as f32, 250.0 - 4.0 * step as f32);
             tracks = advance_tracks(
                 &tracks,
-                segment_cells(&fa, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX),
+                segment_cells(&fa, CELL_THRESHOLD_DBZ, 10),
                 scale,
                 &field,
                 300.0,
@@ -1222,7 +1406,7 @@ mod tests {
             &[],
             &[],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1232,7 +1416,7 @@ mod tests {
             &[],
             &[],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1249,7 +1433,7 @@ mod tests {
             &strikes,
             &[1],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1267,7 +1451,7 @@ mod tests {
         let mut t = bare_track(1, 0.5, 0.5);
         t.flash_history = vec![1.0, 1.0];
         let mut tracks = vec![t];
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
         // No strikes: nothing to stamp.
         apply_lightning(&mut tracks, &[], &[1], 1, scale, 60.0, test_instant());
         assert_eq!(tracks[0].first_flash, None);
@@ -1308,7 +1492,7 @@ mod tests {
         let mut t = bare_track(1, 0.5, 0.5);
         t.flash_history = vec![1.0];
         let mut tracks = vec![t];
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
         let at = |cloud, current| EventAttrs {
             cloud_indicator: Some(cloud),
             peak_current_ka: Some(current),
@@ -1340,7 +1524,7 @@ mod tests {
             &strikes,
             &[1],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1373,7 +1557,7 @@ mod tests {
             &strikes,
             &[1],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1409,7 +1593,7 @@ mod tests {
             &strikes,
             &[1],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1440,7 +1624,7 @@ mod tests {
             &strikes,
             &[1],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1485,7 +1669,7 @@ mod tests {
             &strikes,
             &[1, 2],
             2,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1514,7 +1698,7 @@ mod tests {
             &[],
             &[1],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1539,7 +1723,7 @@ mod tests {
             &strikes,
             &[1],
             1,
-            PixelScale { x: 1.0, y: 1.0 },
+            PixelScale::uniform(1.0, 1.0),
             60.0,
             test_instant(),
         );
@@ -1555,6 +1739,7 @@ mod tests {
         CellBlob {
             centroid: (0.5, 0.5),
             area,
+            physical_area_km2: None,
             volume: max_dbz * area as f32,
             max_value: max_dbz,
         }
@@ -1750,7 +1935,7 @@ mod tests {
         // The asymmetry the metric relies on. Two tracks end the same distance
         // from their origin; one got there directly, the other by ping-ponging.
         // Only the path length tells them apart, so only the ratio does.
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
         let straight: Vec<(f32, f32)> = (0..=10).map(|i| (i as f32 * 3.0, 0.0)).collect();
         let pingpong: Vec<(f32, f32)> = (0..=10)
             .map(|i| if i % 2 == 0 { (0.0, 0.0) } else { (6.3, 0.0) })
@@ -1800,7 +1985,7 @@ mod tests {
 
     #[test]
     fn a_tracked_cell_accumulates_path_and_net_from_its_origin() {
-        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let scale = PixelScale::uniform(1.0, 1.0);
         let frame = |x: f32| disc(300, 120, x, 60.0, 12.0, 50.0);
         let field = estimate_motion(&frame(100.0), &frame(104.0), &MotionOptions::default());
         let mut counter = 0u64;
@@ -1810,7 +1995,7 @@ mod tests {
         };
         let mut tracks = advance_tracks(
             &[],
-            segment_cells(&frame(100.0), CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX),
+            segment_cells(&frame(100.0), CELL_THRESHOLD_DBZ, 10),
             scale,
             &field,
             300.0,
@@ -1824,7 +2009,7 @@ mod tests {
         for x in [104.0f32, 108.0, 112.0] {
             tracks = advance_tracks(
                 &tracks,
-                segment_cells(&frame(x), CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX),
+                segment_cells(&frame(x), CELL_THRESHOLD_DBZ, 10),
                 scale,
                 &field,
                 300.0,
@@ -1897,12 +2082,14 @@ mod tests {
                 CellBlob {
                     centroid: (10.0, 50.0),
                     area: 10,
+                    physical_area_km2: None,
                     volume: 100.0,
                     max_value: 45.0,
                 },
                 CellBlob {
                     centroid: (12.0, 50.0),
                     area: 60,
+                    physical_area_km2: None,
                     volume: 900.0,
                     max_value: 53.0,
                 },
@@ -1962,6 +2149,7 @@ mod tests {
         let grown = CellBlob {
             centroid: (2.0, 0.0),
             area: 40,
+            physical_area_km2: None,
             volume: 2000.0,
             max_value: 48.0,
         };
@@ -2002,6 +2190,7 @@ mod tests {
         let blob = |x: f32| CellBlob {
             centroid: (x, 0.0),
             area: 10,
+            physical_area_km2: None,
             volume: 400.0,
             max_value: 40.0,
         };
@@ -2088,6 +2277,7 @@ mod tests {
         let blob = |x: f32| CellBlob {
             centroid: (x, 50.0),
             area: 20,
+            physical_area_km2: None,
             volume: 300.0,
             max_value: 48.0,
         };

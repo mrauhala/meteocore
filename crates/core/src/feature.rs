@@ -931,7 +931,9 @@ pub fn property_names<'a>(
 
 /// Part 1 property filters are ANDed, including repeated names. Lists match
 /// any element; absent/null values never match. Scalars use exact strings
-/// (Rust's canonical Display form for finite numbers and booleans).
+/// (Rust's canonical Display form for finite numbers and booleans). Numeric
+/// values additionally accept comma-separated alternatives; commas stay literal
+/// for strings, and predicates (including repeated names) still combine by AND.
 pub fn matches_property_filters(feature: &Feature, filters: &[(String, String)]) -> bool {
     matches_property_values(&feature.properties, filters)
 }
@@ -942,11 +944,18 @@ pub fn matches_property_values(
     properties: &HashMap<String, PropertyValue>,
     filters: &[(String, String)],
 ) -> bool {
+    // Numeric alternatives are additive: a numeric scalar could never have
+    // matched a comma before. Text (including literal commas) stays exact.
+    fn numeric_matches(canonical: &str, expected: &str) -> bool {
+        expected
+            .split(',')
+            .any(|alternative| alternative == canonical)
+    }
     fn matches(value: &PropertyValue, expected: &str) -> bool {
         match value {
             PropertyValue::String(s) => s == expected,
-            PropertyValue::Integer(n) => n.to_string() == expected,
-            PropertyValue::Float(n) => n.is_finite() && n.to_string() == expected,
+            PropertyValue::Integer(n) => numeric_matches(&n.to_string(), expected),
+            PropertyValue::Float(n) => n.is_finite() && numeric_matches(&n.to_string(), expected),
             PropertyValue::Bool(b) => b.to_string() == expected,
             PropertyValue::List(values) => values.iter().any(|v| matches(v, expected)),
             PropertyValue::Null => false,
@@ -1203,6 +1212,37 @@ impl Default for FeatureQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_alternatives_preserve_text_commas_and_and_between_predicates() {
+        let f = feat(
+            "f",
+            vec![
+                ("code", PropertyValue::Integer(3)),
+                ("float", PropertyValue::Float(1.5)),
+                ("text", PropertyValue::String("3,4".into())),
+                (
+                    "codes",
+                    PropertyValue::List(vec![PropertyValue::Integer(3), PropertyValue::Integer(5)]),
+                ),
+            ],
+        );
+        let check =
+            |key: &str, value: &str| matches_property_filters(&f, &[(key.into(), value.into())]);
+        assert!(check("code", "1,3,5"));
+        assert!(check("float", "1,1.5,2"));
+        assert!(!check("float", "1,1.50,2"));
+        assert!(!check("code", "1,03,5"));
+        assert!(!check("code", "1, 3,5"));
+        assert!(check("text", "3,4"));
+        assert!(!check("text", "3"));
+        assert!(!check("text", "1,3,4"));
+        assert!(check("codes", "1,5"));
+        assert!(!matches_property_filters(
+            &f,
+            &[("code".into(), "1,3,5".into()), ("code".into(), "4".into())]
+        ));
+    }
 
     #[test]
     fn property_filters_match_exact_scalars_lists_and_conjunctions() {

@@ -374,6 +374,25 @@ static GEOTIFF_DECODED_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock:
     )
 });
 
+static GEOTIFF_DECODE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "geotiff_decode_reserved_bytes",
+        "Reserved transient GeoTIFF decode memory",
+    )
+});
+static GEOTIFF_DECODE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "geotiff_decode_capacity_bytes",
+        "Transient GeoTIFF decode memory capacity",
+    )
+});
+static GEOTIFF_DECODE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "geotiff_decode_rejected_total",
+        "GeoTIFF decodes rejected by memory admission",
+    )
+});
+
 // Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
 // decoded event windows for the events-shape map layer, so the ~50-190
 // meta-tile renders tiling one frame share ONE DB fetch.
@@ -1098,6 +1117,50 @@ static RENDER_SEMAPHORE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+static RENDER_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_queue_depth",
+        "Requests waiting for a shared render slot",
+    )
+});
+static RENDER_QUEUE_CAPACITY: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_queue_capacity",
+        "Maximum requests waiting for a shared render slot",
+    )
+});
+static RENDER_QUEUE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "render_queue_rejected_total",
+        "Requests rejected immediately because the render queue was full",
+    )
+});
+static RENDER_DEADLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "render_deadline_exceeded_total",
+        "Requests exceeding their queue plus execution deadline",
+    )
+});
+
+static RENDER_MEMORY_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_budget_available_bytes",
+        "Available transient raster render budget",
+    )
+});
+static RENDER_MEMORY_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_budget_total_bytes",
+        "Total transient raster render budget",
+    )
+});
+static RENDER_MEMORY_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "render_budget_rejected_total",
+        "Raster requests rejected by memory admission",
+    )
+});
+
 static STORAGE_BYTES_READ: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -1152,6 +1215,9 @@ pub struct ServerState {
     pub tiles: Arc<ArcSwap<TilesState>>,
     pub tiles_3d: Arc<ArcSwap<api_3dtiles::TilesState3d>>,
     pub config_path: String,
+    /// Last accepted config/styles, used by recovery without reading config files.
+    pub accepted_load: RwLock<Option<Arc<AcceptedLoad>>>,
+    pub recovery_shutdown: ds_poll::Shutdown,
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
     pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
@@ -1236,12 +1302,13 @@ pub struct ReusableCaches {
 /// [`ServerState::engine_handles`], so an incremental reload (#574) can hand
 /// unchanged collections' engines back to [`load_collections`] for reuse.
 ///
-/// Only engine types with a poll loop appear here: their catalogs stay fresh
-/// without a rebuild. `csv`/`geojson` have NO poll loop — a reload is the only
-/// way they re-read a changed data file — so they always rebuild and are
-/// deliberately absent.
+/// Explicit reloads rebuild CSV/GeoJSON because they have no poll loop.
+/// Recovery also retains their handles so retrying a radar cannot reload
+/// unrelated static files or reset a nowcast that depends on them.
 #[derive(Clone)]
 pub enum EngineHandle {
+    Csv(Arc<engine_csv::CsvEngine>),
+    Geojson(Arc<engine_geojson::GeoJsonEngine>),
     Geotiff(Arc<engine_geotiff::GeoTiffEngine>),
     QueryData(Arc<engine_querydata::QueryDataEngine>),
     Grib(Arc<engine_grib::GribEngine>),
@@ -1278,6 +1345,8 @@ macro_rules! reuse_take {
 }
 
 impl EngineReuse {
+    reuse_take!(take_csv, Csv, engine_csv::CsvEngine);
+    reuse_take!(take_geojson, Geojson, engine_geojson::GeoJsonEngine);
     reuse_take!(take_geotiff, Geotiff, engine_geotiff::GeoTiffEngine);
     reuse_take!(take_querydata, QueryData, engine_querydata::QueryDataEngine);
     reuse_take!(take_grib, Grib, engine_grib::GribEngine);
@@ -1529,33 +1598,39 @@ pub fn load_collections(
                         continue;
                     }
                 };
-                let store = match engine_csv::CsvDataStore::load(data_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to load CSV from {}: {}",
-                            collection.id,
-                            data_path,
-                            e
+                let engine = match engine_reuse.take_csv(&collection.id) {
+                    Some(engine) => engine,
+                    None => {
+                        let store = match engine_csv::CsvDataStore::load(data_path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Collection '{}': failed to load CSV from {}: {}",
+                                    collection.id,
+                                    data_path,
+                                    e
+                                );
+                                health.push(CollectionHealth {
+                                    id: collection.id.clone(),
+                                    engine_type: "csv".into(),
+                                    status: CollectionStatus::Failed,
+                                    error: Some(format!("{e}")),
+                                });
+                                continue;
+                            }
+                        };
+
+                        info!(
+                            "Loaded {} rows, {} locations, {} parameters",
+                            store.rows.len(),
+                            store.location_index.len(),
+                            store.parameter_names.len()
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "csv".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+
+                        Arc::new(engine_csv::CsvEngine::new(store))
                     }
                 };
-
-                info!(
-                    "Loaded {} rows, {} locations, {} parameters",
-                    store.rows.len(),
-                    store.location_index.len(),
-                    store.parameter_names.len()
-                );
-
-                let engine = Arc::new(engine_csv::CsvEngine::new(store));
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Csv(engine.clone()));
 
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
@@ -1595,24 +1670,28 @@ pub fn load_collections(
                         continue;
                     }
                 };
-                let engine = match engine_geojson::GeoJsonEngine::load(data_path) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to load GeoJSON from {}: {}",
-                            collection.id,
-                            data_path,
-                            e
-                        );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "geojson".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
-                    }
+                let engine = match engine_reuse.take_geojson(&collection.id) {
+                    Some(engine) => engine,
+                    None => match engine_geojson::GeoJsonEngine::load(data_path) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to load GeoJSON from {}: {}",
+                                collection.id,
+                                data_path,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "geojson".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Geojson(engine.clone()));
 
                 info!(
                     "Loaded {} features, extent: {:?}",
@@ -2440,7 +2519,7 @@ pub fn load_collections(
                     // a working registry — see `reload_handler`.
                     tracing::warn!(
                         "Collection '{}': PVOL source has no radar sites yet — no per-site \
-                         collections registered. Reload once volume files arrive.",
+                         collections registered. Remote sources retry registration automatically; local sources require reload.",
                         collection.id
                     );
                     health.push(CollectionHealth {
@@ -3416,13 +3495,9 @@ pub fn load_collections(
     // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
     // because decode/encode interleaves with bilinear passes; configurable
     // knob tracked in #147.
-    let render_concurrency = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .saturating_mul(2)
-        .max(8);
+    let render_concurrency = ds_executor::render_concurrency();
     tracing::info!("Render concurrency: {render_concurrency} (2× available CPUs, min 8)");
-    let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
+    let render_semaphore = ds_executor::RENDER_SLOTS.clone();
     // Reuse the live render caches across a reload when their configured byte
     // size is unchanged, so a reload preserves the warm cache instead of
     // dumping GBs of meta-tiles and forcing a cold re-warm (see
@@ -3844,6 +3919,7 @@ pub(crate) struct ReloadOutcome {
 }
 
 /// Why a reload was rejected — the live registry is left untouched in both cases.
+#[derive(Debug)]
 pub(crate) enum ReloadError {
     /// Re-reading / parsing the config failed (e.g. a malformed collection file).
     ConfigRead(String),
@@ -3923,27 +3999,182 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         ),
     );
 
-    let base_url = config.server.base_url();
+    let fingerprint = crate::colormaps::style_config_fingerprint(&config, config_dir.as_deref());
+    apply_load(
+        state,
+        Arc::new(AcceptedLoad::new(&config, style_ctx, fingerprint)),
+        false,
+    )
+}
 
-    // NOTE: old poll loops are shut down *after* the reload guard below, not
-    // here. If the guard rejects the reload (no `Ready` collection), the old
-    // engines and their poll loops must stay alive — otherwise a rejected
-    // reload would freeze the live registry with dead loops and no new ones
-    // spawned (the guard returns before the spawn block).
+/// Inputs already accepted through startup or an explicit reload. Recovery must
+/// never pick up unapproved file edits or discard command-line collection filters.
+pub struct AcceptedLoad {
+    collections: Vec<CollectionConfig>,
+    style_bundles: Vec<ds_core::config::StyleBundle>,
+    styles: ds_render::StyleContext,
+    base_url: String,
+    trust_proxy_headers: bool,
+    metatile_cache_mb: u64,
+    mcp_enabled: bool,
+    fingerprint: u64,
+}
 
-    // Carry the live render caches into the reload so it preserves the warm
-    // cache instead of rebuilding it empty — a spurious `collections_dir`
-    // watcher event must not dump a multi-GB meta-tile cache. `load_collections`
-    // reuses each one iff its configured size is unchanged.
-    //
-    // EXCEPT when GLOBAL style config changed (palettes, bundles,
-    // parameter_defaults, colormaps_dir files): the rendered / meta-tile keys
-    // carry no style content, so reusing those caches would keep serving the
-    // OLD colors as X-Cache HITs. A per-collection [wms] edit is handled more
-    // surgically: it changes that collection's config, so the incremental
-    // diff below rebuilds it and the post-swap sweep evicts only its entries.
-    // The (style-independent) vector-tile cache is always safe to reuse.
-    let new_style_fp = crate::colormaps::style_config_fingerprint(&config, config_dir.as_deref());
+impl AcceptedLoad {
+    pub fn new(
+        config: &ds_core::config::ServerConfig,
+        styles: ds_render::StyleContext,
+        fingerprint: u64,
+    ) -> Self {
+        Self {
+            collections: config.collections.clone(),
+            style_bundles: config.style_bundles.clone(),
+            styles,
+            base_url: config.server.base_url(),
+            trust_proxy_headers: config.server.trust_proxy_headers,
+            metatile_cache_mb: config.server.metatile_cache_mb,
+            mcp_enabled: config.mcp.as_ref().is_some_and(|m| m.enabled),
+            fingerprint,
+        }
+    }
+}
+
+fn remote_radar(c: &CollectionConfig) -> bool {
+    matches!(c.engine_type.as_str(), "odim" | "odim-volume")
+        && c.odim.as_ref().is_some_and(|o| {
+            (o.endpoint.is_some() && o.bucket.is_some())
+                || (c.engine_type == "odim"
+                    && c.data_path
+                        .as_ref()
+                        .is_some_and(|p| p.starts_with("https://") || p.starts_with("http://")))
+        })
+}
+
+pub(crate) fn has_pending_radar(
+    collections: &[CollectionConfig],
+    health: &[CollectionHealth],
+) -> bool {
+    collections.iter().any(|c| {
+        remote_radar(c)
+            && health
+                .iter()
+                .any(|h| h.id == c.id && h.status != CollectionStatus::Ready)
+    })
+}
+
+/// Only an all-remote-radar deployment may boot with every collection failed.
+/// A pending remote radar must not conceal a failed local/configured collection.
+pub(crate) fn can_start_failed_radar(collections: &[CollectionConfig]) -> bool {
+    !collections.is_empty() && collections.iter().all(remote_radar)
+}
+
+#[cfg(test)]
+mod radar_startup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_local_failures_do_not_gain_the_remote_startup_exception() {
+        let remote: CollectionConfig = toml::from_str(
+            r#"
+id = "radar"
+title = "radar"
+description = "test"
+engine_type = "odim"
+[odim]
+endpoint = "https://example.com"
+bucket = "radar"
+"#,
+        )
+        .unwrap();
+        let local: CollectionConfig = toml::from_str(
+            r#"
+id = "local"
+title = "local"
+description = "test"
+data_path = "/missing/weather.csv"
+"#,
+        )
+        .unwrap();
+        assert!(can_start_failed_radar(std::slice::from_ref(&remote)));
+        assert!(!can_start_failed_radar(&[remote.clone(), local]));
+        let mut local_radar = remote.clone();
+        local_radar.odim.as_mut().unwrap().endpoint = None;
+        local_radar.odim.as_mut().unwrap().bucket = None;
+        local_radar.data_path = Some("/missing/radar".into());
+        assert!(!can_start_failed_radar(&[remote, local_radar]));
+        assert!(!can_start_failed_radar(&[]));
+    }
+}
+
+/// Retry failed startup scans and re-expand empty PVOL inventories. The existing
+/// loader wires per-site routes and dependent nowcasts, not just an engine catalog.
+/// Run only on the background runtime, serialized with manual/watcher reloads.
+pub(crate) async fn radar_recovery_loop(state: AdminState) {
+    let mut delay = std::time::Duration::from_secs(30);
+    while state.recovery_shutdown.sleep(delay).await {
+        let Ok(_guard) = state.reload_lock.try_lock() else {
+            continue;
+        };
+        if state.recovery_shutdown.is_shutdown() {
+            break;
+        }
+        match recover_radar_once(&state) {
+            Ok(RecoveryOutcome::Idle | RecoveryOutcome::Recovered) => {
+                delay = std::time::Duration::from_secs(30);
+            }
+            Ok(RecoveryOutcome::Pending) => {
+                delay = (delay * 2).min(std::time::Duration::from_secs(300));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Radar startup recovery failed; preserving live collections: {error:?}"
+                );
+                delay = (delay * 2).min(std::time::Duration::from_secs(300));
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum RecoveryOutcome {
+    Idle,
+    Pending,
+    Recovered,
+}
+
+pub(crate) fn recover_radar_once(state: &AdminState) -> Result<RecoveryOutcome, ReloadError> {
+    let Some(inputs) = state
+        .accepted_load
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    else {
+        return Ok(RecoveryOutcome::Idle);
+    };
+    if !has_pending_radar(
+        &inputs.collections,
+        &state.health.read().unwrap_or_else(|e| e.into_inner()),
+    ) {
+        return Ok(RecoveryOutcome::Idle);
+    }
+    let outcome = apply_load(state, inputs, true)?;
+    // A partial reload can be accepted while a source is still down. Keep the
+    // backoff in that case too, instead of hammering it every base interval.
+    if outcome.health.iter().any(|h| {
+        h.status != CollectionStatus::Ready
+            && matches!(h.engine_type.as_str(), "odim" | "odim-volume")
+    }) {
+        return Ok(RecoveryOutcome::Pending);
+    }
+    Ok(RecoveryOutcome::Recovered)
+}
+
+fn apply_load(
+    state: &AdminState,
+    config: Arc<AcceptedLoad>,
+    recovery: bool,
+) -> Result<ReloadOutcome, ReloadError> {
+    let new_style_fp = config.fingerprint;
     let styles_changed = state
         .style_fingerprint
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -3976,7 +4207,13 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let reusable = reusable_collections(&old_collections, &config.collections, &live_handles);
+    let reusable = if recovery {
+        // Same accepted configuration: preserve static CSV/GeoJSON and their
+        // nowcast dependents too. Explicit reload retains its rebuild semantics.
+        live_handles.keys().cloned().collect()
+    } else {
+        reusable_collections(&old_collections, &config.collections, &live_handles)
+    };
     let engine_reuse = EngineReuse {
         engines: live_handles
             .iter()
@@ -3991,12 +4228,12 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     );
 
     let mut result = load_collections(
-        &style_ctx,
+        &config.styles,
         &config.collections,
         &config.style_bundles,
-        &base_url,
-        config.server.trust_proxy_headers,
-        config.server.metatile_cache_mb,
+        &config.base_url,
+        config.trust_proxy_headers,
+        config.metatile_cache_mb,
         reuse,
         engine_reuse,
     );
@@ -4159,7 +4396,7 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // cannot introduce it on a server that started without it. Enabling for
     // the first time needs a restart — say so rather than let the reload
     // report success and change nothing.
-    match (&state.mcp, config.mcp.as_ref().is_some_and(|m| m.enabled)) {
+    match (&state.mcp, config.mcp_enabled) {
         (Some(McpWiring { auth, .. }), enabled) => {
             if enabled != auth.is_enabled() {
                 tracing::warn!(
@@ -4222,6 +4459,11 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         .engine_handles
         .write()
         .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut result.engines_by_id);
+
+    *state
+        .accepted_load
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
 
     // Update health
     update_health_gauges(&result.health);
@@ -4575,6 +4817,14 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
+    let execution = ds_executor::metrics();
+    RENDER_QUEUE_DEPTH.set(execution.queued as i64);
+    RENDER_QUEUE_CAPACITY.set(execution.capacity as i64);
+    RENDER_QUEUE_REJECTED.feed(execution.rejected);
+    RENDER_DEADLINES.feed(execution.timed_out);
+    let memory = &*ds_render::budget::RENDER_MEMORY;
+    RENDER_MEMORY_AVAILABLE.set(memory.available().min(i64::MAX as u64) as i64);
+    RENDER_MEMORY_TOTAL.set(memory.capacity().min(i64::MAX as u64) as i64);
     update_memory_gauges();
 
     // Delta-tracked cache counters: cache implementations expose cumulative
@@ -4585,6 +4835,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     let mut counter_state = CACHE_COUNTER_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    RENDER_MEMORY_REJECTED.feed(memory.rejected());
 
     // Rendered image cache: global (single cache shared across collections).
     RENDERED_CACHE_METRICS.update(
@@ -4646,6 +4897,10 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .unwrap_or_else(|e| e.into_inner())
         .is_empty();
     if has_geotiff {
+        let (used, limit, rejected) = engine_geotiff::decode_budget::metrics();
+        GEOTIFF_DECODE_USED.set(used.min(i64::MAX as usize) as i64);
+        GEOTIFF_DECODE_LIMIT.set(limit.min(i64::MAX as usize) as i64);
+        GEOTIFF_DECODE_REJECTED.feed(rejected as u64);
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
     }

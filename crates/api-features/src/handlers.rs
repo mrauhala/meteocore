@@ -323,7 +323,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "name": name,
                     "in": "query",
                     "required": false,
-                    "description": "Exact, case-sensitive property equality (OGC API Features Part 1 §7.15.5–6). Lists match any element; numbers and booleans use canonical string form; null/missing never match. All predicates, including repeated names, are ANDed before paging.",
+                    "description": "Exact, case-sensitive property equality (OGC API Features Part 1 §7.15.5–6). Lists match any element; numbers and booleans use canonical string form. Numeric values also accept comma-separated alternatives (OR within that predicate, no spaces); commas in strings remain literal. Null/missing never match. All predicates, including repeated names, are ANDed before paging.",
                     "style": "form",
                     "explode": false,
                     "schema": {"type": "string"}

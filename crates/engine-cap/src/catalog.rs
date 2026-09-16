@@ -125,7 +125,7 @@ impl Catalog {
     pub fn empty(parameter: &str, as_of: DateTime<Utc>) -> Self {
         Catalog {
             records: Vec::new(),
-            filterables: Default::default(),
+            filterables: Arc::new(["awareness_type_code".to_string()].into_iter().collect()),
             id_index: HashMap::new(),
             tree: RTree::new(),
             spatial_extent: None,
@@ -261,8 +261,11 @@ impl Catalog {
         let temporal_extent = compute_temporal_extent(&records, as_of);
         let info = Arc::new(base_raster_info(parameter, spatial_extent, times));
 
-        let filterables =
+        let mut filterables =
             ds_core::feature::property_names(records.iter().map(|r| r.properties.as_ref()));
+        // A derived, known property stays queryable even when no current
+        // alerts have a valid code (or the collection is empty).
+        Arc::make_mut(&mut filterables).insert("awareness_type_code".into());
         Catalog {
             filterables,
             records,
@@ -618,10 +621,28 @@ fn build_properties(
         );
     }
 
+    // Keep producer text verbatim, and expose its numeric awareness identifier
+    // separately so label capitalization/localization cannot change selection.
+    let codes: Vec<_> = info
+        .parameters
+        .iter()
+        .filter(|(name, _)| name == "awareness_type")
+        .filter_map(|(_, value)| awareness_type_code(value))
+        .map(PropertyValue::Integer)
+        .collect();
+    if !codes.is_empty() {
+        let value = if codes.len() == 1 {
+            codes.into_iter().next().unwrap()
+        } else {
+            PropertyValue::List(codes)
+        };
+        p.insert("awareness_type_code".into(), value);
+    }
+
     // Producer-defined valueName/value pairs (CAP §3.2.2). `<parameter>`s
     // are exposed under their own valueName — MeteoAlarm clients expect
     // `awareness_level` / `awareness_type` as plain top-level properties, and
-    // the MVT tag encoder and any future `<property>=value` filter are flat
+    // the MVT tag encoder and `<property>=value` filters are flat
     // too. `<eventCode>`s are namespaced (`eventCode:<valueName>`) because
     // their names are terse system ids (`OET`, `SAME`). A name that repeats
     // (MeteoAlarm's `impacts`) becomes a List in document order; a parameter
@@ -631,7 +652,7 @@ fn build_properties(
         p.insert(key, value);
     }
     for (key, value) in group_pairs(&info.parameters, |n| n.to_string()) {
-        let key = if p.contains_key(&key) {
+        let key = if p.contains_key(&key) || key == "awareness_type_code" {
             format!("parameter:{key}")
         } else {
             key
@@ -639,6 +660,19 @@ fn build_properties(
         p.insert(key, value);
     }
     p
+}
+
+/// MeteoAlarm's `code; label` convention. Only derive a code from an
+/// unambiguous positive integer prefix and a nonempty label; leave malformed
+/// producer values untouched without inventing a numeric value. Do not infer
+/// the code from the label or freeze the set of codes to a particular edition.
+fn awareness_type_code(value: &str) -> Option<i64> {
+    let (code, label) = value.split_once(';')?;
+    let code = code.trim();
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) || label.trim().is_empty() {
+        return None;
+    }
+    code.parse::<i64>().ok().filter(|&n| n > 0)
 }
 
 /// Group `(valueName, value)` pairs by name (first-seen order): one value
@@ -707,23 +741,33 @@ fn union_extent(records: &[AreaRecord]) -> Option<[f64; 4]> {
     any.then_some(ext)
 }
 
-/// Distinct window boundaries at/below `as_of`, plus `as_of` itself (always the
-/// max, so a WMS TIME-less request — which the handler resolves to `times.last()`
-/// — renders the set active *now*). Capped to the most recent [`MAX_TIME_VALUES`].
+/// Advertise warning boundaries through the next seven days, retaining the
+/// default "now" even under the cardinality cap. Prefer nearby boundaries
+/// when trimming; neither a long archive nor distant forecasts can evict now.
 fn build_times(records: &[AreaRecord], as_of: DateTime<Utc>) -> Vec<DateTime<Utc>> {
-    let mut times: Vec<DateTime<Utc>> = Vec::new();
+    let horizon = as_of
+        .checked_add_signed(Duration::days(7))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let mut times = vec![as_of];
     for r in records {
-        for b in [r.window.start, r.window.end].into_iter().flatten() {
-            if b <= as_of {
-                times.push(b);
-            }
-        }
+        times.extend(
+            [r.window.start, r.window.end]
+                .into_iter()
+                .flatten()
+                .filter(|&t| t <= horizon),
+        );
     }
-    times.push(as_of);
     times.sort_unstable();
     times.dedup();
     if times.len() > MAX_TIME_VALUES {
-        times.drain(0..times.len() - MAX_TIME_VALUES);
+        times.sort_unstable_by_key(|t| {
+            (
+                t.signed_duration_since(as_of).num_seconds().unsigned_abs(),
+                *t,
+            )
+        });
+        times.truncate(MAX_TIME_VALUES);
+        times.sort_unstable();
     }
     times
 }
@@ -922,6 +966,60 @@ mod tests {
       </info></alert>"#;
 
     #[test]
+    fn awareness_code_derivation_preserves_text_lists_and_producer_collisions() {
+        let mut alerts = parse_document(DOC).unwrap();
+        alerts[0].infos[0].parameters = vec![
+            ("awareness_type".into(), "3; Thunderstorm".into()),
+            ("awareness_type".into(), " 12 ; flooding".into()),
+            ("awareness_type".into(), "not-a-code; Wind".into()),
+            ("awareness_type_code".into(), "99".into()),
+        ];
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        let properties = &cat.records[0].properties;
+        assert_eq!(
+            properties["awareness_type_code"],
+            PropertyValue::List(vec![PropertyValue::Integer(3), PropertyValue::Integer(12)])
+        );
+        assert_eq!(
+            properties["parameter:awareness_type_code"],
+            PropertyValue::String("99".into())
+        );
+        assert_eq!(
+            properties["awareness_type"],
+            PropertyValue::List(vec![
+                PropertyValue::String("3; Thunderstorm".into()),
+                PropertyValue::String(" 12 ; flooding".into()),
+                PropertyValue::String("not-a-code; Wind".into())
+            ])
+        );
+        for value in [
+            "3",
+            "3;",
+            "3;  ",
+            "-3; label",
+            "+3; label",
+            "0; label",
+            "3.0; label",
+            "٣; label",
+            "999999999999999999999999; label",
+        ] {
+            assert_eq!(awareness_type_code(value), None, "{value}");
+        }
+        alerts[0].infos[0].parameters = vec![
+            ("awareness_type".into(), "malformed".into()),
+            ("awareness_type_code".into(), "3".into()),
+        ];
+        let empty = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        assert!(!empty.records[0]
+            .properties
+            .contains_key("awareness_type_code"));
+        assert_eq!(
+            empty.records[0].properties["parameter:awareness_type_code"],
+            PropertyValue::String("3".into())
+        );
+    }
+
+    #[test]
     fn builds_record_with_swapped_geometry() {
         let alerts = parse_document(DOC).unwrap();
         let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
@@ -1092,12 +1190,36 @@ mod tests {
     }
 
     #[test]
-    fn times_end_at_as_of_for_now_default() {
+    fn times_include_future_boundaries_and_now() {
         let alerts = parse_document(DOC).unwrap();
         let as_of = at(2026, 6, 15, 12);
         let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", as_of);
-        assert_eq!(cat.info.times.last(), Some(&as_of));
-        // The future expiry (16:00) is excluded (> as_of) so as_of stays the max.
-        assert!(cat.info.times.iter().all(|&t| t <= as_of));
+        assert!(cat.info.times.contains(&as_of));
+        assert!(cat.info.times.contains(&at(2026, 6, 15, 16)));
+    }
+    #[test]
+    fn capped_timeline_keeps_now_and_bounds_future_horizon() {
+        let as_of = at(2026, 6, 15, 12);
+        let cat = Catalog::build(
+            &parse_document(DOC).unwrap(),
+            &cfg(),
+            "cap",
+            "severity",
+            as_of,
+        );
+        let records: Vec<_> = (-600..600)
+            .map(|minute| {
+                let mut record = cat.records[0].clone();
+                record.window.start = Some(as_of + Duration::minutes(minute));
+                record.window.end = Some(as_of + Duration::days(8));
+                record
+            })
+            .collect();
+        let times = build_times(&records, as_of);
+        assert_eq!(times.len(), MAX_TIME_VALUES);
+        assert!(times.contains(&as_of));
+        assert!(times.iter().any(|&t| t > as_of));
+        assert!(times.iter().all(|&t| t <= as_of + Duration::days(7)));
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
     }
 }

@@ -12,10 +12,10 @@
 
 use std::collections::HashMap;
 
+use crate::decode::XY;
 use ds_core::config::BufrParameterConfig;
 use ds_core::model::ParameterDescription;
 use ds_core::units::{display_conversion, DisplayConversion};
-use tinybufr::XY;
 
 use crate::decode::{xy_from_code, ObsReport};
 

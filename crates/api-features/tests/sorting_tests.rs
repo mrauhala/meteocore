@@ -600,6 +600,10 @@ async fn openapi_advertises_collection_property_filters() {
         .unwrap();
     assert_eq!(p["in"], "query");
     assert_eq!(p["schema"]["type"], "string");
+    assert!(p["description"]
+        .as_str()
+        .unwrap()
+        .contains("comma-separated alternatives"));
     assert!(
         !params
             .iter()
@@ -610,4 +614,43 @@ async fn openapi_advertises_collection_property_filters() {
         .as_array()
         .unwrap();
     assert!(!plain.iter().any(|p| p["name"] == "awareness_type"));
+}
+
+#[tokio::test]
+async fn numeric_alternatives_are_ored_before_sorting_paging_and_survive_links() {
+    let (status, first) =
+        get("/collections/sortable/items?size=10,30,40&score=0.5,0.9&limit=1&sortby=-score").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        first["numberMatched"], 2,
+        "AND across properties, OR within each numeric predicate"
+    );
+    assert_eq!(ids(&first), ["top"]);
+    let next = first["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .unwrap()["href"]
+        .as_str()
+        .unwrap();
+    let pairs: Vec<_> = form_urlencoded::parse(next.split_once('?').unwrap().1.as_bytes())
+        .into_owned()
+        .collect();
+    assert!(pairs.contains(&("size".into(), "10,30,40".into())));
+    assert!(pairs.contains(&("score".into(), "0.5,0.9".into())));
+    let (status, second) = get(next.strip_prefix("http://test/features").unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["numberMatched"], 2);
+    assert_eq!(ids(&second), ["mid"]);
+    let (_, none) = get("/collections/sortable/items?size=10,30&size=20,40").await;
+    assert_eq!(
+        none["numberMatched"], 0,
+        "repeated property names remain AND"
+    );
+    let (_, literal) = get("/collections/sortable/items?awareness_type=other,OTHER").await;
+    assert_eq!(
+        literal["numberMatched"], 0,
+        "text alternatives are not enabled implicitly"
+    );
 }

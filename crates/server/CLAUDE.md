@@ -137,6 +137,21 @@ these headers, the proxy strips `Forwarded`/`X-Forwarded-*` on untrusted
 client requests, and clients cannot reach the backend directly — otherwise a
 client could spoof the emitted self-links (open-redirect risk downstream).
 
+## Render admission and deadlines
+
+`ds-executor` owns process-wide render slots and the waiting queue, preserved
+across registry reloads. `MC_RENDER_QUEUE_CAPACITY` defaults to 3× slot count;
+full queues shed immediately with 503 + Retry-After, and cached bytes bypass it.
+`MC_RENDER_TIMEOUT_MS` defaults to 3000 for raster work and MVT encoding. The
+absolute deadline includes the semaphore wait, blocking-pool dispatch, engine
+read and normal encoding. 3D points/meshes share the queue with a 30 s compute
+budget; dedicated voxel execution stays separate. Synchronous CPU work cannot
+be preempted: it retains its CPU/memory permits after timeout/disconnect until
+completion. Pending blocking jobs are aborted before they start.
+
+`render_queue_depth`, `render_queue_capacity`, `render_queue_rejected_total`,
+and `render_deadline_exceeded_total` are exposed in /metrics and Grafana.
+
 ## Operational notes
 
 - A brief "no images" period right after a deploy is the expected readiness
@@ -149,3 +164,36 @@ client could spoof the emitted self-links (open-redirect risk downstream).
   and the graceful-shutdown block at the end of `main` (bug #442 was a
   missing boot-path spawn for `cap_engines`; the shutdown block had also
   silently skipped cap, postgis and nowcast).
+
+- Raster memory admission uses the process-wide `ds_render::budget::RENDER_MEMORY`,
+  configured by `MC_RENDER_MEMORY_MB` (default 1024 MiB; restart to change).
+  It deliberately survives reloads so old and new render tasks share one limit.
+  The 32-byte/output-pixel estimate covers output buffers/scratch, not source
+  decoding or resident caches. At the default, the 8000×8000 format limit exceeds
+  the memory budget and returns 503; operators can raise the budget explicitly.
+
+- Preview temporal manifests may include `temporal_extent.default` from
+  `MapEngine::default_time()`. The slider selects it rather than the last
+  value; preview time-window filtering must preserve that default (CAP's
+  active-now view can precede future warning boundaries).
+
+## Remote radar startup recovery (#190)
+
+Remote COMP/PVOL sources whose startup scan fails keep `failed` health (503
+when every collection failed) but no longer require a manual reload to recover.
+A serialized background task retries after 30 seconds, backing off to five
+minutes while failures persist. An initially empty remote PVOL catalog also
+gets its per-site routes registered once polling discovers sites. Rebuilding
+registration also retries failed dependent nowcasts. Healthy engines, static
+CSV/GeoJSON snapshots and warm render caches are reused; ordinary explicit
+reloads still rebuild static sources as before.
+
+Recovery uses the last accepted collections, palettes and server routing
+settings, including startup CLI filters. It never rereads config/palette files;
+an explicit reload or enabled watcher remains the configuration control plane.
+The task shares the reload mutex and ds-poll shutdown handle lifecycle. Source
+configuration errors remain visible and logged; remote failures may include
+permanent endpoint/bucket mistakes, so repeated failed health needs operator
+attention. The all-failed startup exception requires every configured collection to be
+remote radar; mixed local/remote failures still exit. Local missing files and structurally missing source config retain
+startup fail-fast behavior. Runtime scan errors still retain the good catalog.

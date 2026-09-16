@@ -257,6 +257,12 @@ pub fn resolve_z_levels(
     }
 }
 
+/// Limits apply to decoded coordinates, before per-point allocations/queries.
+pub const MAX_POSITION_COORD_BYTES: usize = 16 * 1024;
+pub const MAX_POSITION_POINTS: usize = 64;
+/// Combined position response budget, including every point and parameter.
+pub const MAX_POSITION_VALUES: usize = 1_000_000;
+
 /// Split a position-query `coords` value into one or more `POINT(lon lat)` WKT
 /// strings. Accepts either a single `POINT(lon lat)` or a
 /// `MULTIPOINT((lon lat),(lon lat),...)` (nested form) /
@@ -264,11 +270,18 @@ pub fn resolve_z_levels(
 /// always normalized to `POINT(lon lat)` so that existing engine
 /// `query_position` implementations can be reused unchanged.
 pub fn split_position_coords(coords: &str) -> Result<Vec<String>, DataServerError> {
+    if coords.len() > MAX_POSITION_COORD_BYTES {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "coords exceeds {MAX_POSITION_COORD_BYTES} bytes"
+        )));
+    }
     let trimmed = coords.trim();
 
-    // POINT(lon lat) — single point, passed through unchanged.
+    // Normalize only the keyword so engines receive the same WKT spelling.
     if starts_with_ignore_ascii_case(trimmed, "POINT") {
-        return Ok(vec![trimmed.to_string()]);
+        let normalized = format!("POINT{}", &trimmed[5..]);
+        ds_core::feature::parse_point_coords(&normalized)?;
+        return Ok(vec![normalized]);
     }
 
     // MULTIPOINT(...) — split into individual POINT strings.
@@ -283,6 +296,11 @@ pub fn split_position_coords(coords: &str) -> Result<Vec<String>, DataServerErro
                 )
             })?;
 
+        if inner.bytes().filter(|&b| b == b',').count() >= MAX_POSITION_POINTS {
+            return Err(DataServerError::QueryTooLarge(format!(
+                "MULTIPOINT exceeds {MAX_POSITION_POINTS} points"
+            )));
+        }
         let points: Vec<String> = inner
             .split(',')
             .map(|part| {
@@ -300,17 +318,9 @@ pub fn split_position_coords(coords: &str) -> Result<Vec<String>, DataServerErro
                         "MULTIPOINT element '{part}' is not 'lon lat'"
                     )));
                 }
-                coords[0].parse::<f64>().map_err(|_| {
-                    DataServerError::InvalidParameter(format!(
-                        "MULTIPOINT element '{part}' has invalid longitude"
-                    ))
-                })?;
-                coords[1].parse::<f64>().map_err(|_| {
-                    DataServerError::InvalidParameter(format!(
-                        "MULTIPOINT element '{part}' has invalid latitude"
-                    ))
-                })?;
-                Ok(format!("POINT({} {})", coords[0], coords[1]))
+                let point = format!("POINT({} {})", coords[0], coords[1]);
+                ds_core::feature::parse_point_coords(&point)?;
+                Ok(point)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -434,9 +444,20 @@ mod tests {
     }
 
     #[test]
+    fn coordinate_byte_boundary_is_inclusive() {
+        let point = "POINT(1 2)";
+        let at_limit = format!(
+            "{point}{}",
+            " ".repeat(MAX_POSITION_COORD_BYTES - point.len())
+        );
+        assert_eq!(split_position_coords(&at_limit).unwrap(), vec![point]);
+        assert!(split_position_coords(&(at_limit + " ")).is_err());
+    }
+
+    #[test]
     fn point_case_insensitive() {
         let points = split_position_coords("point(24.94 60.17)").unwrap();
-        assert_eq!(points, vec!["point(24.94 60.17)".to_string()]);
+        assert_eq!(points, vec!["POINT(24.94 60.17)".to_string()]);
     }
 
     #[test]

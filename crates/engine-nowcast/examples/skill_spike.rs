@@ -345,10 +345,7 @@ fn main() -> ExitCode {
     // carries the cos(lat) factor — at Nordic latitudes y covers ~2–3× more
     // km per pixel than x, so distances are computed anisotropically in km.
     let (px_km_x, px_km_y) = engine_nowcast::lonlat_grid_km_per_px(extent, w, h);
-    let scale = PixelScale {
-        x: px_km_x as f32,
-        y: px_km_y as f32,
-    };
+    let scale = PixelScale::uniform(px_km_x as f32, px_km_y as f32);
     let gate_km = args.gate_km as f32;
     let obs_cells: Vec<Vec<CellBlob>> = frames
         .iter()

@@ -35,8 +35,7 @@ fn parses_real_gfs_fixture() {
         "GFS run hour {hour} should be one of 00/06/12/18"
     );
 
-    // A f006 pgrb2.0p25 file has ~700 distinct messages. After aggregate
-    // filtering (dropping acc/ave records), we still expect hundreds.
+    // A f006 pgrb2.0p25 file has hundreds of supported messages.
     assert!(
         parsed.messages.len() > 300,
         "expected at least 300 instantaneous messages, got {}",
@@ -70,17 +69,12 @@ fn parses_real_gfs_fixture() {
         "at least one pressure-level message must survive"
     );
 
-    // Aggregates (acc/ave) must have been dropped; no message should carry a
-    // StepKind we haven't seen in the real file. GUST in f006 is typically
-    // a 0-6 hour max fcst — with our current plan we keep max/min aggregates
-    // coerced to the window end.
-    for m in &parsed.messages {
-        match m.step_kind {
-            StepKind::Instant => {}
-            StepKind::MaxOverWindow { .. } => {}
-            StepKind::MinOverWindow { .. } => {}
-        }
-    }
+    assert!(parsed.messages.iter().any(|m| m.short_name == "APCP"
+        && matches!(m.step_kind, StepKind::Accumulation { start: 0, end: 6 })));
+    assert!(parsed
+        .messages
+        .iter()
+        .any(|m| matches!(m.step_kind, StepKind::Average { .. })));
 
     // Lengths are consistent: all but the last record must have a concrete
     // length, and all concrete lengths are strictly positive.

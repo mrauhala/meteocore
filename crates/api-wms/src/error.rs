@@ -144,6 +144,12 @@ impl IntoResponse for WmsError {
             xml,
         )
             .into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
         response.extensions_mut().insert(reason);
         response
     }

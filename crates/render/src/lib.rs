@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod colormap;
 pub mod defaults;
 mod encode;
@@ -27,10 +28,6 @@ pub use rasterize::{fill_polygon, Combine};
 pub use style::{ResolvedColormap, StyleContext, StyleSpec};
 
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Maximum time to wait for a render semaphore permit before returning 503.
-pub const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -440,6 +437,7 @@ pub fn render_tile(
     colormap: &dyn ColorMap,
     format: ImageFormat,
 ) -> Result<Vec<u8>, DataServerError> {
+    ds_core::deadline::check()?;
     // Short-circuit for empty tiles: skip colorization, produce transparent RGBA directly.
     let rgba = if tile.is_empty() {
         vec![0u8; (tile.width * tile.height * 4) as usize]
