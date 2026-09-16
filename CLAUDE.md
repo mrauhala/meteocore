@@ -329,11 +329,11 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   keep them consistent.
 - **All raster output→source coordinate mapping goes through
   `OutputCrs`/`ProjectionGrid`** (the `MapEngine::get_raster_tile` path). The
-  WMS Web-Mercator meta-tile assembly (`ds-render/src/metatile.rs`) is the
+  WMS projected meta-tile assembly (`ds-render/src/metatile.rs`) is the
   ONLY place that re-derives the output coordinate map, and it must stay
   consistent with the engine path (#452). When debugging a "data displaced /
   misplaced" report, first confirm which render path the failing request
-  uses: **WMS EPSG:3857 goes through meta-tiling, not the direct
+  uses: **WMS EPSG:3857/3067/3035 go through meta-tiling, not the direct
   `get_raster_tile` path that Maps/Tiles use.**
 - **Before blaming a mechanism for a latency spike, check the magnitude adds
   up.** A 2.3 MB local read from page cache is tens of ms, not seconds.

@@ -1,20 +1,20 @@
-//! Internal meta-tiling for arbitrary-bbox Web Mercator WMS GetMap renders (#202).
+//! Internal meta-tiling for arbitrary-bbox projected WMS GetMap renders (#202).
 //!
 //! A fullscreen WMS client (e.g. OpenLayers `ImageWMS`) requests an arbitrary
 //! bbox + width + height per pan/zoom event, so the rendered-image cache — keyed
 //! on the exact bbox — almost never hits (≈3% in production). Meta-tiling fixes
-//! the *strategy*: decompose each Web Mercator GetMap into a grid of fixed
-//! 256×256 tiles aligned to the WebMercatorQuad grid, render and cache *those*
+//! the *strategy*: decompose each supported GetMap into a grid of fixed
+//! 256×256 tiles aligned to a fixed CRS-specific grid, render and cache *those*
 //! (fixed bbox + fixed size → repeating key → high hit rate), then resample the
 //! covered tiles into the client's exact viewport. The expensive per-source work
-//! (TIFF decode, per-pixel projection, colorize) is cached at tile granularity
+//! (TIFF decode, reprojection, colorize) is cached at tile granularity
 //! and reused across overlapping viewports; the final crop/resample is cheap.
 //!
 //! ## Resolution ladder
 //!
-//! Tiles are rendered at one of a **half-octave** ladder of resolutions whose
+//! Tiles use a **half-octave** resolution ladder. For EPSG:3857 its
 //! even steps coincide with the standard integer WebMercator zoom levels
-//! (`Z0_RES / 2^(level/2)`). For each request we snap to the *finest* ladder
+//! (`Z0_RES / 2^(level/2)`). For each request we snap to the *coarsest* ladder
 //! step whose resolution is still ≤ the request's ground resolution, so the
 //! mosaic is always **downsampled** to the viewport (crisp, never upscaled).
 //! A discrete-zoom OpenLayers view lands exactly on an even step → pure crop, no
@@ -24,11 +24,11 @@
 //!
 //! ## Scope
 //!
-//! Web Mercator (EPSG:3857) requests only — that is the production hot path and
-//! it keeps assembly a pure affine resample in Mercator metres (no reprojection;
-//! the engine already reprojects source→Mercator inside each tile render). Other
-//! CRSs fall back to a direct single-shot render. Degenerate or pathologically
-//! large requests return [`MetaTile::Fallback`] so the caller renders directly.
+//! EPSG:3857 retains its WebMercatorQuad-aligned ladder. EPSG:3067 and
+//! EPSG:3035 use separate internal metre grids, origin (0,0), half-octaves
+//! from 128000 m/px (including 1000/500/250 m/px). They are not advertised
+//! OGC tile matrix sets. Assembly is affine in the output CRS; geographic,
+//! unknown, degenerate, over-zoomed or over-budget requests render directly.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,7 +37,8 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 
 use ds_core::error::DataServerError;
-use ds_core::map_engine::RasterTile;
+use ds_core::geo::{projected_output_crs, wgs84_envelope};
+use ds_core::map_engine::{OutputCrs, RasterTile};
 
 use crate::colorize;
 use crate::{ColorMap, ImageFormat};
@@ -96,36 +97,65 @@ pub fn budget_declines_total() -> u64 {
 // applied explicitly, only where tile *indices* are selected (`row0`/`row1`).
 use ds_core::web_mercator::{lat_to_y, lon_to_x, x_to_lon, y_to_lat, LAT_LIMIT_DEG};
 
-/// Resolution (metres/pixel) of a half-octave ladder level.
-fn level_res(level: i32) -> f64 {
-    Z0_RES / 2f64.powf(level as f64 / 2.0)
+/// Fixed internal grids. Projected grids deliberately use an unbounded signed
+/// index space (origin 0,0); these are not advertised OGC tile matrix sets.
+/// The CRS identity is part of every cache key, even when indices coincide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Grid {
+    WebMercator,
+    Epsg3067,
+    Epsg3035,
 }
 
-/// Snap a ground resolution to the finest half-octave ladder level whose
-/// resolution is still ≤ `res` (i.e. never coarser → the mosaic is downsampled,
-/// never upscaled).
-///
-/// A small epsilon (`1e-6` in log2 space) makes an *exact* standard-zoom
-/// resolution snap to its own level instead of one step finer — without it,
-/// floating-point noise would round every discrete-zoom request up a half-octave
-/// and force a needless 1.41× over-render. The bounded cost: a resolution that
-/// falls *just below* a step, within the epsilon band, can snap down to it and
-/// upscale by at most `2^(5e-7) ≈ 1.0000003×` (sub-nanometre per pixel) — visually
-/// nil, and well worth avoiding the per-request over-render.
-///
-/// Clamped at the **low** end to level 0 (`Z0_RES`, the whole world in one tile);
-/// a request coarser than that still downsamples, so 0 is safe. The **high** end
-/// is intentionally *not* clamped: a value `> MAX_LEVEL` means the request is
-/// finer than the deepest ladder step (~9 mm/px — an absurd over-zoom), and the
-/// caller declines to meta-tiling [`MetaTile::Fallback`] rather than clamp (which
-/// would render coarser-than-requested tiles and silently upscale).
-fn snap_level(res_m_per_px: f64) -> i32 {
-    if !res_m_per_px.is_finite() || res_m_per_px <= 0.0 {
-        return MAX_LEVEL + 1; // decline → Fallback
+impl Grid {
+    fn for_output(output: &OutputCrs) -> Option<Self> {
+        match output {
+            OutputCrs::WebMercator => Some(Self::WebMercator),
+            OutputCrs::Projected { crs, .. }
+                if Some(crs) == projected_output_crs("EPSG:3067").as_ref() =>
+            {
+                Some(Self::Epsg3067)
+            }
+            OutputCrs::Projected { crs, .. }
+                if Some(crs) == projected_output_crs("EPSG:3035").as_ref() =>
+            {
+                Some(Self::Epsg3035)
+            }
+            _ => None,
+        }
     }
-    // L_level = Z0_RES / 2^(level/2) ≤ res  ⇔  level ≥ 2·log2(Z0_RES / res)
-    let level = (2.0 * (Z0_RES / res_m_per_px).log2() - 1e-6).ceil() as i32;
-    level.max(0)
+
+    fn origin(self) -> (f64, f64) {
+        match self {
+            Self::WebMercator => (-ORIGIN, ORIGIN),
+            Self::Epsg3067 | Self::Epsg3035 => (0.0, 0.0),
+        }
+    }
+
+    fn base_resolution(self) -> f64 {
+        match self {
+            Self::WebMercator => Z0_RES,
+            // Half-octaves include common 1000/500/250 metre radar pixels
+            // exactly, avoiding unnecessary resampling at those resolutions.
+            Self::Epsg3067 | Self::Epsg3035 => 128_000.0,
+        }
+    }
+
+    fn level_res(self, level: i32) -> f64 {
+        self.base_resolution() / 2f64.powf(level as f64 / 2.0)
+    }
+
+    /// Choose the coarsest step no coarser than the requested resolution.
+    /// The epsilon keeps exact ladder resolutions on their own level despite
+    /// roundoff. Over-zoom is declined, never clamped to a coarser tile.
+    fn snap_level(self, res: f64) -> i32 {
+        if !res.is_finite() || res <= 0.0 {
+            return MAX_LEVEL + 1;
+        }
+        (2.0 * (self.base_resolution() / res).log2() - 1e-6)
+            .ceil()
+            .max(0.0) as i32
+    }
 }
 
 /// The fixed part of a tile's cache key (everything but the tile's grid
@@ -156,6 +186,7 @@ pub struct TileKey {
     z: Option<i64>,
     reference_time: Option<DateTime<Utc>>,
     content_version: u64,
+    grid: Grid,
     level: i32,
     col: i64,
     row: i64,
@@ -279,17 +310,16 @@ pub enum MetaTile {
     Fallback,
 }
 
-/// Render a Web Mercator GetMap by decomposing it into cached 256×256 tiles and
-/// resampling them to the exact viewport.
+/// Render a supported projected GetMap as cached 256×256 tiles, assembled
+/// affinely in the requested CRS. Geographic/unknown projections decline.
 ///
-/// `bbox_deg` is the viewport in WGS84 degrees `[west, south, east, north]`
-/// (already converted from EPSG:3857 metres by the handler). `render_tile` must
-/// render one tile at the given WGS84-degree bbox and pixel size in Web Mercator
-/// (i.e. call `get_raster_tile(bbox, w, h, OutputCrs::WebMercator, …)`); the
-/// helper colorizes and caches its result.
+/// `bbox_deg` is the WGS84 source-read envelope; projected viewport metres
+/// come from `output_crs`. Each closure call receives its OWN projected tile
+/// bounds plus their WGS84 envelope, never the original viewport's bounds.
 #[allow(clippy::too_many_arguments)]
 pub fn render_metatiled<F>(
     bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
     width: u32,
     height: u32,
     prefix: &TileKeyPrefix,
@@ -299,7 +329,7 @@ pub fn render_metatiled<F>(
     render_tile: F,
 ) -> Result<MetaTile, DataServerError>
 where
-    F: Fn([f64; 4], u32, u32) -> Result<RasterTile, DataServerError>,
+    F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>,
 {
     let [w, s, e, n] = bbox_deg;
     if width == 0
@@ -309,15 +339,22 @@ where
         return Ok(MetaTile::Fallback);
     }
 
-    // Viewport in Web Mercator metres. Mercator Y increases northward. The
-    // bounds use the shared UNCLAMPED `lat_to_y`, so res_x/res_y and the output
-    // coordinate map match the client's request bbox even when it reaches past
-    // ±85° toward a pole; the ±85° clamp belongs only to *tile selection*
-    // (`row0`/`row1` below), not the viewport mapping (#452).
-    let west_m = lon_to_x(w);
-    let east_m = lon_to_x(e);
-    let north_m = lat_to_y(n);
-    let south_m = lat_to_y(s);
+    let Some(grid) = Grid::for_output(output_crs) else {
+        return Ok(MetaTile::Fallback);
+    };
+    let (origin_x, origin_y) = grid.origin();
+    // Keep the viewport exact. Only Web Mercator tile selection is clamped
+    // to its world; neither projected grid clips the requested rectangle.
+    let [west_m, south_m, east_m, north_m] = match output_crs {
+        OutputCrs::Projected { bbox, .. } => *bbox,
+        _ => [lon_to_x(w), lat_to_y(s), lon_to_x(e), lat_to_y(n)],
+    };
+    if ![west_m, south_m, east_m, north_m]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Ok(MetaTile::Fallback);
+    }
     if !(east_m > west_m && north_m > south_m) {
         // Antimeridian crossing or degenerate extent — let the caller render directly.
         return Ok(MetaTile::Fallback);
@@ -326,29 +363,39 @@ where
     // Snap to the ladder using the finer of the two axis resolutions (so neither
     // axis is upscaled), then derive the tile grid at that level.
     let res = ((east_m - west_m) / width as f64).min((north_m - south_m) / height as f64);
-    let level = snap_level(res);
+    let level = grid.snap_level(res);
     if level > MAX_LEVEL {
         // Requested resolution is finer than the deepest ladder step (~9 mm/px —
         // an absurd over-zoom). Meta-tiling would have to upscale; render
         // directly at the exact requested resolution instead.
         return Ok(MetaTile::Fallback);
     }
-    let span = TILE_PX as f64 * level_res(level); // tile edge length in metres
+    let span = TILE_PX as f64 * grid.level_res(level); // tile edge length in metres
 
-    // Covering tile index range. Origin is the world top-left (-ORIGIN, +ORIGIN);
-    // column grows eastward, row grows southward. Sample points sit strictly
-    // inside the viewport, so a tiny epsilon trims a spurious tile when an edge
-    // lands exactly on a grid line.
+    // A tiny epsilon trims a spurious tile when an edge is on a grid line.
     let eps = span * 1e-9;
-    // Tile rows use the ±85°-CLAMPED bounds (`lat_to_y`): tiles only exist
-    // within the valid Web Mercator world, so output pixels past ±85° (present
-    // when the exact `north_m`/`south_m` above run to a pole) have no tile and
-    // the assembly draws them transparent — no phantom rows to render.
-    let col0 = ((west_m + ORIGIN) / span).floor() as i64;
-    let col1 = ((east_m + ORIGIN - eps) / span).floor() as i64;
-    let row0 = ((ORIGIN - lat_to_y(n.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG))) / span).floor() as i64;
-    let row1 =
-        ((ORIGIN - lat_to_y(s.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG)) - eps) / span).floor() as i64;
+    let (tile_south, tile_north) = if grid == Grid::WebMercator {
+        (
+            lat_to_y(s.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG)),
+            lat_to_y(n.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG)),
+        )
+    } else {
+        (south_m, north_m)
+    };
+    let indices = [
+        ((west_m - origin_x) / span).floor(),
+        ((east_m - origin_x - eps) / span).floor(),
+        ((origin_y - tile_north) / span).floor(),
+        ((origin_y - tile_south - eps) / span).floor(),
+    ];
+    // Keep signed index subtraction and global pixel coordinates in range.
+    if indices
+        .iter()
+        .any(|v| !v.is_finite() || v.abs() > (i64::MAX / (2 * TILE_PX as i64)) as f64)
+    {
+        return Ok(MetaTile::Fallback);
+    }
+    let [col0, col1, row0, row1] = indices.map(|v| v as i64);
     let ncols = (col1 - col0 + 1).max(1) as usize;
     let nrows = (row1 - row0 + 1).max(1) as usize;
     if ncols.saturating_mul(nrows) > tile_budget(width, height) {
@@ -384,6 +431,7 @@ where
                 z: prefix.z,
                 reference_time: prefix.reference_time,
                 content_version: prefix.content_version,
+                grid,
                 level,
                 col,
                 row,
@@ -393,18 +441,37 @@ where
                 c.rgba
             } else {
                 misses += 1;
-                // Tile bbox in metres → WGS84 degrees for the engine call.
-                let tx0 = -ORIGIN + col as f64 * span;
+                let tx0 = origin_x + col as f64 * span;
                 let tx1 = tx0 + span;
-                let ty_top = ORIGIN - row as f64 * span;
+                let ty_top = origin_y - row as f64 * span;
                 let ty_bot = ty_top - span;
-                let tbbox = [
-                    x_to_lon(tx0),
-                    y_to_lat(ty_bot),
-                    x_to_lon(tx1),
-                    y_to_lat(ty_top),
-                ];
-                let tile = render_tile(tbbox, TILE_PX, TILE_PX)?;
+                let (tbbox, tile_output) = match output_crs {
+                    OutputCrs::Projected { crs, .. } => {
+                        let bbox = [tx0, ty_bot, tx1, ty_top];
+                        let Some(envelope) = wgs84_envelope(crs, bbox) else {
+                            // An edge tile can extend outside a projection's
+                            // domain. Preserve the direct path's handling.
+                            return Ok(MetaTile::Fallback);
+                        };
+                        (
+                            envelope,
+                            OutputCrs::Projected {
+                                crs: crs.clone(),
+                                bbox,
+                            },
+                        )
+                    }
+                    _ => (
+                        [
+                            x_to_lon(tx0),
+                            y_to_lat(ty_bot),
+                            x_to_lon(tx1),
+                            y_to_lat(ty_top),
+                        ],
+                        OutputCrs::WebMercator,
+                    ),
+                };
+                let tile = render_tile(tbbox, TILE_PX, TILE_PX, &tile_output)?;
                 // All-nodata tiles are cached as a `None` marker: cheap to store
                 // (no 256 KB buffer) yet still a cache hit, so a sparse extent is
                 // not re-decoded every request nor crowds out real-data tiles.
@@ -442,13 +509,12 @@ where
     }
 
     // Resample the tile mosaic into the exact viewport. Output pixels are
-    // uniform in Mercator metres, so this is a pure affine map into global
-    // tile-pixel space, sampled with premultiplied-alpha bilinear (avoids dark
-    // fringes bleeding from transparent nodata pixels).
+    // uniform in the output CRS metres, so this is a pure affine map into
+    // global tile-pixel space. Nearest-neighbour sampling preserves palettes.
     let res_x = (east_m - west_m) / width as f64;
     let res_y = (north_m - south_m) / height as f64;
-    let to_global_x = |x_m: f64| (x_m + ORIGIN) / span * TILE_PX as f64;
-    let to_global_y = |y_m: f64| (ORIGIN - y_m) / span * TILE_PX as f64;
+    let to_global_x = |x_m: f64| (x_m - origin_x) / span * TILE_PX as f64;
+    let to_global_y = |y_m: f64| (origin_y - y_m) / span * TILE_PX as f64;
 
     // usize arithmetic throughout: `width * height * 4` overflows `u32` past
     // ~46 340 px/side. Callers must keep `width * height` within a sane bound
@@ -571,6 +637,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
+            grid: Grid::WebMercator,
             level: 3,
             col: 1,
             row: 2,
@@ -655,10 +722,10 @@ mod tests {
         // snap to even ladder level 2z with no over-render (level_res == res).
         for z in 0..=20 {
             let res = Z0_RES / 2f64.powi(z);
-            let level = snap_level(res);
+            let level = Grid::WebMercator.snap_level(res);
             assert_eq!(level, 2 * z, "zoom {z} should snap to even level {}", 2 * z);
             assert!(
-                (level_res(level) - res).abs() / res < 1e-9,
+                (Grid::WebMercator.level_res(level) - res).abs() / res < 1e-9,
                 "level_res must equal the standard-zoom resolution"
             );
         }
@@ -672,13 +739,13 @@ mod tests {
         let res8 = Z0_RES / 2f64.powi(8);
         let res9 = Z0_RES / 2f64.powi(9);
         let res = (res8 + res9) / 2.0; // between two standard zooms
-        let level = snap_level(res);
+        let level = Grid::WebMercator.snap_level(res);
         assert!(
-            level_res(level) <= res,
+            Grid::WebMercator.level_res(level) <= res,
             "must never upscale (≤ requested res)"
         );
         assert!(
-            level_res(level) >= res / std::f64::consts::SQRT_2 - 1e-6,
+            Grid::WebMercator.level_res(level) >= res / std::f64::consts::SQRT_2 - 1e-6,
             "≤ one half-octave finer"
         );
         assert!((16..=18).contains(&level));
@@ -709,7 +776,12 @@ mod tests {
         }
     }
 
-    fn solid_tile(_b: [f64; 4], w: u32, h: u32) -> Result<RasterTile, DataServerError> {
+    fn solid_tile(
+        _b: [f64; 4],
+        w: u32,
+        h: u32,
+        _: &OutputCrs,
+    ) -> Result<RasterTile, DataServerError> {
         Ok(RasterTile {
             width: w,
             height: h,
@@ -733,6 +805,7 @@ mod tests {
         let bbox = [20.0, 58.0, 30.0, 64.0];
         let out = render_metatiled(
             bbox,
+            &OutputCrs::WebMercator,
             512,
             512,
             &prefix,
@@ -771,6 +844,7 @@ mod tests {
         let bbox2 = [21.0, 59.0, 31.0, 65.0];
         let _ = render_metatiled(
             bbox2,
+            &OutputCrs::WebMercator,
             512,
             512,
             &prefix,
@@ -796,7 +870,7 @@ mod tests {
             reference_time: None,
             content_version: 0,
         };
-        let empty_tile = |_b: [f64; 4], w: u32, h: u32| {
+        let empty_tile = |_b: [f64; 4], w: u32, h: u32, _output: &OutputCrs| {
             Ok(RasterTile {
                 width: w,
                 height: h,
@@ -805,6 +879,7 @@ mod tests {
         };
         let out = render_metatiled(
             [20.0, 58.0, 30.0, 64.0],
+            &OutputCrs::WebMercator,
             256,
             256,
             &prefix,
@@ -847,6 +922,7 @@ mod tests {
         let declined_before = budget_declines_total();
         let out = render_metatiled(
             [-179.0, -85.0, 179.0, 85.0],
+            &OutputCrs::WebMercator,
             256,
             8192,
             &prefix,
@@ -879,7 +955,7 @@ mod tests {
         // direct render. Build the bbox in Mercator metres around southern
         // Finland at 1.38× a ladder resolution, square pixels on both axes.
         let (width, height) = (3840u32, 2160u32);
-        let res = level_res(12) * 1.38; // snaps to level 12, ~1.38×/axis inflation
+        let res = Grid::WebMercator.level_res(12) * 1.38; // snaps to level 12, ~1.38×/axis inflation
         let (cx, cy) = (2_700_000.0, 8_500_000.0);
         let half_w = width as f64 * res / 2.0;
         let half_h = height as f64 * res / 2.0;
@@ -891,6 +967,7 @@ mod tests {
         ];
         let out = render_metatiled(
             bbox,
+            &OutputCrs::WebMercator,
             width,
             height,
             &prefix,
@@ -924,11 +1001,11 @@ mod tests {
         // upscaling; snap_level must signal it and render_metatiled must decline
         // to Fallback rather than clamp + upscale.
         assert!(
-            snap_level(0.001) > MAX_LEVEL,
+            Grid::WebMercator.snap_level(0.001) > MAX_LEVEL,
             "1 mm/px is finer than the ladder"
         );
         assert_eq!(
-            snap_level(Z0_RES / 2f64.powi(20)),
+            Grid::WebMercator.snap_level(Z0_RES / 2f64.powi(20)),
             40,
             "in-range still snaps"
         );
@@ -945,6 +1022,7 @@ mod tests {
         // ~1 µm/px viewport (tiny bbox, large image).
         let out = render_metatiled(
             [24.9400, 60.1700, 24.9401, 60.1701],
+            &OutputCrs::WebMercator,
             2048,
             2048,
             &prefix,
@@ -1051,7 +1129,7 @@ mod tests {
         };
 
         // --- X axis: value = mercator-X, constant down each column. ---
-        let x_render = |b: [f64; 4], tw: u32, th: u32| {
+        let x_render = |b: [f64; 4], tw: u32, th: u32, _output: &OutputCrs| {
             let tw_west = lon_to_x(b[0]);
             let tw_east = lon_to_x(b[2]);
             let mut values = Vec::with_capacity((tw * th) as usize);
@@ -1075,6 +1153,7 @@ mod tests {
         let cache = TilePixelCache::new(64);
         let out = render_metatiled(
             bbox,
+            &OutputCrs::WebMercator,
             w,
             h,
             &prefix,
@@ -1106,7 +1185,7 @@ mod tests {
         );
 
         // --- Y axis: value = mercator-Y, constant across each row. ---
-        let y_render = |b: [f64; 4], tw: u32, th: u32| {
+        let y_render = |b: [f64; 4], tw: u32, th: u32, _output: &OutputCrs| {
             let tn = lat_to_y(b[3]);
             let ts = lat_to_y(b[1]);
             let mut values = Vec::with_capacity((tw * th) as usize);
@@ -1129,6 +1208,7 @@ mod tests {
         let cache_y = TilePixelCache::new(64);
         let out_y = render_metatiled(
             bbox,
+            &OutputCrs::WebMercator,
             w,
             h,
             &prefix,
@@ -1168,7 +1248,12 @@ mod tests {
         // ~55..70 AND match the direct band. The pre-fix clamp of the viewport
         // bounds to ±85° shrank the assembled vertical span, displacing the
         // meta-tile stripe ~10° north of where the direct render puts it.
-        fn stripe_tile(b: [f64; 4], w: u32, h: u32) -> Result<RasterTile, DataServerError> {
+        fn stripe_tile(
+            b: [f64; 4],
+            w: u32,
+            h: u32,
+            _: &OutputCrs,
+        ) -> Result<RasterTile, DataServerError> {
             let (my_n, my_s) = (lat_to_y(b[3]), lat_to_y(b[1]));
             let mut values = vec![None; (w * h) as usize];
             for row in 0..h {
@@ -1200,6 +1285,7 @@ mod tests {
         let (w, h) = (400u32, 400u32);
         let bytes = match render_metatiled(
             bbox,
+            &OutputCrs::WebMercator,
             w,
             h,
             &prefix,
@@ -1261,7 +1347,7 @@ mod tests {
         // path placed the stripe at the same latitudes. Before #452 the meta band
         // sat ~10° north of this direct band; they now share `web_mercator` and
         // must agree to within a tile-granularity slop.
-        let direct = stripe_tile(bbox, w, h).unwrap();
+        let direct = stripe_tile(bbox, w, h, &OutputCrs::WebMercator).unwrap();
         let (mut d_lo, mut d_hi) = (f64::MAX, f64::MIN);
         for row in 0..h {
             let lat = y_to_lat(my_n - (row as f64 + 0.5) / h as f64 * (my_n - my_s));
@@ -1276,5 +1362,183 @@ mod tests {
             "meta band lat[{lat_lo:.1},{lat_hi:.1}] disagrees with direct band \
              lat[{d_lo:.1},{d_hi:.1}]"
         );
+    }
+    fn projected_prefix() -> TileKeyPrefix {
+        TileKeyPrefix {
+            layer: "projected".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        }
+    }
+
+    fn projected_field(
+        b: [f64; 4],
+        w: u32,
+        h: u32,
+        output: &OutputCrs,
+    ) -> Result<RasterTile, DataServerError> {
+        let OutputCrs::Projected {
+            crs,
+            bbox: [left, bottom, right, top],
+        } = output
+        else {
+            panic!("projected tile must retain its CRS");
+        };
+        // Source-read bounds must be the tile's envelope, not the viewport's.
+        assert_eq!(Some(b), wgs84_envelope(crs, [*left, *bottom, *right, *top]));
+        let values = (0..h)
+            .flat_map(|row| {
+                (0..w).map(move |col| {
+                    let x = left + (col as f64 + 0.5) * (right - left) / w as f64;
+                    let y = top - (row as f64 + 0.5) * (top - bottom) / h as f64;
+                    let ix = (x / 500.0).floor() as i64;
+                    let iy = (y / 500.0).floor() as i64;
+                    ((ix + iy).rem_euclid(11) != 0)
+                        .then_some((ix.rem_euclid(7) * 32 + iy.rem_euclid(5) * 3) as f64)
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(RasterTile {
+            width: w,
+            height: h,
+            values: values.into(),
+        })
+    }
+
+    #[test]
+    fn projected_pixels_match_direct_across_tile_edges_and_negative_indices() {
+        // Non-square viewports cross multiple tile seams and have negative
+        // row indices; the TM viewport also crosses column zero. Both axes
+        // and nodata are encoded into the field so flips/seams are visible.
+        for (code, left, bottom) in [
+            ("EPSG:3067", -64_000.0, 6_500_000.0),
+            ("EPSG:3035", 4_000_000.0, 3_000_000.0),
+        ] {
+            let crs = projected_output_crs(code).unwrap();
+            let cache = TilePixelCache::new(32);
+            let cmap = AxisEncode { lo: 0.0, hi: 255.0 };
+            let (w, h) = (513, 337);
+            for shift in [0.0, 125.0, 16_000.0] {
+                let bbox = [
+                    left + shift,
+                    bottom + shift,
+                    left + shift + w as f64 * 500.0,
+                    bottom + shift + h as f64 * 500.0,
+                ];
+                let envelope = wgs84_envelope(&crs, bbox).unwrap();
+                let output = OutputCrs::Projected {
+                    crs: crs.clone(),
+                    bbox,
+                };
+                let result = render_metatiled(
+                    envelope,
+                    &output,
+                    w,
+                    h,
+                    &projected_prefix(),
+                    &cmap,
+                    ImageFormat::Png,
+                    &cache,
+                    projected_field,
+                )
+                .unwrap();
+                let MetaTile::Image { bytes, .. } = result else {
+                    panic!("expected projected tiles")
+                };
+                let direct = projected_field(envelope, w, h, &output).unwrap();
+                assert_eq!(
+                    decode_rgba(&bytes).2,
+                    colorize(&direct, &cmap),
+                    "{code}, shift {shift}"
+                );
+            }
+            assert!(cache.stats().0 > 0, "pans reuse tiles for {code}");
+        }
+    }
+
+    #[test]
+    fn projected_grids_and_every_product_selector_isolate_cached_tiles() {
+        let cache = TilePixelCache::new(32);
+        let bbox = [512_000.0, 6_528_000.0, 640_000.0, 6_656_000.0];
+        for code in ["EPSG:3067", "EPSG:3035"] {
+            let crs = projected_output_crs(code).unwrap();
+            let envelope = wgs84_envelope(&crs, bbox).unwrap();
+            let output = OutputCrs::Projected { crs, bbox };
+            let base = projected_prefix();
+            let mut prefixes = vec![base.clone(); 7];
+            prefixes[1].parameter = Some("other".into());
+            prefixes[2].style = "other".into();
+            prefixes[3].time = Some("2026-01-01T00:00:00Z".parse().unwrap());
+            prefixes[4].z = Some(10);
+            prefixes[5].reference_time = Some("2026-01-01T00:00:00Z".parse().unwrap());
+            prefixes[6].content_version = 1;
+            for prefix in prefixes {
+                for expected_misses in [1, 0] {
+                    let result = render_metatiled(
+                        envelope,
+                        &output,
+                        256,
+                        256,
+                        &prefix,
+                        &SolidRed,
+                        ImageFormat::Png,
+                        &cache,
+                        solid_tile,
+                    )
+                    .unwrap();
+                    let MetaTile::Image { stats, .. } = result else {
+                        panic!("expected image")
+                    };
+                    assert_eq!(stats.tiles, 1);
+                    assert_eq!(stats.misses, expected_misses, "{code}, {prefix:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn projected_ladders_bound_sampling_and_decline_pathological_requests() {
+        for grid in [Grid::Epsg3067, Grid::Epsg3035] {
+            for res in [1000.0, 500.0, 250.0] {
+                assert_eq!(grid.level_res(grid.snap_level(res)), res);
+            }
+            for res in [730.0, 310.0, 123.0] {
+                let actual = grid.level_res(grid.snap_level(res));
+                assert!(actual <= res && actual >= res / std::f64::consts::SQRT_2);
+            }
+        }
+        let cache = TilePixelCache::new(16);
+        for code in ["EPSG:3067", "EPSG:3035"] {
+            for bbox in [
+                [0.0, 0.0, 1e9, 1.0],     // extreme aspect exceeds tile budget
+                [0.0, 0.0, 0.001, 0.001], // past finest ladder step
+                [0.0, 0.0, f64::INFINITY, 10.0],
+                [0.0, 0.0, 0.0, 10.0],
+                [-1e100, -1e100, 1e100, 1e100], // index overflow
+            ] {
+                let output = OutputCrs::Projected {
+                    crs: projected_output_crs(code).unwrap(),
+                    bbox,
+                };
+                let result = render_metatiled(
+                    [10.0, 50.0, 20.0, 60.0],
+                    &output,
+                    256,
+                    256,
+                    &projected_prefix(),
+                    &SolidRed,
+                    ImageFormat::Png,
+                    &cache,
+                    |_, _, _, _| panic!("declined requests must not render tiles"),
+                )
+                .unwrap();
+                assert!(matches!(result, MetaTile::Fallback), "{code}, {bbox:?}");
+            }
+        }
+        assert_eq!(cache.stats(), (0, 0));
     }
 }
