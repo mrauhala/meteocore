@@ -375,6 +375,7 @@ where
     let t_loop = Instant::now();
     for row in row0..=row1 {
         for col in col0..=col1 {
+            ds_core::deadline::check()?;
             let key = TileKey {
                 layer: prefix.layer.clone(),
                 parameter: prefix.parameter.clone(),

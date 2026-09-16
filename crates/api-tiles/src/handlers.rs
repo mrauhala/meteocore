@@ -1314,22 +1314,22 @@ async fn render_vector_tile(
     // before `spawn_blocking`) rather than around `get_features` so an engine
     // that does I/O during the feature query doesn't hold a render slot while
     // it waits.
-    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
+    let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
         .await
-        .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
-        .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
+        .map_err(TilesError::from)?;
 
-    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ds_mvt::EncodeError> {
-        let mut opts = TileEncodeOptions::new(layer_name, tms_kind);
-        opts.properties = allowlist;
-        encode_tile(&features, bbox, &opts)
-    })
-    .await
-    .map_err(|e| TilesError::Internal(format!("Encode task failed: {e}")))?
-    .map_err(|e| {
-        tracing::warn!("MVT encode error for collection '{collection_label}': {e}");
-        TilesError::Internal(format!("Encode failed: {e}"))
-    })?;
+    let bytes = job
+        .run(move || -> Result<Vec<u8>, ds_mvt::EncodeError> {
+            let mut opts = TileEncodeOptions::new(layer_name, tms_kind);
+            opts.properties = allowlist;
+            encode_tile(&features, bbox, &opts)
+        })
+        .await
+        .map_err(TilesError::from)?
+        .map_err(|e| {
+            tracing::warn!("MVT encode error for collection '{collection_label}': {e}");
+            TilesError::Internal(format!("Encode failed: {e}"))
+        })?;
 
     let cached = CachedTile::new(bytes::Bytes::from(bytes));
     state.vector_tile_cache.insert(cache_key, cached.clone());
@@ -1739,13 +1739,9 @@ async fn render_tile(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
-    let cpu_permit = tokio::time::timeout(
-        ds_render::RENDER_TIMEOUT,
-        state.render_semaphore.clone().acquire_owned(),
-    )
-    .await
-    .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
-    .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
+    let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
+        .await
+        .map_err(TilesError::from)?;
     let memory_permit = Arc::new(
         ds_render::budget::RENDER_MEMORY
             .try_acquire(tile_size, tile_size)
@@ -1765,33 +1761,33 @@ async fn render_tile(
     let render_parameter = effective_parameter;
     let render_z = validated.z;
 
-    let render_result = tokio::task::spawn_blocking(move || {
-        let _cpu_permit = cpu_permit;
-        let _memory_permit = worker_memory;
+    let render_result = job
+        .run(move || {
+            let _memory_permit = worker_memory;
 
-        let tile = engine.get_raster_tile(
-            bbox,
-            tile_size,
-            tile_size,
-            time,
-            &output_crs,
-            render_parameter.as_deref(),
-            render_z,
-            // The run pinned before keying (#521): `Some(latest)` renders the
-            // same pixels as `None` by the engine contract, but survives a
-            // run swap mid-render without mixing runs in one response.
-            reference_time,
-        )?;
+            let tile = engine.get_raster_tile(
+                bbox,
+                tile_size,
+                tile_size,
+                time,
+                &output_crs,
+                render_parameter.as_deref(),
+                render_z,
+                // The run pinned before keying (#521): `Some(latest)` renders the
+                // same pixels as `None` by the engine contract, but survives a
+                // run swap mid-render without mixing runs in one response.
+                reference_time,
+            )?;
 
-        // If every pixel is nodata, skip colorization + encoding entirely.
-        if tile.is_empty() {
-            return Ok(None);
-        }
+            // If every pixel is nodata, skip colorization + encoding entirely.
+            if tile.is_empty() {
+                return Ok(None);
+            }
 
-        ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
-    })
-    .await
-    .map_err(|e| TilesError::Internal(format!("Render task failed: {e}")))?;
+            ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
+        })
+        .await
+        .map_err(TilesError::from)?;
 
     let maybe_bytes = render_result.map_err(|e| {
         use ds_core::error::DataServerError as DSE;
@@ -1799,7 +1795,9 @@ async fn render_tile(
         // parameter, bad bbox/datetime) is a 400 with the engine's message,
         // not a 500 that hides it.
         match e {
-            DSE::ResourceExhausted => TilesError::ServiceUnavailable(e.to_string()),
+            DSE::ResourceExhausted | DSE::DeadlineExceeded => {
+                TilesError::ServiceUnavailable(e.to_string())
+            }
             DSE::InvalidParameter(_)
             | DSE::InvalidBbox(_)
             | DSE::InvalidDatetime(_)
@@ -1886,4 +1884,13 @@ async fn render_tile(
         .body(axum::body::Body::from(cached.into_bytes()))
         .unwrap()
         .into_response())
+}
+
+impl From<ds_executor::ExecutionError> for TilesError {
+    fn from(error: ds_executor::ExecutionError) -> Self {
+        match error {
+            ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
+            other => Self::ServiceUnavailable(other.to_string()),
+        }
+    }
 }

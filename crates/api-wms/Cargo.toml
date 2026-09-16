@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ds-executor = { path = "../ds-executor" }
 ds-core = { path = "../core" }
 ds-render = { path = "../render" }
 arc-swap = "1"

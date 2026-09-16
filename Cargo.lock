@@ -119,6 +119,7 @@ dependencies = [
  "ds-3dtiles",
  "ds-cache",
  "ds-core",
+ "ds-executor",
  "ds-render",
  "http-body-util",
  "serde",
@@ -174,6 +175,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ds-core",
+ "ds-executor",
  "ds-render",
  "http-body-util",
  "serde",
@@ -210,6 +212,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ds-core",
+ "ds-executor",
  "ds-mvt",
  "ds-render",
  "http-body-util",
@@ -229,6 +232,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ds-core",
+ "ds-executor",
  "ds-render",
  "http-body-util",
  "quick-xml",
@@ -1250,6 +1254,15 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "ds-executor"
+version = "0.1.0"
+dependencies = [
+ "ds-core",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -4604,6 +4617,7 @@ dependencies = [
  "chrono",
  "ds-cache",
  "ds-core",
+ "ds-executor",
  "ds-mvt",
  "ds-render",
  "ds-wis2",

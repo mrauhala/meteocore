@@ -700,15 +700,14 @@ pub async fn get_content(
             // on a blocking thread. Only the computing (cache-missing)
             // request pays this — hits and coalesced waiters never queue on
             // the semaphore.
-            let _permit = semaphore
-                .acquire_owned()
+            let job = ds_executor::RenderJob::acquire_volume(semaphore)
                 .await
-                .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+                .map_err(Tiles3dError::from)?;
 
             // Sample, encode, and hash all on the blocking thread (the ETag
             // hash over a multi-MB tile is real CPU — keep it off the async
             // worker too).
-            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+            job.run(move || -> Result<(Vec<u8>, String), Tiles3dError> {
                 let cloud = engine.read_point_cloud(quantity.as_deref(), time, min_value, None)?;
                 let bytes = ds_3dtiles::encode_pnts(&cloud, colormap.as_ref())
                     .map_err(|e| Tiles3dError::Internal(format!("pnts encode failed: {e}")))?;
@@ -716,7 +715,7 @@ pub async fn get_content(
                 Ok((bytes, etag))
             })
             .await
-            .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))?
+            .map_err(Tiles3dError::from)?
         })
         .await?;
 
@@ -850,12 +849,11 @@ pub async fn get_content_glb(
             // loop, so bound them with the shared render semaphore and run on
             // a blocking thread (same rule as the `.pnts` path / the raster
             // `get_raster_tile`). Only the computing request pays this.
-            let _permit = semaphore
-                .acquire_owned()
+            let job = ds_executor::RenderJob::acquire_volume(semaphore)
                 .await
-                .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+                .map_err(Tiles3dError::from)?;
 
-            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+            job.run(move || -> Result<(Vec<u8>, String), Tiles3dError> {
                 let result = match representation {
                     Representation::EchoTop => {
                         let grid =
@@ -904,7 +902,7 @@ pub async fn get_content_glb(
                 Ok((bytes, etag))
             })
             .await
-            .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))?
+            .map_err(Tiles3dError::from)?
         })
         .await?;
 
@@ -1143,6 +1141,7 @@ pub async fn get_voxel_content(
                 .await
                 .map_err(|_| Tiles3dError::Internal("voxel semaphore closed".into()))?;
             tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+                let _permit = _permit;
                 let grid = engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
                 let bytes = ds_3dtiles::encode_voxels_glb(&grid).map_err(|e| match e {
                     ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(

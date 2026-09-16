@@ -344,13 +344,9 @@ pub async fn wms_handler(
 
             // Acquire render semaphore (with timeout to shed load under pressure)
             let t_sem = std::time::Instant::now();
-            let cpu_permit = tokio::time::timeout(
-                ds_render::RENDER_TIMEOUT,
-                state.render_semaphore.clone().acquire_owned(),
-            )
-            .await
-            .map_err(|_| WmsError::ServiceUnavailable("Server busy, try again later".to_string()))?
-            .map_err(|_| WmsError::Internal("Render semaphore closed".to_string()))?;
+            let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
+                .await
+                .map_err(WmsError::from)?;
             let memory_permit = Arc::new(
                 ds_render::budget::RENDER_MEMORY
                     .try_acquire(params.width, params.height)
@@ -393,89 +389,89 @@ pub async fn wms_handler(
             // render_ms greatly exceeds the internal phase sum
             // tile_render_ms+assemble_ms+encode_ms, the gap is scheduling latency).
             let t_render = std::time::Instant::now();
-            let render_outcome = tokio::task::spawn_blocking(
-                move || -> Result<(Option<Vec<u8>>, RenderPath), DataServerError> {
-                    let _cpu_permit = cpu_permit;
-                    let _memory_permit = worker_memory;
+            let render_outcome = job
+                .run(
+                    move || -> Result<(Option<Vec<u8>>, RenderPath), DataServerError> {
+                        let _memory_permit = worker_memory;
 
-                    // Direct single-shot render: one get_raster_tile → colorize → encode.
-                    let direct = || -> Result<Option<Vec<u8>>, DataServerError> {
-                        let tile = engine.get_raster_tile(
-                            bbox,
-                            width,
-                            height,
-                            time,
-                            &output_crs,
-                            style_parameter.as_deref(),
-                            elevation,
-                            reference_time,
-                        )?;
-                        // If every pixel is nodata, skip colorization + encoding entirely.
-                        if tile.is_empty() {
-                            return Ok(None);
-                        }
-                        ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
-                    };
-
-                    // Web Mercator: decompose into cached 256×256 meta-tiles and
-                    // resample to the exact viewport (#202). The expensive
-                    // per-tile work is cached and reused across overlapping
-                    // fullscreen views; other CRSs render directly. A zero-byte
-                    // tile cache (`metatile_cache_mb = 0`) is the kill switch:
-                    // it bypasses meta-tiling so an operator can revert to the
-                    // direct path via config reload, no redeploy.
-                    if output_crs == OutputCrs::WebMercator && tile_cache.capacity() > 0 {
-                        let prefix = ds_render::TileKeyPrefix {
-                            layer,
-                            parameter: style_parameter.clone(),
-                            style,
-                            time,
-                            z: z_q,
-                            reference_time,
-                            content_version,
+                        // Direct single-shot render: one get_raster_tile → colorize → encode.
+                        let direct = || -> Result<Option<Vec<u8>>, DataServerError> {
+                            let tile = engine.get_raster_tile(
+                                bbox,
+                                width,
+                                height,
+                                time,
+                                &output_crs,
+                                style_parameter.as_deref(),
+                                elevation,
+                                reference_time,
+                            )?;
+                            // If every pixel is nodata, skip colorization + encoding entirely.
+                            if tile.is_empty() {
+                                return Ok(None);
+                            }
+                            ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
                         };
-                        // `bbox` is in WGS84 degrees here — the params layer
-                        // converts EPSG:3857 metres to degrees before this point;
-                        // render_metatiled re-projects back to metres internally.
-                        let outcome = ds_render::render_metatiled(
-                            bbox,
-                            width,
-                            height,
-                            &prefix,
-                            colormap.as_ref(),
-                            format,
-                            tile_cache.as_ref(),
-                            |tbbox, tw, th| {
-                                engine.get_raster_tile(
-                                    tbbox,
-                                    tw,
-                                    th,
-                                    time,
-                                    &OutputCrs::WebMercator,
-                                    style_parameter.as_deref(),
-                                    elevation,
-                                    reference_time,
-                                )
-                            },
-                        )?;
-                        match outcome {
-                            ds_render::MetaTile::Image { bytes, stats } => {
-                                Ok((Some(bytes), RenderPath::Meta(stats)))
+
+                        // Web Mercator: decompose into cached 256×256 meta-tiles and
+                        // resample to the exact viewport (#202). The expensive
+                        // per-tile work is cached and reused across overlapping
+                        // fullscreen views; other CRSs render directly. A zero-byte
+                        // tile cache (`metatile_cache_mb = 0`) is the kill switch:
+                        // it bypasses meta-tiling so an operator can revert to the
+                        // direct path via config reload, no redeploy.
+                        if output_crs == OutputCrs::WebMercator && tile_cache.capacity() > 0 {
+                            let prefix = ds_render::TileKeyPrefix {
+                                layer,
+                                parameter: style_parameter.clone(),
+                                style,
+                                time,
+                                z: z_q,
+                                reference_time,
+                                content_version,
+                            };
+                            // `bbox` is in WGS84 degrees here — the params layer
+                            // converts EPSG:3857 metres to degrees before this point;
+                            // render_metatiled re-projects back to metres internally.
+                            let outcome = ds_render::render_metatiled(
+                                bbox,
+                                width,
+                                height,
+                                &prefix,
+                                colormap.as_ref(),
+                                format,
+                                tile_cache.as_ref(),
+                                |tbbox, tw, th| {
+                                    engine.get_raster_tile(
+                                        tbbox,
+                                        tw,
+                                        th,
+                                        time,
+                                        &OutputCrs::WebMercator,
+                                        style_parameter.as_deref(),
+                                        elevation,
+                                        reference_time,
+                                    )
+                                },
+                            )?;
+                            match outcome {
+                                ds_render::MetaTile::Image { bytes, stats } => {
+                                    Ok((Some(bytes), RenderPath::Meta(stats)))
+                                }
+                                ds_render::MetaTile::Empty { stats } => {
+                                    Ok((None, RenderPath::MetaEmpty(stats)))
+                                }
+                                ds_render::MetaTile::Fallback => {
+                                    direct().map(|o| (o, RenderPath::Fallback))
+                                }
                             }
-                            ds_render::MetaTile::Empty { stats } => {
-                                Ok((None, RenderPath::MetaEmpty(stats)))
-                            }
-                            ds_render::MetaTile::Fallback => {
-                                direct().map(|o| (o, RenderPath::Fallback))
-                            }
+                        } else {
+                            direct().map(|o| (o, RenderPath::Direct))
                         }
-                    } else {
-                        direct().map(|o| (o, RenderPath::Direct))
-                    }
-                },
-            )
-            .await
-            .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
+                    },
+                )
+                .await
+                .map_err(WmsError::from)?;
             let render_ms = t_render.elapsed().as_millis() as u64;
 
             // Split the render outcome: bytes flow into the existing response
@@ -572,10 +568,10 @@ pub async fn wms_handler(
                         })?;
                     (cached, "EMPTY", "image/png")
                 }
-                Err(DataServerError::ResourceExhausted) => {
-                    return Err(WmsError::ServiceUnavailable(
-                        "Decode memory exhausted".into(),
-                    ));
+                Err(
+                    e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
+                ) => {
+                    return Err(WmsError::ServiceUnavailable(e.to_string()));
                 }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
@@ -762,6 +758,15 @@ pub async fn wms_handler(
                 legend_bytes,
             )
                 .into_response())
+        }
+    }
+}
+
+impl From<ds_executor::ExecutionError> for WmsError {
+    fn from(error: ds_executor::ExecutionError) -> Self {
+        match error {
+            ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
+            other => Self::ServiceUnavailable(other.to_string()),
         }
     }
 }

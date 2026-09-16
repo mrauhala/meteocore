@@ -297,3 +297,8 @@ Client
 - Source sampling depends on the engine (including bilinear for GRIB/QueryData/Zarr); meta-tile assembly uses nearest-neighbor to preserve discrete palettes
 - Collections must implement `MapEngine` and enable `wms`; GeoTIFF, GRIB, ODIM, QueryData, Zarr, nowcast, CAP and PostGIS events are supported
 - JPEG output composites transparency onto white background (no alpha channel)
+
+Uncached GetMap requests have a configurable 3 s queue/render deadline
+(`MC_RENDER_TIMEOUT_MS`) and a bounded waiting queue (`MC_RENDER_QUEUE_CAPACITY`,
+default 3× CPU slots). Overload or expiry returns HTTP 503 with `Retry-After: 1`;
+cached images remain available. GeoTIFF remote reads use the same deadline.

@@ -2,6 +2,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DataServerError {
+    /// An interactive request exhausted its absolute time budget (HTTP 503).
+    #[error("Render deadline exceeded, try again later")]
+    DeadlineExceeded,
     /// Shared transient resource admission failed; retry later (HTTP 503).
     #[error("Server busy, try again later")]
     ResourceExhausted,

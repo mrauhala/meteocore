@@ -161,3 +161,18 @@ client could spoof the emitted self-links (open-redirect risk downstream).
   `MapEngine::default_time()`. The slider selects it rather than the last
   value; preview time-window filtering must preserve that default (CAP's
   active-now view can precede future warning boundaries).
+
+## Render admission and deadlines
+
+`ds-executor` owns process-wide render slots and the waiting queue, preserved
+across registry reloads. `MC_RENDER_QUEUE_CAPACITY` defaults to 3× slot count;
+full queues shed immediately with 503 + Retry-After, and cached bytes bypass it.
+`MC_RENDER_TIMEOUT_MS` defaults to 3000 for raster work and MVT encoding. The
+absolute deadline includes the semaphore wait, blocking-pool dispatch, engine
+read and normal encoding. 3D points/meshes share the queue with a 30 s compute
+budget; dedicated voxel execution stays separate. Synchronous CPU work cannot
+be preempted: it retains its CPU/memory permits after timeout/disconnect until
+completion. Pending blocking jobs are aborted before they start.
+
+`render_queue_depth`, `render_queue_capacity`, `render_queue_rejected_total`,
+and `render_deadline_exceeded_total` are exposed in /metrics and Grafana.

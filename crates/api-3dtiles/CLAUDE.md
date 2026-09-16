@@ -105,3 +105,9 @@ default; `?base=` override.
 Add `"3dtiles"` to a collection's `apis` (only `odim-volume` supports it).
 v1 uses one shared reflectivity colormap; per-collection/per-quantity
 colormaps are follow-ups.
+
+Point/mesh computations now use `ds-executor` admission: the shared bounded
+render queue and a 30 s queue/compute deadline. The raster 3 s default does not
+apply to these larger products. Their workers (and the separate voxel worker)
+retain CPU permits on client disconnection. Admission/deadline failures are
+503 + Retry-After. Coalesced cache waiters retain the existing per-key gate.
