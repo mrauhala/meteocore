@@ -1454,6 +1454,7 @@ async fn render_map(
             // bbox/datetime) is a 400 with the engine's helpful message —
             // not a 500 that hides it behind "Internal server error".
             return Err(match e {
+                DSE::ResourceExhausted => MapsError::ServiceUnavailable(e.to_string()),
                 DSE::InvalidParameter(_)
                 | DSE::InvalidBbox(_)
                 | DSE::InvalidDatetime(_)

@@ -3043,3 +3043,34 @@ async fn engine_default_is_used_for_capabilities_and_timeless_map() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(*requested.lock().unwrap(), expected);
 }
+
+struct ExhaustedEngine;
+impl MapEngine for ExhaustedEngine {
+    fn get_raster_tile(
+        &self,
+        _: [f64; 4],
+        _: u32,
+        _: u32,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+        _: &OutputCrs,
+        _: Option<&str>,
+        _: Option<f64>,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Err(DataServerError::ResourceExhausted)
+    }
+    fn raster_info(&self) -> RasterInfo {
+        PopulatedMockMapEngine.raster_info()
+    }
+}
+
+#[tokio::test]
+async fn decode_exhaustion_is_503_not_a_successful_error_image() {
+    let app = build_populated_router_with_engine(Arc::new(ExhaustedEngine));
+    let response = app.oneshot(Request::builder()
+        .uri("/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&CRS=CRS:84&BBOX=20,60,25,65&WIDTH=32&HEIGHT=32&FORMAT=image/png")
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(response.headers().get("etag").is_none());
+}

@@ -19,6 +19,17 @@ apply here.
 - **STAC security:** `stac_asset_allowlist` is mandatory (SSRF protection).
   HTTP redirects disabled. Pagination origin-checked.
 
+## Decode admission
+
+`MC_GEOTIFF_DECODE_MEMORY_MB` (default 1024; 0 rejects cold decodes) bounds
+transient local/remote GeoTIFF decoding across collections and APIs. Local
+cache hits bypass it; cache retention has its own budget. Local misses reserve
+native output plus the decoder’s capped 64 MiB intermediate buffer. Remote
+reservations include bounded raw output and boxed samples and stay owned until
+parallel tile assembly releases them. Exhaustion propagates as HTTP 503, never
+as transparent pixels or an error image. This is separate from render output
+admission and does not cover other engines or the final source-window buffer.
+
 ## Caches
 
 - **Tile cache:** compressed bytes in an LRU (default 256 MB), **remote
@@ -60,3 +71,10 @@ apply here.
 ## EDR
 
 Position + area queries. Nearest-neighbour sampling of the source grid.
+
+Encoded remote tile ranges are validated before fetching: each is capped at
+64 MiB and included in decode admission alongside raw and boxed output buffers.
+Direct HTTP range bodies are also streamed with the requested length as a cap,
+including when the origin omits Content-Length or ignores Range. Invalid tile
+index arithmetic fails the request; ordinary fetch/decode errors may still
+produce nodata gaps.

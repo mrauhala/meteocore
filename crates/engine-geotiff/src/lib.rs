@@ -1,5 +1,6 @@
 mod cache;
 mod catalog;
+pub mod decode_budget;
 mod decoded_cache;
 mod parse;
 mod reader;
@@ -1105,6 +1106,9 @@ impl GeoTiffEngine {
                         self.band_index,
                     ) {
                         Ok(v) => v,
+                        Err(DataServerError::ResourceExhausted) => {
+                            return Err(DataServerError::ResourceExhausted)
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "Failed to read pixel from {}: {e}",
@@ -1242,6 +1246,9 @@ impl GeoTiffEngine {
             ) {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
+                }
+                Err(DataServerError::ResourceExhausted) => {
+                    return Err(DataServerError::ResourceExhausted)
                 }
                 Err(e) => {
                     tracing::warn!("Failed to read bbox from {}: {e}", entry.path.display());
