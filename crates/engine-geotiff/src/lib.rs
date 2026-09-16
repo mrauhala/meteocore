@@ -1,5 +1,6 @@
 mod cache;
 mod catalog;
+pub mod decode_budget;
 mod decoded_cache;
 mod parse;
 mod reader;

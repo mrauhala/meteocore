@@ -115,3 +115,6 @@ Related issues: #585 MULTIPOINT fan-out bound · #510 `f` aliases · #667
 antimeridian bboxes · #668 400-vs-404 on unsupported query types · #666
 shared parameter-name validation · #665 GRIB value rounding · #523 nowcast
 reflectivity via EDR · #673 shared area budget.
+
+GeoTIFF cold source decodes share a byte budget across APIs; exhausted decode
+admission returns HTTP 503 without a partial CoverageJSON result.

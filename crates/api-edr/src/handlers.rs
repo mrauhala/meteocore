@@ -93,6 +93,10 @@ fn render_coverage_response(
 /// new `DataServerError` variant cannot map differently per query type.
 fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
     match e {
+        DataServerError::ResourceExhausted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"code": "ServerBusy", "description": "Server busy, try again later"})),
+        ),
         DataServerError::InvalidParameter(_)
         | DataServerError::InvalidBbox(_)
         | DataServerError::InvalidDatetime(_)
