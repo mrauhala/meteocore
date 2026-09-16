@@ -71,3 +71,10 @@ admission and does not cover other engines or the final source-window buffer.
 ## EDR
 
 Position + area queries. Nearest-neighbour sampling of the source grid.
+
+Encoded remote tile ranges are validated before fetching: each is capped at
+64 MiB and included in decode admission alongside raw and boxed output buffers.
+Direct HTTP range bodies are also streamed with the requested length as a cap,
+including when the origin omits Content-Length or ignores Range. Invalid tile
+index arithmetic fails the request; ordinary fetch/decode errors may still
+produce nodata gaps.

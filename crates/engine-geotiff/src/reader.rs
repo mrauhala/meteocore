@@ -302,6 +302,27 @@ fn remote_decode_size(
     }
 }
 
+/// Validate attacker-controlled encoded byte counts before admission or I/O.
+/// The encoded input coexists with decompressed and boxed output buffers.
+fn remote_chunk_layout(
+    info: &RemoteTileInfo,
+    samples: u32,
+    index: usize,
+) -> Result<(usize, usize, usize, usize), DataServerError> {
+    let error = || DataServerError::Engine("Invalid or oversized encoded tile range".into());
+    let offset =
+        usize::try_from(*info.tile_offsets.get(index).ok_or_else(error)?).map_err(|_| error())?;
+    let count = usize::try_from(*info.tile_byte_counts.get(index).ok_or_else(error)?)
+        .map_err(|_| error())?;
+    if count > MAX_DECODED_TILE_BYTES {
+        return Err(error());
+    }
+    offset.checked_add(count).ok_or_else(error)?;
+    let (raw, decoded) = remote_decode_size(info, samples)?;
+    let total = decoded.checked_add(count).ok_or_else(error)?;
+    Ok((raw, total, offset, count))
+}
+
 /// Open the decoder for `source` on first use and seek it to `ifd_index`.
 /// Lazy so a read fully served by the decoded-chunk cache skips the IFD
 /// parse entirely.
@@ -1168,19 +1189,10 @@ fn read_remote_chunk_f64(
     // (rayon) thread; `None` for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
 ) -> Result<DecodedTile, DataServerError> {
-    let (raw_size, bytes) = remote_decode_size(tile_info, metadata.samples_per_pixel)?;
-    let permit = BUDGET.reserve(bytes)?;
     let idx = chunk_index as usize;
-    if idx >= tile_info.tile_offsets.len() {
-        return Err(DataServerError::Engine(format!(
-            "Tile index {} out of range ({})",
-            idx,
-            tile_info.tile_offsets.len()
-        )));
-    }
-
-    let offset = tile_info.tile_offsets[idx] as usize;
-    let byte_count = tile_info.tile_byte_counts[idx] as usize;
+    let (raw_size, bytes, offset, byte_count) =
+        remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
+    let permit = BUDGET.reserve(bytes)?;
 
     if byte_count == 0 {
         // Empty tile — return all nodata.
@@ -1282,7 +1294,7 @@ fn read_http_range(
     let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
     let url_owned = url.to_string();
     let fut = async {
-        let resp = http
+        let mut resp = http
             .get(&url_owned)
             .header(reqwest::header::RANGE, &range_header)
             .send()
@@ -1294,9 +1306,26 @@ fn read_http_range(
                 resp.status()
             )));
         }
-        resp.bytes()
+        let limit = range.end.saturating_sub(range.start);
+        if resp.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(DataServerError::Engine(
+                "HTTP range body exceeds requested size".into(),
+            ));
+        }
+        let mut data = Vec::with_capacity(limit);
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))
+            .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))?
+        {
+            if chunk.len() > limit - data.len() {
+                return Err(DataServerError::Engine(
+                    "HTTP range body exceeds requested size".into(),
+                ));
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(data))
     };
     match handle {
         Some(h) => h.block_on(fut),
@@ -1321,19 +1350,10 @@ fn read_http_chunk_f64(
     // for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
 ) -> Result<DecodedTile, DataServerError> {
-    let (raw_size, bytes) = remote_decode_size(tile_info, metadata.samples_per_pixel)?;
-    let permit = BUDGET.reserve(bytes)?;
     let idx = chunk_index as usize;
-    if idx >= tile_info.tile_offsets.len() {
-        return Err(DataServerError::Engine(format!(
-            "Tile index {} out of range ({})",
-            idx,
-            tile_info.tile_offsets.len()
-        )));
-    }
-
-    let offset = tile_info.tile_offsets[idx] as usize;
-    let byte_count = tile_info.tile_byte_counts[idx] as usize;
+    let (raw_size, bytes, offset, byte_count) =
+        remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
+    let permit = BUDGET.reserve(bytes)?;
 
     if byte_count == 0 {
         tracing::trace!(
@@ -2091,7 +2111,9 @@ fn read_bbox_inner(
 }
 
 /// Result of a parallel tile fetch: (row, col, pixel data).
-/// Failed tile reads are logged at error level and replaced with all-nodata
+/// Fetch/decode failures are logged and replaced with all-nodata. Admission
+/// failures and invalid tile-index arithmetic are fatal for the whole request.
+/// Other failed tile reads are replaced with all-nodata
 /// to allow partial rendering — a map with gaps is better than a 500 error.
 type TileFetchResult = (u32, u32, DecodedTile);
 
@@ -2200,7 +2222,7 @@ fn read_bbox_parallel(
     let rt_handle = tokio::runtime::Handle::try_current().ok();
 
     // Fetch all tiles in parallel using the shared thread pool.
-    // Failed tiles are logged at error level and replaced with nodata.
+    // Fetch/decode failures become nodata; admission/index failures propagate.
     let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
     let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
         tile_coords
@@ -2896,6 +2918,91 @@ mod tests {
     /// exactly once and reuse the same `Arc<Mmap>` across every subsequent
     /// decoder open, so per-request rendering avoids `File::open`/`BufReader`
     /// and the on-disk IFD re-parse.
+    #[test]
+    fn direct_http_range_rejects_oversized_bodies_with_or_without_length() {
+        use std::io::{Read, Write};
+        for (response, succeeds) in [
+            ("HTTP/1.1 206 Partial Content\r\nContent-Length: 9999999999\r\nConnection: close\r\n\r\n", false),
+            ("HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n0\r\n\r\n", false),
+            ("HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n0\r\n\r\n", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/tile", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let result = read_http_range(&reqwest::Client::new(), &url, 0..2, None);
+            if succeeds {
+                assert_eq!(result.unwrap().as_ref(), b"ab");
+            } else {
+                assert!(matches!(result, Err(DataServerError::Engine(ref message)) if message == "HTTP range body exceeds requested size"));
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn encoded_tile_ranges_are_bounded_before_either_fetch_path() {
+        let mut info = RemoteTileInfo {
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![1],
+            compression: TiffCompression::None,
+            sample_type: SampleType::U8,
+            predictor: 1,
+            tile_width: 1,
+            tile_height: 1,
+        };
+        assert_eq!(remote_chunk_layout(&info, 1, 0).unwrap(), (1, 19, 0, 1));
+        let store =
+            ds_storage::DataStore::new(Arc::new(ds_storage::object_store::memory::InMemory::new()));
+        let http = reqwest::Client::new();
+        let metadata = tiny_meta(1, 1, 1);
+        let file = Path::new("oversized");
+        for count in [MAX_DECODED_TILE_BYTES as u64 + 1, u64::MAX] {
+            info.tile_byte_counts[0] = count;
+            // Missing object / invalid URL would yield a different error if either
+            // path reached I/O. Tiny pixel dimensions cannot hide giant encodings.
+            for result in [
+                read_remote_chunk_f64(
+                    &store,
+                    &"missing".into(),
+                    &info,
+                    &metadata,
+                    0,
+                    None,
+                    file,
+                    0,
+                    0,
+                    None,
+                ),
+                read_http_chunk_f64(
+                    &http,
+                    "invalid URL",
+                    &info,
+                    &metadata,
+                    0,
+                    None,
+                    file,
+                    0,
+                    0,
+                    None,
+                ),
+            ] {
+                assert!(
+                    matches!(result, Err(DataServerError::Engine(ref message)) if message == "Invalid or oversized encoded tile range")
+                );
+            }
+        }
+        info.tile_byte_counts[0] = 1;
+        info.tile_offsets[0] = u64::MAX;
+        assert!(remote_chunk_layout(&info, 1, 0).is_err());
+        info.tile_offsets.clear();
+        assert!(remote_chunk_layout(&info, 1, 0).is_err());
+    }
+
     #[test]
     fn codecs_reject_expansion_past_metadata_before_unbounded_allocation() {
         use std::io::Write;
