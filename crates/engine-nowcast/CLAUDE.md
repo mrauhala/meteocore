@@ -577,12 +577,29 @@ see `docs/cell-intelligence-plan-amendment.md`).
   collection (municipalities, catchments, service regions). Wired
   second-pass in `admin.rs`; a missing id or one not wired to the Features
   API FAILS the collection at load.
-- **A geojson impact source makes its nowcast rebuild on every reload.**
-  `csv`/`geojson` are always rebuilt (reload is the only way they re-read a
-  changed file), and `reusable_collections` requires every second-pass
-  dependency to be reused — so the typical `municipalities` source costs a
-  nowcast re-bootstrap per reload. Correct, but not free; use a postgis
-  areas collection if that matters.
+- **Compatible reloads retain the nowcast (#604).** GeoJSON still rebuilds to
+  reread its file; a nowcast with unchanged config and the same raster engine
+  receives fresh auxiliary sources through one `ArcSwap` snapshot. The
+  retained source geometry/default-product contract must match too; the
+  engine refuses reuse if that contract changed during retained history.
+  `prepare_dependency_update` stages a validated replacement without changing
+  live state. The server applies it only after accepting the complete reload.
+  One generation uses one snapshot, including lightning, impact and radar;
+  old in-flight work completes with its old inputs, and the next generation
+  picks up the new ones. Existing forecasts and cell fact sheets remain
+  immutable, so a reload at the same source anchor neither advances tracks
+  twice nor recomputes historical impacts. No raster I/O occurs while rebinding.
+- A replaced lightning source starts a new jump baseline (`lightning_epoch`),
+  clearing carried flash history/first-flash time, including coasting tracks,
+  while preserving radar track identity. Comparing rates from different
+  sources would manufacture jumps. Impact/radar joins have no cross-generation
+  statistical baseline. Sortable/filterable capabilities remain those of the
+  unchanged nowcast configuration.
+- Raster-source replacement, nowcast tuning changes, and incompatible source
+  geometry/product contracts still rebuild. Missing or wrong-kind named
+  sources still fail load validation, including reuse candidates. To remove a
+  join, remove its nowcast setting too. This is a conservative compatibility
+  boundary, not an unrestricted registry lookup.
 - Unlike `lightning_source` (postgis only, all built in the first pass),
   impact sources are resolved against a **snapshot of `feature_engines`
   taken before the nowcast pass** (`base_feature_engines`). Nowcast engines

@@ -117,6 +117,12 @@ CoverageJSON 1.0 schema.
 Radius, cube, corridor and items have no engine-specific code: radius is
 answered by every engine that answers area, the other three do not exist.
 
+Compatible nowcast reloads retain motion-field instances alongside forecast
+runs and cell history (#604). Reuse requires unchanged nowcast config, the
+same raster source engine and a compatible retained geometry/product contract;
+source/tuning changes still rebuild. Auxiliary source edits affect subsequent
+generations, not already-published instances.
+
 ## Known gaps, in suggested order
 
 1. `locations` and `trajectory` under `/instances/{id}/`.

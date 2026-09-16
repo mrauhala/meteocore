@@ -178,6 +178,7 @@ enum FrameData {
 type TrackReplay = (Vec<CellTrack>, Vec<CellTrack>, DateTime<Utc>, DateTime<Utc>);
 
 struct Generation {
+    lightning_epoch: u64,
     reference_time: DateTime<Utc>,
     /// Valid times, ascending: `reference_time`, then the leads.
     times: Vec<DateTime<Utc>>,
@@ -210,10 +211,57 @@ struct CellSnapshot {
 }
 
 /// The impact source plus the property names to read from it.
+#[derive(Clone)]
 struct ImpactCfg {
     source: Arc<dyn FeatureEngine>,
     name_property: String,
     weight_property: Option<String>,
+}
+
+/// Auxiliary inputs are replaced as one unit. A generation loads exactly one
+/// snapshot, so a reload cannot mix old lightning with new impact/radar data.
+#[derive(Clone, Default)]
+struct AuxiliarySources {
+    lightning: Option<Arc<dyn ds_core::events::EventSource>>,
+    impact: Option<ImpactCfg>,
+    radar: Option<Arc<dyn ds_core::radar_sites::RadarSiteSource>>,
+    lightning_epoch: u64,
+}
+
+/// A validated reload update, staged without mutating the live engine. The
+/// server applies it only after accepting the complete reload. Dropping it
+/// leaves the live dependencies and history untouched.
+pub struct DependencyUpdate {
+    engine: Arc<NowcastEngine>,
+    sources: AuxiliarySources,
+}
+
+impl DependencyUpdate {
+    /// Commit on the server's serialized reload path. Already-running
+    /// generations finish with their original snapshot; the next generation
+    /// observes the complete replacement. Retained products remain immutable.
+    pub fn apply(mut self) {
+        let old = self.engine.auxiliary.load();
+        let same_lightning = match (&old.lightning, &self.sources.lightning) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.sources.lightning_epoch = old.lightning_epoch + u64::from(!same_lightning);
+        self.engine.auxiliary.store(Arc::new(self.sources));
+    }
+}
+
+/// Times/runs evolve normally; geometry and the default sampled product must
+/// not be blended with historical motion/tracks or served under new units.
+fn compatible_source(a: &RasterInfo, b: &RasterInfo) -> bool {
+    a.native_crs == b.native_crs
+        && a.spatial_extent == b.spatial_extent
+        && a.grid_size == b.grid_size
+        && a.parameter == b.parameter
+        && a.unit == b.unit
+        && a.parameters == b.parameters
+        && a.vertical == b.vertical
 }
 
 /// Cell-history retention: 48 snapshots = 4 h at the 5-min cadence. Cells
@@ -222,6 +270,8 @@ const CELL_HISTORY_SNAPSHOTS: usize = 48;
 
 /// Atomically swapped engine state.
 struct NowcastState {
+    source_info: RasterInfo,
+    source_contract_changed: bool,
     /// Retained generations keyed by reference time (the instances contract).
     generations: BTreeMap<DateTime<Utc>, Arc<Generation>>,
     /// Pre-built snapshot for the O(1) `raster_info()` contract.
@@ -236,6 +286,7 @@ pub struct NowcastEngine {
     collection_id: String,
     source_id: String,
     source: Arc<dyn MapEngine>,
+    reload_config: NowcastConfig,
     cfg: EngineCfg,
     state: ArcSwap<NowcastState>,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
@@ -269,18 +320,10 @@ pub struct NowcastEngine {
     /// since the source last had sites. Logged on the transition, not every
     /// 30 s generation while a volume engine bootstraps (#642 review).
     radar_empty_warned: AtomicBool,
-    /// Optional point-event source joined onto tracked cells per
-    /// generation (#549) — lightning, wired by the server's second pass.
-    lightning: Option<Arc<dyn ds_core::events::EventSource>>,
-    /// Optional polygon source naming the areas a cell is over or heading
-    /// toward, wired by the server's second pass like `lightning`. Feeds the
-    /// `impact` significance term — the one that makes a ranking
-    /// operational rather than merely meteorological.
-    impact: Option<ImpactCfg>,
-    /// Optional radar-site source for per-cell beam geometry (#642), wired
-    /// by the server's second pass like the two above. Data-only: one site
-    /// list per generation, no volume decoding.
-    radar: Option<Arc<dyn ds_core::radar_sites::RadarSiteSource>>,
+    auxiliary: ArcSwap<AuxiliarySources>,
+    // Configuration capabilities stay fixed for this engine's lifetime.
+    lightning_configured: bool,
+    radar_configured: bool,
     /// Sortable properties for THIS instance, resolved once whenever a
     /// source is wired. Stored rather than recomputed so the per-request
     /// accessor is a borrow — same effect as the four-constant version it
@@ -374,6 +417,7 @@ impl NowcastEngine {
             collection_id: collection_id.to_string(),
             source_id: source_id.to_string(),
             source,
+            reload_config: config.clone(),
             cfg: EngineCfg {
                 horizon,
                 step,
@@ -385,6 +429,8 @@ impl NowcastEngine {
                 growth_decay: config.growth_decay,
             },
             state: ArcSwap::from_pointee(NowcastState {
+                source_info: source_info.clone(),
+                source_contract_changed: false,
                 generations: BTreeMap::new(),
                 info: empty_info(&source_info),
                 cell_history: Vec::new(),
@@ -404,9 +450,9 @@ impl NowcastEngine {
             track_pass2_matches_total: AtomicU64::new(0),
             track_velocity_clamps_total: AtomicU64::new(0),
             radar_empty_warned: AtomicBool::new(false),
-            lightning: None,
-            impact: None,
-            radar: None,
+            auxiliary: ArcSwap::from_pointee(AuxiliarySources::default()),
+            lightning_configured: false,
+            radar_configured: false,
             sortables: SORTABLES_BASE.to_vec(),
             filterables: cell_filterables(false, false, false),
             scorer,
@@ -484,7 +530,9 @@ impl NowcastEngine {
     /// wiring before the engine is shared; the Feature layer only emits
     /// the flash properties when a source is attached.
     pub fn with_lightning_source(mut self, source: Arc<dyn ds_core::events::EventSource>) -> Self {
-        self.lightning = Some(source);
+        let mut sources = self.auxiliary.load().as_ref().clone();
+        sources.lightning = Some(source);
+        self.auxiliary.store(Arc::new(sources));
         self.recompute_sortables();
         self
     }
@@ -498,11 +546,13 @@ impl NowcastEngine {
         name_property: &str,
         weight_property: Option<&str>,
     ) -> Self {
-        self.impact = Some(ImpactCfg {
+        let mut sources = self.auxiliary.load().as_ref().clone();
+        sources.impact = Some(ImpactCfg {
             source,
             name_property: name_property.to_string(),
             weight_property: weight_property.map(str::to_string),
         });
+        self.auxiliary.store(Arc::new(sources));
         self.recompute_sortables();
         self
     }
@@ -513,7 +563,9 @@ impl NowcastEngine {
         mut self,
         source: Arc<dyn ds_core::radar_sites::RadarSiteSource>,
     ) -> Self {
-        self.radar = Some(source);
+        let mut sources = self.auxiliary.load().as_ref().clone();
+        sources.radar = Some(source);
+        self.auxiliary.store(Arc::new(sources));
         self.recompute_sortables();
         self
     }
@@ -526,22 +578,61 @@ impl NowcastEngine {
     /// silently-ignored-parameter failure this surface exists to remove.
     /// Advertise only what this instance can actually order by.
     fn recompute_sortables(&mut self) {
+        let sources = self.auxiliary.load();
+        self.lightning_configured = sources.lightning.is_some();
+        self.radar_configured = sources.radar.is_some();
         let mut v = SORTABLES_BASE.to_vec();
-        if self.lightning.is_some() {
+        if sources.lightning.is_some() {
             v.extend(SORTABLES_LIGHTNING_EXTRAS);
         }
-        if self.impact.is_some() {
+        if sources.impact.is_some() {
             v.extend(SORTABLES_IMPACT_EXTRAS);
         }
-        if self.radar.is_some() {
+        if sources.radar.is_some() {
             v.extend(crate::radar::SORTABLES_RADAR_EXTRAS);
         }
         self.sortables = v;
         self.filterables = cell_filterables(
-            self.lightning.is_some(),
-            self.impact.is_some(),
-            self.radar.is_some(),
+            sources.lightning.is_some(),
+            sources.impact.is_some(),
+            sources.radar.is_some(),
         );
+    }
+
+    /// Stage a compatible auxiliary rebind from a fully validated candidate.
+    /// A different raster engine is deliberately incompatible even if its
+    /// metadata matches: equal geometry does not establish source provenance.
+    /// The server also requires the full collection config to be unchanged.
+    pub fn prepare_dependency_update(
+        self: &Arc<Self>,
+        candidate: &Self,
+    ) -> Option<DependencyUpdate> {
+        let incoming = candidate.auxiliary.load();
+        let current = self.auxiliary.load();
+        let state = self.state.load();
+        let same_impact_contract = match (&current.impact, &incoming.impact) {
+            (Some(a), Some(b)) => {
+                a.name_property == b.name_property && a.weight_property == b.weight_property
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if self.collection_id != candidate.collection_id
+            || self.source_id != candidate.source_id
+            || self.reload_config != candidate.reload_config
+            || !Arc::ptr_eq(&self.source, &candidate.source)
+            || self.lightning_configured != candidate.lightning_configured
+            || self.radar_configured != candidate.radar_configured
+            || !same_impact_contract
+            || state.source_contract_changed
+            || !compatible_source(&state.source_info, &candidate.source.raster_info())
+        {
+            return None;
+        }
+        Some(DependencyUpdate {
+            engine: self.clone(),
+            sources: incoming.as_ref().clone(),
+        })
     }
 
     /// Poll the source for a new frame; spawn on the BACKGROUND runtime only.
@@ -561,6 +652,7 @@ impl NowcastEngine {
     /// Public so tests (and pre-warm paths) can drive generations without the
     /// loop.
     pub fn poll_once(&self) {
+        let sources = self.auxiliary.load_full();
         let source_info = self.source.raster_info();
         let Some(&anchor) = source_info.times.last() else {
             return; // source has no data yet
@@ -572,7 +664,7 @@ impl NowcastEngine {
             }
         }
         let started = std::time::Instant::now();
-        match self.generate(&source_info, anchor) {
+        match self.generate(&source_info, anchor, &sources) {
             Ok(generation) => {
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let old = self.state.load();
@@ -597,7 +689,7 @@ impl NowcastEngine {
                 // database, and we are on the poll runtime where that is
                 // legal). A source error degrades to "no impact context this
                 // generation", never a failed generation.
-                let impact_index = self.impact.as_ref().and_then(|cfg| {
+                let impact_index = sources.impact.as_ref().and_then(|cfg| {
                     let g = generation_ref.geom;
                     match ImpactIndex::build(
                         cfg.source.as_ref(),
@@ -627,7 +719,7 @@ impl NowcastEngine {
                 });
                 // Radar sites (#642): a snapshot read, never I/O. An empty
                 // list (source not yet populated) serves the group as null.
-                let radar_sites = self.radar.as_ref().map(|r| r.radar_sites());
+                let radar_sites = sources.radar.as_ref().map(|r| r.radar_sites());
                 if let Some(sites) = &radar_sites {
                     if sites.is_empty() {
                         if !self.radar_empty_warned.swap(true, Ordering::Relaxed) {
@@ -661,6 +753,17 @@ impl NowcastEngine {
                     cell_history.drain(..excess);
                 }
                 self.state.store(Arc::new(NowcastState {
+                    source_contract_changed: old.source_contract_changed
+                        || (!old.generations.is_empty()
+                            && !compatible_source(&old.source_info, &source_info)),
+                    // Keep the contract of the retained history, even if the
+                    // live source later changes metadata. A reload must then
+                    // rebuild rather than declare that mixed history compatible.
+                    source_info: if old.generations.is_empty() {
+                        source_info.clone()
+                    } else {
+                        old.source_info.clone()
+                    },
                     generations,
                     info,
                     cell_history,
@@ -750,6 +853,7 @@ impl NowcastEngine {
         &self,
         source_info: &RasterInfo,
         anchor: DateTime<Utc>,
+        sources: &AuxiliarySources,
     ) -> Result<Generation, DataServerError> {
         let extent = source_info.spatial_extent.ok_or_else(|| {
             DataServerError::Engine("nowcast source reports no spatial extent".into())
@@ -888,7 +992,7 @@ impl NowcastEngine {
             }
         };
         let displacement_secs = (anchor - previous_at).num_seconds().max(1) as f32;
-        let (mut cells, coasting, track_stats) = advance_tracks_coasting(
+        let (mut cells, mut coasting, track_stats) = advance_tracks_coasting(
             previous_cells,
             coasting,
             blobs,
@@ -909,12 +1013,21 @@ impl NowcastEngine {
             .fetch_add(track_stats.pass2_matches, Ordering::Relaxed);
         self.track_velocity_clamps_total
             .fetch_add(track_stats.velocity_clamps, Ordering::Relaxed);
+        if prev_latest.is_some_and(|(_, prev)| prev.lightning_epoch != sources.lightning_epoch) {
+            // A rebuilt events source can represent different coverage/data.
+            // Preserve radar tracks, but never compare its rates with the old
+            // source's jump baseline, including tracks rescued from coasting.
+            for cell in cells.iter_mut().chain(coasting.iter_mut()) {
+                cell.flash_history.clear();
+                cell.first_flash = None;
+            }
+        }
         // Lightning join (#549): one bounded event fetch per generation
         // (we are ON the background poll runtime — the EventSource sync
         // bridge is legal here, root rule 7), binned onto cells via the
         // label map. A source error degrades to "no flash data this
         // generation" (fields stay None), never a failed generation.
-        if let Some(source) = &self.lightning {
+        if let Some(source) = &sources.lightning {
             let mut bounds: Vec<_> = cells
                 .iter()
                 .map(|t| {
@@ -1109,6 +1222,7 @@ impl NowcastEngine {
         drop(trajectories); // release the borrow of `field` before moving it
 
         Ok(Generation {
+            lightning_epoch: sources.lightning_epoch,
             reference_time: anchor,
             times,
             frames,
@@ -2322,7 +2436,7 @@ impl FeatureEngine for NowcastEngine {
             .iter()
             .filter_map(|t| {
                 let (lon, lat, feature) =
-                    cell_feature(t, self.lightning.is_some(), self.radar.is_some());
+                    cell_feature(t, self.lightning_configured, self.radar_configured);
                 if let Some(b) = &query.bbox {
                     if !b.contains(lon, lat) {
                         return None;
@@ -2387,7 +2501,7 @@ impl FeatureEngine for NowcastEngine {
             .iter()
             .find(|t| t.facts.id == id)
             .ok_or_else(not_found)?;
-        Ok(cell_feature(track, self.lightning.is_some(), self.radar.is_some()).2)
+        Ok(cell_feature(track, self.lightning_configured, self.radar_configured).2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on

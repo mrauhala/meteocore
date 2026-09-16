@@ -68,13 +68,25 @@ disk, no TOML needed.
     running, catalog/caches stay warm, no remote re-bootstrap. Poll-loop
     rotation is by `Arc` identity (`diff_by_identity`): reused engines are
     neither `shutdown()` nor re-spawned (either would break — #442).
-  - **Exceptions:** `csv`/`geojson` always rebuild (no poll loop — a reload
-    is the only way they re-read a changed data file). A `nowcast` reuses
-    only if EVERY second-pass dependency — `source`, `lightning_source`,
-    `impact_source`, `radar_source` — is reused too (`reusable_collections`
-    encodes them).
-    A dependency missing from that list would be rebuilt while the wrapper
-    kept an `Arc` to the old one, so add new second-pass deps in both places.
+  - **Exceptions:** `csv`/`geojson` always rebuild to reread changed files.
+    A nowcast whose own collection config and raster source are unchanged can
+    retain its live engine, forecasts, cell history and track IDs (#604).
+    Auxiliary lightning/impact/radar sources are ALL revalidated against the
+    new base registries, even on reuse. The engine also checks source identity
+    and the retained geometry/product contract; a rebuilt raster source or a
+    changed contract forces a fresh nowcast. Equal geometry alone is not proof
+    of the same source data.
+  - **Staged nowcast updates:** `LoadResult` holds `DependencyUpdate`s, applied
+    only AFTER the ready-collection reload guard accepts the load and BEFORE
+    rotating poll loops. Never mutate a live nowcast during `load_collections`:
+    a rejected load must leave its dependencies untouched. Each generation
+    captures one auxiliary snapshot; in-flight work finishes with the old
+    snapshot, and the next generation uses the new one. Existing products are
+    not rewritten at the same anchor. Missing/wrong-kind configured sources
+    still fail load validation; removing an optional join requires updating
+    the nowcast config too. Chaining and declaration-order restrictions stay.
+    Cache eviction follows actual engine reuse, including a candidate that
+    the engine's compatibility guard refused.
   - **Cache hygiene:** previously-live collections that were NOT reused get
     their entries evicted from the rendered/meta-tile/vector-tile caches
     (`evict_collection`; matches `{id}`, `{id}/param`, `{id}-derived`).

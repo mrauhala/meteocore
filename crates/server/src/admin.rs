@@ -1280,9 +1280,20 @@ pub struct LoadResult {
     pub bufr_engines: Vec<Arc<engine_bufr::BufrEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
     pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
+    nowcast_dependency_updates: Vec<engine_nowcast::engine::DependencyUpdate>,
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
     pub engines_by_id: HashMap<String, EngineHandle>,
+}
+
+impl LoadResult {
+    /// Staging a load must not mutate live engines: call only after the reload
+    /// is accepted, before rotating dependency poll loops. Startup has no updates.
+    fn apply_nowcast_dependency_updates(&mut self) {
+        for update in self.nowcast_dependency_updates.drain(..) {
+            update.apply();
+        }
+    }
 }
 
 /// Render caches carried across a reload so a config reload **preserves** the
@@ -1363,10 +1374,10 @@ impl EngineReuse {
 /// (#574): the collection's full `CollectionConfig` is unchanged (derived
 /// `PartialEq` — any field difference, including `[wms]`, forces a rebuild)
 /// AND a live engine exists for it. Derived nowcast collections additionally
-/// require their `source` (and `lightning_source`, when set) to be reusable
-/// themselves — a rebuilt source engine must propagate into a rebuilt nowcast
-/// wrapper even when the nowcast's own TOML is untouched. `csv`/`geojson`
-/// never reuse (no poll loop; see [`EngineHandle`]).
+/// require their raster `source` to be reusable: equal geometry alone cannot
+/// establish a rebuilt source's provenance. Auxiliary joins are revalidated
+/// against the new registries, then rebound atomically on accepted reloads.
+/// `csv`/`geojson` never reuse (no poll loop; see [`EngineHandle`]).
 ///
 /// Two deliberate edges of the equality basis:
 /// - Values resolved from env vars (the postgis DSN) are NOT re-compared: a
@@ -1399,23 +1410,9 @@ pub(crate) fn reusable_collections(
         let Some(nc) = c.nowcast.as_ref() else {
             continue;
         };
-        // Every second-pass dependency must be reusable too, or a rebuilt
-        // dependency would never propagate into the wrapper engine that
-        // holds an Arc to the OLD one.
-        if base.contains(&nc.source)
-            && nc
-                .lightning_source
-                .as_deref()
-                .is_none_or(|ls| base.contains(ls))
-            && nc
-                .impact_source
-                .as_deref()
-                .is_none_or(|is| base.contains(is))
-            && nc
-                .radar_source
-                .as_deref()
-                .is_none_or(|rs| base.contains(rs))
-        {
+        // Only raster provenance gates reuse. Auxiliary references are staged
+        // after validating ALL named dependencies against the new base registries.
+        if base.contains(&nc.source) {
             out.insert(c.id.clone());
         }
     }
@@ -1528,6 +1525,7 @@ pub fn load_collections(
     // Reuse pool for the NEXT reload: every poll-loop engine that made it
     // into this load, whether freshly built or taken from `engine_reuse`.
     let mut engines_by_id: HashMap<String, EngineHandle> = HashMap::new();
+    let mut nowcast_dependency_updates = Vec::new();
 
     for collection in collections {
         let data_path_display = collection
@@ -3283,104 +3281,105 @@ pub fn load_collections(
             ));
             continue;
         };
-        // Reuse only reaches here when the nowcast's own config AND its
-        // source (and lightning_source) collections are unchanged — see
-        // `reusable_collections` — so the reused wrapper keeps extrapolating
-        // the same live source engine that was re-registered above.
+        // Always validate the complete new dependency set, even for a reuse
+        // candidate. Building this lightweight wrapper performs no generation
+        // or remote source fetch, and does not mutate the live wrapper.
+        let engine = match engine_nowcast::NowcastEngine::new(
+            &collection.id,
+            &nowcast_config.source,
+            source.clone(),
+            nowcast_config,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                fail(format!("failed to initialize nowcast engine: {e}"));
+                continue;
+            }
+        };
+        // Lightning join (#549): a named source must exist and be an
+        // events-shape postgis collection in the same config — failing the
+        // collection beats silently serving cells without flash data.
+        let engine = match nowcast_config.lightning_source.as_deref() {
+            Some(src_id) => match event_sources.get(src_id) {
+                Some(events) => engine.with_lightning_source(events.clone()),
+                None => {
+                    fail(format!(
+                        "lightning_source '{src_id}' not found or not an events-shape postgis \
+                         collection (it must be defined in the same config)"
+                    ));
+                    continue;
+                }
+            },
+            None => engine,
+        };
+        // Impact context (named areas a cell is over / heading
+        // toward): a named source must exist and be wired to the
+        // Features API in the same config. Same stance as the
+        // lightning join — failing the collection beats silently
+        // serving cells with an inert `impact` significance term.
+        let engine = match nowcast_config.impact_source.as_deref() {
+            Some(src_id) => match base_feature_engines.get(src_id) {
+                Some(areas) => engine.with_impact_source(
+                    areas.clone(),
+                    &nowcast_config.impact_name_property,
+                    nowcast_config.impact_weight_property.as_deref(),
+                ),
+                // Name the nowcast case specifically: resolving
+                // against the pre-pass snapshot makes it fail
+                // deterministically, but "not found" would be a
+                // baffling message for a collection the operator can
+                // see in their own config.
+                None if collections
+                    .iter()
+                    .any(|c| c.id == src_id && c.engine_type == "nowcast") =>
+                {
+                    fail(format!(
+                        "impact_source '{src_id}' is a nowcast collection; impact areas \
+                         must be a non-derived Features collection (tracked cells are \
+                         points, not areas)"
+                    ));
+                    continue;
+                }
+                None => {
+                    fail(format!(
+                        "impact_source '{src_id}' not found or not wired to the Features \
+                         API (it must be defined in the same config with \"features\" in \
+                         its apis)"
+                    ));
+                    continue;
+                }
+            },
+            None => engine,
+        };
+        // Beam geometry (#642): a named radar source must be a
+        // polar-volume collection in the same config. Same stance as
+        // the other two joins.
+        let engine = match nowcast_config.radar_source.as_deref() {
+            Some(src_id) => match radar_site_sources.get(src_id) {
+                Some(sites) => engine.with_radar_source(sites.clone()),
+                None => {
+                    fail(format!(
+                        "radar_source '{src_id}' not found or not an odim-volume \
+                         collection (it must be defined in the same config)"
+                    ));
+                    continue;
+                }
+            },
+            None => engine,
+        };
         let engine = match engine_reuse.take_nowcast(&collection.id) {
-            Some(e) => {
-                info!(
-                    "Collection '{}': config unchanged — reusing live engine",
-                    collection.id
-                );
-                e
-            }
-            None => {
-                let engine = match engine_nowcast::NowcastEngine::new(
-                    &collection.id,
-                    &nowcast_config.source,
-                    source.clone(),
-                    nowcast_config,
-                ) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        fail(format!("failed to initialize nowcast engine: {e}"));
-                        continue;
-                    }
-                };
-                // Lightning join (#549): a named source must exist and be an
-                // events-shape postgis collection in the same config — failing the
-                // collection beats silently serving cells without flash data.
-                let engine = match nowcast_config.lightning_source.as_deref() {
-                    Some(src_id) => match event_sources.get(src_id) {
-                        Some(events) => engine.with_lightning_source(events.clone()),
-                        None => {
-                            fail(format!(
-                                "lightning_source '{src_id}' not found or not an events-shape postgis \
-                                 collection (it must be defined in the same config)"
-                            ));
-                            continue;
-                        }
-                    },
-                    None => engine,
-                };
-                // Impact context (named areas a cell is over / heading
-                // toward): a named source must exist and be wired to the
-                // Features API in the same config. Same stance as the
-                // lightning join — failing the collection beats silently
-                // serving cells with an inert `impact` significance term.
-                let engine = match nowcast_config.impact_source.as_deref() {
-                    Some(src_id) => match base_feature_engines.get(src_id) {
-                        Some(areas) => engine.with_impact_source(
-                            areas.clone(),
-                            &nowcast_config.impact_name_property,
-                            nowcast_config.impact_weight_property.as_deref(),
-                        ),
-                        // Name the nowcast case specifically: resolving
-                        // against the pre-pass snapshot makes it fail
-                        // deterministically, but "not found" would be a
-                        // baffling message for a collection the operator can
-                        // see in their own config.
-                        None if collections
-                            .iter()
-                            .any(|c| c.id == src_id && c.engine_type == "nowcast") =>
-                        {
-                            fail(format!(
-                                "impact_source '{src_id}' is a nowcast collection; impact areas \
-                                 must be a non-derived Features collection (tracked cells are \
-                                 points, not areas)"
-                            ));
-                            continue;
-                        }
-                        None => {
-                            fail(format!(
-                                "impact_source '{src_id}' not found or not wired to the Features \
-                                 API (it must be defined in the same config with \"features\" in \
-                                 its apis)"
-                            ));
-                            continue;
-                        }
-                    },
-                    None => engine,
-                };
-                // Beam geometry (#642): a named radar source must be a
-                // polar-volume collection in the same config. Same stance as
-                // the other two joins.
-                let engine = match nowcast_config.radar_source.as_deref() {
-                    Some(src_id) => match radar_site_sources.get(src_id) {
-                        Some(sites) => engine.with_radar_source(sites.clone()),
-                        None => {
-                            fail(format!(
-                                "radar_source '{src_id}' not found or not an odim-volume \
-                                 collection (it must be defined in the same config)"
-                            ));
-                            continue;
-                        }
-                    },
-                    None => engine,
-                };
-                Arc::new(engine)
-            }
+            Some(live) => match live.prepare_dependency_update(&engine) {
+                Some(update) => {
+                    nowcast_dependency_updates.push(update);
+                    info!(
+                        "Collection '{}': compatible reload — preserving nowcast history",
+                        collection.id
+                    );
+                    live
+                }
+                None => Arc::new(engine),
+            },
+            None => Arc::new(engine),
         };
         engines_by_id.insert(collection.id.clone(), EngineHandle::Nowcast(engine.clone()));
         nowcast_engines.push(engine.clone());
@@ -3597,6 +3596,7 @@ pub fn load_collections(
         bufr_engines,
         postgis_engines,
         nowcast_engines,
+        nowcast_dependency_updates,
         engines_by_id,
     }
 }
@@ -4268,6 +4268,22 @@ fn apply_load(
             configured: config.collections.len(),
         });
     }
+
+    // Candidate reuse may be refused by the engine's geometry/product guard.
+    // Cache eviction must follow actual reuse, not the optimistic config plan.
+    let reusable: std::collections::HashSet<String> = reusable
+        .into_iter()
+        .filter(
+            |id| match (live_handles.get(id), result.engines_by_id.get(id)) {
+                (Some(EngineHandle::Nowcast(old)), Some(EngineHandle::Nowcast(new))) => {
+                    Arc::ptr_eq(old, new)
+                }
+                (_, None) => false,
+                _ => true,
+            },
+        )
+        .collect();
+    result.apply_nowcast_dependency_updates();
 
     // Reload accepted: remember the style fingerprint so the NEXT reload
     // can tell whether style config changed again.
@@ -6093,6 +6109,174 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nowcast_geojson_reload_preserves_serving_and_adopts_edited_file() {
+        use ds_core::feature::{DatetimeInterval, FeatureQuery, PropertyValue};
+        use ds_core::feature_engine::FeatureEngine;
+        use ds_core::map_engine::{MapEngine, OutputCrs};
+        let dir = tempfile::tempdir().unwrap();
+        let radar_dir = dir.path().join("radar");
+        std::fs::create_dir(&radar_dir).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/radar-tm35fin/radar_tm35_20260406T0640Z.tif");
+        for name in [
+            "radar_tm35_20260406T0635Z.tif",
+            "radar_tm35_20260406T0640Z.tif",
+        ] {
+            std::fs::copy(&fixture, radar_dir.join(name)).unwrap();
+        }
+        let areas_path = dir.path().join("areas.geojson");
+        let write_area = |name: &str| {
+            std::fs::write(&areas_path, serde_json::to_vec(&serde_json::json!({
+            "type":"FeatureCollection", "features":[{"type":"Feature", "id":"area",
+            "properties":{"name":name}, "geometry":{"type":"Polygon", "coordinates":[[[5,45],[50,45],[50,80],[5,80],[5,45]]]}}]
+        })).unwrap()).unwrap()
+        };
+        write_area("Before");
+        let mut radar = tm35_source_collection("radar");
+        radar.data_path = Some(radar_dir.to_str().unwrap().into());
+        radar.geotiff.as_mut().unwrap().poll_interval_secs = 1;
+        let mut areas = nowcast_test_collection("areas", "geojson", None);
+        areas.data_path = Some(areas_path.to_str().unwrap().into());
+        areas.apis = vec!["features".into()];
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = vec!["wms".into(), "features".into(), "edr".into()];
+        let cfg = nc.nowcast.as_mut().unwrap();
+        cfg.impact_source = Some("areas".into());
+        cfg.max_pixels = 65_536;
+        cfg.horizon = "PT5M".into();
+        let configs = vec![nc, areas, radar]; // declaration-order independent
+        let first = load_with_reuse(&configs, super::EngineReuse::default());
+        let engine = &first.nowcast_engines[0];
+        engine.poll_once();
+        assert!(engine.has_data());
+        let info = engine.raster_info();
+        let anchor = info.reference_times[0];
+        let query = FeatureQuery {
+            datetime: Some(DatetimeInterval {
+                start: Some(anchor),
+                end: Some(anchor),
+            }),
+            ..Default::default()
+        };
+        let cells = engine.get_features(&query).unwrap().features;
+        assert!(
+            !cells.is_empty(),
+            "committed real radar fixture must produce cells"
+        );
+        assert_eq!(
+            cells[0].properties.get("impact_over"),
+            Some(&PropertyValue::String("Before".into()))
+        );
+        let bbox = info.spatial_extent.unwrap();
+        let render = || {
+            engine
+                .get_raster_tile(
+                    bbox,
+                    64,
+                    64,
+                    Some(anchor),
+                    &OutputCrs::Wgs84,
+                    None,
+                    None,
+                    Some(anchor),
+                )
+                .unwrap()
+        };
+        let pixels = render().values.iter_values().collect::<Vec<_>>();
+        write_area("After");
+        let mut second = load_with_reuse(
+            &configs,
+            reuse_pool(&configs, &configs, &first.engines_by_id),
+        );
+        assert!(Arc::ptr_eq(engine, &second.nowcast_engines[0]));
+        assert!(Arc::ptr_eq(
+            &first.geotiff_engines[0],
+            &second.geotiff_engines[0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &first.features_state.engines["areas"],
+            &second.features_state.engines["areas"]
+        ));
+        assert_eq!(
+            second.features_state.engines["areas"]
+                .get_features(&FeatureQuery::default())
+                .unwrap()
+                .features[0]
+                .properties
+                .get("name"),
+            Some(&PropertyValue::String("After".into()))
+        );
+        assert_eq!(second.nowcast_dependency_updates.len(), 1);
+        assert_eq!(
+            engine.get_features(&query).unwrap().features[0].properties,
+            cells[0].properties
+        );
+        second.apply_nowcast_dependency_updates();
+        assert_eq!(engine.raster_info().reference_times, info.reference_times);
+        assert_eq!(render().values.iter_values().collect::<Vec<_>>(), pixels);
+        assert!(second.nowcast_dependency_updates.is_empty());
+        let (removed, added) =
+            super::diff_by_identity(&first.nowcast_engines, &second.nowcast_engines);
+        assert!(
+            removed.is_empty() && added.is_empty(),
+            "reuse must not stop or double-spawn the poller"
+        );
+
+        std::fs::copy(&fixture, radar_dir.join("radar_tm35_20260406T0645Z.tif")).unwrap();
+        let raster = first.geotiff_engines[0].clone();
+        let poller = crate::poll_runtime().spawn(async move { raster.poll_loop().await });
+        let next = anchor + chrono::Duration::minutes(5);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !first.geotiff_engines[0].raster_info().times.contains(&next) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        first.geotiff_engines[0].shutdown();
+        poller.await.unwrap();
+        engine.poll_once();
+        let current = engine
+            .get_features(&FeatureQuery::default())
+            .unwrap()
+            .features;
+        assert!(!current.is_empty());
+        assert_eq!(
+            current[0].properties.get("impact_over"),
+            Some(&PropertyValue::String("After".into()))
+        );
+        assert_eq!(
+            engine.get_features(&query).unwrap().features[0].properties,
+            cells[0].properties
+        );
+
+        // A reused candidate must still validate missing and wrong-kind deps.
+        let mut missing = configs.clone();
+        missing.retain(|c| c.id != "areas");
+        let rejected = load_with_reuse(
+            &missing,
+            reuse_pool(&configs, &missing, &second.engines_by_id),
+        );
+        assert_eq!(
+            health_of(&rejected, "nc").status,
+            super::CollectionStatus::Failed
+        );
+        assert!(rejected.nowcast_dependency_updates.is_empty());
+        let mut wrong = configs.clone();
+        wrong[1].apis.clear();
+        let rejected = load_with_reuse(&wrong, reuse_pool(&configs, &wrong, &second.engines_by_id));
+        assert_eq!(
+            health_of(&rejected, "nc").status,
+            super::CollectionStatus::Failed
+        );
+        assert!(rejected.nowcast_dependency_updates.is_empty());
+        assert!(
+            engine.has_data(),
+            "staging invalid loads must not touch the live engine"
+        );
+    }
+
     #[test]
     fn reusable_collections_diff_rules() {
         let radar = tm35_source_collection("radar");
@@ -6139,7 +6323,7 @@ mod tests {
         let r = super::reusable_collections(&old_csv, &[csv], &live_of(&["obs"]));
         assert!(r.is_empty());
 
-        // Nowcast with a lightning_source: reusable only when BOTH deps are.
+        // Auxiliary rebuilds do not disqualify reuse; load revalidates their shape.
         let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
         if let Some(n) = nc.nowcast.as_mut() {
             n.lightning_source = Some("lightning".to_string());
@@ -6156,14 +6340,14 @@ mod tests {
         let new = vec![radar.clone(), lightning.clone(), nc.clone()];
         let r = super::reusable_collections(&old, &new, &live_of(&["radar", "lightning", "nc"]));
         assert!(r.contains("nc"), "all deps unchanged → nowcast reusable");
-        // Lightning source engine gone from the live pool → nowcast rebuilds.
+        // Lightning can be rebuilt and rebound; missing/wrong-shaped new sources
+        // still fail validation in the loader (tested below).
         let r = super::reusable_collections(&old, &new, &live_of(&["radar", "nc"]));
-        assert!(!r.contains("nc"));
+        assert!(r.contains("nc"));
         assert!(r.contains("radar"));
 
-        // Same rule for impact_source: a rebuilt impact collection must
-        // force the nowcast to rebuild too, or the wrapper keeps an Arc to
-        // the OLD areas engine and silently serves stale impact context.
+        // Rebuilt impact collections stage a new reference without discarding
+        // forecast runs or cell history.
         let mut nc_impact = nowcast_test_collection("nci", "nowcast", Some("radar"));
         if let Some(n) = nc_impact.nowcast.as_mut() {
             n.impact_source = Some("areas".to_string());
@@ -6182,14 +6366,12 @@ mod tests {
         assert!(r.contains("nci"), "all deps unchanged → nowcast reusable");
         let r = super::reusable_collections(&old, &new, &live_of(&["radar", "nci"]));
         assert!(
-            !r.contains("nci"),
-            "impact source not reused → nowcast must rebuild"
+            r.contains("nci"),
+            "impact source can be rebuilt and rebound"
         );
 
-        // Consequence worth pinning: geojson ALWAYS rebuilds (no poll loop —
-        // reload is the only way it re-reads its file), so the typical
-        // municipality impact source makes its nowcast rebuild on every
-        // reload. Correct per the dependency rule, but not free.
+        // GeoJSON itself still rebuilds to reread the file. Its nowcast now
+        // retains serving history and adopts the refreshed areas next generation.
         let mut geo_areas = nowcast_test_collection("areas", "geojson", None);
         geo_areas.apis = vec!["features".to_string()];
         let old: HashMap<String, CollectionConfig> = [
@@ -6202,8 +6384,8 @@ mod tests {
         let new = vec![radar.clone(), geo_areas, nc_impact.clone()];
         let r = super::reusable_collections(&old, &new, &live_of(&["radar", "areas", "nci"]));
         assert!(
-            !r.contains("nci"),
-            "a geojson impact source always rebuilds, so its nowcast must too"
+            r.contains("nci"),
+            "a geojson impact source must not discard nowcast history"
         );
     }
 
