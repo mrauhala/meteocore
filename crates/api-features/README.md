@@ -180,6 +180,13 @@ coverage of the labeled footprint and attribution radius. With a source wired,
 outside/unknown coverage and on failed or capped joins. An advertised source
 extent alone does not establish coverage.
 
+Compatible nowcast reloads preserve retained cell snapshots and track IDs (#604).
+Edited GeoJSON impact areas are used by the next generation; past snapshots
+keep their original facts. Replaced lightning sources restart the jump baseline
+without restarting radar tracks. Reuse requires unchanged nowcast config, the
+same raster engine and a matching retained geometry/product contract. Missing
+or invalid configured dependencies still fail load validation.
+
 Nowcast cells have a 2.5 km² minimum footprint, summed at each pixel row's
 latitude. `area_km2`, severity and flash density use that physical area;
 tracking distances and speeds use local latitude. Working resolution depends

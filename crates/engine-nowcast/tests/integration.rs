@@ -2640,3 +2640,400 @@ fn served_motion_matches_harness_pipeline_across_irregular_generations() {
         previous = Some(estimate);
     }
 }
+
+/// A whole-grid named area for the reload regressions.
+struct ReloadAreas(&'static str);
+impl ds_core::feature_engine::FeatureEngine for ReloadAreas {
+    fn get_features(
+        &self,
+        _: &ds_core::feature::FeatureQuery,
+    ) -> Result<ds_core::feature::FeaturePage, DataServerError> {
+        use ds_core::feature::*;
+        Ok(FeaturePage {
+            features: vec![Feature {
+                id: "area".into(),
+                geometry: Arc::new(Geometry::Polygon {
+                    exterior: vec![[0., 50.], [10., 50.], [10., 60.], [0., 60.], [0., 50.]],
+                    holes: vec![],
+                }),
+                properties: Arc::new(
+                    [("name".into(), PropertyValue::String(self.0.into()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            }],
+            number_matched: 1,
+            number_returned: 1,
+            next_offset: None,
+        })
+    }
+    fn get_feature(&self, _: &str) -> Result<ds_core::feature::Feature, DataServerError> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn compatible_reload_preserves_runs_history_ids_and_updates_impact_next_generation() {
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::feature::{DatetimeInterval, FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    let a1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), a1]),
+    });
+    let mut cfg = base_config();
+    cfg.impact_source = Some("areas".into());
+    let build = |name| {
+        NowcastEngine::new("nc", "mock", source.clone(), &cfg)
+            .unwrap()
+            .with_impact_source(Arc::new(ReloadAreas(name)), "name", None)
+    };
+    let engine = Arc::new(build("Old area"));
+    engine.poll_once();
+    source
+        .times
+        .write()
+        .unwrap()
+        .push(a1 + Duration::minutes(5));
+    engine.poll_once();
+    let history_query = FeatureQuery {
+        datetime: Some(DatetimeInterval {
+            start: Some(a1),
+            end: Some(a1),
+        }),
+        ..Default::default()
+    };
+    let history = engine.get_features(&history_query).unwrap().features;
+    let latest = engine
+        .get_features(&FeatureQuery::default())
+        .unwrap()
+        .features;
+    let runs = engine.raster_info().reference_times;
+    let pixels = render_raw(&engine, a1 + Duration::minutes(10));
+    let counters = engine.track_metrics();
+    let update = engine
+        .prepare_dependency_update(&build("New area"))
+        .unwrap();
+    assert_eq!(
+        engine.get_features(&history_query).unwrap().features[0].properties,
+        history[0].properties
+    );
+    update.apply();
+    assert!(engine.has_data());
+    assert_eq!(engine.raster_info().reference_times, runs);
+    assert_eq!(engine.get_instances().len(), 2);
+    assert_eq!(render_raw(&engine, a1 + Duration::minutes(10)), pixels);
+    assert_eq!(engine.track_metrics(), counters);
+    engine.poll_once(); // same anchor: never double-advance tracks or rewrite a run
+    assert_eq!(engine.metrics().0, 2);
+    let a3 = a1 + Duration::minutes(10);
+    source.times.write().unwrap().push(a3);
+    engine.poll_once();
+    let current = engine
+        .get_features(&FeatureQuery::default())
+        .unwrap()
+        .features;
+    assert_eq!(current[0].id, latest[0].id);
+    assert_eq!(
+        current[0].properties.get("track_age"),
+        Some(&PropertyValue::Integer(4))
+    );
+    assert_eq!(
+        current[0].properties.get("impact_over"),
+        Some(&PropertyValue::String("New area".into()))
+    );
+    assert_eq!(
+        engine.get_features(&history_query).unwrap().features[0].properties,
+        history[0].properties
+    );
+    assert_eq!(
+        history[0].properties.get("impact_over"),
+        Some(&PropertyValue::String("Old area".into()))
+    );
+    assert_eq!(engine.get_instances().len(), 3);
+
+    // A rejected load can drop its staged update without touching the live engine.
+    drop(
+        engine
+            .prepare_dependency_update(&build("Rejected area"))
+            .unwrap(),
+    );
+    source
+        .times
+        .write()
+        .unwrap()
+        .push(a3 + Duration::minutes(5));
+    engine.poll_once();
+    assert_eq!(
+        engine
+            .get_features(&FeatureQuery::default())
+            .unwrap()
+            .features[0]
+            .properties
+            .get("impact_over"),
+        Some(&PropertyValue::String("New area".into()))
+    );
+    // Equal geometry is insufficient to prove that another source has the same data.
+    let replacement = NowcastEngine::new(
+        "nc",
+        "mock",
+        Arc::new(MockSource {
+            times: RwLock::new(vec![t0(), a1]),
+        }),
+        &cfg,
+    )
+    .unwrap()
+    .with_impact_source(Arc::new(ReloadAreas("New area")), "name", None);
+    assert!(engine.prepare_dependency_update(&replacement).is_none());
+    let mut changed = cfg.clone();
+    changed.min_echo += 1.;
+    let replacement = NowcastEngine::new("nc", "mock", source, &changed)
+        .unwrap()
+        .with_impact_source(Arc::new(ReloadAreas("New area")), "name", None);
+    assert!(engine.prepare_dependency_update(&replacement).is_none());
+}
+
+#[test]
+fn reload_during_generation_uses_one_dependency_snapshot_and_resets_lightning_baseline() {
+    use ds_core::events::{EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Mutex,
+    };
+    struct Strikes {
+        block: AtomicBool,
+        entered: mpsc::SyncSender<()>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+        count: usize,
+    }
+    impl EventSource for Strikes {
+        fn covers(&self, _: [f64; 4]) -> Option<bool> {
+            Some(true)
+        }
+        fn recent_events(
+            &self,
+            _: DateTime<Utc>,
+            end: DateTime<Utc>,
+            _: usize,
+        ) -> Result<Vec<EventPoint>, DataServerError> {
+            if self.block.swap(false, Ordering::SeqCst) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+            }
+            let (x, y) = disc_center(end);
+            Ok(vec![
+                EventPoint {
+                    time: end,
+                    lon: x / W as f64 * 10.,
+                    lat: 60. - y / H as f64 * 10.,
+                    attrs: Default::default()
+                };
+                self.count
+            ])
+        }
+    }
+    let (entered, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release = Arc::new(Mutex::new(release_rx));
+    let a1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), a1]),
+    });
+    let mut cfg = base_config();
+    cfg.lightning_source = Some("lightning".into());
+    cfg.impact_source = Some("areas".into());
+    let old = Arc::new(Strikes {
+        block: AtomicBool::new(false),
+        entered: entered.clone(),
+        release: release.clone(),
+        count: 30,
+    });
+    let engine = Arc::new(
+        NowcastEngine::new("nc", "mock", source.clone(), &cfg)
+            .unwrap()
+            .with_lightning_source(old.clone())
+            .with_impact_source(Arc::new(ReloadAreas("Old")), "name", None),
+    );
+    // Establish a usable jump baseline before replacing the events source.
+    for i in 1..=3 {
+        if i > 1 {
+            source
+                .times
+                .write()
+                .unwrap()
+                .push(t0() + Duration::minutes(i * 5));
+        }
+        engine.poll_once();
+    }
+    let before = engine
+        .get_features(&FeatureQuery::default())
+        .unwrap()
+        .features
+        .remove(0);
+    assert_eq!(
+        before.properties.get("lightning_jump"),
+        Some(&PropertyValue::Bool(false))
+    );
+    old.block.store(true, Ordering::SeqCst);
+    source
+        .times
+        .write()
+        .unwrap()
+        .push(t0() + Duration::minutes(20));
+    std::thread::scope(|scope| {
+        scope.spawn(|| engine.poll_once());
+        // Generation has captured old sources and entered its lightning fetch.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let new = Arc::new(Strikes {
+            block: AtomicBool::new(false),
+            entered: entered.clone(),
+            release: release.clone(),
+            count: 300,
+        });
+        let replacement = NowcastEngine::new("nc", "mock", source.clone(), &cfg)
+            .unwrap()
+            .with_lightning_source(new)
+            .with_impact_source(Arc::new(ReloadAreas("New")), "name", None);
+        engine
+            .prepare_dependency_update(&replacement)
+            .unwrap()
+            .apply();
+        release_tx.send(()).unwrap();
+    });
+    let old_generation = engine
+        .get_features(&FeatureQuery::default())
+        .unwrap()
+        .features
+        .remove(0);
+    assert_eq!(
+        old_generation.properties.get("impact_over"),
+        Some(&PropertyValue::String("Old".into()))
+    );
+    assert_eq!(
+        old_generation.properties.get("flash_count"),
+        Some(&PropertyValue::Integer(30))
+    );
+    source
+        .times
+        .write()
+        .unwrap()
+        .push(t0() + Duration::minutes(25));
+    engine.poll_once();
+    let new_generation = engine
+        .get_features(&FeatureQuery::default())
+        .unwrap()
+        .features
+        .remove(0);
+    assert_eq!(new_generation.id, before.id);
+    assert_eq!(
+        new_generation.properties.get("impact_over"),
+        Some(&PropertyValue::String("New".into()))
+    );
+    assert_eq!(
+        new_generation.properties.get("flash_count"),
+        Some(&PropertyValue::Integer(300))
+    );
+    assert_eq!(
+        new_generation.properties.get("lightning_jump"),
+        Some(&PropertyValue::Null),
+        "new network must not appear to jump against old network rates"
+    );
+    assert_eq!(
+        new_generation.properties.get("jump_sigma"),
+        Some(&PropertyValue::Null)
+    );
+}
+
+#[test]
+fn reload_rejects_geometry_and_product_changes_even_with_the_same_source_arc() {
+    struct MutableInfo {
+        inner: MockSource,
+        info: RwLock<RasterInfo>,
+    }
+    impl MapEngine for MutableInfo {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            crs: &OutputCrs,
+            parameter: Option<&str>,
+            z: Option<f64>,
+            rt: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.inner
+                .get_raster_tile(bbox, width, height, time, crs, parameter, z, rt)
+        }
+        fn raster_info(&self) -> RasterInfo {
+            self.info.read().unwrap().clone()
+        }
+    }
+    let inner = MockSource {
+        times: RwLock::new(vec![t0(), t0() + Duration::minutes(5)]),
+    };
+    let original = inner.raster_info();
+    let source = Arc::new(MutableInfo {
+        inner,
+        info: RwLock::new(original.clone()),
+    });
+    let engine =
+        Arc::new(NowcastEngine::new("nc", "mock", source.clone(), &base_config()).unwrap());
+    engine.poll_once();
+    let candidate = || NowcastEngine::new("nc", "mock", source.clone(), &base_config()).unwrap();
+    assert!(engine.prepare_dependency_update(&candidate()).is_some());
+    let mut changes = vec![];
+    let mut changed = original.clone();
+    changed.spatial_extent = Some([1., 50., 11., 60.]);
+    changes.push(changed);
+    let mut changed = original.clone();
+    changed.grid_size = Some([100, 100]);
+    changes.push(changed);
+    let mut changed = original.clone();
+    changed.parameter = "rainfall".into();
+    changes.push(changed);
+    let mut changed = original.clone();
+    changed.unit = "mm/h".into();
+    changes.push(changed);
+    let mut changed = original.clone();
+    changed.native_crs = "EPSG:3857".into();
+    changes.push(changed);
+    let mut changed = original.clone();
+    changed.parameters = vec![("other".into(), "Other product".into())];
+    changes.push(changed);
+    let mut changed = original.clone();
+    changed.vertical = Some(ds_core::vertical::VerticalDimension {
+        kind: ds_core::vertical::VerticalKind::Height,
+        levels: vec![100.],
+    });
+    changes.push(changed);
+    for changed in changes {
+        *source.info.write().unwrap() = changed;
+        assert!(
+            engine.prepare_dependency_update(&candidate()).is_none(),
+            "changed source contract must reset on reload"
+        );
+    }
+    *source.info.write().unwrap() = original.clone();
+    assert!(engine.prepare_dependency_update(&candidate()).is_some());
+    // If a live source already generated under a changed contract, restoring
+    // its old metadata must not make that mixed history eligible for reuse.
+    source.info.write().unwrap().unit = "mm/h".into();
+    source
+        .info
+        .write()
+        .unwrap()
+        .times
+        .push(t0() + Duration::minutes(10));
+    engine.poll_once();
+    *source.info.write().unwrap() = original;
+    assert!(engine.prepare_dependency_update(&candidate()).is_none());
+}
