@@ -17,7 +17,6 @@ pub struct DataReader<'a, R: Read> {
     reader: BitReader<std::io::Take<R>, BigEndian>,
     /// Stack for parsing nested data
     stack: smallvec::SmallVec<[StackEntry<'a>; 8]>,
-    temporary_operator: Option<XY>,
     /// Current offset set by the "Change data width" operator
     width_offset: i8,
     /// Current offset set by the "Change scale" operator
@@ -61,7 +60,6 @@ impl<'a, R: Read> DataReader<'a, R> {
             current_subset_index: 0,
             reader: BitReader::endian(reader.take(u64::from(data_length)), BigEndian),
             stack: smallvec::SmallVec::new(),
-            temporary_operator: None,
             scale_offset: 0,
             width_offset: 0,
             character_width: None,
@@ -169,7 +167,6 @@ impl<'a, R: Read> DataReader<'a, R> {
             self.width_offset = 0;
             self.scale_offset = 0;
             self.character_width = None;
-            self.temporary_operator = None;
             self.stack
                 .push(StackEntry::new_sequence(&self.data_spec.root_descriptors));
             let subset_idx = self.current_subset_index;
@@ -370,8 +367,10 @@ impl<'a, R: Read> DataReader<'a, R> {
             // Change scale
             (2, 0) => self.scale_offset = 0,
             (2, y) => self.scale_offset = ((y as i16) - 128) as i8,
-            // Signify data width for the immediately following local descriptor
-            (6, _) => self.temporary_operator = Some(xy),
+            // All local descriptors must already have resolved Table B entries.
+            // Their widths come from those entries; 206 does not let this reader
+            // skip unknown local descriptors (resolution rejects those first).
+            (6, _) => {}
             // Change CCITT IA5 field width, in characters; zero cancels.
             (8, 0) => self.character_width = None,
             (8, y) => self.character_width = Some(u32::from(y) * 8),
@@ -474,6 +473,44 @@ mod format_regressions {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn local_width_operator_requires_a_known_table_entry() {
+        use crate::Descriptor;
+
+        const LOCAL: TableBEntry = TableBEntry {
+            xy: XY { x: 4, y: 214 },
+            bits: 5,
+            reference_value: 0,
+            ..NUM
+        };
+        let descriptors = [
+            Descriptor { f: 2, x: 6, y: 5 },
+            Descriptor { f: 0, x: 4, y: 214 },
+            Descriptor { f: 0, x: 10, y: 4 },
+        ];
+        let mut tables = Tables::default();
+        tables.table_b.remove(&LOCAL.xy);
+        assert!(matches!(
+            resolve_descriptors(&tables, &descriptors),
+            Err(Error::Table(_))
+        ));
+        tables.table_b.insert(LOCAL.xy, &LOCAL);
+        tables.table_b.insert(NUM.xy, &NUM);
+        let spec = DataSpec {
+            number_of_subsets: 1,
+            is_compressed: false,
+            root_descriptors: resolve_descriptors(&tables, &descriptors).unwrap(),
+        };
+        let bytes = section(|w| {
+            w.write::<5, u8>(17).unwrap();
+            w.write::<64, u64>(42).unwrap();
+        });
+        assert_eq!(
+            values(&bytes, &spec).unwrap(),
+            vec![vec![Value::Integer(17)], vec![Value::Integer(32)]]
+        );
     }
 
     #[test]
