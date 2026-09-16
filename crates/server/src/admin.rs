@@ -374,6 +374,25 @@ static GEOTIFF_DECODED_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock:
     )
 });
 
+static GEOTIFF_DECODE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "geotiff_decode_reserved_bytes",
+        "Reserved transient GeoTIFF decode memory",
+    )
+});
+static GEOTIFF_DECODE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "geotiff_decode_capacity_bytes",
+        "Transient GeoTIFF decode memory capacity",
+    )
+});
+static GEOTIFF_DECODE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "geotiff_decode_rejected_total",
+        "GeoTIFF decodes rejected by memory admission",
+    )
+});
+
 // Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
 // decoded event windows for the events-shape map layer, so the ~50-190
 // meta-tile renders tiling one frame share ONE DB fetch.
@@ -4852,6 +4871,10 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .unwrap_or_else(|e| e.into_inner())
         .is_empty();
     if has_geotiff {
+        let (used, limit, rejected) = engine_geotiff::decode_budget::metrics();
+        GEOTIFF_DECODE_USED.set(used.min(i64::MAX as usize) as i64);
+        GEOTIFF_DECODE_LIMIT.set(limit.min(i64::MAX as usize) as i64);
+        GEOTIFF_DECODE_REJECTED.feed(rejected as u64);
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
     }

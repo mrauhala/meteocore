@@ -38,6 +38,7 @@ impl From<ds_core::error::DataServerError> for Tiles3dError {
     fn from(e: ds_core::error::DataServerError) -> Self {
         use ds_core::error::DataServerError as E;
         match e {
+            E::ResourceExhausted => Tiles3dError::ServiceUnavailable(e.to_string()),
             E::InvalidParameter(m)
             | E::InvalidBbox(m)
             | E::InvalidDatetime(m)

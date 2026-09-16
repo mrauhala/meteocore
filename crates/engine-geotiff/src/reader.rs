@@ -9,6 +9,7 @@ use memmap2::Mmap;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
+use crate::decode_budget::{Permit, BUDGET};
 use ds_core::geo::{Crs, GeoTransform};
 
 /// Bridge async to sync for standalone functions.
@@ -204,15 +205,23 @@ impl DataSource {
             DataSource::LocalFile { path, mmap_cache } => {
                 let (mmap, _) = Self::load_mmap(path, mmap_cache)?;
                 let cursor = Cursor::new(SharedBytes::Mmap(mmap));
-                Ok(DecoderWrapper(Decoder::new(cursor).map_err(|e| {
-                    DataServerError::Engine(format!("Invalid TIFF {}: {e}", path.display()))
-                })?))
+                Ok(DecoderWrapper(
+                    Decoder::new(cursor)
+                        .map_err(|e| {
+                            DataServerError::Engine(format!("Invalid TIFF {}: {e}", path.display()))
+                        })?
+                        .with_limits(decode_limits()),
+                ))
             }
             DataSource::InMemory(bytes) => {
                 let cursor = Cursor::new(SharedBytes::Heap(bytes.clone()));
-                Ok(DecoderWrapper(Decoder::new(cursor).map_err(|e| {
-                    DataServerError::Engine(format!("Invalid TIFF (in-memory): {e}"))
-                })?))
+                Ok(DecoderWrapper(
+                    Decoder::new(cursor)
+                        .map_err(|e| {
+                            DataServerError::Engine(format!("Invalid TIFF (in-memory): {e}"))
+                        })?
+                        .with_limits(decode_limits()),
+                ))
             }
             DataSource::Remote { .. } | DataSource::HttpDirect { .. } => {
                 Err(DataServerError::Engine(
@@ -251,6 +260,69 @@ impl DataSource {
     }
 }
 
+fn decode_limits() -> tiff::decoder::Limits {
+    let mut limits = tiff::decoder::Limits::default();
+    limits.decoding_buffer_size = MAX_DECODED_TILE_BYTES;
+    limits.intermediate_buffer_size = MAX_DECODED_TILE_BYTES;
+    limits
+}
+
+/// Keep remote decode reservations until parallel tile assembly drops the
+/// decoded values, not merely until decompression returns.
+struct DecodedTile {
+    values: Vec<Option<f64>>,
+    _permit: Permit,
+}
+
+impl std::ops::Deref for DecodedTile {
+    type Target = [Option<f64>];
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+fn remote_decode_size(
+    info: &RemoteTileInfo,
+    samples_per_pixel: u32,
+) -> Result<(usize, usize), DataServerError> {
+    let pixels = (info.tile_width as usize).checked_mul(info.tile_height as usize);
+    let raw = pixels
+        .and_then(|n| n.checked_mul(samples_per_pixel as usize))
+        .and_then(|n| n.checked_mul(info.sample_type.bytes_per_sample()));
+    let bytes = raw.filter(|&n| n <= MAX_DECODED_TILE_BYTES).and_then(|n| {
+        pixels?
+            .checked_mul(std::mem::size_of::<Option<f64>>())?
+            .checked_add(n + 1)
+    });
+    match (raw, bytes) {
+        (Some(raw), Some(bytes)) => Ok((raw, bytes)),
+        _ => Err(DataServerError::Engine(
+            "Decoded tile exceeds size limit".into(),
+        )),
+    }
+}
+
+/// Validate attacker-controlled encoded byte counts before admission or I/O.
+/// The encoded input coexists with decompressed and boxed output buffers.
+fn remote_chunk_layout(
+    info: &RemoteTileInfo,
+    samples: u32,
+    index: usize,
+) -> Result<(usize, usize, usize, usize), DataServerError> {
+    let error = || DataServerError::Engine("Invalid or oversized encoded tile range".into());
+    let offset =
+        usize::try_from(*info.tile_offsets.get(index).ok_or_else(error)?).map_err(|_| error())?;
+    let count = usize::try_from(*info.tile_byte_counts.get(index).ok_or_else(error)?)
+        .map_err(|_| error())?;
+    if count > MAX_DECODED_TILE_BYTES {
+        return Err(error());
+    }
+    offset.checked_add(count).ok_or_else(error)?;
+    let (raw, decoded) = remote_decode_size(info, samples)?;
+    let total = decoded.checked_add(count).ok_or_else(error)?;
+    Ok((raw, total, offset, count))
+}
+
 /// Open the decoder for `source` on first use and seek it to `ifd_index`.
 /// Lazy so a read fully served by the decoded-chunk cache skips the IFD
 /// parse entirely.
@@ -282,7 +354,21 @@ fn read_chunk_cached(
     decoder: &mut Option<DecoderWrapper>,
 ) -> Result<Arc<DecodingResult>, DataServerError> {
     let decode = |decoder: &mut Option<DecoderWrapper>| {
-        ensure_decoder(source, ifd_index, decoder)?
+        let decoder = ensure_decoder(source, ifd_index, decoder)?;
+        let size = decoder
+            .0
+            .image_chunk_buffer_layout(chunk_index)
+            .map_err(|e| DataServerError::Engine(format!("Invalid chunk layout: {e}")))?
+            .len;
+        if size > MAX_DECODED_TILE_BYTES {
+            return Err(DataServerError::Engine(
+                "Decoded tile exceeds size limit".into(),
+            ));
+        }
+        // The decoder's intermediate buffer is separately capped at 64 MiB.
+        // Cached native chunks subsequently belong to the decoded-cache budget.
+        let _permit = BUDGET.reserve(size + MAX_DECODED_TILE_BYTES)?;
+        decoder
             .read_chunk(chunk_index)
             .map_err(|e| DataServerError::Engine(format!("Failed to read tile: {e}")))
     };
@@ -894,44 +980,67 @@ fn extract_u64_list(value: &tiff::decoder::ifd::Value) -> Option<Vec<u64>> {
 fn decompress_tile(
     compressed: &[u8],
     compression: TiffCompression,
+    expected: usize,
 ) -> Result<Vec<u8>, DataServerError> {
-    match compression {
-        TiffCompression::None => Ok(compressed.to_vec()),
+    if expected > MAX_DECODED_TILE_BYTES {
+        return Err(DataServerError::Engine(
+            "Decoded tile exceeds size limit".into(),
+        ));
+    }
+    let mut output = vec![0; expected + 1];
+    let written = match compression {
+        TiffCompression::None => {
+            if compressed.len() != expected {
+                return Err(DataServerError::Engine(
+                    "Invalid uncompressed tile length".into(),
+                ));
+            }
+            output[..expected].copy_from_slice(compressed);
+            expected
+        }
         TiffCompression::Deflate => {
             use std::io::Read;
-            let decoder = flate2::read::ZlibDecoder::new(compressed);
-            let mut decompressed = Vec::with_capacity(compressed.len().min(1024 * 1024));
-            decoder
-                .take(MAX_DECODED_TILE_BYTES as u64)
-                .read_to_end(&mut decompressed)
-                .map_err(|e| {
+            let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+            let mut written = 0;
+            while written < output.len() {
+                let n = decoder.read(&mut output[written..]).map_err(|e| {
                     DataServerError::Engine(format!("Deflate decompression failed: {e}"))
                 })?;
-            if decompressed.len() >= MAX_DECODED_TILE_BYTES {
-                return Err(DataServerError::Engine(format!(
-                    "Decompressed tile exceeds maximum size ({} bytes)",
-                    MAX_DECODED_TILE_BYTES
-                )));
+                if n == 0 {
+                    break;
+                }
+                written += n;
             }
-            Ok(decompressed)
+            written
         }
         TiffCompression::Lzw => {
-            // TIFF LZW uses an early code size increase compared to standard LZW.
-            // with_tiff_size_switch enables this TIFF-specific behavior.
             let mut decoder =
                 weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
-            let decompressed = decoder
-                .decode(compressed)
-                .map_err(|e| DataServerError::Engine(format!("LZW decompression failed: {e}")))?;
-            if decompressed.len() > MAX_DECODED_TILE_BYTES {
-                return Err(DataServerError::Engine(format!(
-                    "Decompressed tile exceeds maximum size ({} bytes)",
-                    MAX_DECODED_TILE_BYTES
-                )));
+            let (mut input, mut written) = (0, 0);
+            loop {
+                let result = decoder.decode_bytes(&compressed[input..], &mut output[written..]);
+                input += result.consumed_in;
+                written += result.consumed_out;
+                let status = result.status.map_err(|e| {
+                    DataServerError::Engine(format!("LZW decompression failed: {e}"))
+                })?;
+                if matches!(status, weezl::LzwStatus::Done) || written == output.len() {
+                    break;
+                }
+                if result.consumed_in == 0 && result.consumed_out == 0 {
+                    return Err(DataServerError::Engine("Truncated LZW tile".into()));
+                }
             }
-            Ok(decompressed)
+            written
         }
+    };
+    if written != expected {
+        return Err(DataServerError::Engine(
+            "Decoded tile length does not match metadata".into(),
+        ));
     }
+    output.truncate(written);
+    Ok(output)
 }
 
 /// Apply horizontal differencing predictor (TIFF predictor=2).
@@ -1079,18 +1188,11 @@ fn read_remote_chunk_f64(
     // Runtime handle to drive the fetch on when called from a non-Tokio
     // (rayon) thread; `None` for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<Vec<Option<f64>>, DataServerError> {
+) -> Result<DecodedTile, DataServerError> {
     let idx = chunk_index as usize;
-    if idx >= tile_info.tile_offsets.len() {
-        return Err(DataServerError::Engine(format!(
-            "Tile index {} out of range ({})",
-            idx,
-            tile_info.tile_offsets.len()
-        )));
-    }
-
-    let offset = tile_info.tile_offsets[idx] as usize;
-    let byte_count = tile_info.tile_byte_counts[idx] as usize;
+    let (raw_size, bytes, offset, byte_count) =
+        remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
+    let permit = BUDGET.reserve(bytes)?;
 
     if byte_count == 0 {
         // Empty tile — return all nodata.
@@ -1102,7 +1204,10 @@ fn read_remote_chunk_f64(
             offset
         );
         let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
-        return Ok(vec![None; pixel_count]);
+        return Ok(DecodedTile {
+            values: vec![None; pixel_count],
+            _permit: permit,
+        });
     }
 
     // Sanity check: offset 0 for a non-first tile is suspicious (likely truncated header)
@@ -1161,7 +1266,7 @@ fn read_remote_chunk_f64(
         fetched
     };
 
-    let mut raw = decompress_tile(&compressed, tile_info.compression)?;
+    let mut raw = decompress_tile(&compressed, tile_info.compression, raw_size)?;
 
     if tile_info.predictor == 2 {
         undo_horizontal_predictor(
@@ -1171,7 +1276,10 @@ fn read_remote_chunk_f64(
         );
     }
 
-    decode_raw_tile_f64(&raw, tile_info, metadata, band_index)
+    Ok(DecodedTile {
+        values: decode_raw_tile_f64(&raw, tile_info, metadata, band_index)?,
+        _permit: permit,
+    })
 }
 
 /// Fetch a byte range from an HTTP URL using reqwest.
@@ -1186,7 +1294,7 @@ fn read_http_range(
     let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
     let url_owned = url.to_string();
     let fut = async {
-        let resp = http
+        let mut resp = http
             .get(&url_owned)
             .header(reqwest::header::RANGE, &range_header)
             .send()
@@ -1198,9 +1306,26 @@ fn read_http_range(
                 resp.status()
             )));
         }
-        resp.bytes()
+        let limit = range.end.saturating_sub(range.start);
+        if resp.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(DataServerError::Engine(
+                "HTTP range body exceeds requested size".into(),
+            ));
+        }
+        let mut data = Vec::with_capacity(limit);
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))
+            .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))?
+        {
+            if chunk.len() > limit - data.len() {
+                return Err(DataServerError::Engine(
+                    "HTTP range body exceeds requested size".into(),
+                ));
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(data))
     };
     match handle {
         Some(h) => h.block_on(fut),
@@ -1224,18 +1349,11 @@ fn read_http_chunk_f64(
     // Runtime handle for the fetch when on a non-Tokio (rayon) thread; `None`
     // for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<Vec<Option<f64>>, DataServerError> {
+) -> Result<DecodedTile, DataServerError> {
     let idx = chunk_index as usize;
-    if idx >= tile_info.tile_offsets.len() {
-        return Err(DataServerError::Engine(format!(
-            "Tile index {} out of range ({})",
-            idx,
-            tile_info.tile_offsets.len()
-        )));
-    }
-
-    let offset = tile_info.tile_offsets[idx] as usize;
-    let byte_count = tile_info.tile_byte_counts[idx] as usize;
+    let (raw_size, bytes, offset, byte_count) =
+        remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
+    let permit = BUDGET.reserve(bytes)?;
 
     if byte_count == 0 {
         tracing::trace!(
@@ -1244,7 +1362,10 @@ fn read_http_chunk_f64(
             offset
         );
         let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
-        return Ok(vec![None; pixel_count]);
+        return Ok(DecodedTile {
+            values: vec![None; pixel_count],
+            _permit: permit,
+        });
     }
 
     if offset == 0 && idx > 0 {
@@ -1290,7 +1411,7 @@ fn read_http_chunk_f64(
         fetched
     };
 
-    let mut raw = decompress_tile(&compressed, tile_info.compression)?;
+    let mut raw = decompress_tile(&compressed, tile_info.compression, raw_size)?;
 
     if tile_info.predictor == 2 {
         undo_horizontal_predictor(
@@ -1300,7 +1421,10 @@ fn read_http_chunk_f64(
         );
     }
 
-    decode_raw_tile_f64(&raw, tile_info, metadata, band_index)
+    Ok(DecodedTile {
+        values: decode_raw_tile_f64(&raw, tile_info, metadata, band_index)?,
+        _permit: permit,
+    })
 }
 
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
@@ -1987,9 +2111,11 @@ fn read_bbox_inner(
 }
 
 /// Result of a parallel tile fetch: (row, col, pixel data).
-/// Failed tile reads are logged at error level and replaced with all-nodata
+/// Fetch/decode failures are logged and replaced with all-nodata. Admission
+/// failures and invalid tile-index arithmetic are fatal for the whole request.
+/// Other failed tile reads are replaced with all-nodata
 /// to allow partial rendering — a map with gaps is better than a 500 error.
-type TileFetchResult = (u32, u32, Vec<Option<f64>>);
+type TileFetchResult = (u32, u32, DecodedTile);
 
 /// Retry a remote tile read up to 2 times with brief backoff.
 /// On final failure, logs at error level and returns all-nodata pixels.
@@ -2001,12 +2127,13 @@ fn read_remote_chunk_with_retry<F>(
     tile_col: u32,
     chunk_index: u32,
     nodata_pixel_count: usize,
-) -> Vec<Option<f64>>
+) -> Result<DecodedTile, DataServerError>
 where
-    F: Fn() -> Result<Vec<Option<f64>>, DataServerError>,
+    F: Fn() -> Result<DecodedTile, DataServerError>,
 {
     match read_fn() {
-        Ok(data) => data,
+        Ok(data) => Ok(data),
+        Err(DataServerError::ResourceExhausted) => Err(DataServerError::ResourceExhausted),
         Err(first_err) => {
             let mut last_err = first_err;
             for attempt in 1..=2 {
@@ -2027,7 +2154,10 @@ where
                             chunk_index,
                             attempt
                         );
-                        return data;
+                        return Ok(data);
+                    }
+                    Err(DataServerError::ResourceExhausted) => {
+                        return Err(DataServerError::ResourceExhausted)
                     }
                     Err(e) => last_err = e,
                 }
@@ -2039,7 +2169,15 @@ where
                 tile_col,
                 chunk_index
             );
-            vec![None; nodata_pixel_count]
+            let permit = BUDGET.reserve(
+                nodata_pixel_count
+                    .checked_mul(std::mem::size_of::<Option<f64>>())
+                    .ok_or(DataServerError::ResourceExhausted)?,
+            )?;
+            Ok(DecodedTile {
+                values: vec![None; nodata_pixel_count],
+                _permit: permit,
+            })
         }
     }
 }
@@ -2084,7 +2222,7 @@ fn read_bbox_parallel(
     let rt_handle = tokio::runtime::Handle::try_current().ok();
 
     // Fetch all tiles in parallel using the shared thread pool.
-    // Failed tiles are logged at error level and replaced with nodata.
+    // Fetch/decode failures become nodata; admission/index failures propagate.
     let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
     let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
         tile_coords
@@ -2094,7 +2232,7 @@ fn read_bbox_parallel(
                     Ok(idx) => idx,
                     Err(e) => {
                         tracing::error!("Tile index overflow at ({tile_row}, {tile_col}): {e}");
-                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
+                        return Err(e);
                     }
                 };
                 let data = read_remote_chunk_with_retry(
@@ -2117,10 +2255,10 @@ fn read_bbox_parallel(
                     chunk_index,
                     tile_pixel_count,
                 );
-                (tile_row, tile_col, data)
+                Ok((tile_row, tile_col, data?))
             })
-            .collect()
-    });
+            .collect::<Result<Vec<_>, DataServerError>>()
+    })?;
 
     // Assemble the result grid
     let mut result = vec![None; total_pixels];
@@ -2188,7 +2326,7 @@ fn read_bbox_parallel_http(
                     Ok(idx) => idx,
                     Err(e) => {
                         tracing::error!("Tile index overflow at ({tile_row}, {tile_col}): {e}");
-                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
+                        return Err(e);
                     }
                 };
                 let data = read_remote_chunk_with_retry(
@@ -2211,10 +2349,10 @@ fn read_bbox_parallel_http(
                     chunk_index,
                     tile_pixel_count,
                 );
-                (tile_row, tile_col, data)
+                Ok((tile_row, tile_col, data?))
             })
-            .collect()
-    });
+            .collect::<Result<Vec<_>, DataServerError>>()
+    })?;
 
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {
@@ -2780,6 +2918,206 @@ mod tests {
     /// exactly once and reuse the same `Arc<Mmap>` across every subsequent
     /// decoder open, so per-request rendering avoids `File::open`/`BufReader`
     /// and the on-disk IFD re-parse.
+    #[test]
+    fn direct_http_range_rejects_oversized_bodies_with_or_without_length() {
+        use std::io::{Read, Write};
+        for (response, succeeds) in [
+            ("HTTP/1.1 206 Partial Content\r\nContent-Length: 9999999999\r\nConnection: close\r\n\r\n", false),
+            ("HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n0\r\n\r\n", false),
+            ("HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n0\r\n\r\n", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/tile", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let result = read_http_range(&reqwest::Client::new(), &url, 0..2, None);
+            if succeeds {
+                assert_eq!(result.unwrap().as_ref(), b"ab");
+            } else {
+                assert!(matches!(result, Err(DataServerError::Engine(ref message)) if message == "HTTP range body exceeds requested size"));
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn encoded_tile_ranges_are_bounded_before_either_fetch_path() {
+        let mut info = RemoteTileInfo {
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![1],
+            compression: TiffCompression::None,
+            sample_type: SampleType::U8,
+            predictor: 1,
+            tile_width: 1,
+            tile_height: 1,
+        };
+        assert_eq!(remote_chunk_layout(&info, 1, 0).unwrap(), (1, 19, 0, 1));
+        let store =
+            ds_storage::DataStore::new(Arc::new(ds_storage::object_store::memory::InMemory::new()));
+        let http = reqwest::Client::new();
+        let metadata = tiny_meta(1, 1, 1);
+        let file = Path::new("oversized");
+        for count in [MAX_DECODED_TILE_BYTES as u64 + 1, u64::MAX] {
+            info.tile_byte_counts[0] = count;
+            // Missing object / invalid URL would yield a different error if either
+            // path reached I/O. Tiny pixel dimensions cannot hide giant encodings.
+            for result in [
+                read_remote_chunk_f64(
+                    &store,
+                    &"missing".into(),
+                    &info,
+                    &metadata,
+                    0,
+                    None,
+                    file,
+                    0,
+                    0,
+                    None,
+                ),
+                read_http_chunk_f64(
+                    &http,
+                    "invalid URL",
+                    &info,
+                    &metadata,
+                    0,
+                    None,
+                    file,
+                    0,
+                    0,
+                    None,
+                ),
+            ] {
+                assert!(
+                    matches!(result, Err(DataServerError::Engine(ref message)) if message == "Invalid or oversized encoded tile range")
+                );
+            }
+        }
+        info.tile_byte_counts[0] = 1;
+        info.tile_offsets[0] = u64::MAX;
+        assert!(remote_chunk_layout(&info, 1, 0).is_err());
+        info.tile_offsets.clear();
+        assert!(remote_chunk_layout(&info, 1, 0).is_err());
+    }
+
+    #[test]
+    fn codecs_reject_expansion_past_metadata_before_unbounded_allocation() {
+        use std::io::Write;
+        let data = vec![42; 4096];
+        let mut deflate =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate.write_all(&data).unwrap();
+        let deflate = deflate.finish().unwrap();
+        let lzw = weezl::encode::Encoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+            .encode(&data)
+            .unwrap();
+        for (bytes, compression) in [
+            (&data, TiffCompression::None),
+            (&deflate, TiffCompression::Deflate),
+            (&lzw, TiffCompression::Lzw),
+        ] {
+            assert_eq!(
+                decompress_tile(bytes, compression, data.len()).unwrap(),
+                data
+            );
+            assert!(decompress_tile(bytes, compression, 8).is_err());
+            assert!(decompress_tile(bytes, compression, data.len() + 1).is_err());
+        }
+    }
+
+    #[test]
+    fn exhausted_decode_is_not_retried_or_converted_to_transparency() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = read_remote_chunk_with_retry(
+            || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(DataServerError::ResourceExhausted)
+            },
+            0,
+            0,
+            0,
+            1024,
+        );
+        assert!(matches!(result, Err(DataServerError::ResourceExhausted)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn zero_decode_budget_rejects_real_local_and_remote_chunks() {
+        const CHILD: &str = "MC_DECODE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader::tests::zero_decode_budget_rejects_real_local_and_remote_chunks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("MC_GEOTIFF_DECODE_MEMORY_MB", "0")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let path = find_first_tif(&find_test_radar_dir());
+        let source = DataSource::from_path(&path);
+        let metadata = TiffMetadata::from_source(&source).unwrap();
+        assert!(matches!(
+            read_pixel(&source, &metadata, 0, 0, None, &path, 0),
+            Err(DataServerError::ResourceExhausted)
+        ));
+        let info = RemoteTileInfo {
+            tile_offsets: vec![0],
+            tile_byte_counts: vec![1],
+            compression: TiffCompression::None,
+            sample_type: SampleType::U8,
+            predictor: 1,
+            tile_width: 1,
+            tile_height: 1,
+        };
+        let store =
+            ds_storage::DataStore::new(Arc::new(ds_storage::object_store::memory::InMemory::new()));
+        // Admission fails before fetching even a missing object, and the same
+        // reservation path serves explicit HTTP sources.
+        assert!(matches!(
+            read_remote_chunk_f64(
+                &store,
+                &ds_storage::object_store::path::Path::from("missing"),
+                &info,
+                &tiny_meta(1, 1, 1),
+                0,
+                None,
+                &path,
+                0,
+                0,
+                None
+            ),
+            Err(DataServerError::ResourceExhausted)
+        ));
+        assert_eq!(crate::decode_budget::metrics(), (0, 0, 2));
+        let config: ds_core::config::GeoTiffConfig = serde_json::from_value(serde_json::json!({
+            "filename_template": "radar_%Y%m%dT%H%MZ.tif", "parameter": "reflectivity", "unit": "dBZ"
+        })).unwrap();
+        let engine = crate::GeoTiffEngine::new(
+            "zero-budget",
+            Some(find_test_radar_dir().to_str().unwrap()),
+            &config,
+        )
+        .unwrap();
+        let (lon, lat) = metadata.geo_transform.pixel_to_world(50, 50);
+        assert!(matches!(
+            engine.query_point(lat, lon, None, None),
+            Err(DataServerError::ResourceExhausted)
+        ));
+        assert!(matches!(
+            engine.query_bbox(lon, lat, lon + 0.01, lat + 0.01, None, None),
+            Err(DataServerError::ResourceExhausted)
+        ));
+    }
+
     #[test]
     fn local_file_mmaps_once_and_reuses_across_calls() {
         let dir = find_test_radar_dir();

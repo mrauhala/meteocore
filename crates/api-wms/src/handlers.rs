@@ -572,6 +572,11 @@ pub async fn wms_handler(
                         })?;
                     (cached, "EMPTY", "image/png")
                 }
+                Err(DataServerError::ResourceExhausted) => {
+                    return Err(WmsError::ServiceUnavailable(
+                        "Decode memory exhausted".into(),
+                    ));
+                }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
                     let png = render_error_tile(params.width, params.height)?;
