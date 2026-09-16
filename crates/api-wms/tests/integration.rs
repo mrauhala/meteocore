@@ -398,7 +398,10 @@ impl MapEngine for PopulatedMockMapEngine {
 }
 
 fn build_populated_router() -> axum::Router {
-    let engine: Arc<dyn MapEngine> = Arc::new(PopulatedMockMapEngine);
+    build_populated_router_with_engine(Arc::new(PopulatedMockMapEngine))
+}
+
+fn build_populated_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -2957,4 +2960,76 @@ fn capabilities_legend_url_carries_the_full_layer_name() {
         "LegendURL must keep the /param segment (the key GetLegendGraphic \
          resolves); got:\n{vradh}"
     );
+}
+
+struct AlertDefaultMock {
+    requested: Arc<std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+}
+impl MapEngine for AlertDefaultMock {
+    fn raster_info(&self) -> RasterInfo {
+        let mut info = PopulatedMockMapEngine.raster_info();
+        let now = self.default_time().unwrap();
+        info.times = vec![now, now + chrono::Duration::days(1)];
+        info
+    }
+    fn default_time(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some("2024-01-01T00:00:00Z".parse().unwrap())
+    }
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        crs: &OutputCrs,
+        param: Option<&str>,
+        z: Option<f64>,
+        rt: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        *self.requested.lock().unwrap() = time;
+        PopulatedMockMapEngine.get_raster_tile(bbox, width, height, time, crs, param, z, rt)
+    }
+}
+
+#[tokio::test]
+async fn engine_default_is_used_for_capabilities_and_timeless_map() {
+    let requested = Arc::new(std::sync::Mutex::new(None));
+    let engine = Arc::new(AlertDefaultMock {
+        requested: requested.clone(),
+    });
+    let expected = engine.default_time();
+    let app = build_populated_router_with_engine(engine);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/?SERVICE=WMS&REQUEST=GetCapabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let xml = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(xml.contains("default=\"2024-01-01T00:00:00+00:00\""));
+    assert!(xml.contains("2024-01-02T00:00:00+00:00"));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(GETMAP_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*requested.lock().unwrap(), expected);
 }

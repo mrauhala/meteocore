@@ -210,15 +210,13 @@ pub async fn wms_handler(
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
 
-            // Resolve a TIME-less request to the engine's *current* latest
-            // timestamp before any cache key is built. The rendered + meta-tile
-            // caches have no TTL, so keying "latest" as `None` would freeze the
-            // first rendered frame (and its ETag) forever while the engine's
-            // catalog moves on — a TIME-less layer must track new data. Mirrors
-            // Maps/Tiles, which resolve latest the same way before keying.
-            // `info.times` is ascending; when it's empty (e.g. STAC cold start)
-            // the request falls through as `None` = the engine's own latest.
-            let time = params.time.or_else(|| info.times.last().copied());
+            // Engine-owned default first (CAP: active now), then latest
+            // advertised time for engines using the forecast convention.
+            // Resolve before keying so an omitted TIME tracks catalog updates.
+            let time = params
+                .time
+                .or_else(|| engine.default_time())
+                .or_else(|| info.times.last().copied());
 
             // Normalise an explicit pin of the *current* latest run to `None`
             // BEFORE resolution, so it gets the same fallback-tolerant run

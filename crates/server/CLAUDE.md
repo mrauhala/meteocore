@@ -149,3 +149,8 @@ client could spoof the emitted self-links (open-redirect risk downstream).
   and the graceful-shutdown block at the end of `main` (bug #442 was a
   missing boot-path spawn for `cap_engines`; the shutdown block had also
   silently skipped cap, postgis and nowcast).
+
+- Preview temporal manifests may include `temporal_extent.default` from
+  `MapEngine::default_time()`. The slider selects it rather than the last
+  value; preview time-window filtering must preserve that default (CAP's
+  active-now view can precede future warning boundaries).
