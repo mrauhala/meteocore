@@ -38,10 +38,9 @@ as a property.
   `https://feed.evil.com`) or matches an explicit `feed_allowlist` URL
   prefix; others are dropped with a WARN. Stops a compromised feed pivoting
   the server to `http://169.254.169.254/…` or internal hosts.
-- Known limitation: the allowlist constrains request URLs, not redirect
-  responses (object_store's reqwest client follows redirects; still no
-  disable knob as of object_store 0.14). A proper fix belongs in
-  ds-storage (#431).
+- Generic HTTP feed/index/document fetches through ds-storage reject redirects
+  (#431), including same-origin redirects. Configure final URLs directly; a
+  redirect is a refresh error and last-good documents follow normal retention.
 - Config (`CapConfig` in ds-core) validated at load: exactly one of
   `data_path` / `feed_url` / `[cap.wis2]`, `feed_url` http(s), non-empty
   `language`, `poll_interval_secs > 0`, positive ISO 8601 `default_ttl` /

@@ -588,6 +588,21 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
     Ok((DataStore::new(Arc::new(store)), prefix_path))
 }
 
+/// The generic HTTP backend must not follow an operator-trusted URL to an
+/// unvalidated host. object_store's default connector follows redirects;
+/// its injectable connector lets us enforce the policy for every operation.
+#[derive(Debug)]
+struct NoRedirectConnector(reqwest::Client);
+
+impl object_store::client::HttpConnector for NoRedirectConnector {
+    fn connect(
+        &self,
+        _options: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        Ok(object_store::client::HttpClient::new(self.0.clone()))
+    }
+}
+
 fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
     // For HTTP, the URL up to the last '/' is the base, the rest is prefix
     let url = url::Url::parse(data_path)
@@ -604,8 +619,23 @@ fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServ
         None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("")),
     };
 
+    // Own all transport options here rather than using ClientOptions (whose
+    // reqwest builder is private). Disable transparent decompression to keep
+    // GRIB/COG byte ranges and Content-Length exact even with feature unification.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(url.scheme() != "http")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(DataStore::REQUEST_TIMEOUT)
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+        .build()
+        .map_err(|e| DataServerError::Storage(format!("Cannot create HTTP client: {e}")))?;
     let store = object_store::http::HttpBuilder::new()
         .with_url(&base_url)
+        .with_http_connector(NoRedirectConnector(client))
         .build()
         .map_err(|e| {
             DataServerError::Storage(format!("Cannot create HTTP store for {base_url}: {e}"))

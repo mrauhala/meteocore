@@ -1295,6 +1295,7 @@ dependencies = [
  "ds-core",
  "futures",
  "object_store",
+ "reqwest 0.13.4",
  "tempfile",
  "thiserror",
  "tokio",

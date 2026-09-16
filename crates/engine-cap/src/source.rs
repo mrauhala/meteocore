@@ -168,16 +168,9 @@ fn load_feed(
     allowlist: &[String],
     cache: &Mutex<DocumentCache>,
 ) -> Result<SourceLoad, DataServerError> {
-    // SSRF note: the index fetch (and the entry fetches below) go through
-    // `ds-storage`'s HTTP store, which uses object_store's reqwest client with
-    // its DEFAULT redirect policy (follows up to 10 redirects) — object_store
-    // 0.11 exposes no knob to disable it. So a compromised DNS/CDN for the
-    // operator-trusted `feed_url` host could redirect this fetch to an internal
-    // address; the `is_allowed_entry` guard only constrains the *request* URL of
-    // entry links, not redirect *responses*. Feed mode therefore trusts the feed
-    // host (operator-configured). A proper redirect-disabling fix belongs in
-    // ds-storage (it would harden every HTTP-backed engine, not just CAP) and is
-    // a cross-engine follow-up — tracked in #431; see the CAP notes in CLAUDE.md.
+    // Both index and document fetches use ds-storage's no-redirect HTTP
+    // connector. The entry allowlist below validates linked request URLs;
+    // redirects cannot bypass that boundary (#431).
     // Fetch the index through the size-guarded path (HEAD-checks the body
     // against MAX_DOC_BYTES before pulling it into memory), so an oversized or
     // malicious feed can't exhaust the heap before a post-hoc length check —
