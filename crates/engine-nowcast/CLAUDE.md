@@ -118,8 +118,13 @@ in production configs.
   (`MIN_JUMP_RATE_PER_MIN` floor — revisit against Nordic storm data if
   jumps never fire). Feature properties `flash_count` /
   `flash_rate_per_min` / `lightning_jump` exist ONLY when a source is
-  wired; null means "join skipped this generation" (source error — the
-  generation itself never fails), 0 means measured-quiet.
+  wired; null means unavailable (unknown/outside coverage, source error or
+  truncated window). `lightning_coverage` is independently null/false/true.
+  A measured zero requires the source to cover the entire labeled footprint
+  AND centroid fallback radius. Configure the events source's
+  `observations.coverage_bbox` as a guaranteed detection footprint; the
+  advertised `extent_bbox` is NOT coverage. Missing coverage config fails
+  closed. Coverage gaps clear the jump baseline, never append fake zeros.
 
 ## Motion field as a data product (#661)
 
@@ -622,3 +627,22 @@ see `docs/cell-intelligence-plan-amendment.md`).
   `max_pixels` (4 M), `min_echo` (10.0), `[nowcast.significance]` weight
   overrides (all optional; unknown names rejected), `impact_source` +
   `impact_name_property` (default `"name"`) + `impact_weight_property`.
+
+## Track continuity (#649)
+
+Observed tracks get first association priority. An unmatched track is retained
+for one generation for reassociation only; it never appears in features,
+lightning joins, ranking, or growth/decay labels. Rescue uses elapsed time since
+the last actual observation, so velocity is not doubled and age increments
+only once. Death telemetry is delayed until the coast expires.
+
+At startup, replay at most the last eight retained source frames before the newest
+anchor, one frame at a time, using segmentation and association only. Replay
+uses the same blocking-fetch ceiling as motion history; replaying the whole
+48-snapshot serving history would multiply startup I/O stalls. Replay
+publishes no forecast runs and changes no generation/association metrics. It
+recovers motion, observed age and hysteresis; sustained deviation from ambient
+flow starts afresh because replay does not estimate that field. Historical lightning is not
+requeried. Unreadable frames break replay continuity. IDs use an epoch-based
+seed instead of restarting at one. Long-term clutter climatology/persistence
+and split/merge lineage remain separate work (#620/#551).

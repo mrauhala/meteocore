@@ -239,6 +239,9 @@ fn lightning_join_exposes_flash_properties() {
 
     struct DiscStrikes;
     impl EventSource for DiscStrikes {
+        fn covers(&self, _bbox: [f64; 4]) -> Option<bool> {
+            Some(true)
+        }
         fn recent_events(
             &self,
             _start: DateTime<Utc>,
@@ -359,6 +362,9 @@ fn lightning_attributes_reach_the_feature_and_match_the_sortables() {
     /// 30 strikes: 20 CG (5 of them positive) and 10 IC.
     struct MixedStrikes;
     impl EventSource for MixedStrikes {
+        fn covers(&self, _bbox: [f64; 4]) -> Option<bool> {
+            Some(true)
+        }
         fn recent_events(
             &self,
             _start: DateTime<Utc>,
@@ -460,6 +466,9 @@ fn lightning_source_error_degrades_to_null_fields() {
         fail: AtomicBool,
     }
     impl EventSource for FlakyStrikes {
+        fn covers(&self, _bbox: [f64; 4]) -> Option<bool> {
+            Some(true)
+        }
         fn recent_events(
             &self,
             _start: DateTime<Utc>,
@@ -533,7 +542,7 @@ fn lightning_source_error_degrades_to_null_fields() {
     let f = &page.features[0];
     assert!(matches!(
         f.properties.get("track_age"),
-        Some(PropertyValue::Integer(2))
+        Some(PropertyValue::Integer(3))
     ));
     assert!(matches!(
         f.properties.get("flash_count"),
@@ -1012,12 +1021,11 @@ fn cell_features_are_served_and_tracks_persist() {
         f.properties.get("severity"),
         Some(PropertyValue::String(s)) if s == "moderate"
     ));
-    // Null, not false: this is the first generation, so the track has no
-    // velocity and non-deviance cannot have been established. See
-    // `a_newborn_asserts_nothing_it_cannot_know`.
+    // Bootstrap observed the retained source frame before this generation,
+    // so this cell already has measured motion.
     assert_eq!(
         f.properties.get("deviant_mover"),
-        Some(&PropertyValue::Null)
+        Some(&PropertyValue::Bool(false))
     );
     let id1 = f.id.clone();
 
@@ -1033,7 +1041,7 @@ fn cell_features_are_served_and_tracks_persist() {
     assert!(!engine.filterables().contains("lightning_jump"));
     let mut filtered = FeatureQuery {
         property_filters: vec![
-            ("track_age".into(), "2".into()),
+            ("track_age".into(), "3".into()),
             ("likely_clutter".into(), "false".into()),
         ],
         limit: 1,
@@ -1043,7 +1051,7 @@ fn cell_features_are_served_and_tracks_persist() {
     filtered.offset = 1;
     assert_eq!(engine.get_features(&filtered).unwrap().number_returned, 0);
     filtered.offset = 0;
-    filtered.property_filters[0].1 = "1".into();
+    filtered.property_filters[0].1 = "2".into();
     assert_eq!(engine.get_features(&filtered).unwrap().number_matched, 0);
     filtered.datetime = Some(ds_core::feature::DatetimeInterval {
         start: Some(anchor1),
@@ -1053,7 +1061,7 @@ fn cell_features_are_served_and_tracks_persist() {
 
     assert!(matches!(
         f.properties.get("track_age"),
-        Some(PropertyValue::Integer(2))
+        Some(PropertyValue::Integer(3))
     ));
     assert!(engine.get_feature(&id1).is_ok());
     assert!(engine.get_feature("9999").is_err());
@@ -1097,7 +1105,7 @@ fn cell_features_are_served_and_tracks_persist() {
     assert_eq!(hist.number_matched, 1, "older snapshot must serve history");
     assert!(matches!(
         hist.features[0].properties.get("track_age"),
-        Some(PV::Integer(1))
+        Some(PV::Integer(2))
     ));
     let none = engine
         .get_features(&FeatureQuery {
@@ -1209,7 +1217,7 @@ fn geometry_change_resets_cell_tracks() {
     // reach the counters (#643 review: an empty `previous` cannot report
     // the deaths itself).
     let (births, deaths, _, _, _) = engine.track_metrics();
-    assert_eq!(births, 2, "one birth per generation: first frame + reset");
+    assert_eq!(births, 1, "bootstrap births are not production telemetry");
     assert_eq!(deaths, 1, "the discarded track is a death");
 }
 
@@ -1903,9 +1911,9 @@ fn a_newborn_asserts_nothing_it_cannot_know() {
     use ds_core::feature::{FeatureQuery, PropertyValue};
     use ds_core::feature_engine::FeatureEngine;
 
-    // The first generation's cells are all newborns: they have been seen
-    // once, so no velocity has been estimated for any of them yet.
-    let (_s, engine) = build("PT30M", &[t0(), t0() + Duration::minutes(5)]);
+    // The older frame has no disc in the domain: this is a true birth,
+    // even with startup replay enabled.
+    let (_s, engine) = build("PT30M", &[t0() - Duration::minutes(240), t0()]);
     engine.poll_once();
     let page = engine.get_features(&FeatureQuery::default()).unwrap();
     let f = page.features.first().expect("a cell was tracked");
@@ -1954,6 +1962,9 @@ fn a_quiet_cell_reports_a_zero_split_but_no_positive_share() {
 
     struct NoStrikes;
     impl EventSource for NoStrikes {
+        fn covers(&self, _bbox: [f64; 4]) -> Option<bool> {
+            Some(true)
+        }
         fn recent_events(
             &self,
             _start: DateTime<Utc>,
@@ -2364,5 +2375,94 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
         inside > 0 && inside * 3 < tx.len() * ty.len() * 2,
         "about half the bbox masked: {inside}/{}",
         tx.len() * ty.len()
+    );
+}
+
+#[test]
+fn startup_replays_cells_without_publishing_old_forecasts() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    let times: Vec<_> = (0..8).map(|i| t0() + Duration::minutes(i * 5)).collect();
+    let (_, engine) = build("PT30M", &times);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(
+        page.features[0].properties.get("track_age"),
+        Some(&PropertyValue::Integer(8))
+    );
+    assert_eq!(engine.raster_info().reference_times, vec![times[7]]);
+    assert_eq!(engine.track_metrics().0, 0, "no replay births in telemetry");
+    engine.poll_once();
+    assert_eq!(
+        engine
+            .get_features(&FeatureQuery::default())
+            .unwrap()
+            .features[0]
+            .id,
+        page.features[0].id
+    );
+}
+
+#[test]
+fn unknown_and_outside_lightning_coverage_are_not_measured_quiet() {
+    use ds_core::events::{EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    struct EmptyNetwork(Option<bool>);
+    impl EventSource for EmptyNetwork {
+        fn covers(&self, _: [f64; 4]) -> Option<bool> {
+            self.0
+        }
+        fn recent_events(
+            &self,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: usize,
+        ) -> Result<Vec<EventPoint>, DataServerError> {
+            Ok(Vec::new())
+        }
+    }
+    for coverage in [None, Some(false), Some(true)] {
+        let (_, engine) = build("PT30M", &[t0(), t0() + Duration::minutes(5)]);
+        let engine = engine.with_lightning_source(Arc::new(EmptyNetwork(coverage)));
+        engine.poll_once();
+        let page = engine.get_features(&FeatureQuery::default()).unwrap();
+        let props = &page.features[0].properties;
+        assert_eq!(
+            props.get("lightning_coverage"),
+            Some(
+                &coverage
+                    .map(PropertyValue::Bool)
+                    .unwrap_or(PropertyValue::Null)
+            )
+        );
+        for field in ["flash_count", "cg_count", "ic_count"] {
+            assert_eq!(
+                props.get(field),
+                Some(&if coverage == Some(true) {
+                    PropertyValue::Integer(0)
+                } else {
+                    PropertyValue::Null
+                })
+            );
+        }
+        for name in props.keys() {
+            assert!(engine.filterables().contains(name), "{name}");
+        }
+    }
+}
+
+#[test]
+fn startup_replay_caps_io_even_with_a_long_source_history() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    let times: Vec<_> = (0..40).map(|i| t0() + Duration::minutes(i * 5)).collect();
+    let (_, engine) = build("PT30M", &times);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(
+        page.features[0].properties.get("track_age"),
+        Some(&PropertyValue::Integer(9)),
+        "eight replay observations plus the published analysis, not forty serial reads"
     );
 }

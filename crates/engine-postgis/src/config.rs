@@ -344,6 +344,7 @@ mod tests {
                 peak_current_col: None,
                 default_datetime: None,
                 extent_bbox: None,
+                coverage_bbox: None,
                 columns: vec![],
                 tables: vec![
                     PostgisObservationTable {
@@ -540,6 +541,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
+            coverage_bbox: None,
             columns: vec![PostgisObservationColumn {
                 parameter: "t2m".into(),
                 column: "temperature".into(),
@@ -575,6 +577,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
+            coverage_bbox: None,
             columns: vec![],
             tables: vec![],
         };
@@ -621,6 +624,7 @@ mod tests {
                 peak_current_col: None,
                 default_datetime: None,
                 extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
+                coverage_bbox: None,
             },
             parameters: vec![PostgisParameterConfig {
                 name: "peak_current".into(),
