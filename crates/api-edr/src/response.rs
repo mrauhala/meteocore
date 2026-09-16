@@ -370,56 +370,161 @@ pub struct LocationsContext<'a> {
     pub base_url: &'a str,
 }
 
-pub fn locations_to_geojson(locations: &[Location], ctx: &LocationsContext) -> Value {
+/// Serialize the complete EDR 1.1 location inventory directly into response
+/// bytes. Only one feature's links are allocated at a time; parameter and
+/// temporal metadata are borrowed instead of cloned into a full JSON tree.
+pub fn locations_to_json(
+    locations: &[Location],
+    ctx: &LocationsContext,
+) -> Result<Vec<u8>, serde_json::Error> {
     let datetime = ctx
         .temporal_extent
         .as_ref()
         .map(|(start, end)| format!("{start}/{end}"))
         .unwrap_or_default();
-    let base = ctx.base_url;
-
-    let features: Vec<Value> = locations
-        .iter()
-        .map(|loc| {
-            let edr_endpoint = format!(
-                "{base}/edr/collections/{}/locations/{}",
-                ctx.collection_id, loc.id
-            );
-            json!({
-                "type": "Feature",
-                "id": loc.id,
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [loc.longitude, loc.latitude]
-                },
-                "properties": {
-                    "label": loc.label,
-                    "datetime": datetime,
-                    "parameter-name": ctx.parameter_names,
-                    "edrqueryendpoint": edr_endpoint
-                },
-                "links": [
-                    {
-                        "href": edr_endpoint,
-                        "rel": "data",
-                        "type": "application/prs.coverage+json",
-                        "title": format!("Data for {}", loc.label)
-                    }
-                ]
-            })
-        })
-        .collect();
-
-    json!({
-        "type": "FeatureCollection",
-        "features": features,
-        "links": [
-            {
-                "href": format!("{base}/edr/collections/{}/locations", ctx.collection_id),
-                "rel": "self",
-                "type": "application/geo+json",
-                "title": "Locations"
-            }
-        ]
+    let href = format!(
+        "{}/edr/collections/{}/locations",
+        ctx.base_url, ctx.collection_id
+    );
+    serde_json::to_vec(&LocationCollection {
+        features: LocationFeatures {
+            locations,
+            ctx,
+            datetime: &datetime,
+        },
+        links: [LocationLink {
+            href: &href,
+            rel: "self",
+            title: "Locations",
+            kind: "application/geo+json",
+        }],
+        kind: "FeatureCollection",
     })
+}
+
+#[derive(serde::Serialize)]
+struct LocationCollection<'a> {
+    features: LocationFeatures<'a>,
+    links: [LocationLink<'a>; 1],
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+struct LocationFeatures<'a> {
+    locations: &'a [Location],
+    ctx: &'a LocationsContext<'a>,
+    datetime: &'a str,
+}
+
+// Field order matches the original serde_json::Value map order, preserving
+// response bytes (and therefore ETags) as well as the GeoJSON contract.
+#[derive(serde::Serialize)]
+struct LocationFeature<'a> {
+    geometry: LocationGeometry,
+    id: &'a str,
+    links: [LocationLink<'a>; 1],
+    properties: LocationProperties<'a>,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct LocationGeometry {
+    coordinates: [f64; 2],
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct LocationProperties<'a> {
+    datetime: &'a str,
+    edrqueryendpoint: &'a str,
+    label: &'a str,
+    #[serde(rename = "parameter-name")]
+    parameter_names: &'a [String],
+}
+
+#[derive(serde::Serialize)]
+struct LocationLink<'a> {
+    href: &'a str,
+    rel: &'static str,
+    title: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl serde::Serialize for LocationFeatures<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.locations.len()))?;
+        for loc in self.locations {
+            let endpoint = format!(
+                "{}/edr/collections/{}/locations/{}",
+                self.ctx.base_url, self.ctx.collection_id, loc.id
+            );
+            let title = format!("Data for {}", loc.label);
+            sequence.serialize_element(&LocationFeature {
+                geometry: LocationGeometry {
+                    coordinates: [loc.longitude, loc.latitude],
+                    kind: "Point",
+                },
+                id: &loc.id,
+                links: [LocationLink {
+                    href: &endpoint,
+                    rel: "data",
+                    title: &title,
+                    kind: "application/prs.coverage+json",
+                }],
+                properties: LocationProperties {
+                    datetime: self.datetime,
+                    edrqueryendpoint: &endpoint,
+                    label: &loc.label,
+                    parameter_names: self.ctx.parameter_names,
+                },
+                kind: "Feature",
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    #[test]
+    fn direct_serialization_preserves_geojson_bytes_and_escaping() {
+        let label = "Helsinki \"centre\"\n雪";
+        let location = Location {
+            id: "station-1".into(),
+            label: label.into(),
+            latitude: 60.0,
+            longitude: 24.0,
+        };
+        let params = vec!["air_temperature".into(), "wind\"speed".into()];
+        let ctx = LocationsContext {
+            collection_id: "weather",
+            parameter_names: &params,
+            temporal_extent: Some(("2026-01-01T00:00:00Z".into(), "2026-01-02T00:00:00Z".into())),
+            base_url: "https://example.org/prefix",
+        };
+        let endpoint = "https://example.org/prefix/edr/collections/weather/locations/station-1";
+        let expected = json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature", "id": "station-1",
+                "geometry": { "type": "Point", "coordinates": [24.0, 60.0] },
+                "properties": { "label": label, "datetime": "2026-01-01T00:00:00Z/2026-01-02T00:00:00Z", "parameter-name": params, "edrqueryendpoint": endpoint },
+                "links": [{ "href": endpoint, "rel": "data", "type": "application/prs.coverage+json", "title": format!("Data for {label}") }]
+            }],
+            "links": [{ "href": "https://example.org/prefix/edr/collections/weather/locations", "rel": "self", "type": "application/geo+json", "title": "Locations" }]
+        });
+        assert_eq!(
+            locations_to_json(&[location], &ctx).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        let empty: Value = serde_json::from_slice(&locations_to_json(&[], &ctx).unwrap()).unwrap();
+        assert_eq!(empty["features"], json!([]));
+        assert_eq!(empty["links"], expected["links"]);
+    }
 }

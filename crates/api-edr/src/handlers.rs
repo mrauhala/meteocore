@@ -22,7 +22,7 @@ use crate::params::{
     RadiusQueryParams, TrajectoryQueryParams, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
-use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
+use crate::response::{coverage_response_to_json, locations_to_json, LocationsContext};
 
 type HandlerError = (StatusCode, Json<serde_json::Value>);
 
@@ -951,10 +951,35 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
 pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let state = state.load_full();
     let spec_url = format!("{}/edr/api", request_base_url(&state, &headers));
-    axum::response::Html(ds_core::openapi::swagger_ui_html(
-        "MeteoCore - EDR API",
-        &spec_url,
-    ))
+    (
+        [
+            (
+                header::CONTENT_SECURITY_POLICY,
+                ds_core::openapi::SWAGGER_UI_CSP,
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        axum::response::Html(ds_core::openapi::swagger_ui_html(
+            "MeteoCore - EDR API",
+            &spec_url,
+        )),
+    )
+}
+
+/// Pinned Swagger assets embedded in ds-core, available under each API root.
+pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
+    match ds_core::openapi::swagger_ui_asset(&asset) {
+        Some((content_type, bytes)) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 pub async fn conformance(
@@ -1387,28 +1412,40 @@ pub async fn locations(
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
+    let base_url = request_base_url(&state, &headers);
     let query_engine = engine.clone();
-    let locs = execute_query(false, move |_budget| {
-        query_engine.get_locations().map_err(|_| {
+    let (body, etag) = execute_query(false, move |_budget| {
+        let server_error = || {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "code": "ServerError", "description": "Internal server error" })),
             )
-        })
+        };
+        let locs = query_engine.get_locations().map_err(|_| server_error())?;
+        let params = query_engine.get_parameters();
+        let temporal = query_engine
+            .get_temporal_extent()
+            .map(|(s, e)| (s.to_rfc3339(), e.to_rfc3339()));
+        let ctx = LocationsContext {
+            collection_id: &id,
+            parameter_names: &params,
+            temporal_extent: temporal,
+            base_url: &base_url,
+        };
+        // Keep construction, serialization and hashing under the same worker
+        // permit as retrieval, even if the request times out or disconnects.
+        let body = locations_to_json(&locs, &ctx).map_err(|_| server_error())?;
+        let etag = ds_core::http_cache::etag_of(&body);
+        Ok((body, etag))
     })
     .await?;
-    let params = engine.get_parameters();
-    let temporal = engine
-        .get_temporal_extent()
-        .map(|(s, e)| (s.to_rfc3339(), e.to_rfc3339()));
-    let ctx = LocationsContext {
-        collection_id: &id,
-        parameter_names: &params,
-        temporal_extent: temporal,
-        base_url: &request_base_url(&state, &headers),
-    };
-    let body = serde_json::to_string(&locations_to_geojson(&locs, &ctx)).unwrap();
-    Ok(([(header::CONTENT_TYPE, "application/geo+json")], body))
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/geo+json".to_owned()),
+            (header::ETAG, etag),
+        ],
+        body,
+    ))
 }
 
 pub async fn location_query(

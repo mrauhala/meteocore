@@ -13,6 +13,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(handlers::landing_page))
         .route("/api", get(handlers::api_definition))
         .route("/api/docs", get(handlers::api_docs))
+        .route("/api/docs/{asset}", get(handlers::api_docs_asset))
         .route("/conformance", get(handlers::conformance))
         .route("/tileMatrixSets", get(handlers::tile_matrix_sets))
         .route(

@@ -63,7 +63,7 @@ Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
 | `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
-| `limit` | ✓ | `/collections` and `/locations` pagination only |
+| `limit` | partial | `/collections` pagination only; `/locations` returns the full inventory (EDR 1.1 does not define locations paging) |
 
 Data queries execute on a dedicated, bounded runtime, including radius and
 instance routes. Admission is capped at 2–8 concurrent queries (available CPUs,
@@ -73,7 +73,18 @@ further requests receive 503 immediately. A 30-second deadline (including queue 
 a cancelled/timed-out MULTIPOINT stops before its next engine call. This bounds
 concurrency without claiming that synchronous engine I/O is preemptible.
 
+For `/locations`, the same permit covers retrieval, metadata, direct JSON
+serialization and ETag hashing (#533). The response still contains the full
+EDR 1.1 inventory, but no intermediate JSON tree duplicates every location and
+its parameter metadata. The final response bytes and the engine's location
+vector remain in memory; this is bounded concurrency, not constant total
+response memory or pagination.
+
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499).
+
+`/api/docs` uses embedded Swagger UI 5.33.0 assets, served under
+`/api/docs/{asset}`, with a same-origin script policy and `nosniff` headers.
+No executable documentation assets or validation requests use a CDN (#587).
 
 ## Domain types produced
 

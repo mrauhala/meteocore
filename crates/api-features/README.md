@@ -119,6 +119,10 @@ representation with `timeStamp` blanked, and a closed
 Error bodies are `{ "code", "description" }`; 500s never leak internals.
 Structured `ErrorReason` codes are #119.
 
+`/api/docs` uses embedded Swagger UI 5.33.0 assets, served under
+`/api/docs/{asset}`, with a same-origin script policy and `nosniff` headers.
+No executable documentation assets or validation requests use a CDN (#587).
+
 ## Geometry types produced
 
 `Point`, `Polygon`, `MultiPolygon`, and `null` (CAP geocode-only areas).
@@ -142,8 +146,12 @@ layer but has no effect on this engine.
 | Nowcast | one tracked storm cell (Point + fact-sheet properties) from one generation | cell centroid inside box | with none: latest generation; with `datetime`: the newest retained generation inside the interval (~4 h history) | ✓ significance, significance_rank, max_dbz, area_km2, track_age, speed_ms, bearing_deg, intensity_trend_dbz_min + lightning / impact / radar extras when those sources are wired | ✓ all base cell properties + wired lightning/impact/radar groups | ✓ | ✓ (retained history span) | ✓ |
 | GeoTIFF, GRIB, QueryData, Zarr, ODIM composite, ODIM PVOL site | — no `FeatureEngine` (EDR / Maps only) — | | | | — | | | |
 
-Pagination: every engine materializes the whole filtered set and slices it
-(`offset`/`limit`); nothing streams (#532).
+CSV pagination uses an immutable station inventory built at load time, in
+first-observation order. Unfiltered pages slice that inventory directly;
+filtered pages count matching stations but clone only the requested page.
+Requests never scan the CSV observation history or rebuild all station features
+(#532). Other engines retain their own filtering/sorting/paging strategies;
+responses are buffered rather than streamed.
 
 ## Known gaps, in suggested order
 

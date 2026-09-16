@@ -2602,3 +2602,67 @@ async fn exhausted_memory_budget_rejects_uncached_tile() {
     assert_eq!(ds_render::budget::RENDER_MEMORY.available(), 0);
     assert_eq!(ds_render::budget::RENDER_MEMORY.rejected(), 1);
 }
+
+#[tokio::test]
+async fn swagger_docs_and_local_assets_obey_security_policy() {
+    // Nest under a prefix to catch asset URLs that only work at the root.
+    let app = axum::Router::new().nest("/prefix/service", build_router());
+    let docs = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/prefix/service/api/docs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(docs.status(), StatusCode::OK);
+    assert_eq!(
+        docs.headers()["content-security-policy"],
+        ds_core::openapi::SWAGGER_UI_CSP
+    );
+    assert_eq!(docs.headers()["x-content-type-options"], "nosniff");
+    let bytes = axum::body::to_bytes(docs.into_body(), 100_000)
+        .await
+        .unwrap();
+    let html = std::str::from_utf8(&bytes).unwrap();
+    assert!(!html.contains("unpkg.com"));
+    assert!(!html.contains("<script>"));
+    for name in [
+        "swagger-ui-5.33.0.js",
+        "swagger-ui-5.33.0.css",
+        "init.js",
+        "layout.css",
+    ] {
+        assert!(html.contains(&format!("docs/{name}")));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/prefix/service/api/docs/{name}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let (mime, embedded) = ds_core::openapi::swagger_ui_asset(name).unwrap();
+        assert_eq!(response.headers()["content-type"], mime);
+        let bytes = axum::body::to_bytes(response.into_body(), 2_000_000)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), embedded);
+    }
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .uri("/prefix/service/api/docs/not-vendored.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
