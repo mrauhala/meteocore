@@ -2991,6 +2991,24 @@ mod tests {
             Err(DataServerError::ResourceExhausted)
         ));
         assert_eq!(crate::decode_budget::metrics(), (0, 0, 2));
+        let config: ds_core::config::GeoTiffConfig = serde_json::from_value(serde_json::json!({
+            "filename_template": "radar_%Y%m%dT%H%MZ.tif", "parameter": "reflectivity", "unit": "dBZ"
+        })).unwrap();
+        let engine = crate::GeoTiffEngine::new(
+            "zero-budget",
+            Some(find_test_radar_dir().to_str().unwrap()),
+            &config,
+        )
+        .unwrap();
+        let (lon, lat) = metadata.geo_transform.pixel_to_world(50, 50);
+        assert!(matches!(
+            engine.query_point(lat, lon, None, None),
+            Err(DataServerError::ResourceExhausted)
+        ));
+        assert!(matches!(
+            engine.query_bbox(lon, lat, lon + 0.01, lat + 0.01, None, None),
+            Err(DataServerError::ResourceExhausted)
+        ));
     }
 
     #[test]
