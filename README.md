@@ -1651,11 +1651,21 @@ docker compose up -d
 open http://localhost:3000    # Grafana (anonymous admin for local dev)
 ```
 
+All published host ports bind to `127.0.0.1`; other containers use the internal
+Compose network. The stack is for local development, not a production manifest.
+Alloy retains access to the Docker API: mounting its socket `:ro` does not make
+API operations read-only. Only run this stack with trusted local users.
+
 Tear down including volumes: `docker compose down -v`.
 
 Alloy promotes a bounded set of labels to Loki: `level`, `api`, `query_type`, `status_class` (`2xx` / `4xx` / `5xx`). High-cardinality fields like `collection`, `path`, `request_id`, and the raw query string stay in the log body and are queryable via `| json` in LogQL — this keeps Loki's index bounded as the number of collections grows.
 
 The bundled Grafana dashboard at `docker/grafana/dashboards/meteocore-overview.json` has a **Logs** row with four Loki-backed panels: request rate by `(api, query_type)`, error rate by `status_class`, live request stream, and a dedicated 4xx/5xx stream. All panels work with the Prometheus and Loki datasources that are auto-provisioned from `docker/grafana/provisioning/`.
+
+Privileged GitHub workflows pin actions to commit SHAs, updated by Dependabot.
+Claude comment triggers require an owner, member or collaborator; automatic
+reviews additionally require a branch in this repository. Fork PRs still run
+normal CI without the review credential.
 
 > Production note: the compose stack is intended for local dev. It uses anonymous admin Grafana, filesystem-backed Loki, no retention beyond 7 days, and runs Alloy as root so it can tail the Docker socket. Do not deploy it as-is.
 
