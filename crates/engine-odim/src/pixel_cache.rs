@@ -6,8 +6,9 @@
 //! stack of a whole radar network is never resident at once. Mirrors the
 //! GeoTIFF/GRIB `quick_cache` byte-weighted caches.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use ds_cache::ByteBoundedCache;
 use quick_cache::sync::Cache;
@@ -42,6 +43,9 @@ pub struct PixelCache {
     /// the metric increment happen once.
     negative: Cache<PixelKey, ()>,
     inserts: AtomicU64,
+    /// Only active file loads own locks; expired weak entries are pruned on
+    /// the next miss. No raw file bytes or decoded arrays are retained here.
+    loading: Mutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
 impl PixelCache {
@@ -58,6 +62,7 @@ impl PixelCache {
             ),
             negative: Cache::new(NEGATIVE_CAPACITY_ITEMS),
             inserts: AtomicU64::new(0),
+            loading: Mutex::new(HashMap::new()),
         }
     }
 
@@ -83,6 +88,24 @@ impl PixelCache {
     /// cached nor known-bad, so the loader is about to fetch + decode it.
     pub fn record_miss(&self) {
         self.inner.record_miss();
+    }
+
+    /// Serialize cold loads of sibling datasets in a source-qualified file.
+    /// The caller rechecks the pixel/negative caches inside the lock.
+    pub fn with_file_load<T>(&self, file_id: &str, load: impl FnOnce() -> T) -> T {
+        let lock = {
+            let mut loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+            loading.retain(|_, lock| lock.strong_count() != 0);
+            if let Some(lock) = loading.get(file_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                loading.insert(file_id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        load()
     }
 
     /// Whether `(file_id, dataset_path)` is already resident — a presence
@@ -171,6 +194,30 @@ impl PixelCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_file_misses_recheck_after_one_load() {
+        let cache = PixelCache::new(1);
+        let loads = AtomicU64::new(0);
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    cache.with_file_load("same-source/file", || {
+                        if cache.is_known_bad("same-source/file", "moment") {
+                            return;
+                        }
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        cache.mark_bad("same-source/file", "moment");
+                    });
+                });
+            }
+        });
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        cache.with_file_load("next-file", || {});
+        assert!(cache.loading.lock().unwrap().len() <= 1);
+    }
 
     #[test]
     fn negative_cache_dedups_failures() {
