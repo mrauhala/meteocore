@@ -40,9 +40,9 @@ path can leave the WMS symptom unchanged (#448 vs #452).
 ## Dimensions
 
 - **TIME** — valid-time axis from `RasterInfo.times`. A TIME-less GetMap
-  resolves to `times.last()` (engines therefore order `times` so the last
-  entry is the correct default — the CAP engine relies on this for its
-  "active now" default).
+  resolves to `MapEngine::default_time()` when supplied, else `times.last()`.
+  GetCapabilities advertises the same default. CAP advertises future warnings
+  while keeping its snapshot's `as_of` as the "active now" default.
 - **ELEVATION** — advertised when the collection has a vertical extent
   (`RasterInfo.vertical`); rejected with 400 otherwise.
 - **`reference_time` (forecast model run, #337/#345):** forecast layers

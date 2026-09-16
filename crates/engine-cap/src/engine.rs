@@ -692,6 +692,10 @@ fn encode_feature_id(id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 impl MapEngine for CapEngine {
+    fn default_time(&self) -> Option<DateTime<Utc>> {
+        Some(self.snapshot().as_of)
+    }
+
     /// The instant a render is keyed on. `None` (a TIME-less request) means
     /// "now" — the snapshot's `as_of`, exactly what [`Self::get_raster_tile`]
     /// substitutes — so the no-TTL rendered/meta-tile caches key the default

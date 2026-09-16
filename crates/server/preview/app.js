@@ -140,6 +140,7 @@
             hasZoomed: false,
             timeIndex: null,
             timeValues: temporalValues(collection),
+            defaultTime: collection.temporal_extent?.default || null,
             // Selected parameter name for multi-parameter raster collections.
             // null = use the server's default. The dropdown is only rendered
             // when `parameters.length > 1`, but state holds the first entry's
@@ -637,9 +638,11 @@
 
     function attachTimeSlider(controlsHost, state, layerHandles) {
         const values = state.timeValues;
-        // Default to the latest timestep so an opt-in toggle shows current
-        // conditions, matching the server's default `&time=` resolution.
-        state.timeIndex = values.length - 1;
+        // Use the engine-owned default (alerts: now), with latest as the
+        // fallback for forecast and older manifests.
+        const defaultIndex = state.defaultTime === null ? -1
+            : values.findIndex(t => Date.parse(t) === Date.parse(state.defaultTime));
+        state.timeIndex = defaultIndex >= 0 ? defaultIndex : values.length - 1;
         // Track the index that's been pushed to the source so we can skip a
         // no-op refresh when the user scrubs and returns to the same step
         // (each setTiles call re-fetches the visible tiles even with the
