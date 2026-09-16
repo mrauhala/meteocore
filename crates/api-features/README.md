@@ -176,3 +176,9 @@ Nowcast cells have a 2.5 km² minimum footprint, summed at each pixel row's
 latitude. `area_km2`, severity and flash density use that physical area;
 tracking distances and speeds use local latitude. Working resolution depends
 on the source and configured pixel budget.
+
+BUFR decoding supports compressed character fields, operator 208, and numeric
+fields through 64 bits. Unsupported operators or unknown national descriptors
+skip the affected message (counted in `bufr_decode_failures_total`); other
+messages in the same file remain available. See
+[`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).

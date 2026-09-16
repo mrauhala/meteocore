@@ -11,9 +11,8 @@ ecCodes `bufr_dump`).
 
 ## The decoder boundary
 
-- **`src/decode.rs` is the only module that imports `tinybufr`.** Keep it
-  that way: if a real feed hits one of tinybufr's gaps (compressed
-  character strings, operators 203/204/207/22x) the fix is to vendor or
+- **`src/decode.rs` is the only module that imports `ds_bufr`.** Keep it
+  that way: if a real feed hits an unsupported operator (203/204/207/22x) the fix is to vendor or
   replace the decoder behind `Decoder::decode`, not to spread the API.
 - `Tables::default()` rebuilds three hash maps from ~1 MB of statics —
   build **once per engine** (`Decoder::new`), never per message.
@@ -26,12 +25,16 @@ ecCodes `bufr_dump`).
 - Unsupported operators / features are `DecodeError::Unsupported`
   (counted per message in `bufr_decode_failures_total{reason="unsupported"}`),
   other failures `reason="error"`; neither is fatal to the file or the scan.
-  Known live gaps (#693): compressed character fields (kz-kazhydromet),
-  operator 2 08 YYY (cy-dom), > 32-bit numeric reads (ca-eccc-msc).
+  `ds-bufr` supports compressed character fields, operator 208 (including
+  cancellation), and numeric widths through 64 bits (#693). Regression
+  fixtures in `testdata/bufr-decoder/` are generated independently by ecCodes.
+  This does not establish complete coverage of every live centre/template.
 - National local descriptors have no width in the master tables, so one
   unknown element misaligns the whole message. `LOCAL_TABLE_B` in
-  `decode.rs` registers the ones seen live (DWD 020237/238/239); add to it
-  when a centre logs `Table B entry not found for …`.
+  `decode.rs` registers DWD 020237/238/239 only for centre 78/local version 8,
+  and 004214 for centre 78/local versions 2–8. Never install national entries
+  globally: the same number can mean a different width at another centre.
+  Extend centre/version selection only from a verified published local table.
 
 ## Extraction rules (template-agnostic)
 

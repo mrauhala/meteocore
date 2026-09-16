@@ -1239,6 +1239,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ds-bufr"
+version = "0.1.0"
+dependencies = [
+ "bitstream-io",
+ "byteorder",
+ "hashbrown 0.15.5",
+ "serde",
+ "smallvec",
+ "thiserror",
+]
+
+[[package]]
 name = "ds-cache"
 version = "0.1.0"
 dependencies = [
@@ -1375,13 +1387,13 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "chrono",
+ "ds-bufr",
  "ds-core",
  "ds-poll",
  "ds-storage",
  "ds-wis2",
  "tempfile",
  "thiserror",
- "tinybufr",
  "tokio",
  "tracing",
 ]
@@ -5024,20 +5036,6 @@ checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
-]
-
-[[package]]
-name = "tinybufr"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27b5e52685367b017f3d49546040b592afe7bb0b5f4fa017398f47f259de2ab8"
-dependencies = [
- "bitstream-io",
- "byteorder",
- "hashbrown 0.15.5",
- "serde_json",
- "smallvec",
- "thiserror",
 ]
 
 [[package]]

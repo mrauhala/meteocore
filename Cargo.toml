@@ -16,6 +16,7 @@ members = [
     "crates/storage",
     "crates/render",
     "crates/ds-cache",
+    "crates/ds-bufr",
     "crates/ds-poll",
     "crates/ds-executor",
     "crates/ds-wis2",
