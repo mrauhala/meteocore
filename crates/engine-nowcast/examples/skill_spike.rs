@@ -2,27 +2,32 @@
 //!
 //! Loads a directory of composite GeoTIFF frames through the public
 //! `GeoTiffEngine` (the same decode path phase 1 will consume via
-//! `Arc<dyn MapEngine>`), estimates motion from each consecutive frame pair,
-//! extrapolates, and scores the extrapolation against the frame that actually
-//! followed — next to a persistence baseline.
+//! `Arc<dyn MapEngine>`), compares the historical single-pair estimator with
+//! the shared production multi-pair/coarsening/EMA pipeline, and scores both
+//! against the same observations and persistence baseline.
 //!
-//! Gate: nowcast CSI must beat persistence CSI at the gate threshold, lead 1.
+//! Gate: production-estimator CSI must beat persistence at the gate threshold,
+//! lead 1. Object metrics are reported alongside it; they have no binary gate.
 //!
 //! ```text
 //! cargo run --release -p engine-nowcast --example skill_spike -- \
 //!     --dir testdata/smhi-radar-geotiff-4326 \
-//!     --template "%Y%m%d%H%M%S_smhi_radar.tif"
+//!     --template "%Y%m%d%H%M%S_smhi_radar.tif" \
+//!     --nodata 255 --scale 0.4 --offset -30
 //! ```
 
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ds_core::config::GeoTiffConfig;
+use ds_core::config::{GeoTiffConfig, NowcastConfig};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterValues};
 use engine_geotiff::GeoTiffEngine;
 use engine_nowcast::advect::advect_u8;
 use engine_nowcast::cells2d::{advance_tracks, CellTrack};
 use engine_nowcast::motion::{estimate_motion, MotionOptions};
+use engine_nowcast::motion_pipeline::{
+    estimate_production_motion, working_grid_size, MotionEstimate, MAX_HISTORY_FRAMES,
+};
 use engine_nowcast::objects::{
     classify_growth, match_cells, score_objects, segment_cells, segment_cells_labeled, CellBlob,
     GrowthClass, ObjectScores, PixelScale,
@@ -30,9 +35,6 @@ use engine_nowcast::objects::{
 use engine_nowcast::skill::{score, Contingency};
 use engine_nowcast::tendency::EFOLD_INTERVALS;
 use engine_nowcast::{advect::advect, Grid};
-
-/// Keep the working grid at most this many pixels (halve dims until it fits).
-const MAX_PIXELS: usize = 6_000_000;
 
 struct Args {
     dir: String,
@@ -50,15 +52,21 @@ struct Args {
     min_area: usize,
     gate_km: f64,
     growth_decay: bool,
+    history_frames: usize,
+    max_pixels: usize,
+    max_lead: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, String> {
+    // Read actual config defaults so harness defaults cannot drift from serving.
+    let defaults: NowcastConfig = serde_json::from_value(serde_json::json!({"source": "fixture"}))
+        .expect("nowcast config defaults");
     let mut args = Args {
         dir: String::new(),
         template: String::new(),
         thresholds: vec![10.0, 20.0, 35.0],
         gate_threshold: 20.0,
-        min_echo: 10.0,
+        min_echo: defaults.min_echo as f32,
         block: 32,
         search: 20,
         substeps: 4,
@@ -69,6 +77,9 @@ fn parse_args() -> Result<Args, String> {
         min_area: 5,
         gate_km: 20.0,
         growth_decay: false,
+        history_frames: defaults.history_frames,
+        max_pixels: defaults.max_pixels,
+        max_lead: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -144,6 +155,23 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e: std::num::ParseFloatError| e.to_string())?
             }
             "--growth-decay" => args.growth_decay = true,
+            "--history-frames" => {
+                args.history_frames = value("--history-frames")?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?
+            }
+            "--max-pixels" => {
+                args.max_pixels = value("--max-pixels")?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?
+            }
+            "--max-lead" => {
+                args.max_lead = Some(
+                    value("--max-lead")?
+                        .parse::<usize>()
+                        .map_err(|e| e.to_string())?,
+                )
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -153,7 +181,9 @@ fn parse_args() -> Result<Args, String> {
                     [--thresholds 10,20,35] [--gate-threshold 20] [--min-echo 10] \
                     [--block 32] [--search 20] [--substeps 4] \
                     [--nodata <raw>] [--scale <gain>] [--offset <off>] \
-                    [--object-threshold 35] [--min-area 5] [--gate-km 20]"
+                    [--object-threshold 35] [--min-area 5] [--gate-km 20] \
+                    [--history-frames 3] [--max-pixels 4000000] [--max-lead <frames>] \
+                    [--growth-decay]"
                 .into(),
         );
     }
@@ -164,6 +194,22 @@ fn parse_args() -> Result<Args, String> {
             "--gate-threshold {} is not among --thresholds {:?}",
             args.gate_threshold, args.thresholds
         ));
+    }
+    if !(2..=MAX_HISTORY_FRAMES).contains(&args.history_frames) {
+        return Err(format!(
+            "--history-frames must be in 2..={MAX_HISTORY_FRAMES}"
+        ));
+    }
+    if args.max_pixels == 0
+        || args.max_lead == Some(0)
+        || args.block == 0
+        || args.search < 0
+        || args.substeps == 0
+    {
+        return Err(
+            "pixel budget, lead, block and substeps must be positive; search must be nonnegative"
+                .into(),
+        );
     }
     Ok(args)
 }
@@ -195,6 +241,10 @@ fn tile_to_grid(values: RasterValues, width: usize, height: usize) -> Grid {
 
 fn fmt_ratio(r: Option<f64>) -> String {
     r.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into())
+}
+
+fn fmt_gate_ratio(r: Option<f64>) -> String {
+    r.map(|v| format!("{v:.6}")).unwrap_or_else(|| "n/a".into())
 }
 
 fn main() -> ExitCode {
@@ -251,11 +301,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let [mut w, mut h] = info.grid_size.unwrap_or([1024, 1024]);
-    while (w as usize) * (h as usize) > MAX_PIXELS {
-        w /= 2;
-        h /= 2;
-    }
+    let [w, h] = working_grid_size(info.grid_size.unwrap_or([1024, 1024]), args.max_pixels);
     println!(
         "source: {} frames, native CRS {}, sampling {}x{} over {:?}",
         info.times.len(),
@@ -271,11 +317,14 @@ fn main() -> ExitCode {
         .map(|p| (p[1] - p[0]).num_seconds())
         .collect();
     if let (Some(&min), Some(&max)) = (deltas.iter().min(), deltas.iter().max()) {
-        println!("cadence: {}s between frames", min);
+        if min < 1 {
+            eprintln!("source cadence must be at least 1 second and ascending");
+            return ExitCode::FAILURE;
+        }
+        println!("cadence: {min}–{max}s between frames; leads use actual elapsed time");
         if max as f64 > min as f64 * 1.05 {
             eprintln!(
-                "warning: irregular cadence ({min}–{max}s); vectors are per-interval and will \
-                 mix speeds"
+                "note: irregular cadence; lead rows count observations, not fixed-duration steps"
             );
         }
     }
@@ -323,6 +372,10 @@ fn main() -> ExitCode {
         frames.push(grid);
     }
 
+    println!(
+        "decode overrides: nodata={:?}, scale={:?}, offset={:?}; substeps={}",
+        args.nodata, args.scale, args.offset, args.substeps
+    );
     let opts = MotionOptions {
         block: args.block,
         search_radius: args.search,
@@ -330,10 +383,10 @@ fn main() -> ExitCode {
         ..MotionOptions::default()
     };
 
-    // Aggregate (lead, threshold) → nowcast + persistence tables across every
-    // usable anchor frame i (motion from i-1→i, verify at i+lead).
-    let max_lead = frames.len() - 2;
-    let mut nowcast = vec![vec![Contingency::default(); args.thresholds.len()]; max_lead];
+    let max_lead = args
+        .max_lead
+        .unwrap_or(frames.len() - 2)
+        .min(frames.len() - 2);
     let mut persistence = vec![vec![Contingency::default(); args.thresholds.len()]; max_lead];
 
     // Object-based verification (#542, after Ritvanen et al. GMD 2025):
@@ -362,119 +415,156 @@ fn main() -> ExitCode {
         px_km_y,
         obs_cells.iter().map(Vec::len).collect::<Vec<_>>()
     );
-    let mut obj_now = vec![[ObjectScores::default(); 3]; max_lead];
     let mut obj_pers = vec![[ObjectScores::default(); 3]; max_lead];
 
-    // Chained track state for the --growth-decay arm (engine parity).
-    let mut tracks: Vec<CellTrack> = Vec::new();
-    let mut next_track_id: u64 = 0;
-
-    for i in 1..frames.len() - 1 {
-        let started = Instant::now();
-        let field = estimate_motion(&frames[i - 1], &frames[i], &opts);
-        let motion_ms = started.elapsed().as_millis();
-        let measured = field.measured.iter().filter(|&&m| m).count();
+    println!("comparison: baseline single-pair block={} search={}px; production history={} physical radius + multi-pair + EMA; max_pixels={}; growth_decay={}", args.block, args.search, args.history_frames, args.max_pixels, args.growth_decay);
+    let mut results = Vec::new();
+    for production in [false, true] {
         println!(
-            "anchor {}: motion {}ms, {} of {} blocks measured",
-            info.times[i],
-            motion_ms,
-            measured,
-            field.measured.len()
+            "estimator: {}",
+            if production { "production" } else { "baseline" }
         );
+        let mut nowcast = vec![vec![Contingency::default(); args.thresholds.len()]; max_lead];
+        let mut obj_now = vec![[ObjectScores::default(); 3]; max_lead];
+        let mut previous: Option<MotionEstimate> = None;
+        // Separate track state for each estimator's experimental growth/decay arm.
+        let mut tracks: Vec<CellTrack> = Vec::new();
+        let mut next_track_id: u64 = 0;
 
-        // Growth/decay class of each observed cell at forecast creation,
-        // then chained forward through observed-track matches per lead.
-        let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], scale, gate_km);
-
-        // Per-cell growth/decay (#546): ENGINE-PARITY tendencies — the
-        // same `advance_tracks` production runs (two-hypothesis motion-
-        // compensated matching + tendency EMA), chained across anchors, so
-        // the gate measures what the server would actually apply. The first
-        // anchor has no track history ⇒ zero tendencies (pure advection),
-        // exactly like a fresh engine boot.
-        let gd = args.growth_decay.then(|| {
-            let (blobs, labels) =
-                segment_cells_labeled(&frames[i], args.object_threshold, args.min_area);
-            let elapsed = (info.times[i] - info.times[i - 1]).num_seconds() as f32;
-            tracks = advance_tracks(&tracks, blobs, scale, &field, elapsed, elapsed, || {
-                next_track_id += 1;
-                next_track_id
-            });
-            // Labels beyond the u8 range fall back to 0 = pure advection
-            // (mirrors the engine; clamping onto 255 would borrow cell
-            // #254's tendency for every overflow cell).
-            let label_map: Vec<u8> = labels
-                .iter()
-                .map(|&l| if l <= 254 { l as u8 } else { 0 })
-                .collect();
-            let mut tend = [0f32; 256];
-            for (k, t) in tracks.iter().take(254).enumerate() {
-                // Per-interval units to pair with the lead damp below.
-                tend[k + 1] = t.intensity_tendency * elapsed;
-            }
-            (tend, label_map)
-        });
-
-        for lead in 1..=(frames.len() - 1 - i) {
+        for i in 1..frames.len() - 1 {
             let started = Instant::now();
-            let mut forecast = advect(&frames[i], &field, lead as f32, args.substeps);
-            if let Some((tend, label_map)) = &gd {
-                let moved = advect_u8(
-                    label_map,
-                    w as usize,
-                    h as usize,
-                    0,
-                    &field,
-                    lead as f32,
-                    args.substeps,
+            let interval_secs = deltas[i - 1] as f32;
+            let field = if production {
+                let start = (i + 1).saturating_sub(args.history_frames);
+                let refs: Vec<&Grid> = frames[start..=i].iter().collect();
+                let intervals: Vec<f32> = deltas[start..i].iter().map(|dt| *dt as f32).collect();
+                let estimate = estimate_production_motion(
+                    &refs,
+                    &intervals,
+                    px_km_x * 1000.0,
+                    args.min_echo,
+                    previous.as_ref().map(|p| (&p.field, p.interval_secs)),
                 );
-                let damp = EFOLD_INTERVALS * (1.0 - (-(lead as f32) / EFOLD_INTERVALS).exp());
-                for (v, k) in forecast.data.iter_mut().zip(&moved) {
-                    if v.is_finite() && *k > 0 {
-                        *v += tend[*k as usize] * damp;
+                println!("  production history={} pairs={} coarsening={} search={}px interval={}s ema={}",
+                refs.len(), intervals.len(), estimate.coarsening, estimate.search_radius,
+                estimate.interval_secs, previous.is_some());
+                previous = Some(estimate);
+                &previous.as_ref().expect("estimate stored").field
+            } else {
+                &estimate_motion(&frames[i - 1], &frames[i], &opts)
+            };
+            let motion_ms = started.elapsed().as_millis();
+            let measured = field.measured.iter().filter(|&&m| m).count();
+            println!(
+                "anchor {}: motion {}ms, {} of {} blocks measured",
+                info.times[i],
+                motion_ms,
+                measured,
+                field.measured.len()
+            );
+
+            // Growth/decay class of each observed cell at forecast creation,
+            // then chained forward through observed-track matches per lead.
+            let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], scale, gate_km);
+
+            // Preserve the optional historical growth/decay experiment separately
+            // for both estimators. This harness is not a parity test of production
+            // track replay/coasting, joins, or the raw-byte forecast representation.
+            let gd = args.growth_decay.then(|| {
+                let (blobs, labels) =
+                    segment_cells_labeled(&frames[i], args.object_threshold, args.min_area);
+                let elapsed = (info.times[i] - info.times[i - 1]).num_seconds() as f32;
+                tracks = advance_tracks(&tracks, blobs, scale, field, elapsed, elapsed, || {
+                    next_track_id += 1;
+                    next_track_id
+                });
+                // Labels beyond the u8 range fall back to 0 = pure advection
+                // (mirrors the engine; clamping onto 255 would borrow cell
+                // #254's tendency for every overflow cell).
+                let label_map: Vec<u8> = labels
+                    .iter()
+                    .map(|&l| if l <= 254 { l as u8 } else { 0 })
+                    .collect();
+                let mut tend = [0f32; 256];
+                for (k, t) in tracks.iter().take(254).enumerate() {
+                    // Per-interval units to pair with the lead damp below.
+                    tend[k + 1] = t.intensity_tendency * elapsed;
+                }
+                (tend, label_map)
+            });
+
+            for lead in 1..=(frames.len() - 1 - i).min(max_lead) {
+                let lead_intervals =
+                    (info.times[i + lead] - info.times[i]).num_seconds() as f32 / interval_secs;
+                let started = Instant::now();
+                let mut forecast = advect(&frames[i], field, lead_intervals, args.substeps);
+                if let Some((tend, label_map)) = &gd {
+                    let moved = advect_u8(
+                        label_map,
+                        w as usize,
+                        h as usize,
+                        0,
+                        field,
+                        lead_intervals,
+                        args.substeps,
+                    );
+                    let damp =
+                        EFOLD_INTERVALS * (1.0 - (-(lead_intervals) / EFOLD_INTERVALS).exp());
+                    for (v, k) in forecast.data.iter_mut().zip(&moved) {
+                        if v.is_finite() && *k > 0 {
+                            *v += tend[*k as usize] * damp;
+                        }
                     }
                 }
-            }
-            let advect_ms = started.elapsed().as_millis();
-            println!("  lead +{lead}: advection {advect_ms}ms");
-            for (k, &thr) in args.thresholds.iter().enumerate() {
-                nowcast[lead - 1][k].merge(&score(&forecast, &frames[i + lead], thr));
-                persistence[lead - 1][k].merge(&score(&frames[i], &frames[i + lead], thr));
-            }
+                let advect_ms = started.elapsed().as_millis();
+                println!("  lead +{lead}: advection {advect_ms}ms");
+                for (k, &thr) in args.thresholds.iter().enumerate() {
+                    nowcast[lead - 1][k].merge(&score(&forecast, &frames[i + lead], thr));
+                    if !production {
+                        persistence[lead - 1][k].merge(&score(&frames[i], &frames[i + lead], thr));
+                    }
+                }
 
-            // Carry creation-time classes to this lead's observed cells.
-            let prev_obs = &obs_cells[i + lead - 1];
-            let cur_obs = &obs_cells[i + lead];
-            let mut next_classes = vec![GrowthClass::Unknown; cur_obs.len()];
-            for (pi, ci) in match_cells(prev_obs, cur_obs, scale, gate_km) {
-                next_classes[ci] = classes[pi];
-            }
-            classes = next_classes;
+                // Carry creation-time classes to this lead's observed cells.
+                let prev_obs = &obs_cells[i + lead - 1];
+                let cur_obs = &obs_cells[i + lead];
+                let mut next_classes = vec![GrowthClass::Unknown; cur_obs.len()];
+                for (pi, ci) in match_cells(prev_obs, cur_obs, scale, gate_km) {
+                    next_classes[ci] = classes[pi];
+                }
+                classes = next_classes;
 
-            let fc_cells = segment_cells(&forecast, args.object_threshold, args.min_area);
-            let (o, g, d) = score_objects(&fc_cells, cur_obs, Some(&classes), scale, gate_km);
-            obj_now[lead - 1][0].merge(&o);
-            obj_now[lead - 1][1].merge(&g);
-            obj_now[lead - 1][2].merge(&d);
-            let (po, pg, pd) =
-                score_objects(&obs_cells[i], cur_obs, Some(&classes), scale, gate_km);
-            obj_pers[lead - 1][0].merge(&po);
-            obj_pers[lead - 1][1].merge(&pg);
-            obj_pers[lead - 1][2].merge(&pd);
+                let fc_cells = segment_cells(&forecast, args.object_threshold, args.min_area);
+                let (o, g, d) = score_objects(&fc_cells, cur_obs, Some(&classes), scale, gate_km);
+                obj_now[lead - 1][0].merge(&o);
+                obj_now[lead - 1][1].merge(&g);
+                obj_now[lead - 1][2].merge(&d);
+                if !production {
+                    let (po, pg, pd) =
+                        score_objects(&obs_cells[i], cur_obs, Some(&classes), scale, gate_km);
+                    obj_pers[lead - 1][0].merge(&po);
+                    obj_pers[lead - 1][1].merge(&pg);
+                    obj_pers[lead - 1][2].merge(&pd);
+                }
+            }
         }
+        results.push((nowcast, obj_now));
     }
+    let (baseline, obj_baseline) = &results[0];
+    let (nowcast, obj_now) = &results[1];
 
     println!();
     println!(
-        "lead  thr({})   CSI nowcast  CSI persist  POD nowcast  FAR nowcast",
+        "lead  thr({})   CSI baseline  CSI production  CSI persist  POD production  FAR production",
         info.unit
     );
     for (li, row) in nowcast.iter().enumerate() {
         for (k, &thr) in args.thresholds.iter().enumerate() {
             println!(
-                "  +{:<3} {:>6.1}   {:>11} {:>12} {:>12} {:>12}",
+                "  +{:<3} {:>6.1}   {:>12} {:>14} {:>12} {:>14} {:>14}",
                 li + 1,
                 thr,
+                fmt_ratio(baseline[li][k].csi()),
                 fmt_ratio(row[k].csi()),
                 fmt_ratio(persistence[li][k].csi()),
                 fmt_ratio(row[k].pod()),
@@ -490,22 +580,22 @@ fn main() -> ExitCode {
     // Per-class columns are POD (hits/(hits+misses)): a spurious forecast
     // cell has no observed class, so false alarms exist only in the overall
     // CSI — labeling per-class columns "CSI" would silently print POD anyway.
-    println!("lead  objCSI now/pers  growPOD now/pers  decayPOD now/pers  cent.err km (now)");
+    println!("lead  objCSI base/prod/pers  growPOD base/prod/pers  decayPOD base/prod/pers  cent.err km base/prod");
     for li in 0..max_lead {
-        let err_km = obj_now[li][0]
-            .mean_centroid_error()
-            .map(|e| format!("{e:.1}"))
-            .unwrap_or_else(|| "n/a".into());
         println!(
-            "  +{:<3} {:>6}/{:<6}  {:>6}/{:<6}  {:>6}/{:<6}   {}",
+            "  +{:<3} {}/{}/{}  {}/{}/{}  {}/{}/{}  {}/{}",
             li + 1,
+            fmt_ratio(obj_baseline[li][0].csi()),
             fmt_ratio(obj_now[li][0].csi()),
             fmt_ratio(obj_pers[li][0].csi()),
+            fmt_ratio(obj_baseline[li][1].pod()),
             fmt_ratio(obj_now[li][1].pod()),
             fmt_ratio(obj_pers[li][1].pod()),
+            fmt_ratio(obj_baseline[li][2].pod()),
             fmt_ratio(obj_now[li][2].pod()),
             fmt_ratio(obj_pers[li][2].pod()),
-            err_km,
+            fmt_ratio(obj_baseline[li][0].mean_centroid_error()),
+            fmt_ratio(obj_now[li][0].mean_centroid_error()),
         );
     }
 
@@ -522,9 +612,9 @@ fn main() -> ExitCode {
     match (n, p) {
         (Some(n), Some(p)) if n > p => {
             println!(
-                "GATE PASS: lead-1 CSI {} > persistence {} at {} {}",
-                fmt_ratio(Some(n)),
-                fmt_ratio(Some(p)),
+                "GATE PASS: production lead-1 CSI {} > persistence {} at {} {}",
+                fmt_gate_ratio(Some(n)),
+                fmt_gate_ratio(Some(p)),
                 args.thresholds[gate_idx],
                 info.unit
             );
@@ -532,9 +622,9 @@ fn main() -> ExitCode {
         }
         (n, p) => {
             println!(
-                "GATE FAIL: lead-1 CSI {} vs persistence {} at {} {}",
-                fmt_ratio(n),
-                fmt_ratio(p),
+                "GATE FAIL: production lead-1 CSI {} vs persistence {} at {} {}",
+                fmt_gate_ratio(n),
+                fmt_gate_ratio(p),
                 args.thresholds[gate_idx],
                 info.unit
             );

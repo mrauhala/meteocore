@@ -87,6 +87,31 @@ in production configs.
   `nowcast_lead1_persistence_csi_permille`. A persistent gap collapse in
   prod = motion or data regression; check before blaming the client.
 
+### Estimator parity (#640)
+
+`motion_pipeline::estimate_production_motion` is shared by `generate` and
+`skill_spike`: physical radius/coarsening, multi-pair averaging, interval
+rescaling and temporal EMA live there. Keep future estimator changes in this
+helper. `working_grid_size` is shared too; the harness reads config defaults
+for `max_pixels`, `history_frames`, and `min_echo`.
+
+The harness prints baseline/production/persistence pixel and object scores on
+the same observations. `--block` and `--search` configure ONLY the historical
+single-pair baseline; production uses its own shared policy. The exit-code gate
+uses production lead-1 pixel CSI. Object scores are a separate review gate,
+not silently folded into the exit code. Each arm starts cold at the second
+fixture frame, advances chronologically and never estimates from future
+frames. Irregular forecast leads use elapsed timestamps, not frame counts.
+
+The common working grid now follows the production pixel budget (default 4M,
+previous harness 6M and a different halving rule), so historical published
+scores are not directly comparable. `--max-pixels`/`--history-frames` should
+match the collection being evaluated; `--max-lead` caps observation-step leads
+for bounded runs. Optional `--growth-decay` retains the historical experimental
+tracker arm; this establishes estimator parity, not parity of track bootstrap,
+coasting, joins, or raw-byte forecast encoding. See
+`docs/nowcast-estimator-parity.md` for measured results and limitations.
+
 ## Cell intelligence (V2.2, #544)
 
 - `cells2d` tracks the analysis frame's 35 dBZ cells across generations

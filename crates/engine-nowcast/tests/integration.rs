@@ -2555,3 +2555,88 @@ fn physical_cell_area_reaches_served_facts_and_bootstrap_uses_same_floor() {
         assert!((actual - expected).abs() < 0.051, "{actual} != {expected}");
     }
 }
+
+/// The public motion product must match the helper used by skill_spike over
+/// consecutive generations, including history truncation and a skipped frame.
+#[test]
+fn served_motion_matches_harness_pipeline_across_irregular_generations() {
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::model::CoverageResponse;
+    use engine_nowcast::motion_grid::{motion_grid, GridSpec};
+    use engine_nowcast::motion_pipeline::{estimate_production_motion, MotionEstimate};
+    use engine_nowcast::Grid;
+
+    let times: Vec<_> = [0, 5, 10, 20]
+        .into_iter()
+        .map(|m| t0() + Duration::minutes(m))
+        .collect();
+    let frames: Vec<_> = times
+        .iter()
+        .map(|t| {
+            Grid::new(
+                W as usize,
+                H as usize,
+                truth_frame(*t)
+                    .into_iter()
+                    .map(|v| (v as f64 * 0.4 - 30.0) as f32)
+                    .collect(),
+            )
+        })
+        .collect();
+    let (source, engine) = build_with_history("PT30M", &times[..2], 3);
+    let (px_km, _) = engine_nowcast::lonlat_grid_km_per_px(EXTENT, W, H);
+    let spec = GridSpec {
+        west: EXTENT[0],
+        north: EXTENT[3],
+        dlon: (EXTENT[2] - EXTENT[0]) / W as f64,
+        dlat: (EXTENT[3] - EXTENT[1]) / H as f64,
+        width: W,
+        height: H,
+    };
+    let coords = "POLYGON((0 50,10 50,10 60,0 60,0 50))";
+    let mut previous: Option<MotionEstimate> = None;
+    for i in 1..times.len() {
+        *source.times.write().unwrap() = times[..=i].to_vec();
+        engine.poll_once();
+        let start = (i + 1).saturating_sub(3);
+        let refs: Vec<_> = frames[start..=i].iter().collect();
+        let intervals: Vec<_> = times[start..=i]
+            .windows(2)
+            .map(|p| (p[1] - p[0]).num_seconds() as f32)
+            .collect();
+        let estimate = estimate_production_motion(
+            &refs,
+            &intervals,
+            px_km * 1000.0,
+            10.0,
+            previous.as_ref().map(|p| (&p.field, p.interval_secs)),
+        );
+        let expected = motion_grid(
+            &estimate.field,
+            &spec,
+            estimate.interval_secs as f64,
+            EXTENT,
+        )
+        .unwrap();
+        let CoverageResponse::Single(actual) =
+            engine.query_area(coords, None, None, None, None).unwrap()
+        else {
+            panic!("expected a single motion coverage");
+        };
+        for (name, values) in [
+            ("motion_u", expected.u),
+            ("motion_v", expected.v),
+            ("motion_quality", expected.quality),
+        ] {
+            assert_eq!(
+                actual.ranges[name].values,
+                values
+                    .into_iter()
+                    .map(|v| Some((v * 100.0).round() / 100.0))
+                    .collect::<Vec<_>>(),
+                "{name} at generation {i}"
+            );
+        }
+        previous = Some(estimate);
+    }
+}
