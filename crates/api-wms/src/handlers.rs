@@ -411,14 +411,14 @@ pub async fn wms_handler(
                             ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
                         };
 
-                        // Web Mercator: decompose into cached 256×256 meta-tiles and
+                        // Supported projected CRSs: cache 256×256 meta-tiles and
                         // resample to the exact viewport (#202). The expensive
                         // per-tile work is cached and reused across overlapping
-                        // fullscreen views; other CRSs render directly. A zero-byte
+                        // fullscreen views; geographic requests render directly. A zero-byte
                         // tile cache (`metatile_cache_mb = 0`) is the kill switch:
                         // it bypasses meta-tiling so an operator can revert to the
                         // direct path via config reload, no redeploy.
-                        if output_crs == OutputCrs::WebMercator && tile_cache.capacity() > 0 {
+                        if output_crs != OutputCrs::Wgs84 && tile_cache.capacity() > 0 {
                             let prefix = ds_render::TileKeyPrefix {
                                 layer,
                                 parameter: style_parameter.clone(),
@@ -428,24 +428,25 @@ pub async fn wms_handler(
                                 reference_time,
                                 content_version,
                             };
-                            // `bbox` is in WGS84 degrees here — the params layer
-                            // converts EPSG:3857 metres to degrees before this point;
-                            // render_metatiled re-projects back to metres internally.
+                            // Projected output retains its exact metre rectangle;
+                            // the helper supplies each tile's own OutputCrs and
+                            // WGS84 source-read envelope to the engine.
                             let outcome = ds_render::render_metatiled(
                                 bbox,
+                                &output_crs,
                                 width,
                                 height,
                                 &prefix,
                                 colormap.as_ref(),
                                 format,
                                 tile_cache.as_ref(),
-                                |tbbox, tw, th| {
+                                |tbbox, tw, th, tile_output| {
                                     engine.get_raster_tile(
                                         tbbox,
                                         tw,
                                         th,
                                         time,
-                                        &OutputCrs::WebMercator,
+                                        tile_output,
                                         style_parameter.as_deref(),
                                         elevation,
                                         reference_time,
@@ -523,8 +524,8 @@ pub async fn wms_handler(
                         height = params.height,
                         "slow WMS render (meta-tiling fell back to direct)"
                     ),
-                    // `Direct` covers both a non-Web-Mercator CRS and a Web
-                    // Mercator request with meta-tiling disabled (metatile_cache_mb
+                    // `Direct` covers geographic output and any request
+                    // with meta-tiling disabled (metatile_cache_mb
                     // = 0), so the label stays generic rather than claiming a CRS.
                     Some(RenderPath::Direct) => tracing::info!(
                         layer = %params.layer,

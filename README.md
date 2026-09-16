@@ -358,7 +358,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `colormaps_dir` | no | — | Directory of palette files loaded as named colormaps (one per file, name = file stem). Formats: `.toml` (colormap fields), GMT `.cpt`, GRLevelX/RadarScope `.pal` (Color/Color4/SolidColor[4] with per-bin gradients, values below the lowest entry render transparent per the GR display-threshold behavior, `Scale:`/`Offset:` inverted to data units, RadarScope mask tokens collapsed to one ramp, `ND:` → nodata color, `RF:` ignored), GDAL color-relief `.txt`/`.clr`, SLD `.sld` (ColorMap). Resolved relative to the config file's directory; re-read on reload. Missing directory is a hard error; other extensions are skipped (`.disabled` works). |
 | `watch_collections_dir` | no | `false` | Auto-reload when files in `collections_dir` are added, changed, or removed. Debounced; runs on the background runtime. See trust-model note in [Per-File Collection Configs](#per-file-collection-configs). |
 | `watch_debounce_ms` | no | `500` | Coalesce-window in milliseconds for the filesystem watcher (only used when `watch_collections_dir = true`). |
-| `metatile_cache_mb` | no | `1024` | Size (MB) of the global Web Mercator meta-tile cache. Server-wide, not per-collection. `0` disables meta-tiling (EPSG:3857 GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
+| `metatile_cache_mb` | no | `1024` | Size (MB) of the global EPSG:3857/3067/3035 meta-tile cache. Server-wide, not per-collection. `0` disables meta-tiling (projected GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
 
 ### Collection Config Fields
 
@@ -1460,14 +1460,16 @@ Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP
 - Error tiles and empty tiles (all nodata) are NOT cached.
 - MVT vector tiles use a separate `VectorTileCache` (content-derived ETag, `Cache-Control: max-age=300`); they are NOT subject to `rendered_cache_mb`.
 
-### Meta-Tile Cache (Web Mercator WMS)
+### Meta-Tile Cache (Projected WMS)
 
-A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the Tier-2 rendered cache (keyed on the exact bbox) rarely hits. For EPSG:3857 GetMap, the WMS handler instead decomposes each request into fixed 256×256 tiles aligned to the WebMercatorQuad grid, renders and caches *those* (decoded RGBA), and resamples them to the exact viewport — so the expensive decode/projection/colorize work is cached at tile granularity and reused across overlapping views.
+A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the Tier-2 rendered cache (keyed on the exact bbox) rarely hits. For EPSG:3857/3067/3035 GetMap, the WMS handler instead decomposes each request into fixed 256×256 tiles on a CRS-specific grid, renders and caches *those* (decoded RGBA), and resamples them to the exact viewport — so the expensive decode/projection/colorize work is cached at tile granularity and reused across overlapping views.
 
 - Default size: 1024 MB, configured server-wide via **`[server] metatile_cache_mb`** (it is a single global cache, not per-collection); **set to 0 to disable** meta-tiling (reverts to a direct single-shot render, reload-reversible). Consumed by the WMS GetMap path today; Maps/Tiles render directly and would share this cache when meta-tiling extends to them.
-- Cache key: layer + parameter + style + time + elevation + ladder level + tile col/row.
-- Resolution ladder: half-octave steps coinciding with standard WebMercator zooms; snaps to the finest step ≤ the request resolution (always downsampled, never upscaled).
-- Web Mercator only; other CRSs and degenerate/oversized requests fall back to the direct render.
+- Cache key: grid CRS + layer + parameter + style + time + elevation + reference time + content version + ladder level + tile col/row.
+- Resolution ladder: half-octave steps, snapped to the coarsest step no coarser than the request. EPSG:3857 keeps its WebMercatorQuad alignment. EPSG:3067/3035 use internal metre grids with origin (0,0) and a base resolution of 128000 m/px, including exact 1000/500/250 m/px levels. These internal grids do not add new OGC API Tiles matrix sets.
+- Assembly uses nearest-neighbour sampling to preserve discrete palettes. Non-aligned resolutions may sample a finer intermediate grid, as on the Web Mercator path.
+- Geographic/unsupported CRSs, degenerate bounds, excessive tile counts, and over-zoomed requests fall back to direct rendering.
+- Panning reuses tiles, but a cold request can cost more because it renders complete covering tiles. See the [projected WMS pan measurements](docs/performance/projected-wms-pan.md).
 - Distinct from the per-collection GeoTIFF source tile cache (`tile_cache_*`).
 
 ### HTTP Cache Headers

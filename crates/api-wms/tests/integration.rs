@@ -872,6 +872,8 @@ async fn content_version_change_invalidates_rendered_and_metatile_caches() {
     for (crs, bbox, metatile_mb) in [
         ("CRS:84", "10,55,30,70", 64), // direct path (rendered cache)
         ("EPSG:3857", "1113194,7361866,3339584,11068715", 64), // meta-tiled
+        ("EPSG:3067", "100000,6500000,612000,7012000", 64),
+        ("EPSG:3035", "4000000,3000000,4512000,3512000", 64),
     ] {
         let (app, _tiles, calls, version) = build_counting_router_versioned(metatile_mb);
         let uri = format!(
@@ -1208,10 +1210,40 @@ async fn meta_tiling_reuses_tiles_across_overlapping_viewports() {
     );
 }
 
-/// Non-Web-Mercator requests (here CRS:84) bypass meta-tiling and render
+/// Projected panning reuses tiles while the zero-cache switch keeps the
+/// original one-call direct path available for both supported projections.
+#[tokio::test]
+async fn projected_pans_reuse_tiles_and_honour_the_kill_switch() {
+    use std::sync::atomic::Ordering;
+    for (crs, x, y) in [
+        ("EPSG:3067", 100000, 6500000),
+        ("EPSG:3035", 4000000, 3000000),
+    ] {
+        for budget in [0, 64] {
+            let (app, cache, calls) = build_counting_router(budget);
+            let mut first_calls = 0;
+            for pan in [0, 32000] {
+                let bbox = format!("{},{},{},{}", x + pan, y, x + pan + 256000, y + 256000);
+                assert_eq!(get_map(&app, crs, &bbox, 512, 512).await, StatusCode::OK);
+                if pan == 0 {
+                    first_calls = calls.load(Ordering::Relaxed);
+                }
+            }
+            if budget == 0 {
+                assert_eq!(calls.load(Ordering::Relaxed), 2);
+                assert_eq!(cache.stats(), (0, 0));
+            } else {
+                assert!(cache.stats().0 > 0, "{crs} must reuse tiles");
+                assert!(calls.load(Ordering::Relaxed) - first_calls < first_calls);
+            }
+        }
+    }
+}
+
+/// Geographic requests (here CRS:84) bypass meta-tiling and render
 /// directly: the meta-tile cache is never touched.
 #[tokio::test]
-async fn non_web_mercator_bypasses_meta_tiling() {
+async fn geographic_output_bypasses_meta_tiling() {
     let (app, tile_cache, calls) = build_counting_router(64);
     let status = get_map(&app, "CRS:84", "10,55,30,70", 256, 256).await;
     assert_eq!(status, StatusCode::OK);

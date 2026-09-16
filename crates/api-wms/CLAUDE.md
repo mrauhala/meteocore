@@ -23,7 +23,7 @@ internally. Test with BOTH CRS:84 and EPSG:4326 to catch axis-order bugs.
 
 ## Render path: meta-tiling
 
-WMS EPSG:3857 GetMap goes through the **meta-tile** path
+WMS EPSG:3857/3067/3035 GetMap goes through the **meta-tile** path
 (`ds-render/src/metatile.rs`), NOT the direct `get_raster_tile` path that
 Maps/Tiles use. Remember this when debugging: a fix applied to the direct
 path can leave the WMS symptom unchanged (#448 vs #452).
@@ -32,6 +32,13 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   coordinate map; it must stay consistent with `OutputCrs`/`ProjectionGrid`.
 - Viewport/bbox conversions are UNCLAMPED (`ds_core::web_mercator`); clamp to
   `LAT_LIMIT_DEG` only for tile-index selection (#452).
+- EPSG:3067/3035 use separate internal metre grids: origin (0,0),
+  half-octave ladder from 128000 m/px (including 1000/500/250 m/px).
+  These are not advertised OGC tile matrix sets. The grid identity is part
+  of the tile cache key; each engine call gets a tile-specific projected
+  `OutputCrs::Projected.bbox` plus its WGS84 source-read envelope.
+- Geographic/unsupported output, excessive tile fan-out, and over-zoom use
+  the direct path. `[server] metatile_cache_mb = 0` bypasses all meta-tiling.
 - Assembly resampling is nearest-neighbour — bilinear blending destroyed the
   discrete radar palette and killed PNG8 (~9× bigger output, #451).
 - Meta-tiling is engine-agnostic and WMS-only; keep it enabled (it is the pan
