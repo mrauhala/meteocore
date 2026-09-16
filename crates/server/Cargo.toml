@@ -9,6 +9,7 @@ edition = "2021"
 icechunk = ["engine-zarr/icechunk"]
 
 [dependencies]
+ds-poll = { path = "../ds-poll" }
 toml = "1.1"
 ds-core = { path = "../core" }
 ds-wis2 = { path = "../ds-wis2" }
