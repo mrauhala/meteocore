@@ -414,7 +414,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | Engine | Traits | APIs |
 |--------|--------|------|
 | CAP | `FeatureEngine` + `MapEngine` | Features, WMS, Maps, Tiles (severity-shaded alert polygons) |
-| CSV | `EdrEngine` + `FeatureEngine` | EDR (locations only), Features |
+| CSV | `EdrEngine` + `FeatureEngine` | EDR (locations, area, radius), Features |
 | GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |

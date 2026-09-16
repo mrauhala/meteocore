@@ -2466,3 +2466,92 @@ fn startup_replay_caps_io_even_with_a_long_source_history() {
         "eight replay observations plus the published analysis, not forty serial reads"
     );
 }
+
+#[test]
+fn physical_cell_area_reaches_served_facts_and_bootstrap_uses_same_floor() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    struct Rows;
+    impl MapEngine for Rows {
+        fn raster_info(&self) -> RasterInfo {
+            let mut info = MockSource {
+                times: RwLock::new(vec![
+                    t0(),
+                    t0() + Duration::minutes(5),
+                    t0() + Duration::minutes(10),
+                ]),
+            }
+            .raster_info();
+            info.spatial_extent = Some([20.0, 56.0, 21.0, 72.0]);
+            info.grid_size = Some([128, 128]);
+            info
+        }
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _run: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            assert_eq!((width, height), (128, 128));
+            let mut data = vec![0; (width * height) as usize];
+            for row in [4, 123] {
+                for x in 40..50 {
+                    data[row * 128 + x] = ECHO_RAW;
+                }
+            }
+            data[123 * 128 + 90] = ECHO_RAW; // < 10 px but > 2.5 km²
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+    }
+    let engine = NowcastEngine::new("physical", "rows", Arc::new(Rows), &base_config()).unwrap();
+    engine.poll_once();
+    let features = engine
+        .get_features(&FeatureQuery::default())
+        .unwrap()
+        .features;
+    assert_eq!(features.len(), 3);
+    let mut areas = Vec::new();
+    for feature in features {
+        assert_eq!(
+            feature.properties["track_age"],
+            PropertyValue::Integer(3),
+            "bootstrap must retain the same small cell as live segmentation"
+        );
+        let PropertyValue::Float(area) = feature.properties["area_km2"] else {
+            panic!("missing area")
+        };
+        areas.push(area);
+        let severity = if area >= 50.0 { "moderate" } else { "weak" };
+        assert_eq!(
+            feature.properties["severity"],
+            PropertyValue::String(severity.into())
+        );
+    }
+    areas.sort_by(f64::total_cmp);
+    let expected = |row: f64, count: f64| {
+        count * engine_nowcast::KM_PER_DEG.powi(2) / 128.0
+            * (16.0 / 128.0)
+            * (72.0 - (row + 0.5) * 16.0 / 128.0).to_radians().cos()
+    };
+    for (actual, expected) in areas.into_iter().zip([
+        expected(123.0, 1.0),
+        expected(4.0, 10.0),
+        expected(123.0, 10.0),
+    ]) {
+        assert!((actual - expected).abs() < 0.051, "{actual} != {expected}");
+    }
+}
