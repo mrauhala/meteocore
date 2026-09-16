@@ -201,6 +201,7 @@ pub async fn conformance(
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
+        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/html",
     ];
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
@@ -219,7 +220,7 @@ pub async fn conformance(
 }
 
 /// OpenAPI `f` (output-format) query parameter, shared by the content-negotiated
-/// metadata endpoints (landing, conformance, collections, collection detail).
+/// metadata and feature endpoints.
 fn format_parameter() -> serde_json::Value {
     json!({"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
@@ -288,15 +289,17 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {"$ref": "#/components/parameters/limit"},
                     {"$ref": "#/components/parameters/offset"},
                     {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/sortby"}
+                    {"$ref": "#/components/parameters/sortby"},
+                    format_parameter()
                 ],
                 "responses": {
                     "200": {
-                        "description": "Features in GeoJSON format",
+                        "description": "Features in GeoJSON or HTML format",
                         "content": {
                             "application/geo+json": {
                                 "schema": {"$ref": "#/components/schemas/featureCollectionGeoJSON"}
-                            }
+                            },
+                            "text/html": {"schema": {"type": "string"}}
                         }
                     },
                     "400": {"description": "Bad request"},
@@ -338,17 +341,20 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "in": "path",
                         "required": true,
                         "schema": {"type": "string"}
-                    }
+                    },
+                    format_parameter()
                 ],
                 "responses": {
                     "200": {
-                        "description": "A single feature in GeoJSON format",
+                        "description": "A single feature in GeoJSON or HTML format",
                         "content": {
                             "application/geo+json": {
                                 "schema": {"$ref": "#/components/schemas/featureGeoJSON"}
-                            }
+                            },
+                            "text/html": {"schema": {"type": "string"}}
                         }
                     },
+                    "400": {"description": "Bad request"},
                     "404": {"description": "Feature not found"},
                     "500": {"description": "Server error"}
                 }
@@ -685,6 +691,11 @@ pub async fn collection(
             };
             let links = [
                 LinkView::new(
+                    format!("{base}/features/collections/{}/items?f=html", config.id),
+                    "items",
+                    Some("Browse features"),
+                ),
+                LinkView::new(
                     format!("{base}/features/collections/{}?f=json", config.id),
                     "alternate",
                     Some("JSON"),
@@ -707,7 +718,7 @@ pub async fn items(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
     let bad_request = |e: ds_core::error::DataServerError| {
         (
             StatusCode::BAD_REQUEST,
@@ -715,6 +726,7 @@ pub async fn items(
         )
     };
     let params = ItemsQueryParams::from_pairs(pairs).map_err(bad_request)?;
+    let wanted = negotiate(params.f.as_deref(), &headers)?;
     params
         .validate_filters(&engine.filterables())
         .map_err(bad_request)?;
@@ -811,18 +823,22 @@ pub async fn items(
         "",
         &request_base_url(&state, &headers),
     );
-    let etag = ds_core::http_cache::etag_of(
-        serde_json::to_string(&doc)
-            .expect("GeoJSON Value serializes")
-            .as_bytes(),
-    );
-    // Seconds precision with a `Z` suffix (2026-08-01T20:26:39Z) — sub-second
-    // precision is noise for a response-generation stamp, and `Z` matches the
-    // temporal-extent formatting elsewhere. Caching-neutral: the ETag above is
-    // computed with `timeStamp` blanked.
+    crate::html::representation_links(&mut doc, wanted);
+    let render = |doc: &serde_json::Value| match wanted {
+        ds_core::html::Wanted::Json => {
+            serde_json::to_string(doc).expect("GeoJSON Value serializes")
+        }
+        ds_core::html::Wanted::Html => {
+            crate::html::features_html(doc, &config.title, &id, &request_base_url(&state, &headers))
+        }
+    };
+    // Hash the selected representation with the volatile timestamp blanked.
+    let etag = ds_core::http_cache::etag_of(render(&doc).as_bytes());
     doc["timeStamp"] = json!(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-
-    let mut resp = GeoJsonResponse(doc).into_response();
+    let mut resp = match wanted {
+        ds_core::html::Wanted::Json => GeoJsonResponse(doc).into_response(),
+        ds_core::html::Wanted::Html => Html(render(&doc)).into_response(),
+    };
     resp.headers_mut().insert(
         header::ETAG,
         HeaderValue::from_str(&etag).expect("quoted-hex etag is a valid header value"),
@@ -831,17 +847,19 @@ pub async fn items(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),
     );
-    Ok(resp)
+    Ok(with_vary(resp))
 }
 
 pub async fn item(
     Path((id, feature_id)): Path<(String, String)>,
+    Query(fp): Query<ds_core::html::FormatParams>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
 
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let feature = engine.get_feature(&feature_id).map_err(|e| match &e {
         ds_core::error::DataServerError::FeatureNotFound(_) => (
             StatusCode::NOT_FOUND,
@@ -853,11 +871,15 @@ pub async fn item(
         ),
     })?;
 
-    Ok(GeoJsonResponse(feature_to_geojson(
-        &feature,
-        &id,
-        &request_base_url(&state, &headers),
-    )))
+    let base = request_base_url(&state, &headers);
+    let mut doc = feature_to_geojson(&feature, &id, &base);
+    crate::html::representation_links(&mut doc, wanted);
+    Ok(with_vary(match wanted {
+        ds_core::html::Wanted::Json => GeoJsonResponse(doc).into_response(),
+        ds_core::html::Wanted::Html => {
+            Html(crate::html::features_html(&doc, &config.title, &id, &base)).into_response()
+        }
+    }))
 }
 
 fn build_collection_metadata(

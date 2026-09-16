@@ -514,7 +514,6 @@ async fn sortby_is_declared_with_the_schema_the_standard_requires() {
 async fn property_filters_reject_unknown_and_unsupported_parameters() {
     for name in [
         "typo",
-        "f",
         "crs",
         "bbox-crs",
         "filter",

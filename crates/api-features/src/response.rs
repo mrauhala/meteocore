@@ -76,7 +76,7 @@ pub fn feature_to_geojson(feature: &Feature, collection_id: &str, base_url: &str
         "properties": properties,
         "links": [
             {
-                "href": format!("{base_url}/features/collections/{}/items/{}", collection_id, feature.id),
+                "href": format!("{base_url}/features/collections/{}/items/{}", collection_id, crate::html::path_segment(&feature.id)),
                 "rel": "self",
                 "type": "application/geo+json"
             },

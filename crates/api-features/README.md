@@ -21,8 +21,8 @@ Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Base route:
 |---|---|---|
 | Part 1 `core` | ✓ | landing, `/conformance`, `/collections`, `/collections/{id}`, `/items`, `/items/{featureId}`; optional Part 1 property equality filters implemented (#700) |
 | Part 1 `oas30` | ✓ | `/features/api` (hand-written `api_definition()`, validated against the bundled OpenAPI 3.0 meta-schema in tests), Swagger UI at `/features/api/docs` |
-| Part 1 `geojson` | ✓ | the only feature encoding |
-| Part 1 `html` | ✗ | metadata resources negotiate HTML (Common Part 2 `html` is declared), but `/items` and `/items/{featureId}` are GeoJSON only |
+| Part 1 `geojson` | ✓ | GeoJSON feature encoding (default) |
+| Part 1 `html` | ✓ | metadata, feature pages and individual features negotiate HTML; property tables, geometry details and a map using the preview’s vendored MapLibre assets |
 | Part 1 `gmlsf0` / `gmlsf2` | ✗ | no GML |
 | Part 2 CRS by reference (`crs`) | ✗ | CRS84 only; `crs` on `/items` returns 400; collections advertise `crs: [CRS84]` + `storageCrs` |
 | Part 3 Filtering / CQL2 (`filter`, `queryables`) | ✗ | `filter` controls return 400; no `/queryables` |
@@ -44,8 +44,8 @@ CRS84 only).
 | `/features/conformance` | ✓ | JSON + HTML |
 | `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
 | `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the collection also lists `tiles` in `apis` |
-| `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
-| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` with `self` + `collection` links |
+| `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
+| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
 
 Vector tiles: a collection with a `FeatureEngine` and `tiles` in its `apis`
@@ -64,7 +64,7 @@ tiles render the selected instant. Not part of this crate.
 | `limit` | ✓ | default 100, clamped to `[1, 1000]` (out-of-range values are clamped, not rejected) |
 | `offset` | ✓ | offset pagination (non-standard extension; Part 1 only mandates `next`) |
 | `sortby` | ✓ | Part 8 syntax `[+\|-]property,…`; a decoded `+` (space) is accepted as ascending; 400 unless every property is in `FeatureEngine::sortables`; applied before paging (`ds_core::feature::sort_features`) |
-| `f` | partial | negotiated (`json` / `html`) on every metadata resource; **400 on `/items`**; still silently ignored on `/items/{featureId}` (GeoJSON only) |
+| `f` | ✓ | `json` (GeoJSON for features) / `html` on metadata, `/items` and `/items/{featureId}`; overrides `Accept`; unsupported formats → 400. HTML pagination retains format, filters and sort |
 | `crs`, `bbox-crs` (on `/items`) | ✗ | 400; CRS84 only |
 | `filter`, `filter-lang`, `filter-crs` | ✗ | 400 (CQL2 is not implemented) |
 | `properties` | ✗ | 400; every property is always returned |
@@ -91,7 +91,9 @@ This does not declare Part 3 conformance or add `/queryables`.
 Example: `/features/collections/cap-meteoalarm-wis2/items?awareness_type=1%3B%20Wind&severity=Severe`.
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304
-(#499). `/items` hashes the ETag with `timeStamp` blanked, and a closed
+(#499). Both feature routes send `Vary: Accept`, explicit-format pagination and alternate
+links, and representation-specific ETags. `/items` hashes the selected
+representation with `timeStamp` blanked, and a closed
 `datetime` window entirely in the past gets the long cache policy.
 
 Error bodies are `{ "code", "description" }`; 500s never leak internals.
@@ -128,8 +130,7 @@ Pagination: every engine materializes the whole filtered set and slices it
 1. Reject or honour query parameters on `/items/{featureId}` (#681);
    `/items` now rejects unsupported/unknown names (#700). Honour or reject
    `datetime` on engines without a time dimension (#682).
-2. Declare Part 8 sorting + serve `/sortables` (#683); HTML for `/items`
-   and declare Part 1 `html` (#684).
+2. Declare Part 8 sorting + serve `/sortables` (#683).
 3. PostGIS events shape as Features items with keyset pagination (#503).
 4. `Geometry::LineString` for storm tracks (#408); polygon cells.
 5. Part 2 CRS (`crs`, `bbox-crs` on `/items`) — engines hold CRS84 only, so

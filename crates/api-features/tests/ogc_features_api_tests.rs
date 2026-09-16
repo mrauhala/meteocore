@@ -995,3 +995,132 @@ mod metadata_extras {
             .all(|l| l["rel"] != "license"));
     }
 }
+
+mod feature_html {
+    use super::*;
+
+    async fn request(uri: &str, accept: &str) -> (StatusCode, String, String) {
+        let resp = build_router()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("accept", accept)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp.headers()["content-type"].to_str().unwrap().to_owned();
+        let body = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        (status, ct, body)
+    }
+
+    #[tokio::test]
+    async fn feature_routes_negotiate_formats() {
+        for path in [
+            "/collections/cities/items",
+            "/collections/cities/items/helsinki",
+        ] {
+            for (suffix, accept, html) in [
+                ("", "*/*", false),
+                ("", "application/geo+json", false),
+                ("", "text/html", true),
+                ("?f=html", "application/geo+json", true),
+                ("?f=json", "text/html", false),
+                ("", "text/html;q=0", false),
+            ] {
+                let (status, ct, body) = request(&format!("{path}{suffix}"), accept).await;
+                assert_eq!(status, StatusCode::OK, "{path}{suffix}");
+                if html {
+                    assert!(ct.starts_with("text/html"));
+                    assert!(body.contains("<!DOCTYPE html>"));
+                    assert!(body.contains("<table>"));
+                    assert!(body.contains("Helsinki"));
+                    assert!(body.contains("maplibre-gl.js"));
+                    assert!(body.contains("?f=json"));
+                    assert!(body.contains("Geometry (Point)"));
+                } else {
+                    assert_eq!(ct, "application/geo+json");
+                    let doc: Value = serde_json::from_str(&body).unwrap();
+                    assert!(doc["links"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|l| l["rel"] == "alternate" && l["type"] == "text/html"));
+                }
+            }
+            assert_eq!(
+                request(&format!("{path}?f=xml"), "text/html").await.0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                request(&format!("{path}?f=json&f=html"), "text/html")
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            request("/collections/cities/items/missing?f=html", "text/html")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request("/collections/missing/items?f=html", "text/html")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn html_pagination_and_empty_results() {
+        let (_, _, html) = request(
+            "/collections/cities/items?f=html&limit=1&offset=1&bbox=20,50,30,70",
+            "*/*",
+        )
+        .await;
+        assert!(!html.contains("rel=\"next\""));
+        assert!(html.contains("rel=\"prev\""));
+        assert!(html.contains("offset=0&amp;limit=1&amp;bbox=20,50,30,70&amp;f=html"));
+        let (_, _, empty) = request("/collections/cities/items?f=html&bbox=0,0,1,1", "*/*").await;
+        assert!(empty.contains("No features match this query."));
+        assert!(!empty.contains("maplibre-gl.js"));
+        let (_, _, collection) = request("/collections/cities?f=html", "*/*").await;
+        assert!(collection.contains("/features/collections/cities/items?f=html"));
+    }
+
+    #[tokio::test]
+    async fn html_conformance_and_openapi_are_advertised() {
+        let (_, doc) = get("/conformance").await;
+        assert!(doc["conformsTo"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/html"));
+        let (_, api) = get("/api").await;
+        for path in [
+            "/features/collections/cities/items",
+            "/features/collections/cities/items/{featureId}",
+        ] {
+            let operation = &api["paths"][path]["get"];
+            assert!(operation["responses"]["200"]["content"]["text/html"].is_object());
+            assert!(operation["responses"]["200"]["content"]["application/geo+json"].is_object());
+            assert!(operation["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "f"));
+        }
+    }
+}

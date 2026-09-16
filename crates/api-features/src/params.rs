@@ -6,6 +6,7 @@ pub const MAX_LIMIT: usize = 1000;
 
 #[derive(Debug, Default)]
 pub struct ItemsQueryParams {
+    pub f: Option<String>,
     pub bbox: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -46,6 +47,7 @@ impl ItemsQueryParams {
                 )));
             }
             match name.as_str() {
+                "f" => params.f = Some(value),
                 "bbox" => params.bbox = Some(value),
                 "datetime" => params.datetime = Some(value),
                 "sortby" => params.sortby = Some(value),

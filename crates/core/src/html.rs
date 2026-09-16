@@ -152,10 +152,16 @@ padding:.05em .4em;margin:.1em .25em .1em 0;font-size:.8em;color:#334}\
 /// from `escape()`d pieces; a caller that interpolates raw user-derived text
 /// into `body` would introduce stored XSS.
 fn page(title: &str, body: &str) -> String {
+    page_with_head(title, "", body)
+}
+
+/// Page skeleton with additional head elements (for example a map stylesheet).
+/// `head` and `body` must already be HTML-escaped; only `title` is escaped here.
+pub fn page_with_head(title: &str, head: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-<title>{}</title>\n<style>{STYLE}</style>\n</head>\n<body>\n{body}</body>\n</html>\n",
+<title>{}</title>\n<style>{STYLE}</style>\n{head}</head>\n<body>\n{body}</body>\n</html>\n",
         escape(title)
     )
 }
