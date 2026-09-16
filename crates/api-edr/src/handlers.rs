@@ -22,7 +22,7 @@ use crate::params::{
     RadiusQueryParams, TrajectoryQueryParams, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
-use crate::response::{coverage_response_to_json, locations_to_json, LocationsContext};
+use crate::response::{coverage_response_to_json, locations_to_writer, LocationsContext};
 
 type HandlerError = (StatusCode, Json<serde_json::Value>);
 
@@ -1414,7 +1414,7 @@ pub async fn locations(
 
     let base_url = request_base_url(&state, &headers);
     let query_engine = engine.clone();
-    let (body, etag) = execute_query(false, move |_budget| {
+    let (body, etag) = execute_query(false, move |budget| {
         let server_error = || {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1434,7 +1434,23 @@ pub async fn locations(
         };
         // Keep construction, serialization and hashing under the same worker
         // permit as retrieval, even if the request times out or disconnects.
-        let body = locations_to_json(&locs, &ctx).map_err(|_| server_error())?;
+        let cancelled = || budget.expired();
+        let mut writer = crate::location_budget::Writer::new(&cancelled);
+        locations_to_writer(&locs, &ctx, &mut writer).map_err(|_| {
+            match writer.failure {
+                Some(crate::location_budget::Failure::Cancelled) => query_timeout(),
+                Some(crate::location_budget::Failure::Limit) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"code": "ResponseLimit", "description": "Complete location inventory exceeds the configured response limit"})),
+                ),
+                Some(crate::location_budget::Failure::Memory) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"code": "ServerBusy", "description": "Location response memory capacity exhausted; retry later"})),
+                ),
+                None => server_error(),
+            }
+        })?;
+        let body = writer.into_bytes();
         let etag = ds_core::http_cache::etag_of(&body);
         Ok((body, etag))
     })

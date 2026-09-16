@@ -377,6 +377,18 @@ pub fn locations_to_json(
     locations: &[Location],
     ctx: &LocationsContext,
 ) -> Result<Vec<u8>, serde_json::Error> {
+    let mut bytes = Vec::new();
+    locations_to_writer(locations, ctx, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Serialize into an admitted writer so size/deadline/memory failures stop
+/// construction before an unbounded response buffer has been allocated.
+pub(crate) fn locations_to_writer(
+    locations: &[Location],
+    ctx: &LocationsContext,
+    writer: impl std::io::Write,
+) -> Result<(), serde_json::Error> {
     let datetime = ctx
         .temporal_extent
         .as_ref()
@@ -386,20 +398,23 @@ pub fn locations_to_json(
         "{}/edr/collections/{}/locations",
         ctx.base_url, ctx.collection_id
     );
-    serde_json::to_vec(&LocationCollection {
-        features: LocationFeatures {
-            locations,
-            ctx,
-            datetime: &datetime,
+    serde_json::to_writer(
+        writer,
+        &LocationCollection {
+            features: LocationFeatures {
+                locations,
+                ctx,
+                datetime: &datetime,
+            },
+            links: [LocationLink {
+                href: &href,
+                rel: "self",
+                title: "Locations",
+                kind: "application/geo+json",
+            }],
+            kind: "FeatureCollection",
         },
-        links: [LocationLink {
-            href: &href,
-            rel: "self",
-            title: "Locations",
-            kind: "application/geo+json",
-        }],
-        kind: "FeatureCollection",
-    })
+    )
 }
 
 #[derive(serde::Serialize)]

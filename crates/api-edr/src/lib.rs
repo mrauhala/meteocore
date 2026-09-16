@@ -1,6 +1,7 @@
 pub mod caching;
 mod executor;
 pub mod handlers;
+mod location_budget;
 pub mod params;
 pub(crate) mod plot_convert;
 pub mod response;

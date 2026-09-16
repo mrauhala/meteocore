@@ -76,11 +76,15 @@ concurrency without claiming that synchronous engine I/O is preemptible.
 For `/locations`, the same permit covers retrieval, metadata, direct JSON
 serialization and ETag hashing (#533). The response still contains the full
 EDR 1.1 inventory, but no intermediate JSON tree duplicates every location and
-its parameter metadata. The final response bytes and the engine's location
-vector remain in memory; this is bounded concurrency, not constant total
-response memory or pagination.
-JSON object keys have a stable serialization order independent of dependency
-features; ETags may change once when upgrading from the previous serializer.
+its parameter metadata. Encoded location buffers are bounded by
+`MC_EDR_LOCATIONS_MAX_BYTES` (default 16 MiB per complete inventory) and `MC_EDR_LOCATIONS_MEMORY_MB` (default 128
+MiB process-wide). Memory reservations cover buffer growth, including the old
+and new allocations during copying, and remain with response bytes through
+middleware and client delivery. Exhaustion returns 503 without partial JSON or
+truncation; cancellation/deadlines stop serialization. Engine-owned inventory
+snapshots and the `get_locations()` result are separate from this encoded-buffer
+budget; retrieval remains under the bounded query executor. EDR 1.1's complete
+inventory contract remains unchanged: there is no implicit pagination.
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499).
 
