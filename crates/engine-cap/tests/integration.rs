@@ -703,3 +703,55 @@ fn filterable_names_follow_catalog_refresh() {
     assert!(eng.filterables().contains("new_producer_property"));
     assert!(!eng.filterables().contains("awareness_type"));
 }
+
+#[test]
+fn awareness_codes_select_three_types_across_capitalization_before_paging() {
+    let dir = tempfile::tempdir().unwrap();
+    let template = include_str!("fixtures/helsinki-flood.xml");
+    for (index, value) in [
+        "1; Wind",
+        "1; wind",
+        "3; Thunderstorm",
+        "3; thunderstorm",
+        "5; High-Temperature",
+        "5; high-temperature",
+        "4; Fog",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let xml = template
+            .replace("urn:test:helsinki-flood-1", &format!("awareness-{index}"))
+            .replace("12; Flooding", value);
+        std::fs::write(dir.path().join(format!("alert-{index}.xml")), xml).unwrap();
+    }
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "awareness").unwrap();
+    assert!(eng.filterables().contains("awareness_type_code"));
+    let mut query = FeatureQuery {
+        property_filters: vec![("awareness_type_code".into(), "1,3,5".into())],
+        limit: 100,
+        ..Default::default()
+    };
+    let page = eng.get_features(&query).unwrap();
+    assert_eq!(page.number_matched, 6);
+    for feature in &page.features {
+        assert!(matches!(
+            feature.properties["awareness_type_code"],
+            ds_core::feature::PropertyValue::Integer(1 | 3 | 5)
+        ));
+    }
+    query.limit = 2;
+    query.offset = 2;
+    let page = eng.get_features(&query).unwrap();
+    assert_eq!(page.number_matched, 6);
+    assert_eq!(page.number_returned, 2);
+    query
+        .property_filters
+        .push(("awareness_type_code".into(), "4".into()));
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, 0);
+    query.property_filters = vec![("awareness_type_code".into(), "3".into())];
+    query.offset = 0;
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, 2);
+    query.property_filters = vec![("awareness_type".into(), "3; Thunderstorm".into())];
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, 1);
+}
