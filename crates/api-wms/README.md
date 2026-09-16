@@ -292,8 +292,8 @@ Client
 ## Current Limitations
 
 - Single layer per request (no multi-layer composition)
-- No SLD/SE styling (no external style documents)
+- No external SLD/SE style documents; local SLD ColorMap palette import is supported
 - No GetFeatureInfo (use EDR position query instead)
-- Nearest-neighbor resampling only (no bilinear interpolation)
-- Only GeoTIFF collections can be exposed via WMS
+- Source sampling depends on the engine (including bilinear for GRIB/QueryData/Zarr); meta-tile assembly uses nearest-neighbor to preserve discrete palettes
+- Collections must implement `MapEngine` and enable `wms`; GeoTIFF, GRIB, ODIM, QueryData, Zarr, nowcast, CAP and PostGIS events are supported
 - JPEG output composites transparency onto white background (no alpha channel)

@@ -1687,17 +1687,17 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 ## Known Limitations
 
 - CSV/GeoJSON data loaded into memory at startup; GeoTIFF reads tiles on demand
-- CSV engine supports only the `locations` query type
+- CSV EDR supports `locations`, `area` and `radius`; arbitrary `position` queries are not supported. See the [EDR query-type matrix](crates/api-edr/README.md#per-engine-query-type-matrix).
 - GeoJSON engine implements `FeatureEngine` only (not EDR or WMS)
 - GeoTIFF engine implements `EdrEngine` + `MapEngine` only (not Features)
 - GeoTIFF: one band per collection; strip-based TIFFs not supported
-- WMS: single LAYERS only, no SLD/SE styling, no GetFeatureInfo
-- WMS/Maps/Tiles: nearest-neighbor resampling only
-- STAC: no retry logic, no HTTP caching (ETag/Last-Modified)
+- WMS: one `LAYERS` value per request; no external SLD/SE styling or GetFeatureInfo. Local SLD ColorMap palette import is supported.
+- Raster sampling is engine-specific: GRIB, QueryData and Zarr use bilinear sampling; GeoTIFF and nowcast use nearest-neighbor. WMS meta-tile assembly uses nearest-neighbor to preserve discrete palettes; there is no request-level resampling selector.
+- STAC metadata discovery retries transport failures and server errors up to three times with backoff; it does not use conditional HTTP caching (ETag/Last-Modified).
 - Tiles: WebMercatorQuad and WorldCRS84Quad only; fixed 256x256 raster tiles; MVT is supported via `?f=mvt` for `FeatureEngine`-backed collections
 - GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files. Wgrib2 hour-window accumulation/average fields use duration-qualified keys (e.g. `APCP_acc_6h`, `DSWRF_avg_6h`) at the window end; source units are preserved without division by duration. ECMWF JSON sidecars retain their existing naming and semantics.
-- QueryData: no compressed files, EDR position only, level 0 only; retains up to `max_runs` (default 4) most-recent files as model runs
-- Zarr: geographic (WGS84 lat/lon) grids only, EDR position only; forecast model-run selection pins the latest run (#337); STAC per-item-CRS and kerchunk modes not yet implemented
+- QueryData: uncompressed `.sqd` files only; EDR supports position, area and radius, but only level index 0 is exposed (no selectable vertical dimension). Retains up to `max_runs` (default 4) most-recent files as model runs.
+- Zarr: geographic (WGS84 lat/lon) grids only; EDR supports position, area and radius. Forecast stores expose runs as EDR instances and WMS `DIM_REFERENCE_TIME`, defaulting to the latest run. Native 0–360° longitude axes are not normalized; STAC per-item-CRS and kerchunk modes are not implemented.
 - Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only, new snapshots picked up on reload (not poll)
 - 3D Tiles: only `odim-volume` collections support `VolumeEngine`; voxel representation (`EXT_primitive_voxels`) requires CesiumJS ≥ 1.142 and is a CesiumGS draft extension (not in the Khronos registry); voxel octree/time-dynamic voxels are follow-ups; the 3D Tiles API has no `reference_time` parameter yet (model-run pinning; `datetime` selects valid time only)
 
