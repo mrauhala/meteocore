@@ -115,3 +115,22 @@ Related issues: #585 MULTIPOINT fan-out bound · #510 `f` aliases · #667
 antimeridian bboxes · #668 400-vs-404 on unsupported query types · #666
 shared parameter-name validation · #665 GRIB value rounding · #523 nowcast
 reflectivity via EDR · #673 shared area budget.
+
+GRIB wgrib2 accumulation and average fields use duration-qualified parameter
+names, for example `APCP_acc_6h`, `APCP_acc_3h` and `DSWRF_avg_6h`. The time axis
+is the **window end**, with the duration in the parameter label/name; the start
+is that valid time minus the duration. A source parameter filter such as
+`parameters = ["APCP"]` includes its available windows; clients query the
+advertised qualified keys. Missing windows at a step are null. Values use the
+source WMO unit and existing display conversion (precipitation kg/m² → mm);
+there is no implicit division by duration or conversion of energy into flux.
+ECMWF JSON naming remains unchanged.
+
+If a wgrib2 index repeats the same parameter/level/window at different offsets,
+the scan warns and queries select the first record. Duration-qualified names
+separate different windows; they cannot recover product distinctions omitted
+from the source sidecar, or prove that repeated records contain identical data.
+
+An area query without `parameter-name` prefers the existing near-surface
+instant/max/min products before newly supported acc/ave records. If only
+aggregates are configured, the first available aggregate is the default.

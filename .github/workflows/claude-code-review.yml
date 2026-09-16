@@ -1,5 +1,9 @@
 name: Claude Code Review
 
+# Jobs elevate only the permissions they need.
+permissions:
+  contents: read
+
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
@@ -27,24 +31,28 @@ jobs:
     #   a dependency bump is reviewed by the CI + audit gates regardless.
     if: >-
       github.event.pull_request.head.ref != 'release-pr/main' &&
-      github.event.pull_request.user.login != 'dependabot[bot]'
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
-      issues: write
-      id-token: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Full history so the action can diff the PR against the base branch.
           fetch-depth: 0
 
       - name: Run Claude Code Review
-        uses: anthropics/claude-code-action@v1
+        id: review
+        uses: anthropics/claude-code-action@7b0b255830a1fab6e602658672acad11c12d841d # v1
         with:
+          # A scoped workflow token avoids the App token service's default-
+          # branch workflow-identity check (which skips reviews of workflow PRs).
+          github_token: ${{ github.token }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # In agent mode `--allowedTools` is the WHOLE allowlist — the
           # action adds nothing to it — and a headless run denies every
@@ -68,5 +76,27 @@ jobs:
             A run that posts nothing is indistinguishable from a broken
             reviewer — never end without the top-level comment. Flag real
             issues only; do not nitpick style.
+            Include this marker in the top-level summary comment:
+            <!-- meteocore-review:${{ github.event.pull_request.head.sha }} -->
             REPO: ${{ github.repository }}
             PR_NUMBER: ${{ github.event.pull_request.number }}
+
+      - name: Verify review execution and summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
+            echo "::error::Claude did not produce an execution record; the review did not run."
+            exit 1
+          fi
+          marker="<!-- meteocore-review:${HEAD_SHA} -->"
+          count=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" |
+            jq -s --arg marker "$marker" '[.[][] | select(.user.type == "Bot" and (.body | contains($marker)))] | length')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Claude ran but did not post the required summary for this commit."
+            exit 1
+          fi

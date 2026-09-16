@@ -12,6 +12,8 @@ use chrono::{NaiveDate, NaiveTime};
 pub struct MessageEntry {
     /// Parameter short name (e.g., "2t", "msl").
     pub param: String,
+    /// Preserved source statistic/window (wgrib2); JSON sidecars do not carry it.
+    pub step_kind: crate::wgrib2_index::StepKind,
     /// Level type: "sfc" (surface), "hag" (height above ground),
     /// "pl" (pressure level), "sol" (soil), "ml" (model level), "iso" (isentropic).
     pub levtype: String,
@@ -69,6 +71,25 @@ impl MessageEntry {
     }
 }
 
+/// Sidecars can repeat a catalog key at distinct offsets (including GFS
+/// accumulation records). Report these without assuming their payloads are
+/// equivalent or inventing a scientific discriminator absent from the index.
+pub(crate) fn duplicate_message_keys(
+    messages: &[MessageEntry],
+) -> impl Iterator<Item = (&MessageEntry, &MessageEntry)> {
+    let mut first = HashMap::new();
+    messages.iter().filter_map(move |message| {
+        let key = (&message.param, &message.levtype, message.level);
+        match first.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(message);
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => Some((*entry.get(), message)),
+        }
+    })
+}
+
 /// One forecast step file with its message index.
 #[derive(Debug, Clone)]
 pub struct StepFile {
@@ -79,6 +100,24 @@ pub struct StepFile {
 }
 
 impl StepFile {
+    /// Preserve the existing surface default when newly supported acc/ave
+    /// records precede it in an index. An aggregate-only collection still
+    /// has a useful default, as does a collection containing only upper air.
+    pub fn default_message(&self) -> Option<&MessageEntry> {
+        self.messages
+            .iter()
+            .find(|m| {
+                m.is_near_surface()
+                    && !matches!(
+                        m.step_kind,
+                        crate::wgrib2_index::StepKind::Accumulation { .. }
+                            | crate::wgrib2_index::StepKind::Average { .. }
+                    )
+            })
+            .or_else(|| self.messages.iter().find(|m| m.is_near_surface()))
+            .or_else(|| self.messages.first())
+    }
+
     /// Find a message by parameter short name and optional level.
     /// For surface parameters, level should be None.
     pub fn find_message(&self, param: &str, level: Option<u32>) -> Option<&MessageEntry> {
@@ -150,12 +189,15 @@ impl ForecastRun {
 pub struct Catalog {
     /// Forecast runs keyed by reference time (most recent last).
     pub runs: BTreeMap<DateTime<Utc>, ForecastRun>,
+    /// Latest-run parameter union, rebuilt on the poll path before publication.
+    parameters: Vec<(String, String, Option<u32>)>,
 }
 
 impl Catalog {
     pub fn new() -> Self {
         Self {
             runs: BTreeMap::new(),
+            parameters: Vec::new(),
         }
     }
 
@@ -197,53 +239,48 @@ impl Catalog {
         Some((times[0], *times.last().unwrap()))
     }
 
-    /// All unique surface parameter names from the latest run.
+    /// Parameters are unioned across the run: f000 commonly lacks aggregates.
     pub fn surface_params(&self) -> Vec<String> {
-        let Some(run) = self.latest_run() else {
-            return Vec::new();
-        };
-        // Use the first available step to get parameter list
-        let Some(step) = run.steps.values().next() else {
-            return Vec::new();
-        };
         let mut seen = std::collections::HashSet::new();
-        let mut params = Vec::new();
-        for m in &step.messages {
-            if m.is_near_surface() && seen.insert(m.param.clone()) {
-                params.push(m.param.clone());
-            }
-        }
-        params
+        self.all_params_with_levels()
+            .into_iter()
+            .filter(|(_, levtype, level)| {
+                levtype == "sfc" || (levtype == "hag" && level.is_some_and(|l| l <= 100))
+            })
+            .map(|(param, _, _)| param)
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
     }
 
-    /// All unique parameter names (all level types) from the latest run.
     pub fn all_params(&self) -> Vec<String> {
-        let Some(run) = self.latest_run() else {
-            return Vec::new();
-        };
-        let Some(step) = run.steps.values().next() else {
-            return Vec::new();
-        };
-        step.param_names()
+        let mut seen = std::collections::HashSet::new();
+        self.all_params_with_levels()
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
     }
 
-    /// All unique parameters with level info: (param, levtype, level).
+    /// All unique parameters with level info from every step in the latest run.
     pub fn all_params_with_levels(&self) -> Vec<(String, String, Option<u32>)> {
-        let Some(run) = self.latest_run() else {
-            return Vec::new();
+        self.parameters.clone()
+    }
+
+    /// Call after modifying runs, before publishing the immutable snapshot.
+    /// Request-time metadata must not scan hundreds of forecast steps.
+    pub fn refresh_parameters(&mut self) {
+        self.parameters.clear();
+        let Some(run) = self.runs.values().next_back() else {
+            return;
         };
-        let Some(step) = run.steps.values().next() else {
-            return Vec::new();
-        };
-        let mut result: Vec<(String, String, Option<u32>)> = Vec::new();
         let mut seen = HashMap::new();
-        for m in &step.messages {
+        for m in run.steps.values().flat_map(|sf| &sf.messages) {
             let key = (&m.param, &m.levtype, m.level);
             if seen.insert(key, ()).is_none() {
-                result.push((m.param.clone(), m.levtype.clone(), m.level));
+                self.parameters
+                    .push((m.param.clone(), m.levtype.clone(), m.level));
             }
         }
-        result
     }
 
     /// Apply max_runs eviction: keep only the N most recent runs.
@@ -277,6 +314,7 @@ mod tests {
     #[test]
     fn is_near_surface_cases() {
         let sfc = MessageEntry {
+            step_kind: crate::wgrib2_index::StepKind::Instant,
             param: "msl".into(),
             levtype: "sfc".into(),
             level: None,

@@ -41,6 +41,7 @@ updates:
           - minor
           - patch
 
+  # Keep immutable action SHA pins current; version comments remain human-readable.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

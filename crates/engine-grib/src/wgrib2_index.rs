@@ -17,17 +17,49 @@ use chrono::{DateTime, TimeZone, Utc};
 /// corrupted index or overflowing offsets, so we reject the whole file.
 const MAX_MESSAGE_LEN: u64 = 1 << 30; // 1 GiB
 
-/// Forecast step kind. v1 distinguishes instantaneous values from max/min
-/// aggregates (coerced to the window end) and drops accumulation and average
-/// aggregates entirely.
+/// Forecast statistic and its source window in hours after reference time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
     /// Instantaneous forecast at `nominal_step` hours.
     Instant,
+    Accumulation {
+        start: u32,
+        end: u32,
+    },
+    Average {
+        start: u32,
+        end: u32,
+    },
     /// Maximum over the window [start, end]; we coerce to nominal_step = end.
-    MaxOverWindow { start: u32, end: u32 },
+    MaxOverWindow {
+        start: u32,
+        end: u32,
+    },
     /// Minimum over the window; we coerce to nominal_step = end.
-    MinOverWindow { start: u32, end: u32 },
+    MinOverWindow {
+        start: u32,
+        end: u32,
+    },
+}
+
+impl StepKind {
+    /// Stable identifiers distinguish aggregates of different duration and
+    /// statistic at the same valid time. Existing max/min names stay compatible.
+    pub fn parameter_name(self, name: &str) -> String {
+        match self {
+            Self::Accumulation { start, end } => format!("{name}_acc_{}h", end - start),
+            Self::Average { start, end } => format!("{name}_avg_{}h", end - start),
+            _ => name.to_owned(),
+        }
+    }
+
+    pub fn qualifier(self) -> Option<String> {
+        match self {
+            Self::Accumulation { start, end } => Some(format!("{} h accumulation", end - start)),
+            Self::Average { start, end } => Some(format!("{} h average", end - start)),
+            _ => None,
+        }
+    }
 }
 
 /// One parsed message. Length is `None` for the last record in a file
@@ -186,7 +218,7 @@ pub fn parse_wgrib2_ref_time(token: &str) -> Option<DateTime<Utc>> {
 /// Parse a wgrib2 time descriptor.
 ///
 /// Returns `Some((nominal_step_hours, StepKind))` for instantaneous and
-/// max/min fields; `None` for `acc`, `ave`, and anything else we skip in v1.
+/// supported hour-window statistics; `None` for unsupported descriptors.
 pub fn parse_wgrib2_step(desc: &str) -> Option<(u32, StepKind)> {
     let lower = desc.trim().to_ascii_lowercase();
 
@@ -213,9 +245,23 @@ pub fn parse_wgrib2_step(desc: &str) -> Option<(u32, StepKind)> {
         return Some((n, StepKind::MinOverWindow { start: m, end: n }));
     }
 
-    // Dropped in v1: accumulations and averages.
-    if lower.ends_with(" hour acc fcst") || lower.ends_with(" hour ave fcst") {
-        return None;
+    for (suffix, average) in [(" hour acc fcst", false), (" hour ave fcst", true)] {
+        if let Some(rest) = lower.strip_suffix(suffix) {
+            let (start, end) = rest.split_once('-')?;
+            let start: u32 = start.trim().parse().ok()?;
+            let end: u32 = end.trim().parse().ok()?;
+            if start >= end {
+                return None;
+            }
+            return Some((
+                end,
+                if average {
+                    StepKind::Average { start, end }
+                } else {
+                    StepKind::Accumulation { start, end }
+                },
+            ));
+        }
     }
 
     // "{N} hour fcst"
@@ -661,14 +707,23 @@ mod tests {
     }
 
     #[test]
-    fn step_acc_dropped() {
-        assert_eq!(parse_wgrib2_step("0-6 hour acc fcst"), None);
-        assert_eq!(parse_wgrib2_step("6-12 hour acc fcst"), None);
+    fn step_acc_preserves_window() {
+        assert_eq!(
+            parse_wgrib2_step("0-6 hour acc fcst"),
+            Some((6, StepKind::Accumulation { start: 0, end: 6 }))
+        );
+        assert_eq!(
+            parse_wgrib2_step("6-12 hour acc fcst"),
+            Some((12, StepKind::Accumulation { start: 6, end: 12 }))
+        );
     }
 
     #[test]
-    fn step_ave_dropped() {
-        assert_eq!(parse_wgrib2_step("0-6 hour ave fcst"), None);
+    fn step_ave_preserves_window() {
+        assert_eq!(
+            parse_wgrib2_step("0-6 hour ave fcst"),
+            Some((6, StepKind::Average { start: 0, end: 6 }))
+        );
     }
 
     #[test]
@@ -744,25 +799,15 @@ mod tests {
     // ---------- Aggregate mixing ----------
 
     #[test]
-    fn aggregate_records_are_dropped() {
-        // APCP accumulation is dropped; instantaneous TMP is kept.
-        let input = "\
-1:0:d=2026040800:TMP:2 m above ground:6 hour fcst:
-2:1000:d=2026040800:APCP:surface:0-6 hour acc fcst:
-3:2000:d=2026040800:TMP:2 m above ground:12 hour fcst:
-";
-        let result = parse_wgrib2(input).expect("should parse");
-        // APCP gone; TMP records survive.
-        assert_eq!(result.messages.len(), 2);
-        for m in &result.messages {
-            assert_eq!(m.short_name, "TMP");
-        }
-        // Because APCP was dropped, the first TMP sees the next surviving
-        // record (at offset 2000), so its length is 2000.
-        assert_eq!(result.messages[0].offset, 0);
-        assert_eq!(result.messages[0].length, Some(2000));
-        assert_eq!(result.messages[1].offset, 2000);
-        assert_eq!(result.messages[1].length, None);
+    fn aggregate_records_preserve_individual_byte_ranges() {
+        let result = parse_wgrib2("1:0:d=2026040800:TMP:2 m above ground:6 hour fcst:\n2:1000:d=2026040800:APCP:surface:0-6 hour acc fcst:\n3:2000:d=2026040800:DSWRF:surface:0-6 hour ave fcst:\n").unwrap();
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.messages[0].length, Some(1000));
+        assert_eq!(result.messages[1].short_name, "APCP");
+        assert_eq!(result.messages[1].length, Some(1000));
+        assert_eq!(result.messages[2].length, None);
+        assert_eq!(parse_wgrib2_step("6-0 hour acc fcst"), None);
+        assert_eq!(parse_wgrib2_step("6-6 hour ave fcst"), None);
     }
 
     #[test]
