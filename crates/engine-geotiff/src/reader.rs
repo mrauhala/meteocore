@@ -2186,19 +2186,16 @@ fn read_bbox_tiles(
             remote_chunk_layout(tile_info, metadata.samples_per_pixel, chunk as usize)?;
         // With batching disabled, keep the original worker-time lookup:
         // another queued render may populate the cache before this job runs.
-        let hit = if batch_limit > 1 {
-            cache.and_then(|c| c.get(file_path, chunk, ifd_index))
-        } else {
-            None
-        };
-        if hit.is_some() || count == 0 {
+        // Speculation must neither count a second hit/miss nor retain Bytes
+        // across queueing (an evicted entry would then outlive its budget).
+        let hit = batch_limit > 1
+            && cache.is_some_and(|c| c.contains_untracked(file_path, chunk, ifd_index));
+        if hit || count == 0 {
             jobs.push(Job::Single(i));
         } else {
             misses.push((i, offset..offset + count));
         }
         chunks.push(chunk);
-        // Drop the planning lookup here. Retaining Bytes until worker admission
-        // could pin entries after LRU eviction without a decode reservation.
         // The worker rechecks; a hit evicted meanwhile becomes a single read.
     }
     for batch in crate::range_batch::plan(misses, batch_limit) {
@@ -3576,6 +3573,11 @@ mod tests {
         ranges.sort_by_key(|r| r.start);
         assert_eq!(ranges, [0..64, 136..268]);
         assert_eq!(
+            cache.stats(),
+            (1, 3),
+            "planning does not double-count lookups"
+        );
+        assert_eq!(
             cache.weight(),
             4 * (64 + 32),
             "cache charges only individually owned tile bytes"
@@ -3595,6 +3597,7 @@ mod tests {
         )
         .unwrap();
         assert!(calls.lock().unwrap().is_empty(), "warm hits never fetch");
+        assert_eq!(cache.stats(), (5, 3), "one hit per warm tile");
         read_bbox_tiles(
             &coords,
             &info,
