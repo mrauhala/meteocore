@@ -49,14 +49,14 @@ use ds_core::significance::WeightedScorer;
 
 use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{
-    advance_tracks_coasting, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
+    advance_tracks_coasting, apply_lightning, CellTrack, CELL_MIN_AREA_KM2, CELL_THRESHOLD_DBZ,
 };
 use crate::impact::ImpactIndex;
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
 use crate::motion_grid::{
     self, param_spec, GridSpec, PARAM_QUALITY, PARAM_SPECS, PARAM_U, PARAM_V,
 };
-use crate::objects::{segment_cells_labeled, PixelScale};
+use crate::objects::{segment_cells_physical, PixelScale};
 use crate::tendency::EFOLD_INTERVALS;
 use crate::Grid;
 
@@ -64,10 +64,9 @@ use crate::Grid;
 /// matches the cell-tracker gate in `ds_core::cells`.
 const MAX_SPEED_MS: f64 = 40.0;
 /// Target search radius (px) on the motion-estimation grid; frames are
-/// coarsened until the physical search window fits. 48 keeps the FMI
-/// composite's ~500 m working grid uncoarsened (~16 km motion blocks
-/// instead of ~25 km — small convective cells get a closer-fitting
-/// vector), affordable since #529 made generation cost linear in leads.
+/// coarsened until the physical search window fits. 48 preserves typical
+/// kilometre-scale working grids; actual resolution depends on the source
+/// extent and pixel budget, not a fixed 500 m assumption.
 const TARGET_SEARCH_PX: i32 = 48;
 /// Temporal EMA weights for blending each generation's motion field with
 /// the previous one (#524): the new field keeps this share, per block.
@@ -922,17 +921,13 @@ impl NowcastEngine {
 
         // Cell tracking (#544) — now inside generate() so the growth/decay
         // measurement (#546 iteration 1) can condition on per-cell classes.
-        let (blobs, labels) =
-            segment_cells_labeled(analysis_f32, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX);
-        let (kx, ky) = crate::lonlat_grid_km_per_px(
+        let scale = PixelScale::lonlat(
             [geom.west, geom.south, geom.east, geom.north],
             geom.width,
             geom.height,
         );
-        let scale = PixelScale {
-            x: kx as f32,
-            y: ky as f32,
-        };
+        let (blobs, labels) =
+            segment_cells_physical(analysis_f32, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_KM2, scale);
         let prev_state = self.state.load();
         let prev_latest = prev_state.generations.iter().next_back();
         // On first generation reconstruct association history without producing
@@ -1000,8 +995,7 @@ impl NowcastEngine {
                 .iter()
                 .map(|t| {
                     let (x, y) = t.blob.centroid;
-                    let rx = crate::cells2d::LIGHTNING_JOIN_RADIUS_KM / scale.x;
-                    let ry = crate::cells2d::LIGHTNING_JOIN_RADIUS_KM / scale.y;
+                    let (rx, ry) = scale.radius_pixels(y, crate::cells2d::LIGHTNING_JOIN_RADIUS_KM);
                     [x - rx, y - ry, x + rx, y + ry]
                 })
                 .collect();
@@ -1248,7 +1242,8 @@ impl NowcastEngine {
                 }
             };
             let grid = frame_to_grid(&frame, geom.width as usize, geom.height as usize);
-            let (blobs, _) = segment_cells_labeled(&grid, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX);
+            let (blobs, _) =
+                segment_cells_physical(&grid, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_KM2, scale);
             let dt = (time - at).num_seconds().max(1) as f32;
             let (next, next_coasts, _) = advance_tracks_coasting(
                 &tracks,
@@ -1625,8 +1620,7 @@ fn score_cells(
     impact: Option<&ImpactIndex>,
     radar_sites: Option<&[ds_core::radar_sites::RadarSiteInfo]>,
 ) -> Vec<ScoredCell> {
-    let (kx, ky) =
-        crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
+    let scale = PixelScale::lonlat([g.west, g.south, g.east, g.north], g.width, g.height);
     let mut facts: Vec<CellFactSheet> = cells
         .iter()
         .map(|t| {
@@ -1646,13 +1640,13 @@ fn score_cells(
             let radar_facts =
                 radar_sites.and_then(|sites| crate::radar::radar_facts(lon, lat, sites));
 
-            // 5 decimals ≈ 1 m — the working grid is ~500 m, so raw f64s
+            // 5 decimals ≈ 1 m — far finer than the source-dependent working grid; raw f64s
             // would roughly double the payload to carry pure noise.
             let lon = round_to(lon, 5);
             let lat = round_to(lat, 5);
             // Bound once: the fact sheet reports it and flash density
             // divides by it, and the two must be the same number.
-            let area_km2 = round_to(t.blob.area as f64 * kx * ky, 1);
+            let area_km2 = round_to(t.blob.area_km2(scale), 1);
             CellFactSheet {
                 id: t.id,
                 observed: anchor,
@@ -1833,7 +1827,7 @@ fn cell_filterables(
 fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, Feature) {
     let t = &cell.facts;
     // Values were rounded to their MEANINGFUL precision when the fact sheet
-    // was built (the working grid is ~500 m, so 5 lon/lat decimals ≈ 1 m;
+    // was built (5 lon/lat decimals ≈ 1 m, finer than the working grid;
     // raw f64s roughly double the GeoJSON payload to carry noise).
     let (lon, lat) = (t.lon, t.lat);
     let mut props = std::collections::HashMap::new();

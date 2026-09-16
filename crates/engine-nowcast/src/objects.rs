@@ -22,11 +22,21 @@ pub struct CellBlob {
     pub centroid: (f32, f32),
     /// Pixel count.
     pub area: usize,
+    /// Sum of member-pixel areas for physical segmentation; absent in pixel-only harnesses.
+    pub physical_area_km2: Option<f64>,
     /// Sum of (value − threshold) over member pixels — the "volume rain
     /// rate" proxy used for growth/decay classification and ranking.
     pub volume: f32,
     /// Maximum value inside the cell.
     pub max_value: f32,
+}
+
+impl CellBlob {
+    /// Physical area, or the centroid-scale estimate for pixel-only callers.
+    pub fn area_km2(&self, scale: PixelScale) -> f64 {
+        self.physical_area_km2
+            .unwrap_or_else(|| self.area as f64 * scale.pixel_area(self.centroid.1))
+    }
 }
 
 /// Segment `grid` into cells: 8-connected components of pixels with
@@ -44,7 +54,31 @@ pub fn segment_cells_labeled(
     threshold: f32,
     min_area: usize,
 ) -> (Vec<CellBlob>, Vec<u32>) {
+    segment_cells_impl(grid, threshold, min_area as f64, None)
+}
+
+/// Segment using the summed physical area of the component, in km².
+/// Row areas are precomputed once; segmentation performs no per-pixel trig.
+/// Labels have the same compact, 1-based contract as `segment_cells_labeled`.
+pub fn segment_cells_physical(
+    grid: &Grid,
+    threshold: f32,
+    min_area_km2: f64,
+    scale: PixelScale,
+) -> (Vec<CellBlob>, Vec<u32>) {
+    segment_cells_impl(grid, threshold, min_area_km2, Some(scale))
+}
+
+fn segment_cells_impl(
+    grid: &Grid,
+    threshold: f32,
+    min_area: f64,
+    scale: Option<PixelScale>,
+) -> (Vec<CellBlob>, Vec<u32>) {
     let (w, h) = (grid.width, grid.height);
+    let row_area: Vec<f64> = (0..h)
+        .map(|y| scale.map_or(1.0, |s| s.pixel_area(y as f32 + 0.5)))
+        .collect();
     let mut labels = vec![0u32; w * h];
     let mut cells: Vec<CellBlob> = Vec::new();
     let mut retained: Vec<u32> = Vec::new();
@@ -60,6 +94,7 @@ pub fn segment_cells_labeled(
         labels[start] = next_label;
         stack.push(start);
         let (mut area, mut volume, mut max_value) = (0usize, 0f32, f32::MIN);
+        let mut physical_area = 0.0;
         let (mut wx, mut wy, mut wsum) = (0f64, 0f64, 0f64);
 
         while let Some(i) = stack.pop() {
@@ -68,6 +103,7 @@ pub fn segment_cells_labeled(
             volume += val - threshold;
             max_value = max_value.max(val);
             let (x, y) = (i % w, i / w);
+            physical_area += row_area[y];
             // Weight the centroid by exceedance so the core dominates.
             let wgt = (val - threshold).max(0.0) as f64 + 1e-6;
             wx += (x as f64 + 0.5) * wgt;
@@ -90,10 +126,11 @@ pub fn segment_cells_labeled(
             }
         }
 
-        if area >= min_area {
+        if physical_area >= min_area {
             cells.push(CellBlob {
                 centroid: ((wx / wsum) as f32, (wy / wsum) as f32),
                 area,
+                physical_area_km2: scale.map(|_| physical_area),
                 volume,
                 max_value,
             });
@@ -111,31 +148,70 @@ pub fn segment_cells_labeled(
     (cells, labels)
 }
 
-/// Per-axis pixel scale for distance computations. A regular lat/lon grid
-/// is anisotropic away from the equator: the east–west span carries a
-/// `cos(lat)` factor the north–south span does not (at 65°N the y-axis
-/// covers ~2.4× more km per pixel than the x-axis). Distances and gates are
-/// computed in the scale's unit — km for a real grid, or pass `UNIT` to work
-/// in raw pixels (tests, isotropic grids).
+/// Local ground scale for a regular grid. Geographic grids use the latitude
+/// of the row; uniform grids (including verification fixtures) retain fixed units.
 #[derive(Debug, Clone, Copy)]
 pub struct PixelScale {
-    pub x: f32,
+    equatorial_x: f64,
     pub y: f32,
+    latitude: Option<(f64, f64)>, // north edge, degrees per row
 }
 
 impl PixelScale {
-    /// Identity scale: distances and gates are in pixels.
-    pub const UNIT: PixelScale = PixelScale { x: 1.0, y: 1.0 };
+    pub const UNIT: Self = Self::uniform(1.0, 1.0);
 
-    #[inline]
-    /// Anisotropy-aware distance between two pixel coordinates, in the
-    /// scale's unit. `pub(crate)` so the tracker measures path length the
-    /// same way matching measures gates — a second hand-rolled copy is how
-    /// this kind of thing drifts.
-    pub(crate) fn distance(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
-        let dx = (a.0 - b.0) * self.x;
-        let dy = (a.1 - b.1) * self.y;
-        (dx * dx + dy * dy).sqrt()
+    pub const fn uniform(x: f32, y: f32) -> Self {
+        Self {
+            equatorial_x: x as f64,
+            y,
+            latitude: None,
+        }
+    }
+
+    /// `extent = [west, south, east, north]`, with rows increasing southward.
+    pub fn lonlat(extent: [f64; 4], width: u32, height: u32) -> Self {
+        let dy = (extent[3] - extent[1]) / f64::from(height.max(1));
+        Self {
+            equatorial_x: (extent[2] - extent[0]) * crate::KM_PER_DEG / f64::from(width.max(1)),
+            y: (dy * crate::KM_PER_DEG) as f32,
+            latitude: Some((extent[3], dy)),
+        }
+    }
+
+    pub fn x_at(self, row: f32) -> f32 {
+        let cos = self.latitude.map_or(1.0, |(north, dy)| {
+            (north - f64::from(row) * dy)
+                .clamp(-90.0, 90.0)
+                .to_radians()
+                .cos()
+                .max(1e-6)
+        });
+        (self.equatorial_x * cos) as f32
+    }
+
+    pub fn pixel_area(self, row: f32) -> f64 {
+        f64::from(self.x_at(row)) * f64::from(self.y)
+    }
+
+    /// Signed local displacement from a to b, in grid axes (east, south).
+    /// Evaluating longitude scale halfway between the rows makes it symmetric.
+    pub(crate) fn delta(self, a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+        (
+            (b.0 - a.0) * self.x_at((a.1 + b.1) * 0.5),
+            (b.1 - a.1) * self.y,
+        )
+    }
+
+    pub(crate) fn distance(self, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let (dx, dy) = self.delta(a, b);
+        dx.hypot(dy)
+    }
+
+    /// Conservative pixel rectangle around the latitude-dependent distance gate.
+    pub(crate) fn radius_pixels(self, row: f32, radius: f32) -> (f32, f32) {
+        let ry = radius / self.y;
+        let min_x = self.x_at(row - ry).min(self.x_at(row + ry));
+        (radius / min_x, ry)
     }
 }
 
@@ -200,7 +276,9 @@ impl MatchCost {
         if d > self.gate {
             return None;
         }
-        let area_ratio = (b.area.max(1) as f32 / a.area.max(1) as f32).ln().abs();
+        let area_ratio = (b.area_km2(scale).max(f64::EPSILON) / a.area_km2(scale).max(f64::EPSILON))
+            .ln()
+            .abs() as f32;
         let ddb = (b.max_value - a.max_value).abs();
         Some(d + self.area_per_efold * area_ratio + self.per_db * ddb)
     }
@@ -471,6 +549,66 @@ mod tests {
     }
 
     #[test]
+    fn physical_floor_is_independent_of_resolution_and_labels_stay_compact() {
+        for (pixels, resolution) in [(1, 2.0), (4, 1.0), (16, 0.5)] {
+            let scale = PixelScale::uniform(resolution, resolution);
+            let grid = Grid::new(pixels, 1, vec![40.0; pixels]);
+            let (cells, labels) = segment_cells_physical(&grid, 35.0, 2.5, scale);
+            assert_eq!(cells.len(), 1);
+            assert!((cells[0].area_km2(scale) - 4.0).abs() < 1e-6);
+            assert!(labels.iter().all(|&v| v == 1));
+            assert!(segment_cells_physical(&grid, 35.0, 4.1, scale).0.is_empty());
+        }
+        // Equal pixel counts at opposite ends of the Nordic grid have different
+        // areas. The discarded northern component must not leave a label hole.
+        let scale = PixelScale::lonlat([6.7, 56.0, 43.0, 72.0], 1240, 1829);
+        let mut grid = Grid::filled_nodata(1240, 1829);
+        for x in 1..3 {
+            grid.data[x] = 40.0;
+            grid.data[1828 * 1240 + x] = 40.0;
+        }
+        let (cells, labels) = segment_cells_physical(&grid, 35.0, 2.5, scale);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(labels[1], 0);
+        assert_eq!(labels[1828 * 1240 + 1], 1);
+        assert!(cells[0].centroid.1 > 1828.0);
+    }
+
+    #[test]
+    fn physical_area_sums_rows_instead_of_using_intensity_centroid() {
+        let scale = PixelScale::lonlat([20.0, 56.0, 21.0, 72.0], 1, 2);
+        let grid = Grid::new(1, 2, vec![60.0, 35.0]);
+        let (cells, _) = segment_cells_physical(&grid, 35.0, 0.0, scale);
+        let expected =
+            crate::KM_PER_DEG.powi(2) * 8.0 * (68f64.to_radians().cos() + 60f64.to_radians().cos());
+        assert!((cells[0].area_km2(scale) / expected - 1.0).abs() < 1e-6);
+        assert!(
+            (cells[0].area_km2(scale) / (2.0 * scale.pixel_area(cells[0].centroid.1)) - 1.0).abs()
+                > 0.1
+        );
+    }
+
+    #[test]
+    fn row_distances_agree_with_great_circle_and_are_symmetric() {
+        let extent = [6.7, 56.0, 43.0, 72.0];
+        let scale = PixelScale::lonlat(extent, 1240, 1829);
+        for row in [0.5, 914.5, 1828.5] {
+            let lat = 72.0 - f64::from(row) / 1829.0 * 16.0;
+            let expected =
+                ds_core::geo::great_circle_distance_m(20.0, lat, 20.0 + 10.0 * 36.3 / 1240.0, lat)
+                    / 1000.0;
+            let a = (400.0, row);
+            let b = (410.0, row);
+            let actual = f64::from(scale.distance(a, b));
+            assert!((actual / expected - 1.0).abs() < 0.002);
+            assert_eq!(scale.distance(a, b), scale.distance(b, a));
+            let (rx, ry) = scale.radius_pixels(row, 5.0);
+            assert!(rx * scale.x_at(row) >= 5.0 - 1e-5);
+            assert!((ry * scale.y - 5.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
     fn segments_distinct_cells_with_centroids_and_min_area() {
         let g = grid_with_discs(
             200,
@@ -558,7 +696,7 @@ mod tests {
         let b = grid_with_discs(100, 100, &[(50.0, 50.0, 6.0, 45.0)]);
         let ca = segment_cells(&a, 35.0, 5);
         let cb = segment_cells(&b, 35.0, 5);
-        let scale = PixelScale { x: 1.0, y: 2.0 };
+        let scale = PixelScale::uniform(1.0, 2.0);
         assert_eq!(match_cells(&ca, &cb, scale, 25.0).len(), 1);
         assert_eq!(match_cells(&ca, &cb, scale, 15.0).len(), 0);
         assert_eq!(match_cells(&ca, &cb, PixelScale::UNIT, 15.0).len(), 1);
@@ -654,6 +792,7 @@ mod tests {
         let mk = |x: f32, area: usize, max: f32| CellBlob {
             centroid: (x, 0.0),
             area,
+            physical_area_km2: None,
             volume: area as f32 * 8.0,
             max_value: max,
         };
@@ -679,12 +818,14 @@ mod tests {
         let a = CellBlob {
             centroid: (0.0, 0.0),
             area: 20,
+            physical_area_km2: None,
             volume: 160.0,
             max_value: 42.0,
         };
         let b = CellBlob {
             centroid: (0.0, 0.0),
             area: 40,
+            physical_area_km2: None,
             volume: 400.0,
             max_value: 52.0,
         };

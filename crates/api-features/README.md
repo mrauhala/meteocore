@@ -151,3 +151,8 @@ coverage of the labeled footprint and attribution radius. With a source wired,
 `lightning_coverage` is `true`, `false`, or `null` (unknown); flash fields are null
 outside/unknown coverage and on failed or capped joins. An advertised source
 extent alone does not establish coverage.
+
+Nowcast cells have a 2.5 km² minimum footprint, summed at each pixel row's
+latitude. `area_km2`, severity and flash density use that physical area;
+tracking distances and speeds use local latitude. Working resolution depends
+on the source and configured pixel budget.

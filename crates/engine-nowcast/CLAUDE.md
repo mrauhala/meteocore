@@ -45,7 +45,7 @@ reason `MapEngine::resolve_reference_time` exists (#521).
   (4 B/px — the FMI S3 COG path lands here until #475-style typed paths).
 - Motion is estimated on a coarsened grid sized so the physical search
   window (40 m/s × source interval) fits `TARGET_SEARCH_PX` (48 — keeps
-  the FMI 500 m grid uncoarsened), then the field is scaled back —
+  typical kilometre-scale working grids uncoarsened), then the field is scaled back —
   deliberate scale handling; do NOT rely on the pixel budget to do this
   implicitly.
 - **Motion stabilization (#524 part 1)** — two mechanisms against the
@@ -443,7 +443,8 @@ see `docs/cell-intelligence-plan-amendment.md`).
   — so all four see identical numbers by construction. Do NOT reconstruct
   cell attributes at request time; that is how two of them drift.
 - Rounding to meaningful precision happens in `score_cells`, not in
-  `cell_feature`: the working grid is ~500 m, so 5 lon/lat decimals ≈ 1 m,
+  `cell_feature`: 5 lon/lat decimals ≈ 1 m, much finer than the
+  source-dependent, pixel-budget-coarsened working grid,
   and raw f64s roughly double the GeoJSON payload to carry noise.
 - **Ranking is `ds_core::significance`** (domain-agnostic: it sees normalized
   `Term`s, never a storm cell). Weights come from
@@ -646,3 +647,21 @@ flow starts afresh because replay does not estimate that field. Historical light
 requeried. Unreadable frames break replay continuity. IDs use an epoch-based
 seed instead of restarting at one. Long-term clutter climatology/persistence
 and split/merge lineage remain separate work (#620/#551).
+
+## Physical cell scale (#647)
+
+Live segmentation and startup replay use `CELL_MIN_AREA_KM2 = 2.5`, summing
+member-pixel areas with each row's latitude. The old 10-pixel floor was about
+14 km² on the coarsened FMI grid; source resolution and `max_pixels` determine
+working resolution, never a universal 500 m. Small retained cells can therefore
+increase in number. Row areas are computed once before segmentation.
+
+`PixelScale::lonlat` uses row latitude for east-west distances; centroid
+matching, velocity, path length, lightning attribution and coverage bounds all
+share it. Severity, served area and flash density use the summed footprint area,
+not the intensity-weighted centroid's latitude. The motion estimator's global
+search/coarsening scale remains a mid-latitude approximation; its EDR output
+already converts each vector at its own latitude. Pixel-only verification
+segmentation and its uniform matching scale stay unchanged for comparability.
+These unit corrections do not recalibrate clutter thresholds or establish
+classifier precision on confirmed convective examples.
