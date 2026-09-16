@@ -46,6 +46,17 @@ admission and does not cover other engines or the final source-window buffer.
   mtime+size alone miss a same-size same-second atomic rename (#253) — so a
   replacement can't serve stale pixels. Band extraction + nodata +
   scale/offset are applied at copy time for the intersecting window only.
+- Remote bbox reads can coalesce nearby compressed cache misses with
+  `MC_COG_RANGE_BATCH_TILES` (default **1: disabled**, clamped 1–16). An
+  opt-in batch is capped at 1 MiB, 4 KiB per gap and 10% total overfetch.
+  Its input is charged to decode admission alongside each decoded tile.
+  Cache entries own individual tile allocations: never insert `Bytes::slice`
+  of a batch into the LRU, because its weigher would undercount retained RAM.
+  Both object-store and direct HTTP use the same planner. Short/rejected
+  batches fall back to individual reads; admission/deadline errors fail the
+  request. Keep it opt-in until measured on the deployment: current OPERA
+  tests reduce request count but do not establish a latency win. See
+  `docs/performance/cog-range-batching.md`.
 - Remote tile fetch concurrency: `MC_COG_TILE_CONCURRENCY` (default 16,
   clamp [1,1024]). It's I/O-bound — size by RTT, not cores.
 

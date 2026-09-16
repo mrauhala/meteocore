@@ -1189,6 +1189,36 @@ fn read_remote_chunk_f64(
     // (rayon) thread; `None` for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
 ) -> Result<DecodedTile, DataServerError> {
+    read_encoded_chunk_f64(
+        tile_info,
+        metadata,
+        chunk_index,
+        cache,
+        file_path,
+        band_index,
+        ifd_index,
+        &|range| {
+            match handle {
+                Some(h) => store.get_range_on(obj_path, range, h),
+                None => store.get_range(obj_path, range),
+            }
+            .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))
+        },
+    )
+}
+
+/// Shared decoder/cache path for individual and coalesced remote ranges.
+#[allow(clippy::too_many_arguments)]
+fn read_encoded_chunk_f64(
+    tile_info: &RemoteTileInfo,
+    metadata: &TiffMetadata,
+    chunk_index: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+    ifd_index: u16,
+    fetch_range: &impl Fn(std::ops::Range<usize>) -> Result<Bytes, DataServerError>,
+) -> Result<DecodedTile, DataServerError> {
     let idx = chunk_index as usize;
     let (raw_size, bytes, offset, byte_count) =
         remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
@@ -1226,20 +1256,12 @@ fn read_remote_chunk_f64(
         ))
     })?;
 
-    // Fetch a byte range, reusing the caller's runtime handle when on a rayon
-    // thread (avoids a per-call Runtime::new — see #222).
-    let fetch_range = |range: std::ops::Range<usize>| match handle {
-        Some(h) => store.get_range_on(obj_path, range, h),
-        None => store.get_range(obj_path, range),
-    };
-
     // Check cache for compressed bytes (keyed by file + chunk + IFD level)
     let compressed = if let Some(c) = cache {
         if let Some(cached) = c.get(file_path, chunk_index, ifd_index) {
             cached
         } else {
-            let fetched = fetch_range(offset..end)
-                .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))?;
+            let fetched = fetch_range(offset..end)?;
             // Validate response length matches request
             if fetched.len() != byte_count {
                 return Err(DataServerError::Engine(format!(
@@ -1253,8 +1275,7 @@ fn read_remote_chunk_f64(
             fetched
         }
     } else {
-        let fetched = fetch_range(offset..end)
-            .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))?;
+        let fetched = fetch_range(offset..end)?;
         if fetched.len() != byte_count {
             return Err(DataServerError::Engine(format!(
                 "Tile {} truncated: requested {} bytes, got {}",
@@ -1361,81 +1382,16 @@ fn read_http_chunk_f64(
     // for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
 ) -> Result<DecodedTile, DataServerError> {
-    let idx = chunk_index as usize;
-    let (raw_size, bytes, offset, byte_count) =
-        remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
-    let permit = BUDGET.reserve(bytes)?;
-
-    if byte_count == 0 {
-        tracing::trace!(
-            "Tile {} has byte_count=0 (offset={}), returning nodata",
-            idx,
-            offset
-        );
-        let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
-        return Ok(DecodedTile {
-            values: vec![None; pixel_count],
-            _permit: permit,
-        });
-    }
-
-    if offset == 0 && idx > 0 {
-        tracing::warn!(
-            "Tile {} has offset=0 (suspicious for non-first tile, possible truncated header)",
-            idx
-        );
-    }
-
-    let end = offset.checked_add(byte_count).ok_or_else(|| {
-        DataServerError::Engine(format!(
-            "Tile {} byte range overflow: offset={} + count={}",
-            idx, offset, byte_count
-        ))
-    })?;
-
-    let compressed = if let Some(c) = cache {
-        if let Some(cached) = c.get(file_path, chunk_index, ifd_index) {
-            cached
-        } else {
-            let fetched = read_http_range(http, url, offset..end, handle)?;
-            if fetched.len() != byte_count {
-                return Err(DataServerError::Engine(format!(
-                    "Tile {} truncated: requested {} bytes, got {}",
-                    idx,
-                    byte_count,
-                    fetched.len()
-                )));
-            }
-            c.insert(file_path, chunk_index, ifd_index, fetched.clone());
-            fetched
-        }
-    } else {
-        let fetched = read_http_range(http, url, offset..end, handle)?;
-        if fetched.len() != byte_count {
-            return Err(DataServerError::Engine(format!(
-                "Tile {} truncated: requested {} bytes, got {}",
-                idx,
-                byte_count,
-                fetched.len()
-            )));
-        }
-        fetched
-    };
-
-    let mut raw = decompress_tile(&compressed, tile_info.compression, raw_size)?;
-
-    if tile_info.predictor == 2 {
-        undo_horizontal_predictor(
-            &mut raw,
-            tile_info.tile_width,
-            tile_info.sample_type.bytes_per_sample(),
-        );
-    }
-
-    Ok(DecodedTile {
-        values: decode_raw_tile_f64(&raw, tile_info, metadata, band_index)?,
-        _permit: permit,
-    })
+    read_encoded_chunk_f64(
+        tile_info,
+        metadata,
+        chunk_index,
+        cache,
+        file_path,
+        band_index,
+        ifd_index,
+        &|range| read_http_range(http, url, range, handle),
+    )
 }
 
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
@@ -2199,6 +2155,144 @@ where
     }
 }
 
+/// Fetch cache misses in bounded nearby ranges for both remote transports.
+#[allow(clippy::too_many_arguments)]
+fn read_bbox_tiles(
+    coords: &[(u32, u32)],
+    tile_info: &RemoteTileInfo,
+    metadata: &TiffMetadata,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+    ifd_index: u16,
+    deadline: Option<std::time::Instant>,
+    batch_limit: usize,
+    fetch: &(impl Fn(std::ops::Range<usize>) -> Result<Bytes, DataServerError> + Sync),
+) -> Result<Vec<TileFetchResult>, DataServerError> {
+    use rayon::prelude::*;
+    ds_core::deadline::check()?;
+    enum Job {
+        Single(usize),
+        Batch(crate::range_batch::Batch),
+    }
+    let mut chunks = Vec::with_capacity(coords.len());
+    let mut cached = Vec::with_capacity(coords.len());
+    let mut jobs = Vec::new();
+    let mut misses = Vec::new();
+    for (i, &(row, col)) in coords.iter().enumerate() {
+        let chunk = safe_tile_index(row, metadata.tiles_across, col)?;
+        // Validate ALL tile layouts before any I/O; bad metadata cannot hide
+        // behind retries or a transparent gap.
+        let (_, _, offset, count) =
+            remote_chunk_layout(tile_info, metadata.samples_per_pixel, chunk as usize)?;
+        // With batching disabled, keep the original worker-time lookup:
+        // another queued render may populate the cache before this job runs.
+        let hit = if batch_limit > 1 {
+            cache.and_then(|c| c.get(file_path, chunk, ifd_index))
+        } else {
+            None
+        };
+        if hit.is_some() || count == 0 {
+            jobs.push(Job::Single(i));
+        } else {
+            misses.push((i, offset..offset + count));
+        }
+        chunks.push(chunk);
+        cached.push(hit);
+    }
+    for batch in crate::range_batch::plan(misses, batch_limit) {
+        if batch.tiles.len() == 1 {
+            jobs.push(Job::Single(batch.tiles[0]));
+        } else {
+            jobs.push(Job::Batch(batch));
+        }
+    }
+    let read_one = |i: usize, batch: Option<(&std::ops::Range<usize>, &Bytes)>| {
+        let (row, col) = coords[i];
+        let chunk = chunks[i];
+        let data = read_remote_chunk_with_retry(
+            || {
+                read_encoded_chunk_f64(
+                    tile_info,
+                    metadata,
+                    chunk,
+                    None,
+                    file_path,
+                    band_index,
+                    ifd_index,
+                    &|range| {
+                        if let Some(bytes) = &cached[i] {
+                            return Ok(bytes.clone());
+                        }
+                        // Recheck planned misses after admission/queueing, also
+                        // preserving the established cache-backed retry path.
+                        if let Some(bytes) = cache.and_then(|c| c.get(file_path, chunk, ifd_index))
+                        {
+                            return Ok(bytes);
+                        }
+                        let bytes = if let Some((whole, bytes)) = batch {
+                            // Copy ONLY this tile. A Bytes slice in the LRU would
+                            // retain the whole batch while charging just the slice.
+                            // The chunk's admission already covers this copy.
+                            Bytes::copy_from_slice(
+                                &bytes[range.start - whole.start..range.end - whole.start],
+                            )
+                        } else {
+                            fetch(range.clone())?
+                        };
+                        if bytes.len() != range.len() {
+                            return Err(DataServerError::Engine("Truncated tile range".into()));
+                        }
+                        if let Some(cache) = cache {
+                            cache.insert(file_path, chunk, ifd_index, bytes.clone());
+                        }
+                        Ok(bytes)
+                    },
+                )
+            },
+            row,
+            col,
+            chunk,
+            (metadata.tile_width * metadata.tile_height) as usize,
+        )?;
+        Ok((row, col, data))
+    };
+    let groups: Vec<Vec<TileFetchResult>> = TILE_FETCH_POOL.install(|| {
+        jobs.par_iter()
+            .map(|job| {
+                let _scope = ds_core::deadline::enter(deadline);
+                ds_core::deadline::check()?;
+                match job {
+                    Job::Single(i) => Ok(vec![read_one(*i, None)?]),
+                    Job::Batch(batch) => {
+                        // Account for the merged input in addition to each tile's
+                        // compressed copy + decoder/output allocations. It lives
+                        // until the whole batch is decoded; failures unwind it.
+                        let _permit = BUDGET.reserve(batch.range.len())?;
+                        let bytes = match fetch(batch.range.clone()) {
+                            Ok(bytes) if bytes.len() == batch.range.len() => Some(bytes),
+                            Err(
+                                e @ (DataServerError::ResourceExhausted
+                                | DataServerError::DeadlineExceeded),
+                            ) => return Err(e),
+                            _ => None,
+                        };
+                        // An origin may reject a larger range or return a short
+                        // body. Fall back to the established per-tile retry/nodata
+                        // policy, sharing the same absolute deadline.
+                        batch
+                            .tiles
+                            .iter()
+                            .map(|&i| read_one(i, bytes.as_ref().map(|b| (&batch.range, b))))
+                            .collect()
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, DataServerError>>()
+    })?;
+    Ok(groups.into_iter().flatten().collect())
+}
+
 /// Parallel tile fetching for remote data sources.
 /// Uses the shared [`TILE_FETCH_POOL`] (sized by `MC_COG_TILE_CONCURRENCY` /
 /// [`DEFAULT_TILE_CONCURRENCY`]).
@@ -2223,8 +2317,6 @@ fn read_bbox_parallel(
     total_pixels: usize,
     ifd_index: u16,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
-    use rayon::prelude::*;
-
     // Collect all tile coordinates we need to fetch
     let tile_coords: Vec<(u32, u32)> = (tile_row_start..tile_row_end)
         .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
@@ -2239,46 +2331,24 @@ fn read_bbox_parallel(
     let rt_handle = tokio::runtime::Handle::try_current().ok();
     let deadline = ds_core::deadline::current();
 
-    // Fetch all tiles in parallel using the shared thread pool.
-    // Fetch/decode failures become nodata; admission/index failures propagate.
-    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
-    let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
-        tile_coords
-            .par_iter()
-            .map(|&(tile_row, tile_col)| {
-                let _scope = ds_core::deadline::enter(deadline);
-                ds_core::deadline::check()?;
-                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tracing::error!("Tile index overflow at ({tile_row}, {tile_col}): {e}");
-                        return Err(e);
-                    }
-                };
-                let data = read_remote_chunk_with_retry(
-                    || {
-                        read_remote_chunk_f64(
-                            store,
-                            obj_path,
-                            tile_info,
-                            metadata,
-                            chunk_index,
-                            cache,
-                            file_path,
-                            band_index,
-                            ifd_index,
-                            rt_handle.as_ref(),
-                        )
-                    },
-                    tile_row,
-                    tile_col,
-                    chunk_index,
-                    tile_pixel_count,
-                );
-                Ok((tile_row, tile_col, data?))
-            })
-            .collect::<Result<Vec<_>, DataServerError>>()
-    })?;
+    let tile_results = read_bbox_tiles(
+        &tile_coords,
+        tile_info,
+        metadata,
+        cache,
+        file_path,
+        band_index,
+        ifd_index,
+        deadline,
+        crate::range_batch::limit(),
+        &|range| {
+            match &rt_handle {
+                Some(h) => store.get_range_on(obj_path, range, h),
+                None => store.get_range(obj_path, range),
+            }
+            .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))
+        },
+    )?;
 
     // Assemble the result grid
     let mut result = vec![None; total_pixels];
@@ -2325,57 +2395,24 @@ fn read_bbox_parallel_http(
     total_pixels: usize,
     ifd_index: u16,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
-    use rayon::prelude::*;
-
     let tile_coords: Vec<(u32, u32)> = (tile_row_start..tile_row_end)
         .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
         .collect();
 
-    let http_clone = http.clone();
-    let url_owned = url.to_string();
-
-    // Reuse the current runtime for the rayon workers' fetches (#222).
     let rt_handle = tokio::runtime::Handle::try_current().ok();
     let deadline = ds_core::deadline::current();
-
-    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
-    let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
-        tile_coords
-            .par_iter()
-            .map(|&(tile_row, tile_col)| {
-                let _scope = ds_core::deadline::enter(deadline);
-                ds_core::deadline::check()?;
-                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tracing::error!("Tile index overflow at ({tile_row}, {tile_col}): {e}");
-                        return Err(e);
-                    }
-                };
-                let data = read_remote_chunk_with_retry(
-                    || {
-                        read_http_chunk_f64(
-                            &http_clone,
-                            &url_owned,
-                            tile_info,
-                            metadata,
-                            chunk_index,
-                            cache,
-                            file_path,
-                            band_index,
-                            ifd_index,
-                            rt_handle.as_ref(),
-                        )
-                    },
-                    tile_row,
-                    tile_col,
-                    chunk_index,
-                    tile_pixel_count,
-                );
-                Ok((tile_row, tile_col, data?))
-            })
-            .collect::<Result<Vec<_>, DataServerError>>()
-    })?;
+    let tile_results = read_bbox_tiles(
+        &tile_coords,
+        tile_info,
+        metadata,
+        cache,
+        file_path,
+        band_index,
+        ifd_index,
+        deadline,
+        crate::range_batch::limit(),
+        &|range| read_http_range(http, url, range, rt_handle.as_ref()),
+    )?;
 
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {
@@ -3383,6 +3420,358 @@ mod tests {
         stop.send(()).unwrap();
         server.join().unwrap();
         assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
+    }
+
+    /// Real-origin diagnostic, deliberately excluded from deterministic CI.
+    /// Set MC_COG_BENCH_URL and MC_COG_BENCH_SIZE to a recent public OPERA COG.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a public COG URL; see docs/performance/cog-range-batching.md"]
+    async fn benchmark_cold_cog_ranges() {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let url = std::env::var("MC_COG_BENCH_URL").unwrap();
+        let size = std::env::var("MC_COG_BENCH_SIZE").unwrap().parse().unwrap();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let (meta, info) = TiffMetadata::from_http_header_read(&http, &url, size).unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let calls = AtomicUsize::new(0);
+        let transferred = AtomicUsize::new(0);
+        let fetch = |range: std::ops::Range<usize>| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let bytes = read_http_range(&http, &url, range, Some(&handle))?;
+            transferred.fetch_add(bytes.len(), Ordering::Relaxed);
+            Ok(bytes)
+        };
+        // Full-resolution central 10 × 7 source tiles; then a sparse sample of
+        // the same region, where the overfetch policy should avoid large gaps.
+        let col0 = meta.tiles_across.saturating_sub(10) / 2;
+        let row0 = meta.tiles_down.saturating_sub(7) / 2;
+        for sparse in [false, true] {
+            let coords: Vec<_> = (row0..(row0 + 7).min(meta.tiles_down))
+                .flat_map(|r| {
+                    (col0..(col0 + 10).min(meta.tiles_across))
+                        .filter(move |c| !sparse || c % 3 == 0)
+                        .map(move |c| (r, c))
+                })
+                .collect();
+            let mut reference = None;
+            for run in 0..6 {
+                // Alternate order to expose connection warm-up and origin noise.
+                for batched in if run % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    calls.store(0, Ordering::Relaxed);
+                    transferred.store(0, Ordering::Relaxed);
+                    let start = std::time::Instant::now();
+                    let mut tiles = if batched {
+                        read_bbox_tiles(
+                            &coords,
+                            &info,
+                            &meta,
+                            None,
+                            Path::new("benchmark"),
+                            0,
+                            0,
+                            None,
+                            crate::range_batch::limit(),
+                            &fetch,
+                        )
+                        .unwrap()
+                    } else {
+                        TILE_FETCH_POOL.install(|| {
+                            coords
+                                .par_iter()
+                                .map(|&(r, c)| {
+                                    let chunk = safe_tile_index(r, meta.tiles_across, c).unwrap();
+                                    (
+                                        r,
+                                        c,
+                                        read_encoded_chunk_f64(
+                                            &info,
+                                            &meta,
+                                            chunk,
+                                            None,
+                                            Path::new("benchmark"),
+                                            0,
+                                            0,
+                                            &fetch,
+                                        )
+                                        .unwrap(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    };
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    tiles.sort_by_key(|(r, c, _)| (*r, *c));
+                    let values: Vec<_> = tiles.iter().map(|(_, _, t)| t.values.clone()).collect();
+                    if let Some(reference) = &reference {
+                        assert_eq!(&values, reference);
+                    } else {
+                        reference = Some(values);
+                    }
+                    eprintln!("COG_BENCH sparse={sparse} batched={batched} run={run} tiles={} calls={} bytes={} ms={elapsed:.1}", coords.len(), calls.load(Ordering::Relaxed), transferred.load(Ordering::Relaxed));
+                }
+            }
+        }
+    }
+
+    fn batch_fixture() -> (TiffMetadata, RemoteTileInfo, Vec<u8>) {
+        let meta = tiny_meta(32, 8, 8);
+        let info = RemoteTileInfo {
+            tile_offsets: vec![0, 68, 136, 204],
+            tile_byte_counts: vec![64; 4],
+            compression: TiffCompression::None,
+            sample_type: SampleType::U8,
+            predictor: 1,
+            tile_width: 8,
+            tile_height: 8,
+        };
+        let mut bytes = vec![255; 268];
+        for (i, &start) in info.tile_offsets.iter().enumerate() {
+            bytes[start as usize..start as usize + 64].fill(i as u8 + 1);
+        }
+        (meta, info, bytes)
+    }
+
+    #[test]
+    fn batched_misses_preserve_pixels_cache_boundaries_and_ifd_identity() {
+        let (meta, info, bytes) = batch_fixture();
+        let cache = crate::cache::TileCache::new(4096);
+        let file = Path::new("batch-fixture");
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let calls = std::sync::Mutex::new(Vec::new());
+        let fetch = |range: std::ops::Range<usize>| {
+            calls.lock().unwrap().push(range.clone());
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        // A cached middle tile must not be re-fetched: its 64-byte hole
+        // exceeds the allowed overfetch ratio for these tiny tiles.
+        cache.insert(file, 1, 0, Bytes::copy_from_slice(&bytes[68..132]));
+        let result = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            file,
+            0,
+            0,
+            None,
+            4,
+            &fetch,
+        )
+        .unwrap();
+        for (_, col, tile) in result {
+            assert_eq!(tile.values, vec![Some(col as f64 + 1.0); 64]);
+        }
+        let mut ranges = calls.lock().unwrap().clone();
+        ranges.sort_by_key(|r| r.start);
+        assert_eq!(ranges, [0..64, 136..268]);
+        assert_eq!(
+            cache.weight(),
+            4 * (64 + 32),
+            "cache charges only individually owned tile bytes"
+        );
+        calls.lock().unwrap().clear();
+        read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            file,
+            0,
+            0,
+            None,
+            4,
+            &fetch,
+        )
+        .unwrap();
+        assert!(calls.lock().unwrap().is_empty(), "warm hits never fetch");
+        read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            file,
+            0,
+            0,
+            None,
+            1,
+            &fetch,
+        )
+        .unwrap();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "disabled mode keeps worker-time cache hits"
+        );
+        read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            file,
+            0,
+            1,
+            None,
+            4,
+            &fetch,
+        )
+        .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 1, "another IFD is cold");
+        assert_eq!(calls.lock().unwrap()[0], 0..268);
+        calls.lock().unwrap().clear();
+        read_bbox_tiles(&coords, &info, &meta, None, file, 0, 0, None, 4, &fetch).unwrap();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "batching works without a cache"
+        );
+        assert_eq!(calls.lock().unwrap()[0], 0..268);
+    }
+
+    #[test]
+    fn batch_short_reads_fall_back_but_deadlines_and_bad_metadata_fail() {
+        let (meta, mut info, bytes) = batch_fixture();
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetch = |range: std::ops::Range<usize>| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if range.len() > 64 {
+                Ok(Bytes::new())
+            } else {
+                Ok(Bytes::copy_from_slice(&bytes[range]))
+            }
+        };
+        let result = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            None,
+            Path::new("short"),
+            0,
+            0,
+            None,
+            4,
+            &fetch,
+        )
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert!(result
+            .iter()
+            .all(|(_, col, tile)| tile.values == vec![Some(*col as f64 + 1.0); 64]));
+        for error in [
+            DataServerError::DeadlineExceeded,
+            DataServerError::ResourceExhausted,
+        ] {
+            let deadline_error = matches!(error, DataServerError::DeadlineExceeded);
+            let result = read_bbox_tiles(
+                &coords,
+                &info,
+                &meta,
+                None,
+                Path::new("failed"),
+                0,
+                0,
+                None,
+                4,
+                &|_| {
+                    if deadline_error {
+                        Err(DataServerError::DeadlineExceeded)
+                    } else {
+                        Err(DataServerError::ResourceExhausted)
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(DataServerError::DeadlineExceeded | DataServerError::ResourceExhausted)
+            ));
+        }
+        info.tile_byte_counts[3] = u64::MAX;
+        assert!(read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            None,
+            Path::new("bad"),
+            0,
+            0,
+            None,
+            4,
+            &|_| panic!("invalid last tile must fail before any I/O")
+        )
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesced_object_store_and_http_bbox_match() {
+        if std::env::var_os("MC_TEST_COG_BATCH_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader::tests::coalesced_object_store_and_http_bbox_match",
+                    "--nocapture",
+                ])
+                .env("MC_TEST_COG_BATCH_CHILD", "1")
+                .env("MC_COG_RANGE_BATCH_TILES", "4")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use std::io::{Read, Write};
+        let (meta, info, bytes) = batch_fixture();
+        use ds_storage::object_store::ObjectStoreExt;
+        let objects = Arc::new(ds_storage::object_store::memory::InMemory::new());
+        objects
+            .put(&"tiles".into(), Bytes::copy_from_slice(&bytes).into())
+            .await
+            .unwrap();
+        let store = ds_storage::DataStore::new(objects);
+        let remote = DataSource::Remote {
+            store: store.clone(),
+            path: "tiles".into(),
+            tile_info: info.clone(),
+        };
+        let expected = read_bbox(&remote, &meta, 0, 0, 32, 8, None, Path::new("tiles"), 0).unwrap();
+        assert_eq!(
+            store.bytes_read(),
+            268,
+            "one nearby range, including its bounded gaps"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/tiles", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .to_lowercase()
+                .contains("range: bytes=0-267"));
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 268\r\nConnection: close\r\n\r\n").unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+        let http = DataSource::HttpDirect {
+            http: Arc::new(reqwest::Client::new()),
+            url,
+            tile_info: info,
+        };
+        let result = read_bbox(&http, &meta, 0, 0, 32, 8, None, Path::new("tiles"), 0).unwrap();
+        assert_eq!(result, expected);
+        server.join().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
