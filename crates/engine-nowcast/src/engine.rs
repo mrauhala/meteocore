@@ -52,37 +52,19 @@ use crate::cells2d::{
     advance_tracks_coasting, apply_lightning, CellTrack, CELL_MIN_AREA_KM2, CELL_THRESHOLD_DBZ,
 };
 use crate::impact::ImpactIndex;
-use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
+use crate::motion::MotionField;
 use crate::motion_grid::{
     self, param_spec, GridSpec, PARAM_QUALITY, PARAM_SPECS, PARAM_U, PARAM_V,
 };
+use crate::motion_pipeline::{estimate_production_motion, working_grid_size, MAX_HISTORY_FRAMES};
 use crate::objects::{segment_cells_physical, PixelScale};
 use crate::tendency::EFOLD_INTERVALS;
 use crate::Grid;
 
-/// Fastest cell motion the search window must cover (m/s). 40 m/s ≈ 144 km/h
-/// matches the cell-tracker gate in `ds_core::cells`.
-const MAX_SPEED_MS: f64 = 40.0;
-/// Target search radius (px) on the motion-estimation grid; frames are
-/// coarsened until the physical search window fits. 48 preserves typical
-/// kilometre-scale working grids; actual resolution depends on the source
-/// extent and pixel budget, not a fixed 500 m assumption.
-const TARGET_SEARCH_PX: i32 = 48;
-/// Temporal EMA weights for blending each generation's motion field with
-/// the previous one (#524): the new field keeps this share, per block.
-/// Measured blocks carry fresh information; filled blocks are inferred and
-/// lean harder on history. 0.7 ≈ one-and-a-half generations of memory —
-/// enough to damp single-pair convective noise without lagging a genuine
-/// wind shift by more than a couple of cadence intervals.
-const EMA_ALPHA_MEASURED: f32 = 0.7;
-const EMA_ALPHA_FILLED: f32 = 0.4;
 /// Trajectory integration substeps per frame interval.
 const SUBSTEPS: usize = 4;
 /// Hard cap on extrapolated frames per generation.
 const MAX_LEADS: usize = 96;
-/// Hard cap on `history_frames`: each is one sequential blocking source
-/// fetch per generation, and pair-averaging saturates after a few pairs.
-const MAX_HISTORY_FRAMES: usize = 8;
 /// Row cap on the per-generation lightning fetch (#549) — a safety valve
 /// mirroring engine-postgis's own window cap; an extreme Nordic storm day
 /// peaks around 10⁴ strikes per 5-minute window, well under it. Hitting
@@ -796,17 +778,10 @@ impl NowcastEngine {
 
         // Working grid: the source's native cell counts, halved until the
         // pixel budget fits (FMI's 250 m composite lands at ~1 km here).
-        let [mut w, mut h] = source_info.grid_size.unwrap_or([1024, 1024]);
-        // Halve the larger axis until the budget fits — guaranteed to
-        // terminate and to hold for any aspect ratio (a per-axis floor
-        // instead would let an elongated grid blow past the budget).
-        while (w as usize) * (h as usize) > self.cfg.max_pixels && w.max(h) > 1 {
-            if w >= h {
-                w = (w / 2).max(1);
-            } else {
-                h = (h / 2).max(1);
-            }
-        }
+        let [w, h] = working_grid_size(
+            source_info.grid_size.unwrap_or([1024, 1024]),
+            self.cfg.max_pixels,
+        );
         let geom = GridGeom {
             west: extent[0],
             south: extent[1],
@@ -842,82 +817,31 @@ impl NowcastEngine {
         motion_frames.push((anchor, analysis_f32));
         let analysis_f32 = &motion_frames.last().expect("anchor pushed").1;
 
-        // Deliberate scale handling (not the phase-0 accident): estimate
-        // motion on a grid coarse enough that the physical search window
-        // (MAX_SPEED × interval) fits in TARGET_SEARCH_PX, then scale the
-        // field back to working-grid units.
+        // The harness uses this exact production pipeline, including cadence
+        // scaling and the previous generation's EMA field (#640).
         let (px_km_x, _) =
             crate::lonlat_grid_km_per_px([geom.west, geom.south, geom.east, geom.north], w, h);
-        let px_meters = px_km_x * 1000.0;
-        let max_shift_px = MAX_SPEED_MS * interval.num_seconds() as f64 / px_meters.max(1.0);
-        let mut factor = 1u32;
-        while max_shift_px / factor as f64 > TARGET_SEARCH_PX as f64
-            && (w / (factor * 2)) >= 128
-            && (h / (factor * 2)) >= 128
-        {
-            factor *= 2;
-        }
-        let search_radius =
-            ((max_shift_px / factor as f64).ceil() as i32).clamp(4, TARGET_SEARCH_PX * 2);
-        let opts = MotionOptions {
-            search_radius,
-            min_echo: self.cfg.min_echo,
-            ..MotionOptions::default()
-        };
-
-        // Multi-pair estimation (#524): every consecutive history pair
-        // contributes measurements, scaled to px-per-LAST-interval so a
-        // mildly irregular cadence still averages correctly (a degenerate
-        // pair interval skips that pair inside estimate_motion_multi).
-        // Vectors come out in pixels per source interval; the leads below
-        // are expressed in the same interval unit — no time scaling needed.
-        let interval_secs = interval.num_seconds().max(1) as f32;
-        let scales: Vec<f32> = motion_frames
+        let refs: Vec<&Grid> = motion_frames.iter().map(|(_, g)| g).collect();
+        let intervals: Vec<f32> = motion_frames
             .windows(2)
-            .map(|p| interval_secs / (p[1].0 - p[0].0).num_seconds().max(0) as f32)
+            .map(|p| (p[1].0 - p[0].0).num_seconds().max(0) as f32)
             .collect();
-        let mut field = if factor > 1 {
-            let coarse: Vec<Grid> = motion_frames
-                .iter()
-                .map(|(_, g)| downsample(g, factor as usize))
-                .collect();
-            let coarse_refs: Vec<&Grid> = coarse.iter().collect();
-            let mut f = estimate_motion_multi(&coarse_refs, &scales, &opts);
-            // Coarse-grid vectors/blocks → working-grid units.
-            f.block *= factor as usize;
-            for v in f.u.iter_mut().chain(f.v.iter_mut()) {
-                *v *= factor as f32;
-            }
-            f
-        } else {
-            let refs: Vec<&Grid> = motion_frames.iter().map(|(_, g)| g).collect();
-            estimate_motion_multi(&refs, &scales, &opts)
-        };
-
-        // Temporal EMA with the previous generation's field (#524): stops
-        // the per-generation motion-noise oscillation that reads as
-        // rubber-banding in animations. No-op when the block grid changed
-        // (blend_with_previous checks dims).
-        {
+        let field = {
             let state = self.state.load();
-            if let Some((_, latest)) = state.generations.iter().next_back() {
-                // Vectors are px per SOURCE interval, and the previous
-                // generation may have been measured over a different one
-                // (a skipped composite doubles it). Rescale before
-                // blending so the EMA mixes like units — otherwise the
-                // served m/s (#661) would be biased by the cadence ratio.
-                let ratio = (interval.num_seconds() as f32) / (latest.interval_secs as f32);
-                if (ratio - 1.0).abs() > 1e-6 && ratio.is_finite() {
-                    let mut prev = latest.field.clone();
-                    for v in prev.u.iter_mut().chain(prev.v.iter_mut()) {
-                        *v *= ratio;
-                    }
-                    field.blend_with_previous(&prev, EMA_ALPHA_MEASURED, EMA_ALPHA_FILLED);
-                } else {
-                    field.blend_with_previous(&latest.field, EMA_ALPHA_MEASURED, EMA_ALPHA_FILLED);
-                }
-            }
-        }
+            let previous = state
+                .generations
+                .iter()
+                .next_back()
+                .map(|(_, latest)| (&latest.field, latest.interval_secs as f32));
+            estimate_production_motion(
+                &refs,
+                &intervals,
+                px_km_x * 1000.0,
+                self.cfg.min_echo,
+                previous,
+            )
+            .field
+        };
 
         // Cell tracking (#544) — now inside generate() so the growth/decay
         // measurement (#546 iteration 1) can condition on per-cell classes.
@@ -1417,20 +1341,6 @@ fn frame_to_grid(frame: &FrameData, width: usize, height: usize) -> Grid {
         FrameData::F32(values) => values.clone(),
     };
     Grid::new(width, height, data)
-}
-
-/// Nearest-neighbour 1/f downsample (motion estimation only — stored frames
-/// stay full resolution).
-fn downsample(grid: &Grid, factor: usize) -> Grid {
-    let w = (grid.width / factor).max(1);
-    let h = (grid.height / factor).max(1);
-    let mut data = Vec::with_capacity(w * h);
-    for y in 0..h {
-        for x in 0..w {
-            data.push(grid.at(x * factor, y * factor));
-        }
-    }
-    Grid::new(w, h, data)
 }
 
 impl MapEngine for NowcastEngine {
