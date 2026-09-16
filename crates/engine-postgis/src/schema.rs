@@ -189,6 +189,7 @@ pub struct EventsShape {
     /// consumer can tell "not reported" from "reported as zero".
     pub cloud_indicator_col: Option<String>,
     pub peak_current_col: Option<String>,
+    pub coverage_bbox: Option<[f64; 4]>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +369,7 @@ impl EventsShape {
         }
 
         Ok(Self {
+            coverage_bbox: cfg.coverage_bbox,
             table: QualifiedTable::parse(table)?,
             time_col: check_identifier(time_col, "observations.time_col")?,
             time_col_tz: cfg.time_col_tz.clone(),
@@ -536,6 +538,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
+            coverage_bbox: None,
             columns: vec![],
             tables: vec![],
         }
@@ -573,6 +576,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
+            coverage_bbox: None,
             columns: vec![
                 PostgisObservationColumn {
                     parameter: "t2m".into(),
@@ -612,6 +616,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
+            coverage_bbox: None,
             columns: vec![],
             tables: vec![PostgisObservationTable {
                 parameter: "t2m".into(),
@@ -666,6 +671,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
+            coverage_bbox: None,
             columns: vec![],
             tables: vec![PostgisObservationTable {
                 parameter: "t2m".into(),
@@ -699,6 +705,7 @@ mod tests {
             peak_current_col: None,
             default_datetime: Some("PT1H".into()),
             extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
+            coverage_bbox: None,
         }
     }
 

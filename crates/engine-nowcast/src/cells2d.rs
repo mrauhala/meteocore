@@ -280,6 +280,7 @@ pub struct CellTrack {
     /// Lightning join (#549): strikes attributed to this cell over the
     /// last inter-generation window. `None` = no event source configured,
     /// or the join was skipped this generation (source error).
+    pub lightning_coverage: Option<bool>,
     pub flash_count: Option<u32>,
     /// The same window's strikes per minute.
     pub flash_rate_per_min: Option<f32>,
@@ -409,6 +410,67 @@ pub fn advance_tracks(
     .0
 }
 
+/// Advance observed tracks first; only unmatched detections may reclaim a
+/// track missing from the previous frame. Returned coasts are association-only:
+/// never serve, score, join lightning onto, or count them as observations.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_tracks_coasting(
+    previous: &[CellTrack],
+    coasting: &[CellTrack],
+    blobs: Vec<CellBlob>,
+    scale: PixelScale,
+    field: &MotionField,
+    displacement_secs: f32,
+    coast_displacement_secs: f32,
+    field_interval_secs: f32,
+    mut next_id: impl FnMut() -> u64,
+) -> (Vec<CellTrack>, Vec<CellTrack>, TrackStats) {
+    let (mut tracks, mut stats) = advance_tracks_with_stats(
+        previous,
+        blobs,
+        scale,
+        field,
+        displacement_secs,
+        field_interval_secs,
+        &mut next_id,
+    );
+    let previous_ids: std::collections::HashSet<_> = previous.iter().map(|t| t.id).collect();
+    let current_ids: std::collections::HashSet<_> = tracks.iter().map(|t| t.id).collect();
+    let next_coasts = previous
+        .iter()
+        .filter(|t| !current_ids.contains(&t.id))
+        .cloned()
+        .collect();
+    let births: Vec<_> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !previous_ids.contains(&t.id))
+        .map(|(i, _)| i)
+        .collect();
+    let (rescued, rescue_stats) = advance_tracks_with_stats(
+        coasting,
+        births.iter().map(|&i| tracks[i].blob.clone()).collect(),
+        scale,
+        field,
+        coast_displacement_secs,
+        field_interval_secs,
+        &mut next_id,
+    );
+    let coast_ids: std::collections::HashSet<_> = coasting.iter().map(|t| t.id).collect();
+    for (i, track) in births.into_iter().zip(rescued) {
+        if coast_ids.contains(&track.id) {
+            tracks[i] = track;
+        }
+    }
+    let matched = rescue_stats.pass1_matches + rescue_stats.pass2_matches;
+    stats.births -= matched;
+    stats.deaths = coasting.len() as u64 - matched;
+    stats.pass1_matches += rescue_stats.pass1_matches;
+    stats.pass2_matches += rescue_stats.pass2_matches;
+    stats.velocity_clamps += rescue_stats.velocity_clamps;
+    (tracks, next_coasts, stats)
+}
+
 /// `next_id` supplies ids for newborn tracks.
 #[allow(clippy::too_many_arguments)]
 pub fn advance_tracks_with_stats(
@@ -524,6 +586,7 @@ pub fn advance_tracks_with_stats(
                     deviant_streak: 0,
                     growing: None,
                     intensity_tendency: 0.0,
+                    lightning_coverage: None,
                     flash_count: None,
                     flash_rate_per_min: None,
                     flash_history: Vec::new(),
@@ -624,6 +687,7 @@ pub fn advance_tracks_with_stats(
                         // The join (apply_lightning) fills this generation's
                         // stats after matching; the baseline history rides
                         // the track.
+                        lightning_coverage: None,
                         flash_count: None,
                         flash_rate_per_min: None,
                         flash_history: prev.flash_history.clone(),
@@ -784,6 +848,12 @@ pub fn apply_lightning(
 
     let window_min = (window_secs / 60.0).max(f32::EPSILON);
     for (idx, (t, &n)) in tracks.iter_mut().zip(&counts).enumerate() {
+        if t.lightning_coverage != Some(true) {
+            // A coverage gap also breaks the jump baseline: missing windows
+            // cannot become measured zeros or an adjacent-rate history.
+            t.flash_history.clear();
+            continue;
+        }
         let rate = n as f32 / window_min;
         // Keep the magnitude instead of collapsing it to the threshold test.
         // None while there is no baseline to measure against — 0.0 would
@@ -880,6 +950,7 @@ mod tests {
             growing: None,
             trend_anchor_volume: 0.0,
             intensity_tendency: 0.0,
+            lightning_coverage: Some(true),
             flash_count: None,
             flash_rate_per_min: None,
             flash_history: Vec::new(),
@@ -891,6 +962,68 @@ mod tests {
             cg_polarity_known_count: None,
             first_flash: None,
         }
+    }
+
+    #[test]
+    fn one_missing_frame_reassociates_without_serving_or_aging_the_coast() {
+        let field = MotionField {
+            block: 1,
+            bw: 1,
+            bh: 1,
+            u: vec![0.0],
+            v: vec![0.0],
+            measured: vec![false],
+        };
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let mut initial = bare_track(42, 0.0, 0.0);
+        initial.age = 7;
+        initial.velocity_kms = Some((0.01, 0.0));
+        initial.first_flash = Some(test_instant());
+        let (missing, coast, stats) = advance_tracks_coasting(
+            &[initial.clone()],
+            &[],
+            vec![],
+            scale,
+            &field,
+            300.0,
+            600.0,
+            300.0,
+            || 100,
+        );
+        assert!(missing.is_empty(), "coasts are never observed cells");
+        assert_eq!(coast[0].age, 7);
+        assert_eq!(stats.deaths, 0);
+        let mut blob = initial.blob.clone();
+        blob.centroid = (6.0, 0.0);
+        let (returned, _, stats) = advance_tracks_coasting(
+            &[],
+            &coast,
+            vec![blob],
+            scale,
+            &field,
+            300.0,
+            600.0,
+            300.0,
+            || 100,
+        );
+        assert_eq!(returned[0].id, 42);
+        assert_eq!(returned[0].age, 8);
+        assert_eq!(returned[0].first_flash, initial.first_flash);
+        assert!((returned[0].velocity_kms.unwrap().0 - 0.01).abs() < 1e-6);
+        assert_eq!(stats.births, 0);
+        let (_, expired, stats) = advance_tracks_coasting(
+            &[],
+            &coast,
+            vec![],
+            scale,
+            &field,
+            300.0,
+            600.0,
+            300.0,
+            || 100,
+        );
+        assert!(expired.is_empty());
+        assert_eq!(stats.deaths, 1);
     }
 
     #[test]
@@ -1079,6 +1212,7 @@ mod tests {
             growing: None,
             trend_anchor_volume: 0.0,
             intensity_tendency: 0.0,
+            lightning_coverage: Some(true),
             flash_count: None,
             flash_rate_per_min: None,
             flash_history: Vec::new(),

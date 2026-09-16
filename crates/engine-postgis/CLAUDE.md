@@ -149,3 +149,8 @@ Derivation rules (hard-won from production timeouts):
 - Do not `map_err(|_| …)` away the underlying Postgres error — surfacing
   the real error is tracked in #436; swallowing it hid a production
   misconfiguration.
+
+- Event-source detection coverage (#621) is `observations.coverage_bbox`,
+  optional and independently validated. `EventSource::covers` checks full
+  containment; absent config returns unknown. Never substitute `extent_bbox`
+  or observed strike positions: neither guarantees detection coverage.

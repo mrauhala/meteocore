@@ -49,7 +49,7 @@ use ds_core::significance::WeightedScorer;
 
 use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{
-    advance_tracks_with_stats, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
+    advance_tracks_coasting, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
 };
 use crate::impact::ImpactIndex;
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
@@ -194,6 +194,8 @@ enum FrameData {
 
 /// One generation: the analysis frame plus extrapolated leads, anchored on a
 /// source frame (`reference_time`).
+type TrackReplay = (Vec<CellTrack>, Vec<CellTrack>, DateTime<Utc>, DateTime<Utc>);
+
 struct Generation {
     reference_time: DateTime<Utc>,
     /// Valid times, ascending: `reference_time`, then the leads.
@@ -209,6 +211,8 @@ struct Generation {
     interval_secs: f64,
     /// Tracked cells of this generation's analysis frame (#544/#546).
     cells: Arc<Vec<CellTrack>>,
+    coasting: Vec<CellTrack>,
+    coast_at: DateTime<Utc>,
 }
 
 /// One retained cell snapshot: the tracked cells of a past analysis frame,
@@ -412,7 +416,7 @@ impl NowcastEngine {
             lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
-            next_track_id: AtomicU64::new(1),
+            next_track_id: AtomicU64::new(Utc::now().timestamp_millis().max(0) as u64 * 1_000_000),
             track_births_total: AtomicU64::new(0),
             track_deaths_total: AtomicU64::new(0),
             track_pass1_matches_total: AtomicU64::new(0),
@@ -931,27 +935,48 @@ impl NowcastEngine {
         };
         let prev_state = self.state.load();
         let prev_latest = prev_state.generations.iter().next_back();
-        // Displacement spans the previous generation's anchor → this one
-        // (2× cadence after a skipped generation); field vectors span the
-        // source interval. Track continuity requires an unchanged grid
-        // (geometry change ⇒ reset, cells restart as newborns).
-        let displacement_secs = prev_latest
-            .map(|(&p, _)| (anchor - p).num_seconds() as f32)
-            .unwrap_or_else(|| interval.num_seconds() as f32);
-        // A geometry reset discards every live track (they restart as
-        // newborns). Those are deaths too, and the tracker cannot see them
-        // from an empty `previous`, so count them here (#643 review).
-        let (previous_cells, reset_deaths): (&[CellTrack], u64) = match prev_latest {
-            Some((_, prev)) if prev.geom == geom => (&prev.cells, 0),
-            Some((_, prev)) => (&[], prev.cells.len() as u64),
-            None => (&[], 0),
+        // On first generation reconstruct association history without producing
+        // forecasts, publishing historical runs, or incrementing telemetry.
+        let bootstrap = if prev_latest.is_none() {
+            Some(self.replay_tracks(source_info, geom, anchor, scale))
+        } else {
+            None
         };
-        let (mut cells, track_stats) = advance_tracks_with_stats(
+        let (previous_cells, coasting, previous_at, coast_at, reset_deaths) = match prev_latest {
+            Some((at, prev)) if prev.geom == geom => (
+                prev.cells.as_slice(),
+                prev.coasting.as_slice(),
+                *at,
+                prev.coast_at,
+                0,
+            ),
+            Some((_, prev)) => (
+                &[][..],
+                &[][..],
+                anchor - interval,
+                anchor - interval,
+                (prev.cells.len() + prev.coasting.len()) as u64,
+            ),
+            None => {
+                let history = bootstrap.as_ref().expect("bootstrap created");
+                (
+                    history.0.as_slice(),
+                    history.1.as_slice(),
+                    history.2,
+                    history.3,
+                    0,
+                )
+            }
+        };
+        let displacement_secs = (anchor - previous_at).num_seconds().max(1) as f32;
+        let (mut cells, coasting, track_stats) = advance_tracks_coasting(
             previous_cells,
+            coasting,
             blobs,
             scale,
             &field,
             displacement_secs,
+            (anchor - coast_at).num_seconds().max(1) as f32,
             interval.num_seconds() as f32,
             || self.next_track_id.fetch_add(1, Ordering::Relaxed),
         );
@@ -971,16 +996,46 @@ impl NowcastEngine {
         // label map. A source error degrades to "no flash data this
         // generation" (fields stay None), never a failed generation.
         if let Some(source) = &self.lightning {
+            let mut bounds: Vec<_> = cells
+                .iter()
+                .map(|t| {
+                    let (x, y) = t.blob.centroid;
+                    let rx = crate::cells2d::LIGHTNING_JOIN_RADIUS_KM / scale.x;
+                    let ry = crate::cells2d::LIGHTNING_JOIN_RADIUS_KM / scale.y;
+                    [x - rx, y - ry, x + rx, y + ry]
+                })
+                .collect();
+            for (i, &label) in labels.iter().enumerate() {
+                if label == 0 {
+                    continue;
+                }
+                let b = &mut bounds[label as usize - 1];
+                let x = (i % geom.width as usize) as f32;
+                let y = (i / geom.width as usize) as f32;
+                b[0] = b[0].min(x);
+                b[1] = b[1].min(y);
+                b[2] = b[2].max(x + 1.0);
+                b[3] = b[3].max(y + 1.0);
+            }
+            for (cell, [x0, y0, x1, y1]) in cells.iter_mut().zip(bounds) {
+                let lon = |x: f32| {
+                    geom.west + f64::from(x) / f64::from(geom.width) * (geom.east - geom.west)
+                };
+                let lat = |y: f32| {
+                    geom.north - f64::from(y) / f64::from(geom.height) * (geom.north - geom.south)
+                };
+                cell.lightning_coverage = source.covers([lon(x0), lat(y1), lon(x1), lat(y0)]);
+            }
             let window_secs = displacement_secs.max(1.0);
             let start = anchor - Duration::seconds(window_secs as i64);
             match source.recent_events(start, anchor, MAX_JOIN_STRIKES) {
+                Ok(events) if events.len() >= MAX_JOIN_STRIKES => {
+                    tracing::warn!(
+                        collection = %self.collection_id,
+                        "lightning join skipped: window hit the {MAX_JOIN_STRIKES}-row cap"
+                    );
+                }
                 Ok(events) => {
-                    if events.len() >= MAX_JOIN_STRIKES {
-                        tracing::warn!(
-                            collection = %self.collection_id,
-                            "lightning window hit the {MAX_JOIN_STRIKES}-row cap; flash counts may undercount this generation"
-                        );
-                    }
                     // Carry each strike's reported attributes through the
                     // projection, so the per-cell IC/CG and polarity tallies
                     // have something to count (#616).
@@ -1143,7 +1198,74 @@ impl NowcastEngine {
             field,
             interval_secs: interval.num_seconds() as f64,
             cells,
+            coasting,
+            coast_at: previous_at,
         })
+    }
+
+    /// Bounded boot replay, retaining only cells and one frame at a time.
+    /// Gaps/unreadable frames break continuity; no invented observations.
+    fn replay_tracks(
+        &self,
+        info: &RasterInfo,
+        geom: GridGeom,
+        anchor: DateTime<Utc>,
+        scale: PixelScale,
+    ) -> TrackReplay {
+        let mut tracks = Vec::new();
+        let mut coasts = Vec::new();
+        let mut at = anchor;
+        let mut coast_at = anchor;
+        let field = MotionField {
+            block: 1,
+            bw: 1,
+            bh: 1,
+            u: vec![0.0],
+            v: vec![0.0],
+            measured: vec![false],
+        };
+        let times: Vec<_> = info
+            .times
+            .iter()
+            .copied()
+            .filter(|t| *t < anchor)
+            .rev()
+            .take(CELL_HISTORY_SNAPSHOTS)
+            .collect();
+        for time in times.into_iter().rev() {
+            let run = self.source.resolve_reference_time(Some(time), None);
+            let frame = match self.fetch_frame(&geom, time, run) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    tracing::warn!(collection = %self.collection_id, %time,
+                        "cell bootstrap frame skipped: {error}");
+                    tracks.clear();
+                    coasts.clear();
+                    at = time;
+                    coast_at = time;
+                    continue;
+                }
+            };
+            let grid = frame_to_grid(&frame, geom.width as usize, geom.height as usize);
+            let (blobs, _) = segment_cells_labeled(&grid, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX);
+            let dt = (time - at).num_seconds().max(1) as f32;
+            let (next, next_coasts, _) = advance_tracks_coasting(
+                &tracks,
+                &coasts,
+                blobs,
+                scale,
+                &field,
+                dt,
+                (time - coast_at).num_seconds().max(1) as f32,
+                dt,
+                || self.next_track_id.fetch_add(1, Ordering::Relaxed),
+            );
+            tracks = next;
+            coasts = next_coasts;
+            coast_at = at;
+            at = time;
+        }
+        (tracks, coasts, at, coast_at)
     }
 
     /// Fetch one source frame on the working WGS84 grid.
@@ -1569,6 +1691,7 @@ fn score_cells(
                 // Tri-state preserved: None here covers both "no source
                 // wired" and "join skipped"; the served property set
                 // distinguishes them via the engine's `lightning` flag.
+                lightning_coverage: t.lightning_coverage,
                 lightning: t.flash_count.map(|count| LightningFacts {
                     flash_count: count,
                     flash_rate_per_min: t
@@ -1668,6 +1791,7 @@ fn cell_filterables(
     ];
     if lightning {
         names.extend([
+            "lightning_coverage",
             "flash_count",
             "flash_rate_per_min",
             "cg_count",
@@ -1877,6 +2001,12 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
     // absent means "not measured", null means "join skipped this
     // generation" (source error), values mean measured (0 = quiet cell).
     if lightning {
+        props.insert(
+            "lightning_coverage".into(),
+            t.lightning_coverage
+                .map(PropertyValue::Bool)
+                .unwrap_or(PropertyValue::Null),
+        );
         props.insert(
             "flash_count".into(),
             t.lightning

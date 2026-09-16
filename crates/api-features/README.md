@@ -142,3 +142,12 @@ Related issues: #605 sortby · #532 pagination without materializing · #503
 PostGIS events items · #408 LineString · #119 ErrorReason · #127 MVT ·
 #138 vector-tile cache key · #303 Part 4 search follow-ups · #306 shared
 content-negotiation glue.
+
+Nowcast tracks survive one missed detection for reassociation only: the missing
+cell is absent from that generation's features, and `track_age` counts observed
+frames. Startup reconstructs up to 48 retained source frames without publishing
+historical forecast runs. Lightning fields require explicitly known source
+coverage of the labeled footprint and attribution radius. With a source wired,
+`lightning_coverage` is `true`, `false`, or `null` (unknown); flash fields are null
+outside/unknown coverage and on failed or capped joins. An advertised source
+extent alone does not establish coverage.

@@ -75,6 +75,12 @@ impl EventAttrs {
 ///   a request-handler task — the same rules as `ds-storage`
 ///   (root CLAUDE.md rule 7).
 pub trait EventSource: Send + Sync {
+    /// Does the source guarantee detection over this entire CRS84 footprint?
+    /// None means unknown. This is network metadata, never event-derived extent.
+    fn covers(&self, _bbox: [f64; 4]) -> Option<bool> {
+        None
+    }
+
     fn recent_events(
         &self,
         start: DateTime<Utc>,

@@ -557,3 +557,12 @@ suspicious but workable (WARN — the collection still loads).
 - This README: [#112](https://github.com/mrauhala/meteocore/issues/112)
 - Workspace guide: `/CLAUDE.md` (architecture rules, config format, admin
   endpoints)
+
+For nowcast lightning joins, set `[postgis.observations].coverage_bbox` only to a
+CRS84 rectangle over which the network guarantees detection. This is separate
+from `extent_bbox`, which advertises the data's spatial extent. No coverage
+configuration means unknown coverage and null nowcast flash counts. A cell's
+whole labeled footprint and 10 km attribution radius must fit inside the
+coverage rectangle. Use a conservative rectangle for an irregular network;
+polygonal detection footprints are not yet supported. Do not infer coverage
+from the bounding box of recent strikes or from administrative borders.
