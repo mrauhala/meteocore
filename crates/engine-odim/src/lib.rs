@@ -29,6 +29,7 @@ pub mod pvol;
 pub mod quantities;
 pub mod reader;
 pub mod volume_engine;
+pub mod voxel_diagnostics;
 
 pub use cells::cell_set_cache_metrics;
 pub use engine::{composite_cache_metrics, EngineError, OdimEngine};

@@ -139,6 +139,16 @@ in `crates/api-3dtiles/CLAUDE.md`.
   `(radius, height)` column once (`ColumnTarget`) instead of per-cell
   lookups.
 
+## Quantitative voxel validation (#641)
+
+`examples/voxel_validation.rs` compares the production grid against all native
+gates of the exact requested quantity. `voxel_diagnostics` contains the offline
+range-band comparison and declared beam-support integration model, with
+fixture-free regression tests. See [method and measured baseline](../../docs/odim-voxel-validation.md).
+The beam width is an assumption; its VIL-like integrals are not ground truth.
+Nearest sampling can miss peaks and extend echoes vertically; larger grids do
+not guarantee monotonic improvement. This baseline does not enable #642.
+
 ## Storm cells (#367)
 
 - `ds_core::cells` segments a `VoxelGrid` into `StormCell`s on the
