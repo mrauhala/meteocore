@@ -2945,6 +2945,105 @@
           "legendFormat": "jemalloc active"
         }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Raster render memory admission",
+      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Separate from source decoding and resident caches.",
+      "id": 61,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 182
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "render_budget_total_bytes - render_budget_available_bytes",
+          "refId": "A",
+          "legendFormat": "reserved"
+        },
+        {
+          "expr": "render_budget_total_bytes",
+          "refId": "B",
+          "legendFormat": "budget"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Raster memory rejections",
+      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Separate from source decoding and resident caches.",
+      "id": 62,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 182
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(render_budget_rejected_total[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "rejected/s"
+        }
+      ]
     }
   ]
 }

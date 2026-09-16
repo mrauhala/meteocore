@@ -2627,3 +2627,11 @@ mod parameter_styles {
         );
     }
 }
+
+#[tokio::test]
+async fn oversized_render_is_rejected_by_memory_admission() {
+    let (status, headers, _) =
+        get_raw("/collections/radar/map?bbox=20,60,30,70&width=8000&height=8000").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
+}

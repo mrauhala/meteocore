@@ -149,3 +149,10 @@ client could spoof the emitted self-links (open-redirect risk downstream).
   and the graceful-shutdown block at the end of `main` (bug #442 was a
   missing boot-path spawn for `cap_engines`; the shutdown block had also
   silently skipped cap, postgis and nowcast).
+
+- Raster memory admission uses the process-wide `ds_render::budget::RENDER_MEMORY`,
+  configured by `MC_RENDER_MEMORY_MB` (default 1024 MiB; restart to change).
+  It deliberately survives reloads so old and new render tasks share one limit.
+  The 32-byte/output-pixel estimate covers output buffers/scratch, not source
+  decoding or resident caches. At the default, the 8000×8000 format limit exceeds
+  the memory budget and returns 503; operators can raise the budget explicitly.
