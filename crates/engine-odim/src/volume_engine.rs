@@ -3418,11 +3418,37 @@ impl ds_core::radar_sites::RadarSiteSource for PolarVolumeEngine {
 }
 
 impl FeatureEngine for PolarVolumeEngine {
+    fn filterables(&self) -> ds_core::feature::FilterableProperties {
+        static NAMES: std::sync::LazyLock<ds_core::feature::FilterableProperties> =
+            std::sync::LazyLock::new(|| {
+                Arc::new(
+                    [
+                        "nod",
+                        "name",
+                        "wmo",
+                        "longitude",
+                        "latitude",
+                        "antenna_height_m",
+                        "quantities",
+                        "elevation_angles",
+                        "coverage_radius_m",
+                        "latest_volume_time",
+                        "volume_count",
+                        "collection",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                )
+            });
+        NAMES.clone()
+    }
+
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let catalog = self.catalog.load();
         // `sorted_nods` is pre-sorted at catalog-build time, so paging is
         // deterministic with no per-request sort — just look up, filter, page.
-        let filtered: Vec<(&String, &SiteMeta)> = catalog
+        let mut filtered: Vec<(&String, &SiteMeta)> = catalog
             .sorted_nods
             .iter()
             .filter_map(|nod| catalog.by_site_meta.get(nod).map(|m| (nod, m)))
@@ -3446,6 +3472,14 @@ impl FeatureEngine for PolarVolumeEngine {
             })
             .collect();
 
+        if !query.property_filters.is_empty() {
+            filtered.retain(|(nod, m)| {
+                ds_core::feature::matches_property_filters(
+                    &self.site_to_feature(nod, m),
+                    &query.property_filters,
+                )
+            });
+        }
         let number_matched = filtered.len();
         let offset = query.offset.min(number_matched);
         // Mirror `CsvEngine::get_features`: `limit` is taken verbatim (`0` ⇒ an
@@ -6920,6 +6954,28 @@ mod tests {
             vec![entry(synthetic_volume(21.0, 60.0), "v0")],
         );
         engine_for(by_site, "radar-fi-volume-local-h5")
+    }
+
+    #[test]
+    fn site_property_filters_apply_before_paging() {
+        let engine = two_site_engine();
+        let mut query = FeatureQuery {
+            property_filters: vec![
+                ("nod".into(), "fivih".into()),
+                ("quantities".into(), "DBZH".into()),
+            ],
+            limit: 1,
+            ..Default::default()
+        };
+        let page = engine.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.features[0].id, "fivih");
+        query.offset = 1;
+        let page = engine.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 1);
+        assert!(page.features.is_empty());
+        query.property_filters[1].1 = "nonexistent".into();
+        assert_eq!(engine.get_features(&query).unwrap().number_matched, 0);
     }
 
     #[test]

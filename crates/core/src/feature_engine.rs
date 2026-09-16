@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
-use crate::feature::{Feature, FeaturePage, FeatureQuery};
+use crate::feature::{Feature, FeaturePage, FeatureQuery, FilterableProperties};
 
 pub trait FeatureEngine: Send + Sync {
     /// Get a page of features matching the query.
@@ -37,6 +37,16 @@ pub trait FeatureEngine: Send + Sync {
     /// which already incorporates it.
     fn sortables(&self) -> &[&'static str] {
         &[]
+    }
+
+    /// Properties accepted as Part 1 equality filters. Engines must apply
+    /// them before paging and number_matched, using the shared matcher.
+    /// Dynamic names belong in a prebuilt snapshot, never a per-request scan.
+    /// Empty means no property filtering; the API rejects unknown names.
+    fn filterables(&self) -> FilterableProperties {
+        static EMPTY: std::sync::LazyLock<FilterableProperties> =
+            std::sync::LazyLock::new(Default::default);
+        EMPTY.clone()
     }
 
     /// Spatial extent as [west, south, east, north], if available.

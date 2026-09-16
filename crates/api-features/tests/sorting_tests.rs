@@ -36,6 +36,30 @@ fn feature(id: &str, score: Option<f64>, size: i64) -> Feature {
         },
     );
     m.insert("size".to_string(), PropertyValue::Integer(size));
+    m.insert("bbox".into(), PropertyValue::String("source field".into()));
+    m.insert(
+        "filter".into(),
+        PropertyValue::String("source field".into()),
+    );
+    m.insert(
+        "awareness_type".into(),
+        PropertyValue::String(
+            if size == 20 {
+                "other"
+            } else {
+                "1; Wind + rain & snow=雪#?%"
+            }
+            .into(),
+        ),
+    );
+    m.insert(
+        "impacts".into(),
+        PropertyValue::List(vec![
+            PropertyValue::String("roads".into()),
+            PropertyValue::String("homes".into()),
+        ]),
+    );
+    m.insert("producer:key &=".into(), PropertyValue::String("".into()));
     Feature {
         id: id.into(),
         geometry: Arc::new(Geometry::Point { x: 24.0, y: 60.0 }),
@@ -45,28 +69,37 @@ fn feature(id: &str, score: Option<f64>, size: i64) -> Feature {
 
 struct SortableEngine {
     features: Vec<Feature>,
+    filterables: FilterableProperties,
 }
 
 impl SortableEngine {
     fn new() -> Self {
+        let features = vec![
+            feature("mid", Some(0.5), 30),
+            feature("top", Some(0.9), 10),
+            feature("nul", None, 20),
+            feature("low", Some(0.1), 40),
+        ];
+        let filterables = property_names(features.iter().map(|f| f.properties.as_ref()));
         Self {
-            features: vec![
-                feature("mid", Some(0.5), 30),
-                feature("top", Some(0.9), 10),
-                feature("nul", None, 20),
-                feature("low", Some(0.1), 40),
-            ],
+            features,
+            filterables,
         }
     }
 }
 
 impl FeatureEngine for SortableEngine {
+    fn filterables(&self) -> FilterableProperties {
+        self.filterables.clone()
+    }
+
     fn sortables(&self) -> &[&'static str] {
         &["score", "size"]
     }
 
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let mut all: Vec<Feature> = self.features.clone();
+        all.retain(|f| matches_property_filters(f, &query.property_filters));
         // Before paging — the contract sortables() opts into.
         sort_features(&mut all, &query.sortby);
         let number_matched = all.len();
@@ -475,4 +508,107 @@ async fn sortby_is_declared_with_the_schema_the_standard_requires() {
             "{path} must reference the sortby parameter"
         );
     }
+}
+
+#[tokio::test]
+async fn property_filters_reject_unknown_and_unsupported_parameters() {
+    for name in [
+        "typo",
+        "f",
+        "crs",
+        "bbox-crs",
+        "filter",
+        "filter-lang",
+        "filter-crs",
+        "properties",
+    ] {
+        let (status, doc) = get(&format!("/collections/sortable/items?{name}=value")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        let message = doc["description"].as_str().unwrap();
+        assert!(message.contains(name) && message.contains("awareness_type"));
+    }
+    let (status, doc) = get("/collections/plain/items?name=Helsinki").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(doc["description"].as_str().unwrap().contains("none"));
+    for query in ["limit=1&limit=2", "offset=-1", "limit=bad", "bbox=1&bbox=2"] {
+        assert_eq!(
+            get(&format!("/collections/sortable/items?{query}")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[tokio::test]
+async fn property_filters_survive_paging_sorting_and_url_encoding() {
+    let filters = [
+        ("awareness_type", "1; Wind + rain & snow=雪#?%"),
+        ("impacts", "roads"),
+        ("impacts", "homes"),
+        ("producer:key &=", ""),
+    ];
+    let encoded = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(filters)
+        .finish();
+    let (status, first) = get(&format!("/collections/sortable/items?limit=1&sortby=-score&bbox=20,50,30,70&datetime=2026-01-01T00:00:00.500Z&{encoded}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["numberMatched"], 3);
+    assert_eq!(ids(&first), ["top"]);
+    let link = |doc: &Value, rel: &str| -> String {
+        doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == rel)
+            .unwrap()["href"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let next = link(&first, "next");
+    let (_, second) = get(next.strip_prefix("http://test/features").unwrap()).await;
+    assert_eq!(second["numberMatched"], 3);
+    assert_eq!(ids(&second), ["mid"]);
+    for rel in ["self", "prev", "next"] {
+        let href = link(&second, rel);
+        let pairs: Vec<_> = form_urlencoded::parse(href.split_once('?').unwrap().1.as_bytes())
+            .into_owned()
+            .collect();
+        for (key, value) in filters {
+            assert!(pairs.contains(&(key.into(), value.into())), "{href}");
+        }
+        assert!(pairs.contains(&("sortby".into(), "-score".into())));
+        assert!(pairs.contains(&("datetime".into(), "2026-01-01T00:00:00.500Z".into())));
+    }
+    let prev = link(&second, "prev");
+    let (_, back) = get(prev.strip_prefix("http://test/features").unwrap()).await;
+    assert_eq!(ids(&back), ids(&first));
+    let (_, none) = get("/collections/sortable/items?size=10&size=30").await;
+    assert_eq!(
+        none["numberMatched"], 0,
+        "repeated predicates must not be dropped"
+    );
+}
+
+#[tokio::test]
+async fn openapi_advertises_collection_property_filters() {
+    let (_, doc) = get("/api").await;
+    let params = doc["paths"]["/features/collections/sortable/items"]["get"]["parameters"]
+        .as_array()
+        .unwrap();
+    let p = params
+        .iter()
+        .find(|p| p["name"] == "awareness_type")
+        .unwrap();
+    assert_eq!(p["in"], "query");
+    assert_eq!(p["schema"]["type"], "string");
+    assert!(
+        !params
+            .iter()
+            .any(|p| p["name"] == "bbox" || p["name"] == "filter"),
+        "reserved source names must not shadow API controls"
+    );
+    let plain = doc["paths"]["/features/collections/plain/items"]["get"]["parameters"]
+        .as_array()
+        .unwrap();
+    assert!(!plain.iter().any(|p| p["name"] == "awareness_type"));
 }

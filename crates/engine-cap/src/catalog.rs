@@ -100,6 +100,7 @@ impl RTreeObject for IndexedArea {
 #[derive(Clone)]
 pub struct Catalog {
     pub records: Vec<AreaRecord>,
+    pub filterables: ds_core::feature::FilterableProperties,
     id_index: HashMap<String, usize>,
     tree: RTree<IndexedArea>,
     pub spatial_extent: Option<[f64; 4]>,
@@ -124,6 +125,7 @@ impl Catalog {
     pub fn empty(parameter: &str, as_of: DateTime<Utc>) -> Self {
         Catalog {
             records: Vec::new(),
+            filterables: Default::default(),
             id_index: HashMap::new(),
             tree: RTree::new(),
             spatial_extent: None,
@@ -259,7 +261,10 @@ impl Catalog {
         let temporal_extent = compute_temporal_extent(&records, as_of);
         let info = Arc::new(base_raster_info(parameter, spatial_extent, times));
 
+        let filterables =
+            ds_core::feature::property_names(records.iter().map(|r| r.properties.as_ref()));
         Catalog {
+            filterables,
             records,
             id_index,
             tree,

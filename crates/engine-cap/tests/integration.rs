@@ -633,3 +633,73 @@ fn instant(t: DateTime<Utc>) -> DatetimeInterval {
         end: Some(t),
     }
 }
+
+#[test]
+fn property_filters_match_producer_values_and_lists_with_spacetime_and_paging() {
+    let eng = engine(None);
+    for name in [
+        "awareness_type",
+        "awareness_level",
+        "impacts",
+        "category",
+        "eventCode:OET",
+        "parameter:severity",
+        "severity",
+        "event",
+        "language",
+        "msgType",
+        "status",
+    ] {
+        assert!(eng.filterables().contains(name), "{name}");
+    }
+    let mut query = FeatureQuery {
+        bbox: Some(Bbox::new(24.8, 60.0, 25.2, 60.4).unwrap()),
+        datetime: Some(instant(at(2026, 6, 15, 12))),
+        property_filters: vec![
+            ("awareness_type".into(), "12; Flooding".into()),
+            ("impacts".into(), "Cellars may take in water.".into()),
+            ("category".into(), "Met".into()),
+        ],
+        limit: 1,
+        ..Default::default()
+    };
+    let page = eng.get_features(&query).unwrap();
+    assert_eq!(page.number_matched, 1);
+    assert!(page.features[0].id.contains("helsinki-flood"));
+    query.offset = 1;
+    let page = eng.get_features(&query).unwrap();
+    assert_eq!(page.number_matched, 1);
+    assert_eq!(page.number_returned, 0);
+    assert_eq!(page.next_offset, None);
+    query.offset = 0;
+    query.property_filters[0].1 = "Flooding".into();
+    assert_eq!(
+        eng.get_features(&query).unwrap().number_matched,
+        0,
+        "no substring match"
+    );
+    query.property_filters[0].1 = "12; Flooding".into();
+    query.bbox = Some(Bbox::new(0.0, 0.0, 1.0, 1.0).unwrap());
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, 0);
+    query.bbox = None;
+    query.datetime = Some(instant(at(2000, 1, 1, 0)));
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, 0);
+}
+
+#[test]
+fn filterable_names_follow_catalog_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let xml = std::fs::read_to_string(fixtures_dir().join("helsinki-flood.xml")).unwrap();
+    let path = dir.path().join("alert.xml");
+    std::fs::write(&path, &xml).unwrap();
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "dynamic").unwrap();
+    assert!(eng.filterables().contains("awareness_type"));
+    std::fs::write(
+        &path,
+        xml.replace("awareness_type", "new_producer_property"),
+    )
+    .unwrap();
+    eng.refresh().unwrap();
+    assert!(eng.filterables().contains("new_producer_property"));
+    assert!(!eng.filterables().contains("awareness_type"));
+}

@@ -564,6 +564,10 @@ async fn resolve_for_apply(
 // ---------------------------------------------------------------------------
 
 impl ds_core::feature_engine::FeatureEngine for CapEngine {
+    fn filterables(&self) -> ds_core::feature::FilterableProperties {
+        self.snapshot().filterables.clone()
+    }
+
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let cat = self.snapshot();
 
@@ -579,6 +583,12 @@ impl ds_core::feature_engine::FeatureEngine for CapEngine {
             indices.retain(|&i| cat.records[i].window.intersects(dt.start, dt.end));
         }
 
+        indices.retain(|&i| {
+            ds_core::feature::matches_property_values(
+                &cat.records[i].properties,
+                &query.property_filters,
+            )
+        });
         let number_matched = indices.len();
         let offset = query.offset.min(number_matched);
         let end = offset.saturating_add(query.limit).min(number_matched);

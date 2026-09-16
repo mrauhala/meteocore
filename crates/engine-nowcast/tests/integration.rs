@@ -1027,6 +1027,30 @@ fn cell_features_are_served_and_tracks_persist() {
     let page = engine.get_features(&FeatureQuery::default()).unwrap();
     let f = &page.features[0];
     assert_eq!(f.id, id1, "track id persists across generations");
+    for name in f.properties.keys() {
+        assert!(engine.filterables().contains(name), "{name}");
+    }
+    assert!(!engine.filterables().contains("lightning_jump"));
+    let mut filtered = FeatureQuery {
+        property_filters: vec![
+            ("track_age".into(), "2".into()),
+            ("likely_clutter".into(), "false".into()),
+        ],
+        limit: 1,
+        ..Default::default()
+    };
+    assert_eq!(engine.get_features(&filtered).unwrap().number_matched, 1);
+    filtered.offset = 1;
+    assert_eq!(engine.get_features(&filtered).unwrap().number_returned, 0);
+    filtered.offset = 0;
+    filtered.property_filters[0].1 = "1".into();
+    assert_eq!(engine.get_features(&filtered).unwrap().number_matched, 0);
+    filtered.datetime = Some(ds_core::feature::DatetimeInterval {
+        start: Some(anchor1),
+        end: Some(anchor1),
+    });
+    assert_eq!(engine.get_features(&filtered).unwrap().number_matched, 1);
+
     assert!(matches!(
         f.properties.get("track_age"),
         Some(PropertyValue::Integer(2))

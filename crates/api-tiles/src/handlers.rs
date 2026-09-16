@@ -1287,6 +1287,7 @@ async fn render_vector_tile(
         // the client; a server-side order would cost a sort per tile and
         // change nothing the client can observe.
         sortby: Vec::new(),
+        property_filters: Vec::new(),
     };
 
     let page = engine

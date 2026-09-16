@@ -301,6 +301,7 @@ pub struct NowcastEngine {
     /// accessor is a borrow — same effect as the four-constant version it
     /// replaces, with one source of truth instead of four to keep in step.
     sortables: Vec<&'static str>,
+    filterables: ds_core::feature::FilterableProperties,
     /// Significance ranking for tracked cells: the default weight table with
     /// any per-collection overrides applied. Validated at construction, so a
     /// typo in a weight name fails the collection at load rather than
@@ -422,6 +423,7 @@ impl NowcastEngine {
             impact: None,
             radar: None,
             sortables: SORTABLES_BASE.to_vec(),
+            filterables: cell_filterables(false, false, false),
             scorer,
         })
     }
@@ -550,6 +552,11 @@ impl NowcastEngine {
             v.extend(crate::radar::SORTABLES_RADAR_EXTRAS);
         }
         self.sortables = v;
+        self.filterables = cell_filterables(
+            self.lightning.is_some(),
+            self.impact.is_some(),
+            self.radar.is_some(),
+        );
     }
 
     /// Poll the source for a new frame; spawn on the BACKGROUND runtime only.
@@ -1635,6 +1642,60 @@ fn score_cells(
         .collect()
 }
 
+/// Resolve the accepted property groups once when sources are wired.
+fn cell_filterables(
+    lightning: bool,
+    impact: bool,
+    radar: bool,
+) -> ds_core::feature::FilterableProperties {
+    let mut names = vec![
+        "severity",
+        "max_dbz",
+        "area_km2",
+        "track_age",
+        "net_displacement_km",
+        "path_straightness",
+        "deviant_mover",
+        "likely_clutter",
+        "speed_ms",
+        "bearing_deg",
+        "observed",
+        "significance",
+        "significance_rank",
+        "significance_reasons",
+        "volume_trend",
+        "intensity_trend_dbz_min",
+    ];
+    if lightning {
+        names.extend([
+            "flash_count",
+            "flash_rate_per_min",
+            "cg_count",
+            "ic_count",
+            "cg_polarity_known",
+            "positive_cg_fraction",
+            "flash_density_per_km2",
+            "jump_sigma",
+            "first_flash",
+            "lightning_jump",
+        ]);
+    }
+    if impact {
+        names.extend(["impact_over", "impact_approaching", "impact_eta_minutes"]);
+    }
+    if radar {
+        names.extend([
+            "nearest_radar_id",
+            "nearest_radar_name",
+            "nearest_radar_distance_km",
+            "in_radar_coverage",
+            "beam_height_m",
+            "beam_elevation_deg",
+        ]);
+    }
+    Arc::new(names.into_iter().map(String::from).collect())
+}
+
 /// Build one cell feature from its fact sheet and score. Shared by
 /// `get_features` and `get_feature` so the two paths cannot drift (and the
 /// by-id path needn't materialize every cell).
@@ -2187,6 +2248,10 @@ impl EdrEngine for NowcastEngine {
 }
 
 impl FeatureEngine for NowcastEngine {
+    fn filterables(&self) -> ds_core::feature::FilterableProperties {
+        self.filterables.clone()
+    }
+
     /// Tracked cells as Point features (#544/#548). With no `datetime`,
     /// the latest snapshot is served; `datetime` selects the NEWEST retained
     /// snapshot whose analysis instant falls inside the interval (history
@@ -2222,7 +2287,8 @@ impl FeatureEngine for NowcastEngine {
                         return None;
                     }
                 }
-                Some(feature)
+                ds_core::feature::matches_property_filters(&feature, &query.property_filters)
+                    .then_some(feature)
             })
             .collect();
         // BEFORE paging: slicing first and sorting the slice would return the

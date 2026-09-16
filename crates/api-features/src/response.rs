@@ -101,6 +101,7 @@ pub fn preserved_query(
     bbox: Option<&Bbox>,
     datetime: Option<&DatetimeInterval>,
     sortby: &[SortKey],
+    property_filters: &[(String, String)],
 ) -> String {
     let mut q = String::new();
     if let Some(b) = bbox {
@@ -139,6 +140,14 @@ pub fn preserved_query(
             })
             .collect();
         q.push_str(&format!("&sortby={}", terms.join(",")));
+    }
+    if !property_filters.is_empty() {
+        q.push('&');
+        q.push_str(
+            &form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(property_filters.iter().map(|(k, v)| (k, v)))
+                .finish(),
+        );
     }
     q
 }

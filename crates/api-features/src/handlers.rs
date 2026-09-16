@@ -305,6 +305,28 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         });
+        // Part 1 §7.15.5–6 uses ordinary named query parameters, not CQL2.
+        // The catalog is a cheap snapshot, including producer-defined names.
+        if let Some(engine) = state.engines.get(id) {
+            let parameters = collection_paths[&items_path]["get"]["parameters"]
+                .as_array_mut()
+                .unwrap();
+            for name in engine
+                .filterables()
+                .iter()
+                .filter(|n| !crate::params::is_reserved_parameter(n))
+            {
+                parameters.push(json!({
+                    "name": name,
+                    "in": "query",
+                    "required": false,
+                    "description": "Exact, case-sensitive property equality (OGC API Features Part 1 §7.15.5–6). Lists match any element; numbers and booleans use canonical string form; null/missing never match. All predicates, including repeated names, are ANDed before paging.",
+                    "style": "form",
+                    "explode": false,
+                    "schema": {"type": "string"}
+                }));
+            }
+        }
         collection_paths[&item_path] = json!({
             "get": {
                 "summary": format!("Get a single feature from {}", config.title),
@@ -680,12 +702,22 @@ pub async fn collection(
 
 pub async fn items(
     Path(id): Path<String>,
-    Query(params): Query<ItemsQueryParams>,
+    Query(pairs): Query<Vec<(String, String)>>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
+    let bad_request = |e: ds_core::error::DataServerError| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    };
+    let params = ItemsQueryParams::from_pairs(pairs).map_err(bad_request)?;
+    params
+        .validate_filters(&engine.filterables())
+        .map_err(bad_request)?;
 
     let bbox = params
         .bbox
@@ -746,6 +778,7 @@ pub async fn items(
         offset,
         datetime,
         sortby,
+        property_filters: params.property_filters,
     };
 
     let page = engine.get_features(&query).map_err(|_| {
@@ -763,7 +796,12 @@ pub async fn items(
     // Carry the caller's filters and ordering onto the pagination links:
     // following `rel="next"` is the OGC-recommended pattern, and a next link
     // that drops them silently serves page 2 unfiltered and unsorted.
-    let filters = preserved_query(query.bbox.as_ref(), query.datetime.as_ref(), &query.sortby);
+    let filters = preserved_query(
+        query.bbox.as_ref(),
+        query.datetime.as_ref(),
+        &query.sortby,
+        &query.property_filters,
+    );
     let mut doc = feature_page_to_geojson(
         &page,
         &id,
