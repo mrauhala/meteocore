@@ -54,10 +54,16 @@ deterministic.
   nearest volume; `None` ⇒ latest). The collection JSON advertises a `times`
   manifest (`VolumeInfo.times`, RFC 3339 `…Z`, ascending; each value
   round-trips as `?datetime=`).
-- The viewer preloads one hidden tileset per timestamp —
-  **`preloadWhenHidden: true` is load-bearing** (a hidden tileset otherwise
-  fetches no tiles and the first reveal stalls) — and animates by toggling
-  `.show`: zero network per frame.
+- The viewer uses a global six-slot queue across control changes. A slot
+  covers tileset JSON AND root content loading; `fromUrl` alone is not readiness.
+  JSON loads use an abortable `Resource` subclass (preserved by `clone`) with a
+  timeout, so superseded/stalled metadata cannot permanently consume a slot.
+  Hidden loads use `preloadWhenHidden: true` until `tileLoad`, then disable it.
+  Only content-ready frames enter the cache/playback set; failures and canceled
+  loads are destroyed. Track load/unload through public Cesium events.
+- Refresh the manifest every minute and on returning to a visible tab. Preserve
+  controls, camera, cached frames, and historical seeks; follow new volumes when
+  viewing latest. Guard metadata fetches against out-of-order collection changes.
 - The viewer caps preload at the most recent `MAX_FRAMES` (48) so an
   unbounded source can't hold hundreds of tilesets. Frame count = the
   engine's retained volumes (`[odim] max_files`/`time_window`).
@@ -87,10 +93,13 @@ default; `?base=` override.
   encoded content bytes + ETag, keyed (collection, product, quantity,
   datetime, params, dims) **plus a data-version hashed from
   `VolumeInfo.times`** (new volume ⇒ new version — "latest"/nearest-time
-  invalidate without duplicating engine selection logic). Per-key
-  single-flight coalescing (concurrent identical requests share one compute;
-  only the computing request takes the semaphore).
-  `MC_3DTILES_CONTENT_CACHE_MB` (default 512, 0 disables).
+  invalidate without duplicating engine selection logic). Exact advertised
+  times use a stable version so new arrivals retain archived frames. Per-key
+  shared-result flights coalesce successes AND errors (including with retention
+  disabled). A cache-owned task finishes and caches an encode even if HTTP
+  waiters disconnect; RAII cleans up flights on panic. Blocking encodes own
+  semaphore permits through completion.
+  `MC_3DTILES_CONTENT_CACHE_MB` (default 512, 0 disables retention).
 - The engine-side `VOXEL_GRID_CACHE` is the second layer (see engine-odim
   notes).
 - **Cache-Control:** a `?datetime=` exactly matching an advertised volume
@@ -106,8 +115,12 @@ Add `"3dtiles"` to a collection's `apis` (only `odim-volume` supports it).
 v1 uses one shared reflectivity colormap; per-collection/per-quantity
 colormaps are follow-ups.
 
+Viewer regression tests: `node --test crates/api-3dtiles/tests/viewer.test.cjs`
+(delay metadata/content and check scheduling, failure, cancellation, refresh).
+These run in CI; WebGL/render verification remains a separate check.
+
 Point/mesh computations now use `ds-executor` admission: the shared bounded
 render queue and a 30 s queue/compute deadline. The raster 3 s default does not
 apply to these larger products. Their workers (and the separate voxel worker)
 retain CPU permits on client disconnection. Admission/deadline failures are
-503 + Retry-After. Coalesced cache waiters retain the existing per-key gate.
+503 + Retry-After. Coalesced cache waiters share the cache-owned result flight.

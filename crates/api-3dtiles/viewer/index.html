@@ -191,6 +191,7 @@ let frames = [];          // Cesium3DTileset per animated timestamp (parallel to
 let times = [];           // full volume-time manifest (ISO Z) from the collection doc
 let frameTimes = [];      // the timestamps actually animated = most-recent MAX_FRAMES of `times`
 let frameIdx = 0;         // active index into `frameTimes`
+let playbackIntent = 0; // user play/pause/seek changes invalidate deferred auto-resume
 let playing = false;      // animation running?
 let playTimer = null;     // setInterval handle while playing
 const FRAME_MS = 600;     // per-frame dwell when playing
@@ -206,6 +207,11 @@ let pointsFetchFloor = null; // the min_value (dBZ) the point-cloud frames were 
 let pointsStyleMin = null;   // the min currently applied to point styles (client-side filter)
 let legendData = null;    // colour-scale legend {title,unit,min,max,stops} from the collection doc
 let voxelPrimitive = null; // active Cesium VoxelPrimitive (the `voxels` representation)
+let metadataToken = 0;
+let metadataController = null;
+let metaCollection = null;
+let frameController = null;
+let refreshingTimes = false;
 
 async function loadCollections() {
   setStatus("loading collections…");
@@ -232,8 +238,18 @@ async function loadCollections() {
 async function loadCollectionMeta(reframe) {
   const id = $coll.value;
   if (!id) return;
+  const token = ++metadataToken;
+  metadataController?.abort();
+  metadataController = new AbortController();
+  ++loadToken;
+  frameController?.abort();
+  stopPlaying();
   try {
-    const data = await (await fetch(`${BASE}/collections/${encodeURIComponent(id)}`)).json();
+    const response = await fetch(`${BASE}/collections/${encodeURIComponent(id)}`, { signal: metadataController.signal });
+    if (!response.ok) throw new Error(`collection request failed (${response.status})`);
+    const data = await response.json();
+    if (token !== metadataToken || id !== $coll.value) return;
+    metaCollection = id;
     legendData = data.legend || null;
     buildLegend();
     // The volume time axis (ascending). Default to the latest frame so the static
@@ -268,7 +284,34 @@ async function loadCollectionMeta(reframe) {
     clearFrameCache();
     await loadFrames(reframe);
   } catch (e) {
-    setStatus("error loading collection — " + e, true);
+    if (token === metadataToken && e.name !== "AbortError") setStatus("error loading collection — " + e, true);
+  }
+}
+
+// Refresh only the manifest: retain controls, camera, and ready frame objects.
+// Follow newly arriving volumes when viewing latest; preserve a historical seek.
+async function refreshCollectionTimes() {
+  const id = metaCollection, token = metadataToken;
+  if (!id || id !== $coll.value || refreshingTimes || document.hidden) return;
+  refreshingTimes = true;
+  try {
+    const response = await fetch(`${BASE}/collections/${encodeURIComponent(id)}`, { cache: "no-cache" });
+    if (!response.ok) throw new Error(`collection request failed (${response.status})`);
+    const data = await response.json();
+    if (token !== metadataToken || id !== $coll.value) return;
+    const updated = Array.isArray(data.times) ? data.times : [];
+    if (updated.length === times.length && updated.every((t, i) => t === times[i])) return;
+    const selected = frameTimes[frameIdx];
+    const followLatest = currentRep === "voxels" || !selected || selected === times[times.length - 1];
+    const resumePlayback = playing;
+    times = updated;
+    const window = times.slice(-MAX_FRAMES);
+    frameIdx = followLatest ? Math.max(0, window.length - 1) : Math.max(0, window.indexOf(selected));
+    await loadFrames(false, resumePlayback, true);
+  } catch (e) {
+    console.warn("volume manifest refresh", e);
+  } finally {
+    refreshingTimes = false;
   }
 }
 
@@ -313,9 +356,10 @@ function buildLegend() {
 
 // The tileset.json URL for the active params at a given volume timestamp
 // (`time` = null → the server's latest-volume default, no `datetime`).
-function tilesetUrl(time) {
+function tilesetUrl(time, pointFloor = null) {
   const id = $coll.value, q = $qty.value, rep = $rep.value || "points";
-  const num = $num.value.trim();
+  const num = rep === "points" && pointFloor !== null
+    ? (Number.isFinite(pointFloor) ? String(pointFloor) : "") : $num.value.trim();
   let url = `${BASE}/collections/${encodeURIComponent(id)}/tileset.json?quantity=${encodeURIComponent(q)}`;
   if (rep === "isosurface" || rep === "echotop") {
     url += `&representation=${rep}`;
@@ -335,6 +379,8 @@ function tilesetUrl(time) {
 // frame. LRU-capped at the active frame set plus one full previous set; eviction
 // removes the tileset from the scene (the primitive collection's
 // destroyPrimitives:true destroys its GPU buffers on remove()).
+const readyFrames = new WeakSet();
+function isFrameReady(ts) { return !!ts && !ts.isDestroyed() && readyFrames.has(ts); }
 const tileCache = new Map(); // tileset URL → Cesium3DTileset (in scene.primitives, hidden)
 const TILE_CACHE_MAX = 2 * MAX_FRAMES;
 
@@ -350,6 +396,11 @@ function dropTileset(ts) {
 function cacheGet(url) {
   const ts = tileCache.get(url);
   if (!ts) return null;
+  if (!isFrameReady(ts)) {
+    tileCache.delete(url);
+    if (!ts.isDestroyed()) dropTileset(ts);
+    return null;
+  }
   tileCache.delete(url); tileCache.set(url, ts); // LRU bump
   return ts;
 }
@@ -395,6 +446,7 @@ function cachePut(url, ts) {
 // captures the generation it started under).
 let cacheGen = 0;
 function clearFrameCache() {
+  frameController?.abort();
   stopPlaying(); // don't leave the play timer ticking over an emptied `frames`
   cacheGen++;
   frames = [];
@@ -420,28 +472,114 @@ function clearVoxel() {
 // newest→oldest with bounded concurrency — instead of one unthrottled
 // Promise.all over all 48 (#379).
 const PRELOAD_CONCURRENCY = 6;
+const FRAME_LOAD_TIMEOUT_MS = 120000;
+const frameLoadQueue = [];
+let activeFrameLoads = 0;
+const frameAbort = () => new DOMException("Frame load superseded", "AbortError");
 
-async function loadFrames(reframe = false) {
+// Resource clones retain an abortable JSON loader; content URLs still resolve
+// against the original tileset URL and use Cesium's normal binary loaders.
+class FrameResource extends Cesium.Resource {
+  constructor(options, signal) { super(options); this.frameSignal = signal; }
+  clone(result) {
+    const copy = super.clone(result || new FrameResource({ url: this.url }, this.frameSignal));
+    copy.frameSignal = this.frameSignal;
+    return copy;
+  }
+  async fetchJson() {
+    const response = await fetch(this.url, {
+      signal: this.frameSignal, headers: { Accept: "application/json", ...this.headers },
+    });
+    if (!response.ok) throw new Error(`Tileset metadata HTTP ${response.status}`);
+    return response.json();
+  }
+}
+async function loadFrameMetadata(url, options, signal) {
+  if (signal.aborted) throw frameAbort();
+  const controller = new AbortController();
+  const abort = () => controller.abort(frameAbort());
+  signal.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("Tileset metadata load timed out")), FRAME_LOAD_TIMEOUT_MS);
+  try {
+    return await Cesium.Cesium3DTileset.fromUrl(new FrameResource({ url }, controller.signal), options);
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+// One queue across ALL builds. Cancellation aborts metadata fetches before
+// releasing their slots; a control change cannot multiply active requests.
+function queueFrameLoad(signal, load) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(frameAbort()); return; }
+    const job = { signal, load, resolve, reject, cancel: null };
+    job.cancel = () => {
+      const index = frameLoadQueue.indexOf(job);
+      if (index >= 0) { frameLoadQueue.splice(index, 1); reject(frameAbort()); }
+    };
+    signal.addEventListener("abort", job.cancel, { once: true });
+    frameLoadQueue.push(job);
+    drainFrameLoads();
+  });
+}
+function drainFrameLoads() {
+  while (activeFrameLoads < PRELOAD_CONCURRENCY && frameLoadQueue.length) {
+    const job = frameLoadQueue.shift();
+    job.signal.removeEventListener("abort", job.cancel);
+    if (job.signal.aborted) { job.reject(frameAbort()); continue; }
+    activeFrameLoads++;
+    Promise.resolve().then(job.load).then(job.resolve, job.reject).finally(() => {
+      activeFrameLoads--;
+      drainFrameLoads();
+    });
+  }
+}
+
+// These API tilesets have one root content tile. `tilesLoaded` / metadata
+// readiness can be true when offscreen with NO content, so wait for tileLoad.
+// Resolve only from the event; scene/cache mutations happen after traversal.
+function waitForFrameContent(ts, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(frameAbort()); return; }
+    if (isFrameReady(ts)) { resolve(); return; }
+    let timer;
+    const cleanup = () => {
+      removeLoaded(); removeFailed();
+      signal.removeEventListener("abort", aborted);
+      clearTimeout(timer);
+    };
+    const loaded = (tile) => { if (tile === ts.root) { cleanup(); resolve(); } };
+    const failed = (error) => { cleanup(); reject(new Error(error.message || "Tile content failed")); };
+    const aborted = () => { cleanup(); reject(frameAbort()); };
+    const removeLoaded = ts.tileLoad.addEventListener(loaded);
+    const removeFailed = ts.tileFailed.addEventListener(failed);
+    signal.addEventListener("abort", aborted, { once: true });
+    timer = setTimeout(() => failed({ message: "Tile content load timed out" }), FRAME_LOAD_TIMEOUT_MS);
+  });
+}
+
+async function loadFrames(reframe = false, resumePlayback = false, refresh = false) {
   const id = $coll.value, q = $qty.value, rep = $rep.value || "points";
   const num = $num.value.trim();
-  if (!id || !q) return;
+  if (!id || !q || id !== metaCollection) return;
+  frameController?.abort();
+  frameController = new AbortController();
+  const signal = frameController.signal;
   const token = ++loadToken;
+  const playIntent = playbackIntent;
   const gen = cacheGen; // cache generation this build belongs to
   stopPlaying();
   hideFrames();
   clearVoxel();
+  const retainedFloor = refresh && currentRep === "points" ? pointsFetchFloor : null;
   currentRep = rep;
-  pointsFetchFloor = rep === "points" ? (num === "" ? -Infinity : parseFloat(num)) : null;
+  pointsFetchFloor = rep === "points" ? (retainedFloor ?? (num === "" ? -Infinity : parseFloat(num))) : null;
 
-  // Voxels are a CesiumJS VoxelPrimitive (ray-marched volume), not a tileset of
-  // tiles — their own load path. MVP: pin to the LATEST volume (no frame
-  // preload/animation — voxel time-dynamic playback is a #351 follow-up). Force
-  // a single-entry `frameTimes` so `syncTimeBar()` keeps the bar hidden: the
-  // scrubber drives `showFrame()` over `frames[]` (always empty for voxels), so
-  // on a multi-volume collection a shown bar would be inert. (`frameTimes[0] =
-  // null` → `loadVoxel` requests the server's latest-volume default.)
+  // Voxels use one ray-marched primitive, without animation. Pin the latest
+  // advertised time so the periodic manifest refresh advances this view too.
   if (rep === "voxels") {
-    frameTimes = [null];
+    frameTimes = [times[times.length - 1] || null];
     frameIdx = 0;
     syncTimeBar();
     await loadVoxel(token);
@@ -457,11 +595,12 @@ async function loadFrames(reframe = false) {
 
   // Satisfy what we can from the frame cache, then show it immediately — a
   // control toggled back to cached params renders with zero network.
-  const urls = frameTimes.map((t) => tilesetUrl(t));
+  const urls = frameTimes.map((t) => tilesetUrl(t, pointsFetchFloor));
   frames = urls.map((u) => cacheGet(u));
-  if (rep === "points") applyPointStyle(pointsFetchFloor);
+  if (rep === "points") applyPointStyle(num === "" ? -Infinity : parseFloat(num));
   syncTimeBar();
   showFrame(frameIdx);
+  if (resumePlayback) startPlaying();
 
   // Load order for the misses: the active frame first (it's what's on screen),
   // then the rest newest→oldest so recent frames fill in first.
@@ -469,7 +608,7 @@ async function loadFrames(reframe = false) {
   if (!frames[frameIdx]) pending.push(frameIdx);
   for (let i = frames.length - 1; i >= 0; i--) if (i !== frameIdx && !frames[i]) pending.push(i);
   const progress = () => {
-    const done = frames.filter(Boolean).length;
+    const done = frames.filter(isFrameReady).length;
     setStatus(`loading ${id} · ${q} · ${rep} · frame ${done}/${frameTimes.length}${capped}…`);
   };
   if (pending.length) progress();
@@ -477,8 +616,7 @@ async function loadFrames(reframe = false) {
   // Reframe the camera as soon as the active frame exists (cached, or first to
   // load) — don't hold the view hostage to the background fill.
   let needReframe = reframe;
-  const maybeReframe = async () => {
-    const ts = frames[frameIdx];
+  const maybeReframe = async (ts = frames[frameIdx]) => {
     if (!needReframe || !ts) return;
     needReframe = false;
     try {
@@ -493,39 +631,50 @@ async function loadFrames(reframe = false) {
   await maybeReframe();
   if (token !== loadToken) return; // superseded during the zoomTo animation
 
-  // Bounded-concurrency fill: PRELOAD_CONCURRENCY workers pull from `pending`.
-  // Each frame is created hidden; `preloadWhenHidden` is load-bearing — without
-  // it a hidden tileset doesn't fetch tiles, so the first reveal would stall.
-  // `fromUrl` rejects on a 4xx (e.g. no data) → that slot stays null. A build
-  // superseded by a control change still caches what it fetched (it may be
-  // toggled back to) and just stops touching the live `frames`; a build that
-  // raced past a collection-switch clearFrameCache (gen mismatch) discards
-  // instead — its tilesets belong to the dropped collection.
+  // Only content-ready tilesets enter frames/cache. Failed or aborted loads
+  // are destroyed, so playback never mistakes successful JSON for a frame.
   let next = 0;
   const worker = async () => {
     while (next < pending.length && token === loadToken) {
       const i = pending[next++];
       let ts = null;
       try {
-        ts = await Cesium.Cesium3DTileset.fromUrl(urls[i],
-          { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true });
-      } catch (e) { console.error("frame", frameTimes[i], e); }
-      // Distinct from the token guard below, which CACHES the superseded
-      // tileset (a control change may toggle back to it): a generation
-      // mismatch means the cache was cleared by a collection switch, so the
-      // tileset belongs to the dropped collection — destroy it instead. Don't
-      // fold this into the token check.
-      if (ts && gen !== cacheGen) { ts.destroy(); ts = null; }
-      if (ts) {
-        viewer.scene.primitives.add(ts);
-        if (!cachePut(urls[i], ts)) ts = null; // stale dup of a live pinned frame — destroyed
+        ts = await queueFrameLoad(signal, async () => {
+          if (signal.aborted) throw frameAbort();
+          const tile = await loadFrameMetadata(urls[i],
+            { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true }, signal);
+          try {
+            if (signal.aborted) throw frameAbort();
+            // Track readiness through public content events, including eviction.
+            tile.tileLoad.addEventListener(root => { if (root === tile.root) readyFrames.add(tile); });
+            tile.tileUnload.addEventListener(root => { if (root === tile.root) readyFrames.delete(tile); });
+            const ready = waitForFrameContent(tile, signal);
+            viewer.scene.primitives.add(tile);
+            // The initial camera must see the radar before Cesium will request
+            // content. Reframe from metadata, without advertising it as playable.
+            await Promise.all([ready, i === frameIdx ? maybeReframe(tile) : Promise.resolve()]);
+            if (signal.aborted) throw frameAbort();
+            tile.preloadWhenHidden = false;
+            return tile;
+          } catch (e) {
+            dropTileset(tile);
+            throw e;
+          }
+        });
+      } catch (e) {
+        if (e.name !== "AbortError") console.error("frame", urls[i], e);
       }
-      if (token !== loadToken) return; // superseded — the tileset stays cached
+      if (token !== loadToken || gen !== cacheGen) {
+        if (ts) dropTileset(ts);
+        return;
+      }
+      if (ts && !cachePut(urls[i], ts)) ts = cacheGet(urls[i]);
       frames[i] = ts;
       if (ts) {
         if (currentRep === "points") stylePointFrame(ts, pointsStyleMin);
-        syncTimeBar(); // unhides the time bar once the first frame exists
-        if (i === frameIdx) { showFrame(frameIdx); await maybeReframe(); if (token !== loadToken) return; }
+        syncTimeBar();
+        if (i === frameIdx) showFrame(frameIdx);
+        if (resumePlayback && playIntent === playbackIntent) startPlaying();
       }
       progress();
     }
@@ -533,8 +682,11 @@ async function loadFrames(reframe = false) {
   await Promise.all(Array.from({ length: Math.min(PRELOAD_CONCURRENCY, pending.length) }, () => worker()));
   if (token !== loadToken) return;
 
-  if (!frames.some(Boolean)) setStatus("no data for this selection", true);
-  else updateStatus();
+  if (!frames.some(isFrameReady)) setStatus("no data for this selection", true);
+  else {
+    updateStatus();
+    if (resumePlayback && playIntent === playbackIntent) startPlaying();
+  }
 }
 
 // Load the cylindrical voxel volume for the active time as a CesiumJS
@@ -678,7 +830,7 @@ function applyPointStyle(min) {
 // We can only hide points we already have, so dropping below the fetched floor
 // re-fetches the (larger) set; raising the threshold is always client-side.
 function pointsClientFilter() {
-  if (($rep.value || "points") !== "points" || currentRep !== "points" || !frames.some(Boolean)) return false;
+  if (($rep.value || "points") !== "points" || currentRep !== "points" || !frames.some(isFrameReady)) return false;
   const min = parseFloat($num.value);
   if (!Number.isFinite(min) || pointsFetchFloor === null || min < pointsFetchFloor) return false;
   applyPointStyle(min);
@@ -701,7 +853,7 @@ function syncTimeBar() {
   const n = frameTimes.length;
   // Hide for a single frame, and also when every frame failed to load (the
   // manifest had >1 time but nothing rendered) — no point showing a dead slider.
-  $timebar.hidden = n <= 1 || !frames.some(Boolean);
+  $timebar.hidden = n <= 1 || !frames.some(isFrameReady);
   $time.max = String(Math.max(0, n - 1));
   $time.value = String(frameIdx);
   updateTimeLabel();
@@ -727,7 +879,7 @@ function updateStatus(extra) {
 function nextLoadedFrame(from) {
   for (let k = 0; k < frames.length; k++) {
     const i = (((from + k) % frames.length) + frames.length) % frames.length;
-    if (frames[i]) return i;
+    if (isFrameReady(frames[i])) return i;
   }
   return from;
 }
@@ -735,7 +887,7 @@ function nextLoadedFrame(from) {
 function startPlaying() {
   // Need >1 frame AND at least one that actually loaded — otherwise play would
   // loop forever showing nothing (every frame's fromUrl can fail → all null).
-  if (playing || frames.length <= 1 || !frames.some(Boolean)) return;
+  if (playing || frames.length <= 1 || !frames.some(isFrameReady)) return;
   playing = true;
   $play.textContent = "⏸";
   playTimer = setInterval(() => showFrame(nextLoadedFrame(frameIdx + 1)), FRAME_MS);
@@ -765,8 +917,10 @@ $num.addEventListener("input", () => { pointsClientFilter() || voxelClientFilter
 $num.addEventListener("change", onNumCommit);
 // Time scrubber: play/pause toggles the loop; dragging the slider seeks (and
 // pauses, so the frame you drag to stays put).
-$play.addEventListener("click", () => { playing ? stopPlaying() : startPlaying(); });
-$time.addEventListener("input", () => { stopPlaying(); showFrame(parseInt($time.value, 10) || 0); });
+$play.addEventListener("click", () => { ++playbackIntent; playing ? stopPlaying() : startPlaying(); });
+$time.addEventListener("input", () => { ++playbackIntent; stopPlaying(); showFrame(parseInt($time.value, 10) || 0); });
+setInterval(refreshCollectionTimes, 60000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCollectionTimes(); });
 loadCollections();
 </script>
 </body>

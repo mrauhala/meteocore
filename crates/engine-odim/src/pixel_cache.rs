@@ -18,6 +18,9 @@ use crate::reader::RawPixels;
 /// Cache key: the file identity (local path string or S3 object key) plus
 /// the HDF5 dataset path of the moment (`/datasetN/dataM/data`). File ids
 /// are globally unique, so one cache can be shared across every collection.
+pub(crate) type MomentPixels = HashMap<String, Arc<RawPixels>>;
+pub(crate) type MomentRequest<'a> = (&'a str, usize, usize);
+
 type PixelKey = (Arc<str>, Arc<str>);
 
 /// Byte-weights each entry by its decoded array size (plus key/Arc overhead).
@@ -82,6 +85,44 @@ impl PixelCache {
             self.inner.record_hit();
         }
         hit
+    }
+
+    /// Resolve a volume's requested moments, fetching/decoding all missing
+    /// datasets in one batch. Retain the returned Arcs for the whole render:
+    /// LRU eviction (or a disabled cache) must not cause rereads mid-volume.
+    /// Returns the number of newly recorded read/decode failures as well.
+    pub(crate) fn load_many(
+        &self,
+        file_id: &str,
+        requests: &[MomentRequest<'_>],
+        load: impl FnOnce(&[MomentRequest<'_>]) -> Vec<(String, RawPixels)>,
+    ) -> (MomentPixels, usize) {
+        self.with_file_load(file_id, || {
+            let mut pixels = HashMap::new();
+            let mut missing = Vec::new();
+            for &(path, nrays, nbins) in requests {
+                if let Some(raw) = self.get(file_id, path) {
+                    pixels.insert(path.to_string(), raw);
+                } else if !self.is_known_bad(file_id, path) {
+                    self.record_miss();
+                    missing.push((path, nrays, nbins));
+                }
+            }
+            let mut failures = 0;
+            if !missing.is_empty() {
+                for (path, raw) in load(&missing) {
+                    let raw = Arc::new(raw);
+                    self.insert(file_id, &path, raw.clone());
+                    pixels.insert(path, raw);
+                }
+                for (path, _, _) in missing {
+                    if !pixels.contains_key(path) && self.mark_bad(file_id, path) {
+                        failures += 1;
+                    }
+                }
+            }
+            (pixels, failures)
+        })
     }
 
     /// Count one genuine positive-cache miss — i.e. a key that is neither
@@ -297,5 +338,71 @@ mod tests {
         for _ in 0..100 {
             assert!(!c.mark_bad("k", "/d"));
         }
+    }
+    fn raw() -> RawPixels {
+        RawPixels::U8(ndarray::Array2::zeros((2, 2)))
+    }
+
+    #[test]
+    fn batch_reads_missing_sweeps_once_and_retains_arrays_without_cache() {
+        let cache = PixelCache::new(0);
+        let requests = [("/sweep1", 2, 2), ("/sweep2", 2, 2)];
+        let mut reads = 0;
+        let (pixels, failures) = cache.load_many("volume", &requests, |missing| {
+            reads += 1;
+            assert_eq!(missing.len(), 2);
+            missing
+                .iter()
+                .map(|(path, _, _)| (path.to_string(), raw()))
+                .collect()
+        });
+        assert_eq!(reads, 1);
+        assert_eq!(pixels.len(), 2);
+        assert_eq!(failures, 0);
+        assert_eq!(cache.weight(), 0);
+        assert_eq!(pixels["/sweep1"].size_bytes(), 4);
+    }
+
+    #[test]
+    fn concurrent_volume_batches_share_cached_decodes() {
+        let cache = Arc::new(PixelCache::new(1));
+        let reads = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = cache.clone();
+                let reads = reads.clone();
+                let start = start.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    let (pixels, failures) =
+                        cache.load_many("volume", &[("/a", 2, 2), ("/b", 2, 2)], |missing| {
+                            reads.fetch_add(1, Ordering::Relaxed);
+                            missing
+                                .iter()
+                                .map(|(path, _, _)| (path.to_string(), raw()))
+                                .collect()
+                        });
+                    assert_eq!(pixels.len(), 2);
+                    assert_eq!(failures, 0);
+                });
+            }
+        });
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().1, 2);
+    }
+
+    #[test]
+    fn partial_batch_failure_is_not_refetched() {
+        let cache = PixelCache::new(1);
+        let requests = [("/good", 2, 2), ("/bad", 2, 2)];
+        let (pixels, failures) =
+            cache.load_many("volume", &requests, |_| vec![("/good".into(), raw())]);
+        assert_eq!(pixels.len(), 1);
+        assert_eq!(failures, 1);
+        let (pixels, failures) =
+            cache.load_many("volume", &requests, |_| panic!("cached or known bad"));
+        assert_eq!(pixels.len(), 1);
+        assert_eq!(failures, 0);
     }
 }

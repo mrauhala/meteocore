@@ -693,7 +693,7 @@ pub async fn get_content(
     let semaphore = state.render_semaphore.clone();
     let colormap = state.colormap.clone();
     let content = CONTENT_CACHE
-        .get_or_compute(key, || async move {
+        .get_or_compute(key, move || async move {
             // Sample + encode off the request worker: `read_point_cloud` does
             // blocking HDF5 I/O and a long CPU loop (CLAUDE.md concurrency
             // rules), so bound it with the shared render semaphore and run it
@@ -844,7 +844,7 @@ pub async fn get_content_glb(
     let colormap = state.colormap.clone(); // reflectivity ramp (isosurface)
     let id_for_err = key.collection.clone();
     let content = CONTENT_CACHE
-        .get_or_compute(key, || async move {
+        .get_or_compute(key, move || async move {
             // read_voxel_grid + meshing do blocking HDF5 I/O + a long CPU
             // loop, so bound them with the shared render semaphore and run on
             // a blocking thread (same rule as the `.pnts` path / the raster
@@ -1131,7 +1131,7 @@ pub async fn get_voxel_content(
     let engine = engine.clone();
     let id_for_err = key.collection.clone();
     let content = CONTENT_CACHE
-        .get_or_compute(key, || async move {
+        .get_or_compute(key, move || async move {
             // Dedicated voxel pool (NOT the shared raster `render_semaphore`)
             // so a slow `high`-res encode can't hold a WMS/Maps/Tiles render
             // slot — see `VOXEL_SEMAPHORE`. Only the computing request pays.

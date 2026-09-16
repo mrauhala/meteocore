@@ -106,6 +106,13 @@ around `ds-storage` calls (Critical Rules 6–7).
 
 ## VolumeEngine (3D Tiles) implementation
 
+- Cold 3D point/grid reads batch all missing sweeps of the requested quantity
+  through one file fetch and HDF5 open. `PixelCache::load_many` serializes
+  same-file batches and rechecks the shared cache before decoding. The render
+  retains decoded Arcs so eviction or a disabled cache cannot cause rereads
+  inside its sampling loop. Failed moments keep the existing known-bad policy.
+
+
 Encoder-side rules live in `crates/ds-3dtiles/CLAUDE.md`; API routes/caching
 in `crates/api-3dtiles/CLAUDE.md`.
 

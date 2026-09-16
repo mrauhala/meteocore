@@ -56,6 +56,9 @@ jobs:
     - name: Rust cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
+    - name: Viewer loading and state tests
+      run: node --test crates/api-3dtiles/tests/viewer.test.cjs
+
     - name: Check formatting
       run: cargo fmt -- --check
 

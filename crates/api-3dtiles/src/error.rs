@@ -6,7 +6,7 @@ use axum::Json;
 use serde_json::json;
 
 /// HTTP-facing error for the 3D Tiles API.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Tiles3dError {
     /// Unknown collection, or no data for the request → 404.
     NotFound(String),
