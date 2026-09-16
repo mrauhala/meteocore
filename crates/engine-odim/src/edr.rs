@@ -16,18 +16,13 @@
 //! empty and `query_location` is unsupported — clients use the
 //! position endpoint instead.
 //!
-//! Phase 1.5 scope: the position query loads one composite per
-//! timestep through `OdimEngine`'s single-entry cache, so a query
-//! spanning N timesteps performs N sequential file reads. ODIM
-//! directories hold at most `max_files` entries (typically ≤288 at
-//! 5-min cadence), so this is acceptable for v1; a multi-entry
-//! composite cache is a follow-up.
-//!
-//! Those reads are blocking (HDF5 parse). The api-edr handlers call
-//! `EdrEngine` methods directly from `async fn`s without
-//! `spawn_blocking`, so the work currently lands on a Tokio worker —
-//! a pre-existing api-edr gap that affects every EDR engine, tracked
-//! in issue #178 and to be fixed in the api-edr handlers.
+//! Composite queries reuse the process-wide byte-bounded composite cache.
+//! Cold reads and HDF5 parsing are blocking. `api_edr::executor` runs these
+//! synchronous query methods on its dedicated multi-thread runtime, with
+//! bounded admission and deadlines (#178); HTTP workers do not execute them.
+//! The multi-thread worker context supports the storage `block_in_place`
+//! bridge. Trajectories use the executor's blocking pool and an explicit
+//! runtime handle for remote reads instead.
 
 use std::collections::HashMap;
 

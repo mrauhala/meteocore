@@ -26,6 +26,32 @@ use crate::response::{coverage_response_to_json, locations_to_geojson, Locations
 
 type HandlerError = (StatusCode, Json<serde_json::Value>);
 
+/// The executor owns admission and keeps running work accounted for after a
+/// client timeout. No engine-specific execution decisions belong in handlers.
+async fn execute_query<T: Send + 'static>(
+    blocking: bool,
+    work: impl FnOnce(crate::executor::QueryBudget) -> Result<T, HandlerError> + Send + 'static,
+) -> Result<T, HandlerError> {
+    crate::executor::run(blocking, work).await.map_err(|e| match e {
+        crate::executor::ExecutionError::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"code": "ServerBusy", "description": "EDR query capacity exhausted; retry later"})),
+        ),
+        crate::executor::ExecutionError::Timeout => query_timeout(),
+        crate::executor::ExecutionError::Task(e) => {
+            tracing::error!("EDR query task failed: {e}");
+            server_error()
+        }
+    })?
+}
+
+fn query_timeout() -> HandlerError {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(json!({"code": "Timeout", "description": "EDR query exceeded its time budget"})),
+    )
+}
+
 /// Serialise an EDR coverage response in the requested output format.
 ///
 /// `CoverageJSON` is the default; `PNG` renders a vertical-profile or
@@ -854,7 +880,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": true,
                     "schema": {"type": "string"},
-                    "description": "WKT POINT or MULTIPOINT geometry. Examples: POINT(24.94 60.17), MULTIPOINT((24.94 60.17),(23.76 61.5)). Note: for a MULTIPOINT against a collection with a vertical extent, every point's coverages are flattened into one CoverageCollection — per-point grouping is not preserved."
+                    "description": "WKT POINT or MULTIPOINT geometry; at most 64 points and 16384 decoded bytes, finite CRS84 coordinates only. Combined response budget: 1000000 values; query deadline: 30 seconds. Examples: POINT(24.94 60.17), MULTIPOINT((24.94 60.17),(23.76 61.5)). Note: for a MULTIPOINT against a collection with a vertical extent, every point's coverages are flattened into one CoverageCollection — per-point grouping is not preserved."
                 },
                 "coords-polygon": {
                     "name": "coords",
@@ -1357,12 +1383,16 @@ pub async fn locations(
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
-    let locs = engine.get_locations().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-        )
-    })?;
+    let query_engine = engine.clone();
+    let locs = execute_query(false, move |_budget| {
+        query_engine.get_locations().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            )
+        })
+    })
+    .await?;
     let params = engine.get_parameters();
     let temporal = engine
         .get_temporal_extent()
@@ -1404,32 +1434,19 @@ pub async fn location_query(
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
-    let result = engine
-        .query_location(
-            &loc_id,
-            datetime,
-            param_names.as_deref(),
-            z.as_deref(),
-            None,
-        )
-        .map_err(|e| match &e {
-            ds_core::error::DataServerError::LocationNotFound(_) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "code": "NotFound", "description": e.to_string() })),
-            ),
-            ds_core::error::DataServerError::InvalidParameter(_)
-            | ds_core::error::DataServerError::QueryTooLarge(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            ),
-            _ => {
-                tracing::error!("Location query error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-                )
-            }
-        })?;
+    let engine = engine.clone();
+    let result = execute_query(false, move |_budget| {
+        engine
+            .query_location(
+                &loc_id,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                None,
+            )
+            .map_err(|e| map_query_error(&e, "Location"))
+    })
+    .await?;
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
     render_coverage_response(result, format, params.width, params.height)
@@ -1493,50 +1510,56 @@ async fn run_position_query(
         )
     })?;
 
-    let map_engine_error = |e: &DataServerError| map_query_error(e, "Position");
-
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
-
-    if points.len() == 1 {
-        let result = engine
-            .query_position(
-                &points[0],
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                reference_time,
-            )
-            .map_err(|e| map_engine_error(&e))?;
-        return render_coverage_response(result, format, params.width, params.height)
-            .map(|r| with_data_cache_control(r, datetime));
-    }
-
-    // MULTIPOINT — fan out one query per point and flatten every point's
-    // coverages into a single CoverageCollection.
-    let mut coverages = Vec::with_capacity(points.len());
-    for point in &points {
-        let qr = engine
-            .query_position(
-                point,
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                reference_time,
-            )
-            .map_err(|e| map_engine_error(&e))?;
-        match qr {
-            CoverageResponse::Single(q) => coverages.push(q),
-            CoverageResponse::Collection(v) => coverages.extend(v),
+    let engine = engine.clone();
+    execute_query(false, move |budget| {
+        let single = points.len() == 1;
+        let mut coverages = Vec::with_capacity(points.len());
+        let mut values = 0usize;
+        let mut collection_response = !single;
+        for point in &points {
+            if budget.expired() {
+                return Err(query_timeout());
+            }
+            let response = engine
+                .query_position(
+                    point,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    reference_time,
+                )
+                .map_err(|e| map_query_error(&e, "Position"))?;
+            collection_response |= matches!(&response, CoverageResponse::Collection(_));
+            let batch = match response {
+                CoverageResponse::Single(q) => vec![q],
+                CoverageResponse::Collection(v) => v,
+            };
+            for q in &batch {
+                for range in q.ranges.values() {
+                    values = values.saturating_add(range.values.len());
+                }
+            }
+            if values > crate::params::MAX_POSITION_VALUES {
+                return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                    "Position response exceeds {} values",
+                    crate::params::MAX_POSITION_VALUES
+                ))));
+            }
+            coverages.extend(batch);
         }
-    }
-
-    render_coverage_response(
-        CoverageResponse::Collection(coverages),
-        format,
-        params.width,
-        params.height,
-    )
-    .map(|r| with_data_cache_control(r, datetime))
+        if budget.expired() {
+            return Err(query_timeout());
+        }
+        let result = if !collection_response && coverages.len() == 1 {
+            CoverageResponse::Single(coverages.remove(0))
+        } else {
+            CoverageResponse::Collection(coverages)
+        };
+        render_coverage_response(result, format, params.width, params.height)
+            .map(|r| with_data_cache_control(r, datetime))
+    })
+    .await
 }
 
 pub async fn area_query(
@@ -1597,15 +1620,19 @@ async fn run_area_query(
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
-    let result = engine
-        .query_area(
-            &params.coords,
-            datetime,
-            param_names.as_deref(),
-            z.as_deref(),
-            reference_time,
-        )
-        .map_err(|e| map_query_error(&e, "Area"))?;
+    let engine = engine.clone();
+    let result = execute_query(false, move |_budget| {
+        engine
+            .query_area(
+                &params.coords,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                reference_time,
+            )
+            .map_err(|e| map_query_error(&e, "Area"))
+    })
+    .await?;
 
     let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
         tracing::error!("Area CoverageJSON serialise error: {e}");
@@ -1695,16 +1722,20 @@ async fn run_radius_query(
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
-    let result = engine
-        .query_radius(
-            &params.coords,
-            within_m,
-            datetime,
-            param_names.as_deref(),
-            z.as_deref(),
-            reference_time,
-        )
-        .map_err(|e| map_query_error(&e, "Radius"))?;
+    let engine = engine.clone();
+    let result = execute_query(false, move |_budget| {
+        engine
+            .query_radius(
+                &params.coords,
+                within_m,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                reference_time,
+            )
+            .map_err(|e| map_query_error(&e, "Radius"))
+    })
+    .await?;
 
     let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
         tracing::error!("Radius CoverageJSON serialise error: {e}");
@@ -1774,54 +1805,22 @@ pub async fn trajectory_query(
     // sweeps); an interval `z=0.3/15` expands to the angles in range.
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
-    // The cross-section sampler is the heaviest EDR path — up to
-    // nodes × z-levels × quantities × timesteps `sample_polar_slant`
-    // iterations (millions, seconds of CPU). Run it on the blocking pool
-    // so it doesn't park a request-serving worker and head-of-line-block
-    // other requests. spawn_blocking is also *required* for correctness under
-    // lazy pixel loading: an S3 cache miss now fetches via `DataStore::get_on`
-    // (`handle.block_on`), the valid bridge on a `spawn_blocking` pool thread —
-    // the plain `DataStore::get` uses `block_in_place`, which *panics* on a
-    // spawn_blocking thread (it is only valid on a multi-thread runtime worker).
-    // The still-direct position/area/locations queries keep `DataStore::get`
-    // precisely because they run on a worker; offloading them is tracked in #178.
+    // Trajectory implementations use explicit runtime handles for remote I/O,
+    // and therefore require a blocking thread rather than an async worker.
     let engine = engine.clone();
     let coords = params.coords.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        engine.query_trajectory(
-            &coords,
-            datetime,
-            param_names.as_deref(),
-            z.as_deref(),
-            None,
-        )
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Trajectory query task join error: {e}");
-        server_error()
-    })?
-    .map_err(|e| match &e {
-        ds_core::error::DataServerError::InvalidParameter(_)
-        | ds_core::error::DataServerError::InvalidBbox(_)
-        | ds_core::error::DataServerError::InvalidDatetime(_)
-        | ds_core::error::DataServerError::QueryTooLarge(_) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        ),
-        ds_core::error::DataServerError::LocationNotFound(_)
-        | ds_core::error::DataServerError::CollectionNotFound(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": e.to_string() })),
-        ),
-        _ => {
-            tracing::error!("Trajectory query error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+    let result = execute_query(true, move |_budget| {
+        engine
+            .query_trajectory(
+                &coords,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                None,
             )
-        }
-    })?;
+            .map_err(|e| map_query_error(&e, "Trajectory"))
+    })
+    .await?;
 
     match format {
         EdrFormat::CoverageJson => {

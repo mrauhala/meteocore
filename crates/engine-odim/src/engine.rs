@@ -867,20 +867,12 @@ impl OdimEngine {
     /// byte-bounded composite LRU ([`COMPOSITE_CACHE`]) keyed by
     /// [`Location::id`].
     ///
-    /// **Blocking call** — reads the file (local `read` or S3 `get`)
-    /// and parses HDF5 directly. Callers from async contexts must wrap
-    /// in `tokio::task::spawn_blocking`. Two call paths reach here:
-    ///
-    /// - `MapEngine::get_raster_tile` — already runs inside
-    ///   `spawn_blocking` (the WMS / Maps / Tiles handlers do this).
-    /// - `EdrEngine::query_position` / `query_area` (see `edr.rs`) —
-    ///   the api-edr handlers currently call these directly from an
-    ///   `async fn` *without* `spawn_blocking`, so this blocking
-    ///   work lands on a Tokio worker. That is a pre-existing
-    ///   api-edr-level gap affecting every EDR engine (GeoTIFF,
-    ///   QueryData, GRIB all do blocking I/O in `query_position`
-    ///   too) — tracked in issue #178, to be fixed in the api-edr
-    ///   handlers rather than per-engine.
+    /// **Blocking call** — reads the file (local or remote) and parses HDF5.
+    /// Map handlers run this on their blocking pool. EDR position/area queries
+    /// run on `api_edr::executor`'s dedicated multi-thread runtime (#178),
+    /// where the storage `block_in_place` bridge is valid. Do not move them
+    /// back onto HTTP workers or use a blocking pool without adapting remote
+    /// I/O to an explicit runtime handle.
     pub(crate) fn load_composite(
         &self,
         location: &Location,

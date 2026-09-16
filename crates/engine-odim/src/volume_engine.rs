@@ -512,7 +512,7 @@ pub(crate) fn pixel_cache_id<'a>(source: &Source, file_id: &'a str) -> std::borr
 /// Capture the current runtime handle for the lazy pixel fetch. Call ONLY
 /// from a `spawn_blocking` context (`get_raster_tile` / `query_trajectory`),
 /// where `handle.block_on` is valid and `block_in_place` would panic; the
-/// request-worker query paths pass `None` instead. Uses `try_current` (not
+/// dedicated EDR runtime worker paths pass `None` instead. Uses `try_current` (not
 /// `current`) so unit tests that invoke the trait methods outside any runtime
 /// — always with a `Local` source that ignores the handle — don't panic.
 pub(crate) fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
@@ -526,7 +526,7 @@ pub(crate) fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
 /// runtime context (see [`Pixels::handle`]): `Some(handle)` drives the fetch
 /// via `handle.block_on` (valid on a `spawn_blocking` pool thread, where
 /// `block_in_place` *panics*); `None` uses the plain [`DataStore::get`],
-/// whose `block_in_place` is valid on a request-worker thread. A local read
+/// whose `block_in_place` is valid on a multi-thread runtime worker. A local read
 /// never touches a runtime, so the handle is irrelevant there.
 fn fetch_file_bytes(
     source: &Source,
@@ -562,7 +562,7 @@ struct Pixels<'a> {
     /// `Some(handle)` when the caller runs inside `spawn_blocking`
     /// (`get_raster_tile` / `query_trajectory`) — the fetch then uses
     /// `handle.block_on` because `block_in_place` panics on a `spawn_blocking`
-    /// pool thread. `None` on a request worker (EDR position / area /
+    /// pool thread. `None` on a dedicated EDR runtime worker (position / area /
     /// locations), where the fetch must use `block_in_place` via the plain
     /// `DataStore::get`. Irrelevant for a `Local` source.
     handle: Option<&'a tokio::runtime::Handle>,
@@ -4180,7 +4180,7 @@ impl PolarVolumeSiteView {
     /// storm-cell path (`cells.rs`) can drive it from **either** runtime
     /// context: `handle` is the async→sync bridge selector for a remote
     /// pixel fetch (`Some` on a `spawn_blocking` pool thread, where
-    /// `block_in_place` panics; `None` on a request worker, where
+    /// `block_in_place` panics; `None` on a multi-thread runtime worker, where
     /// `block_in_place` is the valid bridge — see [`Pixels::handle`]).
     ///
     /// Returns the shared grid plus its echo-cell count; the caller owns the
@@ -4358,8 +4358,8 @@ impl EdrEngine for PolarVolumeSiteView {
             .volume
             .site;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
-        // EDR `query_location` runs directly on the request worker (the
-        // generic api-edr handler does not `spawn_blocking`), so any S3 pixel
+        // EDR `query_location` runs on the executor's dedicated multi-thread
+        // runtime worker (not its blocking pool), so any S3 pixel
         // fetch must use `block_in_place` (the plain `DataStore::get`) — pass
         // `None`. `handle.block_on` would panic in this async context.
         let pix = Pixels {
@@ -4468,7 +4468,7 @@ impl EdrEngine for PolarVolumeSiteView {
             ))
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
-        // Request-worker path (no `spawn_blocking`) — `None` selects the
+        // Dedicated EDR worker path — `None` selects the
         // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
             source: &self.source,
@@ -4510,7 +4510,7 @@ impl EdrEngine for PolarVolumeSiteView {
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
         let levels = resolve_levels(canonical, z)?;
-        // Request-worker path (no `spawn_blocking`) — `None` selects the
+        // Dedicated EDR worker path — `None` selects the
         // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
             source: &self.source,

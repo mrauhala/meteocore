@@ -121,3 +121,14 @@ value (a generation timestamp, a random id): a body-hash ETag then never
 matches, so precompute the ETag over the body with that field blanked and
 set the `ETag` header yourself — the middleware honours it (see the
 Features `items` handler).
+
+## Query execution and limits (#178, #585)
+
+Every data query uses `executor`: normal engines run on a dedicated multi-thread
+runtime (storage sync bridges are valid there), trajectories use its blocking
+pool for their explicit-handle I/O. Never call synchronous engines directly on
+HTTP workers. The admission queue is bounded to 32 waiting requests; deadlines include queue
+time. Beyond the queue, admission fails fast. Permits live with the
+work, including after client timeout/disconnect. Check `QueryBudget::expired`
+between MULTIPOINT elements. Validate the whole coordinate list before dispatch;
+keep point, byte and combined-value limits and OpenAPI/README documentation aligned.

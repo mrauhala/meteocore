@@ -1,4 +1,5 @@
 pub mod caching;
+mod executor;
 pub mod handlers;
 pub mod params;
 pub(crate) mod plot_convert;
