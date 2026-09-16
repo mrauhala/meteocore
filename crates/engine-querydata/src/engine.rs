@@ -663,8 +663,9 @@ impl MapEngine for QueryDataEngine {
             _ => "projected".to_string(),
         };
 
-        // Build parameter list: (short_name, full_title) for each parameter
-        let parameters: Vec<(String, String)> = data
+        // QueryData descriptors carry no trustworthy unit metadata. Keep units
+        // unknown instead of inferring physical units from names.
+        let parameters: Vec<ds_core::map_engine::ParameterInfo> = data
             .params
             .iter()
             .map(|p| {
@@ -675,7 +676,11 @@ impl MapEngine for QueryDataEngine {
                     .and_then(|start| p.name[start + 1..].strip_suffix(')'))
                     .unwrap_or(&p.name)
                     .to_string();
-                (short, p.name.clone())
+                ds_core::map_engine::ParameterInfo {
+                    name: short,
+                    title: p.name.clone(),
+                    unit: String::new(),
+                }
             })
             .collect();
 

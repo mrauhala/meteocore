@@ -165,11 +165,9 @@ pub async fn wms_handler(
             // defaults to and cache that result under the invalid name —
             // ServiceException is the correct OGC response here.
             if let Some(pname) = layer_parameter.as_deref() {
-                if !info.parameters.is_empty()
-                    && !info.parameters.iter().any(|(name, _)| name == pname)
-                {
+                if !info.parameters.is_empty() && !info.parameters.iter().any(|p| p.name == pname) {
                     let mut supported: Vec<&str> =
-                        info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+                        info.parameters.iter().map(|p| p.name.as_str()).collect();
                     supported.sort_unstable();
                     return Err(WmsError::LayerNotDefined(format!(
                         "Parameter '{pname}' is not available for layer \
@@ -660,21 +658,21 @@ pub async fn wms_handler(
             let format = crate::params::parse_legend_format(query.format.as_deref())?;
 
             // Resolve the parameter + unit the legend describes from the
-            // engine's raster metadata (#371). The parameter is the style's
-            // configured one (set for per-parameter layers), falling back to the
-            // "collection/param" layer segment, then the engine's default
-            // parameter. The unit is the collection-level unit; multi-unit
-            // sources (e.g. radar polar volumes) report none, so it's omitted.
+            // engine's raster metadata (#371). Match GetMap precedence: the
+            // "collection/param" layer segment, then the style's configured
+            // parameter, then the engine's default. Resolve the unit only
+            // after selecting the parameter.
             // Both feed the rendered legend's title and the JSON legend, so the
             // two representations describe the same thing.
             let info = state
                 .engines
                 .get(legend_collection_id)
                 .map(|e| e.raster_info());
-            let param = style_info
-                .parameter
-                .clone()
-                .or_else(|| layer_name.split('/').nth(1).map(str::to_string))
+            let param = layer_name
+                .split('/')
+                .nth(1)
+                .map(str::to_string)
+                .or_else(|| style_info.parameter.clone())
                 .or_else(|| {
                     info.as_ref()
                         .map(|i| i.parameter.clone())
@@ -682,8 +680,8 @@ pub async fn wms_handler(
                 });
             let unit = info
                 .as_ref()
-                .map(|i| i.unit.clone())
-                .filter(|u| !u.is_empty());
+                .and_then(|i| i.parameter_unit(param.as_deref()))
+                .map(str::to_string);
 
             // Machine-readable legend: palette stops + range, for clients that
             // draw their own legend.

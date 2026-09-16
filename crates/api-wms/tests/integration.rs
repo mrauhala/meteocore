@@ -1287,11 +1287,16 @@ impl MapEngine for SiteMockMapEngine {
             parameter: "DBZH".into(),
             unit: String::new(),
             parameters: vec![
-                ("DBZH".into(), "DBZH — Reflectivity (horizontal)".into()),
-                (
-                    "VRADH".into(),
-                    "VRADH — Radial velocity (horizontal)".into(),
-                ),
+                ds_core::map_engine::ParameterInfo {
+                    name: "DBZH".into(),
+                    title: "DBZH — Reflectivity (horizontal)".into(),
+                    unit: "dBZ".into(),
+                },
+                ds_core::map_engine::ParameterInfo {
+                    name: "VRADH".into(),
+                    title: "VRADH — Radial velocity (horizontal)".into(),
+                    unit: "m/s".into(),
+                },
             ],
             vertical: None,
             grid_size: None,
@@ -2769,7 +2774,7 @@ fn param_layer_styles() -> HashMap<String, HashMap<String, StyleInfo>> {
             ),
             (
                 "gray".to_string(),
-                param_palette_style("gray", "grayscale", None),
+                param_palette_style("gray", "grayscale", Some("VRADH")),
             ),
         ]),
     );
@@ -2840,6 +2845,7 @@ async fn legend_graphic_uses_the_full_layer_key() {
     // The parameter still resolves — from the style, which the per-parameter
     // layer tags.
     assert_eq!(json["parameter"], "VRADH");
+    assert_eq!(json["unit"], "m/s");
 
     // Distinct from the collection-level default it used to serve.
     let collection = legend_json_for("radar-fivih").await;
@@ -2865,6 +2871,21 @@ async fn legend_graphic_falls_back_to_the_collection_style() {
     );
     // The layer-name segment supplies the parameter when the style doesn't.
     assert_eq!(json["parameter"], "DBZH");
+    assert_eq!(json["unit"], "dBZ");
+}
+
+#[tokio::test]
+async fn legend_layer_parameter_overrides_style_parameter_like_get_map() {
+    let app = build_param_layer_router();
+    let req = Request::builder()
+        .uri("/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0&LAYER=radar-fivih/DBZH&STYLE=gray&FORMAT=application/json")
+        .body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["parameter"], "DBZH");
+    assert_eq!(json["unit"], "dBZ");
 }
 
 /// A style defined only on a parameter layer is reachable through that layer.

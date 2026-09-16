@@ -1240,7 +1240,7 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 **Per-parameter default styles** (#320) — parameters of multi-parameter
 collections (GRIB, QueryData, Zarr, radar volumes) with no explicit style
 are matched against a built-in defaults table by normalized name/title plus
-the collection's unit: `t2m`/`2t`/`TMP` (unit K or C) → `temperature`,
+each parameter's unit: `t2m`/`2t`/`TMP` (unit K or C) → `temperature`,
 `msl`/`mslp` (Pa or hPa) → `pressure`, `DBZH`/`dbz` → `radar_dbz`,
 `VRADH` → `radial_velocity`, humidity/cloud/wind/precipitation likewise.
 Unit-gated rules never guess (a temperature with no unit hint stays on the
@@ -1249,6 +1249,12 @@ those parameters; opt out per collection with
 `[wms] parameter_defaults = false`, or add/override rules globally with
 top-level `[[parameter_defaults]]` blocks (`names`/`contains`, `colormap`,
 `min`/`max` or `[[parameter_defaults.unit_ranges]]`).
+
+For multi-parameter rasters, defaults and legend labels use each selected
+parameter's own unit: GRIB display units, Zarr CF units, or ODIM quantity units.
+Temperature and pressure defaults require a known unit; unknown units (including
+QueryData descriptors without unit metadata) stay unlabelled and use the
+configured fallback style. Explicit parameter styles still take precedence.
 
 **Named custom colormaps** — define once, reference anywhere a built-in
 name works (`[wms] colormap`, `[[wms.styles]]`, `[[wms.parameters]]`, style

@@ -577,9 +577,9 @@ pub fn legend_json(
 }
 
 /// Resolve the `(parameter, unit)` a legend describes from a style plus the
-/// engine's raster metadata: the style's configured parameter (set for
+/// engine's raster metadata: the explicit request, then the style's parameter (set for
 /// per-parameter styles) falling back to the collection's default parameter,
-/// and the collection-level unit. Empty strings mean "unknown" and become
+/// and that parameter's unit. Empty strings mean "unknown" and become
 /// `None`, so the pair can be handed straight to [`legend_json`] /
 /// [`legend_title`].
 ///
@@ -589,12 +589,15 @@ pub fn legend_json(
 pub fn legend_parameter_unit(
     style: &StyleInfo,
     info: &ds_core::map_engine::RasterInfo,
+    requested_parameter: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let parameter = style
-        .parameter
-        .clone()
+    let parameter = requested_parameter
+        .map(str::to_string)
+        .or_else(|| style.parameter.clone())
         .or_else(|| Some(info.parameter.clone()).filter(|p| !p.is_empty()));
-    let unit = Some(info.unit.clone()).filter(|u| !u.is_empty());
+    let unit = info
+        .parameter_unit(parameter.as_deref())
+        .map(str::to_string);
     (parameter, unit)
 }
 
@@ -1040,6 +1043,67 @@ mod tests {
         assert_eq!(legend["interpolation"], "step");
         assert_eq!(legend["nodataColor"], "#00000000");
         assert_eq!(legend["parameter"], "class");
+    }
+
+    #[test]
+    fn legends_resolve_units_after_parameter_selection() {
+        use ds_core::map_engine::{ParameterInfo, RasterInfo};
+        let mut info = RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: None,
+            times: vec![],
+            parameter: "t2m".into(),
+            unit: "°C".into(),
+            parameters: [
+                ("t2m", "°C"),
+                ("msl", "hPa"),
+                ("ws", "m/s"),
+                ("unknown", ""),
+            ]
+            .map(|(name, unit)| ParameterInfo {
+                name: name.into(),
+                title: name.into(),
+                unit: unit.into(),
+            })
+            .into(),
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: vec![],
+        };
+        let mut style = style_over("viridis", "default", "Default", 0.0, 1.0);
+        for (requested, styled, expected, expected_unit) in [
+            (None, None, "t2m", Some("°C")),
+            (None, Some("msl"), "msl", Some("hPa")),
+            (Some("ws"), Some("msl"), "ws", Some("m/s")),
+            (Some("unknown"), None, "unknown", None),
+            (Some("absent"), None, "absent", None),
+        ] {
+            style.parameter = styled.map(str::to_string);
+            let (parameter, unit) = legend_parameter_unit(&style, &info, requested);
+            assert_eq!(parameter.as_deref(), Some(expected));
+            assert_eq!(unit.as_deref(), expected_unit);
+            let json = legend_json(&style, parameter.as_deref(), unit.as_deref());
+            assert_eq!(json.get("unit").and_then(|v| v.as_str()), expected_unit);
+            let title = legend_title(&style, parameter.as_deref(), unit.as_deref()).unwrap();
+            assert_eq!(
+                title,
+                expected_unit
+                    .map(|u| format!("{expected} ({u})"))
+                    .unwrap_or(expected.into())
+            );
+        }
+        // Single-band engines keep their legacy default unit. An explicitly
+        // unknown descriptor takes precedence over that legacy field.
+        info.parameters.clear();
+        assert_eq!(info.parameter_unit(None), Some("°C"));
+        assert_eq!(info.parameter_unit(Some("msl")), None);
+        info.parameters.push(ParameterInfo {
+            name: "t2m".into(),
+            title: "Temperature".into(),
+            unit: String::new(),
+        });
+        assert_eq!(info.parameter_unit(None), None);
     }
 
     #[test]
