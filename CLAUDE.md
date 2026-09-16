@@ -14,6 +14,8 @@ every engine's background poll loop uses — never hand-roll a
 `ds-wis2` (WMO WIS2 consumer client: Global Broker MQTT subscription,
 notification parsing, dedup, payload download — shared by every engine
 with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
+`ds-bufr` (BUFR decoder, vendored from tinybufr; compressed strings, operator 208,
+64-bit numerics; see `crates/ds-bufr/CLAUDE.md`),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
@@ -47,6 +49,7 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   duplicate fact, inline payloads, download policy.
 - `crates/engine-odim/CLAUDE.md` — PVOL per-site model, pixel pre-warm,
   resampling, storm cells.
+- `crates/ds-bufr/CLAUDE.md` — decoder provenance, format boundaries, independent fixtures.
 - `crates/engine-bufr/CLAUDE.md` — BUFR decoder boundary (ds_bufr only in
   `decode.rs`), period-context + first-occurrence extraction rules, store
   bounds, EDR/Features semantics.
