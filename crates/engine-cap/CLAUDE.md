@@ -223,10 +223,11 @@ memory. Things that differ from the pull sources:
   all loaded areas. Map/WMS `TIME` selects areas active at that instant;
   **no TIME ⇒ active now** (the snapshot's `as_of`, advanced each poll so
   expired alerts drop out).
-- **WMS TIME shape (load-bearing):** `RasterInfo.times` = distinct window
-  boundaries ≤ `as_of` plus `as_of` itself (always the max entry, capped to
-  256). The WMS handler resolves a TIME-less GetMap to `times.last()`, so
-  `as_of` being last is what makes the default render "now".
+- **WMS TIME shape:** `RasterInfo.times` advertises window boundaries through
+  `as_of + 7 days`, plus `as_of`, capped to 256 nearest boundaries. The sorted
+  axis always retains `as_of`. `MapEngine::default_time()` returns `as_of`:
+  WMS/Maps/Tiles and the preview use that default independently of the latest
+  advertised time. Never restore the old "last advertised time means now" rule.
 - `data_version()` (Feature ETags) hashes record ids + severity + window +
   every property in key order (text, producer parameters, geometry
   provenance) + the geometry — any in-place correction invalidates the

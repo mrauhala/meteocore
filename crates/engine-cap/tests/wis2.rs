@@ -489,8 +489,8 @@ fn resolve_time_keys_the_default_view_on_the_rendered_as_of() {
     );
     engine.refresh_with(|| T_TEST).unwrap();
     assert_eq!(engine.resolve_time(None, None), Some(T_TEST));
-    // `as_of` is also what the WMS handler picks as `times.last()`.
-    assert_eq!(engine.raster_info().times.last().copied(), Some(T_TEST));
+    // The engine-owned default remains now while future times are advertised.
+    assert_eq!(engine.default_time(), Some(T_TEST));
     let explicit: DateTime<Utc> = "2026-09-12T12:00:00Z".parse().unwrap();
     assert_eq!(engine.resolve_time(Some(explicit), None), Some(explicit));
 
