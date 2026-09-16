@@ -411,6 +411,12 @@ mod tests {
             maps: Arc::new(ArcSwap::from_pointee(result.maps_state)),
             tiles: Arc::new(ArcSwap::from_pointee(result.tiles_state)),
             tiles_3d: Arc::new(ArcSwap::from_pointee(result.tiles_3d_state)),
+            accepted_load: RwLock::new(Some(Arc::new(crate::admin::AcceptedLoad::new(
+                &config,
+                style_ctx,
+                crate::colormaps::style_config_fingerprint(&config, config_path.parent()),
+            )))),
+            recovery_shutdown: ds_poll::Shutdown::new(),
             config_path: config_path.to_str().unwrap().to_string(),
             health: RwLock::new(result.health),
             geotiff_engines: RwLock::new(result.geotiff_engines),
@@ -437,6 +443,192 @@ mod tests {
             ),
             engine_handles: RwLock::new(result.engines_by_id),
         })
+    }
+
+    /// Reuse the loader/registry test harness for the automatic recovery path:
+    /// both failed constructors and initially empty PVOL inventories must gain
+    /// real routes, without rereading edited config/static files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn radar_recovery_registers_routes_without_reloading_config_or_static_data() {
+        use crate::admin::{recover_radar_once, EngineHandle, RecoveryOutcome};
+        use axum::{
+            body::Body,
+            http::{Method, Response, StatusCode},
+            routing::any,
+            Router,
+        };
+        use std::sync::atomic::{AtomicU8, Ordering};
+        const PVOL: &[u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        const COMP: &[u8] = include_bytes!("../../../testdata/odim-dmi-fixture.h5");
+        const PVOL_LIST: &str = r#"<?xml version="1.0"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>pvol</Name><IsTruncated>false</IsTruncated><Contents><Key>pvol.h5</Key><LastModified>2026-09-16T10:00:00Z</LastModified><Size>18664</Size></Contents></ListBucketResult>"#;
+        const COMP_LIST: &str = r#"<?xml version="1.0"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>comp</Name><IsTruncated>false</IsTruncated><Contents><Key>comp_20260916T1000.h5</Key><LastModified>2026-09-16T10:00:00Z</LastModified><Size>35889</Size></Contents></ListBucketResult>"#;
+        for initial_mode in [0, 1] {
+            // denied remote, then valid but empty remote
+            let mode = Arc::new(AtomicU8::new(initial_mode));
+            let server_mode = mode.clone();
+            let app = Router::new().fallback(any(move |req: axum::extract::Request| {
+                let mode = server_mode.clone();
+                async move {
+                    if mode.load(Ordering::SeqCst) == 0 {
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                    if req.uri().query().is_some_and(|q| q.contains("list-type")) {
+                        let xml = if mode.load(Ordering::SeqCst) == 1 {
+                            r#"<?xml version="1.0"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketResult>"#
+                        } else if req.uri().path().starts_with("/pvol") {
+                            PVOL_LIST
+                        } else {
+                            COMP_LIST
+                        };
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/xml")
+                            .body(Body::from(xml))
+                            .unwrap();
+                    }
+                    let bytes = if req.uri().path().starts_with("/pvol") {
+                        PVOL
+                    } else {
+                        COMP
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-length", bytes.len())
+                        .body(if req.method() == Method::HEAD {
+                            Body::empty()
+                        } else {
+                            Body::from(bytes)
+                        })
+                        .unwrap()
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let dir = tempfile::tempdir().unwrap();
+            let csv = dir.path().join("weather.csv");
+            fs::write(&csv, include_str!("../../../testdata/weather.csv")).unwrap();
+            let config_path = dir.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+[[collections]]
+id = "stations"
+title = "Stations"
+description = "test"
+data_path = {csv:?}
+apis = ["edr", "features"]
+[[collections]]
+id = "volume"
+title = "Radar volumes"
+description = "test"
+engine_type = "odim-volume"
+apis = ["wms", "maps", "tiles", "edr", "3dtiles", "features"]
+[collections.odim]
+endpoint = "{url}"
+bucket = "pvol"
+prefix_pattern = ""
+prewarm_sweeps = 0
+poll_interval_secs = 1
+[[collections]]
+id = "composite"
+title = "Composite"
+description = "test"
+engine_type = "odim"
+apis = ["wms", "edr"]
+[collections.odim]
+endpoint = "{url}"
+bucket = "comp"
+prefix_pattern = ""
+filename_template = "comp_%Y%m%dT%H%M.h5"
+parameter = "DBZH"
+unit = "dBZ"
+poll_interval_secs = 3600
+"#
+                ),
+            )
+            .unwrap();
+            let state = build_state(&config_path);
+            assert!(!ready_has(&state, "composite"));
+            assert!(crate::admin::has_pending_radar(
+                &state
+                    .last_collections
+                    .read()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                &state.health.read().unwrap(),
+            ));
+            let csv_before = state.engine_handles.read().unwrap()["stations"].clone();
+            let cache_before = state.wms.load().rendered_cache.clone();
+            // A failed retry must retain working static collections and caches.
+            assert_eq!(
+                recover_radar_once(&state).unwrap(),
+                RecoveryOutcome::Pending
+            );
+            assert!(ready_has(&state, "stations"));
+            fs::write(&config_path, "invalid unapproved edit").unwrap();
+            fs::write(&csv, "invalid replacement data").unwrap();
+            mode.store(2, Ordering::SeqCst);
+            // An empty PVOL constructor already supplied an engine; its normal
+            // poll fills the catalog before recovery re-expands the site routes.
+            let volumes = state.odim_volume_engines.read().unwrap().clone();
+            for engine in &volumes {
+                let engine = engine.clone();
+                crate::poll_runtime().spawn(async move { engine.poll_loop().await });
+            }
+            if !volumes.is_empty() {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while volumes[0].sites().is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                recover_radar_once(&state).unwrap(),
+                RecoveryOutcome::Recovered,
+                "health: {}",
+                serde_json::to_string(&*state.health.read().unwrap()).unwrap(),
+            );
+            assert!(ready_has(&state, "composite"));
+            let handles = state.engine_handles.read().unwrap();
+            let (EngineHandle::Csv(before), EngineHandle::Csv(after)) =
+                (&csv_before, &handles["stations"])
+            else {
+                panic!("CSV handle lost")
+            };
+            assert!(Arc::ptr_eq(before, after));
+            let EngineHandle::OdimVolume(volume) = &handles["volume"] else {
+                panic!("volume missing")
+            };
+            let site = format!("volume-{}", volume.sites()[0].0);
+            assert!(state.edr.load().engines.contains_key(&site));
+            assert!(state.wms.load().engines.contains_key(&site));
+            assert!(state.tiles_3d.load().volume_engines.contains_key(&site));
+            assert!(Arc::ptr_eq(&cache_before, &state.wms.load().rendered_cache));
+            drop(handles);
+            // A later outage doesn't trigger reconstruction of healthy engines.
+            mode.store(0, Ordering::SeqCst);
+            assert_eq!(recover_radar_once(&state).unwrap(), RecoveryOutcome::Idle);
+            assert!(state.edr.load().engines.contains_key(&site));
+            for engine in state.odim_engines.read().unwrap().iter() {
+                engine.shutdown();
+            }
+            for engine in state.odim_volume_engines.read().unwrap().iter() {
+                engine.shutdown();
+            }
+            server.abort();
+        }
     }
 
     fn ready_has(state: &AdminState, id: &str) -> bool {

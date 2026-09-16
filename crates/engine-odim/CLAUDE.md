@@ -31,7 +31,9 @@ around `ds-storage` calls (Critical Rules 6–7).
   `"odim-volume"` arm): build the engine once, enumerate `engine.sites()`
   (`(nod, label)` pairs), register one view per site (cloning the base
   `CollectionConfig` with per-site id/title). Site discovery is a scan
-  snapshot — sites added later surface on the next reload.
+  snapshot — sites added later surface on the next reload. An initially
+  empty remote source is re-expanded automatically by server startup recovery
+  once its poll finds sites (#190).
 
 ## Parameters & labels
 
@@ -177,3 +179,11 @@ in `crates/api-3dtiles/CLAUDE.md`.
 - Local test fixture: `testdata/radar-fmi-pvol/` (fivih = Vihti). Several
   radar fixtures are large and intentionally NOT committed — tests skip with
   an eprintln when a fixture is absent.
+
+## Startup errors (#190)
+
+COMP/PVOL constructors still report scan/configuration errors; poll failures
+still preserve the last good catalog. The server retries failed remote startup
+construction with backoff and re-registers per-site APIs when an initially empty
+remote catalog becomes populated. This recovery reuses accepted configuration
+and existing healthy engines; it does not turn scan errors into empty catalogs.

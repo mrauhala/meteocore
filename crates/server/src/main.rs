@@ -495,6 +495,8 @@ async fn main() {
                 "Starting with no collections. The server responds to /health and an empty \
                  /collections; add collections via config + POST /admin/collections/reload."
             );
+        } else if admin::has_pending_radar(&config.collections, &result.health) {
+            tracing::warn!("Remote radar startup failed; starting with failed health and background retry (30–300 s). Check endpoint/bucket/credentials if failures persist.");
         } else {
             tracing::error!(
                 "No collections loaded successfully ({} configured). Refusing to start an empty server.",
@@ -694,6 +696,12 @@ async fn main() {
         maps: maps_swap.clone(),
         tiles: tiles_swap.clone(),
         tiles_3d: tiles_3d_swap.clone(),
+        accepted_load: RwLock::new(Some(Arc::new(admin::AcceptedLoad::new(
+            &config,
+            style_ctx,
+            colormaps::style_config_fingerprint(&config, config_dir.as_deref()),
+        )))),
+        recovery_shutdown: ds_poll::Shutdown::new(),
         config_path,
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
@@ -723,6 +731,11 @@ async fn main() {
                 .collect(),
         ),
         engine_handles: RwLock::new(result.engines_by_id),
+    });
+
+    let recovery_state = server_state.clone();
+    poll_runtime().spawn(async move {
+        admin::radar_recovery_loop(recovery_state).await;
     });
 
     // Start the config-directory watcher (issues #318, #571) if enabled.
@@ -856,6 +869,8 @@ async fn main() {
     .await
     .expect("Server error");
 
+    server_state.recovery_shutdown.shutdown();
+    let _reload_guard = server_state.reload_lock.lock().await;
     // Signal all polling loops to stop
     let geotiff = server_state
         .geotiff_engines

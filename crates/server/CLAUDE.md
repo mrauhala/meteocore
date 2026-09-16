@@ -161,3 +161,23 @@ client could spoof the emitted self-links (open-redirect risk downstream).
   `MapEngine::default_time()`. The slider selects it rather than the last
   value; preview time-window filtering must preserve that default (CAP's
   active-now view can precede future warning boundaries).
+
+## Remote radar startup recovery (#190)
+
+Remote COMP/PVOL sources whose startup scan fails keep `failed` health (503
+when every collection failed) but no longer require a manual reload to recover.
+A serialized background task retries after 30 seconds, backing off to five
+minutes while failures persist. An initially empty remote PVOL catalog also
+gets its per-site routes registered once polling discovers sites. Rebuilding
+registration also retries failed dependent nowcasts. Healthy engines, static
+CSV/GeoJSON snapshots and warm render caches are reused; ordinary explicit
+reloads still rebuild static sources as before.
+
+Recovery uses the last accepted collections, palettes and server routing
+settings, including startup CLI filters. It never rereads config/palette files;
+an explicit reload or enabled watcher remains the configuration control plane.
+The task shares the reload mutex and ds-poll shutdown handle lifecycle. Source
+configuration errors remain visible and logged; remote failures may include
+permanent endpoint/bucket mistakes, so repeated failed health needs operator
+attention. Local missing files and structurally missing source config retain
+startup fail-fast behavior. Runtime scan errors still retain the good catalog.

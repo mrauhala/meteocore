@@ -1005,6 +1005,8 @@ mod tests {
                 base_url: String::new(),
                 trust_proxy_headers: false,
             })),
+            accepted_load: RwLock::new(None),
+            recovery_shutdown: ds_poll::Shutdown::new(),
             config_path: String::new(),
             health: RwLock::new(Vec::new()),
             geotiff_engines: RwLock::new(Vec::new()),
