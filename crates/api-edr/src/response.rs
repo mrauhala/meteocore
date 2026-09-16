@@ -416,8 +416,9 @@ struct LocationFeatures<'a> {
     datetime: &'a str,
 }
 
-// Field order matches the original serde_json::Value map order, preserving
-// response bytes (and therefore ETags) as well as the GeoJSON contract.
+// Struct fields give the response a stable order independent of serde_json's
+// preserve_order feature. The GeoJSON content is unchanged; existing ETags may
+// change once when upgrading from the previous Value-based serializer.
 #[derive(serde::Serialize)]
 struct LocationFeature<'a> {
     geometry: LocationGeometry,
@@ -493,7 +494,7 @@ mod location_tests {
     use super::*;
 
     #[test]
-    fn direct_serialization_preserves_geojson_bytes_and_escaping() {
+    fn direct_serialization_preserves_geojson_content_and_escaping() {
         let label = "Helsinki \"centre\"\n雪";
         let location = Location {
             id: "station-1".into(),
@@ -519,10 +520,11 @@ mod location_tests {
             }],
             "links": [{ "href": "https://example.org/prefix/edr/collections/weather/locations", "rel": "self", "type": "application/geo+json", "title": "Locations" }]
         });
-        assert_eq!(
-            locations_to_json(&[location], &ctx).unwrap(),
-            serde_json::to_vec(&expected).unwrap()
-        );
+        // Workspace dependencies can enable serde_json/preserve_order, which
+        // changes Value serialization order without changing the JSON content.
+        let actual: Value =
+            serde_json::from_slice(&locations_to_json(&[location], &ctx).unwrap()).unwrap();
+        assert_eq!(actual, expected);
         let empty: Value = serde_json::from_slice(&locations_to_json(&[], &ctx).unwrap()).unwrap();
         assert_eq!(empty["features"], json!([]));
         assert_eq!(empty["links"], expected["links"]);

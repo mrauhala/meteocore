@@ -79,6 +79,8 @@ EDR 1.1 inventory, but no intermediate JSON tree duplicates every location and
 its parameter metadata. The final response bytes and the engine's location
 vector remain in memory; this is bounded concurrency, not constant total
 response memory or pagination.
+JSON object keys have a stable serialization order independent of dependency
+features; ETags may change once when upgrading from the previous serializer.
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499).
 
