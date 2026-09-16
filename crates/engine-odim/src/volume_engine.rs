@@ -5421,6 +5421,40 @@ mod tests {
         }
     }
 
+    /// #641: compare native gates with the actual serving sampler. A narrow
+    /// radial peak is missed by coarse point sampling, then recovered when
+    /// radius/height centres resolve it. This pins the diagnostic, not a claim
+    /// that finer grids always converge monotonically on arbitrary radar data.
+    #[test]
+    fn voxel_diagnostics_exposes_narrow_peak_loss_and_beam_extension() {
+        use crate::voxel_diagnostics::{compare, NativeSweep};
+        let vol = synthetic_volume(25.0, 60.0);
+        let s = &vol.sweeps[0];
+        let mut data = Array2::<u16>::from_elem((s.nrays, s.nbins), 20);
+        data.column_mut(10).fill(60);
+        let pixels = std::sync::Arc::new(RawPixels::U16(data));
+        let fid = unique_file_id();
+        pixel_cache().insert(&fid, SYNTHETIC_DS, pixels.clone());
+        let native = [NativeSweep {
+            sweep: s,
+            moment: &s.moments[0],
+            pixels: &pixels,
+        }];
+        let report = |dims| {
+            let (grid, _) =
+                voxel_grid_from_volume(&vol, &fid, test_pixels(), "DBZH", Some(dims)).unwrap();
+            compare(&grid, &native, 1.0).unwrap()
+        };
+        let coarse = report([10, 4, 48]);
+        let fine = report([100, 4, 2000]);
+        assert_eq!(coarse[0].native_peak_dbz, Some(60.0));
+        assert_eq!(fine[0].native_peak_dbz, Some(60.0));
+        assert_eq!(coarse[0].voxel_peak_dbz, Some(20.0));
+        assert_eq!(fine[0].voxel_peak_dbz, Some(60.0));
+        assert!(fine[0].finite_without_beam_support > 0);
+        assert!(fine[0].max_abs_integral_difference_kg_m2 > 0.0);
+    }
+
     /// #360: the voxel grid fills clear air (`undetect`) with the finite
     /// [`NO_ECHO_FLOOR`] (so an isosurface seals against it) while leaving
     /// genuinely-unmeasured cells (outside the single sweep's envelope) as

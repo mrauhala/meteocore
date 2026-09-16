@@ -51,6 +51,21 @@ weather.
 cargo run -p engine-odim --example volume_stats -- path/to/volume.h5 [QUANTITY]
 ```
 
+## `voxel_validation` — quantitative sampling baseline
+
+Compare the actual voxel sampler against every gate of one exact dBZ quantity:
+
+```bash
+cargo run --offline --release -p engine-odim --example voxel_validation -- \
+  path/to/volume.h5 DBZH 1 '48,180,24;128,360,48;256,360,96'
+```
+
+Reports range-banded native/voxel peaks, 18/45/50 dBZ centre-height tops,
+beam-support counts, and vertical integration proxies. Beam width is an
+explicit assumption in degrees, not retrieved metadata; the reference is not
+measured VIL. Missing files or quantities fail rather than skip or fall back.
+See [method, fixture hashes and measured results](../../../docs/odim-voxel-validation.md).
+
 ## Why `.pnts` and not `.glb` (and other gotchas)
 
 Hard-won while building the PoC — these inform how `ds-3dtiles` should encode:

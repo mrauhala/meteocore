@@ -827,7 +827,9 @@ fn pvol_volume_engine_read_cells() {
         .map(|c| c.max_dbz)
         .fold(f64::NEG_INFINITY, f64::max);
     // The native-resolution peak is ≈59 dBZ; cell-centre resampling onto the
-    // modest test grid smooths it to ≈43 dBZ (≈46 at the default dims).
+    // modest test grid misses it: 43.26 dBZ (45.86 at default dims).
+    // This is nearest-gate subsampling, not smoothing; see
+    // docs/odim-voxel-validation.md for range/resolution comparisons.
     assert!(
         (40.0..50.0).contains(&strongest),
         "fixture storm peak on this grid ≈43 dBZ, got {strongest}"
