@@ -14,6 +14,11 @@ class Event {
   addEventListener(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
   fire(value) { for (const fn of [...this.listeners]) fn(value); }
 }
+class Resource {
+  constructor(options) { this.url = options.url; this.headers = {}; }
+  clone(result) { return Object.assign(result || new Resource({url: this.url}), {url: this.url, headers: this.headers}); }
+  getDerivedResource() { return this.clone(); }
+}
 class Tileset {
   root = { contentReady: false };
   tileLoad = new Event();
@@ -44,7 +49,7 @@ async function until(predicate) {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await tick(); }
   assert.fail('asynchronous state did not settle');
 }
-function harness(t) {
+function harness(t, metadataTimeout = null) {
   const elements = new Map(), created = [], primitives = new Set(), timers = new Set(), intervals = [];
   const document = { hidden: false, addEventListener() {}, createElement: () => new Element(),
     getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); } };
@@ -58,12 +63,17 @@ function harness(t) {
     setTimeout(fn, ms) { const id = setTimeout(fn, ms); timers.add(id); return id; },
     clearTimeout(id) { clearTimeout(id); timers.delete(id); },
     setInterval(fn, ms) { intervals.push({fn, ms}); return intervals.length; }, clearInterval() {},
-    fetch: async () => { throw new Error('unexpected fetch'); },
-    Cesium: { Viewer: function () { return viewer; }, ImageryLayer: class {}, UrlTemplateImageryProvider: class {},
+    fetch: async () => ({ok: true, json: async () => ({})}),
+    Cesium: { Resource, Viewer: function () { return viewer; }, ImageryLayer: class {}, UrlTemplateImageryProvider: class {},
       Color: { BLACK: {} }, Math: { toRadians: x => x }, HeadingPitchRange: class {}, Cesium3DTileStyle: class {},
-      Cesium3DTileset: { fromUrl: async (url, options) => { const ts = new Tileset(url, options); created.push(ts); return ts; } } },
+      Cesium3DTileset: { fromUrl: async (resource, options) => {
+        // Cesium clones Resource twice before fetchJson: fromUrl and loadJson.
+        const copy = resource.getDerivedResource().getDerivedResource();
+        await copy.fetchJson();
+        const ts = new Tileset(copy.url, options); created.push(ts); return ts;
+      } } },
   });
-  vm.runInContext(script, context);
+  vm.runInContext(metadataTimeout === null ? script : script.replace('const FRAME_LOAD_TIMEOUT_MS = 120000;', `const FRAME_LOAD_TIMEOUT_MS = ${metadataTimeout};`), context);
   const run = code => vm.runInContext(code, context);
   run(`$coll.value = 'A'; metaCollection = 'A'; $qty.value = 'DBZH'; $rep.value = 'points'; $num.value = '5'; $res.value = 'med';`);
   t.after(() => { run('frameController?.abort()'); for (const timer of timers) clearTimeout(timer); });
@@ -112,29 +122,53 @@ test('content failures leave no playable or cached frame and remove listeners', 
   assert.equal(h.elements.get('status').textContent, 'no data for this selection');
 });
 
-test('superseded metadata requests still occupy the global six slots until settled', async t => {
+test('switching controls aborts metadata before reusing the six shared slots', async t => {
   const h = harness(t), pending = [];
-  h.context.Cesium.Cesium3DTileset.fromUrl = (url, options) => new Promise(resolve => {
-    pending.push(() => { const ts = new Tileset(url, options); h.created.push(ts); resolve(ts); });
+  let active = 0, peak = 0, aborted = 0;
+  h.context.fetch = (url, {signal}) => new Promise((resolve, reject) => {
+    active++; peak = Math.max(peak, active);
+    const cancel = () => { active--; aborted++; reject(signal.reason); };
+    signal.addEventListener('abort', cancel, {once:true});
+    pending.push(() => {
+      if (signal.aborted) return;
+      signal.removeEventListener('abort', cancel); active--;
+      resolve({ok:true, json:async()=>({})});
+    });
   });
   h.run(`times = Array.from({length: 8}, (_, i) => 't' + i);`);
   const old = h.run('loadFrames()');
   await until(() => pending.length === 6);
   const latest = h.run(`$qty.value = 'TH'; loadFrames()`);
-  await tick();
-  assert.equal(pending.length, 6);
-  pending.splice(0).forEach(resolve => resolve());
   await old;
-  await until(() => pending.length === 6);
-  assert.ok(h.created.every(ts => ts.dead));
+  await until(() => pending.length === 12);
+  assert.equal(aborted, 6);
+  assert.equal(peak, 6);
+  assert.equal(h.created.length, 0);
   pending.splice(0).forEach(resolve => resolve());
-  await until(() => h.created.length === 12 && h.primitives.size === 6);
-  for (const ts of h.created) if (!ts.dead) ts.complete();
+  await until(() => h.primitives.size === 6);
+  for (const ts of h.created) ts.complete();
   await until(() => pending.length === 2);
   pending.splice(0).forEach(resolve => resolve());
   await finishFrames(h, latest);
   assert.equal(h.run('frames.filter(Boolean).length'), 8);
-  assert.equal(h.primitives.size, 8);
+  assert.equal(active, 0);
+});
+
+test('stalled metadata times out, aborts its fetch, and leaves the queue usable', async t => {
+  const h = harness(t, 20);
+  let aborted = 0;
+  h.context.fetch = (url, {signal}) => new Promise((_, reject) => {
+    signal.addEventListener('abort', () => { aborted++; reject(signal.reason); }, {once:true});
+  });
+  h.run(`times = ['a','b','c','d','e','f'];`);
+  await h.run('loadFrames()');
+  await until(() => h.run('activeFrameLoads') === 0);
+  assert.equal(aborted, 6);
+  assert.equal(h.created.length, 0);
+  assert.equal(h.run('tileCache.size'), 0);
+  h.context.fetch = async () => ({ok:true, json:async()=>({})});
+  await finishFrames(h, h.run('loadFrames()'));
+  assert.equal(h.run('frames.filter(isFrameReady).length'), 6);
 });
 
 test('late metadata from radar A cannot overwrite radar B', async t => {

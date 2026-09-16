@@ -477,8 +477,39 @@ const frameLoadQueue = [];
 let activeFrameLoads = 0;
 const frameAbort = () => new DOMException("Frame load superseded", "AbortError");
 
-// One queue across ALL builds, including metadata requests still resolving from
-// a superseded build. A control change must not multiply the six content slots.
+// Resource clones retain an abortable JSON loader; content URLs still resolve
+// against the original tileset URL and use Cesium's normal binary loaders.
+class FrameResource extends Cesium.Resource {
+  constructor(options, signal) { super(options); this.frameSignal = signal; }
+  clone(result) {
+    const copy = super.clone(result || new FrameResource({ url: this.url }, this.frameSignal));
+    copy.frameSignal = this.frameSignal;
+    return copy;
+  }
+  async fetchJson() {
+    const response = await fetch(this.url, {
+      signal: this.frameSignal, headers: { Accept: "application/json", ...this.headers },
+    });
+    if (!response.ok) throw new Error(`Tileset metadata HTTP ${response.status}`);
+    return response.json();
+  }
+}
+async function loadFrameMetadata(url, options, signal) {
+  if (signal.aborted) throw frameAbort();
+  const controller = new AbortController();
+  const abort = () => controller.abort(frameAbort());
+  signal.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("Tileset metadata load timed out")), FRAME_LOAD_TIMEOUT_MS);
+  try {
+    return await Cesium.Cesium3DTileset.fromUrl(new FrameResource({ url }, controller.signal), options);
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+// One queue across ALL builds. Cancellation aborts metadata fetches before
+// releasing their slots; a control change cannot multiply active requests.
 function queueFrameLoad(signal, load) {
   return new Promise((resolve, reject) => {
     if (signal.aborted) { reject(frameAbort()); return; }
@@ -610,8 +641,8 @@ async function loadFrames(reframe = false, resumePlayback = false, refresh = fal
       try {
         ts = await queueFrameLoad(signal, async () => {
           if (signal.aborted) throw frameAbort();
-          const tile = await Cesium.Cesium3DTileset.fromUrl(urls[i],
-            { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true });
+          const tile = await loadFrameMetadata(urls[i],
+            { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true }, signal);
           try {
             if (signal.aborted) throw frameAbort();
             // Track readiness through public content events, including eviction.

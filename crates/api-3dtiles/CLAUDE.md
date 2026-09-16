@@ -56,6 +56,8 @@ deterministic.
   round-trips as `?datetime=`).
 - The viewer uses a global six-slot queue across control changes. A slot
   covers tileset JSON AND root content loading; `fromUrl` alone is not readiness.
+  JSON loads use an abortable `Resource` subclass (preserved by `clone`) with a
+  timeout, so superseded/stalled metadata cannot permanently consume a slot.
   Hidden loads use `preloadWhenHidden: true` until `tileLoad`, then disable it.
   Only content-ready frames enter the cache/playback set; failures and canceled
   loads are destroyed. Track load/unload through public Cesium events.
