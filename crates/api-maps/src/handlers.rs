@@ -1225,7 +1225,10 @@ async fn render_map(
     // hoisting still saves one Arc-clone-sized allocation per request on
     // engines that materialise `RasterInfo` lazily.
     let raster_info = engine.raster_info();
-    let time = validated.time.or_else(|| raster_info.times.last().copied());
+    let time = validated
+        .time
+        .or_else(|| engine.default_time())
+        .or_else(|| raster_info.times.last().copied());
     // #521: resolve the run axis to the CONCRETE run the engine will render
     // before the cache key is built. The Maps `reference_time` query
     // parameter is still a follow-up (#337 Phase 4) — the handler never pins

@@ -156,3 +156,8 @@ client could spoof the emitted self-links (open-redirect risk downstream).
   The 32-byte/output-pixel estimate covers output buffers/scratch, not source
   decoding or resident caches. At the default, the 8000×8000 format limit exceeds
   the memory budget and returns 503; operators can raise the budget explicitly.
+
+- Preview temporal manifests may include `temporal_extent.default` from
+  `MapEngine::default_time()`. The slider selects it rather than the last
+  value; preview time-window filtering must preserve that default (CAP's
+  active-now view can precede future warning boundaries).

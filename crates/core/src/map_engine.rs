@@ -412,6 +412,14 @@ pub trait MapEngine: Send + Sync {
     /// per-request, cache it.
     fn raster_info(&self) -> RasterInfo;
 
+    /// An explicit default valid time, independent of the advertised axis.
+    /// `None` means use the last advertised timestep (the existing forecast
+    /// convention). Alert engines override this with their snapshot's "now"
+    /// while advertising future warnings. Must be O(1), with no I/O.
+    fn default_time(&self) -> Option<DateTime<Utc>> {
+        None
+    }
+
     /// Resolve a requested time to the **exact timestep this engine would
     /// render** for it — the timestamp that must key any cache of the
     /// rendered output (#507).

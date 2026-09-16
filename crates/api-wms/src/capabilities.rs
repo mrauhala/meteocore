@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -56,7 +57,15 @@ pub fn get_capabilities_xml(
                 // Multi-parameter engine: parent layer (not requestable) with
                 // nested child layers per parameter. Each child resolves its
                 // own style map, so pass the whole registry down.
-                write_parent_layer(&mut writer, id, config, &info, styles, base_url);
+                write_parent_layer(
+                    &mut writer,
+                    id,
+                    config,
+                    &info,
+                    styles,
+                    base_url,
+                    engine.default_time(),
+                );
             } else {
                 // Single-parameter engine: one requestable layer
                 write_layer(
@@ -67,6 +76,7 @@ pub fn get_capabilities_xml(
                     styles.get(id.as_str()),
                     base_url,
                     None,
+                    engine.default_time(),
                 );
             }
         }
@@ -146,6 +156,7 @@ fn write_parent_layer(
     info: &RasterInfo,
     styles: &HashMap<String, HashMap<String, StyleInfo>>,
     base_url: &str,
+    default_time: Option<DateTime<Utc>>,
 ) {
     let _ = writer.write_event(Event::Start(BytesStart::new("Layer")));
 
@@ -155,7 +166,7 @@ fn write_parent_layer(
     write_keyword_list(writer, &config.keywords);
 
     // CRS, bbox, time on parent — inherited by children
-    write_layer_metadata(writer, info);
+    write_layer_metadata(writer, info, default_time);
 
     // Attribution (license) after Dimension, before nested child Layers.
     write_attribution(writer, config.license.as_ref());
@@ -183,6 +194,7 @@ fn write_parent_layer(
             child_styles,
             base_url,
             Some(&child_title),
+            default_time,
         );
     }
 
@@ -192,6 +204,7 @@ fn write_parent_layer(
 /// Write a single requestable layer.
 /// If `param_title` is Some, this is a child of a multi-param parent and we
 /// skip inherited metadata (CRS, bbox, time) since the parent already has it.
+#[allow(clippy::too_many_arguments)]
 fn write_layer(
     writer: &mut Writer<Vec<u8>>,
     layer_name: &str,
@@ -200,6 +213,7 @@ fn write_layer(
     layer_styles: Option<&HashMap<String, StyleInfo>>,
     base_url: &str,
     param_title: Option<&str>,
+    default_time: Option<DateTime<Utc>>,
 ) {
     let mut layer = BytesStart::new("Layer");
     layer.push_attribute(("queryable", "0"));
@@ -221,7 +235,7 @@ fn write_layer(
     // For top-level (non-nested) layers, write full metadata.
     // For nested child layers, parent already has CRS/bbox/time.
     if param_title.is_none() {
-        write_layer_metadata(writer, info);
+        write_layer_metadata(writer, info, default_time);
         // Attribution (license) after Dimension, before Style.
         write_attribution(writer, config.license.as_ref());
     }
@@ -233,7 +247,11 @@ fn write_layer(
 }
 
 /// Write CRS, bbox, and time dimension for a layer.
-fn write_layer_metadata(writer: &mut Writer<Vec<u8>>, info: &RasterInfo) {
+fn write_layer_metadata(
+    writer: &mut Writer<Vec<u8>>,
+    info: &RasterInfo,
+    default_time: Option<DateTime<Utc>>,
+) {
     // CRS
     for crs in params::supported_crs_list() {
         write_text_element(writer, "CRS", crs);
@@ -262,7 +280,7 @@ fn write_layer_metadata(writer: &mut Writer<Vec<u8>>, info: &RasterInfo) {
         let mut dim = BytesStart::new("Dimension");
         dim.push_attribute(("name", "time"));
         dim.push_attribute(("units", "ISO8601"));
-        if let Some(latest) = info.times.last() {
+        if let Some(latest) = default_time.or_else(|| info.times.last().copied()) {
             dim.push_attribute(("default", latest.to_rfc3339().as_str()));
         }
         dim.push_attribute(("nearestValue", "1"));

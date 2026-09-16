@@ -707,23 +707,33 @@ fn union_extent(records: &[AreaRecord]) -> Option<[f64; 4]> {
     any.then_some(ext)
 }
 
-/// Distinct window boundaries at/below `as_of`, plus `as_of` itself (always the
-/// max, so a WMS TIME-less request — which the handler resolves to `times.last()`
-/// — renders the set active *now*). Capped to the most recent [`MAX_TIME_VALUES`].
+/// Advertise warning boundaries through the next seven days, retaining the
+/// default "now" even under the cardinality cap. Prefer nearby boundaries
+/// when trimming; neither a long archive nor distant forecasts can evict now.
 fn build_times(records: &[AreaRecord], as_of: DateTime<Utc>) -> Vec<DateTime<Utc>> {
-    let mut times: Vec<DateTime<Utc>> = Vec::new();
+    let horizon = as_of
+        .checked_add_signed(Duration::days(7))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let mut times = vec![as_of];
     for r in records {
-        for b in [r.window.start, r.window.end].into_iter().flatten() {
-            if b <= as_of {
-                times.push(b);
-            }
-        }
+        times.extend(
+            [r.window.start, r.window.end]
+                .into_iter()
+                .flatten()
+                .filter(|&t| t <= horizon),
+        );
     }
-    times.push(as_of);
     times.sort_unstable();
     times.dedup();
     if times.len() > MAX_TIME_VALUES {
-        times.drain(0..times.len() - MAX_TIME_VALUES);
+        times.sort_unstable_by_key(|t| {
+            (
+                t.signed_duration_since(as_of).num_seconds().unsigned_abs(),
+                *t,
+            )
+        });
+        times.truncate(MAX_TIME_VALUES);
+        times.sort_unstable();
     }
     times
 }
@@ -1092,12 +1102,36 @@ mod tests {
     }
 
     #[test]
-    fn times_end_at_as_of_for_now_default() {
+    fn times_include_future_boundaries_and_now() {
         let alerts = parse_document(DOC).unwrap();
         let as_of = at(2026, 6, 15, 12);
         let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", as_of);
-        assert_eq!(cat.info.times.last(), Some(&as_of));
-        // The future expiry (16:00) is excluded (> as_of) so as_of stays the max.
-        assert!(cat.info.times.iter().all(|&t| t <= as_of));
+        assert!(cat.info.times.contains(&as_of));
+        assert!(cat.info.times.contains(&at(2026, 6, 15, 16)));
+    }
+    #[test]
+    fn capped_timeline_keeps_now_and_bounds_future_horizon() {
+        let as_of = at(2026, 6, 15, 12);
+        let cat = Catalog::build(
+            &parse_document(DOC).unwrap(),
+            &cfg(),
+            "cap",
+            "severity",
+            as_of,
+        );
+        let records: Vec<_> = (-600..600)
+            .map(|minute| {
+                let mut record = cat.records[0].clone();
+                record.window.start = Some(as_of + Duration::minutes(minute));
+                record.window.end = Some(as_of + Duration::days(8));
+                record
+            })
+            .collect();
+        let times = build_times(&records, as_of);
+        assert_eq!(times.len(), MAX_TIME_VALUES);
+        assert!(times.contains(&as_of));
+        assert!(times.iter().any(|&t| t > as_of));
+        assert!(times.iter().all(|&t| t <= as_of + Duration::days(7)));
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
     }
 }
