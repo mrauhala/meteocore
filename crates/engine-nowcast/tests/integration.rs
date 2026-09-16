@@ -2451,3 +2451,18 @@ fn unknown_and_outside_lightning_coverage_are_not_measured_quiet() {
         }
     }
 }
+
+#[test]
+fn startup_replay_caps_io_even_with_a_long_source_history() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    let times: Vec<_> = (0..40).map(|i| t0() + Duration::minutes(i * 5)).collect();
+    let (_, engine) = build("PT30M", &times);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(
+        page.features[0].properties.get("track_age"),
+        Some(&PropertyValue::Integer(9)),
+        "eight replay observations plus the published analysis, not forty serial reads"
+    );
+}

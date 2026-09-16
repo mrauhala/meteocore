@@ -145,7 +145,7 @@ content-negotiation glue.
 
 Nowcast tracks survive one missed detection for reassociation only: the missing
 cell is absent from that generation's features, and `track_age` counts observed
-frames. Startup reconstructs up to 48 retained source frames without publishing
+frames. Startup reconstructs up to eight retained source frames without publishing
 historical forecast runs. Lightning fields require explicitly known source
 coverage of the labeled footprint and attribution radius. With a source wired,
 `lightning_coverage` is `true`, `false`, or `null` (unknown); flash fields are null

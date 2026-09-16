@@ -1203,7 +1203,8 @@ impl NowcastEngine {
         })
     }
 
-    /// Bounded boot replay, retaining only cells and one frame at a time.
+    /// Boot replay uses the same eight-fetch ceiling as motion history.
+    /// Retain only cells and one frame at a time.
     /// Gaps/unreadable frames break continuity; no invented observations.
     fn replay_tracks(
         &self,
@@ -1230,7 +1231,7 @@ impl NowcastEngine {
             .copied()
             .filter(|t| *t < anchor)
             .rev()
-            .take(CELL_HISTORY_SNAPSHOTS)
+            .take(MAX_HISTORY_FRAMES)
             .collect();
         for time in times.into_iter().rev() {
             let run = self.source.resolve_reference_time(Some(time), None);
@@ -1261,6 +1262,12 @@ impl NowcastEngine {
                 || self.next_track_id.fetch_add(1, Ordering::Relaxed),
             );
             tracks = next;
+            // Replay deliberately estimates no ambient field. It reconstructs
+            // track motion, but cannot establish sustained deviation from an
+            // ambient flow it never measured.
+            for track in &mut tracks {
+                track.deviant_streak = 0;
+            }
             coasts = next_coasts;
             coast_at = at;
             at = time;

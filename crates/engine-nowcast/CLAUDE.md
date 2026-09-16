@@ -636,10 +636,13 @@ lightning joins, ranking, or growth/decay labels. Rescue uses elapsed time since
 the last actual observation, so velocity is not doubled and age increments
 only once. Death telemetry is delayed until the coast expires.
 
-At startup, replay at most the last 48 retained source frames before the newest
+At startup, replay at most the last eight retained source frames before the newest
 anchor, one frame at a time, using segmentation and association only. Replay
+uses the same blocking-fetch ceiling as motion history; replaying the whole
+48-snapshot serving history would multiply startup I/O stalls. Replay
 publishes no forecast runs and changes no generation/association metrics. It
-recovers motion, observed age and hysteresis; historical lightning is not
+recovers motion, observed age and hysteresis; sustained deviation from ambient
+flow starts afresh because replay does not estimate that field. Historical lightning is not
 requeried. Unreadable frames break replay continuity. IDs use an epoch-based
 seed instead of restarting at one. Long-term clutter climatology/persistence
 and split/merge lineage remain separate work (#620/#551).
