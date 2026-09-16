@@ -16,7 +16,7 @@ use url::Url;
 
 use ds_core::error::DataServerError;
 use ds_storage::object_store::path::Path as ObjectPath;
-use ds_storage::{build_store, DataStore};
+use ds_storage::{build_http_store, build_store, DataStore};
 
 use crate::parser::{parse_document, CapAlert};
 use crate::wis2::Wis2CapSource;
@@ -78,7 +78,7 @@ impl Source {
                 })
             }
             (None, Some(url)) => {
-                let (index_store, index_path) = build_store(url)?;
+                let (index_store, index_path) = build_http_store(url)?;
                 Ok(Source::Feed {
                     cache: Mutex::default(),
                     index_store,
@@ -270,7 +270,7 @@ fn load_feed(
     // cross-call client reuse; pooling across polls is a future optimisation.
     let mut documents = Vec::new();
     for (origin, paths) in by_origin {
-        match build_store(&origin) {
+        match build_http_store(&origin) {
             Ok((store, _)) => documents.extend(fetch_and_parse(&store, &paths, &origin)),
             Err(e) => {
                 tracing::warn!("cap feed: cannot build store for origin '{origin}': {e}");
@@ -282,7 +282,7 @@ fn load_feed(
     // `get_many` (HEAD-checks the body against MAX_DOC_BYTES before pulling it),
     // still bounded by the entry count cap.
     for u in with_query {
-        let fetched = build_store(u.as_str()).and_then(|(store, path)| {
+        let fetched = build_http_store(u.as_str()).and_then(|(store, path)| {
             store
                 .get_many(std::slice::from_ref(&path), 1, Some(MAX_DOC_BYTES))?
                 .into_iter()

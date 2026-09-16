@@ -46,8 +46,14 @@ impl Server {
                 let mut fields = request.split_whitespace();
                 let method = fields.next().unwrap();
                 let path = fields.next().unwrap();
-                let response = if let Some(code) = path.strip_prefix("/redirect") {
+                let route = path.split('?').next().unwrap();
+                let response = if let Some(code) = route.strip_prefix("/redirect") {
                     format!("HTTP/1.1 {code} Redirect\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else if route == "/signed"
+                    && path != "/signed?token=a%2Fb&next=https://host.amazonaws.com/"
+                {
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .into()
                 } else if request.to_ascii_lowercase().contains("range: bytes=1-2") {
                     "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-2/4\r\nContent-Length: 2\r\nConnection: close\r\n\r\nbc".into()
                 } else {
@@ -83,6 +89,15 @@ async fn http_get_head_and_range_work_but_never_contact_redirect_targets() {
     assert_eq!(&store.get(&path).unwrap()[..], b"abcd");
     assert_eq!(store.head(&path).unwrap().size, 4);
     assert_eq!(&store.get_range(&path, 1..3).unwrap()[..], b"bc");
+
+    let (signed, path) = ds_storage::build_store(&format!(
+        "{}/signed?token=a%2Fb&next=https://host.amazonaws.com/",
+        server.url
+    ))
+    .unwrap();
+    assert_eq!(&signed.get(&path).unwrap()[..], b"abcd");
+    assert_eq!(signed.head(&path).unwrap().size, 4);
+    assert_eq!(&signed.get_range(&path, 1..3).unwrap()[..], b"bc");
 
     for code in [301, 302, 303, 307, 308] {
         let (_, path) = ds_storage::build_store(&format!("{}/redirect{code}", server.url)).unwrap();

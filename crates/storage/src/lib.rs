@@ -477,8 +477,17 @@ pub fn build_s3_store_from_parts(
 
 /// Detect S3-style HTTP URLs like https://s3-eu-west-1.amazonaws.com/bucket/...
 /// or https://bucket.s3.region.amazonaws.com/...
-fn is_s3_http_url(url: &str) -> bool {
-    url.contains(".amazonaws.com/") || url.contains(".cloudferro.com/")
+fn is_s3_http_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    // Query-bearing links (including pre-signed object URLs) must preserve
+    // their exact HTTP query rather than becoming S3 prefix discovery.
+    if !matches!(url.scheme(), "http" | "https") || url.query().is_some() {
+        return false;
+    }
+    url.host_str()
+        .is_some_and(|host| host.ends_with(".amazonaws.com") || host.ends_with(".cloudferro.com"))
 }
 
 fn build_local_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
@@ -603,21 +612,22 @@ impl object_store::client::HttpConnector for NoRedirectConnector {
     }
 }
 
-fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
+/// Build a no-redirect HTTP object store without S3 URL auto-detection.
+/// Use for feeds and allowlisted document URLs, including S3-hosted objects.
+/// The source query string is preserved on each request.
+pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
     // For HTTP, the URL up to the last '/' is the base, the rest is prefix
     let url = url::Url::parse(data_path)
         .map_err(|e| DataServerError::Storage(format!("Invalid URL {data_path}: {e}")))?;
 
-    // Use the URL without the path as the base (preserve port if present)
-    let base_url = match url.port() {
-        Some(port) => format!(
-            "{}://{}:{}",
-            url.scheme(),
-            url.host_str().unwrap_or(""),
-            port
-        ),
-        None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("")),
-    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(DataServerError::Config(
+            "HTTP source requires an http(s) URL".into(),
+        ));
+    }
+    let mut base_url = url.clone();
+    base_url.set_path("");
+    base_url.set_fragment(None);
 
     // Own all transport options here rather than using ClientOptions (whose
     // reqwest builder is private). Disable transparent decompression to keep
@@ -634,7 +644,7 @@ fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServ
         .build()
         .map_err(|e| DataServerError::Storage(format!("Cannot create HTTP client: {e}")))?;
     let store = object_store::http::HttpBuilder::new()
-        .with_url(&base_url)
+        .with_url(base_url.as_str())
         .with_http_connector(NoRedirectConnector(client))
         .build()
         .map_err(|e| {
@@ -648,6 +658,24 @@ fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_detection_uses_only_host_and_never_loses_signed_queries() {
+        assert!(is_s3_http_url(
+            "https://bucket.s3.eu-west-1.amazonaws.com/prefix"
+        ));
+        assert!(is_s3_http_url(
+            "https://s3.waw3-1.cloudferro.com/bucket/prefix"
+        ));
+        for value in [
+            "https://example.com/x?next=https://s3.eu-west-1.amazonaws.com/bucket",
+            "https://example.com/path/.cloudferro.com/file",
+            "https://s3.amazonaws.com.evil.test/file",
+            "https://bucket.s3.eu-west-1.amazonaws.com/doc.xml?X-Amz-Signature=abc",
+        ] {
+            assert!(!is_s3_http_url(value), "{value}");
+        }
+    }
 
     #[test]
     fn has_scheme_is_case_insensitive_on_the_prefix_only() {
