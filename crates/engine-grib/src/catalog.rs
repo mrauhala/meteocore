@@ -71,6 +71,25 @@ impl MessageEntry {
     }
 }
 
+/// Sidecars can repeat a catalog key at distinct offsets (including GFS
+/// accumulation records). Report these without assuming their payloads are
+/// equivalent or inventing a scientific discriminator absent from the index.
+pub(crate) fn duplicate_message_keys(
+    messages: &[MessageEntry],
+) -> impl Iterator<Item = (&MessageEntry, &MessageEntry)> {
+    let mut first = HashMap::new();
+    messages.iter().filter_map(move |message| {
+        let key = (&message.param, &message.levtype, message.level);
+        match first.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(message);
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => Some((*entry.get(), message)),
+        }
+    })
+}
+
 /// One forecast step file with its message index.
 #[derive(Debug, Clone)]
 pub struct StepFile {

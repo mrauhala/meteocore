@@ -656,7 +656,7 @@ impl GribEngine {
     fn parse_and_resolve(
         format: index::IndexFormat,
         content: &str,
-        _grib_url: &str,
+        grib_url: &str,
     ) -> Option<index::IndexResult> {
         match format {
             index::IndexFormat::EcmwfJson => index::parse_ecmwf_json(content),
@@ -696,6 +696,18 @@ impl GribEngine {
 
                 if messages.is_empty() {
                     return None;
+                }
+
+                for (first, duplicate) in catalog::duplicate_message_keys(&messages) {
+                    tracing::warn!(
+                        source = grib_url,
+                        parameter = %first.param,
+                        level_type = %first.levtype,
+                        level = ?first.level,
+                        first_offset = first.offset,
+                        duplicate_offset = duplicate.offset,
+                        "ambiguous wgrib2 catalog key; queries select the first record; payload equivalence is unknown"
+                    );
                 }
 
                 Some(index::IndexResult {
@@ -1573,6 +1585,22 @@ mod tests {
         assert_eq!(parsed.step, 6);
         assert!(parsed.messages.iter().any(|m| m.param == "APCP_acc_6h"));
         assert!(parsed.messages.iter().any(|m| m.param == "DSWRF_avg_6h"));
+        let duplicates: Vec<_> = catalog::duplicate_message_keys(&parsed.messages).collect();
+        let (first, duplicate) = duplicates
+            .iter()
+            .find(|(first, _)| first.param == "APCP_acc_6h")
+            .unwrap();
+        assert_eq!((first.offset, duplicate.offset), (426827357, 427200871));
+        assert_eq!(first.length, Some(373514));
+        assert_eq!(duplicate.length, Some(373514));
+        let step = StepFile {
+            grib_url: "fixture".into(),
+            messages: parsed.messages.clone(),
+        };
+        assert_eq!(
+            step.find_message("APCP_acc_6h", None).unwrap().offset,
+            426827357
+        );
         let mixed = fixture.replace("0-6 hour acc fcst", "0-12 hour acc fcst");
         assert!(
             GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, &mixed, "fixture").is_none()
@@ -1590,6 +1618,7 @@ mod tests {
         let index = "1:0:d=2026040800:APCP:surface:6 hour fcst:\n2:100:d=2026040800:APCP:surface:0-6 hour acc fcst:\n3:200:d=2026040800:APCP:surface:3-6 hour acc fcst:\n4:300:d=2026040800:DSWRF:surface:0-6 hour ave fcst:\n";
         let parsed =
             GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, index, "synthetic").unwrap();
+        assert_eq!(catalog::duplicate_message_keys(&parsed.messages).count(), 0);
         let rt = parsed.reference_time;
         let mut sf = StepFile {
             grib_url: "synthetic".into(),

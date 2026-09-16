@@ -118,6 +118,11 @@ source WMO unit and existing display conversion (precipitation kg/m² → mm);
 there is no implicit division by duration or conversion of energy into flux.
 ECMWF JSON naming remains unchanged.
 
+If a wgrib2 index repeats the same parameter/level/window at different offsets,
+the scan warns and queries select the first record. Duration-qualified names
+separate different windows; they cannot recover product distinctions omitted
+from the source sidecar, or prove that repeated records contain identical data.
+
 An area query without `parameter-name` prefers the existing near-surface
 instant/max/min products before newly supported acc/ave records. If only
 aggregates are configured, the first available aggregate is the default.

@@ -59,6 +59,10 @@ implements the shared `ds_core::instances` contract (see root CLAUDE.md).
   end and labels carry the duration. Config `parameters = ["APCP"]` includes
   its window variants; an exact key selects one duration. Discover keys
   from the collection before querying. Existing max/min keys remain unchanged.
+  Repeated identical catalog keys at different offsets are ambiguous (the real
+  GFS fixture has two `APCP_acc_6h` surface records). Scan logs a warning with
+  both offsets; queries preserve first-record selection. The index alone cannot
+  establish payload equivalence or expose an omitted product discriminator.
 - Source units still come from the decoded WMO triple: no automatic division
   by window length. Precipitation kg/m² displays as mm; already-averaged flux
   W/m² stays W/m², and energy in J/m² stays energy. ECMWF JSON sidecars retain
