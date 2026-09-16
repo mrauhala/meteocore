@@ -17,7 +17,7 @@
 //! selection logic here.
 //!
 //! Single-flight: concurrent requests for the same key share one compute
-//! (a per-key async mutex). Without it, the viewer's frame preload could run
+//! (a per-key shared result). Without it, the viewer's frame preload could run
 //! the identical multi-second resample N times in parallel.
 //!
 //! Process-global (`LazyLock`, like the engine-side pixel cache) rather than
@@ -38,11 +38,8 @@ use crate::error::Tiles3dError;
 /// Default encoded-content cache size (MB) when `MC_3DTILES_CONTENT_CACHE_MB`
 /// is unset. Encoded tiles are a few hundred KB (echo-top) to tens of MB
 /// (dense point clouds); 512 MB comfortably holds an animation window of one
-/// busy collection. `0` disables caching entirely (diagnostic only): every
-/// request recomputes — concurrent duplicates are merely **serialized** by the
-/// per-key gate (each waiter re-checks the cache, misses because nothing is
-/// admitted at capacity 0, and recomputes in turn), so the gate bounds the
-/// stampede to one compute at a time but does not share results.
+/// busy collection. `0` disables retention, but concurrent callers still share
+/// the same computation and result (including errors).
 const DEFAULT_CONTENT_CACHE_MB: u64 = 512;
 
 /// Which encoded product the bytes are — part of the key so two products with
@@ -97,90 +94,102 @@ fn weigh_content(key: &ContentKey, val: &CachedContent) -> u64 {
     (val.bytes.len() + val.etag.len() + key.collection.len() + key.quantity.len() + 128) as u64
 }
 
-/// Byte-bounded LRU of encoded content + per-key single-flight gates.
+type ContentResult = Result<CachedContent, Tiles3dError>;
+type Flights = Arc<Mutex<HashMap<ContentKey, tokio::sync::watch::Receiver<Option<ContentResult>>>>>;
+
+/// Byte-bounded content cache with computations owned by the cache, not by
+/// individual HTTP requests. Disconnecting a waiter cannot cancel an encode.
+#[derive(Clone)]
 pub struct ContentCache {
-    cache: ByteBoundedCache<ContentKey, CachedContent>,
-    /// One async mutex per in-flight key. The first requester computes while
-    /// holding the gate; coalesced requesters block on it, then find the
-    /// cache populated. Entries are removed when their compute finishes, so
-    /// the map only ever holds currently-computing keys.
-    inflight: Mutex<HashMap<ContentKey, Arc<tokio::sync::Mutex<()>>>>,
+    cache: Arc<ByteBoundedCache<ContentKey, CachedContent>>,
+    inflight: Flights,
+}
+
+/// Remove the flight even when its compute panics or the runtime shuts down.
+/// Dropping the sender also wakes waiters with a closed-channel error.
+struct FlightGuard {
+    key: ContentKey,
+    inflight: Flights,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
 }
 
 impl ContentCache {
     fn new(capacity_mb: u64) -> Self {
-        // Estimate item slots at ~2 MB each; capacity 0 disables retention
-        // (entries heavier than capacity are simply never admitted — the same
-        // "disabled" idiom as the engine's pixel cache).
         ContentCache {
-            cache: ByteBoundedCache::new(
+            cache: Arc::new(ByteBoundedCache::new(
                 capacity_mb.saturating_mul(ds_cache::MIB),
                 2 * ds_cache::MIB,
                 weigh_content,
-            ),
-            inflight: Mutex::new(HashMap::new()),
+            )),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Cached bytes for `key`, or run `compute` (which returns the encoded
-    /// bytes + their ETag) and cache its result. Concurrent callers with the
-    /// same key share one compute; errors are not cached (coalesced waiters
-    /// then retry serially, which bounds an error stampede without pinning a
-    /// transient failure).
-    pub async fn get_or_compute<F, Fut>(
-        &self,
-        key: ContentKey,
-        compute: F,
-    ) -> Result<CachedContent, Tiles3dError>
+    /// Return cached content or join a shared computation. All callers in a
+    /// flight receive its result, even for errors or entries too large to cache.
+    /// Errors are not retained after the flight, so subsequent requests retry.
+    pub async fn get_or_compute<F, Fut>(&self, key: ContentKey, compute: F) -> ContentResult
     where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(Vec<u8>, String), Tiles3dError>>,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(Vec<u8>, String), Tiles3dError>> + Send + 'static,
     {
-        // Untracked lookups + explicit hit/miss recording: a coalesced waiter
-        // that misses the first lookup but hits the re-check under the gate
-        // must count as ONE hit, not a miss + a hit.
         if let Some(hit) = self.cache.get_untracked(&key) {
             self.cache.record_hit();
             return Ok(hit);
         }
-        let gate = {
+        let mut receiver = {
             let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            map.entry(key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let _held = gate.lock().await;
-        // Re-check under the gate: if a coalesced compute just finished, the
-        // bytes are in the cache and this request cost two lookups.
-        if let Some(hit) = self.cache.get_untracked(&key) {
-            self.cache.record_hit();
-            self.release(&key, &gate);
-            return Ok(hit);
-        }
-        self.cache.record_miss();
-        let result = compute().await;
-        let out = match result {
-            Ok((bytes, etag)) => {
-                let content = CachedContent {
-                    bytes: Bytes::from(bytes),
-                    etag: Arc::from(etag.as_str()),
-                };
-                self.cache.insert(key.clone(), content.clone());
-                Ok(content)
+            // A compute can finish between the first lookup and taking the lock.
+            if let Some(hit) = self.cache.get_untracked(&key) {
+                self.cache.record_hit();
+                return Ok(hit);
             }
-            Err(e) => Err(e),
+            if let Some(receiver) = map.get(&key) {
+                self.cache.record_hit();
+                receiver.clone()
+            } else {
+                self.cache.record_miss();
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                map.insert(key.clone(), receiver.clone());
+                let cache = self.cache.clone();
+                let guard = FlightGuard {
+                    key: key.clone(),
+                    inflight: self.inflight.clone(),
+                };
+                // No await between registering and spawning: cancellation cannot
+                // leave a flight without an owner. Keep encoding and populate the
+                // cache even if every HTTP waiter disconnects.
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    let result = compute().await.map(|(bytes, etag)| {
+                        let content = CachedContent {
+                            bytes: Bytes::from(bytes),
+                            etag: Arc::from(etag),
+                        };
+                        cache.insert(key, content.clone());
+                        content
+                    });
+                    sender.send_replace(Some(result));
+                });
+                receiver
+            }
         };
-        self.release(&key, &gate);
-        out
-    }
-
-    /// Drop this key's in-flight gate — but only if it is still *our* gate
-    /// (`ptr_eq`): after an error, a later request may have installed a fresh
-    /// gate for the same key, which must not be removed from under it.
-    fn release(&self, key: &ContentKey, gate: &Arc<tokio::sync::Mutex<()>>) {
-        let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if map.get(key).is_some_and(|g| Arc::ptr_eq(g, gate)) {
-            map.remove(key);
+        loop {
+            let result = receiver.borrow_and_update().clone();
+            if let Some(result) = result {
+                return result;
+            }
+            receiver.changed().await.map_err(|_| {
+                Tiles3dError::Internal("content computation stopped before completion".into())
+            })?;
         }
     }
 
@@ -228,7 +237,7 @@ mod tests {
         for _ in 0..3 {
             let c = computes.clone();
             let got = cache
-                .get_or_compute(key(1), || async move {
+                .get_or_compute(key(1), move || async move {
                     c.fetch_add(1, Ordering::Relaxed);
                     Ok((vec![1, 2, 3], "\"abc\"".to_string()))
                 })
@@ -248,10 +257,9 @@ mod tests {
         let cache = ContentCache::new(64);
         for v in [1u64, 2] {
             let got = cache
-                .get_or_compute(
-                    key(v),
-                    || async move { Ok((vec![v as u8], format!("\"{v}\""))) },
-                )
+                .get_or_compute(key(v), move || async move {
+                    Ok((vec![v as u8], format!("\"{v}\"")))
+                })
                 .await
                 .unwrap();
             assert_eq!(&got.bytes[..], &[v as u8]);
@@ -270,7 +278,7 @@ mod tests {
             let computes = computes.clone();
             handles.push(tokio::spawn(async move {
                 cache
-                    .get_or_compute(key(7), || async move {
+                    .get_or_compute(key(7), move || async move {
                         computes.fetch_add(1, Ordering::Relaxed);
                         // Linger so the other tasks pile onto the gate.
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -318,5 +326,98 @@ mod tests {
         }
         let m = cache.metrics();
         assert_eq!((m.hits, m.misses), (0, 2), "nothing admitted at capacity 0");
+    }
+    #[tokio::test]
+    async fn canceled_waiter_does_not_cancel_compute_or_leak_flight() {
+        let cache = ContentCache::new(64);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let c = cache.clone();
+        let s = started.clone();
+        let r = release.clone();
+        let request = tokio::spawn(async move {
+            c.get_or_compute(key(99), move || async move {
+                s.notify_one();
+                r.notified().await;
+                Ok((vec![42], "etag".into()))
+            })
+            .await
+        });
+        started.notified().await;
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            cache.inflight.lock().unwrap().len(),
+            1,
+            "compute still owns the flight"
+        );
+        release.notify_one();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cache.get_or_compute(key(99), || async {
+                panic!("must join the original compute")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&result.bytes[..], &[42]);
+        assert!(cache.inflight.lock().unwrap().is_empty());
+        assert_eq!(cache.metrics().misses, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_errors_share_one_result_and_later_request_retries() {
+        let cache = ContentCache::new(0);
+        let computes = Arc::new(AtomicU64::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let c = cache.clone();
+            let n = computes.clone();
+            let r = release.clone();
+            requests.push(tokio::spawn(async move {
+                c.get_or_compute(key(100), move || async move {
+                    n.fetch_add(1, Ordering::Relaxed);
+                    r.notified().await;
+                    Err(Tiles3dError::NotFound("no echo".into()))
+                })
+                .await
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while cache.metrics().hits < 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.notify_one();
+        for request in requests {
+            assert!(matches!(
+                request.await.unwrap(),
+                Err(Tiles3dError::NotFound(_))
+            ));
+        }
+        assert_eq!(computes.load(Ordering::Relaxed), 1);
+        assert!(cache.inflight.lock().unwrap().is_empty());
+        assert!(cache
+            .get_or_compute(key(100), || async { Ok((vec![1], "retry".into())) })
+            .await
+            .is_ok());
+        assert_eq!(cache.metrics().misses, 2);
+    }
+
+    #[tokio::test]
+    async fn panic_wakes_waiters_and_releases_flight() {
+        let cache = ContentCache::new(1);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cache.get_or_compute(key(101), || async { panic!("injected compute panic") }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Tiles3dError::Internal(_))));
+        assert!(cache.inflight.lock().unwrap().is_empty());
     }
 }

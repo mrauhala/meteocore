@@ -1197,3 +1197,67 @@ async fn exact_time_entry_survives_new_volume_arrival() {
         "latest entry must re-key on a new volume"
     );
 }
+
+/// A real blocking engine call that can outlive its HTTP waiter.
+struct GatedVolume {
+    started: Arc<tokio::sync::Notify>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    reads: std::sync::atomic::AtomicU64,
+}
+impl VolumeEngine for GatedVolume {
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        MockVolume.volume_info()
+    }
+    fn read_point_cloud(
+        &self,
+        quantity: Option<&str>,
+        time: Option<chrono::DateTime<Utc>>,
+        min_value: Option<f64>,
+        reference_time: Option<chrono::DateTime<Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.started.notify_one();
+        self.release.lock().unwrap().recv().unwrap();
+        MockVolume.read_point_cloud(quantity, time, min_value, reference_time)
+    }
+}
+
+#[tokio::test]
+async fn canceled_http_waiter_keeps_render_permit_and_populates_cache() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (release, receiver) = std::sync::mpsc::channel();
+    let engine = Arc::new(GatedVolume {
+        started: started.clone(),
+        release: std::sync::Mutex::new(receiver),
+        reads: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = "radar-cancel";
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let state = Arc::new(ArcSwap::from_pointee(TilesState3d {
+        volume_engines: [(id.into(), engine.clone() as Arc<dyn VolumeEngine>)].into(),
+        collections: [(id.into(), collection_config(id))].into(),
+        colormap: api_3dtiles::default_point_colormap(),
+        render_semaphore: semaphore.clone(),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    }));
+    let app = api_3dtiles::router(state);
+    let uri = "/collections/radar-cancel/content.pnts";
+    let first = app.clone();
+    let request = tokio::spawn(async move { get_on(&first, uri).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    request.abort();
+    let _ = request.await;
+    let held = semaphore.available_permits();
+    release.send(()).unwrap();
+    assert_eq!(held, 0, "blocking encode must still own the permit");
+    let (status, _, _) = tokio::time::timeout(std::time::Duration::from_secs(2), get_on(&app, uri))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(engine.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(semaphore.available_permits(), 1);
+}

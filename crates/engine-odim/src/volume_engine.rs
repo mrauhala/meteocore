@@ -79,7 +79,7 @@ use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, Time
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
-use crate::pixel_cache::PixelCache;
+use crate::pixel_cache::{MomentPixels, PixelCache};
 use crate::pvol::{read_moment_pixels, read_polar_volume, PolarMoment, PolarVolume, Sweep};
 use crate::quantities;
 use crate::reader::{PixelClass, RawPixels};
@@ -566,9 +566,43 @@ struct Pixels<'a> {
     /// locations), where the fetch must use `block_in_place` via the plain
     /// `DataStore::get`. Irrelevant for a `Local` source.
     handle: Option<&'a tokio::runtime::Handle>,
+    /// Complete requested quantity for a 3D render, retained across LRU eviction.
+    moments: Option<&'a MomentPixels>,
 }
 
 impl Pixels<'_> {
+    /// All sweeps of the selected quantity share one file fetch and HDF5 open.
+    fn volume_moments(&self, volume: &PolarVolume, file_id: &str, quantity: &str) -> MomentPixels {
+        let cache_id = pixel_cache_id(self.source, file_id);
+        let requests: Vec<_> = volume
+            .sweeps
+            .iter()
+            .flat_map(|sweep| {
+                sweep
+                    .moments
+                    .iter()
+                    .filter(move |m| m.quantity == quantity)
+                    .map(move |m| (m.dataset_path.as_str(), sweep.nrays, sweep.nbins))
+            })
+            .collect();
+        let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing| {
+            fetch_file_bytes(self.source, file_id, self.handle)
+                .and_then(|bytes| {
+                    crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
+                    Vec::new()
+                })
+        });
+        if failures > 0 {
+            PIXEL_READ_FAILURES.fetch_add(failures as u64, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("PVOL batch pixel read for `{file_id}`: {failures} missing moment(s)");
+        }
+        pixels
+    }
+
     /// Fetch a moment's decoded pixel array — cache hit, or read the one
     /// `/datasetN/dataM/data` dataset from the (re-fetched) file bytes and
     /// cache it. `None` on any I/O / decode error (the caller treats a
@@ -581,6 +615,9 @@ impl Pixels<'_> {
         nrays: usize,
         nbins: usize,
     ) -> Option<Arc<RawPixels>> {
+        if let Some(moments) = self.moments {
+            return moments.get(&moment.dataset_path).cloned();
+        }
         // Source-qualified key so two S3 sources can't collide in the global
         // cache (PR #290 review); the bare `file_id` stays the fetch path.
         let cache_id = pixel_cache_id(self.source, file_id);
@@ -597,14 +634,9 @@ impl Pixels<'_> {
         // Genuine positive-cache miss (not a known-bad skip) — count it here so
         // the miss metric reflects real fetches, then fetch + decode.
         PIXEL_CACHE.record_miss();
-        // NOTE: this fetches + parses the *whole* `.h5` to extract one dataset
-        // (the reader has no slice API), so a file with Q cold moments is
-        // fetched Q times. Batch-decoding all moments on the first miss is
-        // tracked in #293 — and it matters for LOCAL sources too, not just S3:
-        // off-peak the page cache for these files is reclaimed (#472), so a
-        // cold local miss here (a moment above `prewarm_sweeps`, or an entry
-        // the LRU evicted) pays a real disk read + full parse on the render
-        // permit.
+        // Single-moment fallback for raster/EDR callers. 3D volume requests
+        // populate `moments` in one batch before sampling, so they never take
+        // this whole-file read once per sweep.
         let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
             read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
                 .map_err(|e| format!("decode `{}`: {e}", moment.dataset_path))
@@ -3645,6 +3677,7 @@ impl MapEngine for PolarVolumeSiteView {
         // handle, since `block_in_place` panics on a `spawn_blocking` thread.
         let handle = blocking_pixel_handle();
         let pix = Pixels {
+            moments: None,
             source: &self.source,
             handle: handle.as_ref(),
         };
@@ -4169,8 +4202,14 @@ impl PolarVolumeSiteView {
         // or a request worker that would have done the resample itself).
         let result = VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
             let pix = Pixels {
+                moments: None,
                 source: &self.source,
                 handle,
+            };
+            let moments = pix.volume_moments(&entry.volume, &entry.id, quantity);
+            let pix = Pixels {
+                moments: Some(&moments),
+                ..pix
             };
             let (grid, valid) =
                 voxel_grid_from_volume(&entry.volume, &entry.id, pix, quantity, Some(dims))?;
@@ -4193,8 +4232,14 @@ impl VolumeEngine for PolarVolumeSiteView {
 
         let handle = blocking_pixel_handle();
         let pix = Pixels {
+            moments: None,
             source: &self.source,
             handle: handle.as_ref(),
+        };
+        let moments = pix.volume_moments(&entry.volume, &entry.id, &quantity);
+        let pix = Pixels {
+            moments: Some(&moments),
+            ..pix
         };
         let cloud = volume_point_cloud(&entry.volume, &entry.id, pix, &quantity, min_value);
 
@@ -4319,6 +4364,7 @@ impl EdrEngine for PolarVolumeSiteView {
         // fetch must use `block_in_place` (the plain `DataStore::get`) — pass
         // `None`. `handle.block_on` would panic in this async context.
         let pix = Pixels {
+            moments: None,
             source: &self.source,
             handle: None,
         };
@@ -4427,6 +4473,7 @@ impl EdrEngine for PolarVolumeSiteView {
         // Request-worker path (no `spawn_blocking`) — `None` selects the
         // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
+            moments: None,
             source: &self.source,
             handle: None,
         };
@@ -4469,6 +4516,7 @@ impl EdrEngine for PolarVolumeSiteView {
         // Request-worker path (no `spawn_blocking`) — `None` selects the
         // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
+            moments: None,
             source: &self.source,
             handle: None,
         };
@@ -4531,6 +4579,7 @@ impl EdrEngine for PolarVolumeSiteView {
         // `block_in_place` panics on a `spawn_blocking` thread.
         let handle = blocking_pixel_handle();
         let pix = Pixels {
+            moments: None,
             source: &self.source,
             handle: handle.as_ref(),
         };
@@ -5230,6 +5279,7 @@ mod tests {
     /// `Local` and the cache is pre-seeded) would take the worker bridge.
     fn test_pixels() -> Pixels<'static> {
         Pixels {
+            moments: None,
             source: &TEST_SOURCE,
             handle: None,
         }
