@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -914,6 +914,49 @@ pub struct Feature {
     pub properties: Arc<HashMap<String, PropertyValue>>,
 }
 
+/// Cached property-name catalog. Clone the Arc from an engine snapshot; do
+/// not rebuild this on the request path. Names are sorted for discovery/errors.
+pub type FilterableProperties = Arc<BTreeSet<String>>;
+
+/// Build a property-name catalog at load/refresh time, including null values.
+pub fn property_names<'a>(
+    properties: impl IntoIterator<Item = &'a HashMap<String, PropertyValue>>,
+) -> FilterableProperties {
+    let names: BTreeSet<&str> = properties
+        .into_iter()
+        .flat_map(|p| p.keys().map(String::as_str))
+        .collect();
+    Arc::new(names.into_iter().map(String::from).collect())
+}
+
+/// Part 1 property filters are ANDed, including repeated names. Lists match
+/// any element; absent/null values never match. Scalars use exact strings
+/// (Rust's canonical Display form for finite numbers and booleans).
+pub fn matches_property_filters(feature: &Feature, filters: &[(String, String)]) -> bool {
+    matches_property_values(&feature.properties, filters)
+}
+
+/// The same predicate for engines that page stored properties before building
+/// Features, avoiding geometry/id allocations for rejected candidates.
+pub fn matches_property_values(
+    properties: &HashMap<String, PropertyValue>,
+    filters: &[(String, String)],
+) -> bool {
+    fn matches(value: &PropertyValue, expected: &str) -> bool {
+        match value {
+            PropertyValue::String(s) => s == expected,
+            PropertyValue::Integer(n) => n.to_string() == expected,
+            PropertyValue::Float(n) => n.is_finite() && n.to_string() == expected,
+            PropertyValue::Bool(b) => b.to_string() == expected,
+            PropertyValue::List(values) => values.iter().any(|v| matches(v, expected)),
+            PropertyValue::Null => false,
+        }
+    }
+    filters
+        .iter()
+        .all(|(name, expected)| properties.get(name).is_some_and(|v| matches(v, expected)))
+}
+
 /// A page of features with pagination metadata.
 #[derive(Debug, Clone)]
 pub struct FeaturePage {
@@ -1019,6 +1062,8 @@ pub struct FeatureQuery {
     /// sorting a page after slicing it silently returns the wrong rows.
     /// [`sort_features`] does it correctly; call that rather than hand-rolling.
     pub sortby: Vec<SortKey>,
+    /// Exact property predicates, applied before counting, sorting and paging.
+    pub property_filters: Vec<(String, String)>,
 }
 
 /// Sort direction for one [`SortKey`].
@@ -1150,6 +1195,7 @@ impl Default for FeatureQuery {
             offset: 0,
             datetime: None,
             sortby: Vec::new(),
+            property_filters: Vec::new(),
         }
     }
 }
@@ -1157,6 +1203,62 @@ impl Default for FeatureQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn property_filters_match_exact_scalars_lists_and_conjunctions() {
+        let f = feat(
+            "f",
+            vec![
+                ("text", PropertyValue::String("1; Wind".into())),
+                ("int", PropertyValue::Integer(12)),
+                ("float", PropertyValue::Float(1.5)),
+                ("bool", PropertyValue::Bool(true)),
+                ("null", PropertyValue::Null),
+                ("nan", PropertyValue::Float(f64::NAN)),
+                (
+                    "list",
+                    PropertyValue::List(vec![
+                        PropertyValue::String("Met".into()),
+                        PropertyValue::Integer(2),
+                        PropertyValue::Null,
+                    ]),
+                ),
+            ],
+        );
+        let check = |k: &str, v: &str| matches_property_filters(&f, &[(k.into(), v.into())]);
+        assert!(matches_property_filters(&f, &[]));
+        for (k, v) in [
+            ("text", "1; Wind"),
+            ("int", "12"),
+            ("float", "1.5"),
+            ("bool", "true"),
+            ("list", "Met"),
+            ("list", "2"),
+        ] {
+            assert!(check(k, v), "{k}={v}");
+        }
+        for (k, v) in [
+            ("text", "wind"),
+            ("text", "1; Wind "),
+            ("int", "012"),
+            ("float", "1.50"),
+            ("bool", "True"),
+            ("null", "null"),
+            ("missing", ""),
+            ("nan", "NaN"),
+            ("list", "null"),
+        ] {
+            assert!(!check(k, v), "{k}={v}");
+        }
+        let mut filters = vec![
+            ("text".into(), "1; Wind".into()),
+            ("list".into(), "Met".into()),
+            ("list".into(), "2".into()),
+        ];
+        assert!(matches_property_filters(&f, &filters));
+        filters.push(("bool".into(), "false".into()));
+        assert!(!matches_property_filters(&f, &filters));
+    }
 
     #[test]
     fn bbox_valid() {

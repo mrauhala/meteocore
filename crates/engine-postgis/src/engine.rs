@@ -1720,6 +1720,11 @@ mod tests {
             .map(|(i, l)| (l.id.clone(), i))
             .collect();
         CollectionMeta {
+            filterables: ds_core::feature::property_names(
+                stations
+                    .iter()
+                    .map(|s: &crate::metadata::FeatureStation| s.properties.as_ref()),
+            ),
             feature_stations: std::sync::Arc::new(stations),
             locations: std::sync::Arc::new(locations),
             station_idx: std::sync::Arc::new(station_idx),
@@ -1813,6 +1818,39 @@ mod tests {
             }
             other => panic!("expected QueryTooLarge, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn feature_property_filters_use_cached_properties_before_paging() {
+        use ds_core::feature::{FeatureQuery, PropertyValue};
+        use ds_core::feature_engine::FeatureEngine;
+        let engine = engine_with(events_engine_config());
+        let mut meta = meta_with(vec![
+            loc("a", 10.0, 60.0),
+            loc("b", 20.0, 60.0),
+            loc("c", 30.0, 60.0),
+        ]);
+        for station in Arc::make_mut(&mut meta.feature_stations) {
+            station.properties = Arc::new(HashMap::from([(
+                "region".into(),
+                PropertyValue::String(if station.id == "a" { "west" } else { "east" }.into()),
+            )]));
+        }
+        meta.filterables = ds_core::feature::property_names(
+            meta.feature_stations.iter().map(|s| s.properties.as_ref()),
+        );
+        engine.cache().store(meta);
+        assert!(engine.filterables().contains("region"));
+        let query = FeatureQuery {
+            property_filters: vec![("region".into(), "east".into())],
+            limit: 1,
+            offset: 1,
+            ..Default::default()
+        };
+        let page = engine.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.features[0].id, "c");
+        assert_eq!(page.next_offset, None);
     }
 
     #[test]

@@ -70,6 +70,7 @@ pub struct CollectionMeta {
     /// from this list and kept in the same order, so `station_idx`
     /// is a valid index into both.
     pub feature_stations: Arc<Vec<FeatureStation>>,
+    pub filterables: ds_core::feature::FilterableProperties,
     pub locations: Arc<Vec<Location>>,
     /// `id → index into feature_stations/locations` lookup built once
     /// per refresh. Constant-time station resolution for
@@ -92,6 +93,7 @@ impl CollectionMeta {
     fn empty() -> Self {
         Self {
             feature_stations: Arc::new(Vec::new()),
+            filterables: Default::default(),
             locations: Arc::new(Vec::new()),
             station_idx: Arc::new(HashMap::new()),
             parameters: Arc::new(HashMap::new()),
@@ -169,7 +171,11 @@ impl MetadataCache {
         };
 
         let previous = self.inner.load();
+        let filterables = ds_core::feature::property_names(
+            feature_stations.iter().map(|s| s.properties.as_ref()),
+        );
         let next = CollectionMeta {
+            filterables,
             feature_stations: Arc::new(feature_stations),
             locations: Arc::new(locations),
             station_idx: Arc::new(station_idx),
@@ -602,6 +608,7 @@ mod tests {
 
         let next = CollectionMeta {
             feature_stations: Arc::new(vec![]),
+            filterables: Default::default(),
             locations: Arc::new(vec![mk_loc("s", 1.0, 2.0)]),
             station_idx: Arc::new(HashMap::from([("s".to_string(), 0)])),
             parameters: Arc::new(HashMap::new()),

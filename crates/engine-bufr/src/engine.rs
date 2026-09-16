@@ -597,6 +597,26 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
 const SORTABLES: &[&str] = &["last_report", "first_report", "report_count", "name"];
 
 impl FeatureEngine for BufrEngine {
+    fn filterables(&self) -> ds_core::feature::FilterableProperties {
+        static NAMES: std::sync::LazyLock<ds_core::feature::FilterableProperties> =
+            std::sync::LazyLock::new(|| {
+                Arc::new(
+                    [
+                        "name",
+                        "wigos_station_identifier",
+                        "elevation",
+                        "first_report",
+                        "last_report",
+                        "report_count",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                )
+            });
+        NAMES.clone()
+    }
+
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let snap = self.snapshot.load();
         // `datetime`: a station matches when it has at least one report
@@ -629,6 +649,7 @@ impl FeatureEngine for BufrEngine {
                 }
                 _ => true,
             })
+            .filter(|(f, _)| ds_core::feature::matches_property_filters(f, &query.property_filters))
             .map(|(f, _)| f.clone())
             .collect();
         drop(store);
@@ -724,6 +745,21 @@ mod tests {
             store.ingest(&report("gap-station", h(9, 0)), &e.table, h(9, 0));
         }
         e.rebuild_snapshot();
+        let mut query = FeatureQuery {
+            property_filters: vec![("wigos_station_identifier".into(), "gap-station".into())],
+            limit: 1,
+            ..Default::default()
+        };
+        let page = e.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.features[0].id, "gap-station");
+        query.offset = 1;
+        assert_eq!(e.get_features(&query).unwrap().number_returned, 0);
+        query
+            .property_filters
+            .push(("name".into(), "no such station".into()));
+        assert_eq!(e.get_features(&query).unwrap().number_matched, 0);
+
         let matched = |start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>| {
             e.get_features(&FeatureQuery {
                 datetime: Some(DatetimeInterval { start, end }),

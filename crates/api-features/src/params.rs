@@ -1,17 +1,92 @@
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, DatetimeInterval, SortDirection, SortKey};
-use serde::Deserialize;
 
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 1000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
 pub struct ItemsQueryParams {
     pub bbox: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub datetime: Option<String>,
     pub sortby: Option<String>,
+    pub property_filters: Vec<(String, String)>,
+}
+
+/// Reserved API controls cannot be shadowed by source property names.
+pub fn is_reserved_parameter(name: &str) -> bool {
+    matches!(
+        name,
+        "bbox"
+            | "datetime"
+            | "limit"
+            | "offset"
+            | "sortby"
+            | "f"
+            | "crs"
+            | "bbox-crs"
+            | "filter"
+            | "filter-lang"
+            | "filter-crs"
+            | "properties"
+    )
+}
+
+impl ItemsQueryParams {
+    /// Axum decodes the form into pairs first so repeated property predicates
+    /// survive. Repeating a control parameter is ambiguous and rejected.
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, DataServerError> {
+        let mut params = Self::default();
+        let mut seen = std::collections::HashSet::new();
+        for (name, value) in pairs {
+            if is_reserved_parameter(&name) && !seen.insert(name.clone()) {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "duplicate parameter '{name}'"
+                )));
+            }
+            match name.as_str() {
+                "bbox" => params.bbox = Some(value),
+                "datetime" => params.datetime = Some(value),
+                "sortby" => params.sortby = Some(value),
+                "limit" | "offset" => {
+                    let n = value.parse().map_err(|_| {
+                        DataServerError::InvalidParameter(format!(
+                            "{name} must be a non-negative integer"
+                        ))
+                    })?;
+                    if name == "limit" {
+                        params.limit = Some(n);
+                    } else {
+                        params.offset = Some(n);
+                    }
+                }
+                _ => params.property_filters.push((name, value)),
+            }
+        }
+        Ok(params)
+    }
+
+    pub fn validate_filters(
+        &self,
+        names: &std::collections::BTreeSet<String>,
+    ) -> Result<(), DataServerError> {
+        for (name, _) in &self.property_filters {
+            if is_reserved_parameter(name) || !names.contains(name) {
+                let valid = names
+                    .iter()
+                    .filter(|n| !is_reserved_parameter(n))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(DataServerError::InvalidParameter(format!(
+                    "unsupported parameter '{name}' (valid property filters: {})",
+                    if valid.is_empty() { "none" } else { &valid }
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Parse an OGC API – Features Part 8 `sortby` value.

@@ -27,6 +27,7 @@ struct StoredFeature {
 
 pub struct GeoJsonEngine {
     features: Vec<StoredFeature>,
+    filterables: ds_core::feature::FilterableProperties,
     id_index: HashMap<String, usize>,
     spatial_index: SpatialIndex,
     spatial_extent: Option<[f64; 4]>,
@@ -138,7 +139,10 @@ impl GeoJsonEngine {
             }
         };
 
+        let filterables =
+            ds_core::feature::property_names(features.iter().map(|f| f.properties.as_ref()));
         Ok(GeoJsonEngine {
+            filterables,
             features,
             id_index,
             spatial_index,
@@ -167,11 +171,24 @@ impl GeoJsonEngine {
 }
 
 impl FeatureEngine for GeoJsonEngine {
+    fn filterables(&self) -> ds_core::feature::FilterableProperties {
+        self.filterables.clone()
+    }
+
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         // When bbox is set, query the spatial index; otherwise iterate all features directly.
         // R-tree results are already unique (each feature is indexed once).
-        if let Some(bbox) = &query.bbox {
-            let indices = self.spatial_index.query(bbox);
+        if query.bbox.is_some() || !query.property_filters.is_empty() {
+            let mut indices = match &query.bbox {
+                Some(bbox) => self.spatial_index.query(bbox),
+                None => (0..self.features.len()).collect(),
+            };
+            indices.retain(|&i| {
+                ds_core::feature::matches_property_values(
+                    &self.features[i].properties,
+                    &query.property_filters,
+                )
+            });
             let number_matched = indices.len();
             let offset = query.offset.min(number_matched);
             let end = offset.saturating_add(query.limit).min(number_matched);
@@ -505,6 +522,38 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("test_geojson_{n}.json"));
         std::fs::write(&tmp, json).unwrap();
         GeoJsonEngine::load(tmp.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn property_filters_apply_before_paging_with_and_without_bbox() {
+        let engine = load_from_string(sample_geojson());
+        assert!(engine.filterables().contains("population"));
+        assert!(engine.filterables().contains("name"));
+        for bbox in [
+            None,
+            Some(ds_core::feature::Bbox::new(24.0, 60.0, 25.5, 61.5).unwrap()),
+        ] {
+            let mut query = FeatureQuery {
+                bbox,
+                property_filters: vec![
+                    ("name".into(), "Helsinki".into()),
+                    ("population".into(), "658457".into()),
+                ],
+                limit: 1,
+                ..Default::default()
+            };
+            let page = engine.get_features(&query).unwrap();
+            assert_eq!(page.number_matched, 1);
+            assert_eq!(page.features[0].id, "city.1");
+            query.offset = 1;
+            let page = engine.get_features(&query).unwrap();
+            assert_eq!(page.number_matched, 1);
+            assert!(page.features.is_empty());
+            query
+                .property_filters
+                .push(("missing".into(), "anything".into()));
+            assert_eq!(engine.get_features(&query).unwrap().number_matched, 0);
+        }
     }
 
     #[test]

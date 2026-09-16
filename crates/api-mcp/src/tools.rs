@@ -348,6 +348,7 @@ impl MeteoCoreMcp {
                 offset: 0,
                 datetime,
                 sortby,
+                property_filters: Vec::new(),
             })
             .map_err(query_failed)?;
 
@@ -491,6 +492,7 @@ impl MeteoCoreMcp {
                         end: Some(cursor),
                     }),
                     sortby: Vec::new(),
+                    property_filters: Vec::new(),
                 })
                 .map_err(query_failed)?;
 

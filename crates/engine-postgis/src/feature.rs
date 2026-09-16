@@ -25,12 +25,19 @@ use crate::engine::PostgisEngine;
 use crate::metadata::FeatureStation;
 
 impl FeatureEngine for PostgisEngine {
+    fn filterables(&self) -> ds_core::feature::FilterableProperties {
+        self.cache().load().filterables.clone()
+    }
+
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let meta = self.cache().load();
         let filtered: Vec<&FeatureStation> = meta
             .feature_stations
             .iter()
             .filter(|s| bbox_contains(query.bbox.as_ref(), s.lon, s.lat))
+            .filter(|s| {
+                ds_core::feature::matches_property_values(&s.properties, &query.property_filters)
+            })
             .collect();
 
         let number_matched = filtered.len();

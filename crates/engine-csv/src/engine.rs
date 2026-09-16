@@ -299,6 +299,19 @@ impl EdrEngine for CsvEngine {
 }
 
 impl FeatureEngine for CsvEngine {
+    fn filterables(&self) -> ds_core::feature::FilterableProperties {
+        static NAMES: std::sync::LazyLock<ds_core::feature::FilterableProperties> =
+            std::sync::LazyLock::new(|| {
+                Arc::new(
+                    ["name", "latitude", "longitude"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                )
+            });
+        NAMES.clone()
+    }
+
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         // Build unique locations as features
         let mut seen = HashMap::new();
@@ -335,6 +348,8 @@ impl FeatureEngine for CsvEngine {
             });
         }
 
+        all_features
+            .retain(|f| ds_core::feature::matches_property_filters(f, &query.property_filters));
         let number_matched = all_features.len();
         let offset = query.offset.min(number_matched);
         let end = offset.saturating_add(query.limit).min(number_matched);
@@ -390,6 +405,26 @@ mod tests {
 
     fn test_store() -> CsvDataStore {
         CsvDataStore::load("../../testdata/weather.csv").unwrap()
+    }
+
+    #[test]
+    fn property_filters_select_stations_before_paging() {
+        let engine = CsvEngine::new(test_store());
+        let all = engine.get_features(&FeatureQuery::default()).unwrap();
+        let target = all.features.last().unwrap();
+        let name = target.properties["name"].as_str().unwrap();
+        let mut query = FeatureQuery {
+            property_filters: vec![("name".into(), name.into())],
+            limit: 1,
+            ..Default::default()
+        };
+        let page = engine.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.features[0].id, target.id);
+        query.offset = 1;
+        let page = engine.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 1);
+        assert!(page.features.is_empty());
     }
 
     #[test]
