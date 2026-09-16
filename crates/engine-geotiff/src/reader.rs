@@ -2266,7 +2266,7 @@ fn read_bbox_tiles(
                         // Account for the merged input in addition to each tile's
                         // compressed copy + decoder/output allocations. It lives
                         // until the whole batch is decoded; failures unwind it.
-                        let _permit = BUDGET.reserve(batch.range.len())?;
+                        let permit = BUDGET.reserve(batch.range.len())?;
                         let bytes = match fetch(batch.range.clone()) {
                             Ok(bytes) if bytes.len() == batch.range.len() => Some(bytes),
                             Err(
@@ -2275,6 +2275,11 @@ fn read_bbox_tiles(
                             ) => return Err(e),
                             _ => None,
                         };
+                        if bytes.is_none() {
+                            // The failed input has already been released. Do not
+                            // charge an absent batch throughout individual retries.
+                            drop(permit);
+                        }
                         // An origin may reject a larger range or return a short
                         // body. Fall back to the established per-tile retry/nodata
                         // policy, sharing the same absolute deadline.
@@ -3634,17 +3639,36 @@ mod tests {
 
     #[test]
     fn batch_short_reads_fall_back_but_deadlines_and_bad_metadata_fail() {
+        // Isolate the process-wide budget so the assertion inside the first
+        // fallback fetch cannot race another test's decode admission.
+        if std::env::var_os("MC_TEST_COG_FALLBACK_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reader::tests::batch_short_reads_fall_back_but_deadlines_and_bad_metadata_fail", "--nocapture"])
+                .env("MC_TEST_COG_FALLBACK_CHILD", "1")
+                .env("MC_GEOTIFF_DECODE_MEMORY_MB", "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
         let (meta, mut info, bytes) = batch_fixture();
         let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let fetch = |range: std::ops::Range<usize>| {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if range.len() > 64 {
-                Ok(Bytes::new())
-            } else {
-                Ok(Bytes::copy_from_slice(&bytes[range]))
-            }
-        };
+        let fetch =
+            |range: std::ops::Range<usize>| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if range.len() > 64 {
+                    Ok(Bytes::new())
+                } else {
+                    if call == 1 {
+                        assert_eq!(
+                        crate::decode_budget::metrics().0,
+                        remote_chunk_layout(&info, meta.samples_per_pixel, 0).unwrap().1,
+                        "first fallback read owns only its tile reservation, not the failed batch"
+                    );
+                    }
+                    Ok(Bytes::copy_from_slice(&bytes[range]))
+                }
+            };
         let result = read_bbox_tiles(
             &coords,
             &info,
