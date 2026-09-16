@@ -1456,9 +1456,9 @@ pub async fn style_legend(
     // 400 with the available list, not fall back to the collection style and
     // emit a legend labelled with a parameter that doesn't exist.
     if let Some(pname) = params.parameter_name.as_deref() {
-        if !info.parameters.is_empty() && !info.parameters.iter().any(|(name, _)| name == pname) {
+        if !info.parameters.is_empty() && !info.parameters.iter().any(|p| p.name == pname) {
             let mut supported: Vec<&str> =
-                info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+                info.parameters.iter().map(|p| p.name.as_str()).collect();
             supported.sort_unstable();
             return Err(TilesError::BadRequest(format!(
                 "parameter-name '{pname}' is not available for collection '{id}'. \
@@ -1467,12 +1467,8 @@ pub async fn style_legend(
             )));
         }
     }
-    let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info);
-    // A ?parameter-name= request labels the legend with the REQUESTED
-    // parameter even when no dedicated "{coll}/{param}" style layer exists
-    // and the style fell back to the collection map — the rendered data is
-    // that parameter's either way (the same query param drives the engine).
-    let parameter = params.parameter_name.clone().or(parameter);
+    let (parameter, unit) =
+        ds_render::legend_parameter_unit(style_info, &info, params.parameter_name.as_deref());
 
     match format {
         LegendFormat::Json => {
@@ -1665,12 +1661,12 @@ async fn render_tile(
     // ignore the parameter at render time — we still accept the query.
     if let Some(pname) = validated.parameter_name.as_deref() {
         if !raster_info.parameters.is_empty()
-            && !raster_info.parameters.iter().any(|(name, _)| name == pname)
+            && !raster_info.parameters.iter().any(|p| p.name == pname)
         {
             let mut supported: Vec<&str> = raster_info
                 .parameters
                 .iter()
-                .map(|(n, _)| n.as_str())
+                .map(|p| p.name.as_str())
                 .collect();
             supported.sort_unstable();
             return Err(TilesError::BadRequest(format!(

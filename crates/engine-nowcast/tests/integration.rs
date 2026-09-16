@@ -3007,7 +3007,11 @@ fn reload_rejects_geometry_and_product_changes_even_with_the_same_source_arc() {
     changed.native_crs = "EPSG:3857".into();
     changes.push(changed);
     let mut changed = original.clone();
-    changed.parameters = vec![("other".into(), "Other product".into())];
+    changed.parameters = vec![ds_core::map_engine::ParameterInfo {
+        name: "other".into(),
+        title: "Other product".into(),
+        unit: "".into(),
+    }];
     changes.push(changed);
     let mut changed = original.clone();
     changed.vertical = Some(ds_core::vertical::VerticalDimension {

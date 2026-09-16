@@ -57,6 +57,11 @@ fn grib_engine_serves_local_directory() {
     // On-demand render exercises the local byte-range read + decode + resample
     // end-to-end (not just the eager probe).
     let info = engine.raster_info();
+    let descriptions = engine.get_parameter_descriptions();
+    for p in &info.parameters {
+        assert_eq!(p.unit, descriptions[&p.name].unit);
+        assert!(!p.unit.is_empty());
+    }
     let param = info.parameter.clone();
     let bbox = info.spatial_extent.unwrap_or([-180.0, -90.0, 180.0, 90.0]);
     let tile = engine

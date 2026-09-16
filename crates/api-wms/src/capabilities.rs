@@ -176,7 +176,9 @@ fn write_parent_layer(
     // Title so WMS clients that render a flat layer list (ignoring this parent
     // tree) can still tell sibling collections apart — otherwise every site's
     // child layer is titled identically (just the parameter).
-    for (short_name, title) in &info.parameters {
+    for parameter in &info.parameters {
+        let short_name = &parameter.name;
+        let title = &parameter.title;
         let child_layer_name = format!("{id}/{short_name}");
         let child_title = match &info.layer_subtitle {
             Some(subtitle) => format!("{subtitle} — {title}"),

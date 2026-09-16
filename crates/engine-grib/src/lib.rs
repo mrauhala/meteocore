@@ -1393,13 +1393,17 @@ impl MapEngine for GribEngine {
 
         // Build parameter list from catalog using cached metadata (populated
         // lazily as each parameter is first decoded).
-        let params: Vec<(String, String)> = catalog
+        let params: Vec<ds_core::map_engine::ParameterInfo> = catalog
             .all_params()
             .into_iter()
             .map(|p| {
                 let meta = self.param_metadata(&p);
                 let label = meta.label();
-                (p, label)
+                ds_core::map_engine::ParameterInfo {
+                    name: p,
+                    title: label,
+                    unit: meta.display.display_unit.to_string(),
+                }
             })
             .collect();
 

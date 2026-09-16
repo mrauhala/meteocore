@@ -497,7 +497,7 @@ fn pvol_engine_renders_fmi_vihti_volume() {
 
     // The FMI Vihti lowest sweep exposes TH (and DBZH); the
     // parameters are **bare quantities** — no `fivih:` prefix.
-    let params: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+    let params: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
     assert!(
         !params.is_empty(),
         "expected bare-quantity parameters, got {:?}",
@@ -930,8 +930,7 @@ fn pvol_cells_raster_layer() {
     assert!(
         info.parameters
             .iter()
-            .any(|(name, title)| name == engine_odim::cells::CELLS_PARAMETER
-                && title == "Storm cells"),
+            .any(|p| p.name == engine_odim::cells::CELLS_PARAMETER && p.title == "Storm cells"),
         "CELLS layer advertised in raster_info().parameters"
     );
     assert_ne!(
@@ -1280,7 +1279,7 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
     );
 
     // Parameters are bare quantities (no `fivih:` prefix).
-    let params: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+    let params: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
     assert!(
         !params.is_empty() && params.iter().all(|n| !n.contains(':')),
         "remote scan must discover bare-quantity parameters, got {:?}",

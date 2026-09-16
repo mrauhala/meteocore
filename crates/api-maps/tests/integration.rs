@@ -1504,8 +1504,16 @@ impl MapEngine for MultiParamMockEngine {
             parameter: "2t".into(),
             unit: "K".into(),
             parameters: vec![
-                ("2t".into(), "Temperature".into()),
-                ("10u".into(), "U Wind".into()),
+                ds_core::map_engine::ParameterInfo {
+                    name: "2t".into(),
+                    title: "Temperature".into(),
+                    unit: "°C".into(),
+                },
+                ds_core::map_engine::ParameterInfo {
+                    name: "10u".into(),
+                    title: "U Wind".into(),
+                    unit: "".into(),
+                },
             ],
             vertical: None,
             grid_size: None,
@@ -2335,8 +2343,16 @@ impl MapEngine for MultiParamMockMapEngine {
     fn raster_info(&self) -> RasterInfo {
         RasterInfo {
             parameters: vec![
-                ("T".to_string(), "Temperature".to_string()),
-                ("RH".to_string(), "Relative humidity".to_string()),
+                ds_core::map_engine::ParameterInfo {
+                    name: "T".to_string(),
+                    title: "Temperature".to_string(),
+                    unit: "°C".into(),
+                },
+                ds_core::map_engine::ParameterInfo {
+                    name: "RH".to_string(),
+                    title: "Relative humidity".to_string(),
+                    unit: "%".into(),
+                },
             ],
             ..MockMapEngine::make_info()
         }
@@ -2596,6 +2612,18 @@ mod parameter_styles {
         assert_eq!(stops[stops.len() - 1]["color"], "#FFFFFF");
         // The parameter comes from the style layer, not the engine default.
         assert_eq!(json["parameter"], "T");
+        assert_eq!(json["unit"], "°C");
+    }
+
+    #[tokio::test]
+    async fn legend_fallback_uses_requested_parameters_unit() {
+        // RH has no dedicated style layer: the collection's dBZ unit must
+        // not leak into its legend when falling back to the collection style.
+        let (status, json) =
+            fetch_json("/collections/radar/styles/default/legend?parameter-name=RH").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["parameter"], "RH");
+        assert_eq!(json["unit"], "%");
     }
 
     #[tokio::test]

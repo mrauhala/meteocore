@@ -743,10 +743,10 @@ pub(crate) struct SiteMeta {
     wmo: Option<String>,
     /// Antenna height above mean sea level (metres).
     height_m: f64,
-    /// Map/WMS layer list — `(bare_quantity, title)` from this site's
+    /// Map/WMS layer descriptors with units from this site's
     /// lowest sweep. **No `<nod>:` prefix**: the site *is*
     /// the collection, so the parameter is the bare quantity.
-    parameters: Vec<(String, String)>,
+    parameters: Vec<ds_core::map_engine::ParameterInfo>,
     /// Bare EDR quantities (lowest sweep), sorted distinct.
     pub(crate) quantities: Vec<String>,
     /// This site's distinct volume times, ascending.
@@ -1554,11 +1554,15 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         return None;
     }
     // Title is the human-readable label from the ODIM quantity dictionary
-    // (acronym + name); the tuple key stays the bare quantity so the
+    // (acronym + name); the name stays the bare quantity so the
     // parameter id / WMS `<Name>` token is unchanged.
-    let mut parameters: Vec<(String, String)> = quantities
+    let mut parameters: Vec<ds_core::map_engine::ParameterInfo> = quantities
         .iter()
-        .map(|q| (q.clone(), quantities::quantity_label(q)))
+        .map(|q| ds_core::map_engine::ParameterInfo {
+            name: q.clone(),
+            title: quantities::quantity_label(q),
+            unit: quantities::quantity_unit(q).to_string(),
+        })
         .collect();
 
     // Coverage radius = the **maximum** range-gate reach across all sweeps
@@ -1646,7 +1650,10 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         ]
     });
     let volume_info = Arc::new(VolumeInfo {
-        quantities: parameters.clone(),
+        quantities: parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.title.clone()))
+            .collect(),
         times: times.clone(),
         default_quantity,
         default_unit,
@@ -1673,10 +1680,11 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         .iter()
         .any(|q| quantities::quantity_unit(q) == "dBZ")
     {
-        parameters.push((
-            crate::cells::CELLS_PARAMETER.to_string(),
-            crate::cells::CELLS_PARAMETER_TITLE.to_string(),
-        ));
+        parameters.push(ds_core::map_engine::ParameterInfo {
+            name: crate::cells::CELLS_PARAMETER.to_string(),
+            title: crate::cells::CELLS_PARAMETER_TITLE.to_string(),
+            unit: "dBZ".to_string(),
+        });
     }
 
     Some(SiteMeta {
@@ -3748,9 +3756,8 @@ impl MapEngine for PolarVolumeSiteView {
         let catalog = self.catalog.load();
         let meta = catalog.by_site_meta.get(&self.nod);
         let parameters = meta.map(|m| m.parameters.clone()).unwrap_or_default();
-        let parameter = parameters
-            .first()
-            .map(|(name, _)| name.clone())
+        let parameter = meta
+            .map(|m| m.volume_info.default_quantity.clone())
             .unwrap_or_default();
 
         RasterInfo {
@@ -3758,9 +3765,9 @@ impl MapEngine for PolarVolumeSiteView {
             spatial_extent: meta.and_then(|m| m.spatial_extent),
             times: meta.map(|m| m.times.clone()).unwrap_or_default(),
             parameter,
-            // PVOL quantities span multiple physical units; the per-layer
-            // unit is not a single collection constant — leave it blank.
-            unit: String::new(),
+            unit: meta
+                .map(|m| m.volume_info.default_unit.clone())
+                .unwrap_or_default(),
             parameters,
             vertical: meta.and_then(|m| m.vertical.clone()),
             grid_size: None,
@@ -6528,7 +6535,7 @@ mod tests {
         // plus the derived CELLS overlay layer (appended last, after the
         // real quantities, because the site carries a dBZ moment).
         let info = MapEngine::raster_info(&view);
-        let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["DBZH", crate::cells::CELLS_PARAMETER],
@@ -6829,6 +6836,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn raster_default_describes_the_rendered_quantity() {
+        let mut volume = synthetic_volume(25.0, 60.0);
+        let mut quality = volume.sweeps[0].moments[0].clone();
+        quality.quantity = "CCORH".into();
+        volume.sweeps[0].moments.push(quality);
+        let mut sites = HashMap::new();
+        sites.insert("fivih".to_string(), vec![entry(volume, "v")]);
+        let view = site_view_for(sites, "fivih");
+        let info = MapEngine::raster_info(&view);
+        assert_eq!(info.parameters[0].name, "CCORH");
+        assert_eq!(info.parameter, "DBZH");
+        assert_eq!(info.parameter_unit(None), Some("dBZ"));
+        assert_eq!(info.unit, "dBZ");
+    }
+
     /// A quantity present only on a higher-elevation sweep (a split-cut
     /// strategy) is still advertised in the parameter list **and** renders
     /// without a 400 — the advertised list unions across sweeps and
@@ -6853,7 +6876,13 @@ mod tests {
             "lowest- and higher-sweep quantities must both be advertised, got {params:?}"
         );
         let info = MapEngine::raster_info(&view);
-        let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(info.parameter_unit(Some("DBZH")), Some("dBZ"));
+        assert_eq!(info.parameter_unit(Some("VRADH")), Some("m/s"));
+        assert_eq!(
+            info.parameter_unit(Some(crate::cells::CELLS_PARAMETER)),
+            Some("dBZ")
+        );
+        let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
         assert!(
             names.contains(&"VRADH"),
             "WMS layer list must include VRADH"

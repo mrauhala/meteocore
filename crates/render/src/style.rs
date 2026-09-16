@@ -273,8 +273,7 @@ impl StyleContext {
         &self,
         collection: &CollectionConfig,
         bundle: Option<&StyleBundle>,
-        param_names: &[(String, String)],
-        unit: Option<&str>,
+        param_names: &[ds_core::map_engine::ParameterInfo],
         wrap: &dyn Fn(&str, Arc<dyn ColorMap>) -> Arc<dyn ColorMap>,
     ) -> Result<HashMap<String, HashMap<String, StyleInfo>>, String> {
         let mut out = HashMap::new();
@@ -319,7 +318,10 @@ impl StyleContext {
             }
         }
 
-        for (short_name, title) in param_names {
+        for parameter in param_names {
+            let short_name = &parameter.name;
+            let title = &parameter.title;
+            let unit = (!parameter.unit.is_empty()).then_some(parameter.unit.as_str());
             let layer_key = format!("{}/{}", collection.id, short_name);
             let mut layer_styles = HashMap::new();
 
@@ -674,14 +676,22 @@ mod tests {
             "#,
         );
         let params = vec![
-            ("DBZH".to_string(), "Z".to_string()),
-            ("VRADH".to_string(), "V".to_string()),
+            ds_core::map_engine::ParameterInfo {
+                name: "DBZH".to_string(),
+                title: "Z".to_string(),
+                unit: "dBZ".into(),
+            },
+            ds_core::map_engine::ParameterInfo {
+                name: "VRADH".to_string(),
+                title: "V".to_string(),
+                unit: "m/s".into(),
+            },
         ];
         for id in ["c1", "c2"] {
             let mut c = coll("style_bundle = \"radar_volume\"\n");
             c.id = id.to_string();
             let maps = ctx
-                .parameter_layer_styles(&c, Some(&b), &params, None, &|_, cm| cm)
+                .parameter_layer_styles(&c, Some(&b), &params, &|_, cm| cm)
                 .unwrap();
             let dbzh = &maps[&format!("{id}/DBZH")]["default"];
             assert_eq!(dbzh.palette.name, "radar_dbz");
@@ -728,9 +738,13 @@ mod tests {
         assert_eq!(default.palette.name, "radar_dbz");
         assert_eq!((default.min, default.max), (-10.0, 80.0));
 
-        let params = vec![("VRADH".to_string(), "V".to_string())];
+        let params = vec![ds_core::map_engine::ParameterInfo {
+            name: "VRADH".to_string(),
+            title: "V".to_string(),
+            unit: "m/s".into(),
+        }];
         let maps = ctx
-            .parameter_layer_styles(&c, Some(&b), &params, None, &|_, cm| cm)
+            .parameter_layer_styles(&c, Some(&b), &params, &|_, cm| cm)
             .unwrap();
         let vradh = &maps["c1/VRADH"]["default"];
         // Inline param defines only min/max → narrows the range, inherits
@@ -845,35 +859,60 @@ mod tests {
     #[test]
     fn parameter_defaults_beat_collection_colormap_on_multi_param() {
         let ctx = StyleContext::with_builtins();
-        let c = coll("colormap = \"temperature\"\n");
-        let params = vec![
-            ("t2m".to_string(), "2 m temperature".to_string()),
-            ("msl".to_string(), "Mean sea-level pressure".to_string()),
-            ("zzz".to_string(), "Mystery".to_string()),
-        ];
+        let c = coll("colormap = \"viridis\"\n");
+        let params = [
+            ("t2m", "2 m temperature", "°C"),
+            ("msl", "Mean sea-level pressure", "hPa"),
+            ("ws", "Wind speed", "m/s"),
+            ("tmp", "Temperature", "K"),
+            ("pres", "Pressure", "Pa"),
+            ("t", "Temperature", ""),
+            ("zzz", "Mystery", ""),
+        ]
+        .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
+            name: name.into(),
+            title: title.into(),
+            unit: unit.into(),
+        });
         let maps = ctx
-            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
             .unwrap();
-        // msl matches the pressure default despite the collection colormap.
-        let msl = &maps["c1/msl"]["default"];
-        assert_eq!(msl.palette.name, "pressure");
-        assert_eq!((msl.min, msl.max), (950.0, 1050.0));
-        // Unmatched parameter falls back to the collection colormap.
-        assert_eq!(maps["c1/zzz"]["default"].palette.name, "temperature");
-        // t2m: the collection-level unit hint is hPa; the temperature rule
-        // is unit-gated (never guess K vs C) → no default, collection wins.
-        assert_eq!(maps["c1/t2m"]["default"].palette.name, "temperature");
+        for (name, palette, range) in [
+            ("t2m", "temperature", (-40.0, 50.0)),
+            ("msl", "pressure", (950.0, 1050.0)),
+            ("ws", "wind_speed", (0.0, 40.0)),
+            ("tmp", "temperature", (233.15, 323.15)),
+            ("pres", "pressure", (95000.0, 105000.0)),
+        ] {
+            let style = &maps[&format!("c1/{name}")]["default"];
+            assert_eq!(style.palette.name, palette, "{name}");
+            assert_eq!((style.min, style.max), range, "{name}");
+        }
+        // Unknown units never borrow the neighbouring temperature's unit:
+        // unit-gated rules fall back to the explicitly configured collection.
+        let fallback = ctx.collection_styles(&c, None).unwrap();
+        for name in ["t", "zzz"] {
+            let style = &maps[&format!("c1/{name}")]["default"];
+            assert_eq!(
+                (style.min, style.max),
+                (fallback["default"].min, fallback["default"].max)
+            );
+        }
     }
 
     #[test]
     fn parameter_defaults_opt_out_and_inline_override() {
         let ctx = StyleContext::with_builtins();
-        let params = vec![("msl".to_string(), "MSLP".to_string())];
+        let params = vec![ds_core::map_engine::ParameterInfo {
+            name: "msl".to_string(),
+            title: "MSLP".to_string(),
+            unit: "hPa".into(),
+        }];
 
         // Opt-out: collection colormap paints everything, as before.
         let c = coll("colormap = \"temperature\"\nparameter_defaults = false\n");
         let maps = ctx
-            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
             .unwrap();
         assert_eq!(maps["c1/msl"]["default"].palette.name, "temperature");
 
@@ -882,7 +921,7 @@ mod tests {
             "colormap = \"temperature\"\n[[wms.parameters]]\nname = \"msl\"\ncolormap = \"viridis\"\nmin = 980.0\nmax = 1040.0\n",
         );
         let maps = ctx
-            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
             .unwrap();
         assert_eq!(maps["c1/msl"]["default"].palette.name, "viridis");
         assert_eq!(
@@ -893,7 +932,7 @@ mod tests {
         // Inline param with only a range narrows the DEFAULT palette.
         let c = coll("[[wms.parameters]]\nname = \"msl\"\nmin = 990.0\nmax = 1030.0\n");
         let maps = ctx
-            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
             .unwrap();
         let msl = &maps["c1/msl"]["default"];
         assert_eq!(msl.palette.name, "pressure");
@@ -907,9 +946,13 @@ mod tests {
         let ctx = StyleContext::with_builtins();
         let c: CollectionConfig =
             toml::from_str("id = \"c1\"\ntitle = \"t\"\ndescription = \"d\"\n").unwrap();
-        let params = vec![("DBZH".to_string(), "Reflectivity".to_string())];
+        let params = vec![ds_core::map_engine::ParameterInfo {
+            name: "DBZH".to_string(),
+            title: "Reflectivity".to_string(),
+            unit: "dBZ".into(),
+        }];
         let maps = ctx
-            .parameter_layer_styles(&c, None, &params, Some("dBZ"), &|_, cm| cm)
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
             .unwrap();
         assert_eq!(maps["c1/DBZH"]["default"].palette.name, "radar_dbz");
         assert_eq!(
@@ -933,12 +976,20 @@ mod tests {
             "#,
         );
         let params = vec![
-            ("DBZH".to_string(), "Reflectivity".to_string()),
-            ("VRADH".to_string(), "Radial velocity".to_string()),
+            ds_core::map_engine::ParameterInfo {
+                name: "DBZH".to_string(),
+                title: "Reflectivity".to_string(),
+                unit: "dBZ".into(),
+            },
+            ds_core::map_engine::ParameterInfo {
+                name: "VRADH".to_string(),
+                title: "Radial velocity".to_string(),
+                unit: "m/s".into(),
+            },
         ];
         let wrapped_for: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let maps = ctx
-            .parameter_layer_styles(&c, None, &params, None, &|short, cmap| {
+            .parameter_layer_styles(&c, None, &params, &|short, cmap| {
                 wrapped_for.borrow_mut().push(short.to_string());
                 cmap
             })

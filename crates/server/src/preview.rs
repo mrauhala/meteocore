@@ -458,7 +458,7 @@ fn build_entry(
 ///    GRIB / multi-param QueryData): that list is the renderable source of
 ///    truth. Names also present in EDR are enriched with EDR's richer
 ///    `(label, unit)`; names absent from EDR fall back to the raster-side
-///    `(short_name, title)` with an empty unit.
+///    descriptor, including its unit.
 /// 2. `raster_info().parameters` empty (single-band engines like
 ///    single-band GeoTIFF): the tile handler ignores `?parameter-name=`
 ///    regardless of value — emitting dropdown options would lie about what
@@ -470,7 +470,7 @@ fn collection_parameters(
     tiles: &api_tiles::handlers::TilesState,
     wms: &api_wms::handlers::WmsState,
 ) -> Option<Vec<Value>> {
-    let raster_params: Vec<(String, String)> = maps
+    let raster_params: Vec<ds_core::map_engine::ParameterInfo> = maps
         .engines
         .get(id)
         .or_else(|| tiles.map_engines.get(id))
@@ -490,11 +490,13 @@ fn collection_parameters(
 
     let mut out: Vec<Value> = raster_params
         .into_iter()
-        .map(|(name, title)| {
+        .map(|parameter| {
+            let name = parameter.name;
+            let title = parameter.title;
             let (label, unit) = edr_descs
                 .get(&name)
                 .map(|d| (d.label.clone(), d.unit.clone()))
-                .unwrap_or((title, String::new()));
+                .unwrap_or((title, parameter.unit));
             json!({ "name": name, "title": label, "unit": unit })
         })
         .collect();
@@ -853,7 +855,7 @@ mod tests {
         /// `parameters` returned by `raster_info()`. Empty by default
         /// (single-band convention). Tests for multi-parameter raster
         /// behaviour set this explicitly.
-        parameters: Vec<(String, String)>,
+        parameters: Vec<ds_core::map_engine::ParameterInfo>,
     }
 
     impl Default for RasterMock {
@@ -1883,9 +1885,21 @@ mod tests {
             unit: "K".into(),
             // GRIB shape: raster exposes the same param set as EDR.
             parameters: vec![
-                ("2t".into(), "Temperature".into()),
-                ("msl".into(), "Pressure".into()),
-                ("10u".into(), "Wind U".into()),
+                ds_core::map_engine::ParameterInfo {
+                    name: "2t".into(),
+                    title: "Temperature".into(),
+                    unit: "K".into(),
+                },
+                ds_core::map_engine::ParameterInfo {
+                    name: "msl".into(),
+                    title: "Pressure".into(),
+                    unit: "hPa".into(),
+                },
+                ds_core::map_engine::ParameterInfo {
+                    name: "10u".into(),
+                    title: "Wind U".into(),
+                    unit: "".into(),
+                },
             ],
             ..RasterMock::default()
         });
@@ -1906,6 +1920,43 @@ mod tests {
         assert_eq!(params[2]["name"], "msl");
         assert_eq!(params[1]["unit"], "K");
         assert_eq!(params[1]["title"], "2 metre temperature");
+    }
+
+    #[test]
+    fn manifest_keeps_raster_units_without_an_edr_engine() {
+        let mut tiles = empty_tiles();
+        tiles.map_engines.insert(
+            "mixed".into(),
+            Arc::new(RasterMock {
+                parameters: [("t2m", "°C"), ("msl", "hPa"), ("ws", "m/s")]
+                    .map(|(name, unit)| ds_core::map_engine::ParameterInfo {
+                        name: name.into(),
+                        title: name.into(),
+                        unit: unit.into(),
+                    })
+                    .into(),
+                ..RasterMock::default()
+            }),
+        );
+        tiles
+            .collections
+            .insert("mixed".into(), config("mixed", &["tiles"]));
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let manifest = build_manifest(&state, 0, 100);
+        let parameters = manifest["collections"][0]["parameters"].as_array().unwrap();
+        assert_eq!(
+            parameters
+                .iter()
+                .map(|p| (p["name"].as_str().unwrap(), p["unit"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("msl", "hPa"), ("t2m", "°C"), ("ws", "m/s")]
+        );
     }
 
     #[test]
@@ -2097,8 +2148,16 @@ mod tests {
                     unit: "K".into(),
                     // Note: "derived_index" is intentionally absent.
                     parameters: vec![
-                        ("2t".into(), "Temperature".into()),
-                        ("msl".into(), "Mean SLP".into()),
+                        ds_core::map_engine::ParameterInfo {
+                            name: "2t".into(),
+                            title: "Temperature".into(),
+                            unit: "K".into(),
+                        },
+                        ds_core::map_engine::ParameterInfo {
+                            name: "msl".into(),
+                            title: "Mean SLP".into(),
+                            unit: "hPa".into(),
+                        },
                     ],
                     vertical: None,
                     grid_size: None,

@@ -319,6 +319,18 @@ impl RasterTile {
     }
 }
 
+/// A selectable raster parameter. Units describe the values returned by the
+/// engine (after any display conversion); an empty unit means unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterInfo {
+    /// Stable selector used in layer names and parameter-name queries.
+    pub name: String,
+    /// Human-readable parameter label.
+    pub title: String,
+    /// Unit of the returned raster values; empty when unknown.
+    pub unit: String,
+}
+
 /// Metadata about a map-capable raster collection.
 #[derive(Debug, Clone)]
 pub struct RasterInfo {
@@ -330,11 +342,11 @@ pub struct RasterInfo {
     pub times: Vec<DateTime<Utc>>,
     /// Default parameter name (e.g., "reflectivity").
     pub parameter: String,
-    /// Unit of measurement (e.g., "dBZ").
+    /// Unit of the default parameter (e.g., "dBZ").
     pub unit: String,
     /// All available parameters. Empty means single-parameter engine (use `parameter`).
-    /// For multi-parameter engines (e.g., querydata), each entry is a (short_name, title) pair.
-    pub parameters: Vec<(String, String)>,
+    /// Multi-parameter engines carry each parameter's own display unit.
+    pub parameters: Vec<ParameterInfo>,
     /// The collection's vertical axis, when it has one (e.g. radar elevation
     /// sweeps, pressure levels). `None` for collections with no vertical
     /// dimension.
@@ -359,6 +371,23 @@ pub struct RasterInfo {
     /// `reference_time` dimension and `get_raster_tile`'s `reference_time`
     /// argument selects one (`None` ⇒ latest); see [`crate::instances`].
     pub reference_times: Vec<DateTime<Utc>>,
+}
+
+impl RasterInfo {
+    /// Resolve a selected parameter's unit without borrowing another field's
+    /// unit. The legacy default unit is used only when no matching descriptor
+    /// exists and the request selects the collection default.
+    pub fn parameter_unit(&self, parameter: Option<&str>) -> Option<&str> {
+        let name = parameter.unwrap_or(&self.parameter);
+        let unit = if let Some(p) = self.parameters.iter().find(|p| p.name == name) {
+            p.unit.as_str()
+        } else if name == self.parameter {
+            self.unit.as_str()
+        } else {
+            return None;
+        };
+        (!unit.trim().is_empty()).then_some(unit)
+    }
 }
 
 /// Trait for serving raster data as map images.

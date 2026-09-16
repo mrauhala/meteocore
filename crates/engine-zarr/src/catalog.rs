@@ -865,9 +865,13 @@ fn build_raster_info(
     extent: [f64; 4],
     grid_size: [u32; 2],
 ) -> RasterInfo {
-    let parameters: Vec<(String, String)> = vars
+    let parameters: Vec<ds_core::map_engine::ParameterInfo> = vars
         .iter()
-        .map(|v| (v.name.clone(), v.label.clone()))
+        .map(|v| ds_core::map_engine::ParameterInfo {
+            name: v.name.clone(),
+            title: v.label.clone(),
+            unit: v.units.clone(),
+        })
         .collect();
     let (parameter, unit) = vars
         .first()

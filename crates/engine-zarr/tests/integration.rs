@@ -889,8 +889,10 @@ fn raster_info_describes_the_grid() {
     assert_eq!(info.times.len(), 4);
     assert!(info.spatial_extent.is_some());
     assert_eq!(info.grid_size, Some([16, 12])); // [nx lon, ny lat]
-    let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
     assert!(names.contains(&"t2m") && names.contains(&"t2m_packed"));
+    assert_eq!(info.parameter_unit(Some("t2m")), Some("K"));
+    assert_eq!(info.parameter_unit(Some("t2m_packed")), Some("K"));
 }
 
 #[test]
