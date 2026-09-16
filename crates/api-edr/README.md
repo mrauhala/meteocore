@@ -134,3 +134,9 @@ from the source sidecar, or prove that repeated records contain identical data.
 An area query without `parameter-name` prefers the existing near-surface
 instant/max/min products before newly supported acc/ave records. If only
 aggregates are configured, the first available aggregate is the default.
+
+BUFR decoding supports compressed character fields, operator 208, and numeric
+fields through 64 bits. Unsupported operators or unknown national descriptors
+skip the affected message (counted in `bufr_decode_failures_total`); other
+messages in the same file remain available. See
+[`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).

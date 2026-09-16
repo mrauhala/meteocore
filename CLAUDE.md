@@ -47,7 +47,7 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   duplicate fact, inline payloads, download policy.
 - `crates/engine-odim/CLAUDE.md` — PVOL per-site model, pixel pre-warm,
   resampling, storm cells.
-- `crates/engine-bufr/CLAUDE.md` — BUFR decoder boundary (tinybufr only in
+- `crates/engine-bufr/CLAUDE.md` — BUFR decoder boundary (ds_bufr only in
   `decode.rs`), period-context + first-occurrence extraction rules, store
   bounds, EDR/Features semantics.
 - `crates/engine-geotiff/CLAUDE.md`, `crates/engine-grib/CLAUDE.md`,
