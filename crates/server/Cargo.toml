@@ -9,7 +9,6 @@ edition = "2021"
 icechunk = ["engine-zarr/icechunk"]
 
 [dependencies]
-ds-executor = { path = "../ds-executor" }
 toml = "1.1"
 ds-core = { path = "../core" }
 ds-wis2 = { path = "../ds-wis2" }
@@ -32,6 +31,7 @@ api-maps = { path = "../api-maps" }
 api-tiles = { path = "../api-tiles" }
 api-3dtiles = { path = "../api-3dtiles" }
 ds-render = { path = "../render" }
+ds-executor = { path = "../ds-executor" }
 ds-mvt = { path = "../ds-mvt" }
 ds-cache = { path = "../ds-cache" }
 arc-swap = "1"
