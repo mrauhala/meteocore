@@ -68,3 +68,9 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   schema order); license → `<Attribution>` (after `<Dimension>` elements).
 - ODIM per-site layers: `<Title>` is prefixed with the site place name via
   `RasterInfo.layer_subtitle` so flat clients can tell per-site layers apart.
+
+GetMap cache misses use `ds-executor::RenderJob`: a bounded shared queue and
+one absolute deadline across admission/render/encoding. The worker retains
+CPU and memory permits after HTTP timeout/disconnect. Propagate
+`DeadlineExceeded` as 503 + Retry-After, never a successful transparent/error
+image. Meta-tile fan-out checks the same deadline between tiles.

@@ -154,6 +154,8 @@ not re-scan the auto roots.
 | `LOG_FORMAT` | human-readable | Set to `json` for newline-delimited JSON logs (production / Loki ingestion) |
 | `RUST_LOG` | `info` | Log level filter, e.g. `server=debug,engine_geotiff=warn` |
 | `ADMIN_TOKEN` | _(none — unauthenticated)_ | Bearer token required for `POST /admin/collections/reload`. When unset, the admin endpoint is open. |
+| `MC_RENDER_TIMEOUT_MS` | `3000` | Absolute queue + raster render deadline for WMS/Maps/Tiles (and MVT encoding), in milliseconds; 0 rejects uncached work, maximum one day. Timeout returns 503 + Retry-After. In-flight CPU work keeps its permits until completion; remote GeoTIFF reads stop at the same deadline. Restart to change. |
+| `MC_RENDER_QUEUE_CAPACITY` | `3 × render slots` | Process-wide cap on requests waiting for a shared render slot. A full queue returns immediate 503 + Retry-After; 0 allows only immediately available slots. Cached responses bypass admission. Restart to change. |
 | `MC_RENDER_MEMORY_MB` | `1024` | Process-wide transient raster render admission budget (MiB), shared by WMS/Maps/Tiles and retained across reloads. Estimate: 32 bytes/output pixel. Exhaustion returns 503 + Retry-After; 0 rejects uncached renders. Restart to change. Source decoding and resident caches are separate budgets. |
 | `MC_3DTILES_CONTENT_CACHE_MB` | `512` | 3D Tiles encoded-content cache size in MB. `0` disables. |
 | `MC_PVOL_VOXEL_GRID_CACHE_MB` | `512` | PVOL polar-resampled voxel-grid cache size in MB. `0` disables. |

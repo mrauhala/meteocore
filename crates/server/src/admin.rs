@@ -1117,6 +1117,31 @@ static RENDER_SEMAPHORE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+static RENDER_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_queue_depth",
+        "Requests waiting for a shared render slot",
+    )
+});
+static RENDER_QUEUE_CAPACITY: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_queue_capacity",
+        "Maximum requests waiting for a shared render slot",
+    )
+});
+static RENDER_QUEUE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "render_queue_rejected_total",
+        "Requests rejected immediately because the render queue was full",
+    )
+});
+static RENDER_DEADLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "render_deadline_exceeded_total",
+        "Requests exceeding their queue plus execution deadline",
+    )
+});
+
 static RENDER_MEMORY_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "render_budget_available_bytes",
@@ -3470,13 +3495,9 @@ pub fn load_collections(
     // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
     // because decode/encode interleaves with bilinear passes; configurable
     // knob tracked in #147.
-    let render_concurrency = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .saturating_mul(2)
-        .max(8);
+    let render_concurrency = ds_executor::render_concurrency();
     tracing::info!("Render concurrency: {render_concurrency} (2× available CPUs, min 8)");
-    let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
+    let render_semaphore = ds_executor::RENDER_SLOTS.clone();
     // Reuse the live render caches across a reload when their configured byte
     // size is unchanged, so a reload preserves the warm cache instead of
     // dumping GBs of meta-tiles and forcing a cold re-warm (see
@@ -4796,6 +4817,11 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
+    let execution = ds_executor::metrics();
+    RENDER_QUEUE_DEPTH.set(execution.queued as i64);
+    RENDER_QUEUE_CAPACITY.set(execution.capacity as i64);
+    RENDER_QUEUE_REJECTED.feed(execution.rejected);
+    RENDER_DEADLINES.feed(execution.timed_out);
     let memory = &*ds_render::budget::RENDER_MEMORY;
     RENDER_MEMORY_AVAILABLE.set(memory.available().min(i64::MAX as u64) as i64);
     RENDER_MEMORY_TOTAL.set(memory.capacity().min(i64::MAX as u64) as i64);

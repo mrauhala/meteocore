@@ -32,6 +32,7 @@ api-maps = { path = "../api-maps" }
 api-tiles = { path = "../api-tiles" }
 api-3dtiles = { path = "../api-3dtiles" }
 ds-render = { path = "../render" }
+ds-executor = { path = "../ds-executor" }
 ds-mvt = { path = "../ds-mvt" }
 ds-cache = { path = "../ds-cache" }
 arc-swap = "1"

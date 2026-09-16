@@ -364,13 +364,16 @@ impl DataStore {
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
+        let deadline = ds_core::deadline::current();
+        ds_core::deadline::check()?;
         let timed = async {
-            match tokio::time::timeout(Self::REQUEST_TIMEOUT, future).await {
-                Ok(result) => result,
-                Err(_) => Err(object_store::Error::Generic {
-                    store: "DataStore",
-                    source: "Request timed out after 30s".into(),
-                }),
+            let end = deadline.unwrap_or_else(|| std::time::Instant::now() + Self::REQUEST_TIMEOUT);
+            match tokio::time::timeout_at(end.into(), future).await {
+                Ok(result) => result.map_err(|e| DataServerError::from(StorageError::from(e))),
+                Err(_) if deadline.is_some() => Err(DataServerError::DeadlineExceeded),
+                Err(_) => Err(DataServerError::Storage(
+                    "Request timed out after 30s".into(),
+                )),
             }
         };
         let result = match handle {
@@ -386,7 +389,7 @@ impl DataStore {
                 }
             },
         };
-        result.map_err(|e| DataServerError::from(StorageError::from(e)))
+        result
     }
 
     /// Get the underlying async ObjectStore for use in async contexts
@@ -812,5 +815,49 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(&header[0..2], b"II", "Expected little-endian TIFF header");
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_deadline_cancels_storage_future_and_leaves_background_unrestricted() {
+        let store = DataStore::new(Arc::new(object_store::memory::InMemory::new()));
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            struct Dropped(Arc<AtomicBool>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let scope = ds_core::deadline::enter(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(30),
+            ));
+            let dropped = Dropped(cancelled.clone());
+            let result: Result<(), _> = store.block_on_with(Some(&handle), async {
+                let _dropped = dropped;
+                std::future::pending().await
+            });
+            assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
+            assert!(cancelled.load(Ordering::SeqCst));
+            // Expired requests must not start another source operation/retry.
+            let result: Result<(), _> =
+                store.block_on_with(Some(&handle), async { panic!("expired I/O was polled") });
+            assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
+            drop(scope);
+            assert!(ds_core::deadline::current().is_none());
+            let result: Result<u8, _> = store.block_on_with(Some(&handle), async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(42)
+            });
+            assert_eq!(result.unwrap(), 42);
+        })
+        .await
+        .unwrap();
     }
 }

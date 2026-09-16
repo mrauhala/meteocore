@@ -1291,6 +1291,8 @@ fn read_http_range(
     // (rayon) thread; `None` for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
 ) -> Result<Bytes, DataServerError> {
+    ds_core::deadline::check()?;
+    let deadline = ds_core::deadline::current();
     let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
     let url_owned = url.to_string();
     let fut = async {
@@ -1326,6 +1328,15 @@ fn read_http_range(
             data.extend_from_slice(&chunk);
         }
         Ok(Bytes::from(data))
+    };
+    let fut = async {
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline.into(), fut)
+                .await
+                .map_err(|_| DataServerError::DeadlineExceeded)?
+        } else {
+            fut.await
+        }
     };
     match handle {
         Some(h) => h.block_on(fut),
@@ -2131,9 +2142,10 @@ fn read_remote_chunk_with_retry<F>(
 where
     F: Fn() -> Result<DecodedTile, DataServerError>,
 {
+    ds_core::deadline::check()?;
     match read_fn() {
         Ok(data) => Ok(data),
-        Err(DataServerError::ResourceExhausted) => Err(DataServerError::ResourceExhausted),
+        Err(e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded)) => Err(e),
         Err(first_err) => {
             let mut last_err = first_err;
             for attempt in 1..=2 {
@@ -2144,7 +2156,11 @@ where
                     chunk_index,
                     attempt
                 );
-                std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                let backoff = std::time::Duration::from_millis(50 * attempt);
+                let remaining = ds_core::deadline::current()
+                    .map(|d| d.saturating_duration_since(std::time::Instant::now()));
+                std::thread::sleep(remaining.map_or(backoff, |r| r.min(backoff)));
+                ds_core::deadline::check()?;
                 match read_fn() {
                     Ok(data) => {
                         tracing::debug!(
@@ -2156,9 +2172,10 @@ where
                         );
                         return Ok(data);
                     }
-                    Err(DataServerError::ResourceExhausted) => {
-                        return Err(DataServerError::ResourceExhausted)
-                    }
+                    Err(
+                        e
+                        @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
+                    ) => return Err(e),
                     Err(e) => last_err = e,
                 }
             }
@@ -2220,6 +2237,7 @@ fn read_bbox_parallel(
     // Runtime per tile (#222). `None` only if no runtime is current (e.g.
     // tests), in which case the storage layer falls back to a temporary one.
     let rt_handle = tokio::runtime::Handle::try_current().ok();
+    let deadline = ds_core::deadline::current();
 
     // Fetch all tiles in parallel using the shared thread pool.
     // Fetch/decode failures become nodata; admission/index failures propagate.
@@ -2228,6 +2246,8 @@ fn read_bbox_parallel(
         tile_coords
             .par_iter()
             .map(|&(tile_row, tile_col)| {
+                let _scope = ds_core::deadline::enter(deadline);
+                ds_core::deadline::check()?;
                 let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
                     Ok(idx) => idx,
                     Err(e) => {
@@ -2316,12 +2336,15 @@ fn read_bbox_parallel_http(
 
     // Reuse the current runtime for the rayon workers' fetches (#222).
     let rt_handle = tokio::runtime::Handle::try_current().ok();
+    let deadline = ds_core::deadline::current();
 
     let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
     let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
         tile_coords
             .par_iter()
             .map(|&(tile_row, tile_col)| {
+                let _scope = ds_core::deadline::enter(deadline);
+                ds_core::deadline::check()?;
                 let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
                     Ok(idx) => idx,
                     Err(e) => {
@@ -3279,6 +3302,87 @@ mod tests {
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);
         assert_eq!(misses, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_deadline_reaches_both_rayon_fetch_paths_without_io() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+        let (store, _) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
+        let obj_path = ds_storage::object_store::path::Path::from(
+            tif_path.file_name().unwrap().to_str().unwrap(),
+        );
+        let (metadata, tile_info) = TiffMetadata::from_header_read(
+            &store,
+            &obj_path,
+            std::fs::metadata(&tif_path).unwrap().len(),
+        )
+        .unwrap();
+        let read_before = store.bytes_read();
+        let remote = DataSource::Remote {
+            store: store.clone(),
+            path: obj_path,
+            tile_info: tile_info.clone(),
+        };
+        let http = DataSource::HttpDirect {
+            http: Arc::new(reqwest::Client::new()),
+            url: "http://127.0.0.1:9/unreachable".into(),
+            tile_info,
+        };
+        let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
+        for source in [remote, http] {
+            let result = read_bbox(
+                &source,
+                &metadata,
+                0,
+                0,
+                metadata.tile_width.min(metadata.width),
+                metadata.tile_height.min(metadata.height),
+                None,
+                &tif_path,
+                0,
+            );
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "{result:?}"
+            );
+        }
+        assert_eq!(store.bytes_read(), read_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_http_range_wait_uses_the_interactive_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/slow", listener.local_addr().unwrap());
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut connections = Vec::new();
+            loop {
+                if stopped.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => connections.push(stream), // Intentionally never send headers.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1))
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+        });
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _scope = ds_core::deadline::enter(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(50),
+            ));
+            read_http_range(&reqwest::Client::new(), &url, 0..1, Some(&handle))
+        })
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

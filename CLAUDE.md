@@ -8,6 +8,7 @@ Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-storage` (S3/HTTP/local object store, directory `crates/storage`),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
+`ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure),
 `ds-poll` (shared poll-loop lifecycle: the `Shutdown` handle + `PollTicker`
 every engine's background poll loop uses — never hand-roll a
 `tokio::select!` shutdown signal, #481),
@@ -25,6 +26,7 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 **Per-crate notes live in `crates/<crate>/CLAUDE.md`.** Before working on one
 of these crates, read its file — it holds that crate's rules and gotchas:
 
+- `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership.
 - `crates/server/CLAUDE.md` — CLI flags, no-config boot, auto-collections,
   reload/watcher trust model, proxy headers.
 - `crates/api-wms/CLAUDE.md` — BBOX axis order, meta-tiling, TIME/ELEVATION/
@@ -208,7 +210,8 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   extraction the same ~40 lines were copy-pasted 12×. In `server/src/
   admin.rs`, a global cache's `/metrics` family is one `CacheMetricSet`
   static + one `update()` call in `metrics_handler`.
-- **API crates depend only on ds-core** (plus ds-render for
+- **API crates depend only on ds-core** (plus ds-executor for bounded render execution,
+  ds-render for
   api-wms/api-maps, and api-edr for its `f=png` time-series plots) — never on
   engine crates. API state is a registry of engines keyed by collection ID.
 - **EDR, Features, Maps, Tiles, and WMS are separate services** with separate

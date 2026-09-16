@@ -78,3 +78,9 @@ Direct HTTP range bodies are also streamed with the requested length as a cap,
 including when the origin omits Content-Length or ignores Range. Invalid tile
 index arithmetic fails the request; ordinary fetch/decode errors may still
 produce nodata gaps.
+
+Interactive render deadlines propagate through Rayon tile fetching to both
+object-store and direct HTTP range/body reads. All retries share one absolute
+end time; deadline errors stop retries and fail the request with 503 rather
+than becoming nodata gaps. Background scans have no render deadline and retain
+their existing storage timeout/retry policy.
