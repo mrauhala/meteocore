@@ -1,4 +1,4 @@
-# MeteoCore API explorer — design proposal 01
+# MeteoCore API workbench — design proposal 02
 
 **Status: design for approval. Production HTML, routes and handlers are unchanged.**
 
@@ -14,7 +14,9 @@ python3 -m http.server 8766 --bind 127.0.0.1 --directory docs/design/api-explore
 
 ![Desktop landing page](screenshots/landing.png)
 
-[Collection search](screenshots/collections.png) ·
+[Query builder · light](screenshots/collections.png) ·
+[Query builder · dark](screenshots/collections-dark.png) ·
+[JSON representation](screenshots/json.png) ·
 [Items and map](screenshots/items.png) ·
 [Item detail](screenshots/item-detail.png) ·
 [Future hierarchy](screenshots/hierarchy.png) ·
@@ -22,46 +24,74 @@ python3 -m http.server 8766 --bind 127.0.0.1 --directory docs/design/api-explore
 
 ## The proposed experience
 
-A calm, light data explorer with forest/teal accents, an API workspace switcher,
-readable metadata, and a consistent path from discovery to data. The browser
-should help both someone exploring weather data and a developer looking for a
-precise API request. It remains a human-readable representation of the OGC
-resources, rather than becoming a separate catalog with different behavior.
+An HTML representation of the API, organized around resources and requests.
+The landing page is an endpoint index. Collection discovery puts a parameter
+editor beside results, with exact parameter names, types, paging inputs and an
+encoded request preview. Collection and item pages retain readable metadata,
+geometry and typed properties within the same request-oriented shell.
 
 Primary journey:
 
-**Platform home → API overview → filtered collections → collection overview →
-items → item detail → copy request / GeoJSON.**
+**API resource → collection query → collection → item query → item → HTML / JSON.**
 
 The same shell serves EDR, Maps, Tiles and Features. Common navigation and
 collection discovery are shared; data access changes according to the API and
-collection capabilities.
+collection capabilities. The current mockup builds collection queries and
+Features item equality/time queries. Complete EDR geometry, Maps rendering and
+Tiles request builders remain separate design increments; their advertised
+access methods are linked from collection details.
+
+### Representation and request controls
+
+- **HTML / JSON** remains visible in a sticky top bar, including on mobile.
+  It changes the representation of the current resource with the same applied
+  filters, limit and offset. JSON is a full page, not a modal.
+- The request panel shows the machine-readable counterpart of the applied
+  request, with **Copy URL**, **Copy cURL** and **Open live JSON**. The last
+  action opens the real service in another tab; its data may have changed.
+- The prototype's JSON view displays captured or locally simulated data and
+  labels that distinction. Landing/reference/future resources are conceptual;
+  production must serialize the actual same resource behind both formats.
+- Editing parameters updates the **Request preview** without changing results
+  or the applied JSON link. **Apply query** commits the parameters. Changing
+  filters resets offset; an explicitly entered offset is respected.
+- A single-item API URL contains its item ID, not the previous list's filter
+  parameters. The prototype preserves list context separately in navigation.
+- Future-only requests expose a concept JSON view but no misleading live link.
+
+### Themes
+
+**System / Light / Dark** is available alongside the representation switch.
+System follows the OS; explicit choices persist locally across reloads. Theme
+is a presentation preference, so it does not change the API query or results.
+Both palettes cover controls, results, JSON/code, dialogs and map context.
+Production should apply the preference before first paint to avoid a flash,
+while preserving readable defaults without JavaScript.
 
 ## Review these flows
 
-1. Open the home page; choose Features or use **Explore collections**.
-2. Search for `radar`, open Filters, and try `radar +Finland -volume` in the
-   advanced field. Clear individual chips, switch list/cards, and follow Next.
-3. Open Finnish Radar Nowcast. Inspect coverage, then **Browse items**.
-4. Select the map cluster, choose Siikajoki, then open its full item details.
-   Try **Find a property**, GeoJSON, and the link back to its collection.
-5. Open Finland Weather Warnings. The snapshot contains expired warnings;
-   item details call that out explicitly instead of implying they are active.
-6. Switch an existing collection to EDR, Maps or Tiles. The access actions
-   change to advertised query types, styles, or tile matrix sets.
-7. Under collections, use **Review a screen state** to inspect empty, loading
-   and request-failure designs.
-8. Use the top **Explore future: hierarchy + sorting** toggle. This exposes
-   proposed groups, title sorting and the discovery-only group page. This
-   toolbar is for design review, not a proposed production toolbar.
+1. Open the resource landing page, then **Open in query builder**.
+2. Edit `q`, `query`, `bbox`, `datetime`, `limit` and `offset`. Observe the
+   draft request separately from the applied request. Try
+   `radar +Finland -volume` in `query`, then **Apply query**.
+3. Switch **HTML → JSON → HTML**; the same filters and page remain selected.
+   Copy the cURL command or follow **Open live JSON**.
+4. Open Finnish Radar Nowcast, then **Browse items**. Filter `severity` equals
+   `moderate`, switch to JSON, then return and open a single item.
+5. Select the map cluster and choose Siikajoki. Inspect typed properties and
+   quality flags. Open Finland Weather Warnings to see expiry information.
+6. Switch between **Light**, **Dark** and **System**, including on mobile.
+7. Use **Review a screen state** for empty/loading/failure designs.
+8. Use **Explore future: hierarchy + sorting** for proposed groups, title
+   sorting, parent breadcrumbs and discovery-only group pages.
 
 ## Screen decisions
 
 | Screen | Main task | Design |
 |---|---|---|
-| Platform landing | Choose an access method | Four API entry points, short explanations, direct collection starting points. No invented uptime, health or popularity statistics. |
-| API landing | Understand this API and start exploring | API purpose, collection search, API-specific collection count, examples and a secondary developer entry point. |
-| Collections | Find suitable datasets | Search first, advanced filters progressively disclosed, applied-filter chips, matched count, list/cards, paging and a copyable API URL. |
+| Platform landing | Choose an access method | Endpoint index with GET methods, resource paths, collection counts and query examples. |
+| API landing | Understand this API and start exploring | Links to collections, conformance and OpenAPI, with a starter query and example resources. |
+| Collections | Find suitable datasets | Parameter editor beside results: q/query, bbox, datetime, limit/offset, draft URL, apply action, result counts and paging. |
 | Collection overview | Decide whether the dataset fits | Description, coverage and temporal range, keywords, license, available access methods and other API representations. |
 | Items | Inspect a collection's contents | Supported property/time filters, compact table, map and quick-look panel, clear paging and GeoJSON access. |
 | Item detail | Read one feature without raw JSON overload | Meaningful title, source ID, geometry, typed property table, optional domain-specific summary, quality flags and validity information. |
@@ -165,13 +195,15 @@ replacing basic text/area/time discovery.
 
 ## Visual and interaction system
 
-- Forest text, teal primary actions, off-white workspace, white content panels.
+- Light and dark palettes with teal primary actions and distinct workspace,
+  panel and code surfaces.
   Status colors supplement text and icons; they never carry meaning alone.
 - System sans-serif type, restrained size hierarchy, monospace only for IDs,
   property keys and request URLs. Dense data stays compact; introductory
   content gets more breathing room.
-- One prominent action per task. JSON remains accessible but secondary to
-  browsing. Technical relations and raw IDs move to metadata/detail contexts.
+- One prominent action per task. HTML and JSON are equal representations;
+  method, resource path and parameter names are explicit. Longer raw metadata
+  remains available through the JSON view and metadata tabs.
 - Shared page shell, breadcrumbs, API picker, forms, chips, result rows,
   pagination, request bar and status messages. API adapters supply capabilities
   and metadata; avoid four separately evolving frontend implementations.
@@ -188,7 +220,8 @@ replacing basic text/area/time discovery.
 
 ## Responsive and accessibility requirements
 
-Desktop uses persistent sidebar navigation and side-by-side data/map context.
+Desktop uses persistent sidebar navigation, a query editor beside results,
+and supplementary data/map context.
 Below 800 px, navigation becomes a compact top bar. Below 560 px, filters and
 content stack; item tables may scroll horizontally inside their own container,
 without making the whole page overflow. Maps are supplementary: all item access,
@@ -239,8 +272,10 @@ Checked in connected Chrome:
 - Future sorting control, group/depth view and parent breadcrumb navigation.
 - Request-failure review state and desktop layouts.
 - Mobile catalog at 390 px and 320 px without page-level horizontal overflow;
-  mobile item layout at 390 px with contained table scrolling.
-- No browser errors or warnings in the checked preview session.
+  mobile item layout at 390 px with contained table scrolling (revision 01);
+  revision 02 HTML catalog at 390 px and JSON at 320 px without page overflow.
+- Revision 02: encoded draft URL versus applied request, filtered and paged
+  HTML/JSON parity, and theme persistence across reloads.
 
 JavaScript syntax, workspace Rust formatting and workspace Clippy checks pass.
 These checks cover the prototype, not production integration or complete
@@ -253,7 +288,8 @@ collection/item layouts, and the reserved extension points first.
 
 After approval, deliver incrementally:
 
-1. Shared HTML shell, API/platform landing pages and collection search/forms.
+1. Shared HTML shell, resource landing pages, light/dark/system themes,
+   persistent representation links and collection query forms.
 2. Collection overview and capability-aware access/navigation.
 3. Features item list/detail with progressive map enhancement and typed values.
 4. Metadata/reference/conformance pages and complete responsive/accessibility QA.
