@@ -91,6 +91,25 @@ fn negotiate(f: Option<&str>, headers: &HeaderMap) -> Result<ds_core::html::Want
     ds_core::html::negotiate(f, accept).map_err(|e| bad_request_msg(&e.to_string()))
 }
 
+/// Feature clients also use the GeoJSON media type as the format identifier.
+fn negotiate_feature(
+    f: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<ds_core::html::Wanted, HandlerError> {
+    let normalized = f.map(str::trim).map(|value| {
+        if value.eq_ignore_ascii_case("application/geo+json")
+            || value.eq_ignore_ascii_case("application/json")
+        {
+            "json"
+        } else if value.eq_ignore_ascii_case("text/html") {
+            "html"
+        } else {
+            value
+        }
+    });
+    negotiate(normalized, headers)
+}
+
 /// Tag a content-negotiated response with `Vary: Accept` so shared caches
 /// don't serve the JSON body to a client that asked for HTML (or vice versa).
 fn with_vary(mut resp: Response) -> Response {
@@ -250,6 +269,12 @@ fn searchable_collections_parameters() -> serde_json::Value {
     params
 }
 
+fn feature_format_parameter() -> serde_json::Value {
+    json!({"name": "f", "in": "query", "required": false,
+        "schema": {"type": "string", "enum": ["json", "html", "application/geo+json", "application/json", "text/html"]},
+        "description": "Output format, case-insensitive; overrides Accept. JSON aliases return GeoJSON. Encode the plus sign as %2B in application/geo+json."})
+}
+
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
@@ -290,7 +315,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {"$ref": "#/components/parameters/offset"},
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/sortby"},
-                    format_parameter()
+                    feature_format_parameter()
                 ],
                 "responses": {
                     "200": {
@@ -342,7 +367,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "required": true,
                         "schema": {"type": "string"}
                     },
-                    format_parameter()
+                    feature_format_parameter()
                 ],
                 "responses": {
                     "200": {
@@ -751,7 +776,7 @@ pub async fn items(
         )
     };
     let params = ItemsQueryParams::from_pairs(pairs).map_err(bad_request)?;
-    let wanted = negotiate(params.f.as_deref(), &headers)?;
+    let wanted = negotiate_feature(params.f.as_deref(), &headers)?;
     params
         .validate_filters(&engine.filterables())
         .map_err(bad_request)?;
@@ -884,7 +909,7 @@ pub async fn item(
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
 
-    let wanted = negotiate(fp.f.as_deref(), &headers)?;
+    let wanted = negotiate_feature(fp.f.as_deref(), &headers)?;
     let feature = engine.get_feature(&feature_id).map_err(|e| match &e {
         ds_core::error::DataServerError::FeatureNotFound(_) => (
             StatusCode::NOT_FOUND,

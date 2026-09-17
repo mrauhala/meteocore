@@ -342,16 +342,13 @@ pub async fn wms_handler(
 
             // Acquire render semaphore (with timeout to shed load under pressure)
             let t_sem = std::time::Instant::now();
-            let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
-                .await
-                .map_err(WmsError::from)?;
-            let memory_permit = Arc::new(
-                ds_render::budget::RENDER_MEMORY
-                    .try_acquire(params.width, params.height)
-                    .ok_or_else(|| {
-                        WmsError::ServiceUnavailable("Render memory budget exhausted".into())
-                    })?,
-            );
+            let (job, memory_permit) = ds_executor::RenderJob::acquire_raster(
+                state.render_semaphore.clone(),
+                params.width,
+                params.height,
+            )
+            .await
+            .map_err(WmsError::from)?;
             let worker_memory = memory_permit.clone();
 
             let sem_wait_ms = t_sem.elapsed().as_millis() as u64;

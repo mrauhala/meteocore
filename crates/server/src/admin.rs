@@ -1120,13 +1120,13 @@ static RENDER_SEMAPHORE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 static RENDER_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "render_queue_depth",
-        "Requests waiting for a shared render slot",
+        "Requests waiting for raster memory or a shared render slot",
     )
 });
 static RENDER_QUEUE_CAPACITY: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "render_queue_capacity",
-        "Maximum requests waiting for a shared render slot",
+        "Maximum requests waiting for raster memory or a shared render slot",
     )
 });
 static RENDER_QUEUE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
@@ -1157,7 +1157,7 @@ static RENDER_MEMORY_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 static RENDER_MEMORY_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
     DeltaCounter::new(
         "render_budget_rejected_total",
-        "Raster requests rejected by memory admission",
+        "Raster requests too large for memory admission or timed out waiting for memory",
     )
 });
 
@@ -4798,7 +4798,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     RENDER_QUEUE_CAPACITY.set(execution.capacity as i64);
     RENDER_QUEUE_REJECTED.feed(execution.rejected);
     RENDER_DEADLINES.feed(execution.timed_out);
-    let memory = &*ds_render::budget::RENDER_MEMORY;
+    let memory = &*ds_executor::budget::RENDER_MEMORY;
     RENDER_MEMORY_AVAILABLE.set(memory.available().min(i64::MAX as u64) as i64);
     RENDER_MEMORY_TOTAL.set(memory.capacity().min(i64::MAX as u64) as i64);
     update_memory_gauges();

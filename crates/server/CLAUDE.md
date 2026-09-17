@@ -155,7 +155,7 @@ client could spoof the emitted self-links (open-redirect risk downstream).
 across registry reloads. `MC_RENDER_QUEUE_CAPACITY` defaults to 3× slot count;
 full queues shed immediately with 503 + Retry-After, and cached bytes bypass it.
 `MC_RENDER_TIMEOUT_MS` defaults to 3000 for raster work and MVT encoding. The
-absolute deadline includes the semaphore wait, blocking-pool dispatch, engine
+absolute deadline includes memory and semaphore waits, blocking-pool dispatch, engine
 read and normal encoding. 3D points/meshes share the queue with a 30 s compute
 budget; dedicated voxel execution stays separate. Synchronous CPU work cannot
 be preempted: it retains its CPU/memory permits after timeout/disconnect until
@@ -177,12 +177,14 @@ and `render_deadline_exceeded_total` are exposed in /metrics and Grafana.
   missing boot-path spawn for `cap_engines`; the shutdown block had also
   silently skipped cap, postgis and nowcast).
 
-- Raster memory admission uses the process-wide `ds_render::budget::RENDER_MEMORY`,
+- Raster memory admission uses the process-wide `ds_executor::budget::RENDER_MEMORY`,
   configured by `MC_RENDER_MEMORY_MB` (default 1024 MiB; restart to change).
   It deliberately survives reloads so old and new render tasks share one limit.
   The 32-byte/output-pixel estimate covers output buffers/scratch, not source
   decoding or resident caches. At the default, the 8000×8000 format limit exceeds
   the memory budget and returns 503; operators can raise the budget explicitly.
+  Temporary memory exhaustion queues within the same deadline instead of failing
+  immediately. Memory waiters consume queue capacity, not CPU slots.
 
 - Preview temporal manifests may include `temporal_extent.default` from
   `MapEngine::default_time()`. The slider selects it rather than the last

@@ -1,4 +1,5 @@
 //! Bounded render admission and blocking execution shared by HTTP APIs.
+pub mod budget;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -69,6 +70,61 @@ pub struct RenderJob {
 }
 
 impl RenderJob {
+    /// Reserve output memory and CPU together. Short bursts wait in the same
+    /// bounded queue as CPU contention, without occupying a CPU slot while
+    /// waiting for memory. Both waits consume the original render deadline.
+    pub async fn acquire_raster(
+        slots: Arc<Semaphore>,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, Arc<budget::RenderPermit>), ExecutionError> {
+        Self::acquire_raster_on(
+            slots,
+            WAITING.clone(),
+            *TIMEOUT,
+            budget::RENDER_MEMORY.clone(),
+            width,
+            height,
+        )
+        .await
+    }
+
+    async fn acquire_raster_on(
+        slots: Arc<Semaphore>,
+        waiting: Arc<Semaphore>,
+        timeout: Duration,
+        memory: Arc<budget::RenderBudget>,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, Arc<budget::RenderPermit>), ExecutionError> {
+        let deadline = Instant::now() + timeout;
+        // A request that can never fit must not occupy the waiting queue.
+        if !memory.fits(width, height) {
+            memory.reject();
+            return Err(ExecutionError::Busy);
+        }
+        if let Some(reservation) = memory.try_reserve(width, height) {
+            if let Ok(permit) = slots.clone().try_acquire_owned() {
+                return Ok((Self { permit, deadline }, Arc::new(reservation)));
+            }
+        }
+        let _queued = waiting.try_acquire_owned().map_err(|_| {
+            REJECTED.fetch_add(1, Ordering::Relaxed);
+            ExecutionError::Busy
+        })?;
+        let reservation = tokio::time::timeout_at(deadline.into(), memory.reserve(width, height))
+            .await
+            .map_err(|_| {
+                memory.reject();
+                timeout_error()
+            })?;
+        let permit = tokio::time::timeout_at(deadline.into(), slots.acquire_owned())
+            .await
+            .map_err(|_| timeout_error())?
+            .map_err(|_| ExecutionError::Busy)?;
+        Ok((Self { permit, deadline }, Arc::new(reservation)))
+    }
+
     pub async fn acquire(slots: Arc<Semaphore>) -> Result<Self, ExecutionError> {
         Self::acquire_on(slots, WAITING.clone(), *TIMEOUT).await
     }
@@ -146,6 +202,170 @@ impl Drop for AbortOnDrop {
 mod tests {
     use super::*;
 
+    async fn wait_until_queued(waiting: &Semaphore, available: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while waiting.available_permits() != available {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn raster_memory_wait_is_bounded_cancellable_and_does_not_hold_cpu() {
+        let memory = Arc::new(budget::RenderBudget::new(budget::BYTES_PER_PIXEL));
+        let held = memory.try_reserve(1, 1).unwrap();
+        let slots = Arc::new(Semaphore::new(24));
+        let waiting = Arc::new(Semaphore::new(1));
+        let task = tokio::spawn(RenderJob::acquire_raster_on(
+            slots.clone(),
+            waiting.clone(),
+            Duration::from_secs(2),
+            memory.clone(),
+            1,
+            1,
+        ));
+        wait_until_queued(&waiting, 0).await;
+        assert_eq!(slots.available_permits(), 24);
+        assert!(matches!(
+            RenderJob::acquire_raster_on(
+                slots.clone(),
+                waiting.clone(),
+                Duration::from_secs(2),
+                memory.clone(),
+                1,
+                1,
+            )
+            .await,
+            Err(ExecutionError::Busy)
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(waiting.available_permits(), 1);
+        assert_eq!(memory.available(), 0);
+        drop(held);
+        assert_eq!(memory.available(), memory.capacity());
+    }
+
+    #[tokio::test]
+    async fn timeline_burst_waits_for_memory_and_all_frames_complete() {
+        // Production regression: 24 CPU slots but only six full-size frames
+        // fit in output memory. Previously the other seven failed immediately.
+        let memory = Arc::new(budget::RenderBudget::new(6 * budget::BYTES_PER_PIXEL));
+        let slots = Arc::new(Semaphore::new(24));
+        let waiting = Arc::new(Semaphore::new(72));
+        let mut initial = Vec::new();
+        for _ in 0..6 {
+            initial.push(
+                RenderJob::acquire_raster_on(
+                    slots.clone(),
+                    waiting.clone(),
+                    Duration::from_secs(2),
+                    memory.clone(),
+                    1,
+                    1,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut tasks = Vec::new();
+        for _ in 0..7 {
+            let (slots, waiting, memory) = (slots.clone(), waiting.clone(), memory.clone());
+            tasks.push(tokio::spawn(async move {
+                let (job, reservation) = RenderJob::acquire_raster_on(
+                    slots,
+                    waiting,
+                    Duration::from_secs(2),
+                    memory,
+                    1,
+                    1,
+                )
+                .await
+                .unwrap();
+                job.run(move || {
+                    let _reservation = reservation;
+                    1
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        wait_until_queued(&waiting, 65).await;
+        for (job, reservation) in initial {
+            assert_eq!(
+                job.run(move || {
+                    let _reservation = reservation;
+                    1
+                })
+                .await
+                .unwrap(),
+                1
+            );
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), 1);
+        }
+        assert_eq!(memory.available(), memory.capacity());
+        assert_eq!(memory.rejected(), 0);
+        assert_eq!(slots.available_permits(), 24);
+        assert_eq!(waiting.available_permits(), 72);
+    }
+
+    #[tokio::test]
+    async fn impossible_requests_and_memory_deadlines_release_admission() {
+        let memory = Arc::new(budget::RenderBudget::new(budget::BYTES_PER_PIXEL));
+        let slots = Arc::new(Semaphore::new(1));
+        let waiting = Arc::new(Semaphore::new(1));
+        assert!(matches!(
+            RenderJob::acquire_raster_on(
+                slots.clone(),
+                waiting.clone(),
+                Duration::from_secs(2),
+                memory.clone(),
+                2,
+                1,
+            )
+            .await,
+            Err(ExecutionError::Busy)
+        ));
+        assert_eq!(waiting.available_permits(), 1);
+        let held = memory.try_reserve(1, 1).unwrap();
+        assert!(matches!(
+            RenderJob::acquire_raster_on(
+                slots.clone(),
+                waiting.clone(),
+                Duration::from_millis(10),
+                memory.clone(),
+                1,
+                1,
+            )
+            .await,
+            Err(ExecutionError::Timeout)
+        ));
+        assert_eq!(memory.rejected(), 2);
+        assert_eq!(waiting.available_permits(), 1);
+        assert_eq!(slots.available_permits(), 1);
+        drop(held);
+        // A canceled CPU waiter must also release memory already reserved.
+        let cpu = slots.clone().acquire_owned().await.unwrap();
+        let task = tokio::spawn(RenderJob::acquire_raster_on(
+            slots.clone(),
+            waiting.clone(),
+            Duration::from_secs(2),
+            memory.clone(),
+            1,
+            1,
+        ));
+        wait_until_queued(&waiting, 0).await;
+        assert_eq!(memory.available(), 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(memory.available(), memory.capacity());
+        drop(cpu);
+    }
+
     #[test]
     fn expired_dispatch_is_counted_once_per_request() {
         const CHILD: &str = "MC_TEST_RENDER_DEADLINE_COUNTER_CHILD";
@@ -221,16 +441,21 @@ mod tests {
     #[tokio::test]
     async fn timeout_keeps_running_worker_permit_until_completion() {
         let slots = Arc::new(Semaphore::new(1));
-        let job = RenderJob::acquire_on(
+        let memory = Arc::new(budget::RenderBudget::new(budget::BYTES_PER_PIXEL));
+        let (job, reservation) = RenderJob::acquire_raster_on(
             slots.clone(),
             Arc::new(Semaphore::new(0)),
             Duration::from_millis(100),
+            memory.clone(),
+            1,
+            1,
         )
         .await
         .unwrap();
         let (release, wait) = std::sync::mpsc::channel();
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(job.run(move || {
+            let _reservation = reservation;
             started.send(()).unwrap();
             wait.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(ds_core::deadline::check().is_err());
@@ -238,11 +463,13 @@ mod tests {
         started_rx.await.unwrap();
         assert!(matches!(task.await.unwrap(), Err(ExecutionError::Timeout)));
         assert_eq!(slots.available_permits(), 0);
+        assert_eq!(memory.available(), 0);
         release.send(()).unwrap();
         let _released = tokio::time::timeout(Duration::from_secs(2), slots.acquire())
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(memory.available(), memory.capacity());
     }
 
     #[tokio::test]
