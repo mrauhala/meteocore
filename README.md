@@ -31,6 +31,10 @@ Each engine implements one or more of the core traits.
 
 ### OGC API Plugins
 
+The [OGC API Common Parts 1–4 matrix](docs/ogc-api-common-matrix.md) compares
+EDR, Maps, Tiles and Features against approved standards and current draft
+baselines, with implementation gaps and evidence for standards experimentation.
+
 | Crate | Plugin | Conformance |
 |-------|--------|-------------|
 | `api-edr` | [OGC API - EDR 1.1](https://docs.ogc.org/is/19-086r6/19-086r6.html) | ogcapi-common-1: core, landing-page, oas30; ogcapi-edr-1: core, collections, json, edr-geojson, covjson |
