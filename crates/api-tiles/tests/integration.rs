@@ -2627,8 +2627,8 @@ async fn exhausted_memory_budget_rejects_uncached_tile() {
         serde_json::from_slice::<Value>(&body).is_ok(),
         "structured error response"
     );
-    assert_eq!(ds_render::budget::RENDER_MEMORY.available(), 0);
-    assert_eq!(ds_render::budget::RENDER_MEMORY.rejected(), 1);
+    assert_eq!(ds_executor::budget::RENDER_MEMORY.available(), 0);
+    assert_eq!(ds_executor::budget::RENDER_MEMORY.rejected(), 1);
 }
 
 #[tokio::test]

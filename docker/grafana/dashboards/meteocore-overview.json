@@ -2949,7 +2949,7 @@
     {
       "type": "timeseries",
       "title": "Raster render memory admission",
-      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Separate from source decoding and resident caches.",
+      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Contention waits in the bounded render queue; oversized requests or expired memory waits are rejected. Separate from source decoding and resident caches.",
       "id": 61,
       "gridPos": {
         "h": 8,
@@ -3001,7 +3001,7 @@
     {
       "type": "timeseries",
       "title": "Raster memory rejections",
-      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Separate from source decoding and resident caches.",
+      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Contention waits in the bounded render queue; oversized requests or expired memory waits are rejected. Separate from source decoding and resident caches.",
       "id": 62,
       "gridPos": {
         "h": 8,

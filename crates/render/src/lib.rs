@@ -1,4 +1,3 @@
-pub mod budget;
 pub mod colormap;
 pub mod defaults;
 mod encode;

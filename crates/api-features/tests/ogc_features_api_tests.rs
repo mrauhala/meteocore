@@ -1036,6 +1036,10 @@ mod feature_html {
                 ("", "text/html", true),
                 ("?f=html", "application/geo+json", true),
                 ("?f=json", "text/html", false),
+                ("?f=application/geo%2Bjson", "text/html", false),
+                ("?f=%20Application%2FGeo%2BJSON%20", "text/html", false),
+                ("?f=application%2Fjson", "text/html", false),
+                ("?f=text%2Fhtml", "application/geo+json", true),
                 ("", "text/html;q=0", false),
             ] {
                 let (status, ct, body) = request(&format!("{path}{suffix}"), accept).await;

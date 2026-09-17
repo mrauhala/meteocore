@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ds-core = { path = "../core" }
+ds-cache = { path = "../ds-cache" }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 thiserror = "2"
 

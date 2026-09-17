@@ -1272,6 +1272,7 @@ dependencies = [
 name = "ds-executor"
 version = "0.1.0"
 dependencies = [
+ "ds-cache",
  "ds-core",
  "thiserror",
  "tokio",

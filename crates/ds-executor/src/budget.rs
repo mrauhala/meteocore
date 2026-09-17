@@ -5,6 +5,7 @@
 //! pixel), rather than counting only the final four-byte RGBA buffer.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use tokio::sync::Notify;
 
 pub const BYTES_PER_PIXEL: u64 = 32;
 
@@ -16,10 +17,12 @@ pub static RENDER_MEMORY: LazyLock<Arc<RenderBudget>> = LazyLock::new(|| {
     ))
 });
 
+#[derive(Debug)]
 pub struct RenderBudget {
     capacity: u64,
     used: AtomicU64,
     rejected: AtomicU64,
+    released: Notify,
 }
 
 impl RenderBudget {
@@ -28,6 +31,7 @@ impl RenderBudget {
             capacity,
             used: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            released: Notify::new(),
         }
     }
 
@@ -42,7 +46,31 @@ impl RenderBudget {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    pub fn try_acquire(self: &Arc<Self>, width: u32, height: u32) -> Option<RenderPermit> {
+    pub(crate) fn fits(&self, width: u32, height: u32) -> bool {
+        u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+            .is_some_and(|bytes| bytes <= self.capacity)
+    }
+
+    pub(crate) fn reject(&self) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) async fn reserve(self: &Arc<Self>, width: u32, height: u32) -> RenderPermit {
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            // Register before checking availability so a concurrent release cannot be lost.
+            released.as_mut().enable();
+            if let Some(permit) = self.try_reserve(width, height) {
+                return permit;
+            }
+            released.await;
+        }
+    }
+
+    pub(crate) fn try_reserve(self: &Arc<Self>, width: u32, height: u32) -> Option<RenderPermit> {
         let bytes = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL));
@@ -61,11 +89,11 @@ impl RenderBudget {
                 });
             }
         }
-        self.rejected.fetch_add(1, Ordering::Relaxed);
         None
     }
 }
 
+#[derive(Debug)]
 pub struct RenderPermit {
     budget: Arc<RenderBudget>,
     bytes: u64,
@@ -74,6 +102,7 @@ pub struct RenderPermit {
 impl Drop for RenderPermit {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.budget.released.notify_waiters();
     }
 }
 
@@ -84,27 +113,27 @@ mod tests {
     #[test]
     fn mixed_size_admission_and_release() {
         let budget = Arc::new(RenderBudget::new(100 * BYTES_PER_PIXEL));
-        let small = budget.try_acquire(2, 5).unwrap();
-        let large = budget.try_acquire(9, 10).unwrap();
+        let small = budget.try_reserve(2, 5).unwrap();
+        let large = budget.try_reserve(9, 10).unwrap();
         assert_eq!(budget.available(), 0);
-        assert!(budget.try_acquire(1, 1).is_none());
+        assert!(budget.try_reserve(1, 1).is_none());
         drop(small);
         assert_eq!(budget.available(), 10 * BYTES_PER_PIXEL);
-        assert!(budget.try_acquire(11, 10).is_none());
+        assert!(budget.try_reserve(11, 10).is_none());
         drop(large);
         assert_eq!(budget.available(), budget.capacity());
-        assert!(budget.try_acquire(u32::MAX, u32::MAX).is_none());
+        assert!(budget.try_reserve(u32::MAX, u32::MAX).is_none());
     }
 
     #[test]
     fn worker_retains_reservation_after_request_is_dropped() {
         let budget = Arc::new(RenderBudget::new(BYTES_PER_PIXEL));
-        let request = Arc::new(budget.try_acquire(1, 1).unwrap());
+        let request = Arc::new(budget.try_reserve(1, 1).unwrap());
         let worker = request.clone();
         drop(request);
-        assert!(budget.try_acquire(1, 1).is_none());
+        assert!(budget.try_reserve(1, 1).is_none());
         drop(worker);
-        assert!(budget.try_acquire(1, 1).is_some());
+        assert!(budget.try_reserve(1, 1).is_some());
     }
 
     #[test]
@@ -117,7 +146,7 @@ mod tests {
                     let budget = budget.clone();
                     let barrier = barrier.clone();
                     scope.spawn(move || {
-                        let permit = budget.try_acquire(1, 1);
+                        let permit = budget.try_reserve(1, 1);
                         barrier.wait();
                         permit
                     })
@@ -128,7 +157,7 @@ mod tests {
                 .filter_map(|t| t.join().unwrap())
                 .collect();
             assert_eq!(permits.len(), 4);
-            assert_eq!(budget.rejected(), 12);
+            assert_eq!(budget.rejected(), 0);
         });
         assert_eq!(budget.available(), budget.capacity());
     }

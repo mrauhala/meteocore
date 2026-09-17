@@ -4,8 +4,11 @@ Shared Tokio render admission/execution, with no axum or engine dependencies.
 Do not put Tokio in ds-core or ds-render; core only carries the absolute
 thread-local deadline. Capture it explicitly when fanning out onto Rayon.
 
-The process-wide queue counts actual semaphore waiters; cache hits bypass it.
-CPU permits belong to workers, never waiting HTTP futures. A timeout cannot
+The process-wide queue counts memory and CPU admission waiters; cache hits bypass it.
+Raster admission reserves memory before CPU, sharing one absolute deadline.
+No CPU slot is held while waiting for memory. CPU permits belong to workers,
+never HTTP futures awaiting a running worker. Memory reservations are shared
+between worker and handler through fallback encoding and survive cancellation. A timeout cannot
 release a running worker's permit. Abort handles may cancel pending blocking
 jobs but cannot preempt running CPU work. Keep tests for overload, canceled
 waiters, deadline expiry, and worker permit ownership.

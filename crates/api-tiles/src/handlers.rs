@@ -1760,16 +1760,13 @@ async fn render_tile(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
-    let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
-        .await
-        .map_err(TilesError::from)?;
-    let memory_permit = Arc::new(
-        ds_render::budget::RENDER_MEMORY
-            .try_acquire(tile_size, tile_size)
-            .ok_or_else(|| {
-                TilesError::ServiceUnavailable("Render memory budget exhausted".into())
-            })?,
-    );
+    let (job, memory_permit) = ds_executor::RenderJob::acquire_raster(
+        state.render_semaphore.clone(),
+        tile_size,
+        tile_size,
+    )
+    .await
+    .map_err(TilesError::from)?;
     let worker_memory = memory_permit.clone();
 
     // Render on a blocking thread

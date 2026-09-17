@@ -155,8 +155,8 @@ not re-scan the auto roots.
 | `RUST_LOG` | `info` | Log level filter, e.g. `server=debug,engine_geotiff=warn` |
 | `ADMIN_TOKEN` | _(none — unauthenticated)_ | Bearer token required for `POST /admin/collections/reload`. When unset, the admin endpoint is open. |
 | `MC_RENDER_TIMEOUT_MS` | `3000` | Absolute queue + raster render deadline for WMS/Maps/Tiles (and MVT encoding), in milliseconds; 0 rejects uncached work, maximum one day. Timeout returns 503 + Retry-After. In-flight CPU work keeps its permits until completion; remote GeoTIFF reads stop at the same deadline. Restart to change. |
-| `MC_RENDER_QUEUE_CAPACITY` | `3 × render slots` | Process-wide cap on requests waiting for a shared render slot. A full queue returns immediate 503 + Retry-After; 0 allows only immediately available slots. Cached responses bypass admission. Restart to change. |
-| `MC_RENDER_MEMORY_MB` | `1024` | Process-wide transient raster render admission budget (MiB), shared by WMS/Maps/Tiles and retained across reloads. Estimate: 32 bytes/output pixel. Exhaustion returns 503 + Retry-After; 0 rejects uncached renders. Restart to change. Source decoding and resident caches are separate budgets. |
+| `MC_RENDER_QUEUE_CAPACITY` | `3 × render slots` | Process-wide cap on requests waiting for raster memory or a shared render slot. A full queue returns immediate 503 + Retry-After; 0 allows only immediately available slots. Cached responses bypass admission. Restart to change. |
+| `MC_RENDER_MEMORY_MB` | `1024` | Process-wide transient raster render admission budget (MiB), shared by WMS/Maps/Tiles and retained across reloads. Estimate: 32 bytes/output pixel. Temporary exhaustion waits in the bounded render queue within the same deadline; requests larger than the budget, full queues, and expired waits return 503 + Retry-After; 0 rejects uncached renders. Restart to change. Source decoding and resident caches are separate budgets. |
 | `MC_3DTILES_CONTENT_CACHE_MB` | `512` | 3D Tiles encoded-content cache size in MB. `0` disables. |
 | `MC_PVOL_VOXEL_GRID_CACHE_MB` | `512` | PVOL polar-resampled voxel-grid cache size in MB. `0` disables. |
 | `MC_PVOL_PIXEL_CACHE_MB` | `1024` | PVOL per-moment decoded-pixel cache size in MB. `0` disables. |
@@ -164,6 +164,27 @@ not re-scan the auto roots.
 | `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | GeoTIFF decoded-chunk cache for local sources, in MB. `0` disables. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool. Raise for high-latency object stores; value must be ≥ 1. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
+
+### Sizing render memory on larger hosts
+
+`MC_RENDER_MEMORY_MB` bounds transient output buffers, not total process RAM.
+Size it from the largest common viewport and intended concurrent renders:
+`width × height × 32 × concurrent renders / 1048576` MiB. For 2702×1925
+frames this is 159 MiB per render: the conservative 1024 MiB default fits six,
+whereas `MC_RENDER_MEMORY_MB=4096` fits all 24 render slots on a 12-core host.
+On a shared 64 GiB server with roughly 30 GiB available at normal load, 4096 MiB
+is a reasonable starting point; leave headroom for source decoding, caches,
+nowcasting, the database and other services. Set it in the deployment's
+MeteoCore container environment and recreate that service; reload is not enough.
+
+Short timeline bursts wait for memory without occupying CPU slots. Sustained
+load still has finite capacity: watch `render_queue_depth`,
+`render_queue_rejected_total`, `render_deadline_exceeded_total`, and host
+available memory during busy weather. More RAM cannot remove CPU or upstream
+I/O bottlenecks. Clients should retry 503 responses according to `Retry-After`
+with bounded backoff, and cap concurrent full-resolution frame prefetches.
+Keep the three-second interactive deadline unless measurements justify a
+change; raising it alone increases latency and queued work.
 
 ### Fuzz Testing
 

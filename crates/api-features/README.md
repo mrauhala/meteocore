@@ -64,7 +64,7 @@ tiles render the selected instant. Not part of this crate.
 | `limit` | ✓ | default 100, clamped to `[1, 1000]` (out-of-range values are clamped, not rejected) |
 | `offset` | ✓ | offset pagination (non-standard extension; Part 1 only mandates `next`) |
 | `sortby` | ✓ | Part 8 syntax `[+\|-]property,…`; a decoded `+` (space) is accepted as ascending; 400 unless every property is in `FeatureEngine::sortables`; applied before paging (`ds_core::feature::sort_features`) |
-| `f` | ✓ | `json` (GeoJSON for features) / `html` on metadata, `/items` and `/items/{featureId}`; overrides `Accept`; unsupported formats → 400. HTML pagination retains format, filters and sort |
+| `f` | ✓ | `json` (GeoJSON for features) / `html` on metadata, `/items` and `/items/{featureId}`; overrides `Accept`; feature routes also accept `application/geo+json` (encode `+` as `%2B`), `application/json`, and `text/html` aliases, case-insensitively; unsupported formats → 400. HTML pagination retains format, filters and sort |
 | `crs`, `bbox-crs` (on `/items`) | ✗ | 400; CRS84 only |
 | `filter`, `filter-lang`, `filter-crs` | ✗ | 400 (CQL2 is not implemented) |
 | `properties` | ✗ | 400; every property is always returned |

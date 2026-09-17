@@ -1390,16 +1390,13 @@ async fn render_map(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
-    let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
-        .await
-        .map_err(MapsError::from)?;
-    let memory_permit = Arc::new(
-        ds_render::budget::RENDER_MEMORY
-            .try_acquire(validated.width, validated.height)
-            .ok_or_else(|| {
-                MapsError::ServiceUnavailable("Render memory budget exhausted".into())
-            })?,
-    );
+    let (job, memory_permit) = ds_executor::RenderJob::acquire_raster(
+        state.render_semaphore.clone(),
+        validated.width,
+        validated.height,
+    )
+    .await
+    .map_err(MapsError::from)?;
     let worker_memory = memory_permit.clone();
 
     // Render on a blocking thread
