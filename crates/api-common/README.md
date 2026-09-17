@@ -21,15 +21,59 @@ the same inventory drives pair validation and OpenAPI generation.
 | `bbox` | Four/six comma-separated coordinates, horizontal intersection; antimeridian supported, vertical bounds ignored |
 | `bbox-crs` | CRS84 only, including the existing URI/CURIE/short aliases |
 | `datetime` | RFC 3339 instant or interval overlap; unknown temporal extents remain eligible |
-| `q` | Case-insensitive title/description/keyword search; comma-separated OR and literal phrases |
+| `q` | Case-insensitive title/description/keyword search; comma-separated OR; whole words and whitespace-normalized phrases |
+| `query` | The same text matching plus required (`+`) and excluded (`-`) terms/phrases within each OR alternative |
 | `limit` | Default/max 1,000; values above max clamp; invalid values and zero return 400 |
 | `offset` | Nonnegative number of matching collections to skip; default zero |
 | `f` | `json` or `html`, overrides Accept; navigation retains the selected format |
 
-Unsupported controls (`query`, `sd`, `resolution`, `sortby`, CQL2 and hierarchy
+Unsupported controls (`sd`, `resolution`, `sortby`, CQL2 and hierarchy
 controls, for example) and repeated controls return JSON `{code, description}`
 with HTTP 400. This applies to collection lists; it does not change the parameter
 contracts on feature items, maps, tiles, EDR data queries or instance lists.
+
+## Text search (draft 25-046 §7.6–7.7)
+
+`q` and `query` search title, description and each keyword. Commas separate OR
+alternatives. A phrase must occur in order within one property or keyword;
+whitespace is normalized, punctuation is literal, and phrase edges must fall on
+word boundaries. For example, `q=sea surface` matches `Sea surface` with any intervening whitespace, but not
+`undersea surface`, `sea-surface`, or a title ending in `sea` with a description
+starting in `surface`. Matching uses Unicode lowercase and alphanumeric word
+boundaries; the draft does not define a language-specific tokenizer.
+
+`query` adds `+` requirements and `-` exclusions at the beginning of an alternative
+or after whitespace. These operators bind more tightly than commas. Separate
+terms can match different properties/keywords; each phrase still stays within one.
+Internal signs remain literal: `united-states` and `radar+hail` are single terms.
+
+| Decoded `query` value | Meaning |
+|---|---|
+| `canada +weather -extreme` | Both Canada and weather, anywhere in the searched fields; no extreme |
+| `canada +extreme weather` | Canada plus the phrase extreme weather |
+| `canada -extreme,united states` | Canada without extreme, OR the phrase United States (the exclusion is local to the first alternative) |
+| `-extreme` | Every collection whose searched fields lack extreme |
+
+Empty alternatives and operators without an immediately attached term return 400.
+The draft leaves malformed-expression handling unspecified; these are explicit
+validation choices. A negative-only alternative is interpreted as a complement.
+`q` and `query`, when both supplied, are ANDed, along with bbox/datetime filters,
+before paging. `q` does not interpret operators; existing empty-`q` behavior
+(no text restriction) is retained. No quoting, escaping, ranking or CQL2 syntax
+is introduced.
+
+In URLs, encode a required-term `+` as `%2B`; an unescaped `+` is decoded as a
+space by form query parsing. For example:
+
+```text
+/edr/collections?query=canada%20%2Bweather%20-extreme&limit=10
+```
+
+Self/next/prev and JSON/HTML alternate links retain the query with its operators
+percent-encoded. Clients can also use `curl --get --data-urlencode
+'query=canada +weather -extreme'` to construct the request.
+
+## Extents and conformance
 
 Features supplies feature temporal bounds; Tiles uses raster times when present
 and feature temporal bounds as a fallback. Metadata and filtering use the same
@@ -37,8 +81,8 @@ precedence. Bounds alone are not advertised as a sampled time grid.
 
 The Common Part 4 Searchable Collections URI is intentionally not advertised:
 [draft 25-046](https://docs.ogc.org/DRAFTS/25-046.html), retrieved 2026-09-17,
-also requires `query`, `sd` and `resolution`. Removing the former declaration
-does not remove working basic search. The
+also requires `sd` and `resolution`, which remain unimplemented. Text search
+is the first increment of [#742](https://github.com/mrauhala/meteocore/issues/742). The
 [Parts 1–4 matrix](../../docs/ogc-api-common-matrix.md) records the exact baselines
 and other limitations; retained declarations are not a certification claim.
 

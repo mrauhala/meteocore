@@ -32,14 +32,20 @@ Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Base route:
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
 Part 2 (collections, json, html). Collection discovery supports `bbox`,
-`bbox-crs` (CRS84 only), `datetime`, `q`, `limit`, `offset` and `f` through
+`bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `limit`, `offset` and `f` through
 [api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
 return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
 preserve filters and the negotiated format. Collection descriptions expose HTML
 alternate links and configured keywords/license metadata through the shared helper.
 
+Text discovery supports whitespace-normalized whole-word phrases in `q`, and
+`query` adds required (`+`) and excluded (`-`) terms within comma-separated OR
+alternatives. Encode `+` as `%2B`; `q` and `query` are ANDed when both supplied.
+See [the shared text-search contract](../api-common/README.md)
+for examples and validation choices.
+
 Part 4 `searchable-collections` is **not declared**: the 2026-09-17 draft also
-requires `query`, `sd` and `resolution`, which are not implemented. Existing
+requires `sd` and `resolution`, which are not implemented. Existing
 basic search remains supported. See the [Common Parts 1–4 matrix](../../docs/ogc-api-common-matrix.md)
 for the specification baselines and remaining gaps.
 

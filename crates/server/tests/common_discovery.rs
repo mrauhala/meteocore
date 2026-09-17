@@ -25,7 +25,7 @@ use tower::ServiceExt;
 const BASE: &str = "https://example.test/base";
 const SURFACES: &[&str] = &["edr", "maps", "tiles", "vector-tiles", "features"];
 const FILTERS: &str =
-    "bbox=20,60,30,70&bbox-crs=CRS84&datetime=2024-01-01T00%3A30%3A00Z&q=RaDaR%20%26%20hail";
+    "bbox=20,60,30,70&bbox-crs=CRS84&datetime=2024-01-01T00%3A30%3A00Z&q=RaDaR%20%26%20hail&query=%2Bweather%20-wind";
 
 struct Fixture {
     bbox: Option<[f64; 4]>,
@@ -153,7 +153,7 @@ fn app(surface: &str) -> (Router, String) {
         features.insert(id.into(), fixture);
         let config: CollectionConfig = serde_json::from_value(json!({
             "id": id, "title": if id == "f-wind" { "Wind" } else { "Radar & hail" },
-            "description": "Discovery fixture", "keywords": ["weather"],
+            "description": format!("Discovery fixture {id}"), "keywords": ["weather"],
             "license": {"title": "CC-BY-4.0"}, "apis": ["edr", "maps", "tiles", "features"]
         }))
         .unwrap();
@@ -256,6 +256,9 @@ async fn equivalent_catalogs_filter_before_paging_and_preserve_every_filter() {
         )
         .await;
         assert_eq!(doc["numberMatched"], 3, "{surface}");
+        for rel in ["self", "next", "prev", "alternate"] {
+            assert!(link(&doc, rel).contains("query=%2Bweather%20-wind"));
+        }
         assert_eq!(doc["numberReturned"], 1);
         assert_eq!(doc["collections"][0]["id"], "d-match");
         let next = get_json(&app, link(&doc, "next")).await;
@@ -284,6 +287,58 @@ async fn equivalent_catalogs_filter_before_paging_and_preserve_every_filter() {
 }
 
 #[tokio::test]
+async fn query_text_semantics_and_encoding_agree_on_every_surface() {
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        for (query, expected) in [
+            (
+                "query=radar%20%2Bweather%20-old",
+                vec!["a-outside", "c-match", "d-match", "e-unknown"],
+            ),
+            (
+                "query=radar%20%2Bweather%20-old,wind",
+                vec!["a-outside", "c-match", "d-match", "e-unknown", "f-wind"],
+            ),
+            ("query=-radar", vec!["f-wind"]),
+            (
+                "query=weather%20%2BradAR%20-old",
+                vec!["a-outside", "c-match", "d-match", "e-unknown"],
+            ),
+            ("query=c-match", vec!["c-match"]),
+            (
+                "query=radar+%2Bweather+-old",
+                vec!["a-outside", "c-match", "d-match", "e-unknown"],
+            ),
+            // An unencoded + means a space in a form query, not an operator.
+            ("query=radar+weather", vec![]),
+            ("q=radar&query=wind", vec![]),
+            (
+                "q=radar%09%26%20%20hail",
+                vec!["a-outside", "b-old", "c-match", "d-match", "e-unknown"],
+            ),
+            (
+                "query=radar%09%26%20%20hail",
+                vec!["a-outside", "b-old", "c-match", "d-match", "e-unknown"],
+            ),
+            ("q=adar%20%26%20hail", vec![]),
+            ("query=adar%20%26%20hail", vec![]),
+        ] {
+            let doc = get_json(&app, &format!("{prefix}/collections?{query}")).await;
+            let ids: Vec<_> = doc["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected, "{surface}: {query}");
+            assert_eq!(doc["numberMatched"], expected.len());
+            let replay = get_json(&app, link(&doc, "self")).await;
+            assert_eq!(replay["collections"], doc["collections"]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn unsupported_duplicate_and_invalid_parameters_return_structured_400() {
     for surface in SURFACES {
         let (app, prefix) = app(surface);
@@ -292,7 +347,12 @@ async fn unsupported_duplicate_and_invalid_parameters_return_structured_400() {
             "descendants=immediate",
             "sortby=-id",
             "filter=true",
-            "query=radar",
+            "query=radar&query=wind",
+            "query=radar&%71uery=wind",
+            "query=",
+            "query=radar,,wind",
+            "query=radar%20%2B",
+            "query=radar%20-%20hail",
             "sd=1000",
             "resolution=1",
             "typo=1",
@@ -428,11 +488,11 @@ async fn openapi_and_conformance_are_consistent_across_surfaces() {
         );
         let params = &operation["parameters"];
         let parameters = params.as_array().unwrap();
-        assert_eq!(parameters.len(), 7);
+        assert_eq!(parameters.len(), 8);
         let limit = parameters.iter().find(|p| p["name"] == "limit").unwrap();
         assert_eq!(limit["schema"]["default"], 1000);
         assert_eq!(limit["schema"]["maximum"], 1000);
-        for name in ["bbox", "q"] {
+        for name in ["bbox", "q", "query"] {
             let p = parameters.iter().find(|p| p["name"] == name).unwrap();
             assert_eq!(p["schema"]["type"], "array");
             assert_eq!(p["style"], "form");

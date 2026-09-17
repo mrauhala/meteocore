@@ -6,12 +6,12 @@ across its four OGC API surfaces, including draft provisions that are not yet
 implemented. It is an implementation assessment, not an OGC certification or a
 claim that every requirement in a class has passed its abstract test suite.
 
-Implementation assessment updated **2026-09-17** by the shared discovery work
-for [#739](https://github.com/mrauhala/meteocore/issues/739), based on main
-[`48bf897`](https://github.com/mrauhala/meteocore/tree/48bf8977d1aeaae5fda62eb98156e2fd57c49757)
-plus that change. The capability tables describe this source revision. The
-production probe table below is explicitly retained as **pre-change evidence**;
-it does not verify deployment of these fixes.
+Implementation assessment updated **2026-09-17** by the text-search increment of
+[#742](https://github.com/mrauhala/meteocore/issues/742), based on main
+[`adbacde`](https://github.com/mrauhala/meteocore/tree/adbacde87d28c977f104cfc911f3b3a71ed27592)
+plus that change. Shared discovery shipped in #741 / #739. The capability tables
+describe this source revision. The production probe table below remains
+**historical pre-#739 evidence**, not verification of deployment of these changes.
 
 **Specification baselines**
 
@@ -98,8 +98,8 @@ collection.
 | Collection `bbox` intersection (§7.3) | Yes — horizontal extent [9] | Yes — same [9] | Yes — same [9] | Yes — same [9] |
 | Collection `bbox-crs` (§7.4) | Partial — CRS84 only | Partial — CRS84 only | Partial — CRS84 only | Partial — CRS84 only |
 | Collection `datetime`: instant, interval, open ends (§7.5) | Yes — engine extent [5] | Yes — raster extent [5] | Yes — raster or feature extent [5] | Yes — feature extent [5] |
-| Collection `q`: case-insensitive terms/phrases in title, description, keywords (§7.6) | Partial — basic search works [10] | Partial — same [10] | Partial — same [10] | Partial — same [10] |
-| Collection `query`: required/excluded terms (§7.7) | No — 400 | No — 400 | No — 400 | No — 400 |
+| Collection `q`: case-insensitive terms/phrases in title, description, keywords (§7.6) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
+| Collection `query`: required/excluded terms (§7.7) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
 | Collection page size `limit` (§7.8) | Yes — default/max 1,000 | Yes — same | Yes — same | Yes — same |
 | Collection `next` paging links (§7.8) | Yes | Yes | Yes | Yes |
 | Collection `prev` paging links (§7.8, optional) | Yes | Yes | Yes | Yes |
@@ -125,7 +125,7 @@ collection.
 2. The shared extractor rejects unsupported and duplicate collection parameters
    with a JSON `BadRequest` response. Part 1 §8.3 permits some tolerance, but the
    project's stricter policy avoids misleading draft-testing clients. Unsupported
-   controls such as `query`, `parent` and `sortby` now return 400 rather than
+   controls such as `sd`, `parent` and `sortby` now return 400 rather than
    silently serving unfiltered results. `offset` and `f` remain supported extensions.
 3. Maps and Tiles cache rendered data responses; their Common metadata handlers
    lack the EDR/Features metadata caching middleware. This row is about metadata.
@@ -153,14 +153,22 @@ collection.
    EDR `parameter_names` likewise do not establish Part 3 support.
 9. Four- and six-number boxes are accepted; six-number input discards the vertical
    axis. Antimeridian crossing is supported. No vertical filtering is implemented.
-10. `q` uses comma-separated OR, whole-word matching for single terms and literal
-    substring matching for phrases. Phrase whitespace is not normalized, so
-    equivalent phrases separated by different whitespace can fail to match.
-    Phrase word boundaries also need abstract-test coverage. There is no ranking.
-11. The published Part 4 draft additionally requires `query`, `sd`, and `resolution`.
-    Their absence prevents full current Searchable Collections conformance, so
-    the previously advertised URI has been removed from every API. Sorting, CQL2 and hierarchy are separate classes;
-    their absence does not itself invalidate Searchable Collections.
+10. `q` and `query` share whole-word/phrase matching across title, description
+    and individual keywords, with normalized whitespace and literal punctuation.
+    Phrases never span properties. `query` adds required/excluded terms, which may
+    match different properties, inside comma-separated OR alternatives. Operators
+    apply only at the start or after whitespace; internal signs are literal.
+    `q` and `query` combine with AND. Matching uses Unicode lowercase and
+    alphanumeric boundaries; language-specific tokenization is unspecified by the
+    draft. Negative-only alternatives are complements. Empty query alternatives
+    and dangling operators return 400 (an implementation validation choice).
+    URL `+` operators require `%2B`; navigation preserves them. See the
+    [text-search contract and examples](../crates/api-common/README.md).
+11. The published Part 4 draft requires `sd` and `resolution` in addition to
+    the implemented text and extent filters. Those remaining gaps and the final
+    class assessment are tracked in [#742](https://github.com/mrauhala/meteocore/issues/742);
+    Searchable Collections remains undeclared. Sorting, CQL2 and hierarchy are
+    separate classes; their absence does not itself invalidate Searchable Collections.
 
 **Advertised conformance versus assessed behavior**
 
@@ -229,7 +237,8 @@ The [cross-API contract suite](../crates/server/tests/common_discovery.rs) now
 exercises equivalent fixture catalogs through all four routers, including both
 raster and vector-only Tiles. It follows actual navigation links, checks combined
 filters/counts/temporal adapters, validates representation links and unknown or
-duplicate parameter errors, and compares OpenAPI and Common declarations. This
+duplicate parameter errors, exercises text operators and phrase matching, and
+compares OpenAPI and Common declarations. This
 verifies the updated source behavior without depending on production catalog data.
 
 No full OGC abstract test suite was executed for this assessment. Existing unit

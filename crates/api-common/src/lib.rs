@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 /// Existing Common declarations, centralized to keep all API surfaces aligned.
 /// Part 4 is intentionally absent: draft 25-046 retrieved 2026-09-17 requires
-/// query/sd/resolution in addition to the supported search controls. See the
+/// sd/resolution in addition to the supported search controls. See the
 /// repository's docs/ogc-api-common-matrix.md for remaining class-level gaps.
 pub const CONFORMANCE_CLASSES: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
@@ -245,7 +245,9 @@ pub fn collection_parameters() -> Value {
             CollectionParameter::Datetime => (json!({"type": "string"}),
                 "Filter by temporal extent overlap with an RFC 3339 instant or interval (start/end, ../end, start/..). Unknown extents remain eligible."),
             CollectionParameter::Q => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
-                "Case-insensitive text search over title, description and keywords. Comma-separated terms are OR; spaces within a term form a phrase."),
+                "Case-insensitive text search over title, description and keywords. Comma-separated terms are OR; phrases match whole words with normalized whitespace within one property."),
+            CollectionParameter::Query => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
+                "Text search with comma-separated OR alternatives. Within each alternative, + requires and - excludes the following term or phrase; required terms may match different properties. Phrases match within one property with normalized whitespace. Operators only apply at the start or after whitespace; internal signs are literal. Encode + as %2B. Empty alternatives or operators without an attached term return 400. Combined with q and other filters using AND."),
             CollectionParameter::Limit => (json!({"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT}),
                 "Maximum collections per page. Values above the maximum are clamped."),
             CollectionParameter::Offset => (json!({"type": "integer", "minimum": 0, "default": 0}),
@@ -254,7 +256,7 @@ pub fn collection_parameters() -> Value {
                 "Output representation; overrides Accept. Without f, Accept is used, defaulting to JSON."),
         };
         let mut definition = json!({"name": p.name(), "in": "query", "required": false, "schema": schema, "description": description});
-        if matches!(p, CollectionParameter::Bbox | CollectionParameter::Q) {
+        if matches!(p, CollectionParameter::Bbox | CollectionParameter::Q | CollectionParameter::Query) {
             definition["style"] = json!("form");
             definition["explode"] = json!(false);
         }
