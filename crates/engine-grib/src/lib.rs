@@ -703,7 +703,8 @@ impl GribEngine {
                         source = grib_url,
                         parameter = %first.param,
                         level_type = %first.levtype,
-                        level = ?first.level,
+                        // `level` is reserved for severity in flattened JSON logs.
+                        grib_level = first.level,
                         first_offset = first.offset,
                         duplicate_offset = duplicate.offset,
                         "ambiguous wgrib2 catalog key; queries select the first record; payload equivalence is unknown"
