@@ -63,6 +63,8 @@ implements the shared `ds_core::instances` contract (see root CLAUDE.md).
   GFS fixture has two `APCP_acc_6h` surface records). Scan logs a warning with
   both offsets; queries preserve first-record selection. The index alone cannot
   establish payload equivalence or expose an omitted product discriminator.
+  Log the optional vertical level as `grib_level`, never `level`: flattened
+  JSON reserves `level` for severity, and a duplicate key hides WARN in Loki.
 - Source units still come from the decoded WMO triple: no automatic division
   by window length. Precipitation kg/m² displays as mm; already-averaged flux
   W/m² stays W/m², and energy in J/m² stays energy. ECMWF JSON sidecars retain
