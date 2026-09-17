@@ -1,14 +1,13 @@
 //! OGC API – Common – Part 4 ("Discovery within many collections", draft
 //! [25-046]) — a subset of the **Searchable Collections** requirements class.
-//! The 2026-09-17 draft also requires `query`, `sd`, and `resolution`; those
-//! are not implemented, so API layers must not advertise that class yet.
+//! The 2026-09-17 draft also requires `sd` and `resolution`; those are not
+//! implemented, so API layers must not advertise that class yet.
 //!
 //! Filtering and pagination for the `/collections` resource: `bbox` /
-//! `bbox-crs`, `datetime`, `q`, and `limit` + `offset`. The logic lives here
+//! `bbox-crs`, `datetime`, `q`, `query`, and `limit` + `offset`. The logic lives here
 //! (not in the API crates) so EDR, Maps, Tiles, and Features share one
-//! implementation — ds-core never builds `serde_json::Value`, so the crates
-//! call [`parse_search_params`] + [`search`] and assemble the JSON response
-//! themselves (and build `next`/`prev` link hrefs with [`page_query_string`]).
+//! implementation — ds-core never builds `serde_json::Value`; api-common uses
+//! [`SearchQueryParams::parse`] + [`search`] and assembles HTTP responses/links.
 //!
 //! Only CRS84 is supported for `bbox` / `bbox-crs` (every collection bbox is
 //! advertised in CRS84). Sortable / Filterable (CQL2) / Hierarchical classes
@@ -56,7 +55,7 @@ pub struct CollectionMatch<'a> {
     pub title: &'a str,
     pub description: &'a str,
     /// The collection's configured keywords (may be empty). Matched by `q`
-    /// alongside title and description.
+    /// and `query` alongside title and description.
     pub keywords: &'a [String],
     /// CRS84 bbox `[west, south, east, north]`, if the collection has one.
     pub bbox: Option<[f64; 4]>,
@@ -73,8 +72,18 @@ pub struct SearchParams {
     pub datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// Lower-cased, non-empty free-text terms (OR semantics). Empty = no `q`.
     pub q: Vec<String>,
+    /// OR alternatives of required/excluded phrases. Empty = no `query`.
+    pub query: Vec<TextAlternative>,
     pub limit: usize,
     pub offset: usize,
+}
+
+/// One comma-separated `query` alternative. All required phrases must match;
+/// no excluded phrase may match. Separate phrases can match separate properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextAlternative {
+    required: Vec<String>,
+    excluded: Vec<String>,
 }
 
 /// The outcome of a [`search`]: the total match count and the indices of the
@@ -92,7 +101,8 @@ pub struct SearchResult {
 }
 
 /// Parse and validate the raw `/collections` query parameters. Returns
-/// [`SearchError`] (→ HTTP 400) for malformed input.
+/// [`SearchError`] (→ HTTP 400) for malformed input. For the complete set
+/// including advanced `query`, use [`SearchQueryParams::parse`].
 pub fn parse_search_params(
     bbox: Option<&str>,
     bbox_crs: Option<&str>,
@@ -136,7 +146,7 @@ pub fn parse_search_params(
     let q = match q.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => s
             .split(',')
-            .map(|t| t.trim().to_lowercase())
+            .map(normalize_text)
             .filter(|t| !t.is_empty())
             .collect(),
         None => Vec::new(),
@@ -168,6 +178,7 @@ pub fn parse_search_params(
         bbox,
         datetime,
         q,
+        query: Vec::new(),
         limit,
         offset,
     })
@@ -264,10 +275,23 @@ fn matches(it: &CollectionMatch, p: &SearchParams) -> bool {
             Some(_) => return false,
         }
     }
-    if !p.q.is_empty() && !q_matches(&p.q, it.title, it.description, it.keywords) {
-        return false;
+    if p.q.is_empty() && p.query.is_empty() {
+        return true;
     }
-    true
+    // Normalize each field once; never join properties or keyword entries,
+    // which would manufacture phrase matches across metadata boundaries.
+    let fields: Vec<_> = [it.title, it.description]
+        .into_iter()
+        .chain(it.keywords.iter().map(String::as_str))
+        .map(normalize_text)
+        .collect();
+    let contains = |term: &String| fields.iter().any(|field| text_match(field, term));
+    (p.q.is_empty() || p.q.iter().any(contains))
+        && (p.query.is_empty()
+            || p.query.iter().any(|alternative| {
+                alternative.required.iter().all(contains)
+                    && !alternative.excluded.iter().any(contains)
+            }))
 }
 
 /// CRS84 bbox intersection, anti-meridian aware.
@@ -288,39 +312,83 @@ fn lon_overlaps(qw: f64, qe: f64, cw: f64, ce: f64) -> bool {
     }
 }
 
-/// Whole-word (or, for terms containing whitespace, phrase) match of any `q`
-/// term against the collection's title, description, or any keyword. Terms are
-/// pre-lowercased; comparison is Unicode-case-insensitive (Finnish ä/ö etc.).
-///
-/// A keyword matches a non-phrase term either as a whole word *within* the
-/// keyword (so the keyword `"sea surface temperature"` is found by `q=surface`)
-/// or as the keyword in full; a phrase term matches a keyword as a substring,
-/// like the title/description fields.
-fn q_matches(terms: &[String], title: &str, description: &str, keywords: &[String]) -> bool {
-    terms.iter().any(|term| {
-        if term.chars().any(char::is_whitespace) {
-            // Phrase: case-insensitive substring within a *single* field, so the
-            // boundary between two fields can't form a phantom match (e.g. title
-            // "Finnish Weather" + description "Helsinki …" must not match
-            // "weather helsinki").
-            let t = term.as_str();
-            title.to_lowercase().contains(t)
-                || description.to_lowercase().contains(t)
-                || keywords.iter().any(|k| k.to_lowercase().contains(t))
-        } else {
-            word_match(title, term)
-                || word_match(description, term)
-                || keywords.iter().any(|k| word_match(k, term))
-        }
+/// Unicode lowercase and whitespace normalization, preserving punctuation.
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Match normalized literal text with alphanumeric word boundaries. Internal
+/// punctuation is literal (e.g. united-states); only whitespace can separate
+/// words in a phrase. This also rejects partial words at either phrase edge.
+fn text_match(text: &str, term: &str) -> bool {
+    text.char_indices().any(|(start, _)| {
+        let end = start + term.len();
+        !text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+            && text[start..].starts_with(term)
+            && !text[end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
     })
 }
 
-/// True if `term` (already lower-cased) equals a whole word of `text`. Words
-/// are maximal runs of alphanumeric characters (Unicode-aware).
-fn word_match(text: &str, term: &str) -> bool {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .any(|w| w.to_lowercase() == term)
+/// Draft 25-046 §7.7: commas have lower precedence than required/excluded
+/// terms. An operator starts a new phrase only at a whitespace/item boundary;
+/// internal +/- remain literal. A negative-only alternative is a complement.
+fn parse_query(query: &str) -> Result<Vec<TextAlternative>, SearchError> {
+    query
+        .split(',')
+        .map(|item| {
+            let mut alternative = TextAlternative {
+                required: Vec::new(),
+                excluded: Vec::new(),
+            };
+            let mut phrase = String::new();
+            let mut excluded = false;
+            let finish = |phrase: &mut String, excluded, alternative: &mut TextAlternative| {
+                if !phrase.is_empty() {
+                    let target = if excluded {
+                        &mut alternative.excluded
+                    } else {
+                        &mut alternative.required
+                    };
+                    target.push(std::mem::take(phrase));
+                }
+            };
+            for word in item.split_whitespace() {
+                let word = if word.starts_with(['+', '-']) {
+                    finish(&mut phrase, excluded, &mut alternative);
+                    excluded = word.starts_with('-');
+                    let term = &word[1..];
+                    if term.is_empty() {
+                        return Err(SearchError::new(
+                            "query: '+' and '-' must immediately prefix a term",
+                        ));
+                    }
+                    term
+                } else {
+                    word
+                };
+                if !phrase.is_empty() {
+                    phrase.push(' ');
+                }
+                phrase.push_str(&word.to_lowercase());
+            }
+            finish(&mut phrase, excluded, &mut alternative);
+            if alternative.required.is_empty() && alternative.excluded.is_empty() {
+                return Err(SearchError::new(
+                    "query must contain non-empty comma-separated alternatives",
+                ));
+            }
+            Ok(alternative)
+        })
+        .collect()
 }
 
 /// Supported collection discovery controls. HTTP validation and OpenAPI use
@@ -331,6 +399,7 @@ pub enum CollectionParameter {
     BboxCrs,
     Datetime,
     Q,
+    Query,
     Limit,
     Offset,
     Format,
@@ -342,6 +411,7 @@ impl CollectionParameter {
         Self::BboxCrs,
         Self::Datetime,
         Self::Q,
+        Self::Query,
         Self::Limit,
         Self::Offset,
         Self::Format,
@@ -353,6 +423,7 @@ impl CollectionParameter {
             Self::BboxCrs => "bbox-crs",
             Self::Datetime => "datetime",
             Self::Q => "q",
+            Self::Query => "query",
             Self::Limit => "limit",
             Self::Offset => "offset",
             Self::Format => "f",
@@ -373,6 +444,7 @@ pub struct SearchQueryParams {
     pub bbox_crs: Option<String>,
     pub datetime: Option<String>,
     pub q: Option<String>,
+    pub query: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
     /// Output-format selector (`json`/`html`) for content negotiation. Not a
@@ -405,6 +477,7 @@ impl SearchQueryParams {
                 CollectionParameter::BboxCrs => &mut params.bbox_crs,
                 CollectionParameter::Datetime => &mut params.datetime,
                 CollectionParameter::Q => &mut params.q,
+                CollectionParameter::Query => &mut params.query,
                 CollectionParameter::Limit => &mut params.limit,
                 CollectionParameter::Offset => &mut params.offset,
                 CollectionParameter::Format => &mut params.f,
@@ -420,14 +493,18 @@ impl SearchQueryParams {
 
     /// Validate into [`SearchParams`] (→ HTTP 400 on bad input).
     pub fn parse(&self) -> Result<SearchParams, SearchError> {
-        parse_search_params(
+        let mut params = parse_search_params(
             self.bbox.as_deref(),
             self.bbox_crs.as_deref(),
             self.datetime.as_deref(),
             self.q.as_deref(),
             self.limit.as_deref(),
             self.offset.as_deref(),
-        )
+        )?;
+        if let Some(query) = &self.query {
+            params.query = parse_query(query)?;
+        }
+        Ok(params)
     }
 
     /// The query string (leading `?`, or empty) for this request at `offset`,
@@ -437,34 +514,35 @@ impl SearchQueryParams {
     /// not leak `9999` into links). When the client supplied none, links omit
     /// `limit` so default-page URLs stay clean.
     pub fn query_string(&self, limit: usize, offset: usize) -> String {
-        let limit_str = self.limit.as_ref().map(|_| limit.to_string());
-        page_query_string(
-            self.bbox.as_deref(),
-            self.bbox_crs.as_deref(),
-            self.datetime.as_deref(),
-            self.q.as_deref(),
-            limit_str.as_deref(),
-            offset,
-            self.f.as_deref(),
-        )
+        self.query_string_for_format(limit, offset, self.f.as_deref())
     }
 
     /// Like [`query_string`](Self::query_string) but forces the `f` (format)
     /// selector instead of echoing the request's own. Used to build a
     /// `rel="alternate"` link from one representation to the other while
-    /// preserving every search/pagination parameter (bbox, datetime, q,
+    /// preserving every search/pagination parameter (bbox, datetime, q, query,
     /// limit, offset).
     pub fn query_string_with_format(&self, limit: usize, offset: usize, f: &str) -> String {
+        self.query_string_for_format(limit, offset, Some(f))
+    }
+
+    fn query_string_for_format(&self, limit: usize, offset: usize, f: Option<&str>) -> String {
         let limit_str = self.limit.as_ref().map(|_| limit.to_string());
-        page_query_string(
+        let mut result = page_query_string(
             self.bbox.as_deref(),
             self.bbox_crs.as_deref(),
             self.datetime.as_deref(),
             self.q.as_deref(),
             limit_str.as_deref(),
             offset,
-            Some(f),
-        )
+            f,
+        );
+        if let Some(query) = &self.query {
+            result.push(if result.is_empty() { '?' } else { '&' });
+            result.push_str("query=");
+            result.push_str(&encode_qval(query));
+        }
+        result
     }
 }
 
@@ -562,6 +640,202 @@ mod tests {
             keywords,
             bbox: None,
             time: None,
+        }
+    }
+
+    fn text_params(q: Option<&str>, query: Option<&str>) -> SearchParams {
+        SearchQueryParams {
+            q: q.map(str::to_owned),
+            query: query.map(str::to_owned),
+            ..Default::default()
+        }
+        .parse()
+        .unwrap()
+    }
+
+    #[test]
+    fn draft_query_examples_and_operator_precedence() {
+        let keywords = ["weather".into(), "extreme weather".into()];
+        let items = [
+            cm("Canada", "Weather observations", None, None),
+            cm("Canada", "Extreme weather", None, None),
+            cm("United States", "Weather observations", None, None),
+            cm("United western states", "", None, None),
+            cm("United-states", "", None, None),
+            cm_kw("Canada", "", &keywords),
+        ];
+        for (query, expected) in [
+            ("canada +weather -extreme", vec![0]),
+            (
+                "canada +weather -extreme,united states +weather -extreme",
+                vec![0, 2],
+            ),
+            ("united +states", vec![2, 3, 4]),
+            ("united-states", vec![4]),
+            ("canada +extreme weather", vec![1, 5]),
+            ("united,states", vec![2, 3, 4]),
+            ("+weather -extreme", vec![0, 2]),
+            ("-weather", vec![3, 4]),
+            // Exclusion belongs to its OR alternative, not the entire query.
+            ("canada -extreme,+extreme", vec![0, 1, 5]),
+            ("canada +weather -weather", vec![]),
+            ("WEATHER +CANADA -EXTREME", vec![0]),
+        ] {
+            assert_eq!(
+                search(&items, &text_params(None, Some(query))).page,
+                expected,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn q_and_query_share_whitespace_and_phrase_boundaries() {
+        let keywords = ["SEA\tSURFACE\nTemperature".into()];
+        let items = [
+            cm("Sea\t  surface\n temperature", "", None, None),
+            cm("undersea surface temperatures", "", None, None),
+            cm("sea,surface temperature", "", None, None),
+            cm("sea surface", "temperature", None, None),
+            cm_kw("", "", &keywords),
+            cm("Sea\u{a0}surface\u{2003}temperature", "", None, None),
+            cm("undersea surface temperature", "", None, None),
+            cm("sea surface temperatures", "", None, None),
+        ];
+        for term in ["sea surface temperature", "SEA\n  SURFACE\tTEMPERATURE"] {
+            for params in [text_params(Some(term), None), text_params(None, Some(term))] {
+                assert_eq!(search(&items, &params).page, vec![0, 4, 5]);
+            }
+        }
+        // Substring candidates can overlap; an earlier partial-word candidate
+        // must not hide a later whole phrase.
+        let items = [cm("aa a a", "", None, None)];
+        assert_eq!(
+            search(&items, &text_params(Some("a a"), None)).page,
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn query_phrases_stay_within_fields_but_requirements_can_span_them() {
+        let keywords = ["sea".into(), "surface temperature".into()];
+        let items = [cm_kw("Finnish", "Weather", &keywords)];
+        for query in [
+            "finnish weather",
+            "sea surface",
+            "+sea surface",
+            "surface +finnish weather",
+        ] {
+            assert_eq!(
+                search(&items, &text_params(None, Some(query))).number_matched,
+                0,
+                "{query}"
+            );
+        }
+        for query in [
+            "finnish +weather +sea +surface temperature",
+            "-sea surface",
+            "finnish -sea surface",
+        ] {
+            assert_eq!(
+                search(&items, &text_params(None, Some(query))).number_matched,
+                1,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            search(
+                &items,
+                &text_params(None, Some("finnish -surface temperature"))
+            )
+            .number_matched,
+            0
+        );
+    }
+
+    #[test]
+    fn query_internal_signs_are_literal_and_matching_is_case_insensitive() {
+        let items = [
+            cm("SÄÄ C++ united-states radar+hail", "", None, None),
+            cm("sää c united states radar hail", "", None, None),
+        ];
+        for query in [
+            "SÄÄ +c++",
+            "united-states",
+            "radar+hail",
+            "-united-states +SÄÄ",
+        ] {
+            let expected = if query.starts_with('-') {
+                vec![1]
+            } else {
+                vec![0]
+            };
+            assert_eq!(
+                search(&items, &text_params(None, Some(query))).page,
+                expected,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            search(&items, &text_params(Some("united-states"), None)).page,
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn q_and_query_are_combined_with_and() {
+        let items = [
+            cm("Radar", "Weather", None, None),
+            cm("Wind", "Weather", None, None),
+        ];
+        assert_eq!(
+            search(&items, &text_params(Some("radar"), Some("+weather"))).page,
+            vec![0]
+        );
+        assert_eq!(
+            search(&items, &text_params(Some("radar"), Some("wind"))).number_matched,
+            0
+        );
+    }
+
+    #[test]
+    fn query_rejects_empty_alternatives_and_dangling_operators() {
+        for query in [
+            "",
+            " ",
+            ",",
+            "radar,",
+            ",radar",
+            "radar,,wind",
+            "+",
+            "-",
+            "radar +",
+            "radar - hail",
+            "+ weather",
+        ] {
+            let raw = SearchQueryParams {
+                query: Some(query.into()),
+                ..Default::default()
+            };
+            assert!(raw.parse().is_err(), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn query_navigation_preserves_encoded_operators() {
+        let raw = SearchQueryParams {
+            query: Some("radar +SÄÄ -extreme weather,united-states".into()),
+            ..Default::default()
+        };
+        for link in [
+            raw.query_string(1, 2),
+            raw.query_string_with_format(1, 2, "html"),
+        ] {
+            assert!(
+                link.contains("query=radar%20%2BS%C3%84%C3%84%20-extreme%20weather,united-states"),
+                "{link}"
+            );
+            assert!(link.contains("offset=2"));
         }
     }
 

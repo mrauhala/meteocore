@@ -7,6 +7,10 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   and `SearchQueryParams::from_pairs`; do not add a second name allowlist here.
 - `collection_operation` generates the discovery OpenAPI operation for all four
   APIs. Keep schemas, defaults, validation and response representations aligned.
+- Text search follows recorded draft 25-046 §7.6–7.7: comma OR, local required/
+  excluded query terms; phrases never span fields or keyword entries. q and query
+  combine with AND. Keep operator encoding (`%2B`) intact through navigation.
+  See README.md for explicit tokenizer and malformed-input choices.
 - Apply filters before paging. Navigation preserves supported filters and the
   negotiated format, including requests that used Accept without an explicit f.
 - Adapters supply metadata and extents from their registry snapshot. Time bounds
