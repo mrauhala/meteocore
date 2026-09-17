@@ -132,3 +132,12 @@ time. Beyond the queue, admission fails fast. Permits live with the
 work, including after client timeout/disconnect. Check `QueryBudget::expired`
 between MULTIPOINT elements. Validate the whole coordinate list before dispatch;
 keep point, byte and combined-value limits and OpenAPI/README documentation aligned.
+
+## Shared Common discovery (#739)
+
+Use `api-common` for `/collections` validation, responses, links, Common metadata
+fields, OpenAPI operation definitions and Common conformance declarations. The
+adapter supplies engine extents; search and advertised metadata must agree.
+See `crates/api-common/CLAUDE.md` and update `docs/ogc-api-common-matrix.md` when
+changing this behavior. Do not restore the Part 4 class without implementing
+and checking the recorded draft's remaining requirements.

@@ -226,25 +226,15 @@ fn build_collection_metadata(
         }));
     }
 
-    if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
-        // No `type`: an operator-supplied license URL may not be HTML, and OGC
-        // API Common §6.5.2 wants the link's real media type — omitting is valid.
-        links.push(json!({ "href": url, "rel": "license", "title": title }));
-    }
-
-    let mut metadata = json!({
-        "id": config.id,
-        "title": config.title,
-        "description": config.description,
-        "dataType": "map",
-        "crs": crs_uris,
-        "styles": style_list,
-        "links": links
-    });
-    // OGC API – Common – Part 2 `keywords`: emit only when non-empty.
-    if !config.keywords.is_empty() {
-        metadata["keywords"] = json!(config.keywords);
-    }
+    let mut metadata = api_common::collection_metadata(
+        config,
+        json!({
+            "dataType": "map",
+            "crs": crs_uris,
+            "styles": style_list,
+        }),
+        links,
+    );
 
     // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
     // Engines label projected/rotated grids with internal names ("TM",
@@ -358,30 +348,6 @@ pub async fn landing_page(
 fn format_parameter() -> serde_json::Value {
     json!({"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
-}
-
-/// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
-/// `/collections` query parameters (plus the shared `f` format selector).
-fn searchable_collections_parameters() -> serde_json::Value {
-    let mut params = json!([
-        {"name": "bbox", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Filter to collections intersecting this CRS84 bbox: 4 (or 6) comma-separated numbers west,south,east,north."},
-        {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "CRS of the bbox values. Only CRS84 is supported."},
-        {"name": "datetime", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Filter to collections whose temporal extent intersects this RFC 3339 instant or interval (start/end, ../end, start/..)."},
-        {"name": "q", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Free-text search (comma-separated terms, OR) over collection title, description, and keywords."},
-        {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
-         "description": "Maximum number of collections per page (default 1000)."},
-        {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
-         "description": "Number of matching collections to skip (pagination cursor)."}
-    ]);
-    params
-        .as_array_mut()
-        .expect("searchable params is a JSON array")
-        .push(format_parameter());
-    params
 }
 
 /// GET /maps/api — OpenAPI 3.0.3 definition
@@ -586,16 +552,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         },
-        "/maps/collections": {
-            "get": {
-                "summary": "List collections",
-                "operationId": "getCollections",
-                "parameters": searchable_collections_parameters(),
-                "responses": {
-                    "200": {"description": "List of collections"}
-                }
-            }
-        }
+        "/maps/collections": {"get": api_common::collection_operation()}
     });
 
     // Merge collection paths into main paths
@@ -806,22 +763,7 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-    let classes = [
-        // OGC API - Common - Part 1: Core (landing page, /conformance,
-        // /api) and Part 2: Geospatial Data (/collections + /collections/
-        // {id}, JSON). Both are satisfied structurally; the HTML class
-        // (.../common-2/.../conf/html) is now declared — the HTML
-        // representation is served via `?f=html` / Accept.
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/html",
-        // OGC API - Common - Part 4 (Discovery within many collections,
-        // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
-        // limit filtering + offset pagination.
-        "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
+    let classes = api_common::conformance_classes(&[
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
@@ -831,15 +773,7 @@ pub async fn conformance(
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
-        // NOTE: the OGC API Maps "Map Tilesets" class
-        // (.../conf/tilesets) is intentionally NOT declared. Its abstract
-        // tests require maps-native /collections/{id}/map/tiles endpoints,
-        // which we don't implement — raster tiles are served by the
-        // standalone OGC API Tiles service and merely *discovered* from a
-        // maps collection via the `tilesets-map` link relation. Declaring
-        // the class without the endpoints would be a false conformance
-        // claim.
-    ];
+    ]);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {
@@ -859,23 +793,12 @@ pub async fn conformance(
 /// GET /maps/collections
 pub async fn collections(
     State(state): State<AppState>,
-    Query(sp): Query<ds_core::collection_search::SearchQueryParams>,
+    request: api_common::CollectionRequest,
     headers: HeaderMap,
-) -> Result<Response, MapsError> {
-    use ds_core::collection_search::{search, CollectionMatch};
-    use ds_core::html::Wanted;
-
-    let wanted = negotiate(sp.f.as_deref(), &headers)?;
-    let params = sp
-        .parse()
-        .map_err(|e| MapsError::BadRequest(e.to_string()))?;
+) -> Response {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-
-    // (id, title, description, bbox, time, metadata, keywords, license) per
-    // collection; tuple element types are inferred (no extra chrono import).
-    // keywords/license feed `?q=` search and the HTML cards.
-    let mut rows: Vec<_> = state
+    let entries = state
         .collections
         .values()
         .filter_map(|config| {
@@ -887,127 +810,27 @@ pub async fn collections(
                 return None;
             };
             let info = engine.raster_info();
-            let styles = state.styles.get(&config.id);
-            let value = build_collection_metadata(config, &info, styles, base);
-            let time = info.times.first().copied().zip(info.times.last().copied());
-            Some((
-                config.id.clone(),
-                config.title.clone(),
-                config.description.clone(),
-                info.spatial_extent,
-                time,
-                value,
-                config.keywords.clone(),
-                config.license.as_ref().map(|l| l.card_label()),
-            ))
+            let metadata =
+                build_collection_metadata(config, &info, state.styles.get(&config.id), base);
+            Some(api_common::CollectionEntry {
+                config,
+                metadata,
+                bbox: info.spatial_extent,
+                time: info.times.first().copied().zip(info.times.last().copied()),
+            })
         })
         .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let matches: Vec<CollectionMatch> = rows
-        .iter()
-        .map(|r| CollectionMatch {
-            title: &r.1,
-            description: &r.2,
-            keywords: &r.6,
-            bbox: r.3,
-            time: r.4,
-        })
-        .collect();
-    let result = search(&matches, &params);
-    let href = |offset| {
-        format!(
-            "{base}/maps/collections{}",
-            sp.query_string(params.limit, offset)
-        )
-    };
-
-    Ok(with_vary(match wanted {
-        Wanted::Json => {
-            let colls: Vec<serde_json::Value> =
-                result.page.iter().map(|&i| rows[i].5.clone()).collect();
-            let number_returned = colls.len();
-
-            let link = |rel: &str, offset: usize, title: Option<&str>| {
-                let mut o = json!({ "href": href(offset), "rel": rel, "type": "application/json" });
-                if let Some(t) = title {
-                    o["title"] = json!(t);
-                }
-                o
-            };
-            let mut links = vec![link("self", params.offset, None)];
-            if result.has_next {
-                links.push(link("next", result.next_offset, Some("Next page")));
-            }
-            if result.has_prev {
-                links.push(link("prev", result.prev_offset, Some("Previous page")));
-            }
-
-            Json(json!({
-                "collections": colls,
-                "numberMatched": result.number_matched,
-                "numberReturned": number_returned,
-                "links": links
-            }))
-            .into_response()
-        }
-        Wanted::Html => {
-            use ds_core::html::{CollectionCard, LinkView};
-            let cards: Vec<CollectionCard> = result
-                .page
-                .iter()
-                .map(|&i| CollectionCard {
-                    id: rows[i].0.clone(),
-                    title: rows[i].1.clone(),
-                    description: rows[i].2.clone(),
-                    self_href: format!("{base}/maps/collections/{}", rows[i].0),
-                    keywords: rows[i].6.clone(),
-                    license: rows[i].7.clone(),
-                })
-                .collect();
-            let mut nav = vec![LinkView::new(
-                href(params.offset),
-                "self",
-                Some("This page"),
-            )];
-            if result.has_next {
-                nav.push(LinkView::new(
-                    href(result.next_offset),
-                    "next",
-                    Some("Next page"),
-                ));
-            }
-            if result.has_prev {
-                nav.push(LinkView::new(
-                    href(result.prev_offset),
-                    "prev",
-                    Some("Previous page"),
-                ));
-            }
-            // rel="alternate" to the JSON representation, preserving the current
-            // bbox/datetime/q/limit/offset filters (parity with the other HTML
-            // metadata pages).
-            nav.push(LinkView::new(
-                format!(
-                    "{base}/maps/collections{}",
-                    sp.query_string_with_format(params.limit, params.offset, "json")
-                ),
-                "alternate",
-                Some("This page as JSON"),
-            ));
-            Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
-        }
-    }))
+    api_common::collections_response(&format!("{base}/maps/collections"), request, entries)
 }
 
-/// GET /maps/collections/{id}
+/// GET /maps/collections/{id} — Collection detail
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
-    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, &id)?;
@@ -1019,14 +842,10 @@ pub async fn collection(
             Json(build_collection_metadata(config, &info, styles, base)).into_response()
         }
         Wanted::Html => {
-            let card = CollectionCard {
-                id: config.id.clone(),
-                title: config.title.clone(),
-                description: config.description.clone(),
-                self_href: format!("{base}/maps/collections/{}", config.id),
-                keywords: config.keywords.clone(),
-                license: config.license.as_ref().map(|l| l.card_label()),
-            };
+            let card = api_common::collection_card(
+                config,
+                format!("{base}/maps/collections/{}", config.id),
+            );
             let links = [
                 LinkView::new(
                     format!("{base}/maps/collections/{}?f=json", config.id),

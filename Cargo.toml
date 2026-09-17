@@ -22,6 +22,7 @@ members = [
     "crates/ds-wis2",
     "crates/ds-mvt",
     "crates/ds-3dtiles",
+    "crates/api-common",
     "crates/api-edr",
     "crates/api-features",
     "crates/api-mcp",

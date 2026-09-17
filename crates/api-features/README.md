@@ -30,10 +30,22 @@ Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Base route:
 | Part 5 Schemas | ✗ | no `/schema`; properties are untyped `PropertyValue`s |
 | Part 8 Sorting (draft) | partial | `sortby` implemented (#605 rule: validated against `FeatureEngine::sortables`, 400 naming the valid ones) but the class is not declared and no `/sortables` resource exists |
 
-Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
-(collections, json, html) and Part 4 searchable-collections
-(`/collections?bbox=&bbox-crs=&datetime=&q=&limit=&offset=`; `bbox-crs` is
-CRS84 only).
+Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
+Part 2 (collections, json, html). Collection discovery supports `bbox`,
+`bbox-crs` (CRS84 only), `datetime`, `q`, `limit`, `offset` and `f` through
+[api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
+return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
+preserve filters and the negotiated format. Collection descriptions expose HTML
+alternate links and configured keywords/license metadata through the shared helper.
+
+Part 4 `searchable-collections` is **not declared**: the 2026-09-17 draft also
+requires `query`, `sd` and `resolution`, which are not implemented. Existing
+basic search remains supported. See the [Common Parts 1–4 matrix](../../docs/ogc-api-common-matrix.md)
+for the specification baselines and remaining gaps.
+
+Features collection search now uses `FeatureEngine::temporal_extent()`, matching
+the advertised metadata. Unknown extents remain eligible; temporal bounds do not
+imply a regular sampling grid.
 
 ## Routes
 

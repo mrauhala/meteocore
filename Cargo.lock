@@ -131,9 +131,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "api-common"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "ds-core",
+ "serde_json",
+]
+
+[[package]]
 name = "api-edr"
 version = "0.1.0"
 dependencies = [
+ "api-common",
  "arc-swap",
  "axum",
  "chrono",
@@ -152,6 +163,7 @@ dependencies = [
 name = "api-features"
 version = "0.1.0"
 dependencies = [
+ "api-common",
  "arc-swap",
  "axum",
  "chrono",
@@ -170,6 +182,7 @@ dependencies = [
 name = "api-maps"
 version = "0.1.0"
 dependencies = [
+ "api-common",
  "arc-swap",
  "axum",
  "bytes",
@@ -207,6 +220,7 @@ dependencies = [
 name = "api-tiles"
 version = "0.1.0"
 dependencies = [
+ "api-common",
  "arc-swap",
  "axum",
  "bytes",

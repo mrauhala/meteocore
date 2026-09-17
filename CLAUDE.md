@@ -20,7 +20,7 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
-`engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`), API layers (`api-edr`,
+`engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`), API layers (`api-common` shared HTTP plumbing, `api-edr`,
 `api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`,
 `api-mcp` — Model Context Protocol tools over the storm-cell surface), and
 `server` (the binary).
@@ -31,6 +31,7 @@ of these crates, read its file — it holds that crate's rules and gotchas:
 - `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership.
 - `crates/server/CLAUDE.md` — CLI flags, no-config boot, auto-collections,
   reload/watcher trust model, proxy headers.
+- `crates/api-common/CLAUDE.md` — shared discovery validation, metadata/navigation, OpenAPI and conformance.
 - `crates/api-wms/CLAUDE.md` — BBOX axis order, meta-tiling, TIME/ELEVATION/
   reference_time dimensions.
 - `crates/api-edr/CLAUDE.md` — CoverageJSON schema compliance, domain types,
@@ -213,9 +214,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   extraction the same ~40 lines were copy-pasted 12×. In `server/src/
   admin.rs`, a global cache's `/metrics` family is one `CacheMetricSet`
   static + one `update()` call in `metrics_handler`.
-- **API crates depend only on ds-core** (plus ds-executor for bounded render execution,
+- **API crates depend on ds-core and api-common** (shared Common HTTP glue),
+  plus ds-executor for bounded render execution,
   ds-render for
-  api-wms/api-maps, and api-edr for its `f=png` time-series plots) — never on
+  api-wms/api-maps, and api-edr for its `f=png` time-series plots — never on
   engine crates. API state is a registry of engines keyed by collection ID.
 - **EDR, Features, Maps, Tiles, and WMS are separate services** with separate
   base routes (`/edr/...`, `/features/...`, `/maps/...`, `/tiles/...`,
@@ -270,6 +272,16 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.
+
+### Common collection discovery
+
+EDR/Maps/Tiles/Features use `api-common` for collection request validation,
+response/navigation assembly, shared metadata fields, OpenAPI and Common class
+lists. Keep pure search policy and the `CollectionParameter` inventory in
+`ds-core`; do not reintroduce API-local copies. Preserve API-specific metadata
+and EDR's extent representation. Changes must update `docs/ogc-api-common-matrix.md`
+and exercise `cargo test -p server --test common_discovery` alongside affected API
+tests. Do not claim a draft class merely because some of its parameters work.
 
 ### Adding a new API endpoint
 
