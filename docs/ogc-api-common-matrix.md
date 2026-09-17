@@ -297,3 +297,7 @@ JSON links retain applied filters and paging. Full metadata, themes and navigati
 are presentation changes; no additional Common conformance class is declared.
 Common sorting, hierarchies, `sd` and `resolution` remain unavailable and have no
 active UI controls. Features item sorting is a separate, engine-advertised contract.
+
+The workbench uses the approved design's grouped search controls and collection
+overview/metadata tabs. Coverage locators visualize existing advertised extents;
+they do not infer missing temporal bounds, grids or hierarchy relationships.

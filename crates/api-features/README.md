@@ -226,9 +226,11 @@ preserved. Collection search uses Common `q`/`query`; item queries keep their
 existing Features semantics.
 
 Individual items show all typed properties (including false, zero, null, arrays
-and nested objects). The geometry-only MapLibre view renders this response page,
-with a picker for overlapping features, theme-aware shapes and coordinate details
-when WebGL is unavailable. It makes no additional feature or external tile
-requests. Alert expiry is labelled in the browser; server HTML and ETags remain
+and nested objects). Item details include available reflectivity/area/speed metrics
+and source quality flags. The MapLibre locator renders this response page over a
+locally bundled Natural Earth backdrop, with an overlapping-feature picker and
+quick-look panel. It fits the actual geometry, follows the theme, and retains
+coordinate details when WebGL is unavailable. It makes no additional feature or
+external tile requests. Alert expiry is labelled in the browser; server HTML and ETags remain
 deterministic. JavaScript enables item-query editing, map interaction and property
 search; paging and resource links remain usable without it.

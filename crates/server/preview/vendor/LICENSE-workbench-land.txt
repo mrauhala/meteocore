@@ -1,0 +1,6 @@
+Natural Earth 1:110m country outlines (public domain).
+Source: https://github.com/nvkelso/natural-earth-vector/blob/master/geojson/ne_110m_admin_0_countries.geojson
+Retrieved 2026-09-18. Source SHA-256: 6866c877d39cba9c357620878839b336d569f8c662d3cfab4cb1dbe2d39c977f
+Bundled derivative retains geometry rounded to 0.001 degrees, English country names and label positions.
+Used as a general-purpose locator, not an authoritative boundary dataset.
+https://www.naturalearthdata.com/about/terms-of-use/

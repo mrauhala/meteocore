@@ -24,6 +24,21 @@
     }
   });
 
+  document.getElementById('api-select')?.addEventListener('change', event => { location.href = event.target.value; });
+  document.getElementById('help-button')?.addEventListener('click', () => document.getElementById('help-dialog').showModal());
+  document.getElementById('close-help')?.addEventListener('click', () => document.getElementById('help-dialog').close());
+  document.querySelector('[data-page-size]')?.addEventListener('change', event => {
+    const url = new URL(location.href); url.searchParams.set('limit', event.target.value); url.searchParams.delete('offset'); url.searchParams.set('f','html'); location.href = url.href;
+  });
+  function collectionTab() {
+    const active = location.hash === '#metadata' ? 'metadata' : 'overview';
+    document.querySelectorAll('[data-collection-view]').forEach(view => { view.hidden = view.id !== active; });
+    document.querySelectorAll('[data-collection-tab]').forEach(link => {
+      link.classList.toggle('active', link.dataset.collectionTab === active);
+      if (link.dataset.collectionTab === active) link.setAttribute('aria-current','page'); else link.removeAttribute('aria-current');
+    });
+  }
+  collectionTab(); window.addEventListener('hashchange',collectionTab);
   let toastTimer;
   async function copy(text) {
     const toast = document.getElementById('toast');
@@ -44,10 +59,23 @@
   document.querySelectorAll('.query-form').forEach(form => {
     const fields = form.querySelectorAll('[data-param]');
     const update = () => {
+      const bounds = [...form.querySelectorAll('[data-bbox]')];
+      if (bounds.length) {
+        const values = bounds.map(input => input.value);
+        const partial = values.some(Boolean) && !values.every(Boolean);
+        bounds[0].setCustomValidity(partial ? 'Enter all four area bounds, or leave them all blank.' : '');
+        form.querySelector('[data-param="bbox"]').value = values.some(Boolean) ? values.join(',') : '';
+      }
+      const property = form.querySelector('[data-new-property]');
+      const newValue = form.querySelector('[data-new-value]');
+      if (property && newValue) {
+        newValue.dataset.param = property.value;
+        property.setCustomValidity(newValue.value && !property.value ? 'Choose a property for this value.' : '');
+      }
       fields.forEach(input => {
         // Preserve intentional empty exact-match predicates already present in
         // the response URL; otherwise omit unused optional API controls.
-        if (input.value !== '' || input.dataset.keepEmpty === 'true') input.name = input.dataset.param;
+        if (input.dataset.param && (input.value !== '' || input.dataset.keepEmpty === 'true')) input.name = input.dataset.param;
         else input.removeAttribute('name');
       });
       const url = new URL(form.action, location.href);
@@ -74,8 +102,8 @@
     update();
   });
   document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
-    document.querySelector('.collection-list')?.classList.toggle('cards', button.dataset.view === 'cards');
-    document.querySelectorAll('[data-view]').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+    document.querySelector('.collection-list')?.classList.toggle('collection-grid', button.dataset.view === 'cards');
+    document.querySelectorAll('[data-view]').forEach(other => { other.setAttribute('aria-pressed', String(other === button)); other.classList.toggle('selected', other === button); });
   }));
   document.getElementById('property-search')?.addEventListener('input', event => {
     const term = event.target.value.toLowerCase();

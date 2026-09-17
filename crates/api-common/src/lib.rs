@@ -13,7 +13,7 @@ use ds_core::collection_search::{
     MAX_LIMIT,
 };
 use ds_core::config::CollectionConfig;
-use ds_core::html::{self, CollectionCard, LinkView, Wanted};
+use ds_core::html::{self, LinkView, Wanted};
 use serde_json::{json, Value};
 
 /// Existing Common declarations, centralized to keep all API surfaces aligned.
@@ -192,17 +192,6 @@ pub fn collections_response(
         .headers_mut()
         .append(header::VARY, HeaderValue::from_static("accept"));
     response
-}
-
-pub fn collection_card(config: &CollectionConfig, self_href: String) -> CollectionCard {
-    CollectionCard {
-        id: config.id.clone(),
-        title: config.title.clone(),
-        description: config.description.clone(),
-        self_href,
-        keywords: config.keywords.clone(),
-        license: config.license.as_ref().map(|l| l.card_label()),
-    }
 }
 
 /// Assemble shared collection fields and representation/license links. Explicit

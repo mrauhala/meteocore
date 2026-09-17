@@ -189,6 +189,8 @@ Landing, conformance, collections, collection and model-run metadata use the
 shared `api-common::workbench` shell with light/dark/system themes and a persistent
 JSON switch. The collection builder exposes Common text/spatial/temporal search
 and paging. Collection and instance detail pages retain the complete EDR metadata,
-including parameter descriptions, extents and available query links. Data-query
+including parameter descriptions, extents and available query links. Overview and
+metadata tabs separate coverage from the full metadata table; a local geographic
+backdrop locates the advertised extent. Data-query
 payloads keep their existing representations. See the
 [shared HTML behavior](../api-common/README.md#html-api-workbench).

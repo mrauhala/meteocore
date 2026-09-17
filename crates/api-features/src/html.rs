@@ -75,18 +75,15 @@ fn feature_flags(feature: &Value) -> String {
     let p = &feature["properties"];
     let mut out = String::new();
     if let Some(severity) = p["severity"].as_str() {
-        out.push_str(&format!(
-            "<span class=\"badge\">{}</span>",
-            escape(severity)
-        ));
+        out.push_str(&format!("<span class=\"chip\">{}</span>", escape(severity)));
     }
     if p["likely_clutter"] == true {
-        out.push_str("<span class=\"badge warning\">Likely clutter</span>");
+        out.push_str("<span class=\"chip warning\">Likely clutter</span>");
     }
     // Browser enhancement labels expired alerts; server output and ETags stay deterministic.
     if let Some(expires) = p["expires"].as_str() {
         out.push_str(&format!(
-            "<span class=\"badge\" data-expiry=\"{}\">Expires {}</span>",
+            "<span class=\"chip\" data-expiry=\"{}\">Expires {}</span>",
             escape(expires),
             escape(expires)
         ));
@@ -106,14 +103,18 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             .map(|(_, v)| v.as_ref())
             .unwrap_or("")
     };
-    let mut out = format!("<form class=\"query-form item-query panel enhanced\" action=\"{}\" method=\"get\"><h2>Query parameters</h2><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"fields\">",escape(action));
-    out.push_str(&ui::input(
-        "bbox",
-        value("bbox"),
-        "CRS84 · west,south,east,north",
-        "text",
-        true,
-    ));
+    let mut out=format!("<form class=\"query-form item-query items-controls panel enhanced\" action=\"{}\" method=\"get\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"builder-heading\"><h2>Item query parameters</h2><span class=\"mono\">GET</span></div><div class=\"item-primary-fields\">",escape(action));
+    if !controls.filterables.is_empty() {
+        out.push_str("<div class=\"equal-fields\"><label>Property<select data-new-property><option value=\"\">Choose a property</option>");
+        for name in &controls.filterables {
+            out.push_str(&format!(
+                "<option value=\"{}\">{}</option>",
+                escape(name),
+                escape(name)
+            ));
+        }
+        out.push_str("</select></label><label>Equals<input data-new-value data-param=\"\" placeholder=\"Exact value\"></label></div>");
+    }
     if controls.temporal || !value("datetime").is_empty() {
         out.push_str(&ui::input(
             "datetime",
@@ -123,6 +124,28 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             true,
         ));
     }
+    out.push_str("<button class=\"btn primary\">Apply query</button></div><p class=\"search-hint\">Item properties are collection-specific. Collection text search is available under Collections.</p>");
+    let mut applied = String::new();
+    for name in &controls.filterables {
+        for (_, value) in pairs.iter().filter(|(k, _)| k == name) {
+            let mut input = ui::input(name, value, "equals · applied predicate", "text", true);
+            if value.is_empty() {
+                input = input.replace("data-param=", "data-keep-empty=\"true\" data-param=");
+            }
+            applied.push_str(&format!("<div data-predicate>{input}<button class=\"btn small\" type=\"button\" data-clear-predicate>Clear {}</button></div>",escape(name)));
+        }
+    }
+    if !applied.is_empty() {
+        out.push_str(&format!("<div class=\"fields spaced\">{applied}</div><p class=\"field-help\">Applied predicates are combined with AND. Numeric fields also accept comma-separated alternatives.</p>"));
+    }
+    out.push_str("<details class=\"filters\"><summary>Area, ordering &amp; paging</summary><div class=\"fields\">");
+    out.push_str(&ui::input(
+        "bbox",
+        value("bbox"),
+        "CRS84 · west,south,east,north",
+        "text",
+        true,
+    ));
     for (key, default) in [("limit", "100"), ("offset", "0")] {
         out.push_str(&ui::input(
             key,
@@ -141,43 +164,14 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             "sortby",
             value("sortby"),
             &format!(
-                "Comma-separated; prefix - for descending. Available: {}",
+                "Comma-separated; - for descending. Available: {}",
                 controls.sortables.join(", ")
             ),
             "text",
             true,
         ));
     }
-    out.push_str("</div>");
-    if !controls.filterables.is_empty() {
-        let active = controls
-            .filterables
-            .iter()
-            .any(|key| pairs.iter().any(|(k, _)| k == key));
-        out.push_str(&format!("<details {}><summary>Property equality filters · {}</summary><p class=\"hint\">Exact values; all predicates are combined with AND. Numeric fields also accept comma-separated alternatives.</p><div class=\"fields\">",if active{"open"}else{""},controls.filterables.len()));
-        for name in &controls.filterables {
-            let values: Vec<_> = pairs
-                .iter()
-                .filter(|(k, _)| k == name)
-                .map(|(_, v)| v.as_ref())
-                .collect();
-            if values.is_empty() {
-                out.push_str(&ui::input(name, "", "equals · optional", "text", true));
-            } else {
-                for value in values {
-                    let mut input =
-                        ui::input(name, value, "equals · applied predicate", "text", true);
-                    if value.is_empty() {
-                        input =
-                            input.replace("data-param=", "data-keep-empty=\"true\" data-param=");
-                    }
-                    out.push_str(&format!("<div data-predicate>{input}<button class=\"btn\" type=\"button\" data-clear-predicate>Clear {}</button></div>",escape(name)));
-                }
-            }
-        }
-        out.push_str("</div></details>");
-    }
-    out.push_str(&format!("<button class=\"btn primary\">Apply query</button>{}<div class=\"draft\"><p class=\"hint\">Request preview · apply to update results</p><code data-draft></code></div></form><noscript><p class=\"notice\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Reset query","btn")));
+    out.push_str(&format!("</div></details><div class=\"filter-controls\">{}</div><div class=\"draft-request\"><small>Request preview · apply to update results</small><code data-draft></code></div></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
     out
 }
 
@@ -214,14 +208,28 @@ pub(crate) fn features_html(
             "Back to items"
         }
     );
-    body.push_str(&ui::page_heading(
-        &page_title,
-        if is_list {
-            "Inspect the features returned by this request. The map shows this page only."
-        } else {
-            "Feature properties and geometry from the same resource as GeoJSON."
-        },
-    ));
+    if is_list {
+        body.push_str(&format!("<div class=\"detail-heading\"><div class=\"chip-row\"><span class=\"chip teal\">Features</span><span class=\"chip\">Feature collection</span></div><h1>{}</h1><div class=\"mono\">{}</div><p>Inspect features and use the same request as GeoJSON.</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\">{}<a class=\"active\" aria-current=\"page\" href=\"{}\">Browse items</a>{}</nav>",escape(title),escape(collection_id),ui::anchor(&ui::with_format(&collection_url,"html"),"Overview",""),escape(&ui::with_format(&items_url,"html")),ui::anchor(&format!("{}#metadata",ui::with_format(&collection_url,"html")),"Metadata & links","")));
+    } else {
+        body.push_str(&format!("<div class=\"page-title\"><div><span class=\"eyebrow\">FEATURE DETAIL</span><h1>{}</h1><p class=\"mono\">{}</p><div class=\"chip-row spaced\"><span class=\"chip teal\">{}</span>{}</div></div>{}</div>",escape(&page_title),escape(doc["id"].as_str().unwrap_or_default()),escape(doc["geometry"]["type"].as_str().unwrap_or("No geometry")),feature_flags(doc),ui::anchor(&json_url,"GeoJSON { }","btn")));
+        if doc["properties"]["likely_clutter"] == true {
+            body.push_str("<div class=\"callout amber spaced\">The source flags this detection as likely clutter. Keep this quality flag visible when interpreting the cell.</div>");
+        }
+        let mut metrics = String::new();
+        for (key, label, unit) in [
+            ("max_dbz", "Reflectivity", "dBZ"),
+            ("area_km2", "Cell area", "km²"),
+            ("speed_ms", "Speed", "m/s"),
+            ("significance", "Significance", ""),
+        ] {
+            if let Some(value) = doc["properties"].get(key) {
+                metrics.push_str(&format!("<div class=\"metric\"><small>{label}</small><strong>{}<span>{unit}</span></strong></div>",ui::value_html(value)));
+            }
+        }
+        if !metrics.is_empty() {
+            body.push_str(&format!("<div class=\"metrics spaced\">{metrics}</div>"));
+        }
+    }
     let features = if let Some(features) = doc["features"].as_array() {
         body.push_str(&format!(
             "<div data-results-scope=\"{}\"></div>",
@@ -233,13 +241,27 @@ pub(crate) fn features_html(
     } else {
         std::slice::from_ref(doc)
     };
-    let map_features: Vec<_> = features.iter().filter(|f|!f["geometry"].is_null()).map(|f|json!({"type":"Feature","id":f["id"],"geometry":f["geometry"],"properties":{"label":feature_title(f),"href":href_for(f,"self")}})).collect();
+    let reflectivity = features
+        .iter()
+        .any(|f| f["properties"].get("max_dbz").is_some());
+    let map_features:Vec<_>=features.iter().filter(|f|!f["geometry"].is_null()).map(|f| {
+        let mut facts=serde_json::Map::new();
+        for (key,label,unit) in [("max_dbz","Maximum reflectivity"," dBZ"),("area_km2","Area"," km²")] {
+            if let Some(value)=f["properties"].get(key).filter(|v|!v.is_null()){facts.insert(label.into(),json!(format!("{}{unit}",value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string()))));}
+        }
+        if facts.is_empty(){facts.insert("Geometry".into(),f["geometry"]["type"].clone());facts.insert("Properties".into(),json!(f["properties"].as_object().map_or(0,|p|p.len())));}
+        json!({"type":"Feature","id":f["id"],"geometry":f["geometry"],"properties":{"label":feature_title(f),"href":href_for(f,"self"),"facts":facts}})
+    }).collect();
     let mut head = String::new();
-    body.push_str("<div class=\"item-layout\"><section class=\"panel\">");
+    body.push_str(if is_list {
+        "<div class=\"item-layout\"><section>"
+    } else {
+        "<div class=\"detail-layout spaced\"><section class=\"panel\">"
+    });
     if is_list {
-        body.push_str("<div class=\"table-scroll\"><table class=\"item-table\"><thead><tr><th scope=\"col\">Feature / ID</th><th scope=\"col\">Geometry</th><th scope=\"col\">Context</th></tr></thead><tbody>");
+        body.push_str(&format!("<div class=\"table-wrap table-scroll\"><table class=\"item-table\"><thead><tr><th scope=\"col\">Feature / place</th><th scope=\"col\">{}</th><th scope=\"col\">Context</th></tr></thead><tbody>",if reflectivity{"Reflectivity"}else{"Geometry"}));
         for feature in features {
-            body.push_str(&format!("<tr><td><a class=\"table-link\" href=\"{}\">{}<small>{}</small></a></td><td>{}</td><td><div class=\"tags\">{}</div></td></tr>",escape(href_for(feature,"self")),escape(&feature_title(feature)),escape(feature["id"].as_str().unwrap_or_default()),escape(feature["geometry"]["type"].as_str().unwrap_or("No geometry")),feature_flags(feature)));
+            body.push_str(&format!("<tr><td><a class=\"table-link\" href=\"{}\">{}<small>{}</small></a></td><td>{}</td><td><div class=\"chip-row\">{}</div></td></tr>",escape(href_for(feature,"self")),escape(&feature_title(feature)),escape(feature["id"].as_str().unwrap_or_default()),if reflectivity{format!("{} dBZ",ui::value_html(&feature["properties"]["max_dbz"]))}else{escape(feature["geometry"]["type"].as_str().unwrap_or("No geometry"))},feature_flags(feature)));
         }
         body.push_str("</tbody></table></div>");
         if features.is_empty() {
@@ -259,28 +281,59 @@ pub(crate) fn features_html(
             .collect();
         body.push_str(&ui::pagination(&nav));
     } else {
-        body.push_str(&format!("<div class=\"feature-summary\"><code>{}</code><div class=\"tags\">{}</div></div><label class=\"property-search enhanced\" for=\"property-search\">Find a property<input id=\"property-search\" placeholder=\"Property name\"></label>",escape(doc["id"].as_str().unwrap_or_default()),feature_flags(doc)));
+        body.push_str(&format!("<div class=\"panel-head\"><h2>Properties <span class=\"muted\">· {}</span></h2><input class=\"property-filter enhanced\" id=\"property-search\" aria-label=\"Find a property\" placeholder=\"Find a property…\"></div>",doc["properties"].as_object().map_or(0,|p|p.len())));
         body.push_str(&ui::property_table(&doc["properties"]));
     }
-    body.push_str("</section><aside class=\"panel\"><h2>Geometry</h2>");
+    body.push_str("</section><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Location</h2><span class=\"chip\">CRS84</span></div>");
     if !map_features.is_empty() {
-        head.push_str(&format!(
-            "<link rel=\"stylesheet\" href=\"{}/preview/vendor/maplibre-gl.css\">",
-            escape(base)
+        head = ui::map_head(base);
+        body.push_str(&ui::map_html(
+            base,
+            &json!({"type":"FeatureCollection","features":map_features}),
+            is_list,
         ));
-        body.push_str(&format!("<div class=\"map-panel\"><div id=\"feature-map\" role=\"region\" aria-label=\"Feature geometry map\"></div><p id=\"map-status\">Map requires JavaScript and WebGL; geometry is also listed below.</p><div id=\"map-data\" hidden>{}</div></div><script src=\"{}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&json!({"type":"FeatureCollection","features":map_features}).to_string()),escape(base),include_str!("feature-map.js")));
     } else {
         body.push_str("<div class=\"empty\"><p>No geometry available.</p></div>");
     }
+    if !is_list {
+        body.push_str("<div class=\"panel-body\"><dl class=\"definition\">");
+        for (label, value) in [
+            (
+                "Observed / sent",
+                doc["properties"]
+                    .get("observed")
+                    .or(doc["properties"].get("sent"))
+                    .unwrap_or(&Value::Null),
+            ),
+            ("Geometry", &doc["geometry"]["type"]),
+        ] {
+            body.push_str(&format!(
+                "<dt>{label}</dt><dd>{}</dd>",
+                ui::value_html(value)
+            ));
+        }
+        if doc["geometry"]["type"] == "Point" {
+            body.push_str(&format!(
+                "<dt>Longitude</dt><dd>{}°</dd><dt>Latitude</dt><dd>{}°</dd>",
+                ui::value_html(&doc["geometry"]["coordinates"][0]),
+                ui::value_html(&doc["geometry"]["coordinates"][1])
+            ));
+        }
+        body.push_str("</dl></div>");
+    }
     for feature in features {
         body.push_str(&format!(
-            "<details><summary>Geometry ({}) · {}</summary><pre>{}</pre></details>",
+            "<details class=\"geometry-details\"><summary>Geometry ({}) · {}</summary><pre>{}</pre></details>",
             escape(feature["geometry"]["type"].as_str().unwrap_or("None")),
             escape(feature["id"].as_str().unwrap_or_default()),
             escape(
                 &serde_json::to_string_pretty(&feature["geometry"]).expect("geometry serializes")
             )
         ));
+    }
+    body.push_str("</section>");
+    if !is_list {
+        body.push_str(&format!("<section class=\"panel panel-body\"><span class=\"eyebrow\">PART OF THIS COLLECTION</span><h3>{}</h3>{}</section>",escape(title),ui::anchor(&ui::with_format(&collection_url,"html"),"Collection overview →","quiet")));
     }
     body.push_str("</aside></div>");
     ui::Page {

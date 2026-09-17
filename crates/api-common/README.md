@@ -119,3 +119,14 @@ retain the existing structured JSON error response.
 No engine queries run from the renderer. Metadata comes from the existing JSON
 builders. The workbench does not add HTML representations to map images, tiles,
 EDR data-query responses, or the WMS/3D Tiles viewers.
+
+The HTML structure and theme styles follow the approved #744 mockup: API workspace
+selector and branded sidebar, grouped collection query controls, removable applied
+filters, metadata-rich result rows and cards, and collection overview/metadata tabs.
+Overview maps show the advertised extent over bundled Natural Earth outlines; the
+asset is served locally by the existing preview asset handler. The map and item
+quick-look implementation are shared with Features. No preview-only snapshot,
+future-control or loading-state demonstrations are exposed in the live UI.
+
+The former page builders in `ds_core::html` have been removed. That module retains
+content negotiation, escaping and view types; `workbench` owns page rendering.

@@ -13,12 +13,17 @@ ordinary URLs, not a separate client-side application.
   come from the shared server discovery pipeline.
 - Feature items expose the collection's supported property/sort/time controls,
   response counts, paging, typed properties and geometry. The map contains only
-  the returned page, without background tiles; overlapping shapes have a picker.
+  the returned page over locally bundled Natural Earth outlines; overlapping shapes
+  have a picker and quick-look panel.
 - Applied parameters remain in the persistent JSON link and copyable request.
   Unsubmitted edits have a separate request preview. Browser enhancement restores
   the last filtered list when returning from a collection or item.
 - Light/dark/system themes share a 16px body/control scale and 14px minimum for
   supporting text and code. Theme choice persists locally.
+- The sidebar, typography, grouped search controls, chips and result rows use the
+  approved mockup's HTML structure and styles. Collection views restore overview,
+  browse-items and metadata tabs; item details restore summary metrics and source
+  quality callouts when the corresponding properties exist.
 - Collection details retain full API metadata, keywords and license labels,
   including free-text licenses without a URL. EDR model-run pages share the shell.
 - Common sorting, hierarchy, `sd` and `resolution` remain unsupported and have
@@ -34,11 +39,11 @@ and the [Common capability matrix](../../ogc-api-common-matrix.md).
 
 - `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test -p api-common -p api-edr -p api-features -p api-maps -p api-tiles`
+- `cargo test -p ds-core -p api-common -p api-edr -p api-features -p api-maps -p api-tiles`
 - `cargo test -p server --test common_discovery`
 
-The API suites passed 645 tests (four pre-existing ignored tests); cross-API
-contracts passed seven. Contracts cover query/format preservation, full metadata,
+The core and API suites passed 1,025 tests (four pre-existing ignored tests);
+cross-API contracts passed seven. Contracts cover query/format preservation, full metadata,
 license display, proxy prefixes, capability-driven controls, escaping, GeoJSON/HTML
 negotiation and representation-specific caching.
 
@@ -51,5 +56,23 @@ those pages had no contrast failures, a 14px minimum, and two font stacks; lowes
 measured contrast was 5.97:1 in light and 7.36:1 in dark. These checks are not a
 claim of a complete accessibility audit.
 
+[Landing page, light](screenshots/landing-light.png) ·
 [Collections, light](screenshots/collections-light.png) ·
+[Collection overview, light](screenshots/collection-light.png) ·
+[Feature list, light](screenshots/items-light.png) ·
 [Feature properties, dark](screenshots/item-dark.png)
+
+## Design comparison
+
+The initial implementation simplified several approved layouts too far. The
+updated implementation reuses the mockup's CSS and restores its page composition,
+workspace selector, endpoint index, query groups, result details, collection
+overviews, coverage locators and item inspection panels. The production adapters
+keep actual server URLs and data. Preview-only state selectors, captured-data
+banners, synthetic groups and unsupported future controls are excluded. Missing
+metadata is shown as unavailable rather than replaced with the mockup's examples.
+
+The geographic backdrop comes from public-domain Natural Earth 1:110m country
+outlines. See [source and transformation details](../../../crates/server/preview/vendor/LICENSE-workbench-land.txt).
+It is a general-purpose locator; all geometry and bounding values remain available
+in the current resource's JSON.
