@@ -48,117 +48,248 @@ pub(crate) fn representation_links(doc: &mut Value, wanted: Wanted) {
     }
 }
 
-fn links_html(doc: &Value) -> String {
-    let mut body = String::from("<nav aria-label=\"Resource links\"><ul>\n");
-    if let Some(links) = doc["links"].as_array() {
-        for link in links {
-            let rel = link["rel"].as_str().unwrap_or_default();
-            let label = match rel {
-                "self" => "This resource",
-                "next" => "Next page",
-                "prev" => "Previous page",
-                "collection" => "Collection",
-                "alternate" => "GeoJSON",
-                _ => rel,
-            };
-            body.push_str(&format!(
-                "<li><a rel=\"{}\" href=\"{}\">{}</a></li>\n",
-                escape(rel),
-                escape(link["href"].as_str().unwrap_or_default()),
-                escape(label),
-            ));
-        }
-    }
-    body.push_str("</ul></nav>\n");
-    body
+#[derive(Default)]
+pub(crate) struct FeatureControls {
+    pub filterables: Vec<String>,
+    pub sortables: Vec<String>,
+    pub temporal: bool,
 }
 
-fn feature_html(feature: &Value) -> String {
-    let id = feature["id"].as_str().unwrap_or_default();
-    let href = feature["links"][0]["href"].as_str().unwrap_or_default();
-    let mut body = format!(
-        "<article><h2>Feature <a href=\"{}\">{}</a></h2>\n\
-         <table><caption>Properties</caption><thead><tr><th scope=\"col\">Property</th>\
-         <th scope=\"col\">Value</th></tr></thead><tbody>\n",
-        escape(href),
-        escape(id),
-    );
-    if let Some(properties) = feature["properties"].as_object() {
-        for (name, value) in properties {
-            let text = value
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| value.to_string());
-            body.push_str(&format!(
-                "<tr><th scope=\"row\">{}</th><td>{}</td></tr>\n",
-                escape(name),
-                escape(&text),
-            ));
-        }
-    }
-    body.push_str("</tbody></table>\n");
-    if feature["geometry"].is_null() {
-        body.push_str("<p>No geometry available.</p>\n");
-    } else {
-        body.push_str(&format!(
-            "<details><summary>Geometry ({})</summary><pre>{}</pre></details>\n",
-            escape(feature["geometry"]["type"].as_str().unwrap_or_default()),
-            escape(
-                &serde_json::to_string_pretty(&feature["geometry"]).expect("geometry serializes")
-            ),
+fn href_for<'a>(doc: &'a Value, rel: &str) -> &'a str {
+    doc["links"]
+        .as_array()
+        .and_then(|links| links.iter().find(|link| link["rel"] == rel))
+        .and_then(|link| link["href"].as_str())
+        .unwrap_or_default()
+}
+
+fn feature_title(feature: &Value) -> String {
+    let p = &feature["properties"];
+    ["name", "event", "impact_over"]
+        .iter()
+        .find_map(|key| p[key].as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+        .unwrap_or_else(|| feature["id"].as_str().unwrap_or("Feature").to_owned())
+}
+
+fn feature_flags(feature: &Value) -> String {
+    let p = &feature["properties"];
+    let mut out = String::new();
+    if let Some(severity) = p["severity"].as_str() {
+        out.push_str(&format!(
+            "<span class=\"badge\">{}</span>",
+            escape(severity)
         ));
     }
-    body.push_str(&links_html(feature));
-    body.push_str("</article>\n");
-    body
+    if p["likely_clutter"] == true {
+        out.push_str("<span class=\"badge warning\">Likely clutter</span>");
+    }
+    // Browser enhancement labels expired alerts; server output and ETags stay deterministic.
+    if let Some(expires) = p["expires"].as_str() {
+        out.push_str(&format!(
+            "<span class=\"badge\" data-expiry=\"{}\">Expires {}</span>",
+            escape(expires),
+            escape(expires)
+        ));
+    }
+    out
 }
 
-pub(crate) fn features_html(doc: &Value, title: &str, collection_id: &str, base: &str) -> String {
-    let mut body = format!(
-        "<h1>{}</h1>\n<p><a rel=\"collection\" href=\"{}/features/collections/{}?f=html\">Collection</a> \
-         · <a href=\"{}/features/collections/{}/items?f=html\">Browse features</a></p>\n",
-        escape(title), escape(base), escape(&path_segment(collection_id)),
-        escape(base), escape(&path_segment(collection_id)),
+fn query_form(doc: &Value, controls: &FeatureControls) -> String {
+    use api_common::workbench as ui;
+    let href = href_for(doc, "self");
+    let (action, query) = href.split_once('?').unwrap_or((href, ""));
+    let pairs: Vec<_> = form_urlencoded::parse(query.as_bytes()).collect();
+    let value = |key: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_ref())
+            .unwrap_or("")
+    };
+    let mut out = format!("<form class=\"query-form item-query panel enhanced\" action=\"{}\" method=\"get\"><h2>Query parameters</h2><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"fields\">",escape(action));
+    out.push_str(&ui::input(
+        "bbox",
+        value("bbox"),
+        "CRS84 · west,south,east,north",
+        "text",
+        true,
+    ));
+    if controls.temporal || !value("datetime").is_empty() {
+        out.push_str(&ui::input(
+            "datetime",
+            value("datetime"),
+            "UTC instant or interval",
+            "text",
+            true,
+        ));
+    }
+    for (key, default) in [("limit", "100"), ("offset", "0")] {
+        out.push_str(&ui::input(
+            key,
+            if value(key).is_empty() {
+                default
+            } else {
+                value(key)
+            },
+            "integer",
+            "number",
+            false,
+        ));
+    }
+    if !controls.sortables.is_empty() {
+        out.push_str(&ui::input(
+            "sortby",
+            value("sortby"),
+            &format!(
+                "Comma-separated; prefix - for descending. Available: {}",
+                controls.sortables.join(", ")
+            ),
+            "text",
+            true,
+        ));
+    }
+    out.push_str("</div>");
+    if !controls.filterables.is_empty() {
+        let active = controls
+            .filterables
+            .iter()
+            .any(|key| pairs.iter().any(|(k, _)| k == key));
+        out.push_str(&format!("<details {}><summary>Property equality filters · {}</summary><p class=\"hint\">Exact values; all predicates are combined with AND. Numeric fields also accept comma-separated alternatives.</p><div class=\"fields\">",if active{"open"}else{""},controls.filterables.len()));
+        for name in &controls.filterables {
+            let values: Vec<_> = pairs
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| v.as_ref())
+                .collect();
+            if values.is_empty() {
+                out.push_str(&ui::input(name, "", "equals · optional", "text", true));
+            } else {
+                for value in values {
+                    let mut input =
+                        ui::input(name, value, "equals · applied predicate", "text", true);
+                    if value.is_empty() {
+                        input =
+                            input.replace("data-param=", "data-keep-empty=\"true\" data-param=");
+                    }
+                    out.push_str(&format!("<div data-predicate>{input}<button class=\"btn\" type=\"button\" data-clear-predicate>Clear {}</button></div>",escape(name)));
+                }
+            }
+        }
+        out.push_str("</div></details>");
+    }
+    out.push_str(&format!("<button class=\"btn primary\">Apply query</button>{}<div class=\"draft\"><p class=\"hint\">Request preview · apply to update results</p><code data-draft></code></div></form><noscript><p class=\"notice\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Reset query","btn")));
+    out
+}
+
+pub(crate) fn features_html(
+    doc: &Value,
+    title: &str,
+    collection_id: &str,
+    base: &str,
+    controls: &FeatureControls,
+) -> String {
+    use api_common::workbench as ui;
+    let collection_url = format!(
+        "{base}/features/collections/{}",
+        path_segment(collection_id)
     );
+    let items_url = format!("{collection_url}/items");
+    let is_list = doc["features"].is_array();
+    let page_title = if is_list {
+        title.to_owned()
+    } else {
+        feature_title(doc)
+    };
+    let json_url = ui::with_format(href_for(doc, "self"), "json");
+    let mut body = format!(
+        "<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← {}</a>",
+        escape(if is_list { &collection_url } else { &items_url }),
+        escape(&ui::with_format(
+            if is_list { &collection_url } else { &items_url },
+            "html"
+        )),
+        if is_list {
+            "Collection metadata"
+        } else {
+            "Back to items"
+        }
+    );
+    body.push_str(&ui::page_heading(
+        &page_title,
+        if is_list {
+            "Inspect the features returned by this request. The map shows this page only."
+        } else {
+            "Feature properties and geometry from the same resource as GeoJSON."
+        },
+    ));
     let features = if let Some(features) = doc["features"].as_array() {
         body.push_str(&format!(
-            "<p>Features returned: {} · Matched: {}</p>\n<p>Response time: <time>{}</time></p>\n",
-            doc["numberReturned"],
-            doc["numberMatched"],
-            escape(doc["timeStamp"].as_str().unwrap_or_default()),
+            "<div data-results-scope=\"{}\"></div>",
+            escape(&items_url)
         ));
-        body.push_str(&links_html(doc));
-        if features.is_empty() {
-            body.push_str("<p>No features match this query.</p>\n");
-        }
+        body.push_str(&query_form(doc, controls));
+        body.push_str(&format!("<div class=\"results-head\"><h2>Features returned: {} · Matched: {}</h2><p>Response time: <time>{}</time></p></div>",ui::value_html(&doc["numberReturned"]),ui::value_html(&doc["numberMatched"]),escape(doc["timeStamp"].as_str().unwrap_or_default())));
         features.as_slice()
     } else {
         std::slice::from_ref(doc)
     };
-    // Embed only geometry + IDs: tables already contain all properties. Escaped
-    // JSON in an inert HTML element avoids script-closing injection entirely.
-    let map_features: Vec<_> = features.iter().filter(|f| !f["geometry"].is_null())
-        .map(|f| json!({"type": "Feature", "id": f["id"], "geometry": f["geometry"], "properties": {}}))
-        .collect();
-    let mut head = String::from("<style>table{border-collapse:collapse;width:100%;margin-bottom:1rem}th,td{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:.4rem;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}article{margin:2rem 0}</style>\n");
+    let map_features: Vec<_> = features.iter().filter(|f|!f["geometry"].is_null()).map(|f|json!({"type":"Feature","id":f["id"],"geometry":f["geometry"],"properties":{"label":feature_title(f),"href":href_for(f,"self")}})).collect();
+    let mut head = String::new();
+    body.push_str("<div class=\"item-layout\"><section class=\"panel\">");
+    if is_list {
+        body.push_str("<div class=\"table-scroll\"><table class=\"item-table\"><thead><tr><th scope=\"col\">Feature / ID</th><th scope=\"col\">Geometry</th><th scope=\"col\">Context</th></tr></thead><tbody>");
+        for feature in features {
+            body.push_str(&format!("<tr><td><a class=\"table-link\" href=\"{}\">{}<small>{}</small></a></td><td>{}</td><td><div class=\"tags\">{}</div></td></tr>",escape(href_for(feature,"self")),escape(&feature_title(feature)),escape(feature["id"].as_str().unwrap_or_default()),escape(feature["geometry"]["type"].as_str().unwrap_or("No geometry")),feature_flags(feature)));
+        }
+        body.push_str("</tbody></table></div>");
+        if features.is_empty() {
+            body.push_str("<div class=\"empty\"><h2>No features match this query.</h2><p>Change or reset the filters.</p></div>");
+        }
+        let nav: Vec<_> = doc["links"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|l| {
+                ds_core::html::LinkView::new(
+                    l["href"].as_str().unwrap_or_default(),
+                    l["rel"].as_str().unwrap_or_default(),
+                    None,
+                )
+            })
+            .collect();
+        body.push_str(&ui::pagination(&nav));
+    } else {
+        body.push_str(&format!("<div class=\"feature-summary\"><code>{}</code><div class=\"tags\">{}</div></div><label class=\"property-search enhanced\" for=\"property-search\">Find a property<input id=\"property-search\" placeholder=\"Property name\"></label>",escape(doc["id"].as_str().unwrap_or_default()),feature_flags(doc)));
+        body.push_str(&ui::property_table(&doc["properties"]));
+    }
+    body.push_str("</section><aside class=\"panel\"><h2>Geometry</h2>");
     if !map_features.is_empty() {
         head.push_str(&format!(
-            "<link rel=\"stylesheet\" href=\"{}/preview/vendor/maplibre-gl.css\">\n",
+            "<link rel=\"stylesheet\" href=\"{}/preview/vendor/maplibre-gl.css\">",
             escape(base)
         ));
-        body.push_str(&format!(
-            "<div id=\"feature-map\" role=\"region\" aria-label=\"Feature geometry map\" style=\"height:20rem\"></div>\n\
-             <p id=\"map-status\">Map requires JavaScript and WebGL; geometry is also listed below.</p>\n\
-             <div id=\"map-data\" hidden>{}</div>\n\
-             <script src=\"{}/preview/vendor/maplibre-gl.js\"></script>\n<script>{}</script>\n",
-            escape(&json!({"type": "FeatureCollection", "features": map_features}).to_string()),
-            escape(base), include_str!("feature-map.js"),
-        ));
+        body.push_str(&format!("<div class=\"map-panel\"><div id=\"feature-map\" role=\"region\" aria-label=\"Feature geometry map\"></div><p id=\"map-status\">Map requires JavaScript and WebGL; geometry is also listed below.</p><div id=\"map-data\" hidden>{}</div></div><script src=\"{}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&json!({"type":"FeatureCollection","features":map_features}).to_string()),escape(base),include_str!("feature-map.js")));
+    } else {
+        body.push_str("<div class=\"empty\"><p>No geometry available.</p></div>");
     }
     for feature in features {
-        body.push_str(&feature_html(feature));
+        body.push_str(&format!(
+            "<details><summary>Geometry ({}) · {}</summary><pre>{}</pre></details>",
+            escape(feature["geometry"]["type"].as_str().unwrap_or("None")),
+            escape(feature["id"].as_str().unwrap_or_default()),
+            escape(
+                &serde_json::to_string_pretty(&feature["geometry"]).expect("geometry serializes")
+            )
+        ));
     }
-    ds_core::html::page_with_head(title, &head, &body)
+    body.push_str("</aside></div>");
+    ui::Page {
+        base,
+        api: "features",
+        title: &page_title,
+        json_url: &json_url,
+    }
+    .render(&body, &head)
 }
 
 #[cfg(test)]
@@ -166,6 +297,31 @@ mod tests {
     use super::*;
     use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
     use ds_core::feature::{Feature, FeaturePage, Geometry, PropertyValue};
+
+    #[test]
+    fn query_builder_preserves_duplicate_and_empty_predicates_and_capabilities() {
+        let doc = json!({"links":[{"rel":"self","href":"https://example.test/prefix/features/collections/a/items?name=a%26b&name=&offset=20&sortby=-score&f=html"}]});
+        let controls = FeatureControls {
+            filterables: vec!["name".into()],
+            sortables: vec!["score".into()],
+            temporal: true,
+        };
+        let html = query_form(&doc, &controls);
+        assert_eq!(html.matches("data-param=\"name\"").count(), 2);
+        assert!(html.contains("value=\"a&amp;b\""));
+        assert!(html.contains("data-keep-empty=\"true\""));
+        assert!(html.contains("data-clear-predicate"));
+        assert!(html.contains("data-param=\"sortby\""));
+        assert!(html.contains("value=\"-score\""));
+        assert!(html.contains("data-param=\"datetime\""));
+        let plain = query_form(
+            &json!({"links":[{"rel":"self","href":"/features/collections/a/items"}]}),
+            &FeatureControls::default(),
+        );
+        assert!(!plain.contains("data-param=\"sortby\""));
+        assert!(!plain.contains("data-param=\"datetime\""));
+        assert!(!plain.contains("data-param=\"name\""));
+    }
 
     #[test]
     fn untrusted_properties_ids_and_geometry_stay_inert_and_complete() {
@@ -192,12 +348,20 @@ mod tests {
         };
         let mut doc = feature_to_geojson(&feature, "test", "https://example.com/prefix");
         representation_links(&mut doc, Wanted::Html);
-        let html = features_html(&doc, attack, "test", "https://example.com/prefix");
+        let html = features_html(
+            &doc,
+            attack,
+            "test",
+            "https://example.com/prefix",
+            &FeatureControls::default(),
+        );
         assert!(!html.contains(attack));
         assert!(html.contains(&escape(attack)));
         assert!(html.contains("a%2Fb%20%3F%23%C3%A9"));
         assert!(html.contains("Geometry (Polygon)"));
-        assert!(html.contains("true,42,null"));
+        assert!(html.contains(">true</span>"));
+        assert!(html.contains(">42</span>"));
+        assert!(html.contains("Not available"));
         assert!(html.contains("https://example.com/prefix/preview/vendor/maplibre-gl.js"));
         let embedded = html
             .split("<div id=\"map-data\" hidden>")
@@ -215,7 +379,7 @@ mod tests {
         let mut doc = json!({"type": "Feature", "id": "empty", "geometry": null,
             "properties": {}, "links": [{"rel": "self", "href": "/items/empty"}]});
         representation_links(&mut doc, Wanted::Html);
-        let html = features_html(&doc, "No geometry", "test", "");
+        let html = features_html(&doc, "No geometry", "test", "", &FeatureControls::default());
         assert!(html.contains("No geometry available."));
         assert!(!html.contains("maplibre-gl.js"));
     }

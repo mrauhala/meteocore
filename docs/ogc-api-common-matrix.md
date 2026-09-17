@@ -287,3 +287,13 @@ Common repository commit.
 23-058r2: 894eac40d35da34711fa83db901b127d4b11907ba2c25eb9bf9f8564b82a7b14
 25-046:   aae2a94282682a400d17d78273861423e16baaf4faf4c23c70854e6b29372248
 ```
+
+### Shared HTML workbench
+
+EDR, Maps, Tiles and Features now share the HTML shell and discovery query UI in
+[`api-common::workbench`](../crates/api-common/src/workbench.rs). The query builder
+uses the same Common parameter inventory as validation and OpenAPI. Current-page
+JSON links retain applied filters and paging. Full metadata, themes and navigation
+are presentation changes; no additional Common conformance class is declared.
+Common sorting, hierarchies, `sd` and `resolution` remain unavailable and have no
+active UI controls. Features item sorting is a separate, engine-advertised contract.

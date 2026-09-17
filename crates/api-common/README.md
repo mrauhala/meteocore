@@ -1,7 +1,8 @@
 # Shared OGC API Common HTTP layer
 
 EDR, Maps, Tiles and Features use this crate for collection discovery. Pure search
-and HTML/extent types remain in `ds-core`; this crate owns Axum/JSON plumbing.
+and extent policy remain in `ds-core`; this crate owns Axum/JSON plumbing and
+the shared HTML workbench.
 API adapters keep their engine registries, access links, extent representations
 and API-specific fields.
 
@@ -93,3 +94,28 @@ Cross-API contracts live in
 cargo test -p server --test common_discovery
 cargo test -p ds-core -p api-edr -p api-features -p api-maps -p api-tiles
 ```
+
+## HTML API workbench
+
+`workbench` renders the shared server/API landing pages, conformance, collection
+lists and full collection metadata for EDR, Maps, Tiles and Features. EDR model
+runs and Features item pages use the same shell. The JSON link and copyable URL /
+cURL always represent the current resource with its applied filters and paging;
+unsubmitted edits appear separately in the request preview.
+
+The collection builder derives its fields from `CollectionParameter::ALL`.
+Search and paging use ordinary GET requests. Optional advanced controls omit
+empty values; literal `+` operators are form-encoded. Unsupported Common sorting,
+`sd`, `resolution` and hierarchy controls are not shown. Adding them requires the
+shared validator, metadata and OpenAPI contract to support them first.
+
+Light/dark/system themes persist in the browser. Body text and controls are
+16px; supporting text and code are at least 14px. Navigation, metadata, JSON links
+and paging work without JavaScript; basic collection text search also works.
+JavaScript enables optional query fields, clipboard buttons, view switching,
+property search and return links to the last filtered list. API validation errors
+retain the existing structured JSON error response.
+
+No engine queries run from the renderer. Metadata comes from the existing JSON
+builders. The workbench does not add HTML representations to map images, tiles,
+EDR data-query responses, or the WMS/3D Tiles viewers.

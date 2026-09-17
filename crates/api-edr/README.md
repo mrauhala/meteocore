@@ -182,3 +182,13 @@ fields through 64 bits. Unsupported operators or unknown national descriptors
 skip the affected message (counted in `bufr_decode_failures_total`); other
 messages in the same file remain available. See
 [`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).
+
+### HTML workbench
+
+Landing, conformance, collections, collection and model-run metadata use the
+shared `api-common::workbench` shell with light/dark/system themes and a persistent
+JSON switch. The collection builder exposes Common text/spatial/temporal search
+and paging. Collection and instance detail pages retain the complete EDR metadata,
+including parameter descriptions, extents and available query links. Data-query
+payloads keep their existing representations. See the
+[shared HTML behavior](../api-common/README.md#html-api-workbench).

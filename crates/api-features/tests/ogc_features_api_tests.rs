@@ -1047,10 +1047,18 @@ mod feature_html {
                 if html {
                     assert!(ct.starts_with("text/html"));
                     assert!(body.contains("<!DOCTYPE html>"));
-                    assert!(body.contains("<table>"));
+                    assert!(body.contains("<table class=\""));
                     assert!(body.contains("Helsinki"));
                     assert!(body.contains("maplibre-gl.js"));
-                    assert!(body.contains("?f=json"));
+                    let alternate = body
+                        .split("id=\"json-link\" href=\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    assert!(alternate.contains("f=json"));
+                    assert!(body.contains("rel=\"alternate\" type=\"application/geo+json\""));
                     assert!(body.contains("Geometry (Point)"));
                 } else {
                     assert_eq!(ct, "application/geo+json");

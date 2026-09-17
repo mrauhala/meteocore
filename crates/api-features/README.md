@@ -215,3 +215,20 @@ fields through 64 bits. Unsupported operators or unknown national descriptors
 skip the affected message (counted in `bufr_decode_failures_total`); other
 messages in the same file remain available. See
 [`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).
+
+### HTML workbench
+
+Metadata and items share the `api-common::workbench` navigation, themes and
+current-resource JSON switch. The item query builder offers bbox/paging plus
+temporal, exact property and sort controls advertised by the selected engine.
+Repeated predicates and intentional empty predicates from an existing URL are
+preserved. Collection search uses Common `q`/`query`; item queries keep their
+existing Features semantics.
+
+Individual items show all typed properties (including false, zero, null, arrays
+and nested objects). The geometry-only MapLibre view renders this response page,
+with a picker for overlapping features, theme-aware shapes and coordinate details
+when WebGL is unavailable. It makes no additional feature or external tile
+requests. Alert expiry is labelled in the browser; server HTML and ETags remain
+deterministic. JavaScript enables item-query editing, map interaction and property
+search; paging and resource links remain usable without it.
