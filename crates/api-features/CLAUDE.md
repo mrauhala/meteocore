@@ -35,3 +35,12 @@ without reading code.
   against `schemas/openapi-3.0.json` in tests. New route or parameter ⇒
   update it in the same PR; copy standard parameter schemas verbatim,
   including `style`/`explode`.
+
+## Shared Common discovery (#739)
+
+Use `api-common` for `/collections` validation, responses, links, Common metadata
+fields, OpenAPI operation definitions and Common conformance declarations. The
+adapter supplies engine extents; search and advertised metadata must agree.
+See `crates/api-common/CLAUDE.md` and update `docs/ogc-api-common-matrix.md` when
+changing this behavior. Do not restore the Part 4 class without implementing
+and checking the recorded draft's remaining requirements.

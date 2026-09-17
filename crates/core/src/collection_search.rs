@@ -1,5 +1,7 @@
 //! OGC API – Common – Part 4 ("Discovery within many collections", draft
-//! [25-046]) — the **Searchable Collections** requirements class.
+//! [25-046]) — a subset of the **Searchable Collections** requirements class.
+//! The 2026-09-17 draft also requires `query`, `sd`, and `resolution`; those
+//! are not implemented, so API layers must not advertise that class yet.
 //!
 //! Filtering and pagination for the `/collections` resource: `bbox` /
 //! `bbox-crs`, `datetime`, `q`, and `limit` + `offset`. The logic lives here
@@ -321,12 +323,50 @@ fn word_match(text: &str, term: &str) -> bool {
         .any(|w| w.to_lowercase() == term)
 }
 
-/// Raw `/collections` query parameters, deserialized by the API crates'
-/// handlers (`Query<SearchQueryParams>`). Defined here so all four surfaces
-/// share one extractor; [`parse`](Self::parse) validates it into
+/// Supported collection discovery controls. HTTP validation and OpenAPI use
+/// this inventory; new controls must also be implemented in the parser/search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionParameter {
+    Bbox,
+    BboxCrs,
+    Datetime,
+    Q,
+    Limit,
+    Offset,
+    Format,
+}
+
+impl CollectionParameter {
+    pub const ALL: &'static [Self] = &[
+        Self::Bbox,
+        Self::BboxCrs,
+        Self::Datetime,
+        Self::Q,
+        Self::Limit,
+        Self::Offset,
+        Self::Format,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bbox => "bbox",
+            Self::BboxCrs => "bbox-crs",
+            Self::Datetime => "datetime",
+            Self::Q => "q",
+            Self::Limit => "limit",
+            Self::Offset => "offset",
+            Self::Format => "f",
+        }
+    }
+}
+
+/// Raw `/collections` query parameters, constructed from decoded pairs by the
+/// shared api-common extractor. Unsupported and duplicate controls are rejected;
+/// [`parse`](Self::parse) validates it into
 /// [`SearchParams`] and [`query_string`](Self::query_string) rebuilds a
 /// link href for the same request at a different offset.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchQueryParams {
     pub bbox: Option<String>,
     #[serde(rename = "bbox-crs")]
@@ -342,6 +382,42 @@ pub struct SearchQueryParams {
 }
 
 impl SearchQueryParams {
+    /// Consume decoded query pairs without silently discarding unsupported or
+    /// duplicate controls. Keep percent decoding at the HTTP boundary.
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, SearchError> {
+        let mut params = Self::default();
+        for (name, value) in pairs {
+            let parameter = CollectionParameter::ALL
+                .iter()
+                .find(|p| p.name() == name)
+                .ok_or_else(|| {
+                    SearchError::new(format!(
+                        "Unknown collection query parameter '{name}'; supported: {}",
+                        CollectionParameter::ALL
+                            .iter()
+                            .map(|p| p.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+            let slot = match parameter {
+                CollectionParameter::Bbox => &mut params.bbox,
+                CollectionParameter::BboxCrs => &mut params.bbox_crs,
+                CollectionParameter::Datetime => &mut params.datetime,
+                CollectionParameter::Q => &mut params.q,
+                CollectionParameter::Limit => &mut params.limit,
+                CollectionParameter::Offset => &mut params.offset,
+                CollectionParameter::Format => &mut params.f,
+            };
+            if slot.replace(value).is_some() {
+                return Err(SearchError::new(format!(
+                    "Duplicate collection query parameter '{name}'"
+                )));
+            }
+        }
+        Ok(params)
+    }
+
     /// Validate into [`SearchParams`] (→ HTTP 400 on bad input).
     pub fn parse(&self) -> Result<SearchParams, SearchError> {
         parse_search_params(

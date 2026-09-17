@@ -157,6 +157,7 @@ fn build_collection_metadata(
     config: &CollectionConfig,
     raster_info: Option<&ds_core::map_engine::RasterInfo>,
     feature_extent: Option<[f64; 4]>,
+    feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
     styles: Option<&HashMap<String, StyleInfo>>,
     base_url: &str,
 ) -> serde_json::Value {
@@ -245,7 +246,7 @@ fn build_collection_metadata(
     // CRS84 first (stable sort keeps the rest in order).
     crs_uris.sort_by_key(|c| *c != CRS84_URI);
 
-    let mut links = vec![
+    let links = vec![
         json!({
             "href": format!("{base_url}/tiles/collections/{}", config.id),
             "rel": "self",
@@ -259,26 +260,17 @@ fn build_collection_metadata(
             "title": "Tilesets"
         }),
     ];
-    if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
-        // No `type`: an operator-supplied license URL may not be HTML, and OGC
-        // API Common §6.5.2 wants the link's real media type — omitting is valid.
-        links.push(json!({ "href": url, "rel": "license", "title": title }));
-    }
 
-    let mut metadata = json!({
-        "id": config.id,
-        "title": config.title,
-        "description": config.description,
-        "dataType": data_type,
-        "crs": crs_uris,
-        "tileMatrixSetLinks": tms_links,
-        "styles": style_list,
-        "links": links
-    });
-    // OGC API – Common – Part 2 `keywords`: emit only when non-empty.
-    if !config.keywords.is_empty() {
-        metadata["keywords"] = json!(config.keywords);
-    }
+    let mut metadata = api_common::collection_metadata(
+        config,
+        json!({
+            "dataType": data_type,
+            "crs": crs_uris,
+            "tileMatrixSetLinks": tms_links,
+            "styles": style_list,
+        }),
+        links,
+    );
 
     // No `itemType`: OGC API – Common – Part 2 §7.13 defines it as describing
     // the items reachable at /collections/{id}/items, but the Tiles router has
@@ -292,11 +284,21 @@ fn build_collection_metadata(
         metadata["storageCrs"] = json!(sc);
     }
 
-    if let Some(extent) = build_extent(raster_info, feature_extent) {
+    if let Some(extent) = build_extent(raster_info, feature_extent, feature_time) {
         metadata["extent"] = extent;
     }
 
     metadata
+}
+
+/// Temporal extent precedence shared by discovery and metadata.
+fn collection_time(
+    raster_info: Option<&ds_core::map_engine::RasterInfo>,
+    feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    raster_info
+        .and_then(|i| i.times.first().copied().zip(i.times.last().copied()))
+        .or(feature_time)
 }
 
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
@@ -309,20 +311,30 @@ fn build_collection_metadata(
 fn build_extent(
     raster_info: Option<&ds_core::map_engine::RasterInfo>,
     feature_extent: Option<[f64; 4]>,
+    feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
 ) -> Option<serde_json::Value> {
     let spatial_extent = raster_info
         .and_then(|i| i.spatial_extent)
         .or(feature_extent);
-    // Temporal/vertical/grid come from the raster source only; vector-only
-    // collections contribute just the (feature) bbox. An absent `native_crs`
-    // is harmless: with `grid_size = None` the grid block is skipped anyway.
-    let extent = ds_core::ogc_extent::build_extent(
+    let raster_times = raster_info
+        .map(|i| i.times.as_slice())
+        .filter(|t| !t.is_empty());
+    let feature_times: Vec<_> = feature_time
+        .map(|(start, end)| vec![start, end])
+        .unwrap_or_default();
+    let mut extent = ds_core::ogc_extent::build_extent(
         spatial_extent,
         raster_info.and_then(|i| i.grid_size),
         raster_info.map(|i| i.native_crs.as_str()).unwrap_or(""),
-        raster_info.map(|i| i.times.as_slice()).unwrap_or(&[]),
+        raster_times.unwrap_or(&feature_times),
         raster_info.and_then(|i| i.vertical.as_ref()),
     )?;
+    // An interval's endpoints are bounds, not an inventory of sample times.
+    if raster_times.is_none() {
+        if let Some(temporal) = &mut extent.temporal {
+            temporal.grid = None;
+        }
+    }
     Some(serde_json::to_value(extent).expect("Extent serializes to JSON"))
 }
 
@@ -412,30 +424,6 @@ pub async fn landing_page(
 fn format_parameter() -> serde_json::Value {
     json!({"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
-}
-
-/// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
-/// `/collections` query parameters (plus the shared `f` format selector).
-fn searchable_collections_parameters() -> serde_json::Value {
-    let mut params = json!([
-        {"name": "bbox", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Filter to collections intersecting this CRS84 bbox: 4 (or 6) comma-separated numbers west,south,east,north."},
-        {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "CRS of the bbox values. Only CRS84 is supported."},
-        {"name": "datetime", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Filter to collections whose temporal extent intersects this RFC 3339 instant or interval (start/end, ../end, start/..)."},
-        {"name": "q", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Free-text search (comma-separated terms, OR) over collection title, description, and keywords."},
-        {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
-         "description": "Maximum number of collections per page (default 1000)."},
-        {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
-         "description": "Number of matching collections to skip (pagination cursor)."}
-    ]);
-    params
-        .as_array_mut()
-        .expect("searchable params is a JSON array")
-        .push(format_parameter());
-    params
 }
 
 /// GET /tiles/api — OpenAPI 3.0.3 definition
@@ -628,14 +616,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "responses": { "200": {"description": "Conformance classes"} }
             }
         },
-        "/tiles/collections": {
-            "get": {
-                "summary": "List tile-enabled collections",
-                "operationId": "getCollections",
-                "parameters": searchable_collections_parameters(),
-                "responses": { "200": {"description": "List of collections"} }
-            }
-        },
+        "/tiles/collections": {"get": api_common::collection_operation()},
         "/tiles/tileMatrixSets": {
             "get": {
                 "summary": "List supported tile matrix sets",
@@ -791,22 +772,7 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-    let classes = [
-        // OGC API - Common - Part 1: Core (landing page, /conformance,
-        // /api) and Part 2: Geospatial Data (/collections + /collections/
-        // {id}, JSON). Both are satisfied structurally; the HTML class
-        // (.../common-2/.../conf/html) is now declared — the HTML
-        // representation is served via `?f=html` / Accept.
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/html",
-        // OGC API - Common - Part 4 (Discovery within many collections,
-        // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
-        // limit filtering + offset pagination.
-        "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
+    let classes = api_common::conformance_classes(&[
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
@@ -815,7 +781,7 @@ pub async fn conformance(
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/png",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/jpeg",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt",
-    ];
+    ]);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {
@@ -882,25 +848,13 @@ pub async fn tile_matrix_set(Path(tms_id): Path<String>) -> Result<impl IntoResp
 /// GET /tiles/collections — List tile-enabled collections
 pub async fn collections(
     State(state): State<AppState>,
-    Query(sp): Query<ds_core::collection_search::SearchQueryParams>,
+    request: api_common::CollectionRequest,
     headers: HeaderMap,
-) -> Result<Response, TilesError> {
-    use ds_core::collection_search::{search, CollectionMatch};
-    use ds_core::html::Wanted;
-
-    let wanted = negotiate(sp.f.as_deref(), &headers)?;
-    let params = sp
-        .parse()
-        .map_err(|e| TilesError::BadRequest(e.to_string()))?;
+) -> Response {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-
-    // Surface every tile-enabled collection, regardless of which engine backs
-    // it — a vector-only collection that lives in `feature_collections` would
-    // otherwise be invisible. Rows are (id, title, description, bbox, time,
-    // metadata); tuple element types are inferred (no extra chrono import).
     let mut seen = std::collections::HashSet::new();
-    let mut rows: Vec<_> = Vec::new();
+    let mut entries = Vec::new();
     for config in state
         .collections
         .values()
@@ -910,127 +864,30 @@ pub async fn collections(
             continue;
         }
         let raster_info = state.map_engines.get(&config.id).map(|e| e.raster_info());
-        let feature_extent = state
-            .feature_engines
-            .get(&config.id)
-            .and_then(|e| e.spatial_extent());
-        let styles = state.styles.get(&config.id);
-        let value =
-            build_collection_metadata(config, raster_info.as_ref(), feature_extent, styles, base);
+        let feature = state.feature_engines.get(&config.id);
+        let feature_extent = feature.and_then(|e| e.spatial_extent());
+        let feature_time = feature.and_then(|e| e.temporal_extent());
         let bbox = raster_info
             .as_ref()
             .and_then(|i| i.spatial_extent)
             .or(feature_extent);
-        let time = raster_info
-            .as_ref()
-            .and_then(|i| i.times.first().copied().zip(i.times.last().copied()));
-        rows.push((
-            config.id.clone(),
-            config.title.clone(),
-            config.description.clone(),
+        let time = collection_time(raster_info.as_ref(), feature_time);
+        let metadata = build_collection_metadata(
+            config,
+            raster_info.as_ref(),
+            feature_extent,
+            feature_time,
+            state.styles.get(&config.id),
+            base,
+        );
+        entries.push(api_common::CollectionEntry {
+            config,
+            metadata,
             bbox,
             time,
-            value,
-            config.keywords.clone(),
-            config.license.as_ref().map(|l| l.card_label()),
-        ));
+        });
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let matches: Vec<CollectionMatch> = rows
-        .iter()
-        .map(|r| CollectionMatch {
-            title: &r.1,
-            description: &r.2,
-            keywords: &r.6,
-            bbox: r.3,
-            time: r.4,
-        })
-        .collect();
-    let result = search(&matches, &params);
-    let href = |offset| {
-        format!(
-            "{base}/tiles/collections{}",
-            sp.query_string(params.limit, offset)
-        )
-    };
-
-    Ok(with_vary(match wanted {
-        Wanted::Json => {
-            let colls: Vec<serde_json::Value> =
-                result.page.iter().map(|&i| rows[i].5.clone()).collect();
-            let number_returned = colls.len();
-
-            let link = |rel: &str, offset: usize, title: Option<&str>| {
-                let mut o = json!({ "href": href(offset), "rel": rel, "type": "application/json" });
-                if let Some(t) = title {
-                    o["title"] = json!(t);
-                }
-                o
-            };
-            let mut links = vec![link("self", params.offset, None)];
-            if result.has_next {
-                links.push(link("next", result.next_offset, Some("Next page")));
-            }
-            if result.has_prev {
-                links.push(link("prev", result.prev_offset, Some("Previous page")));
-            }
-
-            Json(json!({
-                "collections": colls,
-                "numberMatched": result.number_matched,
-                "numberReturned": number_returned,
-                "links": links
-            }))
-            .into_response()
-        }
-        Wanted::Html => {
-            use ds_core::html::{CollectionCard, LinkView};
-            let cards: Vec<CollectionCard> = result
-                .page
-                .iter()
-                .map(|&i| CollectionCard {
-                    id: rows[i].0.clone(),
-                    title: rows[i].1.clone(),
-                    description: rows[i].2.clone(),
-                    self_href: format!("{base}/tiles/collections/{}", rows[i].0),
-                    keywords: rows[i].6.clone(),
-                    license: rows[i].7.clone(),
-                })
-                .collect();
-            let mut nav = vec![LinkView::new(
-                href(params.offset),
-                "self",
-                Some("This page"),
-            )];
-            if result.has_next {
-                nav.push(LinkView::new(
-                    href(result.next_offset),
-                    "next",
-                    Some("Next page"),
-                ));
-            }
-            if result.has_prev {
-                nav.push(LinkView::new(
-                    href(result.prev_offset),
-                    "prev",
-                    Some("Previous page"),
-                ));
-            }
-            // rel="alternate" to the JSON representation, preserving the current
-            // bbox/datetime/q/limit/offset filters (parity with the other HTML
-            // metadata pages).
-            nav.push(LinkView::new(
-                format!(
-                    "{base}/tiles/collections{}",
-                    sp.query_string_with_format(params.limit, params.offset, "json")
-                ),
-                "alternate",
-                Some("This page as JSON"),
-            ));
-            Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
-        }
-    }))
+    api_common::collections_response(&format!("{base}/tiles/collections"), request, entries)
 }
 
 /// GET /tiles/collections/{id} — Collection detail
@@ -1040,7 +897,7 @@ pub async fn collection(
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
-    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let raster_info = state.map_engines.get(&id).map(|e| e.raster_info());
@@ -1048,6 +905,10 @@ pub async fn collection(
         .feature_engines
         .get(&id)
         .and_then(|e| e.spatial_extent());
+    let feature_time = state
+        .feature_engines
+        .get(&id)
+        .and_then(|e| e.temporal_extent());
     let config = state
         .collections
         .get(&id)
@@ -1066,20 +927,17 @@ pub async fn collection(
                 config,
                 raster_info.as_ref(),
                 feature_extent,
+                feature_time,
                 styles,
                 base,
             ))
             .into_response()
         }
         Wanted::Html => {
-            let card = CollectionCard {
-                id: config.id.clone(),
-                title: config.title.clone(),
-                description: config.description.clone(),
-                self_href: format!("{base}/tiles/collections/{}", config.id),
-                keywords: config.keywords.clone(),
-                license: config.license.as_ref().map(|l| l.card_label()),
-            };
+            let card = api_common::collection_card(
+                config,
+                format!("{base}/tiles/collections/{}", config.id),
+            );
             let links = [
                 LinkView::new(
                     format!("{base}/tiles/collections/{}?f=json", config.id),

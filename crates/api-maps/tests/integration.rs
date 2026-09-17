@@ -2015,10 +2015,10 @@ mod searchable {
     }
 
     #[tokio::test]
-    async fn conformance_declares_searchable_collections() {
+    async fn conformance_does_not_claim_incomplete_searchable_collections() {
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
-        assert!(classes.iter().any(|c| c
+        assert!(!classes.iter().any(|c| c
             .as_str()
             .unwrap()
             .contains("common-4/1.0/conf/searchable-collections")));

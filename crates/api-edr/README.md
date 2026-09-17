@@ -25,8 +25,18 @@ Spec: OGC API - EDR 1.1 (OGC 19-086r6). Base route: `/edr`.
 | `geojson` | ✗ | data queries answer 400 for `f=GeoJSON`; only `/locations` is GeoJSON |
 | `edr-geojson` | ✗ | same reason (a test pins that it is *not* declared) |
 
-Also declared: OGC API - Common Part 1 (core, landing-page, oas30), Part 2
-(collections, json, html) and Part 4 searchable-collections (`/collections?bbox=&datetime=&q=&limit=&offset=`).
+Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
+Part 2 (collections, json, html). Collection discovery supports `bbox`,
+`bbox-crs` (CRS84 only), `datetime`, `q`, `limit`, `offset` and `f` through
+[api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
+return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
+preserve filters and the negotiated format. Collection descriptions expose HTML
+alternate links and configured keywords/license metadata through the shared helper.
+
+Part 4 `searchable-collections` is **not declared**: the 2026-09-17 draft also
+requires `query`, `sd` and `resolution`, which are not implemented. Existing
+basic search remains supported. See the [Common Parts 1–4 matrix](../../docs/ogc-api-common-matrix.md)
+for the specification baselines and remaining gaps.
 
 ## Query types
 

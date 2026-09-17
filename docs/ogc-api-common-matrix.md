@@ -6,10 +6,12 @@ across its four OGC API surfaces, including draft provisions that are not yet
 implemented. It is an implementation assessment, not an OGC certification or a
 claim that every requirement in a class has passed its abstract test suite.
 
-Assessed **2026-09-17**, against MeteoCore
-[`3475c42`](https://github.com/mrauhala/meteocore/tree/3475c4292ce35f9293af74e9e811f6d4b03b87c1)
-(#738). Read-only production probes supplemented source inspection. Production
-observations are a dated snapshot, not a guarantee about future deployments.
+Implementation assessment updated **2026-09-17** by the shared discovery work
+for [#739](https://github.com/mrauhala/meteocore/issues/739), based on main
+[`48bf897`](https://github.com/mrauhala/meteocore/tree/48bf8977d1aeaae5fda62eb98156e2fd57c49757)
+plus that change. The capability tables describe this source revision. The
+production probe table below is explicitly retained as **pre-change evidence**;
+it does not verify deployment of these fixes.
 
 **Specification baselines**
 
@@ -49,7 +51,7 @@ collection.
 | HTML metadata representations (§10.2) | Yes | Yes | Yes | Yes |
 | Representation negotiation (§8.7) | Partial [1] | Partial [1] | Partial [1] | Partial [1] |
 | Invalid supported collection parameter handling (§8.3.2) | Yes — e.g. `limit=0` → 400 | Yes — same | Yes — same | Yes — same |
-| Unknown collection parameter handling (§8.3.1) | Ignored [2] | Ignored [2] | Ignored [2] | Ignored [2] |
+| Unknown collection parameter handling (§8.3.1) | Rejected — 400 [2] | Rejected — 400 [2] | Rejected — 400 [2] | Rejected — 400 [2] |
 | HTTP caching of Common metadata (§8.4, recommendation) | Yes — Cache-Control, ETag, 304 | No metadata cache policy [3] | No metadata cache policy [3] | Yes — Cache-Control, ETag, 304 |
 | Cross-origin access (§8.5, recommendation) | Yes — server CORS | Yes — same | Yes — same | Yes — same |
 | UTF-8 metadata (§8.6) | Yes | Yes | Yes | Yes |
@@ -64,9 +66,9 @@ collection.
 | `itemType` for individually accessible items | Omitted; EDR locations require applicability review | N/A — map access | N/A — tile access | Yes — `feature` |
 | Links to data access mechanisms | Yes — EDR `data_queries` | Yes — map/styles, tiles when enabled | Yes — tilesets | Yes — items, vector tiles when enabled |
 | `self` links on collection list/detail | Yes | Yes | Yes | Yes |
-| `alternate` links for every supported representation (§7.1.2, §7.2.2.3) | Partial — JSON lacks HTML links [4] | Partial — same [4] | Partial — same [4] | Partial — same [4] |
+| `alternate` links for every supported representation (§7.1.2, §7.2.2.3) | Yes [4] | Yes [4] | Yes [4] | Yes [4] |
 | Spatial extent in CRS84 | Yes — engine-dependent | Yes — engine-dependent | Yes — raster or feature extent | Yes — engine-dependent |
-| Temporal extent metadata | Yes — engine-dependent | Yes — raster times | Partial — raster only [5] | Yes — time-aware engines [5] |
+| Temporal extent metadata | Yes — engine-dependent | Yes — raster times | Yes — raster or feature extent [5] | Yes — time-aware engines [5] |
 | Multiple spatial boxes / temporal intervals for sparse data | No — one overall extent | No — one overall extent | No — one overall extent | No — one overall extent |
 | Supported output CRS metadata (`crs`) | Yes — CRS84 | Yes — supported map CRSs | Yes — tile matrix set CRSs and native CRS where known | Yes — CRS84 |
 | Native CRS metadata (`storageCrs`) | No | Partial — known CRS URI only | Partial — known raster CRS URI only | Yes — CRS84 |
@@ -75,10 +77,10 @@ collection.
 | Vertical extent information | Partial — EDR-specific representation [7] | Partial — levels/unit/grid [7] | Partial — raster levels/unit/grid [7] | No |
 | Uniform Additional Dimensions class (§8) | No — EDR extent model [7] | Partial — no full class support [7] | Partial — no full class support [7] | No |
 | Regular spatial grid description (§8.2) | No Common grid descriptor | Partial — geographic grids only | Partial — geographic raster grids only | N/A — feature data |
-| Regular/irregular temporal grid description (§8.2) | No — EDR `temporal.values` instead | Yes — available raster time series | Partial — raster only | Partial — extent endpoints, not full time series [5] |
+| Regular/irregular temporal grid description (§8.2) | No — EDR `temporal.values` instead | Yes — available raster time series | Partial — raster only | No — intervals only [5] |
 | Additional axes such as ensemble/reference-time using the uniform extent model | No | No | No | No |
 | Collection JSON and HTML encodings (§9) | Yes | Yes | Yes | Yes |
-| Complete current Part 2 abstract-test-suite result | Unverified; known link gaps | Unverified; known link/native-bounds gaps | Unverified; known link/native-bounds gaps | Unverified; known link gaps |
+| Complete current Part 2 abstract-test-suite result | Unverified | Unverified; native-bounds gap remains | Unverified; native-bounds gap remains | Unverified |
 | **Part 3 — Schemas** | | | | |
 | Logical schemas using the Part 3 JSON Schema vocabulary (§7) | No | No | No | No |
 | Schema annotations: roles, ordering, units, semantic definitions, special nulls (§7.2) | No | No | No | No |
@@ -95,46 +97,47 @@ collection.
 | **Part 4 — Discovery within many collections** | | | | |
 | Collection `bbox` intersection (§7.3) | Yes — horizontal extent [9] | Yes — same [9] | Yes — same [9] | Yes — same [9] |
 | Collection `bbox-crs` (§7.4) | Partial — CRS84 only | Partial — CRS84 only | Partial — CRS84 only | Partial — CRS84 only |
-| Collection `datetime`: instant, interval, open ends (§7.5) | Yes — engine extent [5] | Yes — raster extent [5] | Partial — raster only [5] | No effective filtering — parsed, extent not supplied [5] |
+| Collection `datetime`: instant, interval, open ends (§7.5) | Yes — engine extent [5] | Yes — raster extent [5] | Yes — raster or feature extent [5] | Yes — feature extent [5] |
 | Collection `q`: case-insensitive terms/phrases in title, description, keywords (§7.6) | Partial — basic search works [10] | Partial — same [10] | Partial — same [10] | Partial — same [10] |
-| Collection `query`: required/excluded terms (§7.7) | No — ignored | No — ignored | No — ignored | No — ignored |
+| Collection `query`: required/excluded terms (§7.7) | No — 400 | No — 400 | No — 400 | No — 400 |
 | Collection page size `limit` (§7.8) | Yes — default/max 1,000 | Yes — same | Yes — same | Yes — same |
 | Collection `next` paging links (§7.8) | Yes | Yes | Yes | Yes |
 | Collection `prev` paging links (§7.8, optional) | Yes | Yes | Yes | Yes |
 | `offset` paging mechanism (MeteoCore extension) | Yes | Yes | Yes | Yes |
 | `numberMatched` and `numberReturned` (§7.8) | Yes | Yes | Yes | Yes |
-| Combined filters before paging; links preserve supported filters | Yes | Yes | Yes | Partial — datetime caveat [5] |
-| Scale denominator filter `sd` (§7.9) | No — ignored | No — ignored | No — ignored | No — ignored |
-| Cell-size filter `resolution` (§7.9) | No — ignored | No — ignored | No — ignored | No — ignored |
+| Combined filters before paging; links preserve supported filters | Yes | Yes | Yes | Yes |
+| Scale denominator filter `sd` (§7.9) | No — 400 | No — 400 | No — 400 | No — 400 |
+| Cell-size filter `resolution` (§7.9) | No — 400 | No — 400 | No — 400 | No — 400 |
 | Client-selected collection sorting `sortby` (§8) | No — fixed ID order | No — fixed ID order | No — fixed ID order | No — fixed ID order |
 | Collection-list sortables discovery (§8) | No | No | No | No |
 | CQL2 collection filtering (§9) | No | No | No | No |
 | Collection-list queryables discovery (§9) | No | No | No | No |
 | Hierarchy `parent` metadata and navigation (§10) | No | No | No | No |
-| Hierarchy filtering `parent` (§10) | No — ignored | No — ignored | No — ignored | No — ignored |
-| Hierarchy depth selection `descendants=immediate/all` (§10) | No — ignored | No — ignored | No — ignored | No — ignored |
-| Complete current Searchable Collections class | No — advertised, but incomplete [11] | No — same [11] | No — same [11] | No — same [11] |
+| Hierarchy filtering `parent` (§10) | No — 400 | No — 400 | No — 400 | No — 400 |
+| Hierarchy depth selection `descendants=immediate/all` (§10) | No — 400 | No — 400 | No — 400 | No — 400 |
+| Complete current Searchable Collections class | No — not declared [11] | No — same [11] | No — same [11] | No — same [11] |
 
 **Limitations and interpretation**
 
 1. Metadata routes share `f=json/html` and Accept negotiation, but do not fully
    rank competing media types by quality values. Features item routes separately
    accept media-type aliases; that does not extend every Common metadata route.
-2. The shared collection parameter struct discards unknown fields. Part 1 §8.3
-   includes tolerance permissions, so ignored parameters alone are not proof of
-   nonconformance. They do violate the project's stricter validation policy and
-   can mislead draft-testing clients. A 200 response does not demonstrate support.
+2. The shared extractor rejects unsupported and duplicate collection parameters
+   with a JSON `BadRequest` response. Part 1 §8.3 permits some tolerance, but the
+   project's stricter policy avoids misleading draft-testing clients. Unsupported
+   controls such as `query`, `parent` and `sortby` now return 400 rather than
+   silently serving unfiltered results. `offset` and `f` remain supported extensions.
 3. Maps and Tiles cache rendered data responses; their Common metadata handlers
    lack the EDR/Features metadata caching middleware. This row is about metadata.
-4. JSON list/detail responses expose `self` but omit `alternate` links to HTML.
-   HTML pages link to JSON. Having both representations is not sufficient to
-   satisfy the draft's bidirectional discovery requirements.
-5. Features metadata calls `FeatureEngine::temporal_extent()`, but the collection
-   search adapter supplies `time: None`. The same collection can therefore advertise
-   a time range yet survive every datetime search. Vector-only Tiles also omits
-   feature temporal extents. Unknown extents intentionally remain eligible under
-   the draft. Features passes only interval endpoints into the shared temporal
-   grid builder, which must not be mistaken for an inventory of observation times.
+4. Shared collection metadata now adds HTML alternate links to JSON list/detail
+   responses. HTML pages link to JSON. List self/next/prev links explicitly retain
+   the negotiated format and all supported filters, even when the original client
+   selected HTML using only an Accept header.
+5. Features and vector-only Tiles now supply feature temporal extents to both
+   metadata and collection search. Tiles prefers available raster times and falls
+   back to feature temporal bounds. Unknown extents remain eligible under the
+   draft. Feature interval endpoints are no longer advertised as a two-sample grid;
+   actual raster time series retain their regular/irregular grid descriptions.
 6. The current Part 2 text requires native spatial bounds when storage and extent
    CRSs differ, while also retaining a related SHOULD recommendation. Projected
    Maps/Tiles metadata can advertise `storageCrs` without `storageCrsBbox`.
@@ -155,8 +158,8 @@ collection.
     equivalent phrases separated by different whitespace can fail to match.
     Phrase word boundaries also need abstract-test coverage. There is no ranking.
 11. The published Part 4 draft additionally requires `query`, `sd`, and `resolution`.
-    Their absence prevents full current Searchable Collections conformance even
-    though the URI is advertised. Sorting, CQL2 and hierarchy are separate classes;
+    Their absence prevents full current Searchable Collections conformance, so
+    the previously advertised URI has been removed from every API. Sorting, CQL2 and hierarchy are separate classes;
     their absence does not itself invalidate Searchable Collections.
 
 **Advertised conformance versus assessed behavior**
@@ -170,7 +173,7 @@ All four APIs currently return the same Common declarations:
 | Part 2 `collections`, `json`, `html` | Declared | Declared | Declared | Declared |
 | Part 2 `uad-collections` | Not declared | Not declared | Not declared | Not declared |
 | Part 3 classes | Not declared | Not declared | Not declared | Not declared |
-| Part 4 `searchable-collections` | Declared; gaps above | Declared; gaps above | Declared; gaps above | Declared; gaps above |
+| Part 4 `searchable-collections` | Not declared; gaps above | Not declared; gaps above | Not declared; gaps above | Not declared; gaps above |
 | Part 4 sorting, filtering, hierarchy | Not declared | Not declared | Not declared | Not declared |
 
 The emitted URIs use `http://www.opengis.net/spec/ogcapi-common-{part}/1.0/conf/…`.
@@ -181,7 +184,9 @@ Common Part 1 class declarations.
 
 **Evidence and reproducible checks**
 
-Shared policy lives in [collection_search.rs](../crates/core/src/collection_search.rs),
+Shared HTTP validation, responses, Common metadata fields, navigation, declarations
+and OpenAPI live in [api-common](../crates/api-common/README.md). Pure policy lives
+in [collection_search.rs](../crates/core/src/collection_search.rs),
 [html.rs](../crates/core/src/html.rs),
 [ogc_extent.rs](../crates/core/src/ogc_extent.rs), and
 [datetime.rs](../crates/core/src/datetime.rs). HTTP adapters, metadata and
@@ -192,7 +197,8 @@ conformance declarations live in the
 [Features](../crates/api-features/src/handlers.rs) handlers.
 Their adjacent `lib.rs` routers establish the missing schema routes.
 
-Production checks on `https://meteocore.app.meteo.fi` returned:
+**Historical production probes, before the #739 changes**, on
+`https://meteocore.app.meteo.fi` returned:
 
 | Probe / observation | EDR | Maps | Tiles | Features |
 |---|---|---|---|---|
@@ -218,6 +224,13 @@ curl -fsS 'https://meteocore.app.meteo.fi/edr/conformance'
 curl -fsS 'https://meteocore.app.meteo.fi/edr/collections?q=radar&limit=2&offset=2'
 curl -fsS -H 'Accept: text/html' 'https://meteocore.app.meteo.fi/edr/collections?limit=1'
 ```
+
+The [cross-API contract suite](../crates/server/tests/common_discovery.rs) now
+exercises equivalent fixture catalogs through all four routers, including both
+raster and vector-only Tiles. It follows actual navigation links, checks combined
+filters/counts/temporal adapters, validates representation links and unknown or
+duplicate parameter errors, and compares OpenAPI and Common declarations. This
+verifies the updated source behavior without depending on production catalog data.
 
 No full OGC abstract test suite was executed for this assessment. Existing unit
 and integration tests and hand-written OpenAPI documents are useful evidence,

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+api-common = { path = "../api-common" }
 ds-core = { path = "../core" }
 arc-swap = "1"
 axum = "0.8"

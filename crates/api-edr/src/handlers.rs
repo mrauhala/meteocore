@@ -388,31 +388,6 @@ fn format_parameter() -> serde_json::Value {
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
-/// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
-/// `/collections` query parameters (plus the shared `f` format selector).
-/// Documented per the CLAUDE.md rule and Part 4 §5.5.
-fn searchable_collections_parameters() -> serde_json::Value {
-    let mut params = json!([
-        {"name": "bbox", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Filter to collections intersecting this CRS84 bbox: 4 (or 6) comma-separated numbers west,south,east,north."},
-        {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "CRS of the bbox values. Only CRS84 is supported."},
-        {"name": "datetime", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Filter to collections whose temporal extent intersects this RFC 3339 instant or interval (start/end, ../end, start/..)."},
-        {"name": "q", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Free-text search (comma-separated terms, OR) over collection title, description, and keywords."},
-        {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
-         "description": "Maximum number of collections per page (default 1000)."},
-        {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
-         "description": "Number of matching collections to skip (pagination cursor)."}
-    ]);
-    params
-        .as_array_mut()
-        .expect("searchable params is a JSON array")
-        .push(format_parameter());
-    params
-}
-
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
@@ -828,16 +803,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         },
-        "/edr/collections": {
-            "get": {
-                "summary": "List collections",
-                "operationId": "getCollections",
-                "parameters": searchable_collections_parameters(),
-                "responses": {
-                    "200": {"description": "List of EDR collections"}
-                }
-            }
-        }
+        "/edr/collections": {"get": api_common::collection_operation()}
     });
 
     // Merge collection paths into main paths
@@ -991,28 +957,10 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-    let classes = [
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
-        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
-        // OGC API - Common - Part 2: Geospatial Data (20-024). /collections +
-        // /collections/{id} satisfy the Collections, JSON, and (now) HTML
-        // classes — the HTML representation is served via `?f=html` / Accept.
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
-        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/html",
-        // OGC API - Common - Part 4 (Discovery within many collections,
-        // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
-        // limit filtering + offset pagination (numberMatched/Returned +
-        // next/prev links). Sortable/Filterable/Hierarchical not declared.
-        "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
-        // OGC API - EDR 1.1 (19-086r6). Every query type (locations, position,
-        // area, trajectory, instances) lives under the single `queries` class;
-        // each collection's `data_queries` says which ones it supports. The
-        // `html` and `oas30` classes are satisfied by `?f=html` / Accept on
-        // every metadata resource and by `/api`. `geojson` / `edr-geojson`
-        // are deliberately NOT declared: data queries answer 400 for
-        // f=GeoJSON (only /locations is GeoJSON).
+    // EDR 1.1 puts every data query under `queries`; each collection's
+    // data_queries identifies supported types. GeoJSON is only available for
+    // /locations, so geojson/edr-geojson conformance is not declared.
+    let classes = api_common::conformance_classes(&[
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/queries",
@@ -1020,7 +968,7 @@ pub async fn conformance(
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/html",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/oas30",
-    ];
+    ]);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {
@@ -1039,149 +987,41 @@ pub async fn conformance(
 
 pub async fn collections(
     State(state): State<AppState>,
-    Query(sp): Query<ds_core::collection_search::SearchQueryParams>,
+    request: api_common::CollectionRequest,
     headers: HeaderMap,
-) -> Result<Response, HandlerError> {
-    use ds_core::collection_search::{search, CollectionMatch};
-    use ds_core::html::Wanted;
-
-    let wanted = negotiate(sp.f.as_deref(), &headers)?;
-    let params = sp.parse().map_err(|e| bad_request_msg(&e.to_string()))?;
+) -> Response {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-
-    // (id, title, description, bbox, time, metadata, keywords, license) per
-    // collection. Tuple element types are inferred, so no extra chrono import is
-    // needed. keywords/license feed `?q=` search and the HTML cards.
-    let mut rows: Vec<_> = state
+    let entries = state
         .collections
         .values()
         .filter_map(|config| {
             let Some(engine) = state.engines.get(&config.id) else {
-                // A registered collection with no engine (e.g. a partial
-                // reload) would otherwise vanish from /collections silently.
                 tracing::warn!(
                     collection = %config.id,
                     "collection has no registered EDR engine; omitting from /collections"
                 );
                 return None;
             };
-            let value = build_collection_metadata(engine.as_ref(), config, base, None);
-            Some((
-                config.id.clone(),
-                config.title.clone(),
-                config.description.clone(),
-                engine.get_spatial_extent(),
-                engine.get_temporal_extent(),
-                value,
-                config.keywords.clone(),
-                config.license.as_ref().map(|l| l.card_label()),
-            ))
+            Some(api_common::CollectionEntry {
+                config,
+                metadata: build_collection_metadata(engine.as_ref(), config, base, None),
+                bbox: engine.get_spatial_extent(),
+                time: engine.get_temporal_extent(),
+            })
         })
         .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let matches: Vec<CollectionMatch> = rows
-        .iter()
-        .map(|r| CollectionMatch {
-            title: &r.1,
-            description: &r.2,
-            keywords: &r.6,
-            bbox: r.3,
-            time: r.4,
-        })
-        .collect();
-    let result = search(&matches, &params);
-    let href = |offset| {
-        format!(
-            "{base}/edr/collections{}",
-            sp.query_string(params.limit, offset)
-        )
-    };
-
-    Ok(with_vary(match wanted {
-        Wanted::Json => {
-            let collections: Vec<serde_json::Value> =
-                result.page.iter().map(|&i| rows[i].5.clone()).collect();
-            let number_returned = collections.len();
-            let link = |rel: &str, offset: usize, title: Option<&str>| {
-                let mut o = json!({ "href": href(offset), "rel": rel, "type": "application/json" });
-                if let Some(t) = title {
-                    o["title"] = json!(t);
-                }
-                o
-            };
-            let mut links = vec![link("self", params.offset, None)];
-            if result.has_next {
-                links.push(link("next", result.next_offset, Some("Next page")));
-            }
-            if result.has_prev {
-                links.push(link("prev", result.prev_offset, Some("Previous page")));
-            }
-            Json(json!({
-                "collections": collections,
-                "numberMatched": result.number_matched,
-                "numberReturned": number_returned,
-                "links": links
-            }))
-            .into_response()
-        }
-        Wanted::Html => {
-            use ds_core::html::{CollectionCard, LinkView};
-            let cards: Vec<CollectionCard> = result
-                .page
-                .iter()
-                .map(|&i| CollectionCard {
-                    id: rows[i].0.clone(),
-                    title: rows[i].1.clone(),
-                    description: rows[i].2.clone(),
-                    self_href: format!("{base}/edr/collections/{}", rows[i].0),
-                    keywords: rows[i].6.clone(),
-                    license: rows[i].7.clone(),
-                })
-                .collect();
-            let mut nav = vec![LinkView::new(
-                href(params.offset),
-                "self",
-                Some("This page"),
-            )];
-            if result.has_next {
-                nav.push(LinkView::new(
-                    href(result.next_offset),
-                    "next",
-                    Some("Next page"),
-                ));
-            }
-            if result.has_prev {
-                nav.push(LinkView::new(
-                    href(result.prev_offset),
-                    "prev",
-                    Some("Previous page"),
-                ));
-            }
-            // rel="alternate" to the JSON representation, preserving the current
-            // bbox/datetime/q/limit/offset filters (parity with the other HTML
-            // metadata pages).
-            nav.push(LinkView::new(
-                format!(
-                    "{base}/edr/collections{}",
-                    sp.query_string_with_format(params.limit, params.offset, "json")
-                ),
-                "alternate",
-                Some("This page as JSON"),
-            ));
-            Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
-        }
-    }))
+    api_common::collections_response(&format!("{base}/edr/collections"), request, entries)
 }
 
+/// GET /edr/collections/{id} — Collection detail
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
-    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
@@ -1195,14 +1035,10 @@ pub async fn collection(
         ))
         .into_response(),
         Wanted::Html => {
-            let card = CollectionCard {
-                id: config.id.clone(),
-                title: config.title.clone(),
-                description: config.description.clone(),
-                self_href: format!("{base}/edr/collections/{}", config.id),
-                keywords: config.keywords.clone(),
-                license: config.license.as_ref().map(|l| l.card_label()),
-            };
+            let card = api_common::collection_card(
+                config,
+                format!("{base}/edr/collections/{}", config.id),
+            );
             let links = [
                 LinkView::new(
                     format!("{base}/edr/collections/{}?f=json", config.id),
@@ -2127,32 +1963,24 @@ fn build_collection_metadata(
             "title": config.title
         }));
     }
-    if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
-        // No `type`: an operator-supplied license URL may not be HTML, and OGC
-        // API Common §6.5.2 wants the link's real media type — omitting is valid.
-        links.push(json!({ "href": url, "rel": "license", "title": title }));
-    }
 
-    let mut metadata = json!({
-        "id": self_id,
-        "title": self_title,
-        "description": config.description,
-        // No `itemType`: OGC API – Common – Part 2 registers only "feature"
-        // and "record", and the field describes a /collections/{id}/items
-        // sub-resource — which EDR has no equivalent of (data is reached via
-        // /position, /area, /trajectory, …). EDR collections are also not all
-        // coverage data (CSV/PostGIS serve discrete observations), so no single
-        // itemType applies. Omitted rather than mislabelled (review on #298).
-        "links": links,
-        "extent": extent,
-        "data_queries": data_queries,
-        "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
-        "parameter_names": parameter_names,
-        "output_formats": ["CoverageJSON", "PNG"]
-    });
-    // OGC API – Common – Part 2 `keywords`: emit only when non-empty.
-    if !config.keywords.is_empty() {
-        metadata["keywords"] = json!(config.keywords);
-    }
-    metadata
+    api_common::collection_metadata(
+        config,
+        json!({
+            "id": self_id,
+            "title": self_title,
+            // No `itemType`: OGC API – Common – Part 2 registers only "feature"
+            // and "record", and the field describes a /collections/{id}/items
+            // sub-resource — which EDR has no equivalent of (data is reached via
+            // /position, /area, /trajectory, …). EDR collections are also not all
+            // coverage data (CSV/PostGIS serve discrete observations), so no single
+            // itemType applies. Omitted rather than mislabelled (review on #298).
+            "extent": extent,
+            "data_queries": data_queries,
+            "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
+            "parameter_names": parameter_names,
+            "output_formats": ["CoverageJSON", "PNG"]
+        }),
+        links,
+    )
 }
