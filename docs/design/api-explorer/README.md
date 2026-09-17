@@ -1,4 +1,4 @@
-# MeteoCore API workbench — design proposal 02
+# MeteoCore API workbench — design proposal 03
 
 **Status: design for approval. Production HTML, routes and handlers are unchanged.**
 
@@ -193,14 +193,56 @@ inputs. Do not ship inert controls or infer native resolution as a suitability
 range. CQL2/queryables can later extend an advanced filter builder without
 replacing basic text/area/time discovery.
 
+## Typography and contrast
+
+The prototype now uses one shared type scale and semantic color palette,
+replacing the earlier per-component and mobile font reductions.
+
+| Role | Size at the default browser setting | Font |
+|---|---|---|
+| Body, controls, navigation, table values | 16 px / 1 rem | System UI |
+| Help, badges, metadata, breadcrumbs | 14 px / 0.875 rem | System UI |
+| URLs, JSON, IDs, property keys | 14 px / 0.875 rem | One shared monospace stack |
+| Subheadings / section headings | 18 px / 24 px | System UI, semibold |
+| Page headings | 32 px; 24 px on narrow screens | System UI, bold |
+
+Parameter labels and HTML/JSON controls use the UI font. Monospace is reserved
+for actual code and identifiers. Browser font-size preferences scale the rem
+values. Mobile rearranges and wraps content instead of reducing supporting text.
+
+Light and dark themes share color roles for primary/secondary text, controls,
+code, status colors and surfaces. Input placeholders, null values and help text
+remain readable. Form/button borders have their own stronger color instead of
+reusing subtle panel separators. Native visited-link colors are explicitly
+normalized; hover and selected states retain their foreground/background pair.
+
+### Revision 03 measurements
+
+Chrome DOM measurements covered landing, collections (list/cards), collection
+metadata, item list/detail, JSON, request failure, future hierarchy, and mobile
+HTML/JSON at 390/320 px. The checked text, including placeholders, had:
+
+- **Minimum 14 px computed size**, with 16 px body text and form controls.
+- **Minimum measured contrast 5.83:1 in light mode and 6.70:1 in dark mode**
+  across the final checked screens, exceeding the 4.5:1 normal-text target.
+- Two computed font stacks: system UI and monospace.
+- No page-level horizontal overflow in the checked 390/320 px mobile views.
+
+The review used computed foreground and ancestor-composited background colors
+with the relative-luminance contrast formula. It excluded disabled controls,
+hidden elements and SVG text; map labels were enlarged and visually reviewed.
+It is a focused design check, not full accessibility certification. Native
+select popups, screen-reader behavior and every possible data/state combination
+still require production validation.
+
 ## Visual and interaction system
 
 - Light and dark palettes with teal primary actions and distinct workspace,
   panel and code surfaces.
   Status colors supplement text and icons; they never carry meaning alone.
-- System sans-serif type, restrained size hierarchy, monospace only for IDs,
-  property keys and request URLs. Dense data stays compact; introductory
-  content gets more breathing room.
+- System UI type uses the shared 14/16/18/24/32 px scale above. Monospace
+  is reserved for code, IDs and property keys. Avoid inline font-size overrides
+  and do not shrink text to make a layout fit.
 - One prominent action per task. HTML and JSON are equal representations;
   method, resource path and parameter names are explicit. Longer raw metadata
   remains available through the JSON view and metadata tabs.
