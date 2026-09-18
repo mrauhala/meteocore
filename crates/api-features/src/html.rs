@@ -21,7 +21,7 @@ pub(crate) fn representation_links(doc: &mut Value, wanted: Wanted) {
         Wanted::Json => ("json", "application/geo+json", "html", "text/html"),
         Wanted::Html => ("html", "text/html", "json", "application/geo+json"),
     };
-    if let Some(links) = doc["links"].as_array_mut() {
+    if let Some(links) = doc.get_mut("links").and_then(Value::as_array_mut) {
         let mut alternate_link = None;
         for link in links.iter_mut() {
             let href = link["href"].as_str().unwrap_or_default().to_owned();
@@ -41,7 +41,7 @@ pub(crate) fn representation_links(doc: &mut Value, wanted: Wanted) {
         }
         links.extend(alternate_link);
     }
-    if let Some(features) = doc["features"].as_array_mut() {
+    if let Some(features) = doc.get_mut("features").and_then(Value::as_array_mut) {
         for feature in features {
             representation_links(feature, wanted);
         }
@@ -63,32 +63,157 @@ fn href_for<'a>(doc: &'a Value, rel: &str) -> &'a str {
         .unwrap_or_default()
 }
 
-fn feature_title(feature: &Value) -> String {
-    let p = &feature["properties"];
-    ["name", "event", "impact_over"]
-        .iter()
-        .find_map(|key| p[key].as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-        .unwrap_or_else(|| feature["id"].as_str().unwrap_or("Feature").to_owned())
+const LABEL_KEYS: &[&str] = &[
+    "name",
+    "label",
+    "title",
+    "display_name",
+    "displayname",
+    "nimi",
+    "namn",
+    "nom",
+    "nombre",
+    "naam",
+    "bezeichnung",
+];
+
+fn feature_id(feature: &Value) -> String {
+    match &feature["id"] {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => "Feature".into(),
+    }
 }
 
-fn feature_flags(feature: &Value) -> String {
-    let p = &feature["properties"];
-    let mut out = String::new();
-    if let Some(severity) = p["severity"].as_str() {
-        out.push_str(&format!("<span class=\"chip\">{}</span>", escape(severity)));
+fn feature_title(feature: &Value) -> String {
+    let properties = feature["properties"].as_object();
+    LABEL_KEYS
+        .iter()
+        .find_map(|key| {
+            properties?.iter().find_map(|(name, value)| {
+                (name.eq_ignore_ascii_case(key))
+                    .then(|| value.as_str())
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| feature_id(feature))
+}
+
+fn value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
-    if p["likely_clutter"] == true {
-        out.push_str("<span class=\"chip warning\">Likely clutter</span>");
+}
+
+fn property_value(value: Option<&Value>) -> String {
+    use api_common::workbench as ui;
+    match value {
+        None => "<span class=\"muted\">Absent</span>".into(),
+        Some(Value::Null) => "<code>null</code>".into(),
+        Some(Value::String(s)) if s.is_empty() => "<span class=\"muted\">Empty string</span>".into(),
+        Some(Value::String(s)) if s.starts_with("https://") || s.starts_with("http://") => ui::anchor(s,s,""),
+        Some(v @ (Value::Array(_) | Value::Object(_))) => format!("<details class=\"property-value\"><summary>{} · {} {}</summary><pre>{}</pre></details>",value_type(v),v.as_array().map_or_else(||v.as_object().map_or(0,|o|o.len()),|a|a.len()),if v.is_array(){"values"}else{"keys"},escape(&serde_json::to_string_pretty(v).expect("properties serialize"))),
+        Some(v) => ui::value_html(v),
     }
-    // Browser enhancement labels expired alerts; server output and ETags stay deterministic.
-    if let Some(expires) = p["expires"].as_str() {
-        out.push_str(&format!(
-            "<span class=\"chip\" data-expiry=\"{}\">Expires {}</span>",
-            escape(expires),
-            escape(expires)
-        ));
+}
+
+fn property_columns(features: &[Value], controls: &FeatureControls) -> (Vec<String>, Vec<String>) {
+    let mut columns: std::collections::BTreeSet<String> =
+        controls.filterables.iter().cloned().collect();
+    for f in features {
+        if let Some(p) = f["properties"].as_object() {
+            columns.extend(p.keys().cloned());
+        }
     }
-    out
+    let defaults = columns
+        .iter()
+        .filter(|key| {
+            !LABEL_KEYS
+                .iter()
+                .any(|label| key.eq_ignore_ascii_case(label))
+        })
+        .filter(|key| {
+            features.iter().any(|f| {
+                f["properties"]
+                    .get(*key)
+                    .is_some_and(|v| !v.is_null() && !v.is_array() && !v.is_object())
+            })
+        })
+        .take(4)
+        .cloned()
+        .collect();
+    (columns.into_iter().collect(), defaults)
+}
+
+fn item_paging(doc: &Value, count: usize) -> String {
+    use api_common::workbench as ui;
+    let href = href_for(doc, "self");
+    let pairs: Vec<_> =
+        form_urlencoded::parse(href.split_once('?').map_or("", |(_, q)| q).as_bytes()).collect();
+    let number = |key: &str, default| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    let limit = number("limit", 100);
+    let offset = number("offset", 0);
+    let matched = doc["numberMatched"].as_u64();
+    let range = if count == 0 {
+        "No items on this page".into()
+    } else {
+        format!(
+            "{}–{} shown",
+            offset.saturating_add(1),
+            offset.saturating_add(count)
+        )
+    };
+    let mut sizes = vec![25, 50, 100, 1000, limit];
+    sizes.sort_unstable();
+    sizes.dedup();
+    let options = sizes
+        .iter()
+        .map(|n| {
+            format!(
+                "<option value=\"{n}\" {}>{n}</option>",
+                if *n == limit { "selected" } else { "" }
+            )
+        })
+        .collect::<String>();
+    let links: Vec<_> = doc["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|l| {
+            ds_core::html::LinkView::new(
+                l["href"].as_str().unwrap_or_default(),
+                l["rel"].as_str().unwrap_or_default(),
+                None,
+            )
+        })
+        .collect();
+    format!("<div class=\"item-paging\"><span>{range} · {} matched</span><label class=\"per-page enhanced\">Per page<select data-page-size>{options}</select></label>{}</div>",matched.map_or("Unknown".into(),|n|n.to_string()),ui::pagination(&links))
+}
+
+fn coordinate(value: &Value) -> String {
+    value
+        .as_f64()
+        .map(|n| {
+            format!("{n:.5}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_owned()
+        })
+        .unwrap_or_else(|| "Not available".into())
 }
 
 fn query_form(doc: &Value, controls: &FeatureControls) -> String {
@@ -103,7 +228,7 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             .map(|(_, v)| v.as_ref())
             .unwrap_or("")
     };
-    let mut out=format!("<form class=\"query-form item-query items-controls panel enhanced\" action=\"{}\" method=\"get\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"builder-heading\"><h2>Data request builder</h2><span class=\"mono\">GET</span></div><div class=\"item-primary-fields\">",escape(action));
+    let mut out=format!("<form class=\"query-form item-query items-controls panel enhanced\" action=\"{}\" method=\"get\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"item-primary-fields\">",escape(action));
     if !controls.filterables.is_empty() {
         out.push_str("<div class=\"equal-fields\"><label>Property<select data-new-property><option value=\"\">Choose a property</option>");
         for name in &controls.filterables {
@@ -138,7 +263,7 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
     if !applied.is_empty() {
         out.push_str(&format!("<div class=\"fields spaced\">{applied}</div><p class=\"field-help\">Applied predicates are combined with AND. Numeric fields also accept comma-separated alternatives.</p>"));
     }
-    out.push_str("<details class=\"filters\"><summary>Area, ordering &amp; paging</summary><div class=\"fields\">");
+    out.push_str("<details class=\"filters\" data-disclosure=\"item-filters\"><summary>Area, ordering &amp; paging</summary><div class=\"fields\">");
     out.push_str(&ui::input(
         "bbox",
         value("bbox"),
@@ -171,7 +296,7 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             true,
         ));
     }
-    out.push_str(&format!("</div></details><div class=\"filter-controls\">{}</div><div class=\"draft-request\"><small>Data request preview · submit to update features</small><code data-draft></code></div></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
+    out.push_str(&format!("</div></details><div class=\"filter-controls\">{}</div><details class=\"draft-request\" data-draft-disclosure><summary>Preview data request</summary><small>Draft · submit to update features</small><code data-draft></code></details></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
     out
 }
 
@@ -195,61 +320,56 @@ pub(crate) fn features_html(
         feature_title(doc)
     };
     let json_url = ui::with_format(href_for(doc, "self"), "json");
-    let mut body = format!(
-        "<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← {}</a>",
-        escape(if is_list { &collection_url } else { &items_url }),
-        escape(&ui::with_format(
-            if is_list { &collection_url } else { &items_url },
-            "html"
-        )),
-        if is_list {
-            "Collection metadata"
-        } else {
-            "Back to items"
-        }
-    );
-    if is_list {
-        body.push_str(&format!("<div class=\"detail-heading\"><div class=\"chip-row\"><span class=\"chip teal\">Features</span><span class=\"chip\">Feature collection</span></div><h1>{}</h1><div class=\"mono\">{}</div><p>Request features from this collection, inspect the response, and use the same request as GeoJSON.</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\">{}<a class=\"active\" aria-current=\"page\" href=\"{}\">Request data</a>{}</nav>",escape(title),escape(collection_id),ui::anchor(&ui::with_format(&collection_url,"html"),"Overview",""),escape(&ui::with_format(&items_url,"html")),ui::anchor(&format!("{}#metadata",ui::with_format(&collection_url,"html")),"Metadata & links","")));
+    let mut body = if is_list {
+        String::new()
     } else {
-        body.push_str(&format!("<div class=\"page-title\"><div><span class=\"eyebrow\">FEATURE DETAIL</span><h1>{}</h1><p class=\"mono\">{}</p><div class=\"chip-row spaced\"><span class=\"chip teal\">{}</span>{}</div></div>{}</div>",escape(&page_title),escape(doc["id"].as_str().unwrap_or_default()),escape(doc["geometry"]["type"].as_str().unwrap_or("No geometry")),feature_flags(doc),ui::anchor(&json_url,"GeoJSON { }","btn")));
-        if doc["properties"]["likely_clutter"] == true {
-            body.push_str("<div class=\"callout amber spaced\">The source flags this detection as likely clutter. Keep this quality flag visible when interpreting the cell.</div>");
-        }
-        let mut metrics = String::new();
-        for (key, label, unit) in [
-            ("max_dbz", "Reflectivity", "dBZ"),
-            ("area_km2", "Cell area", "km²"),
-            ("speed_ms", "Speed", "m/s"),
-            ("significance", "Significance", ""),
-        ] {
-            if let Some(value) = doc["properties"].get(key) {
-                metrics.push_str(&format!("<div class=\"metric\"><small>{label}</small><strong>{}<span>{unit}</span></strong></div>",ui::value_html(value)));
-            }
-        }
-        if !metrics.is_empty() {
-            body.push_str(&format!("<div class=\"metrics spaced\">{metrics}</div>"));
-        }
+        format!(
+            "<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to items</a>",
+            escape(&items_url),
+            escape(&ui::with_format(&items_url, "html"))
+        )
+    };
+    if is_list {
+        body.push_str(&format!("<div class=\"detail-heading\"><h1>{}</h1><div class=\"mono\">{}</div></div><nav class=\"detail-tabs\" aria-label=\"Collection views\">{}<a class=\"active\" aria-current=\"page\" href=\"{}\">Request data</a>{}</nav>",escape(title),escape(collection_id),ui::anchor(&ui::with_format(&collection_url,"html"),"Overview",""),escape(&ui::with_format(&items_url,"html")),ui::anchor(&format!("{}#metadata",ui::with_format(&collection_url,"html")),"Metadata & links","")));
+    } else {
+        let id = feature_id(doc);
+        body.push_str(&format!("<div class=\"page-title\"><div><span class=\"eyebrow\">FEATURE DETAIL</span><h1>{}</h1>{}<span class=\"chip\">{}</span></div></div>",escape(&page_title),if page_title != id {format!("<p class=\"mono\">{}</p>",escape(&id))} else {String::new()},escape(doc["geometry"]["type"].as_str().unwrap_or("No geometry"))));
     }
     let features = if let Some(features) = doc["features"].as_array() {
         body.push_str(&format!(
             "<div data-results-scope=\"{}\"></div>",
             escape(&items_url)
         ));
-        body.push_str(&query_form(doc, controls));
-        body.push_str(&format!("<div class=\"results-head\"><h2>Features returned: {} · Matched: {}</h2><p>Response time: <time>{}</time></p></div>",ui::value_html(&doc["numberReturned"]),ui::value_html(&doc["numberMatched"]),escape(doc["timeStamp"].as_str().unwrap_or_default())));
+        body.push_str(&format!("<details class=\"item-builder enhanced\" data-disclosure=\"item-builder\"><summary>Build a data request</summary>{}</details>",query_form(doc, controls)));
+        let applied: String = form_urlencoded::parse(
+            href_for(doc, "self")
+                .split_once('?')
+                .map_or("", |(_, q)| q)
+                .as_bytes(),
+        )
+        .filter(|(key, _)| !matches!(key.as_ref(), "f" | "limit" | "offset"))
+        .map(|(key, value)| {
+            format!(
+                "<span class=\"chip\"><code>{}</code>: {}</span>",
+                escape(&key),
+                escape(&value)
+            )
+        })
+        .collect();
+        if !applied.is_empty() {
+            body.push_str(&format!("<div class=\"chip-row applied-item-filters\" aria-label=\"Applied item filters\">{applied}</div>"));
+        }
+        body.push_str(&format!(
+            "<div class=\"results-head\"><p>Response generated: <time>{}</time></p></div>",
+            escape(doc["timeStamp"].as_str().unwrap_or_default())
+        ));
         features.as_slice()
     } else {
         std::slice::from_ref(doc)
     };
-    let reflectivity = features
-        .iter()
-        .any(|f| f["properties"].get("max_dbz").is_some());
-    let map_features:Vec<_>=features.iter().filter(|f|!f["geometry"].is_null()).map(|f| {
-        let mut facts=serde_json::Map::new();
-        for (key,label,unit) in [("max_dbz","Maximum reflectivity"," dBZ"),("area_km2","Area"," km²")] {
-            if let Some(value)=f["properties"].get(key).filter(|v|!v.is_null()){facts.insert(label.into(),json!(format!("{}{unit}",value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string()))));}
-        }
-        if facts.is_empty(){facts.insert("Geometry".into(),f["geometry"]["type"].clone());facts.insert("Properties".into(),json!(f["properties"].as_object().map_or(0,|p|p.len())));}
+    let (columns, defaults) = property_columns(features, controls);
+    let map_features: Vec<_> = features.iter().filter(|f|!f["geometry"].is_null()).map(|f| {
+        let facts: serde_json::Map<String,Value> = defaults.iter().filter_map(|key| f["properties"].get(key).map(|v|(key.clone(),v.clone()))).collect();
         json!({"type":"Feature","id":f["id"],"geometry":f["geometry"],"properties":{"label":feature_title(f),"href":href_for(f,"self"),"facts":facts}})
     }).collect();
     let mut head = String::new();
@@ -259,32 +379,83 @@ pub(crate) fn features_html(
         "<div class=\"detail-layout spaced\"><section class=\"panel\">"
     });
     if is_list {
-        body.push_str(&format!("<div class=\"table-wrap table-scroll\"><table class=\"item-table\"><thead><tr><th scope=\"col\">Feature / place</th><th scope=\"col\">{}</th><th scope=\"col\">Context</th></tr></thead><tbody>",if reflectivity{"Reflectivity"}else{"Geometry"}));
-        for feature in features {
-            body.push_str(&format!("<tr><td><a class=\"table-link\" href=\"{}\">{}<small>{}</small></a></td><td>{}</td><td><div class=\"chip-row\">{}</div></td></tr>",escape(href_for(feature,"self")),escape(&feature_title(feature)),escape(feature["id"].as_str().unwrap_or_default()),if reflectivity{format!("{} dBZ",ui::value_html(&feature["properties"]["max_dbz"]))}else{escape(feature["geometry"]["type"].as_str().unwrap_or("No geometry"))},feature_flags(feature)));
-        }
-        body.push_str("</tbody></table></div>");
-        if features.is_empty() {
+        body.push_str(&item_paging(doc, features.len()));
+        if !features.is_empty() {
+            body.push_str("<details class=\"column-picker enhanced\"><summary>Choose property columns</summary><p>Showing properties from this response and advertised filter fields. Choose up to eight; your choice is remembered for this collection.</p><div class=\"column-options\">");
+            for key in &columns {
+                body.push_str(&format!(
+                    "<label><input type=\"checkbox\" data-item-column value=\"{}\" {}>{}</label>",
+                    escape(key),
+                    if defaults.contains(key) {
+                        "checked"
+                    } else {
+                        ""
+                    },
+                    escape(key)
+                ));
+            }
+            body.push_str("</div><p data-column-status role=\"status\"></p></details>");
+            body.push_str("<div class=\"table-wrap item-result-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Feature results; scroll for more rows and columns\"><table class=\"item-table\"><thead><tr><th scope=\"col\">Feature</th><th scope=\"col\">Geometry</th>");
+            for key in &defaults {
+                body.push_str(&format!(
+                    "<th scope=\"col\" data-property-cell>{}</th>",
+                    escape(key)
+                ));
+            }
+            body.push_str("</tr></thead><tbody>");
+            for feature in features {
+                let id = feature_id(feature);
+                let label = feature_title(feature);
+                body.push_str(&format!(
+                    "<tr><td><a class=\"table-link\" href=\"{}\">{}{}</a></td><td>{}</td>",
+                    escape(href_for(feature, "self")),
+                    escape(&label),
+                    if id != label {
+                        format!("<small>{}</small>", escape(&id))
+                    } else {
+                        String::new()
+                    },
+                    escape(
+                        feature["geometry"]["type"]
+                            .as_str()
+                            .unwrap_or("No geometry")
+                    )
+                ));
+                for key in &defaults {
+                    body.push_str(&format!(
+                        "<td data-property-cell>{}</td>",
+                        property_value(feature["properties"].get(key))
+                    ));
+                }
+                body.push_str("</tr>");
+            }
+            body.push_str("</tbody></table></div>");
+            let properties: Vec<_> = features.iter().map(|f| &f["properties"]).collect();
+            body.push_str(&format!(
+                "<div id=\"item-properties\" hidden>{}</div>",
+                escape(&serde_json::to_string(&properties).expect("properties serialize"))
+            ));
+            body.push_str(&item_paging(doc, features.len()));
+        } else if doc["numberMatched"].as_u64().is_some_and(|n| n > 0) {
+            let first = ui::query_edit(
+                &ui::with_format(href_for(doc, "self"), "html"),
+                "offset",
+                None,
+            );
+            body.push_str(&format!("<div class=\"empty\"><h2>This page is outside the results.</h2><p>Matching features exist. Return to the first page to keep these filters.</p>{}</div>",ui::anchor(&first,"Go to first page","btn primary")));
+        } else {
             body.push_str("<div class=\"empty\"><h2>No features match this query.</h2><p>Change or reset the filters.</p></div>");
         }
-        let nav: Vec<_> = doc["links"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|l| {
-                ds_core::html::LinkView::new(
-                    l["href"].as_str().unwrap_or_default(),
-                    l["rel"].as_str().unwrap_or_default(),
-                    None,
-                )
-            })
-            .collect();
-        body.push_str(&ui::pagination(&nav));
     } else {
-        body.push_str(&format!("<div class=\"panel-head\"><h2>Properties <span class=\"muted\">· {}</span></h2><input class=\"property-filter enhanced\" id=\"property-search\" aria-label=\"Find a property\" placeholder=\"Find a property…\"></div>",doc["properties"].as_object().map_or(0,|p|p.len())));
-        body.push_str(&ui::property_table(&doc["properties"]));
+        body.push_str(&format!("<div class=\"panel-head\"><h2>Properties <span class=\"muted\">· {}</span></h2><input class=\"property-filter enhanced\" id=\"property-search\" aria-label=\"Find a property\" placeholder=\"Find a property…\"></div><div class=\"table-scroll\"><table class=\"properties property-table typed-properties\"><thead><tr><th scope=\"col\">Property</th><th scope=\"col\">Type</th><th scope=\"col\">Value</th></tr></thead><tbody>",doc["properties"].as_object().map_or(0,|p|p.len())));
+        if let Some(props) = doc["properties"].as_object() {
+            for (key, value) in props {
+                body.push_str(&format!("<tr data-property=\"{}\"><th scope=\"row\"><code>{}</code></th><td class=\"value-type\">{}</td><td>{}</td></tr>",escape(key),escape(key),value_type(value),property_value(Some(value))));
+            }
+        }
+        body.push_str("</tbody></table></div>");
     }
-    body.push_str("</section><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Location</h2><span class=\"chip\">CRS84</span></div>");
+    body.push_str(&format!("</section><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>{}</h2><span class=\"chip\">CRS84</span></div>",if is_list {"Map · current page"} else {"Location"}));
     if !map_features.is_empty() {
         head = ui::map_head(base);
         body.push_str(&ui::map_html(
@@ -297,31 +468,20 @@ pub(crate) fn features_html(
     }
     if !is_list {
         body.push_str("<div class=\"panel-body\"><dl class=\"definition\">");
-        for (label, value) in [
-            (
-                "Observed / sent",
-                doc["properties"]
-                    .get("observed")
-                    .or(doc["properties"].get("sent"))
-                    .unwrap_or(&Value::Null),
-            ),
-            ("Geometry", &doc["geometry"]["type"]),
-        ] {
-            body.push_str(&format!(
-                "<dt>{label}</dt><dd>{}</dd>",
-                ui::value_html(value)
-            ));
-        }
+        body.push_str(&format!(
+            "<dt>Geometry</dt><dd>{}</dd>",
+            ui::value_html(&doc["geometry"]["type"])
+        ));
         if doc["geometry"]["type"] == "Point" {
             body.push_str(&format!(
                 "<dt>Longitude</dt><dd>{}°</dd><dt>Latitude</dt><dd>{}°</dd>",
-                ui::value_html(&doc["geometry"]["coordinates"][0]),
-                ui::value_html(&doc["geometry"]["coordinates"][1])
+                coordinate(&doc["geometry"]["coordinates"][0]),
+                coordinate(&doc["geometry"]["coordinates"][1])
             ));
         }
         body.push_str("</dl></div>");
     }
-    for feature in features {
+    for feature in features.iter().filter(|_| !is_list) {
         body.push_str(&format!(
             "<details class=\"geometry-details\"><summary>Geometry ({}) · {}</summary><pre>{}</pre></details>",
             escape(feature["geometry"]["type"].as_str().unwrap_or("None")),
@@ -357,6 +517,78 @@ mod tests {
     use super::*;
     use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
     use ds_core::feature::{Feature, FeaturePage, Geometry, PropertyValue};
+
+    #[test]
+    fn labels_are_generic_and_never_interpret_weather_fields() {
+        assert_eq!(
+            feature_title(
+                &json!({"id":"a","properties":{"name":"  ","TITLE":"Town","nimi":"Kunta"}})
+            ),
+            "Town"
+        );
+        assert_eq!(
+            feature_title(&json!({"id":"a","properties":{"nimi":"Kunta"}})),
+            "Kunta"
+        );
+        assert_eq!(
+            feature_title(&json!({"id":42,"properties":{"event":"Wind","impact_over":"Town"}})),
+            "42"
+        );
+        assert_eq!(coordinate(&json!(51.88055000000001)), "51.88055");
+    }
+
+    #[test]
+    fn generic_listing_keeps_mixed_properties_and_large_pages_bounded() {
+        let doc = json!({"features":[
+            {"id":"a","geometry":{"type":"Point","coordinates":[20,60]},"properties":{"label":"First","max_dbz":42,"nested":{"a":1},"null_value":null},"links":[{"rel":"self","href":"/items/a?f=html"}]},
+            {"id":"b","geometry":null,"properties":{"nimi":"Second","last_report":"2026-09-18T09:00:00Z","evil</div>":"</script>"},"links":[{"rel":"self","href":"/items/b?f=html"}]}
+        ],"numberMatched":1000,"numberReturned":2,"links":[{"rel":"self","href":"/features/collections/a/items?limit=2"},{"rel":"next","href":"/features/collections/a/items?limit=2&offset=2&f=html"}]});
+        let html = features_html(&doc, "Collection", "a", "", &FeatureControls::default());
+        assert!(html.contains("data-item-column value=\"last_report\""));
+        assert!(html.contains("data-item-column value=\"nested\""));
+        assert!(html.contains("evil&lt;/div&gt;"));
+        assert!(!html.contains("evil</div>"));
+        assert!(html.contains("item-result-scroll"));
+        assert_eq!(html.matches("<select data-page-size>").count(), 2);
+        assert!(!html.contains("<details class=\"geometry-details\""));
+        assert!(!html.contains("Observed / sent"));
+        assert!(!html.contains("Reflectivity"));
+        assert!(!html.contains(" dBZ"));
+        assert!(html.contains("Map · current page"));
+        let detail = features_html(
+            &doc["features"][0],
+            "Collection",
+            "a",
+            "",
+            &FeatureControls::default(),
+        );
+        assert!(detail.contains("Geometry (Point)"));
+        assert!(detail.contains("<code>null</code>"));
+        assert!(detail.contains("<td class=\"value-type\">object</td>"));
+    }
+
+    #[test]
+    fn empty_offset_recovers_without_dropping_repeated_or_empty_predicates() {
+        let doc = json!({"features":[],"numberMatched":308,"numberReturned":0,"links":[{"rel":"self","href":"/features/collections/a/items?limit=5&offset=1000&name=a%26b&name=&sortby=-name&f=html"}]});
+        let html = features_html(&doc, "Collection", "a", "", &FeatureControls::default());
+        assert!(html.contains("This page is outside the results."));
+        assert!(!html.contains("No features match this query."));
+        assert!(html.contains("href=\"/features/collections/a/items?limit=5&amp;name=a%26b&amp;name=&amp;sortby=-name&amp;f=html\">Go to first page"));
+        let mut empty = doc.clone();
+        empty["numberMatched"] = json!(0);
+        assert!(
+            features_html(&empty, "Collection", "a", "", &FeatureControls::default())
+                .contains("No features match this query.")
+        );
+    }
+
+    #[test]
+    fn representation_links_do_not_add_foreign_null_members() {
+        let mut doc = json!({"type":"Feature","id":"a","geometry":null,"properties":{},"links":[]});
+        representation_links(&mut doc, Wanted::Json);
+        assert!(doc.get("features").is_none());
+        assert!(doc["properties"].as_object().unwrap().is_empty());
+    }
 
     #[test]
     fn query_builder_preserves_duplicate_and_empty_predicates_and_capabilities() {
@@ -419,9 +651,9 @@ mod tests {
         assert!(html.contains(&escape(attack)));
         assert!(html.contains("a%2Fb%20%3F%23%C3%A9"));
         assert!(html.contains("Geometry (Polygon)"));
-        assert!(html.contains(">true</span>"));
-        assert!(html.contains(">42</span>"));
-        assert!(html.contains("Not available"));
+        assert!(html.contains("true"));
+        assert!(html.contains("42"));
+        assert!(html.contains("null"));
         assert!(html.contains("https://example.com/prefix/preview/vendor/maplibre-gl.js"));
         let embedded = html
             .split("<div id=\"map-data\" hidden>")

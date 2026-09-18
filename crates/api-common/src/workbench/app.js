@@ -16,20 +16,12 @@
   });
   media.addEventListener('change', () => { if (theme.value === 'system') applyTheme(); });
 
-  document.querySelectorAll('[data-expiry]').forEach(label => {
-    const expires = Date.parse(label.dataset.expiry);
-    if (Number.isFinite(expires) && expires < Date.now()) {
-      label.textContent = 'Expired · ' + label.dataset.expiry;
-      label.classList.add('warning');
-    }
-  });
-
   document.getElementById('api-select')?.addEventListener('change', event => { location.href = event.target.value; });
   document.getElementById('help-button')?.addEventListener('click', () => document.getElementById('help-dialog').showModal());
   document.getElementById('close-help')?.addEventListener('click', () => document.getElementById('help-dialog').close());
-  document.querySelector('[data-page-size]')?.addEventListener('change', event => {
+  document.querySelectorAll('[data-page-size]').forEach(select => select.addEventListener('change', event => {
     const url = new URL(location.href); url.searchParams.set('limit', event.target.value); url.searchParams.delete('offset'); url.searchParams.set('f','html'); location.href = url.href;
-  });
+  }));
   function collectionTab() {
     const active = location.hash === '#metadata' ? 'metadata' : 'overview';
     document.querySelectorAll('[data-collection-view]').forEach(view => { view.hidden = view.id !== active; });
@@ -57,9 +49,11 @@
   document.querySelectorAll('[data-copy]').forEach(button => button.addEventListener('click', () => copy(button.dataset.copy)));
 
   // Disclosure state is a UI preference, never an API query parameter.
-  document.querySelectorAll('[data-disclosure="collection-search"]').forEach(details => {
-    const form = details.closest('form');
-    const key = 'meteocore-search-disclosure:' + new URL(form.action,location.href).pathname;
+  document.querySelectorAll('[data-disclosure]').forEach(details => {
+    const form = details.closest('form') || details.querySelector('form');
+    if (!form) return;
+    const prefix = details.dataset.disclosure === 'collection-search' ? 'meteocore-search-disclosure:' : 'meteocore-disclosure:' + details.dataset.disclosure + ':';
+    const key = prefix + new URL(form.action,location.href).pathname;
     try { details.open = sessionStorage.getItem(key) === 'open'; } catch (_) {}
     const remember = () => {
       try { sessionStorage.setItem(key,details.open ? 'open' : 'closed'); } catch (_) {}
@@ -134,6 +128,57 @@
     viewButtons.forEach(button => button.addEventListener('click',() => {
       applyView(button.dataset.view);
       try { sessionStorage.setItem(viewKey,button.dataset.view); } catch (_) {}
+    }));
+  }
+  // Column choices affect this HTML view only, never the API request.
+  const itemProperties = document.getElementById('item-properties');
+  if (itemProperties) {
+    const rows = JSON.parse(itemProperties.textContent);
+    const table = document.querySelector('.item-table');
+    const choices = [...document.querySelectorAll('[data-item-column]')];
+    const key = 'meteocore-item-columns:' + location.pathname;
+    const status = document.querySelector('[data-column-status]');
+    function cellValue(cell, value, present) {
+      if (!present) { cell.textContent = 'Absent'; return; }
+      if (value === null) { cell.textContent = 'null'; return; }
+      if (typeof value === 'object') {
+        const details = document.createElement('details'), summary = document.createElement('summary'), pre = document.createElement('pre');
+        details.className = 'property-value';
+        summary.textContent = Array.isArray(value) ? `array · ${value.length} values` : `object · ${Object.keys(value).length} keys`;
+        pre.textContent = JSON.stringify(value,null,2); details.append(summary,pre); cell.append(details); return;
+      }
+      if (typeof value === 'string' && /^https?:\/\//.test(value)) {
+        const link = document.createElement('a'); link.href = value; link.textContent = value; cell.append(link); return;
+      }
+      cell.textContent = value === '' ? 'Empty string' : String(value);
+    }
+    function applyColumns(names) {
+      choices.forEach(c => { c.checked = names.includes(c.value); c.disabled = names.length >= 8 && !c.checked; });
+      table.querySelectorAll('[data-property-cell]').forEach(cell => cell.remove());
+      const header = table.querySelector('thead tr');
+      names.forEach(name => { const th = document.createElement('th'); th.scope = 'col'; th.dataset.propertyCell = ''; th.textContent = name; header.append(th); });
+      table.querySelectorAll('tbody tr').forEach((row,index) => names.forEach(name => {
+        const td = document.createElement('td'); td.dataset.propertyCell = '';
+        cellValue(td,rows[index]?.[name],Object.hasOwn(rows[index] || {},name)); row.append(td);
+      }));
+      status.textContent = `${names.length} property columns selected`;
+    }
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(key));
+      if (Array.isArray(saved) && saved.every(n => typeof n === 'string')) {
+        // Retain selected fields even when absent from a later response page.
+        saved.slice(0,8).forEach(name => {
+          if (choices.some(c => c.value === name)) return;
+          const label=document.createElement('label'), input=document.createElement('input');
+          input.type='checkbox'; input.value=name; input.dataset.itemColumn='';
+          label.append(input,document.createTextNode(name)); document.querySelector('.column-options').append(label); choices.push(input);
+        });
+        applyColumns(saved.slice(0,8));
+      }
+    } catch (_) { /* Server-rendered defaults remain usable. */ }
+    choices.forEach(choice => choice.addEventListener('change',() => {
+      const names=choices.filter(c => c.checked).map(c => c.value).slice(0,8);
+      applyColumns(names); try { sessionStorage.setItem(key,JSON.stringify(names)); } catch (_) {}
     }));
   }
   document.getElementById('property-search')?.addEventListener('input', event => {

@@ -2605,7 +2605,7 @@ a {
 .resource-title code{color:inherit}
 
 /* Catalog: search and results share the full content width. */
-.catalog-page #request-context{display:block;padding:12px 32px}
+:is(.catalog-page,.items-page) #request-context{display:block;padding:12px 32px}
 .catalog-request>summary{cursor:pointer;font-size:14px;line-height:24px}
 .catalog-request>summary code{margin-left:12px;overflow-wrap:anywhere}
 .catalog-request .request-content{padding-top:14px}
@@ -2616,7 +2616,7 @@ a {
 .catalog-page .query-builder{position:static;margin-bottom:22px}
 .catalog-page .search-panel{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px 24px;padding:18px 20px}
 .catalog-page .search-row{grid-column:1/-1;flex-direction:row;align-items:end;gap:12px}
-.catalog-page .search-main{min-width:0}
+:is(.catalog-page,.items-page) .search-main{min-width:0}
 .catalog-page .search-main label{margin-bottom:6px}
 .catalog-page label code{font-size:14px;font-weight:400;margin-left:6px}
 .catalog-page .search-row>.btn{width:auto;flex:none;margin:0;min-height:46px}
@@ -2637,7 +2637,7 @@ a {
 .catalog-page .results-bar{margin-bottom:12px}
 .catalog-page .query-results .collection-row{grid-template-columns:32px minmax(0,1fr) 24px;align-items:start;gap:14px;padding:20px}
 .catalog-page .query-results .collection-icon{display:flex}
-.catalog-page .collection-main{min-width:0}
+:is(.catalog-page,.items-page) .collection-main{min-width:0}
 .catalog-page .collection-main>.mono{display:block;font-size:14px;overflow-wrap:anywhere;margin-top:3px}
 .catalog-page .collection-main>p{margin:8px 0 0}
 .catalog-page .collection-main>.chip-row{margin-top:12px}
@@ -2656,20 +2656,20 @@ a {
   .collection-facts{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media(max-width:800px){
-  .catalog-page .sidebar{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:10px 12px;padding:12px 16px}
-  .catalog-page .brand{margin:0;font-size:20px;gap:8px}
-  .catalog-page .brand small{display:none}
-  .catalog-page .brand-mark{width:30px;height:30px;flex:none}
-  .catalog-page .api-switch{grid-column:2;grid-row:1;margin:0}
-  .catalog-page .api-switch label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-  .catalog-page .api-switch select{height:40px;min-height:40px;margin:0}
-  .catalog-page .sidebar #primary-nav{grid-column:1/-1;grid-row:2;margin:0;gap:6px;padding-bottom:0}
-  .catalog-page #primary-nav a{padding:6px 9px;min-height:36px}
-  .catalog-page .topbar{position:static;padding:8px 16px}
-  .catalog-page .topbar-actions{margin-top:6px}
-  .catalog-page #request-context{padding:8px 16px}
-  .catalog-page .catalog-request>summary code{margin-left:6px}
-  .catalog-page main{padding:18px 16px}
+  :is(.catalog-page,.items-page) .sidebar{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:10px 12px;padding:12px 16px}
+  :is(.catalog-page,.items-page) .brand{margin:0;font-size:20px;gap:8px}
+  :is(.catalog-page,.items-page) .brand small{display:none}
+  :is(.catalog-page,.items-page) .brand-mark{width:30px;height:30px;flex:none}
+  :is(.catalog-page,.items-page) .api-switch{grid-column:2;grid-row:1;margin:0}
+  :is(.catalog-page,.items-page) .api-switch label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+  :is(.catalog-page,.items-page) .api-switch select{height:40px;min-height:40px;margin:0}
+  :is(.catalog-page,.items-page) .sidebar #primary-nav{grid-column:1/-1;grid-row:2;margin:0;gap:6px;padding-bottom:0}
+  :is(.catalog-page,.items-page) #primary-nav a{padding:6px 9px;min-height:36px}
+  :is(.catalog-page,.items-page) .topbar{position:static;padding:8px 16px}
+  :is(.catalog-page,.items-page) .topbar-actions{margin-top:6px}
+  :is(.catalog-page,.items-page) #request-context{padding:8px 16px}
+  :is(.catalog-page,.items-page) .catalog-request>summary code{margin-left:6px}
+  :is(.catalog-page,.items-page) main{padding:18px 16px}
   .catalog-page .page-title .eyebrow{display:none}
   .catalog-page .page-title h1{font-size:26px}
   .catalog-page .page-title p{font-size:14px;line-height:21px}
@@ -2677,7 +2677,7 @@ a {
   .catalog-page .query-builder{margin-bottom:16px}
 }
 @media(max-width:560px){
-  .catalog-page .catalog-request>summary code{display:none}
+  :is(.catalog-page,.items-page) .catalog-request>summary code{display:none}
   .catalog-page .search-panel{grid-template-columns:minmax(0,1fr)}
   .catalog-page .search-row{gap:8px}
   .catalog-page .search-row>.btn{font-size:14px;padding:8px 10px}
@@ -2690,4 +2690,60 @@ a {
   .catalog-page .collection-grid .collection-facts,.collection-facts{grid-template-columns:minmax(0,1fr);gap:10px}
   .catalog-page .results-bar{align-items:center}
   .catalog-page .results-bar small{font-size:14px}
+}
+
+/* Generic feature browser: bound large responses, keep data and paging in reach. */
+.items-page .detail-heading{margin-bottom:12px}
+.items-page .detail-heading h1{margin:0 0 6px}
+.items-page .detail-tabs{margin-bottom:16px}
+.items-page .back-link{margin-bottom:12px}
+.item-builder{border:1px solid var(--line);border-radius:8px;background:var(--surface);margin-bottom:16px}
+.item-builder>summary{cursor:pointer;padding:12px 16px;font-weight:600}
+.items-page .query-form.item-query{margin:0;border:0;padding:0 16px 16px}
+.items-page .item-primary-fields{align-items:end;gap:12px}
+.items-page .item-primary-fields input,.items-page .item-primary-fields select,.items-page .item-primary-fields>.btn{height:46px;min-height:46px;margin:0}
+.items-page .item-primary-fields .field{display:flex;flex-direction:column}
+.items-page .draft-request{margin:10px 0 0;padding:0;border:0}
+.items-page .draft-request>summary{cursor:pointer;font-size:14px}
+.items-page .draft-request[open]>small{margin-top:8px}
+.items-page .results-head{margin:12px 0;display:flex;flex-wrap:wrap;gap:4px 20px;align-items:center}
+.items-page .results-head h2{font-size:18px;margin:0}
+.items-page .results-head p{font-size:14px;margin:0}
+.items-page .item-layout{grid-template-columns:minmax(0,1fr);gap:20px}
+.item-layout>section,.item-layout>aside{min-width:0}
+.item-paging{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:10px 0}
+.item-paging>span{margin-right:auto;font-size:14px}
+.item-paging nav{margin:0}
+.item-paging .per-page{font-size:14px}
+.column-picker{margin:12px 0}
+.column-picker>summary{cursor:pointer;font-weight:500}
+.column-picker p{font-size:14px;margin:8px 0}
+.column-options{display:flex;flex-wrap:wrap;gap:8px 20px}
+.column-options label{display:flex;gap:8px;align-items:center;font-size:14px}
+.column-options input{width:18px;height:18px;min-height:0;margin:0}
+.item-result-scroll{max-height:560px;overflow:auto;overscroll-behavior:contain}
+.item-result-scroll th{position:sticky;top:0;z-index:1;background:var(--surface)}
+.item-result-scroll .item-table{table-layout:auto;min-width:100%}
+.item-result-scroll td,.item-result-scroll th{min-width:130px;max-width:320px;overflow-wrap:anywhere;vertical-align:top}
+.item-result-scroll td:first-child{min-width:200px}
+.item-result-scroll th,.item-result-scroll td{padding:12px 14px;font-size:14px}
+.property-value summary{cursor:pointer;white-space:nowrap;font-size:14px}
+.property-value pre{max-height:260px;overflow:auto;min-width:180px;max-width:500px;font-size:14px}
+.typed-properties th:first-child{width:30%}
+.typed-properties th:nth-child(2){width:90px}
+.typed-properties .value-type{color:var(--muted);font-size:14px;white-space:nowrap}
+.items-page .detail-layout{align-items:start}
+@media(max-width:800px){
+ .items-page .detail-heading h1{font-size:24px}
+ .items-page .detail-tabs{gap:16px;margin-top:12px}
+ .items-page .detail-tabs a{font-size:14px}
+ .items-page .results-head h2{font-size:16px}
+ .item-paging{gap:8px}
+ .item-paging nav{width:100%;display:flex;justify-content:space-between}
+ .item-result-scroll{max-height:440px}
+ .items-page .item-primary-fields{display:grid;grid-template-columns:minmax(0,1fr)}
+ .items-page .item-primary-fields .field{min-width:0}
+ .items-page .item-primary-fields>.btn{width:100%}
+ .typed-properties{table-layout:auto;min-width:420px}
+ .items-page .detail-layout>.panel{min-width:0}
 }

@@ -210,3 +210,38 @@ only advertises its coverage and does not acquire an inferred cadence.
 
 Catalog screenshots: [desktop](screenshots/collections-light.png),
 [mobile](screenshots/collections-mobile.png).
+
+## Generic item browser
+
+Items use common label properties (`name`, `label`, `title`, `nimi`, etc.) with an
+ID fallback. Domain-specific radar metrics, alert chips and the ambiguous
+“Observed / sent” summary have been removed. Every source property remains
+available with its JSON type; units are not guessed from field names.
+
+Listing columns come from actual properties and advertised filter fields. The
+first four non-null scalar fields other than labels are the default; users can
+choose up to eight columns, remembered per collection for the session. Missing
+properties and null values remain distinct. Selection is presentation state and
+never changes the API URL. The table is bounded and keyboard-scrollable, with
+sticky headings and top/bottom pagination. Raw geometry is retained on details.
+
+The map explicitly shows the current page and uses generic property facts. The
+request builder, applied URL and draft URL are collapsible; applied filters remain
+visible. Empty offsets offer first-page recovery without dropping filters.
+
+Validation: 654 API tests passed (four existing ignored), seven cross-API
+contracts passed, workspace clippy with warnings denied, formatting and JS syntax
+checks passed. Chrome checks covered station, municipality and warning samples,
+column persistence through paging/search, draft versus applied requests, typed
+property search and filter-preserving first-page recovery. Builder/advanced
+disclosure states survive submission. Primary query controls align at 46 px.
+
+For the captured 1,000-station response, the listing has no raw-geometry
+disclosures and the document is about 2,000 px tall on desktop, compared with
+83,000 px previously. At 390 × 844 the first result starts at 790 px (previously
+2,015 px), with no horizontal page overflow. Large tables scroll within a
+labelled, keyboard-focusable region.
+
+Screenshots: [items desktop](screenshots/items-light.png),
+[items mobile](screenshots/items-mobile.png),
+[item detail, dark](screenshots/item-dark.png).

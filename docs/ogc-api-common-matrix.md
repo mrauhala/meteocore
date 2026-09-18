@@ -331,3 +331,7 @@ Catalog presentation now has compact request/search disclosures, persistent
 list/cards choice, and truthful empty-page recovery without changing JSON paging.
 Summaries use advertised extents/parameters/styles; temporal sampling is shown
 only when explicitly supplied. No new discovery controls or conformance claims.
+
+Features item HTML now uses generic typed properties and user-selected columns;
+it no longer interprets weather property names. Paging recovery preserves the
+applied request. These presentation changes add no Common conformance claims.
