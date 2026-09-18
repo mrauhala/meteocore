@@ -262,11 +262,17 @@ including numeric lists such as elevation angles and string lists such as
 quantities. The same generic rule applies to item details and selected listing
 columns. Empty arrays are labelled explicitly. Arrays containing arrays/objects
 and object values retain expandable JSON views. No collection-specific rules
-or changes to the API data are introduced.
+are introduced.
 
-Browser verification rendered the original captured Herwijnen response directly
-through the HTML renderer, preserving its typed arrays (the GeoJSON sample loader
-stringifies them). All 14 elevation angles and nine quantities appear as chips
+The GeoJSON loader also preserves flat source arrays as typed lists, fixing the
+captured-data preview where those arrays previously became strings. Original
+string values and nested structures retain their existing handling. List filters
+match individual elements before counting and paging.
+
+Browser verification uses the normal local server with the captured Herwijnen
+GeoJSON fixture. All 14 elevation angles and nine quantities appear as chips
 in details and selected listing columns, including after restoring column choices.
-135 common/Features tests, seven cross-API contracts, formatting and workspace
-clippy passed. [Array chips screenshot](screenshots/item-array-chips.png).
+135 common/Features tests, 15 GeoJSON tests, seven cross-API contracts, formatting
+and workspace clippy passed. A source-file → real GeoJSON engine → Features router
+contract also checks item/listing JSON types, HTML chips and membership filtering.
+[Array chips screenshot](screenshots/item-array-chips.png).

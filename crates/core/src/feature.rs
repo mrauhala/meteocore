@@ -873,8 +873,8 @@ pub enum PropertyValue {
     /// scalars — engines do not nest `List`s, and the Features JSON serializer
     /// (which recurses) and the MVT tag encoder (which flattens to a joined
     /// string) both rely on shallow, engine-constructed nesting rather than a
-    /// runtime depth guard. There is no path from untrusted input to a
-    /// `PropertyValue`, so depth is bounded by construction.
+    /// runtime depth guard. Engines accepting source arrays must check that
+    /// every element is scalar before constructing a `List`.
     List(Vec<PropertyValue>),
 }
 

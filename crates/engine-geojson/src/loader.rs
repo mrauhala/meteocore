@@ -424,26 +424,41 @@ fn parse_properties(props: Option<&serde_json::Value>) -> HashMap<String, Proper
     };
 
     for (key, value) in obj {
-        let pv = match value {
-            serde_json::Value::String(s) => PropertyValue::String(s.clone()),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    PropertyValue::Integer(i)
-                } else if let Some(f) = n.as_f64() {
-                    PropertyValue::Float(f)
-                } else {
-                    PropertyValue::Null
-                }
-            }
-            serde_json::Value::Bool(b) => PropertyValue::Bool(*b),
-            serde_json::Value::Null => PropertyValue::Null,
-            // Nested objects/arrays: serialize to string representation
-            other => PropertyValue::String(other.to_string()),
-        };
+        // PropertyValue lists must be flat. Preserve scalar arrays, including
+        // empty arrays, without recursively admitting nested input structures.
+        let pv = parse_scalar(value)
+            .or_else(|| {
+                value.as_array().and_then(|values| {
+                    values
+                        .iter()
+                        .map(parse_scalar)
+                        .collect::<Option<Vec<_>>>()
+                        .map(PropertyValue::List)
+                })
+            })
+            .unwrap_or_else(|| PropertyValue::String(value.to_string()));
         result.insert(key.clone(), pv);
     }
 
     result
+}
+
+fn parse_scalar(value: &serde_json::Value) -> Option<PropertyValue> {
+    Some(match value {
+        serde_json::Value::String(s) => PropertyValue::String(s.clone()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                PropertyValue::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                PropertyValue::Float(f)
+            } else {
+                PropertyValue::Null
+            }
+        }
+        serde_json::Value::Bool(b) => PropertyValue::Bool(*b),
+        serde_json::Value::Null => PropertyValue::Null,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -583,6 +598,96 @@ mod tests {
             f.properties.get("population"),
             Some(&PropertyValue::Integer(658457))
         );
+    }
+
+    #[test]
+    fn flat_property_arrays_preserve_types_and_nested_values_remain_strings() {
+        let engine = load_from_string(
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"arrays",
+                "geometry":{"type":"Point","coordinates":[24,60]},
+                "properties":{
+                    "labels":["first","second"],
+                    "values":[0,0.3,false,null,""],
+                    "empty":[],
+                    "literal":"[0,0.3]",
+                    "nested":[0,[1,2]],
+                    "objects":[{"key":"value"}],
+                    "object":{"key":"value"}
+                }}]}"#,
+        );
+        let feature = engine.get_feature("arrays").unwrap();
+        let props = &feature.properties;
+        assert_eq!(
+            props["labels"],
+            PropertyValue::List(vec![
+                PropertyValue::String("first".into()),
+                PropertyValue::String("second".into()),
+            ])
+        );
+        assert_eq!(
+            props["values"],
+            PropertyValue::List(vec![
+                PropertyValue::Integer(0),
+                PropertyValue::Float(0.3),
+                PropertyValue::Bool(false),
+                PropertyValue::Null,
+                PropertyValue::String(String::new()),
+            ])
+        );
+        assert_eq!(props["empty"], PropertyValue::List(vec![]));
+        for (key, expected) in [
+            ("literal", "[0,0.3]"),
+            ("nested", "[0,[1,2]]"),
+            ("objects", r#"[{"key":"value"}]"#),
+            ("object", r#"{"key":"value"}"#),
+        ] {
+            assert_eq!(props[key], PropertyValue::String(expected.into()));
+        }
+    }
+
+    #[test]
+    fn array_membership_filters_apply_before_counting_and_paging() {
+        let engine = load_from_string(
+            r#"{"type":"FeatureCollection","features":[
+                {"type":"Feature","id":"skip","geometry":{"type":"Point","coordinates":[24,60]},
+                 "properties":{"labels":["other"],"values":[0.3]}},
+                {"type":"Feature","id":"first","geometry":{"type":"Point","coordinates":[24,60]},
+                 "properties":{"labels":["match","other"],"values":[0,0.3]}},
+                {"type":"Feature","id":"second","geometry":{"type":"Point","coordinates":[24,60]},
+                 "properties":{"labels":["match"],"values":[0.3,1.2]}}
+            ]}"#,
+        );
+        assert!(engine.filterables().contains("labels"));
+        for bbox in [
+            None,
+            Some(ds_core::feature::Bbox::new(23.0, 59.0, 25.0, 61.0).unwrap()),
+        ] {
+            let mut query = FeatureQuery {
+                bbox,
+                property_filters: vec![
+                    ("labels".into(), "match".into()),
+                    ("values".into(), "0.3".into()),
+                ],
+                limit: 1,
+                offset: 1,
+                ..Default::default()
+            };
+            let page = engine.get_features(&query).unwrap();
+            assert_eq!(page.number_matched, 2);
+            assert_eq!(page.features.len(), 1);
+            let second_id = page.features[0].id.clone();
+            query.offset = 0;
+            let first_page = engine.get_features(&query).unwrap();
+            let mut ids = vec![first_page.features[0].id.clone(), second_id];
+            ids.sort();
+            assert_eq!(ids, vec!["first", "second"]);
+            query.offset = 2;
+            let page = engine.get_features(&query).unwrap();
+            assert_eq!(page.number_matched, 2);
+            assert!(page.features.is_empty());
+            query.property_filters = vec![("labels".into(), "absent".into())];
+            assert_eq!(engine.get_features(&query).unwrap().number_matched, 0);
+        }
     }
 
     #[test]
