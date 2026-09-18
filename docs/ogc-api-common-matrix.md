@@ -305,3 +305,5 @@ they do not infer missing temporal bounds, grids or hierarchy relationships.
 The HTML workflow names Common discovery **Find collections** and API-specific
 data access **Request data**. Discovery filters select collections by metadata
 and coverage; they do not become data-query predicates.
+
+HTML catalog headings use the shared request bar for URL/cURL copy actions.

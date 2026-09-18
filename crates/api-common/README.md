@@ -134,3 +134,6 @@ content negotiation, escaping and view types; `workbench` owns page rendering.
 The overview separates collection discovery (Find collections) from data access
 (Request data after selection). Catalog filters search metadata/coverage; they
 are not forwarded as filters on data. The overview has one discovery action.
+
+URL and cURL copy controls live in the shared request bar; catalog headings do
+not duplicate them.

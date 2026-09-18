@@ -652,7 +652,10 @@ pub fn collections_html(
         "Collections",
         "Find datasets by their metadata and coverage. Select a collection to build a data request.",
     );
-    body=body.replace("OGC API · HTML REPRESENTATION",&format!("{} · DATA CATALOG",api.to_uppercase())).replacen("</div></div>",&format!("</div><div class=\"action-row\"><button class=\"btn enhanced\" data-copy=\"{}\">Copy API URL ↗</button></div></div>",escape(&json_url)),1);
+    body = body.replace(
+        "OGC API · HTML REPRESENTATION",
+        &format!("{} · DATA CATALOG", api.to_uppercase()),
+    );
     let first = if docs.is_empty() {
         0
     } else {
