@@ -103,7 +103,7 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             .map(|(_, v)| v.as_ref())
             .unwrap_or("")
     };
-    let mut out=format!("<form class=\"query-form item-query items-controls panel enhanced\" action=\"{}\" method=\"get\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"builder-heading\"><h2>Item query parameters</h2><span class=\"mono\">GET</span></div><div class=\"item-primary-fields\">",escape(action));
+    let mut out=format!("<form class=\"query-form item-query items-controls panel enhanced\" action=\"{}\" method=\"get\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"builder-heading\"><h2>Data request builder</h2><span class=\"mono\">GET</span></div><div class=\"item-primary-fields\">",escape(action));
     if !controls.filterables.is_empty() {
         out.push_str("<div class=\"equal-fields\"><label>Property<select data-new-property><option value=\"\">Choose a property</option>");
         for name in &controls.filterables {
@@ -124,7 +124,7 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             true,
         ));
     }
-    out.push_str("<button class=\"btn primary\">Apply query</button></div><p class=\"search-hint\">Item properties are collection-specific. Collection text search is available under Collections.</p>");
+    out.push_str("<button class=\"btn primary\">Request features</button></div><p class=\"search-hint\">Filter features within this selected collection. Use Collections to find a different dataset.</p>");
     let mut applied = String::new();
     for name in &controls.filterables {
         for (_, value) in pairs.iter().filter(|(k, _)| k == name) {
@@ -171,7 +171,7 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             true,
         ));
     }
-    out.push_str(&format!("</div></details><div class=\"filter-controls\">{}</div><div class=\"draft-request\"><small>Request preview · apply to update results</small><code data-draft></code></div></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
+    out.push_str(&format!("</div></details><div class=\"filter-controls\">{}</div><div class=\"draft-request\"><small>Data request preview · submit to update features</small><code data-draft></code></div></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
     out
 }
 
@@ -209,7 +209,7 @@ pub(crate) fn features_html(
         }
     );
     if is_list {
-        body.push_str(&format!("<div class=\"detail-heading\"><div class=\"chip-row\"><span class=\"chip teal\">Features</span><span class=\"chip\">Feature collection</span></div><h1>{}</h1><div class=\"mono\">{}</div><p>Inspect features and use the same request as GeoJSON.</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\">{}<a class=\"active\" aria-current=\"page\" href=\"{}\">Browse items</a>{}</nav>",escape(title),escape(collection_id),ui::anchor(&ui::with_format(&collection_url,"html"),"Overview",""),escape(&ui::with_format(&items_url,"html")),ui::anchor(&format!("{}#metadata",ui::with_format(&collection_url,"html")),"Metadata & links","")));
+        body.push_str(&format!("<div class=\"detail-heading\"><div class=\"chip-row\"><span class=\"chip teal\">Features</span><span class=\"chip\">Feature collection</span></div><h1>{}</h1><div class=\"mono\">{}</div><p>Request features from this collection, inspect the response, and use the same request as GeoJSON.</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\">{}<a class=\"active\" aria-current=\"page\" href=\"{}\">Request data</a>{}</nav>",escape(title),escape(collection_id),ui::anchor(&ui::with_format(&collection_url,"html"),"Overview",""),escape(&ui::with_format(&items_url,"html")),ui::anchor(&format!("{}#metadata",ui::with_format(&collection_url,"html")),"Metadata & links","")));
     } else {
         body.push_str(&format!("<div class=\"page-title\"><div><span class=\"eyebrow\">FEATURE DETAIL</span><h1>{}</h1><p class=\"mono\">{}</p><div class=\"chip-row spaced\"><span class=\"chip teal\">{}</span>{}</div></div>{}</div>",escape(&page_title),escape(doc["id"].as_str().unwrap_or_default()),escape(doc["geometry"]["type"].as_str().unwrap_or("No geometry")),feature_flags(doc),ui::anchor(&json_url,"GeoJSON { }","btn")));
         if doc["properties"]["likely_clutter"] == true {

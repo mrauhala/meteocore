@@ -130,3 +130,7 @@ future-control or loading-state demonstrations are exposed in the live UI.
 
 The former page builders in `ds_core::html` have been removed. That module retains
 content negotiation, escaping and view types; `workbench` owns page rendering.
+
+The overview separates collection discovery (Find collections) from data access
+(Request data after selection). Catalog filters search metadata/coverage; they
+are not forwarded as filters on data. The overview has one discovery action.

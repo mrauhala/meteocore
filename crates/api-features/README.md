@@ -234,3 +234,7 @@ coordinate details when WebGL is unavailable. It makes no additional feature or
 external tile requests. Alert expiry is labelled in the browser; server HTML and ETags remain
 deterministic. JavaScript enables item-query editing, map interaction and property
 search; paging and resource links remain usable without it.
+
+In HTML, the collection’s **Request data** tab opens the `/items` data request
+builder. **Request features** applies filters within that collection; collection
+discovery remains under **Collections → Find collections**.

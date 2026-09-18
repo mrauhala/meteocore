@@ -22,7 +22,7 @@ ordinary URLs, not a separate client-side application.
   supporting text and code. Theme choice persists locally.
 - The sidebar, typography, grouped search controls, chips and result rows use the
   approved mockup's HTML structure and styles. Collection views restore overview,
-  browse-items and metadata tabs; item details restore summary metrics and source
+  request-data and metadata tabs; item details restore summary metrics and source
   quality callouts when the corresponding properties exist.
 - Collection details retain full API metadata, keywords and license labels,
   including free-text licenses without a URL. EDR model-run pages share the shell.
@@ -76,3 +76,13 @@ The geographic backdrop comes from public-domain Natural Earth 1:110m country
 outlines. See [source and transformation details](../../../crates/server/preview/vendor/LICENSE-workbench-land.txt).
 It is a general-purpose locator; all geometry and bounding values remain available
 in the current resource's JSON.
+
+## Discover collections, then request data
+
+The overview has one **Find collections** action. The adjacent **Request data**
+step explains what becomes available after choosing a collection; it does not
+repeat the search action. Catalog controls are labelled **Collection search**.
+Within a Features collection, **Request data** opens the **Data request builder**
+and **Request features** retrieves matching items. EDR/Maps/Tiles explain their
+own operations without implying a new universal data builder. Discovery and
+data filters remain independent, and JSON always represents the current resource.

@@ -301,3 +301,7 @@ active UI controls. Features item sorting is a separate, engine-advertised contr
 The workbench uses the approved design's grouped search controls and collection
 overview/metadata tabs. Coverage locators visualize existing advertised extents;
 they do not infer missing temporal bounds, grids or hierarchy relationships.
+
+The HTML workflow names Common discovery **Find collections** and API-specific
+data access **Request data**. Discovery filters select collections by metadata
+and coverage; they do not become data-query predicates.

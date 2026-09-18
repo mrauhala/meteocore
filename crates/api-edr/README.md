@@ -194,3 +194,7 @@ metadata tabs separate coverage from the full metadata table; a local geographic
 backdrop locates the advertised extent. Data-query
 payloads keep their existing representations. See the
 [shared HTML behavior](../api-common/README.md#html-api-workbench).
+
+The HTML overview distinguishes finding a collection from requesting its data.
+Collection pages list advertised EDR operations and link to the API reference
+for required data-query inputs; collection search is not an EDR data builder.
