@@ -238,3 +238,7 @@ search; paging and resource links remain usable without it.
 In HTML, the collection’s **Request data** tab opens the `/items` data request
 builder. **Request features** applies filters within that collection; collection
 discovery remains under **Collections → Find collections**.
+
+HTML breadcrumbs display collection and item titles when available; resource
+URLs continue to use the original IDs. Parent titles are passed from the existing
+collection snapshot, without additional data queries.

@@ -150,3 +150,14 @@ Map refreshes retain the displayed image until its replacement has loaded in
 MapLibre, then swap the layers. Status, image-link and request-URL areas keep
 fixed dimensions to avoid shifting content during pan/zoom. Map controls use
 equal-height fields and an aligned action button, stacking on narrow screens.
+
+Breadcrumb labels use available collection/item titles while preserving resource
+IDs in URLs, including parent collections on item and model-run pages. Maps time
+controls expand an advertised regular grid (`cellsCount` + ISO duration) or use
+its explicit irregular coordinates, with previous/next available-time buttons.
+An interval alone does not imply sample availability; absent/oversized grids use
+a native UTC date/time input (expansion is bounded at 10,000 choices). Advertised
+style legends load with the displayed image; unchanged legends stay visible on
+pan/zoom. Full nested metadata and license links remain in Metadata & links,
+with configured licenses and searchable keywords also in the overview. Missing
+storage CRS is labelled "Not advertised", never guessed from the coverage CRS.

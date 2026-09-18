@@ -1,7 +1,13 @@
 // Shared locator for collection extents and this page's feature geometry.
 // Natural Earth is bundled locally; no third-party map service is contacted.
-(() => {
+(function initializeMap() {
   'use strict';
+  // Controls precede the sidebar in server-rendered markup. Bind only once
+  // the whole document exists, including the selected style's legend.
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded',initializeMap,{once:true});
+    return;
+  }
   const status = document.getElementById('map-status');
   const element = document.getElementById('feature-map');
   if (typeof maplibregl === 'undefined') return;
@@ -52,8 +58,65 @@
       const form = document.getElementById('map-controls');
       const style = document.getElementById('map-style');
       const time = document.getElementById('map-time');
+      const previous = document.getElementById('map-time-prev');
+      const next = document.getElementById('map-time-next');
+      function updateTimeButtons() {
+        if (!previous || !next) return;
+        previous.disabled = time.selectedIndex === 1;
+        next.disabled = time.selectedIndex === time.options.length - 1;
+      }
+      function stepTime(direction) {
+        time.selectedIndex = time.selectedIndex === 0
+          ? (direction < 0 ? time.options.length - 1 : 1)
+          : time.selectedIndex + direction;
+        updateTimeButtons(); clearTimeout(timer); render();
+      }
+      previous?.addEventListener('click',() => stepTime(-1));
+      next?.addEventListener('click',() => stepTime(1));
+      time.addEventListener('change',updateTimeButtons);
+      updateTimeButtons();
       const link = document.getElementById('map-image-link');
       const requestText = document.getElementById('map-image-request');
+      const legendImage = document.getElementById('map-legend-image');
+      const legendLink = document.getElementById('map-legend-link');
+      const legendStatus = document.getElementById('map-legend-status');
+      let legendGeneration = 0, activeLegend, legendObjectUrl;
+      async function showLegend(href, title) {
+        if (activeLegend === href) return;
+        activeLegend = href;
+        const current = ++legendGeneration;
+        legendImage.hidden = true; legendLink.hidden = true;
+        legendStatus.textContent = 'Legend not advertised for this style.';
+        if (!href) return;
+        let url;
+        try { url = new URL(href, location.href); } catch (_) { return; }
+        if (url.origin !== location.origin || !['http:','https:'].includes(url.protocol)) return;
+        legendStatus.textContent = 'Loading legend…';
+        let objectUrl;
+        try {
+          url.searchParams.set('f','png');
+          // Legends are cacheable, but an operator can change a style in place.
+          // Revalidate on selection so a cached old palette cannot label new pixels.
+          const response = await fetch(url,{cache:'no-cache',signal:AbortSignal.timeout(15000)});
+          if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('Legend unavailable');
+          const blob = await response.blob();
+          if (current !== legendGeneration) return;
+          objectUrl = URL.createObjectURL(blob);
+          const image = new Image();
+          image.src = objectUrl;
+          await image.decode();
+          if (current !== legendGeneration) { URL.revokeObjectURL(objectUrl); return; }
+          if (legendObjectUrl) URL.revokeObjectURL(legendObjectUrl);
+          legendObjectUrl = objectUrl;
+          legendImage.src = objectUrl; legendImage.alt = `${title} · parameter, units and color scale`;
+          legendImage.hidden = false; legendLink.hidden = false; legendStatus.textContent = '';
+          url.searchParams.set('f','json'); legendLink.href = url.href;
+          legendLink.setAttribute('aria-label',`${title} legend as JSON`);
+        } catch (_) {
+          if (objectUrl) URL.revokeObjectURL(objectUrl);
+          if (current === legendGeneration) { activeLegend = undefined; legendStatus.textContent = 'Legend unavailable.'; }
+        }
+      }
       let pending, generation = 0, timer, activeId, staged;
       function discardStaged() {
         if (!staged) return;
@@ -75,7 +138,8 @@
         let requestedUrl;
         try {
           const selectedStyle = style.selectedOptions[0].textContent;
-          const selectedTime = time.value.trim();
+          const selectedLegend = style.selectedOptions[0].dataset.legend;
+          const selectedTime = time.value ? (time.type === 'datetime-local' ? new Date(`${time.value}Z`).toISOString() : time.value) : '';
           const url = new URL(style.value, location.href);
           if (url.origin !== location.origin || !['http:','https:'].includes(url.protocol)) throw new Error('Map endpoint must use this server.');
           const bounds = map.getBounds();
@@ -113,6 +177,7 @@
             map.setPaintProperty(nextId,'raster-opacity',0.85);
             if (activeId) { map.removeLayer(activeId); map.removeSource(activeId); }
             activeId = nextId; staged = undefined;
+            showLegend(selectedLegend, selectedStyle);
             link.href = requestedUrl; link.removeAttribute('aria-disabled');
             requestText.textContent = requestedUrl;
             status.textContent = `Map data loaded · ${selectedStyle} · ${selectedTime || 'collection default time'}`;
@@ -125,6 +190,9 @@
           if (current !== generation) return;
           discardStaged();
           if (activeId) { map.removeLayer(activeId); map.removeSource(activeId); activeId = undefined; }
+          activeLegend = undefined;
+          ++legendGeneration; legendImage.hidden = true; legendLink.hidden = true;
+          legendStatus.textContent = 'Legend will appear after the map loads.';
           disableImageLink();
           if (requestedUrl) requestText.textContent = requestedUrl;
           status.textContent = error.name === 'AbortError' ? 'Map request timed out. Use Update map to retry.' : (error.message || 'Map data unavailable. Use Update map to retry.');

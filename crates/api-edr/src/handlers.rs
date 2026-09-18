@@ -1118,7 +1118,7 @@ pub async fn instances(
                 LinkView::new(
                     format!("{base}/edr/collections/{}", config.id),
                     "collection",
-                    Some("Collection"),
+                    Some(&config.title),
                 ),
             ];
             Html(api_common::workbench::instances_html(

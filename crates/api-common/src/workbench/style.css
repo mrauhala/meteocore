@@ -2588,3 +2588,15 @@ a {
 .map-controls>.btn{box-sizing:border-box;height:46px;min-height:46px;margin:0;white-space:nowrap}
 .map-controls>p{grid-column:1/-1;font-size:14px;color:var(--muted);margin:0}
 @media(max-width:1000px){.js .map-controls.enhanced{grid-template-columns:minmax(0,1fr)}.map-controls>.btn{justify-self:start}}
+
+/* Keep time navigation and the style/action row aligned at every width. */
+.map-time-field{display:flex;flex-direction:column;gap:8px;min-width:0}
+.map-time-picker{display:flex;align-items:center;gap:6px;min-width:0}
+.map-time-picker select,.map-time-picker input{min-width:0;flex:1}
+.map-time-picker .btn{height:46px;min-width:40px;padding:0 10px;margin:0;flex:none}
+#breadcrumbs{min-width:0;flex-wrap:wrap}
+#breadcrumbs a{overflow-wrap:anywhere}
+
+.map-legend{height:332px;padding:16px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;overflow:auto;font-size:14px;color:var(--muted)}
+.map-legend img{display:block;max-width:100%;height:auto}
+.map-legend [hidden]{display:none}

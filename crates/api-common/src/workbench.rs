@@ -92,6 +92,16 @@ pub struct Page<'a> {
 impl Page<'_> {
     /// `body` and `head` must be trusted markup built from escaped values.
     pub fn render(&self, body: &str, head: &str) -> String {
+        self.render_with_breadcrumbs(body, head, &[])
+    }
+
+    /// Override labels using resource paths; URLs retain their original IDs.
+    pub fn render_with_breadcrumbs(
+        &self,
+        body: &str,
+        head: &str,
+        labels: &[(&str, &str)],
+    ) -> String {
         let Self {
             base,
             api,
@@ -190,9 +200,23 @@ impl Page<'_> {
                     .next()
                     .map(|(_, v)| v.into_owned())
                     .unwrap_or_default();
+                    let label = labels
+                        .iter()
+                        .find(|(href, label)| {
+                            href.split('?').next().unwrap_or(href).trim_end_matches('/') == path
+                                && !label.trim().is_empty()
+                        })
+                        .map(|(_, label)| *label)
+                        .unwrap_or(match segment {
+                            "collections" => "Collections",
+                            "items" => "Items",
+                            "instances" => "Model runs",
+                            "conformance" => "Conformance",
+                            _ => &decoded,
+                        });
                     crumbs.push_str(&format!(
                         "<span>/</span>{}",
-                        anchor(&with_format(&path, "html"), &decoded, "")
+                        anchor(&with_format(&path, "html"), label, "")
                     ));
                 }
             }
@@ -275,6 +299,10 @@ pub fn document_links(doc: &Value) -> String {
                 continue;
             }
             let label = link["title"].as_str().unwrap_or(rel);
+            if rel == "map" {
+                body.push_str(&format!("<div class=\"endpoint\"><div><strong>{}</strong><code>{}</code><p>Image endpoint · requires bbox. Use the map controls or API reference.</p></div></div>",escape(label),escape(href)));
+                continue;
+            }
             let human = matches!(rel, "data" | "child" | "collection" | "conformance" | "up")
                 || rel == "items" && href.contains("/features/");
             let target = if human {
@@ -395,6 +423,48 @@ pub fn map_head(base: &str) -> String {
     )
 }
 
+/// Expand only advertised temporal grids, never infer a cadence from bounds.
+/// Large axes fall back to a native UTC date/time input instead of huge HTML.
+fn map_times(temporal: &Value) -> Vec<String> {
+    fn expand(temporal: &Value) -> Option<Vec<String>> {
+        let grid = &temporal["grid"];
+        let count = grid["cellsCount"].as_u64()?;
+        if !(1..=10_000).contains(&count) {
+            return None;
+        }
+        if let Some(coordinates) = grid["coordinates"].as_array() {
+            if coordinates.len() as u64 != count {
+                return None;
+            }
+            return coordinates
+                .iter()
+                .map(|t| {
+                    chrono::DateTime::parse_from_rfc3339(t.as_str()?)
+                        .ok()
+                        .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339())
+                })
+                .collect();
+        }
+        let step = ds_core::datetime::parse_iso8601_duration(grid["resolution"].as_str()?).ok()?;
+        let start =
+            chrono::DateTime::parse_from_rfc3339(temporal["interval"][0][0].as_str()?).ok()?;
+        let end =
+            chrono::DateTime::parse_from_rfc3339(temporal["interval"][0][1].as_str()?).ok()?;
+        let last = start.checked_add_signed(step.checked_mul((count - 1) as i32)?)?;
+        if last > end {
+            return None;
+        }
+        (0..count)
+            .map(|i| {
+                start
+                    .checked_add_signed(step.checked_mul(i as i32)?)
+                    .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339())
+            })
+            .collect()
+    }
+    expand(temporal).unwrap_or_default()
+}
+
 pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
     let raster = features.get("mapRequest");
     let mut controls = String::new();
@@ -402,12 +472,40 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
         controls.push_str("<form id=\"map-controls\" class=\"map-controls enhanced\"><label>Style<select id=\"map-style\">");
         for style in request["styles"].as_array().into_iter().flatten() {
             controls.push_str(&format!(
-                "<option value=\"{}\">{}</option>",
+                "<option value=\"{}\" data-legend=\"{}\">{}</option>",
                 escape(safe_href(style["href"].as_str().unwrap_or_default())),
+                escape(style["legend"].as_str().map(safe_href).unwrap_or_default()),
                 escape(style["title"].as_str().unwrap_or("Default"))
             ));
         }
-        controls.push_str("</select></label><label>Time · UTC<input id=\"map-time\" placeholder=\"Default time or RFC 3339 instant\" aria-describedby=\"map-help\"></label><button class=\"btn primary\">Update map</button><p id=\"map-help\">Pan or zoom to request the visible area. Leave time blank to use the collection default.</p></form>");
+        controls.push_str("</select></label><div class=\"map-time-field\"><label for=\"map-time\">Time · UTC</label><div class=\"map-time-picker\">");
+        let times = request["times"]
+            .as_array()
+            .filter(|times| !times.is_empty());
+        if let Some(times) = times {
+            controls.push_str("<button type=\"button\" class=\"btn\" id=\"map-time-prev\" aria-label=\"Previous available time\">←</button><select id=\"map-time\" aria-describedby=\"map-help\"><option value=\"\">Collection default</option>");
+            for time in times.iter().filter_map(Value::as_str) {
+                let label = chrono::DateTime::parse_from_rfc3339(time)
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|_| time.to_owned());
+                controls.push_str(&format!(
+                    "<option value=\"{}\">{}</option>",
+                    escape(time),
+                    escape(&label)
+                ));
+            }
+            controls.push_str("</select><button type=\"button\" class=\"btn\" id=\"map-time-next\" aria-label=\"Next available time\">→</button>");
+        } else {
+            controls.push_str("<input id=\"map-time\" type=\"datetime-local\" step=\"1\" aria-describedby=\"map-help\">");
+        }
+        controls.push_str("</div></div><button class=\"btn primary\">Update map</button><p id=\"map-help\">Pan or zoom to request the visible area. ");
+        if let Some(times) = times {
+            controls.push_str(&format!(
+                "{} advertised times. Arrow buttons load the adjacent time. ",
+                times.len()
+            ));
+        }
+        controls.push_str("An empty/default time uses the collection default.</p></form>");
     }
     let label = if raster.is_some() {
         "Collection map data"
@@ -430,6 +528,7 @@ pub fn collection_html(
 ) -> String {
     let title = doc["title"]
         .as_str()
+        .filter(|title| !title.trim().is_empty())
         .or(doc["id"].as_str())
         .unwrap_or("Collection");
     let id = doc["id"].as_str().unwrap_or_default();
@@ -449,15 +548,21 @@ pub fn collection_html(
             .and_then(|l| l["href"].as_str())
             .filter(|href| safe_href(href) != "#")
             .map(|href| {
-                let mut styles = vec![json!({"title":"Collection default","href":href})];
+                let legend = |style: &Value| style["links"].as_array()
+                    .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend"))
+                    .and_then(|l|l["href"].as_str()).filter(|href|safe_href(href) != "#")
+                    .map(str::to_owned);
+                let default_legend = doc["styles"].as_array()
+                    .and_then(|styles|styles.iter().find(|s|s["id"] == "default")).and_then(legend);
+                let mut styles = vec![json!({"title":"Collection default","href":href,"legend":default_legend})];
                 for style in doc["styles"].as_array().into_iter().flatten() {
                     // The collection map endpoint already renders this style.
                     if style["id"] == "default" { continue; }
                     if let Some(href) = style["links"].as_array().and_then(|ls|ls.iter().find(|l|l["rel"]=="map")).and_then(|l|l["href"].as_str()).filter(|href|safe_href(href)!="#") {
-                        styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href}));
+                        styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"legend":legend(style)}));
                     }
                 }
-                json!({"styles":styles})
+                json!({"styles":styles,"times":map_times(&doc["extent"]["temporal"])})
             })
     } else {
         None
@@ -514,7 +619,7 @@ pub fn collection_html(
     } else {
         body.push_str("<div class=\"empty-state\"><p>Spatial extent not specified.</p></div>");
     }
-    body.push_str(&format!("<div class=\"coverage-facts\"><div class=\"fact\"><small>Start · UTC</small><strong>{}</strong></div><div class=\"fact\"><small>End · UTC</small><strong>{}</strong></div><div class=\"fact wide\"><small>Advertised bounds · west, south, east, north</small><strong class=\"mono\">{}</strong></div></div></section><section class=\"section-space\"><h2>Request data from this collection</h2>",value_html(&interval[0]),value_html(&interval[1]),value_html(bbox)));
+    body.push_str(&format!("<div class=\"coverage-facts\"><div class=\"fact\"><small>Start · UTC</small><strong>{}</strong></div><div class=\"fact\"><small>End · UTC</small><strong>{}</strong></div><div class=\"fact wide\"><small>Advertised bounds · CRS84 axis order</small><strong class=\"mono\">{}</strong></div></div></section><section class=\"section-space\"><h2>Request data from this collection</h2>",value_html(&interval[0]),value_html(&interval[1]),value_html(bbox)));
     if let Some(items) = items {
         body.push_str(&format!("<div class=\"callout spaced\">Filter features within this collection by its supported properties, area and time. Inspect the results or copy the GeoJSON request. These filters select data, not collections.</div><div class=\"action-row spaced\">{}{}</div>",anchor(&with_format(items,"html"),"Build a data request →","btn primary"),anchor(&url,"View metadata JSON","btn")));
     }
@@ -532,21 +637,21 @@ pub fn collection_html(
         }
         body.push_str("</div>");
     }
-    if matches!(api, "maps" | "tiles") {
+    if api == "maps" {
+        body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
+        body.push_str(&anchor(
+            &format!("{base}/maps/api/docs"),
+            "Map request parameters ↗",
+            "btn",
+        ));
+    } else if api == "tiles" {
         body.push_str(&document_links(doc));
-        if api == "maps" {
-            body.push_str(&anchor(
-                &format!("{base}/preview"),
-                "Open map preview ↗",
-                "btn primary",
-            ));
-        }
     }
     body.push_str("</section></div><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Collection details</h2></div><div class=\"panel-body\"><dl class=\"definition\">");
     body.push_str(&format!(
-        "<dt>Resource</dt><dd>{}</dd><dt>Coordinate system</dt><dd>{}</dd>",
+        "<dt>Resource</dt><dd>{}</dd><dt>Storage coordinate system</dt><dd>{}</dd>",
         escape(kind),
-        escape(doc["storageCrs"].as_str().unwrap_or("CRS84"))
+        escape(doc["storageCrs"].as_str().unwrap_or("Not advertised"))
     ));
     if let Some(n) = doc.get("numberItems") {
         body.push_str(&format!("<dt>Items</dt><dd>{}</dd>", value_html(n)));
@@ -562,7 +667,17 @@ pub fn collection_html(
     {
         body.push_str(&anchor(&query_edit(&catalog, "q", Some(k)), k, ""));
     }
-    body.push_str("</div></div></div></section><section class=\"panel\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
+    if !doc["keywords"]
+        .as_array()
+        .is_some_and(|ks| ks.iter().any(Value::is_string))
+    {
+        body.push_str("<span class=\"muted\">Not advertised</span>");
+    }
+    body.push_str("</div></div></div></section>");
+    if map_request.is_some() {
+        body.push_str("<section class=\"panel enhanced\"><div class=\"panel-head\"><h2>Map legend</h2></div><div class=\"map-legend\"><span id=\"map-legend-status\">Legend will appear after the map loads.</span><a id=\"map-legend-link\" hidden><img id=\"map-legend-image\" alt=\"Selected map style legend\" hidden></a></div></section>");
+    }
+    body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
     body.push_str(&document_links(doc));
     body.push_str("</div></section></aside></div></section><section id=\"metadata\" class=\"collection-view metadata-section\" data-collection-view><section class=\"panel\"><div class=\"panel-head\"><h2>Coverage &amp; metadata</h2>");
     body.push_str(&anchor(&url, "View full JSON { }", "quiet"));
@@ -581,7 +696,16 @@ pub fn collection_html(
         title,
         json_url: &url,
     }
-    .render(&body, &head)
+    .render_with_breadcrumbs(&body, &head, &{
+        let mut labels = links
+            .into_iter()
+            .flatten()
+            .filter(|l| l["rel"] == "collection")
+            .filter_map(|l| Some((l["href"].as_str()?, l["title"].as_str()?)))
+            .collect::<Vec<_>>();
+        labels.push((href, title));
+        labels
+    })
 }
 
 /// A labelled native input; optional enhanced fields acquire names only while
@@ -866,12 +990,69 @@ pub fn instances_html(
         title,
         json_url: url,
     }
-    .render(&body, "")
+    .render_with_breadcrumbs(
+        &body,
+        "",
+        &nav.iter()
+            .filter(|l| l.rel == "collection")
+            .filter_map(|l| Some((l.href.as_str(), l.title.as_deref()?)))
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_choices_respect_regular_and_irregular_grids_without_inventing_samples() {
+        let mut temporal = json!({"interval":[["2026-09-18T00:00:00Z","2026-09-18T06:00:00Z"]]});
+        assert!(map_times(&temporal).is_empty());
+        temporal["grid"] = json!({"cellsCount":3,"resolution":"PT3H"});
+        let times = map_times(&temporal);
+        assert_eq!(times.len(), 3);
+        assert_eq!(times[1], "2026-09-18T03:00:00+00:00");
+        temporal["grid"] = json!({"cellsCount":3,"coordinates":["2026-09-18T00:00:00Z","2026-09-18T01:00:00Z","2026-09-18T06:00:00Z"]});
+        assert_eq!(map_times(&temporal)[1], "2026-09-18T01:00:00+00:00");
+        temporal["grid"] = json!({"cellsCount":10001,"resolution":"PT1S"});
+        assert!(map_times(&temporal).is_empty());
+        temporal["grid"] = json!({"cellsCount":3,"resolution":"P1D"});
+        assert!(map_times(&temporal).is_empty());
+        temporal["grid"] = json!({"cellsCount":2,"coordinates":["invalid","2026-09-18T01:00:00Z"]});
+        assert!(map_times(&temporal).is_empty());
+    }
+
+    #[test]
+    fn rich_collection_metadata_and_escaped_breadcrumb_titles_remain_available() {
+        let base = "https://example.test/proxy";
+        let href = format!("{base}/maps/collections/a%2Bb");
+        let doc = json!({"id":"a+b","title":"Forecast & <wind>","keywords":["wind","global"],
+            "extent":{"vertical":{"interval":[[100,1000]],"values":[100,500,1000],"unit":"hPa"}},
+            "custom":{"nested":{"value":false}},
+            "links":[{"rel":"self","href":href},{"rel":"license","title":"License","href":"https://example.test/license"}]});
+        let license = LicenseConfig {
+            title: "Use with attribution".into(),
+            url: None,
+        };
+        let html = collection_html(base, "maps", &doc, Some(&license));
+        let crumbs = html
+            .split("id=\"breadcrumbs\"")
+            .nth(1)
+            .unwrap()
+            .split("</nav>")
+            .next()
+            .unwrap();
+        assert!(crumbs.contains("Forecast &amp; &lt;wind&gt;"));
+        assert!(crumbs.contains("/a%2Bb?f=html"));
+        assert!(html.contains("Use with attribution"));
+        assert!(html.contains("https://example.test/license"));
+        for value in [
+            "vertical", "1000", "hPa", "nested", "false", "wind", "global",
+        ] {
+            assert!(html.contains(value), "missing {value}");
+        }
+        assert!(html.contains("Storage coordinate system</dt><dd>Not advertised</dd>"));
+    }
 
     #[test]
     fn format_switch_retains_duplicate_predicates_operators_and_fragment() {

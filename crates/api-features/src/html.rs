@@ -342,7 +342,14 @@ pub(crate) fn features_html(
         title: &page_title,
         json_url: &json_url,
     }
-    .render(&body, &head)
+    .render_with_breadcrumbs(
+        &body,
+        &head,
+        &[
+            (&collection_url, title),
+            (if is_list { "" } else { &json_url }, &page_title),
+        ],
+    )
 }
 
 #[cfg(test)]

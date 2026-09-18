@@ -198,3 +198,6 @@ payloads keep their existing representations. See the
 The HTML overview distinguishes finding a collection from requesting its data.
 Collection pages list advertised EDR operations and link to the API reference
 for required data-query inputs; collection search is not an EDR data builder.
+
+HTML breadcrumbs use collection titles, including parent collection links on
+model-run lists and individual run metadata pages. IDs remain unchanged in URLs.

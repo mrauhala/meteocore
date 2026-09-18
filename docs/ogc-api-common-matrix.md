@@ -314,3 +314,9 @@ JSON representation remains collection metadata and Common discovery is unchange
 
 Map previews update images within a stable HTML layout; pan/zoom does not
 navigate or reload the collection document.
+
+Breadcrumbs prefer resource titles. Maps time navigation consumes Part 2 temporal
+grid metadata (regular resolution/count or explicit irregular coordinates); it
+does not infer sampling from an interval or claim new Part 4 conformance. Optional
+metadata remains visible in the metadata tab, including nested extensions,
+vertical coverage, keywords and license links. Storage CRS is not inferred.
