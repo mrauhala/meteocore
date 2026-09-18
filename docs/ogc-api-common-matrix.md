@@ -307,3 +307,7 @@ data access **Request data**. Discovery filters select collections by metadata
 and coverage; they do not become data-query predicates.
 
 HTML catalog headings use the shared request bar for URL/cURL copy actions.
+
+Maps HTML collection overviews additionally preview actual data using the
+advertised map/style endpoints. This is API-specific data access; the page’s
+JSON representation remains collection metadata and Common discovery is unchanged.

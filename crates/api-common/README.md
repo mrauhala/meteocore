@@ -137,3 +137,11 @@ are not forwarded as filters on data. The overview has one discovery action.
 
 URL and cURL copy controls live in the shared request bar; catalog headings do
 not duplicate them.
+
+Maps collection overviews render the advertised map endpoint over the locator.
+The browser requests the visible CRS84 bbox as a Web Mercator PNG (at most
+1024 × 768), with advertised style links and an optional datetime instant. Pan/zoom
+requests are debounced and superseded fetches are cancelled. Loading/errors are
+explicit; failed requests hide the previous image. The rendered-image URL is
+separate from the collection metadata JSON link. No rendering occurs while
+assembling metadata on the server.

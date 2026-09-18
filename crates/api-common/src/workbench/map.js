@@ -46,10 +46,81 @@
       }
     }
     if (element.dataset.quicklook === 'true' && data.features.length) inspect(data.features[0]);
+    // Render the viewport in Web Mercator so image pixels align with MapLibre.
+    // Bounds come from the map; projection math remains in the existing API.
+    function installRasterPreview() {
+      const form = document.getElementById('map-controls');
+      const style = document.getElementById('map-style');
+      const time = document.getElementById('map-time');
+      const link = document.getElementById('map-image-link');
+      const requestText = document.getElementById('map-image-request');
+      const canvas = document.createElement('canvas');
+      let pending, generation = 0, timer;
+      async function render() {
+        if (!element.clientWidth || !element.clientHeight) return;
+        const current = ++generation;
+        pending?.abort(); pending = new AbortController();
+        const controller = pending;
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        link.hidden = true;
+        if (map.getLayer('map-data')) map.setLayoutProperty('map-data','visibility','none');
+        try {
+          const selectedStyle = style.selectedOptions[0].textContent;
+          const selectedTime = time.value.trim();
+          const url = new URL(style.value, location.href);
+          if (url.origin !== location.origin || !['http:','https:'].includes(url.protocol)) throw new Error('Map endpoint must use this server.');
+          const bounds = map.getBounds();
+          // A single image covers at most one world. Do not clamp latitude:
+          // map bounds and the server's Web Mercator rendering must agree.
+          const west = Math.max(-180,bounds.getWest());
+          const east = Math.min(180,bounds.getEast());
+          const south = bounds.getSouth(), north = bounds.getNorth();
+          if (!(west < east && south < north)) throw new Error('Pan back to the collection to view data.');
+          const width = Math.min(1024,Math.max(1,Math.round(element.clientWidth)));
+          const height = Math.min(768,Math.max(1,Math.round(element.clientHeight)));
+          url.searchParams.set('bbox',[west,south,east,north].join(','));
+          url.searchParams.set('bbox-crs','CRS:84'); url.searchParams.set('crs','EPSG:3857');
+          url.searchParams.set('width',width); url.searchParams.set('height',height);
+          url.searchParams.set('f','image/png'); url.searchParams.set('transparent','true');
+          if (selectedTime) url.searchParams.set('datetime',selectedTime); else url.searchParams.delete('datetime');
+          requestText.textContent = url.href;
+          status.textContent = 'Loading map data…';
+          const response = await fetch(url,{signal:controller.signal});
+          if (!response.ok) throw new Error(`Map request failed (HTTP ${response.status}). Adjust the time or retry.`);
+          if (!response.headers.get('content-type')?.startsWith('image/')) throw new Error('Map endpoint did not return an image.');
+          const bitmap = await createImageBitmap(await response.blob());
+          if (current !== generation || controller.signal.aborted) { bitmap.close(); return; }
+          canvas.width = bitmap.width; canvas.height = bitmap.height;
+          canvas.getContext('2d').drawImage(bitmap,0,0); bitmap.close();
+          const coordinates = [[west,north],[east,north],[east,south],[west,south]];
+          // Replace the static canvas source so every response uploads fresh
+          // pixels, including same-size images after time/style changes.
+          if (map.getLayer('map-data')) map.removeLayer('map-data');
+          if (map.getSource('map-data')) map.removeSource('map-data');
+          map.addSource('map-data',{type:'canvas',canvas,coordinates,animate:false});
+          map.addLayer({id:'map-data',type:'raster',source:'map-data',paint:{'raster-opacity':0.85,'raster-fade-duration':0}},'outlines');
+          map.triggerRepaint();
+          link.href = url.href; link.hidden = false;
+          status.textContent = `Map data loaded · ${selectedStyle} · ${selectedTime || 'collection default time'}`;
+        } catch (error) {
+          if (current !== generation) return;
+          status.textContent = error.name === 'AbortError' ? 'Map request timed out. Use Update map to retry.' : (error.message || 'Map data unavailable. Use Update map to retry.');
+        } finally { clearTimeout(timeout); }
+      }
+      function schedule() {
+        // Invalidate immediately so an old response cannot replace a new view.
+        ++generation; pending?.abort(); clearTimeout(timer);
+        timer = setTimeout(render,300);
+      }
+      form.addEventListener('submit',event => { event.preventDefault(); clearTimeout(timer); render(); });
+      map.on('moveend',schedule);
+      new ResizeObserver(() => { if (element.clientWidth && element.clientHeight) map.resize(); }).observe(element);
+      render();
+    }
     map.on('style.load', async () => {
       const color = palette().ink;
       map.addSource('features', { type: 'geojson', data });
-      map.addLayer({ id: 'areas', type: 'fill', source: 'features', filter: ['==', ['geometry-type'], 'Polygon'], paint: { 'fill-color': color, 'fill-opacity': 0.18 } });
+      map.addLayer({ id: 'areas', type: 'fill', source: 'features', filter: ['==', ['geometry-type'], 'Polygon'], paint: { 'fill-color': color, 'fill-opacity': data.mapRequest ? 0 : 0.18 } });
       map.addLayer({ id: 'outlines', type: 'line', source: 'features', filter: ['!=', ['geometry-type'], 'Point'], paint: { 'line-color': color, 'line-width': 2 } });
       map.addLayer({ id: 'points', type: 'circle', source: 'features', filter: ['==', ['geometry-type'], 'Point'], paint: { 'circle-color': color, 'circle-radius': 7, 'circle-stroke-color': palette().land, 'circle-stroke-width': 2 } });
       const bounds = new maplibregl.LngLatBounds();
@@ -61,8 +132,9 @@
       }
       function geometry(g) { if (!g) return; if (g.geometries) g.geometries.forEach(geometry); else extend(g.coordinates); }
       data.features.forEach(feature => geometry(feature.geometry));
-      if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 45, maxZoom: 5, duration: 0 });
+      if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 45, maxZoom: data.mapRequest ? 8 : 5, duration: 0 });
       status.textContent = element.dataset.quicklook === 'true' ? 'Current page · select a shape for a quick look.' : 'Advertised geometry · general-purpose locator.';
+      if (data.mapRequest) installRasterPreview();
       map.on('click', event => {
         if (element.dataset.quicklook !== 'true') return;
         const { x, y } = event.point;
@@ -105,7 +177,7 @@
           });
         }
         labelCountries();map.on('moveend',labelCountries);
-      } catch (_) { status.textContent += ' Geographic backdrop unavailable.'; }
+      } catch (_) { if (!data.mapRequest) status.textContent += ' Geographic backdrop unavailable.'; }
     });
     map.on('error', () => { status.textContent = 'Map unavailable; coordinates remain available below.'; });
   } catch (_) { status.textContent = 'Map unavailable; coordinates remain available below.'; }

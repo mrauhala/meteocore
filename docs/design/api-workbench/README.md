@@ -42,7 +42,7 @@ and the [Common capability matrix](../../ogc-api-common-matrix.md).
 - `cargo test -p ds-core -p api-common -p api-edr -p api-features -p api-maps -p api-tiles`
 - `cargo test -p server --test common_discovery`
 
-The core and API suites passed 1,025 tests (four pre-existing ignored tests);
+The core and API suites passed 1,026 tests (four pre-existing ignored tests);
 cross-API contracts passed seven. Contracts cover query/format preservation, full metadata,
 license display, proxy prefixes, capability-driven controls, escaping, GeoJSON/HTML
 negotiation and representation-specific caching.
@@ -86,3 +86,19 @@ Within a Features collection, **Request data** opens the **Data request builder*
 and **Request features** retrieves matching items. EDR/Maps/Tiles explain their
 own operations without implying a new universal data builder. Discovery and
 data filters remain independent, and JSON always represents the current resource.
+
+## Maps collection data preview
+
+Maps collection overviews fetch actual rendered PNG data for the visible area
+over the geographic backdrop. Pan/zoom updates the request; advertised styles
+and an optional RFC 3339 time can be applied with **Update map**. Blank time uses
+the collection default. The exact image URL is visible below the map and opens
+through **Open rendered image**. The global JSON switch remains the collection
+metadata representation. Loading failures and timeouts stay in the map panel.
+
+[Maps collection with radar data](screenshots/map-data-light.png)
+
+Validated the local GeoTIFF radar fixture: zoom changes the bbox/image request;
+style changes replace the pixels; explicit time is retained in the image URL;
+invalid time returns a visible HTTP 400 message and hides stale imagery. Recovery,
+light/dark themes and 390px layouts were checked in Chrome.

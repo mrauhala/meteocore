@@ -396,7 +396,30 @@ pub fn map_head(base: &str) -> String {
 }
 
 pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
-    format!("<div class=\"map-panel\"><div id=\"feature-map\" data-land=\"{base}/preview/vendor/workbench-land.json\" data-quicklook=\"{quicklook}\" role=\"region\" aria-label=\"Feature geometry map\"></div><p id=\"map-status\">Map requires JavaScript and WebGL; coordinates remain available below.</p><div id=\"map-data\" hidden>{}</div></div><script src=\"{base}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&features.to_string()),include_str!("workbench/map.js"),base=escape(base))
+    let raster = features.get("mapRequest");
+    let mut controls = String::new();
+    if let Some(request) = raster {
+        controls.push_str("<form id=\"map-controls\" class=\"map-controls enhanced\"><label>Style<select id=\"map-style\">");
+        for style in request["styles"].as_array().into_iter().flatten() {
+            controls.push_str(&format!(
+                "<option value=\"{}\">{}</option>",
+                escape(safe_href(style["href"].as_str().unwrap_or_default())),
+                escape(style["title"].as_str().unwrap_or("Default"))
+            ));
+        }
+        controls.push_str("</select></label><label>Time · UTC<input id=\"map-time\" placeholder=\"Default time or RFC 3339 instant\" aria-describedby=\"map-help\"></label><button class=\"btn primary\">Update map</button><p id=\"map-help\">Pan or zoom to request the visible area. Leave time blank to use the collection default.</p></form>");
+    }
+    let label = if raster.is_some() {
+        "Collection map data"
+    } else {
+        "Feature geometry map"
+    };
+    let request_link = if raster.is_some() {
+        "<div class=\"map-request panel-body enhanced\"><a id=\"map-image-link\" class=\"btn small\" hidden>Open rendered image ↗</a><code id=\"map-image-request\"></code></div>"
+    } else {
+        ""
+    };
+    format!("{controls}<div class=\"map-panel\"><div id=\"feature-map\" data-land=\"{base}/preview/vendor/workbench-land.json\" data-quicklook=\"{quicklook}\" role=\"region\" aria-label=\"{label}\"></div><p id=\"map-status\" role=\"status\">Map requires JavaScript and WebGL; coordinates remain available below.</p>{request_link}<div id=\"map-data\" hidden>{}</div></div><script src=\"{base}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&features.to_string()),include_str!("workbench/map.js"),base=escape(base))
 }
 
 pub fn collection_html(
@@ -421,6 +444,24 @@ pub fn collection_html(
         .and_then(|ls| ls.iter().find(|l| l["rel"] == "items"))
         .and_then(|l| l["href"].as_str())
         .filter(|_| api == "features");
+    let map_request = if api == "maps" {
+        links.and_then(|ls| ls.iter().find(|l| l["rel"] == "map"))
+            .and_then(|l| l["href"].as_str())
+            .filter(|href| safe_href(href) != "#")
+            .map(|href| {
+                let mut styles = vec![json!({"title":"Collection default","href":href})];
+                for style in doc["styles"].as_array().into_iter().flatten() {
+                    // The collection map endpoint already renders this style.
+                    if style["id"] == "default" { continue; }
+                    if let Some(href) = style["links"].as_array().and_then(|ls|ls.iter().find(|l|l["rel"]=="map")).and_then(|l|l["href"].as_str()).filter(|href|safe_href(href)!="#") {
+                        styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href}));
+                    }
+                }
+                json!({"styles":styles})
+            })
+    } else {
+        None
+    };
     let kind = doc["itemType"]
         .as_str()
         .or(doc["dataType"].as_str())
@@ -430,6 +471,12 @@ pub fn collection_html(
         body.push_str(&anchor(&with_format(items, "html"), "Request data", ""));
     }
     body.push_str("<a data-collection-tab=\"metadata\" href=\"#metadata\">Metadata &amp; links</a></nav><section id=\"overview\" class=\"collection-view\" data-collection-view><div class=\"detail-layout\"><div><section class=\"panel\"><div class=\"panel-head\"><h2>Spatial &amp; temporal coverage</h2><span class=\"chip\">CRS84</span></div>");
+    if map_request.is_some() {
+        body = body.replace(
+            "<h2>Spatial &amp; temporal coverage</h2>",
+            "<h2>Map data &amp; coverage</h2>",
+        );
+    }
     let bbox = &doc["extent"]["spatial"]["bbox"][0];
     let interval = &doc["extent"]["temporal"]["interval"][0];
     let mut head = String::new();
@@ -452,7 +499,18 @@ pub fn collection_html(
             json!({"type":"MultiPolygon","coordinates":[[ring(w,180.)],[ring(-180.,e)]]})
         };
         head = map_head(base);
-        body.push_str(&map_html(base,&json!({"type":"FeatureCollection","features":[{"type":"Feature","geometry":geometry,"properties":{"label":"Advertised collection extent"}}]}),false));
+        let mut map_data = json!({"type":"FeatureCollection","features":[{"type":"Feature","geometry":geometry,"properties":{"label":"Advertised collection extent"}}]});
+        if let Some(request) = &map_request {
+            map_data["mapRequest"] = request.clone();
+        }
+        body.push_str(&map_html(base, &map_data, false));
+    } else if let Some(request) = &map_request {
+        head = map_head(base);
+        body.push_str(&map_html(
+            base,
+            &json!({"type":"FeatureCollection","features":[],"mapRequest":request}),
+            false,
+        ));
     } else {
         body.push_str("<div class=\"empty-state\"><p>Spatial extent not specified.</p></div>");
     }
@@ -851,6 +909,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["json"]
         );
+    }
+
+    #[test]
+    fn maps_preview_uses_advertised_endpoints_and_retains_metadata_representation() {
+        let base = "https://example.test/prefix";
+        let doc = json!({"id":"a","extent":{"spatial":{"bbox":[[20,60,0,30,70,100]]}},"links":[
+            {"rel":"self","href":format!("{base}/maps/collections/a")},
+            {"rel":"map","href":format!("{base}/maps/collections/a/map")}
+        ],"styles":[{"title":"Rain & snow","links":[{"rel":"map","href":format!("{base}/maps/collections/a/styles/rain/map")}]},{"title":"Unsafe","links":[{"rel":"map","href":"javascript:alert(1)"}]}]});
+        let html = collection_html(base, "maps", &doc, None);
+        let data = html
+            .split("id=\"map-data\" hidden>")
+            .nth(1)
+            .unwrap()
+            .split("</div>")
+            .next()
+            .unwrap()
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&");
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["mapRequest"]["styles"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            data["mapRequest"]["styles"][1]["href"],
+            format!("{base}/maps/collections/a/styles/rain/map")
+        );
+        assert_eq!(
+            data["features"][0]["geometry"]["coordinates"][0][2],
+            json!([30., 70.])
+        );
+        assert!(html.contains(&format!(
+            "id=\"json-link\" href=\"{base}/maps/collections/a?f=json\""
+        )));
+        assert!(!collection_html(base, "features", &doc, None).contains("id=\"map-controls\""));
     }
 
     #[test]

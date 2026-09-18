@@ -2571,3 +2571,8 @@ a {
 .js .view-switch.enhanced{display:flex!important}.search-hint a{text-decoration:underline;text-underline-offset:3px}.page-title .action-row{align-self:start}.collection-row .collection-side small{font-size:14px}.query-builder .filters .hint{font-size:14px}.properties .chip-row{display:flex;flex-wrap:wrap;gap:6px}
 
 .properties tbody th{border-bottom:1px solid var(--line)}.item-query .equal-fields label{margin-bottom:0}
+
+.js .map-controls.enhanced{display:flex!important}.map-controls{padding:20px;gap:16px;align-items:end;flex-wrap:wrap}.map-controls label{flex:1;min-width:180px}.map-controls select,.map-controls input{display:block;width:100%;margin-top:6px}.map-controls p{flex-basis:100%;font-size:14px;color:var(--muted);margin:0}.map-request code{display:block;margin-top:12px;overflow-wrap:anywhere;font-size:14px}
+
+#feature-map[aria-label="Collection map data"]{height:480px}@media(max-width:800px){#feature-map[aria-label="Collection map data"]{height:380px}}
+.detail-layout>div,.detail-layout>aside{min-width:0}.map-controls label{max-width:100%}
