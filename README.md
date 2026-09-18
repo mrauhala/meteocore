@@ -700,6 +700,8 @@ GRIB2 files from NWP models. The engine discovers data via index sidecar files, 
 **Requirements:**
 - **Index sidecar files** — either ECMWF JSON-lines (default, `_offset`/`_length` per message) or wgrib2 colon-separated text (set `index_format = "wgrib2"`).
 - **Regular lat/lon grid** — Template 3.0 (equidistant cylindrical) only.
+  Row/column-major, reversed and alternating scans are normalized; staggered
+  scan flags are rejected.
 - **Data source:** S3/HTTP remote (default) or a local directory (`data_path`).
 
 **Data access pattern:**
@@ -710,6 +712,14 @@ GRIB2 files from NWP models. The engine discovers data via index sidecar files, 
 
 **Multi-parameter collections:** Unlike GeoTIFF (one band per collection), a GRIB collection exposes all parameters from the data source. EDR queries select parameters via `parameter-name`. MapEngine uses per-parameter WMS layers.
 
+Each run selects a canonical level for each parameter name, preferring near-surface
+products. Metadata, EDR and Maps use the same level identity. A missing canonical
+level produces null in a position series and an error for Maps/area, rather than
+substituting an upper-air field. Explicit vertical selection is not yet supported.
+Requested times use the newest run whose published valid-time extent contains
+the request, snapping to the nearest step within that extent. A pinned run never
+falls back to another run.
+
 **Automatic unit conversion** (config-free):
 
 Unit conversion is driven by the WMO `(discipline, category, parameter_number)` triple read from each GRIB message, not by short-name tables. Source units come from WMO Code Table 4.2 plus per-center overlays for local parameter numbers 192–254.
@@ -717,6 +727,7 @@ Unit conversion is driven by the WMO `(discipline, category, parameter_number)` 
 | Source Unit | Display Unit | Conversion |
 |-------------|-------------|------------|
 | K | °C | −273.15 |
+| K (temperature difference, e.g. dewpoint depression) | K | identity |
 | Pa | hPa | ×0.01 |
 | kg m⁻² | mm | ×1 (accumulated liquid-equivalent, WMO standard triples) |
 | m (metres of water) | mm | ×1000 (ECMWF local params 193/198/254) |

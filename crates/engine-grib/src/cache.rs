@@ -157,8 +157,12 @@ impl DecodedGrid {
         let dx = col_f - col as f64;
         let dy = row_f - row as f64;
 
-        // Right and bottom neighbors (clamp to grid edge)
-        let col1 = (col + 1).min(self.ni - 1);
+        // Global longitude is cyclic, including grids with a duplicate seam
+        // column. Only a regional grid clamps its right neighbor.
+        let col1 = match self.wrap_modulus() {
+            Some(period) if col + 1 >= self.ni || (col + 1) as f64 >= period => 0,
+            _ => (col + 1).min(self.ni - 1),
+        };
         let row1 = (row + 1).min(self.nj - 1);
 
         let v00 = self.values[row * self.ni + col];
@@ -200,12 +204,11 @@ impl DecodedGrid {
         // 360°-spanning grid the bbox may sit a whole turn away from
         // `lon_first` (ECMWF open data starts at 180°, a Finnish bbox at
         // 24° is at column −624): shift the range by whole turns so it
-        // starts inside the grid, then walk columns modulo `ni` — the same
+        // starts inside the grid, then walk columns modulo one turn — the same
         // wrap `wrap_col` applies on the sampling path (#663). Every cast
         // happens AFTER clamping; a negative `isize as usize` once turned a
         // Finnish bbox into a ~1.8e19-element allocation and a 502.
         let wrap = self.wrap_modulus();
-        let global = wrap.is_some();
         let mut c0 = ((west - self.lon_first) / self.lon_inc).floor();
         let mut c1 = ((east - self.lon_first) / self.lon_inc).ceil();
         if !(c0.is_finite() && c1.is_finite()) {
@@ -222,8 +225,10 @@ impl DecodedGrid {
         // is what the longitude axis is computed from — on a global grid a
         // wrapped column has lost its turn count, on a regional grid a
         // clamped column is not the unclamped `c0`.
+        let mut column_shift = 0.0;
         let (cols, positions): (Vec<usize>, Vec<f64>) = if let Some(cols_per_360) = wrap {
             let shift = c0.rem_euclid(cols_per_360) - c0;
+            column_shift = shift;
             c0 += shift;
             c1 += shift;
             // Cap at one full turn (in f64, BEFORE the cast — an unbounded
@@ -268,19 +273,12 @@ impl DecodedGrid {
             return None;
         }
 
-        // Longitudes in the requester's frame: ascending from the bbox
-        // west edge, so a range that crosses the grid seam reads
-        // …, 359.75, 360.0 → −0.25, 0.0 … as a monotonic axis.
+        // Undo the SAME whole-turn shift for every coordinate. The first
+        // node may lie just west of an unaligned bbox edge; wrapping it
+        // independently would move it 360° ahead of the remaining axis.
         let x_coords: Vec<f64> = positions
             .iter()
-            .map(|&pos| {
-                let raw = self.lon_first + pos * self.lon_inc;
-                if global {
-                    raw - ((raw - west) / 360.0).floor() * 360.0
-                } else {
-                    raw
-                }
-            })
+            .map(|&pos| self.lon_first + (pos - column_shift) * self.lon_inc)
             .collect();
 
         let ny = row_end - row_start;
@@ -398,6 +396,21 @@ impl GridCache {
         self.cache.get(&key)
     }
 
+    /// Share one fetch/decode among concurrent requests for the same message.
+    /// Failed fills remain retryable.
+    pub fn get_or_insert_with<E>(
+        &self,
+        url: &str,
+        offset: u64,
+        load: impl FnOnce() -> Result<Arc<DecodedGrid>, E>,
+    ) -> Result<Arc<DecodedGrid>, E> {
+        let key = GridKey {
+            url: Arc::from(url),
+            offset,
+        };
+        self.cache.get_or_insert_with(&key, load)
+    }
+
     /// Insert a decoded grid into the cache.
     pub fn insert(&self, url: &str, offset: u64, grid: Arc<DecodedGrid>) {
         let key = GridKey {
@@ -436,6 +449,57 @@ impl GridCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_coalesces_concurrent_fills_and_retries_failures() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
+        };
+        let cache = GridCache::new(1).unwrap();
+        let fills = AtomicUsize::new(0);
+        let start = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    let grid = cache
+                        .get_or_insert_with("same-message", 0, || {
+                            fills.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            Ok::<_, ()>(Arc::new(grid_2x2()))
+                        })
+                        .unwrap();
+                    assert_eq!(grid.values[0], 1.0);
+                });
+            }
+        });
+        assert_eq!(fills.load(Ordering::SeqCst), 1);
+        let failed = cache.get_or_insert_with("retry", 0, || Err::<Arc<DecodedGrid>, _>("offline"));
+        assert_eq!(failed.unwrap_err(), "offline");
+        assert!(cache
+            .get_or_insert_with("retry", 0, || Ok::<_, ()>(Arc::new(grid_2x2())))
+            .is_ok());
+    }
+
+    #[test]
+    fn interpolation_wraps_the_seam_but_clamps_regional_edges() {
+        for duplicate in [false, true] {
+            let mut grid = grid_2x2();
+            grid.ni = if duplicate { 5 } else { 4 };
+            grid.lon_first = 0.0;
+            grid.lon_inc = 90.0;
+            let row = if duplicate {
+                vec![0.0, 10.0, 20.0, 30.0, 0.0]
+            } else {
+                vec![0.0, 10.0, 20.0, 30.0]
+            };
+            grid.values = Arc::new(row.repeat(2));
+            assert_eq!(grid.bilinear_value(315.0, 59.5), Some(15.0));
+            assert_eq!(grid.bilinear_value(-45.0, 59.5), Some(15.0));
+        }
+        assert_eq!(grid_2x2().bilinear_value(11.5, 60.0), Some(2.0));
+    }
 
     /// 2×2 regular lat/lon grid (10–11°E, 59–60°N) for sampling tests.
     fn grid_2x2() -> DecodedGrid {
@@ -599,6 +663,23 @@ mod tests {
         assert_eq!(v.len(), 9 * 5);
         assert_eq!(v[0], Some(816.0));
         assert_eq!(v[8], Some(824.0));
+    }
+
+    #[test]
+    fn unaligned_bbox_keeps_one_continuous_longitude_frame() {
+        for origin in [0.0, 180.0] {
+            let grid = global_grid(origin);
+            for west in [24.1, -0.1, 359.9] {
+                let (x, y, values) = grid.extract_bbox([west, 60.0, west + 0.5, 60.25]).unwrap();
+                assert!(x[0] <= west && west - x[0] < 0.25);
+                assert!(x
+                    .windows(2)
+                    .all(|pair| (pair[1] - pair[0] - 0.25).abs() < 1e-9));
+                for (col, &lon) in x.iter().enumerate() {
+                    assert_eq!(values[col], grid.nearest_value(lon, y[0]));
+                }
+            }
+        }
     }
 
     #[test]

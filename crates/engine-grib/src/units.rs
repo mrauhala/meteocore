@@ -10,11 +10,6 @@
 //! per-center overlay first. ECMWF (center 98) is the only local overlay
 //! currently populated.
 //!
-//! Nothing imports this module yet — the `#[allow(dead_code)]` attributes keep
-//! the isolated build clean until the engine is wired up.
-
-#![allow(dead_code)]
-
 /// A canonical source unit as encoded in the GRIB2 message.
 ///
 /// The variant names reflect the WMO unit string that appears in Code Table
@@ -24,6 +19,8 @@
 pub enum SourceUnit {
     /// "K"
     Kelvin,
+    /// A temperature difference in K, which has no Celsius zero-point offset.
+    KelvinDifference,
     /// "C" (rare in WMO tables, but included for completeness)
     Celsius,
     /// "Pa"
@@ -141,15 +138,16 @@ fn standard_lookup(discipline: u8, category: u8, number: u8) -> Option<ParamInfo
         (0, 0, 4) => ("Maximum temperature", SourceUnit::Kelvin),
         (0, 0, 5) => ("Minimum temperature", SourceUnit::Kelvin),
         (0, 0, 6) => ("Dewpoint temperature", SourceUnit::Kelvin),
-        (0, 0, 7) => ("Dewpoint depression (or deficit)", SourceUnit::Kelvin),
+        (0, 0, 7) => (
+            "Dewpoint depression (or deficit)",
+            SourceUnit::KelvinDifference,
+        ),
         (0, 0, 17) => ("Skin temperature", SourceUnit::Kelvin),
 
         // Category 1: moisture
         (0, 1, 0) => ("Specific humidity", SourceUnit::KgPerKg),
         (0, 1, 1) => ("Relative humidity", SourceUnit::Percent),
         (0, 1, 7) => ("Precipitation rate", SourceUnit::KgPerM2PerS),
-        // Total precipitation is an accumulation; the engine drops aggregates
-        // in v1, but shipping the metadata costs nothing.
         (0, 1, 8) => ("Total precipitation", SourceUnit::KgPerM2),
         (0, 1, 11) => ("Snow depth", SourceUnit::Metres),
         (0, 1, 13) => (
@@ -304,6 +302,11 @@ impl DisplayConversion {
 /// - Everything else → identity with a canonical source-unit string.
 pub fn default_display(source: SourceUnit) -> DisplayConversion {
     match source {
+        SourceUnit::KelvinDifference => DisplayConversion {
+            display_unit: "K",
+            scale: 1.0,
+            offset: 0.0,
+        },
         SourceUnit::Kelvin => DisplayConversion {
             display_unit: "°C",
             scale: 1.0,
@@ -626,6 +629,17 @@ mod tests {
         assert!(d.has_conversion());
         assert!((d.convert(273.15) - 0.0).abs() < 1e-10);
         assert!((d.convert(293.15) - 20.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn dewpoint_depression_preserves_temperature_difference() {
+        let deficit = lookup(7, 0, 0, 7).unwrap();
+        let display = default_display(deficit.source_unit);
+        assert_eq!(display.display_unit, "K");
+        assert_eq!(display.convert(5.0), 5.0);
+        assert!(!display.has_conversion());
+        let absolute = default_display(lookup(7, 0, 0, 6).unwrap().source_unit);
+        assert!((absolute.convert(280.0) - 6.85).abs() < 1e-9);
     }
 
     #[test]
