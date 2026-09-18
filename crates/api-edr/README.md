@@ -204,3 +204,7 @@ model-run lists and individual run metadata pages. IDs remain unchanged in URLs.
 
 Collection advanced search starts closed and retains the user's open/closed
 choice across searches in the browser session. Resource URLs are clickable.
+
+The compact HTML catalog summarizes advertised parameter names and UTC coverage.
+It retains time precision and distinguishes an out-of-range page from no matches.
+List/cards preference survives searches; JSON continues to reflect applied filters.

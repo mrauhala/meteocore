@@ -232,17 +232,32 @@ impl Page<'_> {
             "application/json"
         };
         let curl = format!("curl --get '{}'", json_url.replace('\'', "'\"'\"'"));
+        let catalog = current_path.trim_end_matches('/') == format!("{base}/{api}/collections");
+        let request_content = format!(
+            r#"<div class="request-identity"><span class="method">GET</span><code id="request-url">{json_url}</code></div><div class="request-tools"><span class="request-note">Applied request · JSON representation</span><button class="btn small enhanced" data-copy="{json_url}">Copy URL</button><button class="btn small enhanced" data-copy="{curl}">Copy cURL</button><a class="btn small" href="{json_url}">Open JSON ↗</a></div>"#,
+            json_url = escape(safe_href(json_url)),
+            curl = escape(&curl)
+        );
+        let request_context = if catalog {
+            format!("<details id=\"request-context\" class=\"catalog-request\"><summary>Current API request <code>GET /{}/collections</code></summary><div class=\"request-content\">{request_content}</div></details>",escape(api))
+        } else {
+            format!("<section id=\"request-context\" aria-label=\"Current API request\">{request_content}</section>")
+        };
         format!(
             r##"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · MeteoCore</title><link rel="alternate" type="{json_type}" href="{json_url}"><style>{CSS}</style><script>{THEME}</script>{head}</head>
-<body><a class="skip" href="#main">Skip to content</a><div class="shell"><aside class="sidebar" aria-label="API navigation"><a class="brand" href="{base}/?f=html"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="11"/><circle cx="16" cy="16" r="6"/><path d="M16 16 27 5M16 3v3M3 16h3M16 26v3M26 16h3"/></svg></span><span>MeteoCore<small>API WORKBENCH</small></span></a><div class="api-switch enhanced"><label for="api-select">API workspace</label><select id="api-select">{options}</select></div><noscript><nav aria-label="APIs">{api_nav}</nav></noscript><nav id="primary-nav" aria-label="Workspace">{nav}</nav><div class="sidebar-note"><span class="eyebrow">OPEN STANDARDS</span><p>One data platform.<br>Different ways to explore.</p><a href="{base}/?f=html">Explore all APIs ↗</a></div><div class="sidebar-footer">MeteoCore<small>OGC API · Developer workspace</small></div></aside>
+<body class="{page_class}"><a class="skip" href="#main">Skip to content</a><div class="shell"><aside class="sidebar" aria-label="API navigation"><a class="brand" href="{base}/?f=html"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="11"/><circle cx="16" cy="16" r="6"/><path d="M16 16 27 5M16 3v3M3 16h3M16 26v3M26 16h3"/></svg></span><span>MeteoCore<small>API WORKBENCH</small></span></a><div class="api-switch enhanced"><label for="api-select">API workspace</label><select id="api-select">{options}</select></div><noscript><nav aria-label="APIs">{api_nav}</nav></noscript><nav id="primary-nav" aria-label="Workspace">{nav}</nav><div class="sidebar-note"><span class="eyebrow">OPEN STANDARDS</span><p>One data platform.<br>Different ways to explore.</p><a href="{base}/?f=html">Explore all APIs ↗</a></div><div class="sidebar-footer">MeteoCore<small>OGC API · Developer workspace</small></div></aside>
 <div class="workspace"><header class="topbar"><nav id="breadcrumbs" aria-label="Breadcrumb">{crumbs}</nav><div class="topbar-actions"><button class="quiet enhanced" id="help-button">Help</button><label class="theme-label enhanced" for="theme">Theme<select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><nav class="representation-switch" aria-label="Representation"><a aria-current="page" href="{html_url}">HTML</a><a rel="alternate" id="json-link" href="{json_url}">JSON</a></nav></div></header>
-<section id="request-context" aria-label="Current API request"><div class="request-identity"><span class="method">GET</span><code id="request-url">{json_url}</code></div><div class="request-tools"><span class="request-note">Applied request · JSON representation</span><button class="btn small enhanced" data-copy="{json_url}">Copy URL</button><button class="btn small enhanced" data-copy="{curl}">Copy cURL</button><a class="btn small" href="{json_url}">Open JSON ↗</a></div></section>
+{request_context}
 <main id="main" tabindex="-1">{body}</main><footer class="page-footer"><span>MeteoCore · Open weather data</span><span>HTML representation · Times in UTC</span></footer></div></div><dialog id="help-dialog"><div class="dialog-head"><h2>Find a collection, then request data</h2><button class="icon-button" id="close-help" aria-label="Close help">×</button></div><div class="panel-body"><p><strong>1. Find a collection.</strong> Collection search matches titles, descriptions and keywords. Commas separate alternatives; words form a phrase.</p><p>Advanced search adds required (+) and excluded (-) terms. Area and time narrow coverage; unknown extents remain eligible.</p><p><strong>2. Request data.</strong> Open a collection to see its data operations. Feature filters select items within that collection; discovery filters are not copied into the data request. The JSON switch always opens the current resource with its applied filters and paging.</p></div></dialog><div id="toast" role="status" aria-live="polite"></div><script>{SCRIPT}</script></body></html>"##,
             title = escape(title),
             json_url = escape(safe_href(json_url)),
             html_url = escape(safe_href(&html_url)),
             base = escape(base),
-            curl = escape(&curl)
+            page_class = if catalog {
+                "catalog-page"
+            } else {
+                "resource-page"
+            }
         )
     }
 }
@@ -750,6 +765,158 @@ pub fn query_edit(href: &str, key: &str, value: Option<&str>) -> String {
     format!("{path}?{}", out.finish())
 }
 
+/// Compact UTC coverage, retaining exact bounds in the accessible tooltip.
+fn collection_time_html(temporal: &Value) -> String {
+    let interval = &temporal["interval"][0];
+    if !interval.is_array() {
+        return "Not advertised".into();
+    }
+    let parse = |v: &Value| {
+        v.as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    let start = parse(&interval[0]);
+    let end = parse(&interval[1]);
+    let clock = |t: &chrono::DateTime<chrono::Utc>| {
+        if t.timestamp_subsec_nanos() != 0 {
+            t.format("%H:%M:%S%.f").to_string()
+        } else if t.timestamp() % 60 != 0 {
+            t.format("%H:%M:%S").to_string()
+        } else {
+            t.format("%H:%M").to_string()
+        }
+    };
+    let endpoint = |t: Option<chrono::DateTime<chrono::Utc>>, raw: &Value, open: &str| {
+        t.map(|t| format!("{} {}", t.format("%Y-%m-%d"), clock(&t)))
+            .unwrap_or_else(|| raw.as_str().unwrap_or(open).to_owned())
+    };
+    let parts = match (start, end) {
+        (Some(a), Some(b)) if a == b => {
+            vec![endpoint(Some(a), &interval[0], "Open start"), "UTC".into()]
+        }
+        (Some(a), Some(b)) if a.date_naive() == b.date_naive() => vec![
+            a.format("%Y-%m-%d").to_string(),
+            format!("{}–{} UTC", clock(&a), clock(&b)),
+        ],
+        _ => vec![
+            endpoint(start, &interval[0], "Open start"),
+            "→".into(),
+            endpoint(end, &interval[1], "Open end"),
+            "UTC".into(),
+        ],
+    };
+    format!(
+        "<span class=\"collection-time\" title=\"{}\">{}</span>",
+        escape(&interval.to_string()),
+        parts
+            .iter()
+            .map(|p| format!("<span>{}</span>", escape(p)))
+            .collect::<String>()
+    )
+}
+
+fn collection_facts(doc: &Value) -> String {
+    let mut facts = String::from("<dl class=\"collection-facts\">");
+    let mut fact = |label: &str, value: String| {
+        facts.push_str(&format!(
+            "<div><dt>{}</dt><dd>{value}</dd></div>",
+            escape(label)
+        ))
+    };
+    let temporal = &doc["extent"]["temporal"];
+    fact("Time · UTC", collection_time_html(temporal));
+    if let Some(resolution) = temporal["grid"]["resolution"].as_str() {
+        let label = ds_core::datetime::parse_iso8601_duration(resolution)
+            .ok()
+            .map(|step| {
+                let secs = step.num_seconds();
+                if secs % 86400 == 0 {
+                    format!("Every {} d", secs / 86400)
+                } else if secs % 3600 == 0 {
+                    format!("Every {} h", secs / 3600)
+                } else if secs % 60 == 0 {
+                    format!("Every {} min", secs / 60)
+                } else {
+                    format!("Every {secs} s")
+                }
+            })
+            .unwrap_or_else(|| resolution.to_owned());
+        fact("Time resolution", escape(&label));
+    } else if let Some(count) = temporal["grid"]["cellsCount"].as_u64().or_else(|| {
+        temporal["values"]
+            .as_array()
+            .filter(|v| v.len() > 1)
+            .map(|v| v.len() as u64)
+    }) {
+        fact("Time steps", format!("{count} advertised"));
+    }
+    let bbox = &doc["extent"]["spatial"]["bbox"][0];
+    if let Some(b) = bbox.as_array().filter(|b| matches!(b.len(), 4 | 6)) {
+        let xy = if b.len() == 6 {
+            [0, 1, 3, 4]
+        } else {
+            [0, 1, 2, 3]
+        };
+        let values: Option<Vec<f64>> = xy
+            .iter()
+            .map(|&i| b[i].as_f64().filter(|n| n.is_finite()))
+            .collect();
+        if let Some(v) = values {
+            let label = if v == [-180., -90., 180., 90.] {
+                "Global".into()
+            } else {
+                format!("{:.2}, {:.2} → {:.2}, {:.2}", v[0], v[1], v[2], v[3])
+            };
+            fact(
+                "Bounds · CRS84",
+                format!(
+                    "<span title=\"{}\">{}</span>",
+                    escape(&bbox.to_string()),
+                    escape(&label)
+                ),
+            );
+        }
+    }
+    if let Some(parameters) = doc["parameter_names"].as_object().filter(|p| !p.is_empty()) {
+        let names: Vec<_> = parameters.keys().map(String::as_str).collect();
+        let mut label = names.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+        if names.len() > 4 {
+            label.push_str(&format!(" +{}", names.len() - 4));
+        }
+        fact(
+            "Parameters",
+            format!(
+                "<span title=\"{}\">{}</span>",
+                escape(&names.join(", ")),
+                escape(&label)
+            ),
+        );
+    } else if let Some(styles) = doc["styles"].as_array().filter(|s| !s.is_empty()) {
+        let names: Vec<_> = styles
+            .iter()
+            .filter_map(|s| s["title"].as_str().or(s["id"].as_str()))
+            .collect();
+        let mut label = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        if names.len() > 3 {
+            label.push_str(&format!(" +{}", names.len() - 3));
+        }
+        fact(
+            "Styles",
+            format!(
+                "<span title=\"{}\">{}</span>",
+                escape(&names.join(", ")),
+                escape(&label)
+            ),
+        );
+    }
+    if let Some(n) = doc.get("numberItems") {
+        fact("Items", value_html(n));
+    }
+    facts.push_str("</dl>");
+    facts
+}
+
 pub fn collections_html(
     url: &str,
     query: &SearchQueryParams,
@@ -782,7 +949,7 @@ pub fn collections_html(
         let current = value(name);
         match parameter {
             CollectionParameter::Format=>{},
-            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">q <span class=\"parameter-type\">string · optional</span></label><div class=\"search-input-wrap\">{}<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"radar\"></div></div><button class=\"btn primary\">Find collections {}</button></div><p class=\"search-hint\">Titles, descriptions and keywords.<span>Try {} or {}</span></p>",icon("search"),escape(current),icon("arrow"),anchor(&query_edit(&json_url,"q",Some("radar")),"radar","quiet"),anchor(&query_edit(&json_url,"q",Some("observations")),"observations","quiet")),
+            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">Search text <code>q</code></label><div class=\"search-input-wrap\">{}<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"e.g. radar or GFS\" aria-describedby=\"collection-search-help\"></div></div><button class=\"btn primary\">Find collections {}</button></div><p id=\"collection-search-help\" class=\"search-hint\">Matches titles, descriptions and keywords. Commas separate alternatives.</p>",icon("search"),escape(current),icon("arrow")),
             CollectionParameter::Limit|CollectionParameter::Offset=>paging.push_str(&input(name,&if name=="limit"{search.limit}else{search.offset}.to_string(),"integer","number",false)),
             CollectionParameter::Bbox=>{
                 let bounds:Vec<_>=current.split(',').collect();
@@ -797,7 +964,9 @@ pub fn collections_html(
             CollectionParameter::BboxCrs if current.is_empty()=>{},
             _=>{
                 let help=match parameter {CollectionParameter::Query=>"string · optional",CollectionParameter::Datetime=>"instant / interval · UTC",_=>"CRS84 coordinate reference system"};
-                let field=input(name,current,help,"text",true);
+                let mut field=input(name,current,help,"text",true);
+                if matches!(parameter,CollectionParameter::Query) {field=field.replace("<span>query</span>","<span>Advanced expression <code>query</code></span>");}
+                if matches!(parameter,CollectionParameter::Datetime) {field=field.replace("<span>datetime</span>","<span>Time coverage <code>datetime</code></span>");}
                 if matches!(parameter,CollectionParameter::Query){advanced.insert_str(0,&format!("<div>{field}<p class=\"field-help\">+ requires a term · − excludes it · commas mean OR</p></div>"));}
                 else {advanced.push_str(&field);}
             }
@@ -827,10 +996,10 @@ pub fn collections_html(
             )
         })
         .collect::<String>();
-    let form=format!("<form class=\"search-panel query-form\" method=\"get\" action=\"{}\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"builder-heading\"><h2>Collection search</h2><span class=\"mono\">GET</span></div>{primary}<details class=\"filters\" data-disclosure=\"collection-search\"><summary>Advanced search, area and time</summary><div class=\"filters-grid\">{advanced}</div><div class=\"paging-fields\">{paging}</div><div class=\"filter-controls\"><span class=\"field-help\">Collections with unknown extents remain eligible.</span>{}</div></details><div class=\"active-filters\">{chips}</div><div class=\"draft-request enhanced\"><small>Collection search request · submit to update matches</small><code data-draft></code></div><noscript><p>Enable JavaScript to edit advanced parameters.</p></noscript></form>",escape(url),anchor(&with_format(url,"html"),"Clear filters","quiet"));
+    let form=format!("<form aria-label=\"Collection search\" class=\"search-panel query-form\" method=\"get\" action=\"{}\"><input type=\"hidden\" name=\"f\" value=\"html\">{primary}<details class=\"filters\" data-disclosure=\"collection-search\"><summary>Advanced search, area and time</summary><div class=\"filters-grid\">{advanced}</div><div class=\"paging-fields\">{paging}</div><div class=\"filter-controls\"><span class=\"field-help\">Collections with unknown extents remain eligible.</span>{}</div></details><div class=\"active-filters\">{chips}</div><details class=\"draft-request enhanced\" data-draft-disclosure><summary>Preview search request</summary><small>Draft · submit to update matches</small><code data-draft></code></details><noscript><p>Enable JavaScript to edit advanced parameters.</p></noscript></form>",escape(url),anchor(&with_format(url,"html"),"Clear filters","quiet"));
     let mut body = page_heading(
         "Collections",
-        "Find datasets by their metadata and coverage. Select a collection to build a data request.",
+        "Find a dataset, then open it to request data.",
     );
     body = body.replace(
         "OGC API · HTML REPRESENTATION",
@@ -841,10 +1010,33 @@ pub fn collections_html(
     } else {
         search.offset + 1
     };
-    let last = search.offset + docs.len();
-    body.push_str(&format!("<div data-results-scope=\"{}\"></div><div class=\"query-workspace\"><aside class=\"query-builder\">{form}</aside><section class=\"query-results\" aria-label=\"Matching collections\"><div class=\"results-bar\"><div><strong>{matched} matching collections</strong><small>{first}–{last} shown · Collection ID order</small></div><div class=\"view-switch enhanced\" aria-label=\"Result presentation\"><button data-view=\"list\" class=\"selected\" aria-pressed=\"true\">{}List</button><button data-view=\"cards\" aria-pressed=\"false\">{}Cards</button></div></div><div class=\"collection-list\">",escape(url),icon("list"),icon("grid")));
+    let last = if docs.is_empty() {
+        0
+    } else {
+        search.offset + docs.len()
+    };
+    let range = if docs.is_empty() {
+        "No collections on this page".to_owned()
+    } else {
+        format!("{first}–{last} shown")
+    };
+    let collection_noun = if matched == 1 {
+        "collection"
+    } else {
+        "collections"
+    };
+    body.push_str(&format!("<div data-results-scope=\"{}\"></div><div class=\"query-workspace\"><aside class=\"query-builder\">{form}</aside><section class=\"query-results\" aria-label=\"Matching collections\"><div class=\"results-bar\"><div><strong>{matched} matching {collection_noun}</strong><small>{range} · Collection ID order</small></div><div class=\"view-switch enhanced\" aria-label=\"Result presentation\"><button data-view=\"list\" class=\"selected\" aria-pressed=\"true\">{}List</button><button data-view=\"cards\" aria-pressed=\"false\">{}Cards</button></div></div><div class=\"collection-list\">",escape(url),icon("list"),icon("grid")));
     if docs.is_empty() {
-        body.push_str(&format!("<div class=\"empty-state\"><span class=\"empty-icon\">{}</span><h2>No collections match these filters.</h2><p>Try a broader search, expand the area or remove a time filter.</p>{}</div>",icon("search"),anchor(&with_format(url,"html"),"Clear filters","btn primary")));
+        if matched > 0 {
+            let first_page = format!(
+                "{url}{}",
+                query.query_string_with_format(search.limit, 0, "html")
+            );
+            let match_verb = if matched == 1 { "matches" } else { "match" };
+            body.push_str(&format!("<div class=\"empty-state\"><h2>This page is outside the results.</h2><p>{matched} {collection_noun} {match_verb}. Return to the first page to keep these filters.</p>{}</div>",anchor(&first_page,"Go to first page","btn primary")));
+        } else {
+            body.push_str(&format!("<div class=\"empty-state\"><h2>No collections match these filters.</h2><p>Try a broader search, expand the area or remove a time filter.</p>{}</div>",anchor(&with_format(url,"html"),"Clear filters","btn primary")));
+        }
     }
     for view in docs {
         let doc = view.metadata;
@@ -858,32 +1050,6 @@ pub fn collections_html(
             .take(4)
             .map(|k| anchor(&query_edit(&json_url, "q", Some(k)), k, "chip"))
             .collect::<String>();
-        let kind = match api {
-            "features" => "Features",
-            "maps" => "Map layer",
-            "tiles" => "Tileset",
-            _ => "Environmental data",
-        };
-        let interval = &doc["extent"]["temporal"]["interval"][0];
-        let times = match (interval[0].as_str(), interval[1].as_str()) {
-            (Some(a), Some(b)) => format!(
-                "{} – {}",
-                a.chars().take(10).collect::<String>(),
-                b.chars().take(10).collect::<String>()
-            ),
-            _ => "Time extent unspecified".into(),
-        };
-        let count = doc
-            .get("numberItems")
-            .map(|n| format!("{} items", value_html(n)))
-            .unwrap_or_else(|| {
-                if interval.is_array() {
-                    "Time-aware"
-                } else {
-                    "Spatial data"
-                }
-                .into()
-            });
         let symbol = if doc["keywords"]
             .as_array()
             .is_some_and(|ks| ks.iter().any(|k| k == "radar"))
@@ -892,7 +1058,11 @@ pub fn collections_html(
         } else {
             "layers"
         };
-        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div><h3>{}</h3><span class=\"mono\">{}</span><p>{}</p><div class=\"chip-row\">{keywords}</div>{}</div><div class=\"collection-side\"><span class=\"chip teal\">{kind}</span><span>{count}</span><small>{}</small></div><a class=\"row-arrow\" href=\"{}\" aria-label=\"Open {}\">{}</a></article>",icon(symbol),anchor(&href,doc["title"].as_str().unwrap_or(id),""),escape(id),escape(doc["description"].as_str().unwrap_or_default()),license_html(view.license),escape(&times),escape(&href),escape(doc["title"].as_str().unwrap_or(id)),icon("arrow")));
+        let title = doc["title"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(id);
+        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div class=\"collection-main\"><h3>{}</h3><span class=\"mono\">{}</span><p>{}</p>{}<div class=\"chip-row\">{keywords}</div>{}</div><a class=\"row-arrow\" href=\"{}\" aria-label=\"Open {}\">{}</a></article>",icon(symbol),anchor(&href,title,""),escape(id),escape(doc["description"].as_str().unwrap_or_default()),collection_facts(doc),license_html(view.license),escape(&href),escape(title),icon("arrow")));
     }
     body.push_str("</div><div class=\"pagination\">");
     body.push_str("<label class=\"per-page enhanced\">Per page<select data-page-size>");
@@ -905,10 +1075,21 @@ pub fn collections_html(
             if n == search.limit { "selected" } else { "" }
         ));
     }
+    let page = if matched == 0 {
+        "0 results".into()
+    } else if docs.is_empty() {
+        format!("No page at offset {}", search.offset)
+    } else if !search.offset.is_multiple_of(search.limit) {
+        format!("{first}–{last} of {matched}")
+    } else {
+        format!(
+            "Page {} of {}",
+            search.offset / search.limit + 1,
+            matched.div_ceil(search.limit)
+        )
+    };
     body.push_str(&format!(
-        "</select></label><span class=\"page-indicator\">Page {} of {}</span>",
-        search.offset / search.limit + 1,
-        matched.div_ceil(search.limit).max(1)
+        "</select></label><span class=\"page-indicator\">{page}</span>"
     ));
     body.push_str(&pagination(nav));
     body.push_str("</div></section></div>");
@@ -1001,6 +1182,51 @@ pub fn instances_html(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_empty_page_keeps_filters_and_does_not_claim_zero_matches() {
+        let query = SearchQueryParams::from_pairs(vec![
+            ("q".into(), "radar & snow".into()),
+            ("query".into(), "+rain -test".into()),
+            ("limit".into(), "12".into()),
+            ("offset".into(), "1000".into()),
+        ])
+        .unwrap();
+        let search = query.parse().unwrap();
+        let url = "https://example.test/proxy/maps/collections";
+        let html = collections_html(url, &query, &search, 3, &[], &[]);
+        assert!(html.contains("3 matching collections"));
+        assert!(html.contains("This page is outside the results."));
+        assert!(html.contains("No page at offset 1000"));
+        assert!(!html.contains("0–1000"));
+        assert!(!html.contains("Page 84 of 1"));
+        assert!(!html.contains("No collections match these filters."));
+        let first = format!("{url}{}", query.query_string_with_format(12, 0, "html"));
+        assert!(html.contains(&format!("href=\"{}\">Go to first page", escape(&first))));
+        let empty = collections_html(url, &query, &search, 0, &[], &[]);
+        assert!(empty.contains("No collections match these filters."));
+        assert!(empty.contains("0 results"));
+        assert!(!empty.contains("Go to first page"));
+    }
+
+    #[test]
+    fn catalog_time_summaries_keep_utc_precision_and_only_advertised_resolution() {
+        let temporal =
+            json!({"interval":[["2026-03-25T01:15:05+02:00","2026-03-25T01:35:05+02:00"]]});
+        let time = collection_time_html(&temporal);
+        assert!(time.contains("2026-03-24"));
+        assert!(time.contains("23:15:05–23:35:05 UTC"));
+        let mut doc = json!({"extent":{"temporal":temporal},"parameter_names":{"rain & snow":{}}});
+        let facts = collection_facts(&doc);
+        assert!(!facts.contains("Time resolution"));
+        assert!(!facts.contains("Time steps"));
+        assert!(facts.contains("rain &amp; snow"));
+        doc["extent"]["temporal"]["grid"] = json!({"resolution":"PT5M","cellsCount":5});
+        assert!(collection_facts(&doc).contains("Every 5 min"));
+        let open = json!({"interval":[[null,"2026-03-25T00:00:00Z"]]});
+        assert!(collection_time_html(&open).contains("Open start"));
+        assert_eq!(collection_time_html(&Value::Null), "Not advertised");
+    }
 
     #[test]
     fn time_choices_respect_regular_and_irregular_grids_without_inventing_samples() {

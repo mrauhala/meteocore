@@ -179,3 +179,34 @@ URLs were verified as anchors. Clicking Styles was blocked by the Chrome client
 (`ERR_BLOCKED_BY_CLIENT`); its endpoint was checked separately over HTTP. GFS country
 borders remained visible above the rendered image after zooming. The existing
 648 API tests, seven cross-API contracts, clippy and HTTP smoke checks passed.
+
+## Collections UX pass
+
+Search now spans the content width above results. Catalog request tools are in a
+native disclosure; the global JSON switch remains visible. The draft URL has a
+separate disclosure, opening on the first edit without replacing the applied URL.
+Search text and advanced expression retain their API names (`q` / `query`). Mobile
+navigation combines the product name and API selector into one row.
+
+Results prioritize UTC temporal coverage, advertised bounds, parameter names or
+styles, and any advertised sampling resolution/count. The same-day radar window
+keeps its actual clock times; date/time components wrap together. Generic
+"Environmental data" / "Time-aware" badges are removed. List/cards choice persists
+per API path for the session. Metadata comes from the existing response document.
+
+An offset beyond the results now says that the page is outside the results and
+offers **Go to first page**, preserving filters and limit. It does not display an
+impossible range/page number or claim zero matches. A truly empty search retains
+its separate zero-results message; unaligned offsets display a range.
+
+Validation: 650 API tests and seven cross-API discovery contracts passed, along
+with workspace clippy, formatting and real-server HTTP smoke checks. Chrome
+confirmed that List/Cards survives a search, draft edits leave the applied JSON
+URL unchanged, advanced search stays closed, and the first-page recovery link
+retains the filters and page size. At 390 × 844, the first result begins at 676 px
+(previously 1,335 px), with no horizontal page overflow; light and dark themes
+were checked. Maps advertises the radar's five-minute sampling interval; EDR
+only advertises its coverage and does not acquire an inferred cadence.
+
+Catalog screenshots: [desktop](screenshots/collections-light.png),
+[mobile](screenshots/collections-mobile.png).

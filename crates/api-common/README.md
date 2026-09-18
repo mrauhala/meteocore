@@ -167,3 +167,13 @@ per API path for the browser session, including after search submission. Applied
 filters remain visible while collapsed. Resource titles and their URLs form one
 clickable link; map endpoints retain their required-bbox hint. Country boundaries
 render above map imagery with a contrasting halo, including after pan/zoom.
+
+Catalogs use a full-width search panel and result summaries. The applied request
+and draft search URL are separate disclosures; the draft opens on the first edit.
+The JSON switch always retains the applied query. List/cards preference persists
+per API path in the browser session. Empty pages beyond the match count explain
+the offset and link to the first page with all filters retained; they do not claim
+that no collections match. Unaligned offsets show a range rather than a misleading
+page number. Summaries retain UTC clock precision (including seconds), show known
+bounds and parameter/style names, and display sampling resolution only when
+advertised. No extra engine queries or inferred sample cadence are introduced.

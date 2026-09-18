@@ -70,6 +70,7 @@
 
   document.querySelectorAll('.query-form').forEach(form => {
     const fields = form.querySelectorAll('[data-param]');
+    let edited = false;
     const update = () => {
       const bounds = [...form.querySelectorAll('[data-bbox]')];
       if (bounds.length) {
@@ -97,6 +98,11 @@
       if (draft) draft.textContent = url.href;
     };
     form.addEventListener('input', event => {
+      if (!edited) {
+        const preview = form.querySelector('[data-draft-disclosure]');
+        if (preview) preview.open = true;
+        edited = true;
+      }
       if (event.target.name !== 'offset' && event.target.dataset.param !== 'offset') {
         const offset = form.querySelector('[name="offset"]');
         if (offset) offset.value = '0';
@@ -113,10 +119,23 @@
     form.addEventListener('submit', update);
     update();
   });
-  document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
-    document.querySelector('.collection-list')?.classList.toggle('collection-grid', button.dataset.view === 'cards');
-    document.querySelectorAll('[data-view]').forEach(other => { other.setAttribute('aria-pressed', String(other === button)); other.classList.toggle('selected', other === button); });
-  }));
+  const collectionList = document.querySelector('.collection-list');
+  const viewButtons = document.querySelectorAll('[data-view]');
+  if (collectionList && viewButtons.length) {
+    const viewKey = 'meteocore-collection-view:' + location.pathname;
+    const applyView = view => {
+      collectionList.classList.toggle('collection-grid',view === 'cards');
+      viewButtons.forEach(button => {
+        button.setAttribute('aria-pressed',String(button.dataset.view === view));
+        button.classList.toggle('selected',button.dataset.view === view);
+      });
+    };
+    try { applyView(sessionStorage.getItem(viewKey) === 'cards' ? 'cards' : 'list'); } catch (_) {}
+    viewButtons.forEach(button => button.addEventListener('click',() => {
+      applyView(button.dataset.view);
+      try { sessionStorage.setItem(viewKey,button.dataset.view); } catch (_) {}
+    }));
+  }
   document.getElementById('property-search')?.addEventListener('input', event => {
     const term = event.target.value.toLowerCase();
     document.querySelectorAll('[data-property]').forEach(row => { row.hidden = !row.dataset.property.toLowerCase().includes(term); });

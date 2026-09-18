@@ -326,3 +326,8 @@ per API path for the browser session, including after search submission. Applied
 filters remain visible while collapsed. Resource titles and their URLs form one
 clickable link; map endpoints retain their required-bbox hint. Country boundaries
 render above map imagery with a contrasting halo, including after pan/zoom.
+
+Catalog presentation now has compact request/search disclosures, persistent
+list/cards choice, and truthful empty-page recovery without changing JSON paging.
+Summaries use advertised extents/parameters/styles; temporal sampling is shown
+only when explicitly supplied. No new discovery controls or conformance claims.

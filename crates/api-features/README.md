@@ -245,3 +245,7 @@ collection snapshot, without additional data queries.
 
 Collection advanced search starts closed and retains the user's open/closed
 choice across searches in the browser session. Resource URLs are clickable.
+
+HTML catalogs now use compact search and metadata summaries, retain UTC time
+precision, and distinguish empty offsets from zero matching collections. Returning
+to the first page preserves discovery filters; list/cards preference persists.
