@@ -299,10 +299,6 @@ pub fn document_links(doc: &Value) -> String {
                 continue;
             }
             let label = link["title"].as_str().unwrap_or(rel);
-            if rel == "map" {
-                body.push_str(&format!("<div class=\"endpoint\"><div><strong>{}</strong><code>{}</code><p>Image endpoint · requires bbox. Use the map controls or API reference.</p></div></div>",escape(label),escape(href)));
-                continue;
-            }
             let human = matches!(rel, "data" | "child" | "collection" | "conformance" | "up")
                 || rel == "items" && href.contains("/features/");
             let target = if human {
@@ -311,11 +307,13 @@ pub fn document_links(doc: &Value) -> String {
                 href.to_owned()
             };
             body.push_str(&format!(
-                "<div class=\"endpoint\"><div>{}<code>{}</code><p>{} · {}</p></div></div>",
-                anchor(&target, label, "resource-title"),
+                "<div class=\"endpoint\"><div><a class=\"resource-title\" href=\"{}\"><strong>{}</strong><code>{}</code></a><p>{} · {}{}</p></div></div>",
+                escape(safe_href(&target)),
+                escape(label),
                 escape(href),
                 escape(rel),
-                escape(link["type"].as_str().unwrap_or("Linked resource"))
+                escape(link["type"].as_str().unwrap_or("Linked resource")),
+                if rel == "map" { " · requires bbox; use the map controls to build a request" } else { "" }
             ));
         }
     }
@@ -829,7 +827,7 @@ pub fn collections_html(
             )
         })
         .collect::<String>();
-    let form=format!("<form class=\"search-panel query-form\" method=\"get\" action=\"{}\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"builder-heading\"><h2>Collection search</h2><span class=\"mono\">GET</span></div>{primary}<details class=\"filters\" open><summary>Advanced search, area and time</summary><div class=\"filters-grid\">{advanced}</div><div class=\"paging-fields\">{paging}</div><div class=\"filter-controls\"><span class=\"field-help\">Collections with unknown extents remain eligible.</span>{}</div></details><div class=\"active-filters\">{chips}</div><div class=\"draft-request enhanced\"><small>Collection search request · submit to update matches</small><code data-draft></code></div><noscript><p>Enable JavaScript to edit advanced parameters.</p></noscript></form>",escape(url),anchor(&with_format(url,"html"),"Clear filters","quiet"));
+    let form=format!("<form class=\"search-panel query-form\" method=\"get\" action=\"{}\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"builder-heading\"><h2>Collection search</h2><span class=\"mono\">GET</span></div>{primary}<details class=\"filters\" data-disclosure=\"collection-search\"><summary>Advanced search, area and time</summary><div class=\"filters-grid\">{advanced}</div><div class=\"paging-fields\">{paging}</div><div class=\"filter-controls\"><span class=\"field-help\">Collections with unknown extents remain eligible.</span>{}</div></details><div class=\"active-filters\">{chips}</div><div class=\"draft-request enhanced\"><small>Collection search request · submit to update matches</small><code data-draft></code></div><noscript><p>Enable JavaScript to edit advanced parameters.</p></noscript></form>",escape(url),anchor(&with_format(url,"html"),"Clear filters","quiet"));
     let mut body = page_heading(
         "Collections",
         "Find datasets by their metadata and coverage. Select a collection to build a data request.",

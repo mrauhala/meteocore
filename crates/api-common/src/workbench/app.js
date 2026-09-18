@@ -56,6 +56,18 @@
   }
   document.querySelectorAll('[data-copy]').forEach(button => button.addEventListener('click', () => copy(button.dataset.copy)));
 
+  // Disclosure state is a UI preference, never an API query parameter.
+  document.querySelectorAll('[data-disclosure="collection-search"]').forEach(details => {
+    const form = details.closest('form');
+    const key = 'meteocore-search-disclosure:' + new URL(form.action,location.href).pathname;
+    try { details.open = sessionStorage.getItem(key) === 'open'; } catch (_) {}
+    const remember = () => {
+      try { sessionStorage.setItem(key,details.open ? 'open' : 'closed'); } catch (_) {}
+    };
+    details.addEventListener('toggle',remember);
+    form.addEventListener('submit',remember);
+  });
+
   document.querySelectorAll('.query-form').forEach(form => {
     const fields = form.querySelectorAll('[data-param]');
     const update = () => {

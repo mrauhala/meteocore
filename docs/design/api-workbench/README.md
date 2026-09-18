@@ -130,9 +130,8 @@ and wind-gust styles explicitly bind their data parameter. NOAA license metadata
 links to the [NWS use conditions](https://www.weather.gov/disclaimer).
 
 The selected style's advertised legend appears beside the map. Its link opens
-the machine-readable legend, including parameter and units. Map endpoint links
-that require `bbox` are labelled as endpoints, rather than opening a known-invalid
-request. The duplicate resource list and unscoped global-preview button were
+the machine-readable legend, including parameter and units. Map endpoint links are clickable and state the required `bbox`; the map
+controls provide a complete image request. The duplicate resource list and unscoped global-preview button were
 removed from the Maps request section. Breadcrumbs prefer collection/item titles.
 
 All serialized metadata fields remain in Metadata & links (including arbitrary
@@ -151,7 +150,7 @@ adding a complete data-request workspace, rather than borrowing EDR-only metadat
 The GFS engine currently selects the first indexed level for an explicit TMP
 parameter (0.01 hPa in the checked NOAA product), rather than guaranteeing 2 m
 temperature. The temperature style is labelled **default level** for this reason.
-GRIB vertical selection remains the existing #185 limitation; pressure and wind
+GRIB vertical selection remains the existing #81 limitation; pressure and wind
 gust provide unambiguous fields for this preview.
 
 Validation after this review: 648 API tests and 7 cross-API discovery contracts
@@ -165,3 +164,18 @@ Legend initialization waits for the full document so a fast/cached map cannot
 race sidebar parsing. Legend images revalidate when selected, avoiding old
 palette images after a configuration reload; unchanged legends stay visible
 through viewport refreshes.
+
+## Navigation and map-overlay follow-up
+
+Resource cards now link both the title and displayed URL as one clickable target.
+Map links retain the bbox requirement hint. Country outlines use a contrasting
+foreground stroke/halo above every raster replacement. Advanced collection search
+starts closed and remembers the user's choice per API path for the session;
+submitting a search does not reopen it or discard active advanced filters.
+
+Browser verification: advanced search was closed on first load, stayed open after
+an open-panel submission, and stayed closed after a close-and-submit. Resource
+URLs were verified as anchors. Clicking Styles was blocked by the Chrome client
+(`ERR_BLOCKED_BY_CLIENT`); its endpoint was checked separately over HTTP. GFS country
+borders remained visible above the rendered image after zooming. The existing
+648 API tests, seven cross-API contracts, clippy and HTTP smoke checks passed.

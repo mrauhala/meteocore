@@ -2600,3 +2600,6 @@ a {
 .map-legend{height:332px;padding:16px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;overflow:auto;font-size:14px;color:var(--muted)}
 .map-legend img{display:block;max-width:100%;height:auto}
 .map-legend [hidden]{display:none}
+
+.resource-title{display:block;text-decoration:underline;text-underline-offset:3px}
+.resource-title code{color:inherit}

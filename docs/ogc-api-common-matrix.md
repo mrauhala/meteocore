@@ -320,3 +320,9 @@ grid metadata (regular resolution/count or explicit irregular coordinates); it
 does not infer sampling from an interval or claim new Part 4 conformance. Optional
 metadata remains visible in the metadata tab, including nested extensions,
 vertical coverage, keywords and license links. Storage CRS is not inferred.
+
+Collection advanced search starts collapsed and remembers its disclosure state
+per API path for the browser session, including after search submission. Applied
+filters remain visible while collapsed. Resource titles and their URLs form one
+clickable link; map endpoints retain their required-bbox hint. Country boundaries
+render above map imagery with a contrasting halo, including after pan/zoom.

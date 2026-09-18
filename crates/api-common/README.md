@@ -161,3 +161,9 @@ style legends load with the displayed image; unchanged legends stay visible on
 pan/zoom. Full nested metadata and license links remain in Metadata & links,
 with configured licenses and searchable keywords also in the overview. Missing
 storage CRS is labelled "Not advertised", never guessed from the coverage CRS.
+
+Collection advanced search starts collapsed and remembers its disclosure state
+per API path for the browser session, including after search submission. Applied
+filters remain visible while collapsed. Resource titles and their URLs form one
+clickable link; map endpoints retain their required-bbox hint. Country boundaries
+render above map imagery with a contrasting halo, including after pan/zoom.

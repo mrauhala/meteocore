@@ -184,7 +184,7 @@
           };
           staged = {id:nextId,onRender};
           map.addSource(nextId,{type:'canvas',canvas,coordinates,animate:false});
-          map.addLayer({id:nextId,type:'raster',source:nextId,paint:{'raster-opacity':0,'raster-fade-duration':0}},'outlines');
+          map.addLayer({id:nextId,type:'raster',source:nextId,paint:{'raster-opacity':0,'raster-fade-duration':0}},map.getLayer('border-halo') ? 'border-halo' : 'outlines');
           map.on('render',onRender); map.triggerRepaint();
         } catch (error) {
           if (current !== generation) return;
@@ -255,7 +255,10 @@
         const land = await response.json();
         map.addSource('land',{type:'geojson',data:land,attribution:'Natural Earth · public domain'});
         map.addLayer({id:'land',type:'fill',source:'land',paint:{'fill-color':palette().land}},'areas');
-        map.addLayer({id:'borders',type:'line',source:'land',paint:{'line-color':palette().border,'line-width':0.8}},'areas');
+        // Keep borders above every replacement raster, with a light halo so
+        // boundaries remain visible over both dark and bright weather colors.
+        map.addLayer({id:'border-halo',type:'line',source:'land',paint:{'line-color':'#ffffff','line-width':3,'line-opacity':0.75}},'outlines');
+        map.addLayer({id:'borders',type:'line',source:'land',paint:{'line-color':'#29434b','line-width':1}},'outlines');
         const labels=[];
         function labelCountries() {
           labels.forEach(marker=>marker.remove()); labels.length=0;

@@ -242,3 +242,6 @@ discovery remains under **Collections → Find collections**.
 HTML breadcrumbs display collection and item titles when available; resource
 URLs continue to use the original IDs. Parent titles are passed from the existing
 collection snapshot, without additional data queries.
+
+Collection advanced search starts closed and retains the user's open/closed
+choice across searches in the browser session. Resource URLs are clickable.

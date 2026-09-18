@@ -201,3 +201,6 @@ for required data-query inputs; collection search is not an EDR data builder.
 
 HTML breadcrumbs use collection titles, including parent collection links on
 model-run lists and individual run metadata pages. IDs remain unchanged in URLs.
+
+Collection advanced search starts closed and retains the user's open/closed
+choice across searches in the browser session. Resource URLs are clickable.
