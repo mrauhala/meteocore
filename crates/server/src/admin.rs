@@ -2064,87 +2064,117 @@ pub fn load_collections(
 
                 grib_engines.push(engine.clone());
 
-                // Get parameter list for per-parameter-layer styles
-                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
-                let raster_params = raster_info.parameters;
+                let views: Vec<_> = if grib_config.level_types.is_some() {
+                    engine
+                        .level_collections()
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect()
+                } else {
+                    vec![engine.clone()]
+                };
+                if views.is_empty() {
+                    health.push(CollectionHealth {
+                        id: collection.id.clone(),
+                        engine_type: "grib".into(),
+                        status: CollectionStatus::Degraded,
+                        error: Some(
+                            "no enabled GRIB level families found yet (waiting for poll)".into(),
+                        ),
+                    });
+                }
+                for engine in views {
+                    let mut view_config = collection.clone();
+                    if let Some(family) = engine.level_type() {
+                        view_config.id = engine.collection_id().to_owned();
+                        view_config.title = format!("{} — {}", collection.title, family.label());
+                        view_config.description =
+                            format!("{} ({})", collection.description, family.label());
+                    }
+                    let collection = &view_config;
+                    // Get parameter list for per-parameter-layer styles
+                    let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                    let raster_params = raster_info.parameters;
 
-                if collection.apis.contains(&"edr".to_string()) {
-                    edr_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                    );
-                    edr_collections.insert(collection.id.clone(), collection.clone());
-                    edr_styles.extend(collection_layer_styles(
-                        style_ctx,
-                        &mut styles_cache,
-                        collection,
-                        &raster_params,
-                        &bundle_index,
-                    ));
-                }
+                    if collection.apis.contains(&"edr".to_string()) {
+                        edr_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                        );
+                        edr_collections.insert(collection.id.clone(), collection.clone());
+                        edr_styles.extend(collection_layer_styles(
+                            style_ctx,
+                            &mut styles_cache,
+                            collection,
+                            &raster_params,
+                            &bundle_index,
+                        ));
+                    }
 
-                if collection.apis.contains(&"wms".to_string()) {
-                    map_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    map_collections.insert(collection.id.clone(), collection.clone());
-                    map_styles.extend(collection_layer_styles(
-                        style_ctx,
-                        &mut styles_cache,
-                        collection,
-                        &raster_params,
-                        &bundle_index,
-                    ));
-                    info!("Collection '{}': wired to WMS API", collection.id);
-                }
-                if collection.apis.contains(&"maps".to_string()) {
-                    maps_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    maps_collections.insert(collection.id.clone(), collection.clone());
-                    maps_styles.extend(collection_layer_styles(
-                        style_ctx,
-                        &mut styles_cache,
-                        collection,
-                        &raster_params,
-                        &bundle_index,
-                    ));
-                    info!("Collection '{}': wired to Maps API", collection.id);
-                }
-                if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    tiles_collections.insert(collection.id.clone(), collection.clone());
-                    tiles_styles.extend(collection_layer_styles(
-                        style_ctx,
-                        &mut styles_cache,
-                        collection,
-                        &raster_params,
-                        &bundle_index,
-                    ));
-                    info!("Collection '{}': wired to Tiles API", collection.id);
-                }
+                    if collection.apis.contains(&"wms".to_string()) {
+                        map_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        map_collections.insert(collection.id.clone(), collection.clone());
+                        map_styles.extend(collection_layer_styles(
+                            style_ctx,
+                            &mut styles_cache,
+                            collection,
+                            &raster_params,
+                            &bundle_index,
+                        ));
+                        info!("Collection '{}': wired to WMS API", collection.id);
+                    }
+                    if collection.apis.contains(&"maps".to_string()) {
+                        maps_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        maps_collections.insert(collection.id.clone(), collection.clone());
+                        maps_styles.extend(collection_layer_styles(
+                            style_ctx,
+                            &mut styles_cache,
+                            collection,
+                            &raster_params,
+                            &bundle_index,
+                        ));
+                        info!("Collection '{}': wired to Maps API", collection.id);
+                    }
+                    if collection.apis.contains(&"tiles".to_string()) {
+                        tiles_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        tiles_collections.insert(collection.id.clone(), collection.clone());
+                        tiles_styles.extend(collection_layer_styles(
+                            style_ctx,
+                            &mut styles_cache,
+                            collection,
+                            &raster_params,
+                            &bundle_index,
+                        ));
+                        info!("Collection '{}': wired to Tiles API", collection.id);
+                    }
 
-                let has_data =
-                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref()).is_some();
-                health.push(CollectionHealth {
-                    id: collection.id.clone(),
-                    engine_type: "grib".into(),
-                    status: if has_data {
-                        CollectionStatus::Ready
-                    } else {
-                        CollectionStatus::Degraded
-                    },
-                    error: if has_data {
-                        None
-                    } else {
-                        Some("no forecast data found yet (waiting for poll)".into())
-                    },
-                });
+                    let has_data =
+                        ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref())
+                            .is_some();
+                    health.push(CollectionHealth {
+                        id: collection.id.clone(),
+                        engine_type: "grib".into(),
+                        status: if has_data {
+                            CollectionStatus::Ready
+                        } else {
+                            CollectionStatus::Degraded
+                        },
+                        error: if has_data {
+                            None
+                        } else {
+                            Some("no forecast data found yet (waiting for poll)".into())
+                        },
+                    });
+                }
             }
             "zarr" => {
                 let zarr_config = match collection.zarr.as_ref() {
@@ -4066,8 +4096,8 @@ data_path = "/missing/weather.csv"
     }
 }
 
-/// Retry failed startup scans and re-expand empty PVOL inventories. The existing
-/// loader wires per-site routes and dependent nowcasts, not just an engine catalog.
+/// Retry failed startup scans and register newly discovered PVOL sites / GRIB
+/// level families. The loader wires routes and dependent nowcasts as well.
 /// Run only on the background runtime, serialized with manual/watcher reloads.
 pub(crate) async fn radar_recovery_loop(state: AdminState) {
     let mut delay = std::time::Duration::from_secs(30);
@@ -4087,7 +4117,7 @@ pub(crate) async fn radar_recovery_loop(state: AdminState) {
             }
             Err(error) => {
                 tracing::warn!(
-                    "Radar startup recovery failed; preserving live collections: {error:?}"
+                    "Source registration/recovery failed; preserving live collections: {error:?}"
                 );
                 delay = (delay * 2).min(std::time::Duration::from_secs(300));
             }
@@ -4114,7 +4144,8 @@ pub(crate) fn recover_radar_once(state: &AdminState) -> Result<RecoveryOutcome, 
     if !has_pending_radar(
         &inputs.collections,
         &state.health.read().unwrap_or_else(|e| e.into_inner()),
-    ) {
+    ) && !grib_registration_changed(state, &inputs.collections)
+    {
         return Ok(RecoveryOutcome::Idle);
     }
     let outcome = apply_load(state, inputs, true)?;
@@ -4127,6 +4158,32 @@ pub(crate) fn recover_radar_once(state: &AdminState) -> Result<RecoveryOutcome, 
         return Ok(RecoveryOutcome::Pending);
     }
     Ok(RecoveryOutcome::Recovered)
+}
+
+/// Polls update shared GRIB catalogs; registration follows newly discovered
+/// level families using the accepted config and the existing reload machinery.
+fn grib_registration_changed(state: &AdminState, collections: &[CollectionConfig]) -> bool {
+    let engines = state.grib_engines.read().unwrap_or_else(|e| e.into_inner());
+    let health = state.health.read().unwrap_or_else(|e| e.into_inner());
+    collections.iter().any(|config| {
+        let Some(types) = config.grib.as_ref().and_then(|g| g.level_types.as_ref()) else {
+            return false;
+        };
+        let Some(engine) = engines.iter().find(|e| e.collection_id() == config.id) else {
+            return false;
+        };
+        let expected: std::collections::HashSet<_> = engine
+            .level_collections()
+            .iter()
+            .map(|view| view.collection_id().to_owned())
+            .collect();
+        let actual: std::collections::HashSet<_> = types
+            .iter()
+            .map(|family| format!("{}-{}", config.id, family.suffix()))
+            .filter(|id| health.iter().any(|h| &h.id == id))
+            .collect();
+        expected != actual
+    })
 }
 
 fn apply_load(
@@ -4677,6 +4734,15 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     {
         let engines = state.grib_engines.read().unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
+            let views = engine.level_collections();
+            if !views.is_empty() {
+                for view in views {
+                    if let Some(temporal) = build_temporal(&view) {
+                        temporal_info.insert(view.collection_id().to_owned(), temporal);
+                    }
+                }
+                continue;
+            }
             let id = engine.collection_id().to_string();
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
@@ -4941,7 +5007,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
-    // GRIB grid cache: per-collection
+    // GRIB grid cache: per-source (all its level collections share it).
     if let Ok(engines) = state.grib_engines.read() {
         for engine in engines.iter() {
             let collection = engine.collection_id();
@@ -5571,6 +5637,100 @@ mod tests {
             .iter()
             .find(|h| h.id == id)
             .unwrap_or_else(|| panic!("no health entry for {id}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grib_level_collections_register_metadata_queries_and_reuse_one_owner() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let cfg: CollectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "forecast", "title": "Forecast", "description": "GRIB families",
+            "engine_type": "grib", "apis": ["edr", "wms", "maps", "tiles"],
+            "grib": {"data_path": "../../testdata/grib-local", "level_types": ["single", "pressure", "model"]}
+        })).unwrap();
+        let load = |reuse| {
+            super::load_collections(
+                &ds_render::StyleContext::with_builtins(),
+                std::slice::from_ref(&cfg),
+                &[],
+                "http://x",
+                false,
+                0,
+                super::ReusableCaches::default(),
+                reuse,
+            )
+        };
+        let result = load(super::EngineReuse::default());
+        assert_eq!(result.grib_engines.len(), 1);
+        let id = "forecast-pressure";
+        for collections in [
+            &result.edr_state.collections,
+            &result.wms_state.collections,
+            &result.maps_state.collections,
+            &result.tiles_state.collections,
+        ] {
+            assert_eq!(
+                collections.len(),
+                1,
+                "only the family present in the files is registered"
+            );
+            assert!(collections.contains_key(id));
+        }
+        let edr_vertical = result.edr_state.engines[id].get_vertical_extent().unwrap();
+        assert_eq!(edr_vertical.levels, [150.0]);
+        assert_eq!(edr_vertical.kind, ds_core::vertical::VerticalKind::Pressure);
+        for engine in [
+            &result.wms_state.engines[id],
+            &result.maps_state.engines[id],
+            &result.tiles_state.map_engines[id],
+        ] {
+            assert_eq!(engine.raster_info().vertical, Some(edr_vertical.clone()));
+        }
+        let reused = load(super::EngineReuse {
+            engines: result.engines_by_id.clone(),
+        });
+        assert!(Arc::ptr_eq(
+            &reused.grib_engines[0],
+            &result.grib_engines[0]
+        ));
+        let app = api_edr::router(Arc::new(arc_swap::ArcSwap::from_pointee(result.edr_state)));
+        let get = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                )
+            }
+        };
+        let (status, metadata) = get("/collections/forecast-pressure").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            metadata["extent"]["vertical"]["values"],
+            serde_json::json!(["150"])
+        );
+        let (status, coverage) =
+            get("/collections/forecast-pressure/position?coords=POINT(25%2060)&z=150").await;
+        assert_eq!(status, StatusCode::OK, "{coverage}");
+        assert_eq!(
+            coverage["domain"]["axes"]["z"]["values"],
+            serde_json::json!([150.0])
+        );
+        assert_eq!(coverage["ranges"]["q"]["shape"], serde_json::json!([1]));
+        assert!(coverage["ranges"]["q"]["values"][0].is_number());
+        let (status, _) = get("/collections/forecast-single").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

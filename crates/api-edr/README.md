@@ -123,7 +123,7 @@ CoverageJSON 1.0 schema.
 |---|---|---|---|---|---|---|---|
 | CSV | ✓ | – | ✓ | ✓ | – | n/a | stations whose point is inside the polygon (≤ 500) |
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | polygon-tested |
-| GRIB | – | ✓ | ✓ | ✓ | – | ✓ | Grid over the polygon's bbox at native resolution (≤ 1M cells), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
+| GRIB | – | ✓ | ✓ | ✓ | – | ✓ | Grid over the polygon's bbox at native resolution (≤ 1M values across levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
 | QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps |
 | Zarr | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, one store read per variable for the whole time span (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
@@ -168,13 +168,29 @@ source WMO unit and existing display conversion (precipitation kg/m² → mm);
 there is no implicit division by duration or conversion of energy into flux.
 ECMWF JSON naming remains unchanged.
 
-GRIB parameter names select one canonical level per run, shared by metadata,
-position, area and Maps. Near-surface levels are preferred; if a step lacks the
-selected level, position returns null and area returns an error instead of
-substituting another level. Explicit `z` selection remains unsupported. A
-temperature difference such as dewpoint depression stays in K without an
-absolute-temperature offset. Area longitude axes remain continuous for bounds
-between grid nodes, and global point interpolation wraps across the grid seam.
+GRIB sources can opt into `level_types = ["single", "pressure", "model"]`.
+The server publishes only present/enabled families as `{id}-single`,
+`{id}-pressure` and `{id}-model`. Single-level fields have no vertical extent;
+pressure uses hPa and model/hybrid uses dimensionless ordinal level numbers.
+The views share discovery, polling and the grid cache. Late-arriving families
+are registered automatically from the accepted config.
+
+Pressure/model position queries return a `PointSeries` when one level is
+selected, or a `CoverageCollection` of `VerticalProfile` coverages (one per
+step) for multiple levels. `z` omitted selects all levels; single/list/interval
+selectors are supported. Area/radius queries return a `[z,y,x]` Grid at one
+forecast step; the 1M-value budget includes every selected level and parameter.
+A missing field at an available level is null; an unavailable level is 400.
+Levels are exact discrete coordinates, not interpolated. Model levels are not
+converted to geometric heights. Soil-depth/isentropic axes and fractional index
+level values remain unsupported by this split.
+
+Without `level_types`, the existing collection ID and canonical-level behavior
+are preserved. Single-level and legacy parameter names select a canonical level
+per run, shared by metadata, position, area and Maps. Missing canonical fields
+are null in position and errors in area; `z` is rejected. A temperature
+difference such as dewpoint depression stays in K. Area longitude axes remain
+continuous between grid nodes, and global interpolation wraps the grid seam.
 
 For datetime selection, a GRIB run must contain the requested start instant
 within its published valid-time extent. An incomplete newer run does not hide

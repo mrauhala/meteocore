@@ -1600,8 +1600,40 @@ fn default_grid_cache_mb() -> u64 {
     256
 }
 
+/// Mutually exclusive GRIB collection families. A single-level collection
+/// carries fixed-height products as parameters, without a vertical axis.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum GribLevelType {
+    Single,
+    Pressure,
+    Model,
+}
+
+impl GribLevelType {
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Pressure => "pressure",
+            Self::Model => "model",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Single => "Single level",
+            Self::Pressure => "Pressure levels",
+            Self::Model => "Model / hybrid levels",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct GribConfig {
+    /// Expand this source into `{id}-single`, `{id}-pressure`, and/or
+    /// `{id}-model`, only for enabled families present in the indexes.
+    /// Omitted preserves the existing collection ID and canonical-level view.
+    pub level_types: Option<Vec<GribLevelType>>,
     /// Local directory of `.grib2` + index sidecar files. Mutually exclusive
     /// with `endpoint`/`bucket` (S3). When set, the engine lists this directory
     /// directly for index files — `prefix_pattern`'s strftime/run-hour
@@ -1661,6 +1693,7 @@ impl GribConfig {
         index_format: Option<String>,
     ) -> Self {
         GribConfig {
+            level_types: None,
             data_path: Some(data_path),
             endpoint: None,
             bucket: None,
@@ -2895,6 +2928,35 @@ impl ServerConfig {
             seen.insert(&collection.id, i);
         }
 
+        // Reserve every configured GRIB family ID even if that family has no
+        // data yet. A later poll must never overwrite a manually named route.
+        let mut derived = std::collections::HashSet::new();
+        for collection in &self.collections {
+            if collection.engine_type != "grib" {
+                continue;
+            }
+            if let Some(types) = collection
+                .grib
+                .as_ref()
+                .and_then(|g| g.level_types.as_ref())
+            {
+                if types.is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{}': grib level_types must not be empty",
+                        collection.id
+                    )));
+                }
+                for family in types {
+                    let id = format!("{}-{}", collection.id, family.suffix());
+                    if seen.contains_key(id.as_str()) || !derived.insert(id.clone()) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Duplicate GRIB derived collection ID '{id}' (check level_types and collection IDs)"
+                        )));
+                    }
+                }
+            }
+        }
+
         for collection in &self.collections {
             let id = &collection.id;
 
@@ -3892,6 +3954,26 @@ url = "https://creativecommons.org/licenses/by/4.0/"
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn grib_level_families_validate_and_reserve_derived_ids() {
+        let cfg = grib_collection("data_path = \"testdata/grib-local\"\nlevel_types = [\"single\", \"pressure\", \"model\"]\n");
+        cfg.validate().unwrap();
+        for types in ["[]", "[\"pressure\", \"pressure\"]"] {
+            let cfg = grib_collection(&format!("data_path = \"x\"\nlevel_types = {types}\n"));
+            assert!(cfg.validate().is_err());
+        }
+        let mut collision = cfg;
+        let mut manual = collision.collections[0].clone();
+        manual.id = format!("{}-pressure", manual.id);
+        manual.grib.as_mut().unwrap().level_types = None;
+        collision.collections.push(manual);
+        assert!(collision
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("derived collection ID"));
     }
 
     #[test]

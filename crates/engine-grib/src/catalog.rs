@@ -1,8 +1,10 @@
 //! Forecast catalog: maps (reference_time, step) → file + message offsets.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use ds_core::config::GribLevelType;
 
 /// The level identity behind a public parameter name. Keep the level type:
 /// pressure at 2 hPa and height at 2 m must never name the same message.
@@ -29,6 +31,9 @@ use chrono::{NaiveDate, NaiveTime};
 /// A single GRIB message location within a file.
 #[derive(Debug, Clone)]
 pub struct MessageEntry {
+    /// Origin when a forecast step contains messages from multiple files.
+    /// Unset in a freshly parsed sidecar; scanning attaches the actual path.
+    pub source_url: Option<Arc<str>>,
     /// Parameter short name (e.g., "2t", "msl").
     pub param: String,
     /// Preserved source statistic/window (wgrib2); JSON sidecars do not carry it.
@@ -50,6 +55,15 @@ pub struct MessageEntry {
 }
 
 impl MessageEntry {
+    pub fn level_type(&self) -> Option<GribLevelType> {
+        match self.levtype.as_str() {
+            "sfc" | "hag" => Some(GribLevelType::Single),
+            "pl" if self.level.is_some() => Some(GribLevelType::Pressure),
+            "ml" if self.level.is_some() => Some(GribLevelType::Model),
+            _ => None,
+        }
+    }
+
     pub fn key(&self) -> ParameterKey {
         ParameterKey {
             param: self.param.clone(),
@@ -131,6 +145,10 @@ pub struct StepFile {
 }
 
 impl StepFile {
+    pub fn message_url<'a>(&'a self, entry: &'a MessageEntry) -> &'a str {
+        entry.source_url.as_deref().unwrap_or(&self.grib_url)
+    }
+
     /// Preserve the existing surface default when newly supported acc/ave
     /// records precede it in an index. An aggregate-only collection still
     /// has a useful default, as does a collection containing only upper air.
@@ -227,6 +245,11 @@ pub struct Catalog {
     /// Canonical levels per run, selected once on publication. A missing
     /// canonical level in a step is missing data, not a switch to upper air.
     parameter_keys: BTreeMap<DateTime<Utc>, ParameterKeys>,
+    /// Built once on the scan path. Child catalogs contain no further children.
+    pub families: BTreeMap<GribLevelType, Arc<Catalog>>,
+    /// Per-run level union, also precomputed for vertical query selection.
+    pub levels: BTreeMap<DateTime<Utc>, Vec<f64>>,
+    pub vertical_levels: Vec<f64>,
 }
 
 impl Catalog {
@@ -344,6 +367,59 @@ impl Catalog {
         }
     }
 
+    pub fn refresh_families(&mut self, enabled: &[GribLevelType]) {
+        self.families.clear();
+        for &family in enabled {
+            let mut catalog = Catalog::new();
+            for (&rt, run) in &self.runs {
+                let mut steps = BTreeMap::new();
+                let mut levels = std::collections::BTreeSet::new();
+                for (&step, file) in &run.steps {
+                    let messages: Vec<_> = file
+                        .messages
+                        .iter()
+                        .filter(|m| m.level_type() == Some(family))
+                        .cloned()
+                        .collect();
+                    if messages.is_empty() {
+                        continue;
+                    }
+                    if family != GribLevelType::Single {
+                        levels.extend(messages.iter().filter_map(|m| m.level));
+                    }
+                    steps.insert(
+                        step,
+                        StepFile {
+                            grib_url: file.grib_url.clone(),
+                            messages,
+                        },
+                    );
+                }
+                if !steps.is_empty() {
+                    catalog.runs.insert(
+                        rt,
+                        ForecastRun {
+                            reference_time: rt,
+                            steps,
+                        },
+                    );
+                    // Bottom first: largest pressure / largest model level.
+                    let levels: Vec<_> = levels.into_iter().rev().map(f64::from).collect();
+                    catalog.levels.insert(rt, levels);
+                }
+            }
+            let levels: std::collections::BTreeSet<_> = catalog
+                .levels
+                .values()
+                .flatten()
+                .map(|&v| v as u32)
+                .collect();
+            catalog.vertical_levels = levels.into_iter().rev().map(f64::from).collect();
+            catalog.refresh_parameters();
+            self.families.insert(family, Arc::new(catalog));
+        }
+    }
+
     /// Apply max_runs eviction: keep only the N most recent runs.
     pub fn evict(&mut self, max_runs: usize) {
         while self.runs.len() > max_runs {
@@ -402,6 +478,7 @@ mod tests {
     #[test]
     fn is_near_surface_cases() {
         let sfc = MessageEntry {
+            source_url: None,
             step_kind: crate::wgrib2_index::StepKind::Instant,
             param: "msl".into(),
             levtype: "sfc".into(),

@@ -211,3 +211,13 @@ permanent endpoint/bucket mistakes, so repeated failed health needs operator
 attention. The all-failed startup exception requires every configured collection to be
 remote radar; mixed local/remote failures still exit. Local missing files and structurally missing source config retain
 startup fail-fast behavior. Runtime scan errors still retain the good catalog.
+
+## GRIB level collections
+
+A GRIB config with `level_types` expands into present/enabled `-single`,
+`-pressure`, `-model` collections. Keep only the source owner in `grib_engines`
+and `engine_handles`; cheap views share its poll loop/cache. Views inherit APIs,
+styles and collection metadata. Config validation reserves derived IDs even
+before data arrives. The background recovery loop also compares GRIB family
+registration with the live catalog, reusing accepted config and warm engines
+when new families appear. Reload eviction already covers `{base}-*` IDs.

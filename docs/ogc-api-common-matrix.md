@@ -36,6 +36,12 @@ a conformance conclusion. A **Yes** on one row does not establish conformance
 for its entire requirements class. Optional metadata and recommendations are
 included to support experimentation; a **No** is not automatically a violation.
 
+GRIB level-collection support (2026-09-19): an opt-in source can register up to
+three separately identified collections across EDR/Maps/Tiles, sharing its
+source catalog/cache. Single-level fields omit vertical extent; pressure and
+model/hybrid views advertise their own hPa/ordinal axes through the existing
+API-specific representations. This does not add a Common conformance class.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively.
 Part 4 rows concern **collection discovery**, not querying the contents of a
 collection.
