@@ -5695,11 +5695,20 @@ mod tests {
             .await
             .unwrap();
         let items = json(response).await;
+        assert_eq!(items["features"].as_array().unwrap().len(), 1);
         for feature in items["features"].as_array().unwrap() {
-            let uri = format!(
-                "/collections/cap-test/items/{}",
-                feature["id"].as_str().unwrap()
-            );
+            // IDs are domain values, not pre-encoded URL segments. Follow the
+            // advertised self link, including encoding of sender/identifier
+            // punctuation, rather than inserting the raw ID into a path.
+            let href = feature["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|link| link["rel"] == "self")
+                .unwrap()["href"]
+                .as_str()
+                .unwrap();
+            let uri = href.strip_prefix("http://x/features").unwrap();
             let response = features
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -5708,9 +5717,11 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::OK,
-                "canonical feature id must round trip through HTTP"
+                "advertised feature self link must round trip through HTTP"
             );
-            assert_eq!(json(response).await["id"], feature["id"]);
+            let item = json(response).await;
+            assert_eq!(item["id"], feature["id"]);
+            assert_eq!(item["properties"], feature["properties"]);
         }
         // Tiles must work even if the operator disables the Features router.
         let mut cfg = cfg;
