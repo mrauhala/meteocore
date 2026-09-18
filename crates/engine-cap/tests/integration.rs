@@ -480,10 +480,9 @@ fn cap_xml(identifier: &str) -> String {
 }
 
 #[test]
-fn identifier_with_slash_is_url_safe_and_reachable() {
-    // A URI-style identifier containing '/' must not break the Features
-    // self-link / route: the emitted Feature id is percent-encoded (no raw '/'),
-    // while the catalog key stays the decoded id that the route resolves to.
+fn identifier_with_slash_is_preserved_and_reachable() {
+    // Domain IDs must be usable for direct engine lookup. URL encoding belongs
+    // to the API, covered by the server's CAP feature-link contract.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.xml"),
@@ -494,35 +493,22 @@ fn identifier_with_slash_is_url_safe_and_reachable() {
 
     let page = eng.get_features(&FeatureQuery::default()).unwrap();
     let fid = &page.features[0].id;
-    assert!(
-        !fid.contains('/'),
-        "emitted id must not contain a raw '/': {fid}"
-    );
-    assert!(
-        fid.contains("%2F"),
-        "the '/' must be percent-encoded: {fid}"
-    );
-    // The route decodes %2F back to '/', so get_feature is keyed by the decoded
-    // id (what the api-features Path extractor yields).
+    assert_eq!(fid, "cap:0:urn:oid:2.49.0.1.840/abc.0.0");
+    assert_eq!(&eng.get_feature(fid).unwrap().id, fid);
+    // The unambiguous legacy alias remains reachable too.
     assert!(eng.get_feature("urn:oid:2.49.0.1.840/abc.0.0").is_ok());
 }
 
 #[test]
-fn identifier_with_brackets_is_url_safe_and_reachable() {
-    // Real US-NWS-style identifiers can contain '[' / ']', which RFC 3986
-    // forbids unencoded in a path segment.
+fn identifier_with_brackets_is_preserved_and_reachable() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.xml"), cap_xml("NWS-IDP[KOUN][2026]")).unwrap();
     let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-brk").unwrap();
     let fid = eng.get_features(&FeatureQuery::default()).unwrap().features[0]
         .id
         .clone();
-    assert!(
-        !fid.contains('[') && !fid.contains(']'),
-        "brackets must be encoded: {fid}"
-    );
-    assert!(fid.contains("%5B") && fid.contains("%5D"));
-    // The decoded form (what the route yields) resolves.
+    assert_eq!(fid, "cap:0:NWS-IDP[KOUN][2026].0.0");
+    assert_eq!(eng.get_feature(&fid).unwrap().id, fid);
     assert!(eng.get_feature("NWS-IDP[KOUN][2026].0.0").is_ok());
 }
 

@@ -180,8 +180,11 @@ memory. Things that differ from the pull sources:
   `cap:{senderByteLength}:{sender}{identifier}.{infoIdx}.{areaIdx}`. The
   sender length makes the prefix unambiguous even with punctuation in either
   identity component, and the ID remains stable when other senders arrive.
-  The emitted `Feature.id` is percent-encoded to one URL path segment;
-  clients use it as-is in self links. Raw identity remains in `properties`.
+  The emitted `Feature.id` is the raw catalog key, usable directly with
+  `get_feature`. The Features API percent-encodes it once when building links;
+  never pre-encode domain IDs in the engine. Clients follow the advertised
+  links rather than inserting raw IDs into paths. Producer identity remains
+  unchanged in `properties`.
   Legacy `{identifier}.{infoIdx}.{areaIdx}` URLs still resolve when exactly
   one sender has that ID; ambiguous legacy aliases return 404. Canonical
   IDs take precedence over aliases.

@@ -150,6 +150,14 @@ No executable documentation assets or validation requests use a CDN (#587).
 ## Geometry types produced
 
 `Point`, `Polygon`, `MultiPolygon`, and `null` (CAP geocode-only areas).
+
+Feature IDs are opaque domain strings; URL path segments in advertised links
+are percent-encoded once by the API. This includes CAP sender-scoped IDs with
+URL-shaped senders, slashes, brackets, literal percent sequences or Unicode.
+CAP IDs now retain those characters in JSON rather than pre-encoding them in
+the engine; producer `sender`/`identifier` properties are unchanged. Follow
+the advertised links, or encode the complete ID as one path segment when
+constructing a URL. Existing correctly encoded URLs remain valid.
 `LineString` does not exist in `ds_core::feature::Geometry` (#408 — storm
 tracks).
 
