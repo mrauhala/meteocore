@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ds_core::error::DataServerError;
 use ds_storage::DataStore;
-use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues};
+use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, GridPointIndex};
 
 use crate::cache::DecodedGrid;
 use crate::catalog::MessageEntry;
@@ -77,12 +77,19 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
     // Extract grid definition
     let grid_def = submessage.grid_def();
 
-    let (ni, nj, lon_first, lat_first, lon_inc, lat_inc) = extract_grid_params(grid_def)
-        .ok_or_else(|| {
-            DataServerError::Engine(format!(
-                "Unsupported grid type in GRIB2 message for {param}"
-            ))
-        })?;
+    let layout = extract_grid_params(grid_def).map_err(|reason| {
+        DataServerError::Engine(format!(
+            "Invalid or unsupported GRIB2 grid for {param}: {reason}"
+        ))
+    })?;
+    let expected = layout.ni.checked_mul(layout.nj).ok_or_else(|| {
+        DataServerError::Engine(format!("GRIB2 grid dimensions overflow for {param}"))
+    })?;
+    if u64::from(grid_def.num_points()) != expected as u64 {
+        return Err(DataServerError::Engine(format!(
+            "GRIB2 grid point count mismatch for {param}"
+        )));
+    }
 
     // Extract the parameter triple from the Product Definition Section.
     // `parameter_category`/`parameter_number` are `Option<u8>` (absent for
@@ -114,14 +121,40 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
     let decoder = Grib2SubmessageDecoder::from(submessage).map_err(|e| {
         DataServerError::Engine(format!("Failed to create decoder for {param}: {e}"))
     })?;
-    let decoded = decoder.dispatch().map_err(|e| {
+    let mut decoded = decoder.dispatch().map_err(|e| {
         DataServerError::Engine(format!("Failed to decode GRIB2 values for {param}: {e}"))
     })?;
 
-    // Convert f32 values to f64, NaN → value (not filtered)
-    let values: Vec<f64> = decoded.map(|v| v as f64).collect();
-
-    let expected = ni * nj;
+    // Preserve the usual row-major scan's allocation and decode fast path.
+    // For other scan modes, place values using the decoder's storage-order
+    // index iterator, then normalize both axes to west→east / north→south.
+    let values: Vec<f64> = if layout.canonical_scan {
+        decoded.map(f64::from).collect()
+    } else {
+        let mut values = vec![f64::NAN; expected];
+        for (i, j) in layout.indices {
+            let value = decoded.next().ok_or_else(|| {
+                DataServerError::Engine(format!("Too few GRIB2 values for {param}"))
+            })?;
+            let col = if layout.reverse_i {
+                layout.ni - 1 - i
+            } else {
+                i
+            };
+            let row = if layout.reverse_j {
+                layout.nj - 1 - j
+            } else {
+                j
+            };
+            values[row * layout.ni + col] = f64::from(value);
+        }
+        if decoded.next().is_some() {
+            return Err(DataServerError::Engine(format!(
+                "Too many GRIB2 values for {param}"
+            )));
+        }
+        values
+    };
     if values.len() != expected {
         return Err(DataServerError::Engine(format!(
             "GRIB2 grid size mismatch for {param}: expected {expected}, got {}",
@@ -130,12 +163,12 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
     }
 
     Ok(DecodedGrid {
-        ni,
-        nj,
-        lon_first,
-        lat_first,
-        lon_inc,
-        lat_inc,
+        ni: layout.ni,
+        nj: layout.nj,
+        lon_first: layout.lon_first,
+        lat_first: layout.lat_first,
+        lon_inc: layout.lon_inc,
+        lat_inc: layout.lat_inc,
         values: Arc::new(values),
         triple: (discipline, category, number),
         centre,
@@ -144,49 +177,136 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
     })
 }
 
-/// Extract grid parameters from a GRIB2 grid definition.
-/// Returns (ni, nj, lon_first, lat_first, lon_inc, lat_inc) for regular lat/lon grids.
-fn extract_grid_params(
-    grid_def: &grib::GridDefinition,
-) -> Option<(usize, usize, f64, f64, f64, f64)> {
-    let template_values = GridDefinitionTemplateValues::try_from(grid_def).ok()?;
+struct GridLayout {
+    ni: usize,
+    nj: usize,
+    lon_first: f64,
+    lat_first: f64,
+    lon_inc: f64,
+    lat_inc: f64,
+    indices: grib::GridPointIndexIterator,
+    reverse_i: bool,
+    reverse_j: bool,
+    canonical_scan: bool,
+}
 
-    match template_values {
-        GridDefinitionTemplateValues::Template0(template) => {
-            let ni = template.lat_lon.grid.ni as usize;
-            let nj = template.lat_lon.grid.nj as usize;
-
-            // GRIB uses microdegrees (values * 1e-6)
-            let lat_first = template.lat_lon.grid.first_point_lat as f64 / 1_000_000.0;
-            let lon_first = template.lat_lon.grid.first_point_lon as f64 / 1_000_000.0;
-            let lat_last = template.lat_lon.grid.last_point_lat as f64 / 1_000_000.0;
-
-            let lon_inc = template.lat_lon.i_direction_inc as f64 / 1_000_000.0;
-            let lat_inc = if lat_first > lat_last {
-                -(template.lat_lon.j_direction_inc as f64 / 1_000_000.0) // N→S scan
-            } else {
-                template.lat_lon.j_direction_inc as f64 / 1_000_000.0 // S→N scan
-            };
-
-            // Normalize lon_first to [-180, 180)
-            let lon_first = if lon_first > 180.0 {
-                lon_first - 360.0
-            } else {
-                lon_first
-            };
-
-            Some((ni, nj, lon_first, lat_first, lon_inc, lat_inc))
-        }
-        _ => {
-            tracing::warn!("Unsupported GRIB grid template type");
-            None
-        }
+/// Normalize the regular-grid geometry to west→east / north→south. The
+/// index iterator handles column-major and alternating-row storage.
+fn extract_grid_params(grid_def: &grib::GridDefinition) -> Result<GridLayout, String> {
+    let GridDefinitionTemplateValues::Template0(template) =
+        GridDefinitionTemplateValues::try_from(grid_def).map_err(|e| e.to_string())?
+    else {
+        return Err("only regular latitude/longitude grids are supported".into());
+    };
+    let ll = template.lat_lon;
+    let grid = &ll.grid;
+    if grid.ni == 0 || grid.nj == 0 || grid.ni == u32::MAX || grid.nj == u32::MAX {
+        return Err("missing or zero grid dimensions".into());
     }
+    let angle = if grid.initial_production_domain_basic_angle == 0 {
+        1e-6
+    } else {
+        if grid.basic_angle_subdivisions == 0 || grid.basic_angle_subdivisions == u32::MAX {
+            return Err("invalid basic-angle subdivisions".into());
+        }
+        f64::from(grid.initial_production_domain_basic_angle)
+            / f64::from(grid.basic_angle_subdivisions)
+    };
+    if ll.i_direction_inc == 0
+        || ll.j_direction_inc == 0
+        || ll.i_direction_inc == u32::MAX
+        || ll.j_direction_inc == u32::MAX
+    {
+        return Err("missing or zero grid increments".into());
+    }
+    let ni = grid.ni as usize;
+    let nj = grid.nj as usize;
+    let lon_inc = f64::from(ll.i_direction_inc) * angle;
+    let lat_inc = f64::from(ll.j_direction_inc) * angle;
+    let reverse_i = !ll.scanning_mode.scans_positively_for_i();
+    let reverse_j = ll.scanning_mode.scans_positively_for_j();
+    let lon_first = f64::from(grid.first_point_lon) * angle
+        - if reverse_i {
+            (ni - 1) as f64 * lon_inc
+        } else {
+            0.0
+        };
+    let lat_first = f64::from(grid.first_point_lat) * angle
+        + if reverse_j {
+            (nj - 1) as f64 * lat_inc
+        } else {
+            0.0
+        };
+    Ok(GridLayout {
+        ni,
+        nj,
+        lon_first: ds_core::geo::wrap_lon(lon_first),
+        lat_first,
+        lon_inc,
+        lat_inc: -lat_inc,
+        indices: ll.ij().map_err(|e| e.to_string())?,
+        reverse_i,
+        reverse_j,
+        canonical_scan: ll.scanning_mode.0 == 0,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_all_rectangular_scan_orders() {
+        // Same physical grid in every storage order: NW=10, NE=20,
+        // SW=30, SE=40. This table is independent of grib's index iterator.
+        let cases = [
+            (0x00, [10, 20, 30, 40]),
+            (0x10, [10, 20, 40, 30]),
+            (0x20, [10, 30, 20, 40]),
+            (0x30, [10, 30, 40, 20]),
+            (0x40, [30, 40, 10, 20]),
+            (0x50, [30, 40, 20, 10]),
+            (0x60, [30, 10, 40, 20]),
+            (0x70, [30, 10, 20, 40]),
+            (0x80, [20, 10, 40, 30]),
+            (0x90, [20, 10, 30, 40]),
+            (0xa0, [20, 40, 10, 30]),
+            (0xb0, [20, 40, 30, 10]),
+            (0xc0, [40, 30, 20, 10]),
+            (0xd0, [40, 30, 10, 20]),
+            (0xe0, [40, 20, 30, 10]),
+            (0xf0, [40, 20, 10, 30]),
+        ];
+        for (scan, packed) in cases {
+            let bytes = crate::test_support::message(scan, 0.0, packed, 103, 2);
+            let grid = decode_message(&bytes, "TMP").unwrap();
+            assert_eq!(*grid.values, vec![10.0, 20.0, 30.0, 40.0], "mode {scan:x}");
+            assert_eq!(
+                (grid.lon_first, grid.lat_first, grid.lon_inc, grid.lat_inc),
+                (0.0, 1.0, 1.0, -1.0)
+            );
+            assert_eq!(grid.bilinear_value(0.5, 0.5), Some(25.0));
+        }
+    }
+
+    #[test]
+    fn basic_angle_is_respected_and_unsupported_scan_flags_rejected() {
+        let mut bytes = crate::test_support::message(0, 0.0, [10, 20, 30, 40], 103, 2);
+        // Section 3 starts after 16-byte indicator + 21-byte identification.
+        let s3 = 37;
+        bytes[s3 + 38..s3 + 42].copy_from_slice(&1u32.to_be_bytes());
+        bytes[s3 + 42..s3 + 46].copy_from_slice(&1u32.to_be_bytes());
+        for offset in [46, 59, 63, 67] {
+            bytes[s3 + offset..s3 + offset + 4].copy_from_slice(&1u32.to_be_bytes());
+        }
+        let grid = decode_message(&bytes, "TMP").unwrap();
+        assert_eq!(
+            (grid.lon_inc, grid.lat_inc, grid.lat_first),
+            (1.0, -1.0, 1.0)
+        );
+        bytes[s3 + 71] = 1; // unsupported staggered/offset grid flag
+        assert!(decode_message(&bytes, "TMP").is_err());
+    }
 
     #[test]
     fn decode_ecmwf_sample() {

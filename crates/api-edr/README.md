@@ -168,6 +168,20 @@ source WMO unit and existing display conversion (precipitation kg/m² → mm);
 there is no implicit division by duration or conversion of energy into flux.
 ECMWF JSON naming remains unchanged.
 
+GRIB parameter names select one canonical level per run, shared by metadata,
+position, area and Maps. Near-surface levels are preferred; if a step lacks the
+selected level, position returns null and area returns an error instead of
+substituting another level. Explicit `z` selection remains unsupported. A
+temperature difference such as dewpoint depression stays in K without an
+absolute-temperature offset. Area longitude axes remain continuous for bounds
+between grid nodes, and global point interpolation wraps across the grid seam.
+
+For datetime selection, a GRIB run must contain the requested start instant
+within its published valid-time extent. An incomplete newer run does not hide
+a covering older run. Area selects the nearest step within the chosen run;
+position returns the steps in the requested interval. Explicit instance pins
+never fall back to another run.
+
 If a wgrib2 index repeats the same parameter/level/window at different offsets,
 the scan warns and queries select the first record. Duration-qualified names
 separate different windows; they cannot recover product distinctions omitted

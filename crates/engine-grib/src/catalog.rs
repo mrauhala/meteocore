@@ -4,6 +4,25 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 
+/// The level identity behind a public parameter name. Keep the level type:
+/// pressure at 2 hPa and height at 2 m must never name the same message.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParameterKey {
+    pub param: String,
+    pub levtype: String,
+    pub level: Option<u32>,
+}
+
+pub type ParameterKeys = BTreeMap<String, ParameterKey>;
+
+impl ParameterKey {
+    pub fn matches(&self, message: &MessageEntry) -> bool {
+        self.param == message.param
+            && self.levtype == message.levtype
+            && self.level == message.level
+    }
+}
+
 #[cfg(test)]
 use chrono::{NaiveDate, NaiveTime};
 
@@ -31,6 +50,18 @@ pub struct MessageEntry {
 }
 
 impl MessageEntry {
+    pub fn key(&self) -> ParameterKey {
+        ParameterKey {
+            param: self.param.clone(),
+            levtype: self.levtype.clone(),
+            level: self.level,
+        }
+    }
+
+    fn preference(&self) -> (u8, Option<u32>, &str) {
+        (self.surface_priority(), self.level, &self.levtype)
+    }
+
     /// True if this message represents a near-surface field — either a surface
     /// type (`sfc`, including MSL / PBL / tropopause / entire-atmosphere in the
     /// wgrib2 canonical mapping) or a height-above-ground level at or below
@@ -157,30 +188,32 @@ impl ForecastRun {
             .collect()
     }
 
-    /// Find the step file closest to the requested valid time.
+    /// Find the closest step within this run's available valid-time extent.
     pub fn find_step_for_time(&self, valid_time: DateTime<Utc>) -> Option<(u32, &StepFile)> {
-        let target_hours = (valid_time - self.reference_time).num_hours();
-        if target_hours < 0 {
+        let (&first, _) = self.steps.first_key_value()?;
+        let (&last, _) = self.steps.last_key_value()?;
+        let first_time = self.reference_time + chrono::Duration::hours(i64::from(first));
+        let last_time = self.reference_time + chrono::Duration::hours(i64::from(last));
+        if valid_time < first_time || valid_time > last_time {
             return None;
         }
-        let target = target_hours as u32;
-
-        // Exact match first
-        if let Some(sf) = self.steps.get(&target) {
-            return Some((target, sf));
-        }
-
-        // Find nearest step
-        let mut best: Option<(u32, &StepFile)> = None;
-        let mut best_diff = u32::MAX;
-        for (&step, sf) in &self.steps {
-            let diff = step.abs_diff(target);
-            if diff < best_diff {
-                best_diff = diff;
-                best = Some((step, sf));
-            }
-        }
-        best
+        // Only the preceding and following steps can be closest. Compare
+        // actual instants (including fractional hours), preferring the earlier
+        // step on ties, without scanning every step on each render request.
+        let hour = (valid_time - self.reference_time).num_hours() as u32;
+        let before = self.steps.range(..=hour).next_back();
+        let after = self
+            .steps
+            .range((std::ops::Bound::Excluded(hour), std::ops::Bound::Unbounded))
+            .next();
+        before
+            .into_iter()
+            .chain(after)
+            .min_by_key(|(&step, _)| {
+                let time = self.reference_time + chrono::Duration::hours(i64::from(step));
+                (time - valid_time).abs()
+            })
+            .map(|(&step, file)| (step, file))
     }
 }
 
@@ -191,14 +224,14 @@ pub struct Catalog {
     pub runs: BTreeMap<DateTime<Utc>, ForecastRun>,
     /// Latest-run parameter union, rebuilt on the poll path before publication.
     parameters: Vec<(String, String, Option<u32>)>,
+    /// Canonical levels per run, selected once on publication. A missing
+    /// canonical level in a step is missing data, not a switch to upper air.
+    parameter_keys: BTreeMap<DateTime<Utc>, ParameterKeys>,
 }
 
 impl Catalog {
     pub fn new() -> Self {
-        Self {
-            runs: BTreeMap::new(),
-            parameters: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Get the latest (most recent) forecast run.
@@ -266,10 +299,38 @@ impl Catalog {
         self.parameters.clone()
     }
 
+    pub fn parameter_keys(&self, reference_time: &DateTime<Utc>) -> Option<&ParameterKeys> {
+        self.parameter_keys.get(reference_time)
+    }
+
     /// Call after modifying runs, before publishing the immutable snapshot.
     /// Request-time metadata must not scan hundreds of forecast steps.
     pub fn refresh_parameters(&mut self) {
         self.parameters.clear();
+        self.parameter_keys = self
+            .runs
+            .iter()
+            .map(|(&reference_time, run)| {
+                let mut chosen: BTreeMap<&str, &MessageEntry> = BTreeMap::new();
+                for message in run.steps.values().flat_map(|sf| &sf.messages) {
+                    chosen
+                        .entry(&message.param)
+                        .and_modify(|current| {
+                            if message.preference() < current.preference() {
+                                *current = message;
+                            }
+                        })
+                        .or_insert(message);
+                }
+                (
+                    reference_time,
+                    chosen
+                        .into_iter()
+                        .map(|(name, m)| (name.to_owned(), m.key()))
+                        .collect(),
+                )
+            })
+            .collect();
         let Some(run) = self.runs.values().next_back() else {
             return;
         };
@@ -301,6 +362,33 @@ fn parse_reference_time(date: &str, time: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_step_respects_actual_extent_and_fractional_hours() {
+        let reference_time = parse_reference_time("20260405", "0000").unwrap();
+        let run = ForecastRun {
+            reference_time,
+            steps: [3, 6]
+                .into_iter()
+                .map(|step| {
+                    (
+                        step,
+                        StepFile {
+                            grib_url: "unused".into(),
+                            messages: vec![],
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let at = |minutes| reference_time + chrono::Duration::minutes(minutes);
+        assert!(run.find_step_for_time(at(179)).is_none());
+        assert!(run.find_step_for_time(at(361)).is_none());
+        assert_eq!(run.find_step_for_time(at(180)).unwrap().0, 3);
+        assert_eq!(run.find_step_for_time(at(270)).unwrap().0, 3); // tie
+        assert_eq!(run.find_step_for_time(at(271)).unwrap().0, 6);
+        assert_eq!(run.find_step_for_time(at(360)).unwrap().0, 6);
+    }
 
     #[test]
     fn parse_ref_time() {

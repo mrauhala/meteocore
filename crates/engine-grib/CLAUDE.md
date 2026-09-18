@@ -16,17 +16,20 @@ unlike GeoTIFF's one band per collection.
   `endpoint`+`bucket`+`prefix_pattern` (S3 with strftime/run-hour date
   templating), or local `data_path` (a directory of `.grib2` + index
   sidecars; also accepts an `s3://`/`http(s)://` fixed-prefix URL). For
-  `data_path`, `prefix_pattern` is optional and literal (no date templating);
+  `data_path`, `prefix_pattern` is optional and literal (no date templating),
+  appended to the URL's object prefix (or the local store root);
   index/data files must share a basename (`X.index` ↔ `X.grib2`).
 - **Index formats** via `index_format`: `"ecmwf-json"` (default, JSON-lines
   as shipped by ECMWF open data) and `"wgrib2"` (colon-separated text as
   shipped by NOAA GFS).
 - Wgrib2 indexes carry only byte offsets — the last record's length is
-  resolved via `DataStore::head()`. If HEAD fails or the size suggests a
-  partial upload, the index is skipped and retried next poll.
+  resolved via `DataStore::head()` on fetch. A failed HEAD/read is not cached
+  and remains retryable; scanning does not issue a HEAD per index.
 - Parameter metadata populates lazily: `scan_once` runs a bounded
   eager-probe (≤32 messages per scan) across the newest run's step
-  files so `/collections` metadata is ready by the first poll cycle.
+  files. Pending probes continue even without new indexes, rotating past
+  failures so later parameters are not starved. Time-window eviction also
+  runs when discovery finds no new indexes.
 
 ## Unit conversion (source-driven — never hardcode parameter names)
 
@@ -39,6 +42,9 @@ unlike GeoTIFF's one band per collection.
   proportion→%. Colormap ranges use display units. The string-keyed twin
   of this table lives in `ds_core::units` (used by engine-bufr); keep the
   two rule for rule.
+- Distinguish absolute temperature from temperature differences using the
+  WMO parameter semantics: dewpoint depression uses `KelvinDifference` and
+  stays in K, with no Celsius zero-point offset.
 - **Per-provider vocabularies are not needed.** A new provider only needs
   overlay entries if it uses local parameter numbers. ECMWF-`tcc` vs
   GFS-`TCDC`, `z` vs `HGT` are handled by construction (different triples).
@@ -47,11 +53,24 @@ unlike GeoTIFF's one band per collection.
 
 Catalog keeps a `runs` map (`BTreeMap` keyed by reference time) and
 implements the shared `ds_core::instances` contract (see root CLAUDE.md).
+Nearest-step selection is limited to a run's published valid-time extent.
+An incomplete newest run does not hide a covering older run; explicit run
+pins do not fall back. No requested datetime still selects the latest run.
+
+Each run also has canonical `(parameter, level type, level)` selectors,
+rebuilt with `Catalog::refresh_parameters` before publication. Metadata
+probes and all query paths share these selectors. A missing canonical level
+is null in a position series and an error in a map/area request; never
+silently substitute an upper-air field. Metadata is cached by that full
+identity, so historical runs with different selected levels keep their labels.
 
 ## v1 limitations (GFS)
 
 - Only regular lat/lon grids (Template 0) — gaussian-grid products
   (`gdas.*`) fail loudly.
+- All rectangular scan orders are normalized to eastward columns and
+  north-to-south rows using the decoder's grid-index iterator. Basic-angle
+  units are honored; unsupported staggered scan flags are rejected.
 - Hour-window `acc fcst` and `ave fcst` records are preserved (#80).
   They use distinct keys (`APCP_acc_6h`, `DSWRF_avg_6h`), so two window
   lengths or an instantaneous field at the same valid time cannot collide.
