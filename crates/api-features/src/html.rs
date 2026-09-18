@@ -395,7 +395,7 @@ pub(crate) fn features_html(
                 ));
             }
             body.push_str("</div><p data-column-status role=\"status\"></p></details>");
-            body.push_str("<div class=\"table-wrap item-result-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Feature results; scroll for more rows and columns\"><table class=\"item-table\"><thead><tr><th scope=\"col\">Feature</th><th scope=\"col\">Geometry</th>");
+            body.push_str("<div class=\"table-wrap item-result-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Feature results; scroll horizontally for more columns\"><table class=\"item-table\"><thead><tr><th scope=\"col\">Feature</th><th scope=\"col\">Geometry</th>");
             for key in &defaults {
                 body.push_str(&format!(
                     "<th scope=\"col\" data-property-cell>{}</th>",
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_listing_keeps_mixed_properties_and_large_pages_bounded() {
+    fn generic_listing_keeps_mixed_properties_and_all_response_rows() {
         let doc = json!({"features":[
             {"id":"a","geometry":{"type":"Point","coordinates":[20,60]},"properties":{"label":"First","max_dbz":42,"nested":{"a":1},"null_value":null},"links":[{"rel":"self","href":"/items/a?f=html"}]},
             {"id":"b","geometry":null,"properties":{"nimi":"Second","last_report":"2026-09-18T09:00:00Z","evil</div>":"</script>"},"links":[{"rel":"self","href":"/items/b?f=html"}]}

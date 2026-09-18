@@ -179,6 +179,10 @@ bounds and parameter/style names, and display sampling resolution only when
 advertised. No extra engine queries or inferred sample cadence are introduced.
 
 Feature pages reuse compact request disclosures and mobile navigation. Shared
-enhancement supports bounded property tables, per-collection session column
+enhancement supports full-height property tables, per-collection session column
 preferences and multiple page-size controls. Property selections affect HTML
 presentation only. Weather-specific expiry interpretation has been removed.
+
+Page-size labels and selects retain their flex spacing after JavaScript enables
+them, across catalogs and item lists. Item tables use page scrolling vertically;
+the map sits beside results on wide screens.

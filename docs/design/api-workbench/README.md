@@ -222,8 +222,9 @@ Listing columns come from actual properties and advertised filter fields. The
 first four non-null scalar fields other than labels are the default; users can
 choose up to eight columns, remembered per collection for the session. Missing
 properties and null values remain distinct. Selection is presentation state and
-never changes the API URL. The table is bounded and keyboard-scrollable, with
-sticky headings and top/bottom pagination. Raw geometry is retained on details.
+never changes the API URL. The table grows to show every response row, with
+page scrolling vertically and top/bottom pagination. Wide tables support
+horizontal scrolling. The map is alongside results on wide screens. Raw geometry is retained on details.
 
 The map explicitly shows the current page and uses generic property facts. The
 request builder, applied URL and draft URL are collapsible; applied filters remain
@@ -236,12 +237,20 @@ column persistence through paging/search, draft versus applied requests, typed
 property search and filter-preserving first-page recovery. Builder/advanced
 disclosure states survive submission. Primary query controls align at 46 px.
 
-For the captured 1,000-station response, the listing has no raw-geometry
-disclosures and the document is about 2,000 px tall on desktop, compared with
-83,000 px previously. At 390 × 844 the first result starts at 790 px (previously
-2,015 px), with no horizontal page overflow. Large tables scroll within a
-labelled, keyboard-focusable region.
+The listing has no per-feature raw-geometry disclosures. Following layout review,
+the result table grows to the requested limit and scrolls with the document;
+it has no height cap or separate vertical scrolling. On wide screens the map
+sits to the right, as on item details. On narrow screens it follows the table.
+Page-size labels and controls share an explicit flex row with a 12 px gap in
+both catalogs and item lists.
 
 Screenshots: [items desktop](screenshots/items-light.png),
 [items mobile](screenshots/items-mobile.png),
 [item detail, dark](screenshots/item-dark.png).
+
+Layout follow-up verification: the 1,000-row table's client height equals its
+scroll height on both desktop and 390 px mobile, confirming no internal vertical
+scroll area. The map lies to the right on desktop and below results on mobile.
+Page-size label/select gaps measure 12 px in both item controls and the catalog;
+mobile pages have no horizontal document overflow. All 654 API tests, seven
+cross-API contracts, clippy, formatting and HTTP smoke checks passed again.

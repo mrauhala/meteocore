@@ -241,8 +241,11 @@ JSON null. Stored columns survive pages where those fields are absent. Column
 choices never change API requests or JSON output. Without JavaScript, the default
 columns, paging and item links still work.
 
-The response table has bounded scrolling, keyboard focus and sticky headings.
-Paging and page-size controls appear above and below it. An empty offset with
+The response table shows every row returned for the requested limit and grows
+with the page, without a separate vertical scrollbar. Horizontal scrolling is
+available for wide sets of selected columns. The map sits to the right on wide
+screens and below the table on narrow screens. Paging and spaced page-size
+controls appear above and below the table. An empty offset with
 matches offers a first-page link that retains filters, repeated/empty predicates
 and sorting. The request builder and applied/draft URL tools are collapsible;
 builder and advanced-filter disclosure choices persist per collection;
