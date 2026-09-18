@@ -186,3 +186,6 @@ presentation only. Weather-specific expiry interpretation has been removed.
 Page-size labels and selects retain their flex spacing after JavaScript enables
 them, across catalogs and item lists. Item tables use page scrolling vertically;
 the map sits beside results on wide screens.
+
+Feature property columns render flat arrays as visible chips, matching item
+details. Empty arrays are explicit; nested structures remain expandable.

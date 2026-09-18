@@ -226,7 +226,9 @@ preserved. Collection search uses Common `q`/`query`; item queries keep their
 existing Features semantics.
 
 Individual items show every property with its JSON type, distinguishing null,
-empty strings, arrays and nested objects. The renderer does not assign weather
+empty strings, arrays and nested objects. Flat arrays render as visible wrapping
+chips, including in selected listing columns; empty arrays are labelled explicitly.
+Nested arrays and objects retain expandable JSON views. The renderer does not assign weather
 semantics, units, severity, expiry state or observation times based on property
 names. Display titles use case-insensitive common label keys in priority order:
 `name`, `label`, `title`, `display_name`, `displayname`, `nimi`, `namn`, `nom`,
