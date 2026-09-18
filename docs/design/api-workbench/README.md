@@ -254,3 +254,25 @@ scroll area. The map lies to the right on desktop and below results on mobile.
 Page-size label/select gaps measure 12 px in both item controls and the catalog;
 mobile pages have no horizontal document overflow. All 654 API tests, seven
 cross-API contracts, clippy, formatting and HTTP smoke checks passed again.
+
+## Array presentation follow-up
+
+Flat property arrays again show their values immediately as wrapping chips,
+including numeric lists such as elevation angles and string lists such as
+quantities. The same generic rule applies to item details and selected listing
+columns. Empty arrays are labelled explicitly. Arrays containing arrays/objects
+and object values retain expandable JSON views. No collection-specific rules
+are introduced.
+
+The GeoJSON loader also preserves flat source arrays as typed lists, fixing the
+captured-data preview where those arrays previously became strings. Original
+string values and nested structures retain their existing handling. List filters
+match individual elements before counting and paging.
+
+Browser verification uses the normal local server with the captured Herwijnen
+GeoJSON fixture. All 14 elevation angles and nine quantities appear as chips
+in details and selected listing columns, including after restoring column choices.
+135 common/Features tests, 15 GeoJSON tests, seven cross-API contracts, formatting
+and workspace clippy passed. A source-file → real GeoJSON engine → Features router
+contract also checks item/listing JSON types, HTML chips and membership filtering.
+[Array chips screenshot](screenshots/item-array-chips.png).

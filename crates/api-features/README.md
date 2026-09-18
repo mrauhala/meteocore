@@ -110,6 +110,12 @@ only when their sources are wired. Reserved API controls (`bbox`, `datetime`,
 cannot be used as property filters. Duplicate control parameters return 400.
 This does not declare Part 3 conformance or add `/queryables`.
 
+The GeoJSON engine preserves flat arrays of scalars (including empty arrays)
+as typed lists, so JSON responses retain arrays, HTML can display chips, and
+property filters match list elements. Strings containing JSON remain strings.
+Objects and arrays containing nested structures retain the engine's existing
+JSON-string fallback; they are not represented as nested typed properties.
+
 Example: `/features/collections/cap-meteoalarm-wis2/items?awareness_type=1%3B%20Wind&severity=Severe`.
 
 CAP also exposes `awareness_type_code`, derived from the positive integer
@@ -226,7 +232,9 @@ preserved. Collection search uses Common `q`/`query`; item queries keep their
 existing Features semantics.
 
 Individual items show every property with its JSON type, distinguishing null,
-empty strings, arrays and nested objects. The renderer does not assign weather
+empty strings, arrays and nested objects. Flat arrays render as visible wrapping
+chips, including in selected listing columns; empty arrays are labelled explicitly.
+Nested arrays and objects retain expandable JSON views. The renderer does not assign weather
 semantics, units, severity, expiry state or observation times based on property
 names. Display titles use case-insensitive common label keys in priority order:
 `name`, `label`, `title`, `display_name`, `displayname`, `nimi`, `namn`, `nom`,

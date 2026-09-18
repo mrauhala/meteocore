@@ -120,6 +120,13 @@ fn property_value(value: Option<&Value>) -> String {
         Some(Value::Null) => "<code>null</code>".into(),
         Some(Value::String(s)) if s.is_empty() => "<span class=\"muted\">Empty string</span>".into(),
         Some(Value::String(s)) if s.starts_with("https://") || s.starts_with("http://") => ui::anchor(s,s,""),
+        Some(Value::Array(values)) if values.iter().all(|v| !v.is_array() && !v.is_object()) => {
+            if values.is_empty() {
+                "<span class=\"muted\">Empty array</span>".into()
+            } else {
+                format!("<span class=\"chip-row\">{}</span>",values.iter().map(|v|format!("<span class=\"chip\">{}</span>",property_value(Some(v)))).collect::<String>())
+            }
+        },
         Some(v @ (Value::Array(_) | Value::Object(_))) => format!("<details class=\"property-value\"><summary>{} · {} {}</summary><pre>{}</pre></details>",value_type(v),v.as_array().map_or_else(||v.as_object().map_or(0,|o|o.len()),|a|a.len()),if v.is_array(){"values"}else{"keys"},escape(&serde_json::to_string_pretty(v).expect("properties serialize"))),
         Some(v) => ui::value_html(v),
     }
@@ -517,6 +524,27 @@ mod tests {
     use super::*;
     use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
     use ds_core::feature::{Feature, FeaturePage, Geometry, PropertyValue};
+
+    #[test]
+    fn flat_property_arrays_are_visible_chips_and_nested_values_remain_expandable() {
+        let html = property_value(Some(&json!(["DBZH", "<script>&", 0, false, null, ""])));
+        assert_eq!(html.matches("class=\"chip\"").count(), 6);
+        assert!(html.contains("DBZH"));
+        assert!(html.contains("&lt;script&gt;&amp;"));
+        assert!(html.contains(">0</span>"));
+        assert!(html.contains(">false</span>"));
+        assert!(html.contains("<code>null</code>"));
+        assert!(html.contains("Empty string"));
+        assert!(!html.contains("<details"));
+        assert!(property_value(Some(&json!([]))).contains("Empty array"));
+        for nested in [
+            json!([[1, 2]]),
+            json!([{"name":"nested"}]),
+            json!({"a":[1,2]}),
+        ] {
+            assert!(property_value(Some(&nested)).starts_with("<details"));
+        }
+    }
 
     #[test]
     fn labels_are_generic_and_never_interpret_weather_fields() {

@@ -141,6 +141,12 @@
     function cellValue(cell, value, present) {
       if (!present) { cell.textContent = 'Absent'; return; }
       if (value === null) { cell.textContent = 'null'; return; }
+      if (Array.isArray(value) && value.every(v => v === null || typeof v !== 'object')) {
+        if (!value.length) { cell.textContent = 'Empty array'; return; }
+        const chips=document.createElement('span'); chips.className='chip-row';
+        value.forEach(v => { const chip=document.createElement('span'); chip.className='chip'; cellValue(chip,v,true); chips.append(chip); });
+        cell.append(chips); return;
+      }
       if (typeof value === 'object') {
         const details = document.createElement('details'), summary = document.createElement('summary'), pre = document.createElement('pre');
         details.className = 'property-value';

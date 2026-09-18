@@ -339,3 +339,6 @@ applied request. These presentation changes add no Common conformance claims.
 Item listings scroll with the page and retain every returned row. Wide-screen
 layouts place the map beside results; shared page-size controls keep label and
 select spacing across catalogs and items. No API paging semantics change.
+
+Feature HTML shows flat property arrays as visible chips and nested structures
+as expandable JSON. This generic presentation rule adds no API semantics.
