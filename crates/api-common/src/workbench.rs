@@ -233,13 +233,17 @@ impl Page<'_> {
         };
         let curl = format!("curl --get '{}'", json_url.replace('\'', "'\"'\"'"));
         let catalog = current_path.trim_end_matches('/') == format!("{base}/{api}/collections");
+        let items = *api == "features"
+            && current_path
+                .strip_prefix(&format!("{base}/features/collections/"))
+                .is_some_and(|tail| tail.split('/').nth(1) == Some("items"));
         let request_content = format!(
             r#"<div class="request-identity"><span class="method">GET</span><code id="request-url">{json_url}</code></div><div class="request-tools"><span class="request-note">Applied request · JSON representation</span><button class="btn small enhanced" data-copy="{json_url}">Copy URL</button><button class="btn small enhanced" data-copy="{curl}">Copy cURL</button><a class="btn small" href="{json_url}">Open JSON ↗</a></div>"#,
             json_url = escape(safe_href(json_url)),
             curl = escape(&curl)
         );
-        let request_context = if catalog {
-            format!("<details id=\"request-context\" class=\"catalog-request\"><summary>Current API request <code>GET /{}/collections</code></summary><div class=\"request-content\">{request_content}</div></details>",escape(api))
+        let request_context = if catalog || items {
+            format!("<details id=\"request-context\" class=\"catalog-request\"><summary>Current API request <code>GET {}</code></summary><div class=\"request-content\">{request_content}</div></details>",escape(current_path.strip_prefix(base).unwrap_or(current_path)))
         } else {
             format!("<section id=\"request-context\" aria-label=\"Current API request\">{request_content}</section>")
         };
@@ -253,7 +257,9 @@ impl Page<'_> {
             json_url = escape(safe_href(json_url)),
             html_url = escape(safe_href(&html_url)),
             base = escape(base),
-            page_class = if catalog {
+            page_class = if items {
+                "items-page"
+            } else if catalog {
                 "catalog-page"
             } else {
                 "resource-page"

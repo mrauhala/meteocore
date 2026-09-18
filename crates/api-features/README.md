@@ -225,15 +225,38 @@ Repeated predicates and intentional empty predicates from an existing URL are
 preserved. Collection search uses Common `q`/`query`; item queries keep their
 existing Features semantics.
 
-Individual items show all typed properties (including false, zero, null, arrays
-and nested objects). Item details include available reflectivity/area/speed metrics
-and source quality flags. The MapLibre locator renders this response page over a
-locally bundled Natural Earth backdrop, with an overlapping-feature picker and
-quick-look panel. It fits the actual geometry, follows the theme, and retains
-coordinate details when WebGL is unavailable. It makes no additional feature or
-external tile requests. Alert expiry is labelled in the browser; server HTML and ETags remain
-deterministic. JavaScript enables item-query editing, map interaction and property
-search; paging and resource links remain usable without it.
+Individual items show every property with its JSON type, distinguishing null,
+empty strings, arrays and nested objects. The renderer does not assign weather
+semantics, units, severity, expiry state or observation times based on property
+names. Display titles use case-insensitive common label keys in priority order:
+`name`, `label`, `title`, `display_name`, `displayname`, `nimi`, `namn`, `nom`,
+`nombre`, `naam`, `bezeichnung`, then the feature ID. Coordinates are rounded to
+five decimal places in the summary; raw geometry retains full precision.
+
+Listings derive selectable columns from response properties and advertised
+filter fields, defaulting to the first four non-null scalar fields other than
+label keys. Up to eight property columns can be selected, with a per-collection
+session preference. Missing properties are shown as **Absent**, separately from
+JSON null. Stored columns survive pages where those fields are absent. Column
+choices never change API requests or JSON output. Without JavaScript, the default
+columns, paging and item links still work.
+
+The response table shows every row returned for the requested limit and grows
+with the page, without a separate vertical scrollbar. Horizontal scrolling is
+available for wide sets of selected columns. The map sits to the right on wide
+screens and below the table on narrow screens. Paging and spaced page-size
+controls appear above and below the table. An empty offset with
+matches offers a first-page link that retains filters, repeated/empty predicates
+and sorting. The request builder and applied/draft URL tools are collapsible;
+builder and advanced-filter disclosure choices persist per collection;
+applied filters stay visible and the global JSON switch retains the applied URL.
+
+The MapLibre locator shows this response page over locally bundled Natural Earth
+outlines, with a generic property quick look and item links. It makes no additional
+feature or external tile requests. Raw geometry is displayed on item details,
+not repeated beneath the listing map. JavaScript enables query editing, property
+column selection, map interaction and property search. Server HTML remains
+deterministic. Response generation timestamps are labelled explicitly.
 
 In HTML, the collection’s **Request data** tab opens the `/items` data request
 builder. **Request features** applies filters within that collection; collection

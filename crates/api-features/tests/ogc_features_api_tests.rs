@@ -1059,7 +1059,13 @@ mod feature_html {
                         .unwrap();
                     assert!(alternate.contains("f=json"));
                     assert!(body.contains("rel=\"alternate\" type=\"application/geo+json\""));
-                    assert!(body.contains("Geometry (Point)"));
+                    if path.ends_with("/helsinki") {
+                        assert!(body.contains("Geometry (Point)"));
+                        assert!(body.contains("typed-properties"));
+                    } else {
+                        assert!(!body.contains("<details class=\"geometry-details\""));
+                        assert!(body.contains("Map · current page"));
+                    }
                 } else {
                     assert_eq!(ct, "application/geo+json");
                     let doc: Value = serde_json::from_str(&body).unwrap();
