@@ -287,3 +287,47 @@ Common repository commit.
 23-058r2: 894eac40d35da34711fa83db901b127d4b11907ba2c25eb9bf9f8564b82a7b14
 25-046:   aae2a94282682a400d17d78273861423e16baaf4faf4c23c70854e6b29372248
 ```
+
+### Shared HTML workbench
+
+EDR, Maps, Tiles and Features now share the HTML shell and discovery query UI in
+[`api-common::workbench`](../crates/api-common/src/workbench.rs). The query builder
+uses the same Common parameter inventory as validation and OpenAPI. Current-page
+JSON links retain applied filters and paging. Full metadata, themes and navigation
+are presentation changes; no additional Common conformance class is declared.
+Common sorting, hierarchies, `sd` and `resolution` remain unavailable and have no
+active UI controls. Features item sorting is a separate, engine-advertised contract.
+
+The workbench uses the approved design's grouped search controls and collection
+overview/metadata tabs. Coverage locators visualize existing advertised extents;
+they do not infer missing temporal bounds, grids or hierarchy relationships.
+
+The HTML workflow names Common discovery **Find collections** and API-specific
+data access **Request data**. Discovery filters select collections by metadata
+and coverage; they do not become data-query predicates.
+
+HTML catalog headings use the shared request bar for URL/cURL copy actions.
+
+Maps HTML collection overviews additionally preview actual data using the
+advertised map/style endpoints. This is API-specific data access; the page’s
+JSON representation remains collection metadata and Common discovery is unchanged.
+
+Map previews update images within a stable HTML layout; pan/zoom does not
+navigate or reload the collection document.
+
+Breadcrumbs prefer resource titles. Maps time navigation consumes Part 2 temporal
+grid metadata (regular resolution/count or explicit irregular coordinates); it
+does not infer sampling from an interval or claim new Part 4 conformance. Optional
+metadata remains visible in the metadata tab, including nested extensions,
+vertical coverage, keywords and license links. Storage CRS is not inferred.
+
+Collection advanced search starts collapsed and remembers its disclosure state
+per API path for the browser session, including after search submission. Applied
+filters remain visible while collapsed. Resource titles and their URLs form one
+clickable link; map endpoints retain their required-bbox hint. Country boundaries
+render above map imagery with a contrasting halo, including after pan/zoom.
+
+Catalog presentation now has compact request/search disclosures, persistent
+list/cards choice, and truthful empty-page recovery without changing JSON paging.
+Summaries use advertised extents/parameters/styles; temporal sampling is shown
+only when explicitly supplied. No new discovery controls or conformance claims.

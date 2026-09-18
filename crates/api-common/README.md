@@ -1,7 +1,8 @@
 # Shared OGC API Common HTTP layer
 
 EDR, Maps, Tiles and Features use this crate for collection discovery. Pure search
-and HTML/extent types remain in `ds-core`; this crate owns Axum/JSON plumbing.
+and extent policy remain in `ds-core`; this crate owns Axum/JSON plumbing and
+the shared HTML workbench.
 API adapters keep their engine registries, access links, extent representations
 and API-specific fields.
 
@@ -93,3 +94,86 @@ Cross-API contracts live in
 cargo test -p server --test common_discovery
 cargo test -p ds-core -p api-edr -p api-features -p api-maps -p api-tiles
 ```
+
+## HTML API workbench
+
+`workbench` renders the shared server/API landing pages, conformance, collection
+lists and full collection metadata for EDR, Maps, Tiles and Features. EDR model
+runs and Features item pages use the same shell. The JSON link and copyable URL /
+cURL always represent the current resource with its applied filters and paging;
+unsubmitted edits appear separately in the request preview.
+
+The collection builder derives its fields from `CollectionParameter::ALL`.
+Search and paging use ordinary GET requests. Optional advanced controls omit
+empty values; literal `+` operators are form-encoded. Unsupported Common sorting,
+`sd`, `resolution` and hierarchy controls are not shown. Adding them requires the
+shared validator, metadata and OpenAPI contract to support them first.
+
+Light/dark/system themes persist in the browser. Body text and controls are
+16px; supporting text and code are at least 14px. Navigation, metadata, JSON links
+and paging work without JavaScript; basic collection text search also works.
+JavaScript enables optional query fields, clipboard buttons, view switching,
+property search and return links to the last filtered list. API validation errors
+retain the existing structured JSON error response.
+
+No engine queries run from the renderer. Metadata comes from the existing JSON
+builders. The workbench does not add HTML representations to map images, tiles,
+EDR data-query responses, or the WMS/3D Tiles viewers.
+
+The HTML structure and theme styles follow the approved #744 mockup: API workspace
+selector and branded sidebar, grouped collection query controls, removable applied
+filters, metadata-rich result rows and cards, and collection overview/metadata tabs.
+Overview maps show the advertised extent over bundled Natural Earth outlines; the
+asset is served locally by the existing preview asset handler. The map and item
+quick-look implementation are shared with Features. No preview-only snapshot,
+future-control or loading-state demonstrations are exposed in the live UI.
+
+The former page builders in `ds_core::html` have been removed. That module retains
+content negotiation, escaping and view types; `workbench` owns page rendering.
+
+The overview separates collection discovery (Find collections) from data access
+(Request data after selection). Catalog filters search metadata/coverage; they
+are not forwarded as filters on data. The overview has one discovery action.
+
+URL and cURL copy controls live in the shared request bar; catalog headings do
+not duplicate them.
+
+Maps collection overviews render the advertised map endpoint over the locator.
+The browser requests the visible CRS84 bbox as a Web Mercator PNG (at most
+1024 × 768), with advertised style links and an optional datetime instant. Pan/zoom
+requests are debounced and superseded fetches are cancelled. Loading/errors are
+explicit; failed requests hide the previous image. The rendered-image URL is
+separate from the collection metadata JSON link. No rendering occurs while
+assembling metadata on the server.
+
+Map refreshes retain the displayed image until its replacement has loaded in
+MapLibre, then swap the layers. Status, image-link and request-URL areas keep
+fixed dimensions to avoid shifting content during pan/zoom. Map controls use
+equal-height fields and an aligned action button, stacking on narrow screens.
+
+Breadcrumb labels use available collection/item titles while preserving resource
+IDs in URLs, including parent collections on item and model-run pages. Maps time
+controls expand an advertised regular grid (`cellsCount` + ISO duration) or use
+its explicit irregular coordinates, with previous/next available-time buttons.
+An interval alone does not imply sample availability; absent/oversized grids use
+a native UTC date/time input (expansion is bounded at 10,000 choices). Advertised
+style legends load with the displayed image; unchanged legends stay visible on
+pan/zoom. Full nested metadata and license links remain in Metadata & links,
+with configured licenses and searchable keywords also in the overview. Missing
+storage CRS is labelled "Not advertised", never guessed from the coverage CRS.
+
+Collection advanced search starts collapsed and remembers its disclosure state
+per API path for the browser session, including after search submission. Applied
+filters remain visible while collapsed. Resource titles and their URLs form one
+clickable link; map endpoints retain their required-bbox hint. Country boundaries
+render above map imagery with a contrasting halo, including after pan/zoom.
+
+Catalogs use a full-width search panel and result summaries. The applied request
+and draft search URL are separate disclosures; the draft opens on the first edit.
+The JSON switch always retains the applied query. List/cards preference persists
+per API path in the browser session. Empty pages beyond the match count explain
+the offset and link to the first page with all filters retained; they do not claim
+that no collections match. Unaligned offsets show a range rather than a misleading
+page number. Summaries retain UTC clock precision (including seconds), show known
+bounds and parameter/style names, and display sampling resolution only when
+advertised. No extra engine queries or inferred sample cadence are introduced.

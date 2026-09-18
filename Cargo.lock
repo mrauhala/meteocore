@@ -137,6 +137,7 @@ dependencies = [
  "axum",
  "chrono",
  "ds-core",
+ "form_urlencoded",
  "serde_json",
 ]
 
@@ -4633,6 +4634,7 @@ name = "server"
 version = "0.9.0"
 dependencies = [
  "api-3dtiles",
+ "api-common",
  "api-edr",
  "api-features",
  "api-maps",

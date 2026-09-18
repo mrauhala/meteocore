@@ -338,7 +338,14 @@ pub async fn landing_page(
                 "alternate",
                 Some("This document as JSON"),
             ));
-            Html(ds_core::html::landing_html(title, description, &views)).into_response()
+            Html(api_common::workbench::landing_html(
+                base,
+                "maps",
+                title,
+                description,
+                &views,
+            ))
+            .into_response()
         }
     }))
 }
@@ -785,7 +792,10 @@ pub async fn conformance(
                     Some("This document as JSON"),
                 ),
             ];
-            Html(ds_core::html::conformance_html(&classes, &nav)).into_response()
+            Html(api_common::workbench::conformance_html(
+                base, "maps", &classes, &nav,
+            ))
+            .into_response()
         }
     }))
 }
@@ -830,7 +840,7 @@ pub async fn collection(
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
-    use ds_core::html::{LinkView, Wanted};
+    use ds_core::html::Wanted;
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, &id)?;
@@ -842,23 +852,19 @@ pub async fn collection(
             Json(build_collection_metadata(config, &info, styles, base)).into_response()
         }
         Wanted::Html => {
-            let card = api_common::collection_card(
+            let metadata = build_collection_metadata(
                 config,
-                format!("{base}/maps/collections/{}", config.id),
+                &engine.raster_info(),
+                state.styles.get(&id),
+                base,
             );
-            let links = [
-                LinkView::new(
-                    format!("{base}/maps/collections/{}?f=json", config.id),
-                    "alternate",
-                    Some("JSON"),
-                ),
-                LinkView::new(
-                    format!("{base}/maps/collections"),
-                    "collection",
-                    Some("All collections"),
-                ),
-            ];
-            Html(ds_core::html::collection_html(&card, &links)).into_response()
+            Html(api_common::workbench::collection_html(
+                base,
+                "maps",
+                &metadata,
+                config.license.as_ref(),
+            ))
+            .into_response()
         }
     }))
 }

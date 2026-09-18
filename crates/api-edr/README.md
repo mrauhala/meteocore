@@ -182,3 +182,29 @@ fields through 64 bits. Unsupported operators or unknown national descriptors
 skip the affected message (counted in `bufr_decode_failures_total`); other
 messages in the same file remain available. See
 [`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).
+
+### HTML workbench
+
+Landing, conformance, collections, collection and model-run metadata use the
+shared `api-common::workbench` shell with light/dark/system themes and a persistent
+JSON switch. The collection builder exposes Common text/spatial/temporal search
+and paging. Collection and instance detail pages retain the complete EDR metadata,
+including parameter descriptions, extents and available query links. Overview and
+metadata tabs separate coverage from the full metadata table; a local geographic
+backdrop locates the advertised extent. Data-query
+payloads keep their existing representations. See the
+[shared HTML behavior](../api-common/README.md#html-api-workbench).
+
+The HTML overview distinguishes finding a collection from requesting its data.
+Collection pages list advertised EDR operations and link to the API reference
+for required data-query inputs; collection search is not an EDR data builder.
+
+HTML breadcrumbs use collection titles, including parent collection links on
+model-run lists and individual run metadata pages. IDs remain unchanged in URLs.
+
+Collection advanced search starts closed and retains the user's open/closed
+choice across searches in the browser session. Resource URLs are clickable.
+
+The compact HTML catalog summarizes advertised parameter names and UTC coverage.
+It retains time precision and distinguishes an out-of-range page from no matches.
+List/cards preference survives searches; JSON continues to reflect applied filters.

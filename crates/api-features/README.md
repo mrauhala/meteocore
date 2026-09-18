@@ -215,3 +215,37 @@ fields through 64 bits. Unsupported operators or unknown national descriptors
 skip the affected message (counted in `bufr_decode_failures_total`); other
 messages in the same file remain available. See
 [`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).
+
+### HTML workbench
+
+Metadata and items share the `api-common::workbench` navigation, themes and
+current-resource JSON switch. The item query builder offers bbox/paging plus
+temporal, exact property and sort controls advertised by the selected engine.
+Repeated predicates and intentional empty predicates from an existing URL are
+preserved. Collection search uses Common `q`/`query`; item queries keep their
+existing Features semantics.
+
+Individual items show all typed properties (including false, zero, null, arrays
+and nested objects). Item details include available reflectivity/area/speed metrics
+and source quality flags. The MapLibre locator renders this response page over a
+locally bundled Natural Earth backdrop, with an overlapping-feature picker and
+quick-look panel. It fits the actual geometry, follows the theme, and retains
+coordinate details when WebGL is unavailable. It makes no additional feature or
+external tile requests. Alert expiry is labelled in the browser; server HTML and ETags remain
+deterministic. JavaScript enables item-query editing, map interaction and property
+search; paging and resource links remain usable without it.
+
+In HTML, the collection’s **Request data** tab opens the `/items` data request
+builder. **Request features** applies filters within that collection; collection
+discovery remains under **Collections → Find collections**.
+
+HTML breadcrumbs display collection and item titles when available; resource
+URLs continue to use the original IDs. Parent titles are passed from the existing
+collection snapshot, without additional data queries.
+
+Collection advanced search starts closed and retains the user's open/closed
+choice across searches in the browser session. Resource URLs are clickable.
+
+HTML catalogs now use compact search and metadata summaries, retain UTC time
+precision, and distinguish empty offsets from zero matching collections. Returning
+to the first page preserves discovery filters; list/cards preference persists.

@@ -3,6 +3,11 @@ title = "NOAA GFS Global Forecast"
 description = "GFS deterministic forecast (0.25 deg) from NOAA Open Data on AWS"
 engine_type = "grib"
 apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "GFS", "NOAA", "global", "temperature", "pressure", "wind"]
+
+[license]
+title = "NOAA / NWS public domain data"
+url = "https://www.weather.gov/disclaimer"
 
 [grib]
 endpoint = "https://s3.us-east-1.amazonaws.com"
@@ -22,12 +27,35 @@ max_runs = 1
 run_hours = [0, 6, 12, 18]
 # Most common near-surface fields. A single GFS 0.25 deg file contains ~700
 # messages; the parameters filter is strongly recommended for wgrib2 indexes.
-# Note: APCP (total precipitation) is unavailable in v1 because GFS only
-# ships it as an accumulated aggregate; use PRATE instead.
 parameters = ["TMP", "DPT", "PRMSL", "UGRD", "VGRD", "GUST", "TCDC", "PRATE"]
 
+# The first near-surface field in this product is PRMSL. Match its hPa
+# display units for requests without a parameter or named style.
 [wms]
+colormap = "pressure"
+min = 950.0
+max = 1050.0
+
+# Named styles expose explicit fields through Maps collection discovery.
+[[wms.styles]]
+name = "temperature"
+title = "Temperature · default level"
+parameter = "TMP"
 colormap = "temperature"
+
+[[wms.styles]]
+name = "pressure"
+title = "Mean sea level pressure · hPa"
+parameter = "PRMSL"
+colormap = "pressure"
+min = 950.0
+max = 1050.0
+
+[[wms.styles]]
+name = "wind-gust"
+title = "Wind gust · m/s"
+parameter = "GUST"
+colormap = "wind_speed"
 
 [[wms.parameters]]
 name = "TMP"
@@ -39,7 +67,7 @@ colormap = "temperature"
 
 [[wms.parameters]]
 name = "PRMSL"
-colormap = "viridis"
+colormap = "pressure"
 min = 950.0
 max = 1050.0
 

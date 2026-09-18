@@ -1,5 +1,7 @@
-//! Shared OGC API Common HTTP plumbing. Pure search/extent/HTML policy stays
-//! in ds-core; API adapters supply their collection metadata and engine facets.
+//! Shared OGC API Common HTTP plumbing and HTML representations. Pure search
+//! and extent policy stays in ds-core; adapters supply metadata and engine facets.
+
+pub mod workbench;
 
 use axum::extract::{FromRequestParts, Query};
 use axum::http::{header, request::Parts, HeaderValue, StatusCode};
@@ -11,7 +13,7 @@ use ds_core::collection_search::{
     MAX_LIMIT,
 };
 use ds_core::config::CollectionConfig;
-use ds_core::html::{self, CollectionCard, LinkView, Wanted};
+use ds_core::html::{self, LinkView, Wanted};
 use serde_json::{json, Value};
 
 /// Existing Common declarations, centralized to keep all API surfaces aligned.
@@ -167,34 +169,29 @@ pub fn collections_response(
             .into_response()
         }
         Wanted::Html => {
-            let cards: Vec<_> = result
+            let metadata: Vec<_> = result
                 .page
                 .iter()
-                .map(|&i| {
-                    collection_card(
-                        entries[i].config,
-                        format!("{url}/{}?f=html", entries[i].config.id),
-                    )
+                .map(|&i| workbench::CollectionView {
+                    metadata: &entries[i].metadata,
+                    license: entries[i].config.license.as_ref(),
                 })
                 .collect();
-            Html(html::collections_html("Collections", &cards, &nav)).into_response()
+            Html(workbench::collections_html(
+                url,
+                &request.query,
+                &request.search,
+                result.number_matched,
+                &metadata,
+                &nav,
+            ))
+            .into_response()
         }
     };
     response
         .headers_mut()
         .append(header::VARY, HeaderValue::from_static("accept"));
     response
-}
-
-pub fn collection_card(config: &CollectionConfig, self_href: String) -> CollectionCard {
-    CollectionCard {
-        id: config.id.clone(),
-        title: config.title.clone(),
-        description: config.description.clone(),
-        self_href,
-        keywords: config.keywords.clone(),
-        license: config.license.as_ref().map(|l| l.card_label()),
-    }
 }
 
 /// Assemble shared collection fields and representation/license links. Explicit

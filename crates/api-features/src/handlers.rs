@@ -185,7 +185,14 @@ pub async fn landing_page(
                 "alternate",
                 Some("This document as JSON"),
             ));
-            Html(ds_core::html::landing_html(title, description, &views)).into_response()
+            Html(api_common::workbench::landing_html(
+                base,
+                "features",
+                title,
+                description,
+                &views,
+            ))
+            .into_response()
         }
     }))
 }
@@ -216,7 +223,10 @@ pub async fn conformance(
                     Some("This document as JSON"),
                 ),
             ];
-            Html(ds_core::html::conformance_html(&classes, &nav)).into_response()
+            Html(api_common::workbench::conformance_html(
+                base, "features", &classes, &nav,
+            ))
+            .into_response()
         }
     }))
 }
@@ -561,7 +571,7 @@ pub async fn collection(
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
-    use ds_core::html::{LinkView, Wanted};
+    use ds_core::html::Wanted;
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
@@ -571,30 +581,33 @@ pub async fn collection(
             Json(build_collection_metadata(engine.as_ref(), config, base)).into_response()
         }
         Wanted::Html => {
-            let card = api_common::collection_card(
-                config,
-                format!("{base}/features/collections/{}", config.id),
-            );
-            let links = [
-                LinkView::new(
-                    format!("{base}/features/collections/{}/items?f=html", config.id),
-                    "items",
-                    Some("Browse features"),
-                ),
-                LinkView::new(
-                    format!("{base}/features/collections/{}?f=json", config.id),
-                    "alternate",
-                    Some("JSON"),
-                ),
-                LinkView::new(
-                    format!("{base}/features/collections"),
-                    "collection",
-                    Some("All collections"),
-                ),
-            ];
-            Html(ds_core::html::collection_html(&card, &links)).into_response()
+            let metadata = build_collection_metadata(engine.as_ref(), config, base);
+            Html(api_common::workbench::collection_html(
+                base,
+                "features",
+                &metadata,
+                config.license.as_ref(),
+            ))
+            .into_response()
         }
     }))
+}
+
+fn html_controls(engine: &dyn FeatureEngine) -> crate::html::FeatureControls {
+    crate::html::FeatureControls {
+        filterables: engine
+            .filterables()
+            .iter()
+            .filter(|name| !crate::params::is_reserved_parameter(name))
+            .cloned()
+            .collect(),
+        sortables: engine
+            .sortables()
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+        temporal: engine.temporal_extent().is_some(),
+    }
 }
 
 pub async fn items(
@@ -714,9 +727,13 @@ pub async fn items(
         ds_core::html::Wanted::Json => {
             serde_json::to_string(doc).expect("GeoJSON Value serializes")
         }
-        ds_core::html::Wanted::Html => {
-            crate::html::features_html(doc, &config.title, &id, &request_base_url(&state, &headers))
-        }
+        ds_core::html::Wanted::Html => crate::html::features_html(
+            doc,
+            &config.title,
+            &id,
+            &request_base_url(&state, &headers),
+            &html_controls(engine.as_ref()),
+        ),
     };
     // Hash the selected representation with the volatile timestamp blanked.
     let etag = ds_core::http_cache::etag_of(render(&doc).as_bytes());
@@ -762,9 +779,14 @@ pub async fn item(
     crate::html::representation_links(&mut doc, wanted);
     Ok(with_vary(match wanted {
         ds_core::html::Wanted::Json => GeoJsonResponse(doc).into_response(),
-        ds_core::html::Wanted::Html => {
-            Html(crate::html::features_html(&doc, &config.title, &id, &base)).into_response()
-        }
+        ds_core::html::Wanted::Html => Html(crate::html::features_html(
+            &doc,
+            &config.title,
+            &id,
+            &base,
+            &html_controls(engine.as_ref()),
+        ))
+        .into_response(),
     }))
 }
 

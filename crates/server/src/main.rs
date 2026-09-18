@@ -780,9 +780,14 @@ async fn main() {
     let mut public = Router::new()
         .route(
             "/",
-            get(move |headers: axum::http::HeaderMap| {
-                root_landing_page(root_state.clone(), headers)
-            }),
+            get(
+                move |axum::extract::Query(format): axum::extract::Query<
+                    ds_core::html::FormatParams,
+                >,
+                      headers: axum::http::HeaderMap| {
+                    root_landing_page(root_state.clone(), format, headers)
+                },
+            ),
         )
         .nest("/edr", api_edr::router(edr_swap.clone()))
         .nest("/features", api_features::router(features_swap.clone()))
@@ -969,14 +974,33 @@ async fn shutdown_signal() {
     }
 }
 
-async fn root_landing_page(state: AdminState, headers: axum::http::HeaderMap) -> impl IntoResponse {
+async fn root_landing_page(
+    state: AdminState,
+    format: ds_core::html::FormatParams,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let wanted = match ds_core::html::negotiate(
+        format.f.as_deref(),
+        headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        Ok(wanted) => wanted,
+        Err(error) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"code":"BadRequest", "description":error.to_string()})),
+            )
+                .into_response()
+        }
+    };
     let edr_state = state.edr.load_full();
     let base = &ds_core::proxy::resolve_base_url(
         &edr_state.base_url,
         edr_state.trust_proxy_headers,
         |name| headers.get(name).and_then(|v| v.to_str().ok()),
     );
-    Json(json!({
+    let document = json!({
         "title": "MeteoCore",
         "description": "Metocean Data Server implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0",
         "links": [
@@ -1083,7 +1107,25 @@ async fn root_landing_page(state: AdminState, headers: axum::http::HeaderMap) ->
                 "title": "Prometheus metrics"
             }
         ]
-    }))
+    });
+    let mut response = match wanted {
+        ds_core::html::Wanted::Json => Json(document).into_response(),
+        ds_core::html::Wanted::Html => {
+            axum::response::Html(api_common::workbench::landing_document(
+                base,
+                "",
+                "MeteoCore API",
+                document["description"].as_str().unwrap_or_default(),
+                &document,
+            ))
+            .into_response()
+        }
+    };
+    response.headers_mut().append(
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("accept"),
+    );
+    response
 }
 
 #[cfg(test)]

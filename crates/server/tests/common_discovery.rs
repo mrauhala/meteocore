@@ -525,3 +525,45 @@ async fn openapi_and_conformance_are_consistent_across_surfaces() {
         assert_eq!(empty["numberReturned"], 0);
     }
 }
+
+#[tokio::test]
+async fn workbench_exposes_supported_queries_and_same_resource_json_on_every_surface() {
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let (status, _, html) = get(
+            &app,
+            &format!("{prefix}/collections?{FILTERS}&limit=1&offset=1&f=html"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for control in ["q", "query", "bbox", "datetime", "limit", "offset"] {
+            assert!(
+                html.contains(&format!("name=\"{control}\""))
+                    || html.contains(&format!("data-param=\"{control}\"")),
+                "{surface}: {control}"
+            );
+        }
+        for unsupported in ["sortby", "sd", "resolution", "parent", "depth"] {
+            assert!(!html.contains(&format!("name=\"{unsupported}\"")));
+            assert!(!html.contains(&format!("data-param=\"{unsupported}\"")));
+        }
+        let target = html
+            .split("id=\"json-link\" href=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .replace("&amp;", "&");
+        let doc = get_json(&app, &target).await;
+        assert_eq!(doc["collections"][0]["id"], "d-match");
+        assert_eq!(doc["numberMatched"], 3);
+        assert!(target.starts_with(BASE));
+        assert!(html.contains("id=\"theme\""));
+        let (_, _, detail) = get(&app, &format!("{prefix}/collections/d-match?f=html"), None).await;
+        assert!(detail.contains("Coverage &amp; metadata"));
+        assert!(detail.contains("2024-01-01"));
+        assert!(detail.contains("Back to collections"));
+    }
+}
