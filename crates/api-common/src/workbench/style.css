@@ -2572,7 +2572,19 @@ a {
 
 .properties tbody th{border-bottom:1px solid var(--line)}.item-query .equal-fields label{margin-bottom:0}
 
-.js .map-controls.enhanced{display:flex!important}.map-controls{padding:20px;gap:16px;align-items:end;flex-wrap:wrap}.map-controls label{flex:1;min-width:180px}.map-controls select,.map-controls input{display:block;width:100%;margin-top:6px}.map-controls p{flex-basis:100%;font-size:14px;color:var(--muted);margin:0}.map-request code{display:block;margin-top:12px;overflow-wrap:anywhere;font-size:14px}
+.map-request code{display:block;margin-top:12px;font-size:14px}
 
 #feature-map[aria-label="Collection map data"]{height:480px}@media(max-width:800px){#feature-map[aria-label="Collection map data"]{height:380px}}
-.detail-layout>div,.detail-layout>aside{min-width:0}.map-controls label{max-width:100%}
+.detail-layout>div,.detail-layout>aside{min-width:0}
+
+/* Keep map refreshes inside a stable panel: no page reflow during pan/zoom. */
+#feature-map[aria-label="Collection map data"]+#map-status{height:6em;overflow:auto;margin:0}
+.map-request code{height:4.5em;line-height:1.5;overflow:auto;overflow-wrap:anywhere}
+#map-image-link[aria-disabled="true"]{cursor:default;color:var(--muted)}
+.map-controls{padding:20px}
+.js .map-controls.enhanced{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) auto;align-items:end;gap:16px}
+.map-controls label{display:flex;flex-direction:column;gap:8px;min-width:0;max-width:none;margin:0;line-height:24px}
+.map-controls select,.map-controls input{display:block;width:100%;box-sizing:border-box;height:46px;min-height:46px;margin:0;font-size:16px;line-height:24px}
+.map-controls>.btn{box-sizing:border-box;height:46px;min-height:46px;margin:0;white-space:nowrap}
+.map-controls>p{grid-column:1/-1;font-size:14px;color:var(--muted);margin:0}
+@media(max-width:1000px){.js .map-controls.enhanced{grid-template-columns:minmax(0,1fr)}.map-controls>.btn{justify-self:start}}

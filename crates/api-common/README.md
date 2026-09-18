@@ -145,3 +145,8 @@ requests are debounced and superseded fetches are cancelled. Loading/errors are
 explicit; failed requests hide the previous image. The rendered-image URL is
 separate from the collection metadata JSON link. No rendering occurs while
 assembling metadata on the server.
+
+Map refreshes retain the displayed image until its replacement has loaded in
+MapLibre, then swap the layers. Status, image-link and request-URL areas keep
+fixed dimensions to avoid shifting content during pan/zoom. Map controls use
+equal-height fields and an aligned action button, stacking on narrow screens.

@@ -311,3 +311,6 @@ HTML catalog headings use the shared request bar for URL/cURL copy actions.
 Maps HTML collection overviews additionally preview actual data using the
 advertised map/style endpoints. This is API-specific data access; the page’s
 JSON representation remains collection metadata and Common discovery is unchanged.
+
+Map previews update images within a stable HTML layout; pan/zoom does not
+navigate or reload the collection document.

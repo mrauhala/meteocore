@@ -54,16 +54,25 @@
       const time = document.getElementById('map-time');
       const link = document.getElementById('map-image-link');
       const requestText = document.getElementById('map-image-request');
-      const canvas = document.createElement('canvas');
-      let pending, generation = 0, timer;
+      let pending, generation = 0, timer, activeId, staged;
+      function discardStaged() {
+        if (!staged) return;
+        map.off('render',staged.onRender);
+        if (map.getLayer(staged.id)) map.removeLayer(staged.id);
+        if (map.getSource(staged.id)) map.removeSource(staged.id);
+        staged = undefined;
+      }
+      function disableImageLink() {
+        link.removeAttribute('href'); link.setAttribute('aria-disabled','true');
+      }
       async function render() {
         if (!element.clientWidth || !element.clientHeight) return;
         const current = ++generation;
+        discardStaged();
         pending?.abort(); pending = new AbortController();
         const controller = pending;
         const timeout = setTimeout(() => controller.abort(), 15000);
-        link.hidden = true;
-        if (map.getLayer('map-data')) map.setLayoutProperty('map-data','visibility','none');
+        let requestedUrl;
         try {
           const selectedStyle = style.selectedOptions[0].textContent;
           const selectedTime = time.value.trim();
@@ -83,33 +92,47 @@
           url.searchParams.set('width',width); url.searchParams.set('height',height);
           url.searchParams.set('f','image/png'); url.searchParams.set('transparent','true');
           if (selectedTime) url.searchParams.set('datetime',selectedTime); else url.searchParams.delete('datetime');
-          requestText.textContent = url.href;
-          status.textContent = 'Loading map data…';
+          requestedUrl = url.href;
+          if (!activeId) requestText.textContent = requestedUrl;
+          status.textContent = activeId ? 'Updating map data… Showing the previous image until ready.' : 'Loading map data…';
           const response = await fetch(url,{signal:controller.signal});
           if (!response.ok) throw new Error(`Map request failed (HTTP ${response.status}). Adjust the time or retry.`);
           if (!response.headers.get('content-type')?.startsWith('image/')) throw new Error('Map endpoint did not return an image.');
           const bitmap = await createImageBitmap(await response.blob());
           if (current !== generation || controller.signal.aborted) { bitmap.close(); return; }
+          const canvas = document.createElement('canvas');
           canvas.width = bitmap.width; canvas.height = bitmap.height;
           canvas.getContext('2d').drawImage(bitmap,0,0); bitmap.close();
           const coordinates = [[west,north],[east,north],[east,south],[west,south]];
-          // Replace the static canvas source so every response uploads fresh
-          // pixels, including same-size images after time/style changes.
-          if (map.getLayer('map-data')) map.removeLayer('map-data');
-          if (map.getSource('map-data')) map.removeSource('map-data');
-          map.addSource('map-data',{type:'canvas',canvas,coordinates,animate:false});
-          map.addLayer({id:'map-data',type:'raster',source:'map-data',paint:{'raster-opacity':0.85,'raster-fade-duration':0}},'outlines');
-          map.triggerRepaint();
-          link.href = url.href; link.hidden = false;
-          status.textContent = `Map data loaded · ${selectedStyle} · ${selectedTime || 'collection default time'}`;
+          // Stage the replacement invisibly. Keep the displayed image and
+          // request link until MapLibre has uploaded the new source's pixels.
+          const nextId = activeId === 'map-data-0' ? 'map-data-1' : 'map-data-0';
+          const onRender = () => {
+            if (current !== generation || !map.isSourceLoaded(nextId)) return;
+            map.off('render',onRender);
+            map.setPaintProperty(nextId,'raster-opacity',0.85);
+            if (activeId) { map.removeLayer(activeId); map.removeSource(activeId); }
+            activeId = nextId; staged = undefined;
+            link.href = requestedUrl; link.removeAttribute('aria-disabled');
+            requestText.textContent = requestedUrl;
+            status.textContent = `Map data loaded · ${selectedStyle} · ${selectedTime || 'collection default time'}`;
+          };
+          staged = {id:nextId,onRender};
+          map.addSource(nextId,{type:'canvas',canvas,coordinates,animate:false});
+          map.addLayer({id:nextId,type:'raster',source:nextId,paint:{'raster-opacity':0,'raster-fade-duration':0}},'outlines');
+          map.on('render',onRender); map.triggerRepaint();
         } catch (error) {
           if (current !== generation) return;
+          discardStaged();
+          if (activeId) { map.removeLayer(activeId); map.removeSource(activeId); activeId = undefined; }
+          disableImageLink();
+          if (requestedUrl) requestText.textContent = requestedUrl;
           status.textContent = error.name === 'AbortError' ? 'Map request timed out. Use Update map to retry.' : (error.message || 'Map data unavailable. Use Update map to retry.');
         } finally { clearTimeout(timeout); }
       }
       function schedule() {
         // Invalidate immediately so an old response cannot replace a new view.
-        ++generation; pending?.abort(); clearTimeout(timer);
+        ++generation; pending?.abort(); discardStaged(); clearTimeout(timer);
         timer = setTimeout(render,300);
       }
       form.addEventListener('submit',event => { event.preventDefault(); clearTimeout(timer); render(); });

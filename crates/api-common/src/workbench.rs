@@ -415,7 +415,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
         "Feature geometry map"
     };
     let request_link = if raster.is_some() {
-        "<div class=\"map-request panel-body enhanced\"><a id=\"map-image-link\" class=\"btn small\" hidden>Open rendered image ↗</a><code id=\"map-image-request\"></code></div>"
+        "<div class=\"map-request panel-body enhanced\"><a id=\"map-image-link\" class=\"btn small\" aria-disabled=\"true\">Open rendered image ↗</a><code id=\"map-image-request\"></code></div>"
     } else {
         ""
     };

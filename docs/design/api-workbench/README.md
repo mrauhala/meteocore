@@ -102,3 +102,12 @@ Validated the local GeoTIFF radar fixture: zoom changes the bbox/image request;
 style changes replace the pixels; explicit time is retained in the image URL;
 invalid time returns a visible HTTP 400 message and hides stale imagery. Recovery,
 light/dark themes and 390px layouts were checked in Chrome.
+
+Map refreshes keep the current image visible until the replacement source is
+ready, then swap it. The status, image link and URL occupy stable space so the
+page below the map does not jump. Style/time fields and the update button have
+equal heights and align at the bottom; narrow screens stack the controls.
+
+Browser regression check: desktop and 390px page height and coverage-section
+position stayed identical before, during and after map refresh. All three map
+controls measure 46px high; desktop controls share the same bottom edge.
