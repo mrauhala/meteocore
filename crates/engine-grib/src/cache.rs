@@ -60,6 +60,15 @@ pub struct DecodedGrid {
     pub first_surface_value: Option<f64>,
 }
 
+/// Native grid selection without allocating its values. Area queries validate
+/// the combined output/mask budget before extracting any field's subset.
+pub(crate) struct GridSubset {
+    pub x: Vec<f64>,
+    pub y: Vec<f64>,
+    cols: Vec<usize>,
+    rows: std::ops::Range<usize>,
+}
+
 impl DecodedGrid {
     /// Memory size estimate in bytes.
     fn size_bytes(&self) -> usize {
@@ -200,6 +209,12 @@ impl DecodedGrid {
     /// Returns (x_coords, y_coords, values) for a Grid domain.
     #[allow(clippy::type_complexity)]
     pub fn extract_bbox(&self, bbox: [f64; 4]) -> Option<(Vec<f64>, Vec<f64>, Vec<Option<f64>>)> {
+        let subset = self.bbox_subset(bbox)?;
+        let values = self.subset_values(&subset);
+        Some((subset.x, subset.y, values))
+    }
+
+    pub(crate) fn bbox_subset(&self, bbox: [f64; 4]) -> Option<GridSubset> {
         let [west, south, east, north] = bbox;
         if self.ni == 0 || self.nj == 0 || self.lon_inc <= 0.0 || self.lat_inc == 0.0 {
             return None;
@@ -302,20 +317,29 @@ impl DecodedGrid {
             y_coords.reverse();
         }
 
-        let mut values = Vec::with_capacity(cols.len() * ny);
+        Some(GridSubset {
+            x: x_coords,
+            y: y_coords,
+            cols,
+            rows: row_start..row_end,
+        })
+    }
+
+    pub(crate) fn subset_values(&self, subset: &GridSubset) -> Vec<Option<f64>> {
+        let mut values = Vec::with_capacity(subset.cols.len() * subset.rows.len());
         // Output in y-ascending order (south to north)
         let row_iter: Box<dyn Iterator<Item = usize>> = if self.lat_inc < 0.0 {
-            Box::new((row_start..row_end).rev())
+            Box::new(subset.rows.clone().rev())
         } else {
-            Box::new(row_start..row_end)
+            Box::new(subset.rows.clone())
         };
         for r in row_iter {
-            for &c in &cols {
+            for &c in &subset.cols {
                 values.push(Some(f64::from(self.values[r * self.ni + c])));
             }
         }
 
-        Some((x_coords, y_coords, values))
+        values
     }
 
     /// Resample grid to output dimensions for map rendering.

@@ -1,4 +1,4 @@
-//! Instrumented store shared by index and metadata discovery tests.
+//! Instrumented store shared by discovery and query tests.
 
 use ds_storage::object_store::{self, memory::InMemory, path::Path, ObjectStore};
 use futures::stream::BoxStream;
@@ -24,6 +24,7 @@ pub struct TestStore {
     pub active: AtomicUsize,
     pub peak: AtomicUsize,
     pub delay: Duration,
+    pub delays: BTreeMap<String, Duration>,
     pub suffix: &'static str,
 }
 
@@ -35,6 +36,7 @@ impl Default for TestStore {
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             delay: Duration::ZERO,
+            delays: BTreeMap::new(),
             suffix: ".idx",
         }
     }
@@ -81,8 +83,13 @@ impl ObjectStore for TestStore {
         for _ in 0..if path.as_ref() == "f000.idx" { 10 } else { 1 } {
             tokio::task::yield_now().await;
         }
-        if !self.delay.is_zero() {
-            tokio::time::sleep(self.delay).await;
+        let delay = self
+            .delays
+            .get(path.as_ref())
+            .copied()
+            .unwrap_or(self.delay);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         let result = if fail {
             Err(object_store::Error::Generic {

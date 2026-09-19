@@ -193,3 +193,22 @@ rendering share `StepFile::default_message` so default labels/units agree.
   `--ignored --nocapture` to compare serial and batched reads over 120 steps,
   with 150 ms simulated per-read latency and the grid cache disabled. It checks
   equal samples and prints timings/bytes; wall-clock times are not CI gates.
+
+## Area and radius queries
+
+- Reuse the first geometry field's values even when the decoded cache is
+  disabled. Select its axes without extracting values, check the combined
+  output and mask budgets, then sample and release the grid before loading
+  remaining fields.
+- Use `runtime::run_field_jobs`, shared with positions, for at most four
+  parameter/level jobs per admitted query. Keep deadline propagation, blocking
+  cache waits and drain-on-error behavior in that scheduler. Area read failures
+  are fatal; ordinary position field failures remain null samples.
+- Workers return small masked/converted subsets into fixed parameter/level
+  slots. Preserve requested level order and missing upper-air nulls regardless
+  of completion order. Validate grid axes before extracting each subset.
+- Radius delegates to the same area path via the default EDR trait method.
+- Run `cargo test -p engine-grib area::tests::area_latency_replay -- --ignored
+  --nocapture` for a 32-field replay with simulated 150 ms GET latency and no
+  decoded cache. It compares serial storage with four concurrent reads, checks
+  equal outputs/bytes and prints timings without CI timing thresholds.
