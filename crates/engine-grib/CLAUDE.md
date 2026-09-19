@@ -23,7 +23,7 @@ unlike GeoTIFF's one band per collection.
   as shipped by ECMWF open data) and `"wgrib2"` (colon-separated text as
   shipped by NOAA GFS).
 - Wgrib2 indexes carry only byte offsets — the last record's length is
-  resolved via `DataStore::head()` on fetch. A failed HEAD/read is not cached
+  resolved via `DataStore::head()` on a full-field fetch. A failed HEAD/read is not cached
   and remains retryable; scanning does not issue a HEAD per index.
 - Fetch new indexes through `DataStore::get_many` in chunks of at most eight.
   Bound the chunk as well as concurrency so raw sidecar bodies do not collect
@@ -33,11 +33,23 @@ unlike GeoTIFF's one band per collection.
   The ignored `scan_tests::index_scan_latency_replay` test compares one versus
   eight concurrent reads over 120 indexes with 150 ms simulated GET latency.
   Run with `--ignored --nocapture`; timings are measurements, not CI gates.
-- Parameter metadata populates lazily: `scan_once` runs a bounded
-  eager-probe (≤32 messages per scan) across the newest run's step
-  files. Pending probes continue even without new indexes, rotating past
+- Parameter metadata populates lazily: `scan_once` probes ≤32 messages per
+  scan, at most eight concurrently, across the newest run's step files.
+  Read headers with 4 KiB read-ahead, skip local-use/grid bodies, and cap each
+  fetched metadata section at 64 KiB. Use the GRIB indicator's length for tail
+  probes without HEAD. Never unpack values or fill the grid cache for discovery.
+  Header discovery validates metadata, not grid geometry or packed values;
+  a later query still validates/decodes the actual field. Unusually large or
+  invalid headers remain unprobed until a successful read or full-field query.
+  Pending probes continue even without new indexes, rotating past
   failures so later parameters are not starved. Time-window eviction also
   runs when discovery finds no new indexes.
+  Preserve cursor order when applying concurrent results; metadata fallback
+  representatives must not depend on completion order. Run on the dedicated
+  poll runtime (shared fallback for CLI), propagate per-probe deadlines, and
+  join all workers before returning. The ignored `metadata_probe_replay` test
+  compares the old full-decode probes with header probes using a real global
+  ECMWF field and simulated GET latency (`--ignored --nocapture`).
 
 ## Level collections
 
@@ -76,7 +88,7 @@ unlike GeoTIFF's one band per collection.
 ## Unit conversion (source-driven — never hardcode parameter names)
 
 - Conversions are driven by the WMO `(discipline, category,
-  parameter_number)` triple read from every decoded message, not by
+  parameter_number)` triple read from message headers, not by
   short-name tables. Source units come from WMO Code Table 4.2
   (`src/units.rs`) plus per-center overlays for local parameter numbers
   192–254.
@@ -105,7 +117,7 @@ probes and all query paths share these selectors. A missing canonical level
 is null in a position series and an error in a map/area request; never
 silently substitute an upper-air field. Metadata is cached by that full
 identity, so historical runs with different selected levels keep their labels.
-Pressure/model views may reuse metadata from a decoded level of the same
+Pressure/model views may reuse metadata from a probed or decoded level of the same
 parameter and level type until the exact level is decoded. Keep this fallback
 indexed alongside the exact cache under one lock; never scan all cached levels
 on the request path. Single-level and legacy views require exact metadata.

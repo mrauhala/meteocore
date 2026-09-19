@@ -91,31 +91,8 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
         )));
     }
 
-    // Extract the parameter triple from the Product Definition Section.
-    // `parameter_category`/`parameter_number` are `Option<u8>` (absent for
-    // some obscure templates); for anything we might render, both are set.
-    let prod_def = submessage.prod_def();
-    let category = prod_def.parameter_category().ok_or_else(|| {
-        DataServerError::Engine(format!(
-            "GRIB2 message for {param} missing parameter category"
-        ))
-    })?;
-    let number = prod_def.parameter_number().ok_or_else(|| {
-        DataServerError::Engine(format!(
-            "GRIB2 message for {param} missing parameter number"
-        ))
-    })?;
-
-    // First fixed surface (GRIB2 Code Table 4.5). Used to distinguish, e.g.,
-    // mean sea level pressure from surface pressure (both encode as WMO
-    // triple (0, 3, 0) "Pressure" but have different surface types).
-    let (first_surface_type, first_surface_value) = match prod_def.fixed_surfaces() {
-        Some((s1, _s2)) => {
-            let v = s1.value();
-            (s1.surface_type, if v.is_nan() { None } else { Some(v) })
-        }
-        None => (255, None),
-    };
+    let metadata =
+        crate::metadata::MessageMetadata::from_product(discipline, centre, submessage.prod_def())?;
 
     // Decode values using Grib2SubmessageDecoder
     let decoder = Grib2SubmessageDecoder::from(submessage).map_err(|e| {
@@ -170,10 +147,10 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
         lon_inc: layout.lon_inc,
         lat_inc: layout.lat_inc,
         values: Arc::new(values),
-        triple: (discipline, category, number),
-        centre,
-        first_surface_type,
-        first_surface_value,
+        triple: metadata.triple,
+        centre: metadata.centre,
+        first_surface_type: metadata.first_surface_type,
+        first_surface_value: metadata.first_surface_value,
     })
 }
 

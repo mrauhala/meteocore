@@ -193,10 +193,15 @@ Levels are exact discrete coordinates, not interpolated. Model levels are not
 converted to geometric heights. Soil-depth/isentropic axes and fractional index
 level values remain unsupported by this split.
 
-Pressure/model parameter labels and units can use a decoded level of the same
+Pressure/model parameter labels and units can use a probed or decoded level of the same
 parameter and level type while another level is unprobed; exact-level metadata
 takes precedence. These lookups use shared indexes rather than scanning every
 cached level, and do not fetch additional data.
+
+GRIB background metadata probes read message headers without unpacking values or
+filling the decoded-grid cache. Each scan probes at most 32 missing parameter
+identities, eight concurrently, usually with one 4 KiB range per message.
+Failed probes remain retryable; labels and units can also populate on a query.
 
 GRIB caches preserve the decoder's `f32` values without widening whole grids;
 sampling, coordinates, unit conversion and response values remain `f64`.

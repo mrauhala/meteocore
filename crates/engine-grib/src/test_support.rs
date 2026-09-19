@@ -1,5 +1,7 @@
 //! Small, independently encoded GRIB2 fixtures for engine regressions.
 
+pub mod store;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

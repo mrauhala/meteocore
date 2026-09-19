@@ -740,6 +740,11 @@ Decoded grids retain the decoder's `f32` values in the shared cache: a
 1440×721 field uses about 4 MiB for values. Interpolation, coordinates and unit
 conversion use `f64`; this storage choice does not reduce decoder precision.
 
+Parameter discovery reads GRIB headers without unpacking whole fields or filling
+the grid cache. It probes up to 32 missing parameters per scan, eight at a time;
+normal headers need one 4 KiB range. Larger headers use additional bounded reads.
+Full fields are fetched and decoded when queried.
+
 Pressure/model EDR queries accept `z` as one level, a list, or an interval.
 A single level produces a `PointSeries`; multiple levels produce one
 `VerticalProfile` per timestep. Area/radius queries include a `z` axis and default
