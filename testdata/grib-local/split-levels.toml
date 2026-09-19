@@ -1,0 +1,21 @@
+# Run from the repository root:
+# cargo run -p server -- --config testdata/grib-local/split-levels.toml
+# This committed fixture contains only q at 150 hPa, so only
+# forecast-pressure is registered. Other sources can produce all three.
+[server]
+host = "127.0.0.1"
+port = 8088
+
+[[collections]]
+id = "forecast"
+title = "GRIB level collections"
+description = "Separate single, pressure and model/hybrid level collections"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.grib]
+data_path = "testdata/grib-local"
+level_types = ["single", "pressure", "model"]
+
+[collections.wms]
+colormap = "viridis"

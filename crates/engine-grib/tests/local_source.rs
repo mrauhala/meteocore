@@ -13,6 +13,7 @@ use engine_grib::GribEngine;
 
 fn local_config() -> GribConfig {
     GribConfig {
+        level_types: None,
         data_path: Some("../../testdata/grib-local".to_string()),
         endpoint: None,
         bucket: None,

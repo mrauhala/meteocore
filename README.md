@@ -712,10 +712,50 @@ GRIB2 files from NWP models. The engine discovers data via index sidecar files, 
 
 **Multi-parameter collections:** Unlike GeoTIFF (one band per collection), a GRIB collection exposes all parameters from the data source. EDR queries select parameters via `parameter-name`. MapEngine uses per-parameter WMS layers.
 
-Each run selects a canonical level for each parameter name, preferring near-surface
-products. Metadata, EDR and Maps use the same level identity. A missing canonical
-level produces null in a position series and an error for Maps/area, rather than
-substituting an upper-air field. Explicit vertical selection is not yet supported.
+Set `level_types` to create separate collections from one source:
+
+```toml
+[collections.grib]
+data_path = "path/to/grib-and-index-files"
+level_types = ["single", "pressure", "model"]
+```
+
+For a configured ID `forecast`, this registers only the enabled families present
+in the indexed data (after the `parameters` filter):
+
+| Collection | Fields | Vertical axis |
+|---|---|---|
+| `forecast-single` | Surface and fixed-height products, including 2 m temperature, 10 m wind and precipitation | None |
+| `forecast-pressure` | Isobaric fields (`pl`) | Pressure in hPa |
+| `forecast-model` | Model/hybrid fields (`ml`) | Model level number, dimensionless |
+
+All three share one scan/poll loop, storage client and decoded-grid cache; the
+`grid_cache_mb` budget applies to the source. Separate files for the same run
+and forecast step are combined. Newly discovered families are registered by the
+background registration check (normally within 30 seconds after a successful
+poll), using the accepted configuration. The base ID is a source, not a fourth
+collection. Derived IDs must not collide with configured collection IDs.
+
+Pressure/model EDR queries accept `z` as one level, a list, or an interval.
+A single level produces a `PointSeries`; multiple levels produce one
+`VerticalProfile` per timestep. Area/radius queries include a `z` axis and default
+to all levels. Maps/Tiles select one level with `elevation` (WMS: `ELEVATION`), defaulting to
+the largest available pressure/model level in the selected run. Levels are
+selected exactly; unavailable levels are errors. Missing parameter/level pairs
+are null in EDR; Maps requires the requested field to exist. Model levels are
+ordinal coordinates, not converted to altitude or pressure.
+
+Omitting `level_types` preserves the existing collection ID and canonical-level
+view without a vertical axis. The single-level view also selects a canonical
+fixed level per short name when names repeat, preferring near-surface products;
+its labels retain qualifiers such as “2 m above ground”. Pressure/model parameter
+labels describe the field without fixing it to one level. Soil-depth and
+isentropic fields are outside these three families; index levels must be
+non-negative integers (e.g. fractional pressure levels are not supported).
+
+A runnable example using the committed pressure-level fixture is
+[`testdata/grib-local/split-levels.toml`](testdata/grib-local/split-levels.toml).
+
 Requested times use the newest run whose published valid-time extent contains
 the request, snapping to the nearest step within that extent. A pinned run never
 falls back to another run.
@@ -760,6 +800,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `poll_interval_secs` | no | `300` | Poll interval in seconds |
 | `max_runs` | no | none | Keep only the N most recent forecast runs |
 | `time_window` | no | none | ISO 8601 duration for valid time filtering |
+| `level_types` | no | omitted | Optional non-empty list of `"single"`, `"pressure"`, `"model"`; creates separate collections for enabled families present in the data. |
 | `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
 | `run_hours` | no | all | Model run hours to poll, e.g., `[0, 6, 12, 18]` |
@@ -1600,7 +1641,7 @@ Returns HTTP 503 only when all collections have failed.
 | `metatile_cache_capacity_bytes` | gauge | — | Configured capacity |
 | `metatile_cache_entries` | gauge | — | Number of cached entries |
 
-**GRIB grid cache** (per-collection, decoded grid cache):
+**GRIB grid cache** (per-source, shared by its level collections):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|

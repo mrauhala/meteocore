@@ -18,7 +18,7 @@ use chrono::{DateTime, TimeZone, Utc};
 const MAX_MESSAGE_LEN: u64 = 1 << 30; // 1 GiB
 
 /// Forecast statistic and its source window in hours after reference time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StepKind {
     /// Instantaneous forecast at `nominal_step` hours.
     Instant,

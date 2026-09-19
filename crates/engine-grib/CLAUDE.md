@@ -31,6 +31,33 @@ unlike GeoTIFF's one band per collection.
   failures so later parameters are not starved. Time-window eviction also
   runs when discovery finds no new indexes.
 
+## Level collections
+
+- Optional `level_types = ["single", "pressure", "model"]` expands a source
+  into present/enabled `{id}-single`, `{id}-pressure`, `{id}-model` views.
+  Omission retains the existing ID/canonical-level behavior.
+- `GribSource` owns the single poll loop, storage and cache. Collection views
+  share it; the server retains only the owner in `grib_engines`. Never spawn
+  one poll loop or allocate a grid cache per view.
+- Family catalogs, run-level lists and collection-level unions are built on
+  the scan path and published with the source catalog. Drop empty steps/runs
+  in each family: run selection and instances must reflect that family's data.
+- Single: `sfc`/`hag`, no vertical axis; pressure: `pl`, hPa; model: `ml`,
+  ordinal model/hybrid numbers. Soil/isentropic/fractional levels are excluded.
+- `StepFile` can combine several source files at one run/step. Always use
+  `StepFile::message_url(entry)` for reads; offsets are local to that origin.
+- Each catalog carries a nonzero render content version, hashed on the scan
+  path from its runs and message identities. Late files can change default
+  levels at an existing time: Maps/Tiles/WMS caches must follow that revision,
+  and explicit-time HTTP images must revalidate. No-op rebuilds and changes
+  confined to other families preserve a view's version.
+- Upper-air queries use exact levels, with no canonical-level fallback.
+  Missing parameter/level pairs are null in EDR and errors in Maps. Pressure/
+  model labels omit a fixed-level qualifier. The shared vertical descriptor
+  feeds both EDR and Maps; single-level fields retain their label qualifiers.
+- New families register through the server's background registration/recovery
+  loop using the accepted config. Config reserves all enabled derived IDs.
+
 ## Unit conversion (source-driven — never hardcode parameter names)
 
 - Conversions are driven by the WMO `(discipline, category,
@@ -58,11 +85,15 @@ An incomplete newest run does not hide a covering older run; explicit run
 pins do not fall back. No requested datetime still selects the latest run.
 
 Each run also has canonical `(parameter, level type, level)` selectors,
-rebuilt with `Catalog::refresh_parameters` before publication. Metadata
+rebuilt with `Catalog::refresh_metadata` before publication. Metadata
 probes and all query paths share these selectors. A missing canonical level
 is null in a position series and an error in a map/area request; never
 silently substitute an upper-air field. Metadata is cached by that full
 identity, so historical runs with different selected levels keep their labels.
+Pressure/model views may reuse metadata from a decoded level of the same
+parameter and level type until the exact level is decoded. Keep this fallback
+indexed alongside the exact cache under one lock; never scan all cached levels
+on the request path. Single-level and legacy views require exact metadata.
 
 ## v1 limitations (GFS)
 
