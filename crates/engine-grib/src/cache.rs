@@ -1,6 +1,6 @@
 //! LRU cache for decoded GRIB grid data.
 //!
-//! Caches decoded f64 arrays keyed by (grib_url, offset) to avoid
+//! Caches decoded f32 arrays keyed by (grib_url, offset) to avoid
 //! repeated byte-range fetches and GRIB decoding.
 
 use std::sync::Arc;
@@ -19,8 +19,9 @@ struct GridKey {
 }
 
 /// Weight function: count the byte size of each cached grid.
-fn weigh_grid(_key: &GridKey, val: &Arc<DecodedGrid>) -> u64 {
-    val.size_bytes() as u64
+fn weigh_grid(key: &GridKey, val: &Arc<DecodedGrid>) -> u64 {
+    // Include the key, its Arc header and a small cache-node allowance.
+    (val.size_bytes() + size_of::<GridKey>() + key.url.len() + 2 * size_of::<usize>() + 64) as u64
 }
 
 /// A decoded grid with its metadata.
@@ -38,8 +39,9 @@ pub struct DecodedGrid {
     pub lon_inc: f64,
     /// Latitude increment (positive northward, but stored negative for N→S grids).
     pub lat_inc: f64,
-    /// Decoded values in row-major order (north to south, west to east).
-    pub values: Arc<Vec<f64>>,
+    /// Decoder-native values in row-major order (north to south, west to east).
+    /// Widen only sampled values; interpolation and public outputs stay f64.
+    pub values: Arc<Vec<f32>>,
     /// WMO GRIB2 parameter identification triple `(discipline, category, number)`
     /// extracted from the decoded message. Used for unit resolution.
     pub triple: (u8, u8, u8),
@@ -61,7 +63,12 @@ pub struct DecodedGrid {
 impl DecodedGrid {
     /// Memory size estimate in bytes.
     fn size_bytes(&self) -> usize {
-        self.values.len() * 8 + 64 // values + struct overhead
+        // Both the grid and its Vec are Arc allocations. Count capacity rather
+        // than length so a decoder's allocation slack stays inside the budget.
+        self.values.capacity() * size_of::<f32>()
+            + size_of::<Self>()
+            + size_of::<Vec<f32>>()
+            + 4 * size_of::<usize>()
     }
 
     /// Get the value at the grid point nearest to (lon, lat).
@@ -76,7 +83,9 @@ impl DecodedGrid {
         if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
             return None;
         }
-        Some(self.values[row as usize * self.ni + col as usize])
+        Some(f64::from(
+            self.values[row as usize * self.ni + col as usize],
+        ))
     }
 
     /// The column count of one full turn when this grid spans 360° (so a
@@ -165,10 +174,12 @@ impl DecodedGrid {
         };
         let row1 = (row + 1).min(self.nj - 1);
 
-        let v00 = self.values[row * self.ni + col];
-        let v10 = self.values[row * self.ni + col1];
-        let v01 = self.values[row1 * self.ni + col];
-        let v11 = self.values[row1 * self.ni + col1];
+        // Convert BEFORE arithmetic to preserve the original f64 interpolation
+        // exactly, including values between the decoder's representable nodes.
+        let v00 = f64::from(self.values[row * self.ni + col]);
+        let v10 = f64::from(self.values[row * self.ni + col1]);
+        let v01 = f64::from(self.values[row1 * self.ni + col]);
+        let v11 = f64::from(self.values[row1 * self.ni + col1]);
 
         // Skip interpolation if any neighbor is NaN
         if v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan() {
@@ -300,7 +311,7 @@ impl DecodedGrid {
         };
         for r in row_iter {
             for &c in &cols {
-                values.push(Some(self.values[r * self.ni + c]));
+                values.push(Some(f64::from(self.values[r * self.ni + c])));
             }
         }
 
@@ -377,11 +388,11 @@ impl GridCache {
         if size_mb == 0 {
             return None;
         }
-        // Estimate: each grid is ~8 MB (1440*721*8 bytes).
+        // Estimate: each grid is ~4 MiB (1440*721*4 bytes).
         Some(Self {
             cache: ByteBoundedCache::new(
                 size_mb.saturating_mul(ds_cache::MIB),
-                8 * ds_cache::MIB,
+                4 * ds_cache::MIB,
                 weigh_grid,
             ),
         })
@@ -449,6 +460,91 @@ impl GridCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_grid_fits_small_cache_without_redecoding() {
+        let cache = GridCache::new(1).unwrap();
+        let mut loads = 0;
+        for _ in 0..3 {
+            let grid = cache
+                .get_or_insert_with("compact", 0, || {
+                    loads += 1;
+                    let mut grid = grid_2x2();
+                    grid.ni = 600;
+                    grid.nj = 400;
+                    grid.values = Arc::new(vec![280.0; grid.ni * grid.nj]);
+                    Ok::<_, ()>(Arc::new(grid))
+                })
+                .unwrap();
+            assert_eq!(grid.nearest_value(10.0, 60.0), Some(280.0));
+        }
+        assert_eq!(loads, 1, "a 240k-cell grid must fit in the 1 MiB cache");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.weight() >= 240_000 * 4);
+        assert!(cache.weight() <= cache.capacity());
+    }
+
+    #[test]
+    fn compact_samples_keep_f64_interpolation_and_response_precision() {
+        let mut grid = grid_2x2();
+        let raw = [0.1_f32, 12345.125, -98765.375, 0.0001];
+        grid.values = Arc::new(raw.to_vec());
+        let [nw, ne, sw, se] = raw.map(f64::from);
+        let (dx, dy) = (0.37, 0.61);
+        let expected = nw * (1.0 - dx) * (1.0 - dy)
+            + ne * dx * (1.0 - dy)
+            + sw * (1.0 - dx) * dy
+            + se * dx * dy;
+        assert_eq!(
+            grid.bilinear_at(dx, dy).unwrap().to_bits(),
+            expected.to_bits()
+        );
+        assert_ne!(
+            expected,
+            f64::from(expected as f32),
+            "sample needs f64 precision"
+        );
+        assert_eq!(grid.nearest_value(10.0, 60.0), Some(nw));
+        let (x, y, values) = grid.extract_bbox([10.0, 59.0, 11.0, 60.0]).unwrap();
+        assert_eq!(x, [10.0, 11.0]);
+        assert_eq!(y, [59.0, 60.0]);
+        assert_eq!(values, [Some(sw), Some(se), Some(nw), Some(ne)]);
+    }
+
+    #[test]
+    fn cache_budget_counts_allocated_capacity() {
+        let cache = GridCache::new(1).unwrap();
+        let mut grid = grid_2x2();
+        grid.ni = 600;
+        grid.nj = 400;
+        let mut values = Vec::with_capacity(300_000);
+        values.resize(grid.ni * grid.nj, 280.0);
+        grid.values = Arc::new(values);
+        // Used values fit in 1 MiB, but the allocated buffer does not.
+        cache.insert("overallocated", 0, Arc::new(grid));
+        assert!(cache.get("overallocated", 0).is_none());
+        assert_eq!(cache.weight(), 0);
+    }
+
+    #[test]
+    fn compact_samples_preserve_missing_values_and_signed_zero() {
+        let mut grid = grid_2x2();
+        grid.values = Arc::new(vec![f32::NAN, -0.0, f32::MAX, f32::MIN_POSITIVE]);
+        // Missing NW still falls back to the first valid neighbour, including
+        // the sign of zero. Widening must also retain the full f32 range.
+        assert_eq!(
+            grid.bilinear_at(0.5, 0.5).unwrap().to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert!(grid.nearest_value(10.0, 60.0).unwrap().is_nan());
+        let (_, _, values) = grid.extract_bbox([10.0, 59.0, 11.0, 60.0]).unwrap();
+        assert_eq!(values[0], Some(f64::from(f32::MAX)));
+        assert_eq!(values[1], Some(f64::from(f32::MIN_POSITIVE)));
+        assert!(values[2].unwrap().is_nan());
+        assert_eq!(values[3].unwrap().to_bits(), (-0.0_f64).to_bits());
+        grid.values = Arc::new(vec![f32::NAN; 4]);
+        assert_eq!(grid.bilinear_at(0.5, 0.5), None);
+    }
 
     #[test]
     fn cache_coalesces_concurrent_fills_and_retries_failures() {
@@ -565,10 +661,10 @@ mod tests {
         // ~ -1; the fix (raw affine in lonlat_to_src_px, wrap in bilinear_at)
         // keeps col_f continuous so every sample stays near the true meridian.
         let (ni, nj) = (360usize, 21usize);
-        let mut values = vec![0.0f64; ni * nj];
+        let mut values = vec![0.0f32; ni * nj];
         for r in 0..nj {
             for c in 0..ni {
-                values[r * ni + c] = (c as f64).to_radians().cos(); // c == lon°
+                values[r * ni + c] = (c as f32).to_radians().cos(); // c == lon°
             }
         }
         let g = DecodedGrid {
@@ -632,7 +728,7 @@ mod tests {
     fn global_grid(lon_first: f64) -> DecodedGrid {
         let (ni, nj) = (1440usize, 721usize);
         // value = column index, so the extracted values name the columns.
-        let values: Vec<f64> = (0..ni * nj).map(|i| (i % ni) as f64).collect();
+        let values: Vec<f32> = (0..ni * nj).map(|i| (i % ni) as f32).collect();
         DecodedGrid {
             ni,
             nj,
@@ -740,7 +836,7 @@ mod tests {
         // is still global; the sampler wraps modulo cols_per_360 and the area
         // extractor must name the same storage column, never the duplicate.
         let (ni, nj) = (1441usize, 3usize);
-        let values: Vec<f64> = (0..ni * nj).map(|i| (i % ni) as f64).collect();
+        let values: Vec<f32> = (0..ni * nj).map(|i| (i % ni) as f32).collect();
         let g = DecodedGrid {
             ni,
             nj,
