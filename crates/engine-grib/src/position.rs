@@ -1,32 +1,12 @@
 //! Sample every requested coordinate while each forecast field is resident.
 
-use std::sync::LazyLock;
-
 use tokio::task::JoinSet;
 
 use super::*;
+use crate::runtime::run_fetches;
 
 // Per admitted EDR query: bound simultaneous fetches, decodes and live grids.
 const POSITION_CONCURRENCY: usize = 4;
-
-// Direct synchronous engine callers (tests/CLI) also share one I/O runtime,
-// rather than constructing one for every forecast step. HTTP calls use the
-// existing dedicated EDR runtime, never the request-serving runtime.
-static POSITION_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(POSITION_CONCURRENCY)
-        .thread_name("grib-position")
-        .enable_all()
-        .build()
-        .expect("GRIB position runtime")
-});
-
-fn run_fetches<F: std::future::Future>(future: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => POSITION_RUNTIME.block_on(future),
-    }
-}
 
 impl GribEngine {
     pub(crate) fn query_batched_positions(
@@ -549,7 +529,7 @@ mod tests {
         for n in [1, 3] {
             let before = engine.storage_bytes_read();
             let start = Instant::now();
-            let serial: Vec<Vec<_>> = POSITION_RUNTIME.block_on(async {
+            let serial: Vec<Vec<_>> = run_fetches(async {
                 points[..n]
                     .iter()
                     .map(|point| {

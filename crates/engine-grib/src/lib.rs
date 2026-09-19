@@ -2,8 +2,10 @@ pub mod cache;
 pub mod catalog;
 mod diagnostics;
 pub mod index;
+mod metadata;
 mod position;
 pub mod reader;
+mod runtime;
 #[cfg(test)]
 mod scan_tests;
 #[cfg(test)]
@@ -33,8 +35,8 @@ use crate::catalog::{Catalog, ForecastRun, ParameterKey, ParameterKeys, StepFile
 use crate::time_window::TimeWindow;
 use crate::units::{DisplayConversion, SourceUnit};
 
-/// Resolved metadata for a parameter, populated after the first successful
-/// decode of a message carrying that parameter and level. Derived from the WMO triple
+/// Resolved metadata for a parameter, populated by a successful header probe
+/// or decode of that parameter and level. Derived from the WMO triple
 /// **and the Code Table 4.5 fixed surface type** read out of the GRIB2
 /// message itself — never from hardcoded name tables.
 #[derive(Debug, Clone)]
@@ -59,7 +61,7 @@ struct ParamMetadata {
 
 impl ParamMetadata {
     /// Placeholder used when metadata has not yet been populated (no message
-    /// for this parameter has been decoded yet). The label falls back to the
+    /// for this parameter has been read yet). The label falls back to the
     /// short name and the display conversion is identity.
     fn placeholder(short_name: &str) -> Self {
         Self {
@@ -87,7 +89,7 @@ impl ParamMetadata {
     }
 }
 
-/// Exact metadata plus one decoded representative per (level type, name).
+/// Exact metadata plus one known representative per (level type, name).
 /// Both indexes are updated under the source's single metadata write lock.
 #[derive(Default)]
 struct ParamMetadataCache {
@@ -201,7 +203,7 @@ struct GribSource {
     /// Which index file format this collection uses.
     index_format: index::IndexFormat,
     /// Parameter metadata keyed by short name AND level identity. Populated
-    /// lazily on the first successful decode of each selected product.
+    /// on the first successful header probe or decode of each selected product.
     param_meta: RwLock<ParamMetadataCache>,
     /// Last attempted name, so failing probes cannot starve later parameters.
     probe_cursor: Mutex<Option<String>>,
@@ -752,7 +754,7 @@ impl GribEngine {
     }
 
     /// For each distinct short name in the newest forecast run that has not
-    /// yet been seen, fetch one message via byte-range and decode it so the
+    /// yet been seen, read the message headers via byte-range so the
     /// WMO triple populates the parameter metadata cache.
     ///
     /// Any failures are logged and swallowed — the probe is best-effort and
@@ -812,14 +814,23 @@ impl GribEngine {
             let start = start % todo.len();
             todo.rotate_left(start);
         }
-        for (cursor, (step_file, entry)) in todo.into_iter().take(MAX_PROBES_PER_SCAN) {
-            let name = &entry.param;
+        todo.truncate(MAX_PROBES_PER_SCAN);
+        let entries: Vec<_> = todo
+            .iter()
+            .map(|(_, (file, entry))| (file.message_url(entry), *entry))
+            .collect();
+        let results = metadata::read_batch(&self.source.store, &entries);
+        // Apply in cursor order, preserving deterministic metadata fallback
+        // representatives even when the reads complete out of order.
+        for ((cursor, (_, entry)), result) in todo.into_iter().zip(results) {
             *self.source.probe_cursor.lock().unwrap() = Some(cursor);
-            if let Err(e) = self.fetch_grid_by_entry(step_file.message_url(entry), entry) {
-                tracing::debug!(
-                    "Collection '{}': probe for parameter '{name}' failed: {e}",
-                    self.collection_id
-                );
+            match result {
+                Ok(meta) => self.populate_message_metadata(&entry.key(), &meta, entry.step_kind),
+                Err(e) => tracing::debug!(
+                    "Collection '{}': probe for parameter '{}' failed: {e}",
+                    self.collection_id,
+                    entry.param
+                ),
             }
         }
     }
@@ -932,6 +943,15 @@ impl GribEngine {
         grid: &DecodedGrid,
         step_kind: wgrib2_index::StepKind,
     ) {
+        self.populate_message_metadata(key, &metadata::MessageMetadata::from(grid), step_kind);
+    }
+
+    fn populate_message_metadata(
+        &self,
+        key: &ParameterKey,
+        message: &metadata::MessageMetadata,
+        step_kind: wgrib2_index::StepKind,
+    ) {
         let short_name = &key.param;
         {
             let cache = self.source.param_meta.read().unwrap();
@@ -940,8 +960,8 @@ impl GribEngine {
             }
         }
 
-        let (discipline, category, number) = grid.triple;
-        let centre = grid.centre;
+        let (discipline, category, number) = message.triple;
+        let centre = message.centre;
         let mut meta = match units::lookup(centre, discipline, category, number) {
             Some(info) => ParamMetadata {
                 base_label: info.label.to_string(),
@@ -960,13 +980,13 @@ impl GribEngine {
             }
         };
 
-        // Attach the surface type from the decoded message so that
+        // Attach the surface type from the message headers so that
         // otherwise-identical parameters at different levels (e.g. msl vs
         // sp, both under WMO triple (0, 3, 0) "Pressure") can be told apart
         // in the rendered label.
         meta.window_qualifier = step_kind.qualifier();
-        meta.first_surface_type = Some(grid.first_surface_type);
-        meta.first_surface_value = grid.first_surface_value;
+        meta.first_surface_type = Some(message.first_surface_type);
+        meta.first_surface_value = message.first_surface_value;
 
         let mut cache = self.source.param_meta.write().unwrap();
         cache.insert(key.clone(), meta);
@@ -974,7 +994,7 @@ impl GribEngine {
 
     /// Look up cached parameter metadata. Returns a placeholder (identity
     /// conversion, empty unit string) if the short name has not yet been
-    /// populated — typically because no message for it has been decoded yet.
+    /// populated — typically because its headers have not been read yet.
     fn param_metadata(&self, catalog: &Catalog, short_name: &str) -> ParamMetadata {
         catalog
             .latest_run()
@@ -1494,7 +1514,7 @@ impl MapEngine for GribEngine {
         let times = catalog.all_valid_times();
 
         // Build parameter list from catalog using cached metadata (populated
-        // lazily as each parameter is first decoded).
+        // as each parameter is first probed or decoded).
         let params: Vec<ds_core::map_engine::ParameterInfo> = catalog
             .all_params()
             .into_iter()
