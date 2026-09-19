@@ -166,6 +166,14 @@ workers share the existing 30-second EDR deadline; expiry stops new reads and
 returns 504. Other engines retain their sequential position behavior through the
 default batch hook, with combined output limits checked after each point.
 
+GRIB sources can set `message_cache_mb` to retain compressed fields separately
+from decoded grids (`0` by default). Repeated queries at another coordinate can
+then reuse message bytes after decoded grids are evicted. This saves storage
+reads while retaining the normal decode and unit-conversion path. The byte
+budget is additional to `grid_cache_mb` and shared by all level collections and
+APIs of that source; header probes do not fill it. Failed reads/decodes are not
+retained, and messages larger than the budget are served without retention.
+
 GRIB area/radius queries use the same four-worker limit across parameter/level
 fields. One initial field supplies both geometry and values, including with the
 cache disabled. The 1M-value and polygon-mask budgets are checked before

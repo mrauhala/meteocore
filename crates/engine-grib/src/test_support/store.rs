@@ -23,6 +23,8 @@ pub struct TestStore {
     pub reads: Mutex<Reads>,
     pub active: AtomicUsize,
     pub peak: AtomicUsize,
+    pub heads: AtomicUsize,
+    pub allow_heads: bool,
     pub delay: Duration,
     pub delays: BTreeMap<String, Duration>,
     pub suffix: &'static str,
@@ -35,6 +37,8 @@ impl Default for TestStore {
             reads: Mutex::default(),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            heads: AtomicUsize::new(0),
+            allow_heads: false,
             delay: Duration::ZERO,
             delays: BTreeMap::new(),
             suffix: ".idx",
@@ -62,10 +66,14 @@ impl ObjectStore for TestStore {
         path: &Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
-        assert!(
-            !options.head,
-            "scanning must not HEAD each index or data file"
-        );
+        if options.head {
+            assert!(
+                self.allow_heads,
+                "scanning must not HEAD each index or data file"
+            );
+            self.heads.fetch_add(1, Ordering::SeqCst);
+            return self.inner.get_opts(path, options).await;
+        }
         if !path.as_ref().ends_with(self.suffix) {
             return self.inner.get_opts(path, options).await;
         }

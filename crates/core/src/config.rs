@@ -1667,6 +1667,10 @@ pub struct GribConfig {
     /// Grid cache size in MB. Default: 256.
     #[serde(default = "default_grid_cache_mb")]
     pub grid_cache_mb: u64,
+    /// Compressed GRIB message cache in MiB, separate from decoded grids.
+    /// Default: 0 (disabled). Shared by every level collection of this source.
+    #[serde(default)]
+    pub message_cache_mb: u64,
     /// Model run hours to poll. Default: all (00, 06, 12, 18)
     pub run_hours: Option<Vec<u32>>,
     /// Index file format: "ecmwf-json" (default) or "wgrib2".
@@ -1705,6 +1709,7 @@ impl GribConfig {
             time_window: None,
             parameters: None,
             grid_cache_mb: default_grid_cache_mb(),
+            message_cache_mb: 0,
             run_hours: None,
             index_format,
             filename_contains: None,
@@ -3981,6 +3986,30 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         // Local source: data_path alone, no prefix_pattern needed.
         let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn grib_message_cache_is_opt_in_and_changes_reload_identity() {
+        let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
+        let original = cfg.collections[0].grib.as_ref().unwrap();
+        assert_eq!(original.message_cache_mb, 0);
+        let local = GribConfig::auto_local(
+            "x".into(),
+            ".idx".into(),
+            ".grib2".into(),
+            Some("wgrib2".into()),
+        );
+        assert_eq!(local.message_cache_mb, 0);
+        let enabled =
+            grib_collection("data_path = \"testdata/grib-local\"\nmessage_cache_mb = 128\n");
+        enabled.validate().unwrap();
+        let updated = enabled.collections[0].grib.as_ref().unwrap();
+        assert_eq!(updated.message_cache_mb, 128);
+        assert_eq!(updated.grid_cache_mb, original.grid_cache_mb);
+        assert_ne!(
+            updated, original,
+            "changed cache budgets must rebuild the engine"
+        );
     }
 
     #[test]

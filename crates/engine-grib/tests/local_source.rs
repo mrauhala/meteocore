@@ -25,6 +25,7 @@ fn local_config() -> GribConfig {
         time_window: None,
         parameters: None,
         grid_cache_mb: 256,
+        message_cache_mb: 0,
         run_hours: None,
         index_format: Some("ecmwf-json".to_string()),
         filename_contains: None,
