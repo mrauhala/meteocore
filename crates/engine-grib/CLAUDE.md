@@ -128,6 +128,18 @@ on the request path. Single-level and legacy views require exact metadata.
   single GFS 0.25° file has ~700 messages.
 - CCSDS/AEC compression needs the `libaec` C library (via `libaec-sys`).
 
+## Decoded-grid memory
+
+- The GRIB decoder produces `f32`; retain those values in `DecodedGrid` to
+  avoid doubling every cached buffer. Widen samples to `f64` before interpolation
+  or display conversion. Coordinates and EDR/Maps outputs remain `f64`.
+- Cache weights include allocated value capacity and key/structure overhead.
+  Keep the entry-size estimate aligned with the 4 MiB typical global field.
+- Run `cargo run --release -p engine-grib --example bench_grid_cache` for a
+  reproducible memory/cache replay and sampling benchmark using the committed
+  ECMWF fixture. It prints a query-output fingerprint for before/after checks;
+  timings are machine-dependent and are not CI thresholds.
+
 Default Maps/area parameter selection preserves the first previously supported
 near-surface product before considering acc/ave records, regardless of index
 ordering. Aggregate-only collections fall back to their first aggregate;

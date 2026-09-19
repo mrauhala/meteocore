@@ -128,10 +128,10 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
     // Preserve the usual row-major scan's allocation and decode fast path.
     // For other scan modes, place values using the decoder's storage-order
     // index iterator, then normalize both axes to west→east / north→south.
-    let values: Vec<f64> = if layout.canonical_scan {
-        decoded.map(f64::from).collect()
+    let values: Vec<f32> = if layout.canonical_scan {
+        decoded.collect()
     } else {
-        let mut values = vec![f64::NAN; expected];
+        let mut values = vec![f32::NAN; expected];
         for (i, j) in layout.indices {
             let value = decoded.next().ok_or_else(|| {
                 DataServerError::Engine(format!("Too few GRIB2 values for {param}"))
@@ -146,7 +146,7 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
             } else {
                 j
             };
-            values[row * layout.ni + col] = f64::from(value);
+            values[row * layout.ni + col] = value;
         }
         if decoded.next().is_some() {
             return Err(DataServerError::Engine(format!(

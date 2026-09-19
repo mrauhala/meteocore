@@ -2022,7 +2022,7 @@ mod tests {
                     lat_first: 1.0,
                     lon_inc: 1.0,
                     lat_inc: -1.0,
-                    values: Arc::new(vec![(i + 1) as f64 * 10.0; 4]),
+                    values: Arc::new(vec![(i + 1) as f32 * 10.0; 4]),
                     triple: if i == 3 { (0, 4, 7) } else { (0, 1, 8) },
                     centre: 7,
                     first_surface_type: 1,

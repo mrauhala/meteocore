@@ -190,6 +190,9 @@ parameter and level type while another level is unprobed; exact-level metadata
 takes precedence. These lookups use shared indexes rather than scanning every
 cached level, and do not fetch additional data.
 
+GRIB caches preserve the decoder's `f32` values without widening whole grids;
+sampling, coordinates, unit conversion and response values remain `f64`.
+
 Without `level_types`, the existing collection ID and canonical-level behavior
 are preserved. Single-level and legacy parameter names select a canonical level
 per run, shared by metadata, position, area and Maps. Missing canonical fields
