@@ -3,6 +3,7 @@ pub mod cache;
 pub mod catalog;
 mod diagnostics;
 pub mod index;
+mod message_cache;
 mod metadata;
 mod position;
 pub mod reader;
@@ -183,6 +184,7 @@ struct GribSource {
     store: ds_storage::DataStore,
     scan_mode: ScanMode,
     grid_cache: Option<GridCache>,
+    message_cache: Option<message_cache::MessageCache>,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
     /// Allowed parameters (None = all).
@@ -268,6 +270,20 @@ impl GribEngine {
             .unwrap_or((0, 0, 0))
     }
 
+    /// Compressed-message cache counters and resident byte budget, per source.
+    pub fn message_cache_metrics(&self) -> ds_cache::CacheMetrics {
+        self.source
+            .message_cache
+            .as_ref()
+            .map(|cache| cache.metrics())
+            .unwrap_or(ds_cache::CacheMetrics {
+                hits: 0,
+                misses: 0,
+                bytes: 0,
+                capacity_bytes: 0,
+            })
+    }
+
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
         // Data source: local `data_path` (a directory, or a fixed-prefix remote
@@ -312,6 +328,7 @@ impl GribEngine {
         };
 
         let grid_cache = GridCache::new(config.grid_cache_mb);
+        let message_cache = message_cache::MessageCache::new(config.message_cache_mb);
 
         let index_format = index::IndexFormat::from_config(config.index_format.as_deref())
             .ok_or_else(|| {
@@ -329,6 +346,7 @@ impl GribEngine {
                 store,
                 scan_mode,
                 grid_cache,
+                message_cache,
                 shutdown: Shutdown::new(),
                 param_filter: config.parameters.clone(),
                 known_indexes: Mutex::new(HashSet::new()),
@@ -924,7 +942,11 @@ impl GribEngine {
     ) -> Result<Arc<DecodedGrid>, DataServerError> {
         let load = || {
             let path = ds_storage::object_store::path::Path::from(grib_url);
-            reader::read_message(&self.source.store, &path, entry).map(Arc::new)
+            match &self.source.message_cache {
+                Some(cache) => cache.read(&self.source.store, &path, entry),
+                None => reader::read_message(&self.source.store, &path, entry),
+            }
+            .map(Arc::new)
         };
         let grid = match &self.source.grid_cache {
             Some(cache) => cache.get_or_insert_with(grib_url, entry.offset, load)?,

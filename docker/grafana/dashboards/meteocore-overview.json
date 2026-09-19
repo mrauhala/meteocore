@@ -1143,7 +1143,7 @@
     {
       "type": "timeseries",
       "title": "Hit ratio — every cache",
-      "description": "One line per cache family. A family sagging while its fill (right panel) is pinned at 100% = working set no longer fits. Families with no traffic show no line.",
+      "description": "One line per cache family. A family sagging while its fill (right panel) is pinned at 100% = working set no longer fits. Families with no traffic show no line. GRIB compressed-message hits measure reuse after decoded-grid misses, not the overall query hit rate.",
       "id": 23,
       "gridPos": {
         "h": 8,
@@ -1234,6 +1234,11 @@
           "legendFormat": "GRIB decoded grids"
         },
         {
+          "expr": "sum(rate(grib_message_cache_hits_total[$__rate_interval])) / clamp_min(sum(rate(grib_message_cache_hits_total[$__rate_interval])) + sum(rate(grib_message_cache_misses_total[$__rate_interval])), 1e-9)",
+          "refId": "E",
+          "legendFormat": "GRIB compressed messages"
+        },
+        {
           "expr": "rate(lightning_strike_cache_hits_total[$__rate_interval]) / clamp_min(rate(lightning_strike_cache_hits_total[$__rate_interval]) + rate(lightning_strike_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "C",
           "legendFormat": "Lightning strike windows (#504)"
@@ -1243,7 +1248,7 @@
     {
       "type": "timeseries",
       "title": "Miss rate — every cache (work per second)",
-      "description": "Misses are actual work: decodes, renders, S3 fetches. Watch for a family whose misses jump while traffic is flat — that is churn, not load.",
+      "description": "Misses are actual work: decodes, renders, S3 fetches. Watch for a family whose misses jump while traffic is flat — that is churn, not load. GRIB decoded-grid misses can reuse compressed messages; compressed-message misses require storage reads.",
       "id": 24,
       "gridPos": {
         "h": 8,
@@ -1332,6 +1337,11 @@
           "legendFormat": "GRIB decoded grids"
         },
         {
+          "expr": "sum(rate(grib_message_cache_misses_total[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "GRIB compressed messages"
+        },
+        {
           "expr": "rate(lightning_strike_cache_misses_total[$__rate_interval])",
           "refId": "A",
           "legendFormat": "Lightning strike windows (#504)"
@@ -1341,7 +1351,7 @@
     {
       "type": "timeseries",
       "title": "Fill — % of configured capacity",
-      "description": "Bytes resident vs configured cap. Pinned at 100% is fine ONLY if the hit ratio holds; 100% + sagging hits + rising inserts = raise the env cap (see PVOL panel below for the worked example).",
+      "description": "Bytes resident vs configured cap. Pinned at 100% is fine ONLY if the hit ratio holds; 100% + sagging hits + rising inserts = raise the cache budget (see PVOL panel below for the worked example). GRIB uses separate per-source budgets: grid_cache_mb for decoded grids and message_cache_mb for compressed messages.",
       "id": 25,
       "gridPos": {
         "h": 8,
@@ -1430,6 +1440,11 @@
           "expr": "sum(grid_cache_bytes) / clamp_min(sum(grid_cache_capacity_bytes), 1)",
           "refId": "D",
           "legendFormat": "GRIB decoded grids"
+        },
+        {
+          "expr": "sum(grib_message_cache_bytes) / clamp_min(sum(grib_message_cache_capacity_bytes), 1)",
+          "refId": "E",
+          "legendFormat": "GRIB compressed messages"
         },
         {
           "expr": "lightning_strike_cache_bytes / clamp_min(lightning_strike_cache_capacity_bytes, 1)",

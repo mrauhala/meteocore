@@ -24,6 +24,17 @@ pub fn read_message(
     path: &ds_storage::object_store::path::Path,
     entry: &MessageEntry,
 ) -> Result<DecodedGrid, DataServerError> {
+    let bytes = fetch_message_bytes(store, path, entry)?;
+    decode_message(&bytes, &entry.param)
+}
+
+/// Fetch the indexed message range without decoding it. Shared by direct reads
+/// and the optional compressed-message cache; metadata probes stay independent.
+pub(crate) fn fetch_message_bytes(
+    store: &DataStore,
+    path: &ds_storage::object_store::path::Path,
+    entry: &MessageEntry,
+) -> Result<ds_storage::bytes::Bytes, DataServerError> {
     let length = match entry.length {
         Some(l) => l,
         None => {
@@ -45,7 +56,14 @@ pub fn read_message(
         }
     };
 
-    let range = entry.offset as usize..(entry.offset + length) as usize;
+    let range = entry
+        .offset
+        .checked_add(length)
+        .and_then(|end| Some(usize::try_from(entry.offset).ok()?..usize::try_from(end).ok()?))
+        .filter(|range| !range.is_empty())
+        .ok_or_else(|| {
+            DataServerError::Storage(format!("Invalid GRIB message range for {}", entry.param))
+        })?;
     let bytes = store.get_range(path, range).map_err(|e| {
         DataServerError::Storage(format!(
             "Failed to fetch GRIB message {}/{}: {}",
@@ -55,7 +73,14 @@ pub fn read_message(
         ))
     })?;
 
-    decode_message(&bytes, &entry.param)
+    if bytes.len() as u64 != length {
+        return Err(DataServerError::Storage(format!(
+            "Short GRIB message read for {}: expected {length} bytes, got {}",
+            entry.param,
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Decode a GRIB2 message from raw bytes.

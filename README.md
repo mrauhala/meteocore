@@ -786,6 +786,24 @@ window can exceed that cache and require reads again. After compact decoding,
 120 global 0.25° fields still occupy about 475 MiB, exceeding the default
 `grid_cache_mb = 256` even for one parameter at one level.
 
+For repeated forecast queries at different coordinates, an optional cache keeps
+the smaller, compressed GRIB messages after decoded grids are evicted. Enable
+it in the source's existing `[collections.grib]` section, for example:
+
+```toml
+message_cache_mb = 128
+```
+
+This budget is **additional to** `grid_cache_mb` and defaults to `0` (disabled).
+Both caches are shared by the source's single/pressure/model collections and
+EDR/Maps/WMS/Tiles requests. A decoded-grid miss can reuse a retained message
+without a GET (or tail-record HEAD), but still pays the decode cost. Memory is
+bounded by message bytes plus cache overhead; compressed sizes vary by field,
+so a working set larger than this budget can still require downloads.
+`grib_message_cache_hits_total`, `grib_message_cache_misses_total`,
+`grib_message_cache_bytes`, and `grib_message_cache_capacity_bytes` report the
+cache per source collection. Header discovery does not fill this cache.
+
 Area and radius queries also load up to four parameter/level fields concurrently.
 The first field determines the grid and supplies its own output values; it is
 not fetched twice when the cache is disabled. The combined output and polygon
@@ -836,6 +854,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `level_types` | no | omitted | Optional non-empty list of `"single"`, `"pressure"`, `"model"`; creates separate collections for enabled families present in the data. |
 | `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
+| `message_cache_mb` | no | `0` | Optional compressed GRIB message cache in MiB; additional to `grid_cache_mb`, shared by the source's level collections. `0` disables it. |
 | `run_hours` | no | all | Model run hours to poll, e.g., `[0, 6, 12, 18]` |
 
 #### GRIB Config Example

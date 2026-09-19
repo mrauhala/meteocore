@@ -833,6 +833,67 @@ static METATILE_DECLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
+// Compressed GRIB messages are shared by all level views of a source.
+static GRIB_MESSAGE_CACHE_COUNTERS: LazyLock<[IntCounterVec; 2]> = LazyLock::new(|| {
+    ["hits", "misses"].map(|suffix| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                format!("grib_message_cache_{suffix}_total"),
+                format!("GRIB compressed-message cache {suffix}"),
+            ),
+            &["collection"],
+        )
+        .unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    })
+});
+
+static GRIB_MESSAGE_CACHE_GAUGES: LazyLock<[IntGaugeVec; 2]> = LazyLock::new(|| {
+    [
+        ("bytes", "Bytes held in the GRIB compressed-message cache"),
+        (
+            "capacity_bytes",
+            "Configured GRIB compressed-message cache capacity in bytes",
+        ),
+    ]
+    .map(|(suffix, help)| {
+        let gauge = IntGaugeVec::new(
+            Opts::new(format!("grib_message_cache_{suffix}"), help),
+            &["collection"],
+        )
+        .unwrap();
+        REGISTRY.register(Box::new(gauge.clone())).unwrap();
+        gauge
+    })
+});
+
+fn update_grib_message_cache_metrics(
+    collection: &str,
+    metrics: ds_cache::CacheMetrics,
+    previous: &mut (u64, u64),
+) {
+    let current = (metrics.hits, metrics.misses);
+    // Match the per-source grid cache's reload rebaselining policy.
+    if current.0 >= previous.0 && current.1 >= previous.1 {
+        for (counter, delta) in GRIB_MESSAGE_CACHE_COUNTERS
+            .iter()
+            .zip([current.0 - previous.0, current.1 - previous.1])
+        {
+            counter.with_label_values(&[collection]).inc_by(delta);
+        }
+    }
+    *previous = current;
+    for (gauge, value) in GRIB_MESSAGE_CACHE_GAUGES
+        .iter()
+        .zip([metrics.bytes, metrics.capacity_bytes])
+    {
+        gauge
+            .with_label_values(&[collection])
+            .set(value.min(i64::MAX as u64) as i64);
+    }
+}
+
 // GRIB grid cache (per-collection).
 static GRID_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -909,6 +970,7 @@ static CACHE_COUNTER_STATE: LazyLock<Mutex<CacheCounterState>> =
 struct CacheCounterState {
     tile: HashMap<String, (u64, u64)>,
     grid: HashMap<String, (u64, u64)>,
+    grib_message: HashMap<String, (u64, u64)>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -5011,6 +5073,14 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     if let Ok(engines) = state.grib_engines.read() {
         for engine in engines.iter() {
             let collection = engine.collection_id();
+            update_grib_message_cache_metrics(
+                collection,
+                engine.message_cache_metrics(),
+                counter_state
+                    .grib_message
+                    .entry(collection.to_owned())
+                    .or_default(),
+            );
             let (hits, misses) = engine.grid_cache_stats();
             let entry = counter_state
                 .grid
@@ -5637,6 +5707,42 @@ mod tests {
             .iter()
             .find(|h| h.id == id)
             .unwrap_or_else(|| panic!("no health entry for {id}"))
+    }
+
+    #[test]
+    fn grib_message_cache_metrics_track_deltas_and_rebaseline_on_reload() {
+        let collection = "grib-message-metrics-test";
+        let mut previous = (0, 0);
+        for (hits, misses, bytes, capacity_bytes, expected) in [
+            (3, 5, 100, 1024, [3, 5]),
+            (3, 5, 100, 1024, [3, 5]), // repeated scrape
+            (5, 6, 200, 1024, [5, 6]),
+            (0, 0, 0, 0, [5, 6]), // reload disables the cache
+            (2, 4, 50, 2048, [7, 10]),
+        ] {
+            super::update_grib_message_cache_metrics(
+                collection,
+                ds_cache::CacheMetrics {
+                    hits,
+                    misses,
+                    bytes,
+                    capacity_bytes,
+                },
+                &mut previous,
+            );
+            for (counter, expected) in super::GRIB_MESSAGE_CACHE_COUNTERS.iter().zip(expected) {
+                assert_eq!(counter.with_label_values(&[collection]).get(), expected);
+            }
+            for (gauge, expected) in super::GRIB_MESSAGE_CACHE_GAUGES
+                .iter()
+                .zip([bytes, capacity_bytes])
+            {
+                assert_eq!(
+                    gauge.with_label_values(&[collection]).get(),
+                    expected as i64
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

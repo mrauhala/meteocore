@@ -169,6 +169,32 @@ on the request path. Single-level and legacy views require exact metadata.
   ECMWF fixture. It prints a query-output fingerprint for before/after checks;
   timings are machine-dependent and are not CI thresholds.
 
+## Compressed-message cache
+
+- `message_cache_mb` is an optional additional per-source memory budget, default
+  `0` (disabled). `GribSource` owns it alongside the decoded cache; level views
+  and all query APIs share it. Keep metadata header probes out of both caches.
+- A decoded-grid miss can reuse the compressed message and decode it again.
+  On a compressed-cache miss, share the fetch through `ByteBoundedCache` and
+  admit bytes only after decoding succeeds. Reuse that cold decode; failed
+  reads, invalid payloads and expired fills must remain retryable.
+- Key by source-local path, offset and indexed length. Like the decoded cache,
+  this assumes immutable files at a given path/offset; engine reconstruction
+  clears both caches. Changing the cache configuration triggers reconstruction
+  through normal config equality; unchanged reloads preserve the warm caches.
+- Retained `Bytes` must own just the message, not a slice backed by an entire
+  object. Count payload/key/node overhead; oversized messages are served but
+  not retained. Range arithmetic must reject overflow/zero lengths and short
+  reads before admission.
+- `/metrics` exposes `grib_message_cache_{hits_total,misses_total,bytes,
+  capacity_bytes}` under the source collection ID, once per owner. Message hits
+  count reuse after decoded-grid misses, not every query field.
+- The ignored `message_cache::tests::repeated_forecast_latency_replay` replays
+  two different coordinates over 120 real global fields with 150 ms simulated
+  GET latency, comparing 256 MiB decoded-only caching with an additional
+  128 MiB message cache. It checks identical samples and reports timings/read
+  bytes; no wall-clock thresholds belong in CI.
+
 Default Maps/area parameter selection preserves the first previously supported
 near-surface product before considering acc/ave records, regardless of index
 ordering. Aggregate-only collections fall back to their first aggregate;
