@@ -1,6 +1,7 @@
 //! Forecast catalog: maps (reference_time, step) → file + message offsets.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -29,7 +30,7 @@ impl ParameterKey {
 use chrono::{NaiveDate, NaiveTime};
 
 /// A single GRIB message location within a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct MessageEntry {
     /// Origin when a forecast step contains messages from multiple files.
     /// Unset in a freshly parsed sidecar; scanning attaches the actual path.
@@ -136,7 +137,7 @@ pub(crate) fn duplicate_message_keys(
 }
 
 /// One forecast step file with its message index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct StepFile {
     /// URL or path to the .grib2 file.
     pub grib_url: String,
@@ -189,7 +190,7 @@ impl StepFile {
 }
 
 /// A single forecast run (e.g., 00z on 2026-04-05).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct ForecastRun {
     /// Model reference time (analysis time).
     pub reference_time: DateTime<Utc>,
@@ -240,6 +241,9 @@ impl ForecastRun {
 pub struct Catalog {
     /// Forecast runs keyed by reference time (most recent last).
     pub runs: BTreeMap<DateTime<Utc>, ForecastRun>,
+    /// Fingerprint for rendered caches, computed on publication from the
+    /// ordered message identities (including origins, offsets and levels).
+    pub content_version: u64,
     /// Latest-run parameter union, rebuilt on the poll path before publication.
     parameters: Vec<(String, String, Option<u32>)>,
     /// Canonical levels per run, selected once on publication. A missing
@@ -327,8 +331,14 @@ impl Catalog {
     }
 
     /// Call after modifying runs, before publishing the immutable snapshot.
-    /// Request-time metadata must not scan hundreds of forecast steps.
-    pub fn refresh_parameters(&mut self) {
+    /// Request-time metadata and cache keys must not scan forecast steps.
+    pub fn refresh_metadata(&mut self) {
+        // This keys process-local caches, not persistent IDs or public ETags.
+        // A content hash preserves hits on no-op rebuilds and cannot reset to
+        // an old revision counter when an evicted family reappears.
+        let mut hasher = DefaultHasher::new();
+        self.runs.hash(&mut hasher);
+        self.content_version = hasher.finish().max(1);
         self.parameters.clear();
         self.parameter_keys = self
             .runs
@@ -415,7 +425,7 @@ impl Catalog {
                 .map(|&v| v as u32)
                 .collect();
             catalog.vertical_levels = levels.into_iter().rev().map(f64::from).collect();
-            catalog.refresh_parameters();
+            catalog.refresh_metadata();
             self.families.insert(family, Arc::new(catalog));
         }
     }

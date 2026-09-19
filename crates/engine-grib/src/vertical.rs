@@ -231,6 +231,169 @@ mod tests {
     }
 
     #[test]
+    fn render_version_follows_late_default_levels_without_churning_other_families() {
+        for (family, surface, first, first_encoded, later, later_encoded) in [
+            (
+                GribLevelType::Pressure,
+                100,
+                "500 mb",
+                50000,
+                "850 mb",
+                85000,
+            ),
+            (
+                GribLevelType::Model,
+                105,
+                "1 hybrid level",
+                1,
+                "137 hybrid level",
+                137,
+            ),
+        ] {
+            let source = TestSource::new();
+            source.write(
+                "single",
+                &[("TMP", "2 m above ground", message(0, 280.0, [0; 4], 103, 2))],
+                0,
+            );
+            source.write(
+                "first",
+                &[(
+                    "TMP",
+                    first,
+                    message(0, 250.0, [0; 4], surface, first_encoded),
+                )],
+                0,
+            );
+            let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+            let views = engine.level_collections();
+            let view = views
+                .iter()
+                .find(|view| view.family == Some(family))
+                .unwrap();
+            let single = views
+                .iter()
+                .find(|view| view.family == Some(GribLevelType::Single))
+                .unwrap();
+            let reference = "2026-04-05T00:00:00Z".parse().unwrap();
+            let render = |z| {
+                view.get_raster_tile(
+                    [0.0, 0.0, 1.0, 1.0],
+                    1,
+                    1,
+                    Some(reference),
+                    &OutputCrs::Wgs84,
+                    Some("TMP"),
+                    z,
+                    Some(reference),
+                )
+                .unwrap()
+                .values
+                .iter_values()
+                .next()
+                .unwrap()
+                .unwrap()
+            };
+            let version = view.content_version();
+            let single_version = single.content_version();
+            assert_ne!(version, 0, "explicit-TIME responses must revalidate");
+            assert!((render(None) + 23.15).abs() < 1e-9);
+
+            source.write(
+                "later",
+                &[(
+                    "TMP",
+                    later,
+                    message(0, 270.0, [0; 4], surface, later_encoded),
+                )],
+                0,
+            );
+            engine.scan_once().unwrap();
+            // Both resolved times and the omitted z are unchanged. The content
+            // version must invalidate rendered tiles and WMS metatiles instead.
+            assert_eq!(
+                view.resolve_time(Some(reference), Some(reference)),
+                Some(reference)
+            );
+            assert_eq!(
+                view.resolve_reference_time(Some(reference), Some(reference)),
+                Some(reference)
+            );
+            assert!((render(None) + 3.15).abs() < 1e-9);
+            let first_level = if family == GribLevelType::Pressure {
+                500.0
+            } else {
+                1.0
+            };
+            assert!((render(Some(first_level)) + 23.15).abs() < 1e-9);
+            assert_ne!(view.content_version(), version);
+            assert_eq!(single.content_version(), single_version);
+
+            let updated = view.content_version();
+            // A new file in another family forces catalog rebuilding, but
+            // must preserve the already rendered upper-air tiles.
+            source.write(
+                "single-later",
+                &[("OTHER", "surface", message(0, 280.0, [0; 4], 1, 0))],
+                0,
+            );
+            engine.scan_once().unwrap();
+            assert_eq!(view.content_version(), updated);
+            assert_ne!(single.content_version(), single_version);
+            engine.scan_once().unwrap();
+            assert_eq!(view.content_version(), updated);
+        }
+    }
+
+    #[test]
+    fn render_version_follows_late_canonical_level_in_single_and_legacy_collections() {
+        for split in [false, true] {
+            let source = TestSource::new();
+            source.write(
+                "skin",
+                &[("TMP", "surface", message(0, 280.0, [0; 4], 1, 0))],
+                0,
+            );
+            let config = if split {
+                split_config(&source)
+            } else {
+                source.config()
+            };
+            let engine = GribEngine::new("forecast", &config).unwrap();
+            let views = engine.level_collections();
+            let view = if split { &views[0] } else { &engine };
+            let render = || {
+                view.get_raster_tile(
+                    [0.0, 0.0, 1.0, 1.0],
+                    1,
+                    1,
+                    None,
+                    &OutputCrs::Wgs84,
+                    Some("TMP"),
+                    None,
+                    None,
+                )
+                .unwrap()
+                .values
+                .iter_values()
+                .next()
+                .unwrap()
+                .unwrap()
+            };
+            let version = view.content_version();
+            assert!((render() - 6.85).abs() < 1e-9);
+            source.write(
+                "air",
+                &[("TMP", "2 m above ground", message(0, 290.0, [0; 4], 103, 2))],
+                0,
+            );
+            engine.scan_once().unwrap();
+            assert!((render() - 16.85).abs() < 1e-9);
+            assert_ne!(view.content_version(), version);
+        }
+    }
+
+    #[test]
     fn separate_files_share_one_source_and_keep_vertical_families_separate() {
         let source = TestSource::new();
         source.write(

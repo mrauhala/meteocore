@@ -46,6 +46,11 @@ unlike GeoTIFF's one band per collection.
   ordinal model/hybrid numbers. Soil/isentropic/fractional levels are excluded.
 - `StepFile` can combine several source files at one run/step. Always use
   `StepFile::message_url(entry)` for reads; offsets are local to that origin.
+- Each catalog carries a nonzero render content version, hashed on the scan
+  path from its runs and message identities. Late files can change default
+  levels at an existing time: Maps/Tiles/WMS caches must follow that revision,
+  and explicit-time HTTP images must revalidate. No-op rebuilds and changes
+  confined to other families preserve a view's version.
 - Upper-air queries use exact levels, with no canonical-level fallback.
   Missing parameter/level pairs are null in EDR and errors in Maps. Pressure/
   model labels omit a fixed-level qualifier. The shared vertical descriptor
@@ -80,7 +85,7 @@ An incomplete newest run does not hide a covering older run; explicit run
 pins do not fall back. No requested datetime still selects the latest run.
 
 Each run also has canonical `(parameter, level type, level)` selectors,
-rebuilt with `Catalog::refresh_parameters` before publication. Metadata
+rebuilt with `Catalog::refresh_metadata` before publication. Metadata
 probes and all query paths share these selectors. A missing canonical level
 is null in a position series and an error in a map/area request; never
 silently substitute an upper-air field. Metadata is cached by that full

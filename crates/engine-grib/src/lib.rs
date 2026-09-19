@@ -662,7 +662,7 @@ impl GribEngine {
             total_steps
         );
 
-        new_catalog.refresh_parameters();
+        new_catalog.refresh_metadata();
         new_catalog.refresh_families(
             self.source
                 .config
@@ -1438,6 +1438,14 @@ impl EdrEngine for GribEngine {
 // ---------------------------------------------------------------------------
 
 impl MapEngine for GribEngine {
+    fn content_version(&self) -> u64 {
+        // Separate files can extend the same run/step and change the default
+        // level without changing either resolved time. Each view's immutable
+        // snapshot carries its own version; unrelated families keep cache hits.
+        // Nonzero also prevents explicit-TIME HTTP responses being immutable.
+        self.catalog().content_version.max(1)
+    }
+
     #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors
     fn get_raster_tile(
         &self,
@@ -1885,10 +1893,16 @@ mod tests {
             );
             let mut engine = GribEngine::new("retention", &source.config()).unwrap();
             Arc::get_mut(&mut engine.source).unwrap().config.time_window = Some("-PT2H".into());
+            let version = engine.content_version();
             engine
                 .scan_at("2026-04-05T01:00:00Z".parse().unwrap())
                 .unwrap();
             assert!(engine.get_temporal_extent().is_some());
+            assert_eq!(
+                engine.content_version(),
+                version,
+                "unchanged retention rebuild"
+            );
             if remove_index {
                 std::fs::remove_file(source.dir.join("f000.idx")).unwrap();
             }
@@ -1897,6 +1911,12 @@ mod tests {
                 .unwrap();
             assert!(engine.get_temporal_extent().is_none());
             assert!(engine.get_parameters().is_empty());
+            assert_ne!(engine.content_version(), version, "expired catalog");
+            assert_ne!(
+                engine.content_version(),
+                0,
+                "empty catalogs still revalidate"
+            );
         }
     }
 
@@ -1998,7 +2018,7 @@ mod tests {
                 steps: [(0, empty_analysis), (6, sf)].into_iter().collect(),
             },
         );
-        catalog.refresh_parameters();
+        catalog.refresh_metadata();
         engine.source.catalog.store(Arc::new(catalog));
         let params = engine.get_parameters();
         assert!(
@@ -2086,7 +2106,7 @@ mod tests {
             .unwrap()
             .messages
             .retain(|m| m.step_kind != wgrib2_index::StepKind::Instant);
-        catalog.refresh_parameters();
+        catalog.refresh_metadata();
         engine.source.catalog.store(Arc::new(catalog));
         assert_eq!(engine.raster_info().parameter, "APCP_acc_6h");
         let aggregate_only = engine
