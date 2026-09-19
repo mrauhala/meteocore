@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod catalog;
+mod diagnostics;
 pub mod index;
 pub mod reader;
 #[cfg(test)]
@@ -565,6 +566,7 @@ impl GribEngine {
 
         // Start from existing catalog for incremental merge
         let mut new_catalog = (*self.source.catalog.load_full()).clone();
+        let mut ambiguities = diagnostics::IndexAmbiguities::default();
 
         for path in &new_paths {
             // Read index file
@@ -590,9 +592,7 @@ impl GribEngine {
             let grib_url = path.as_ref().replace(index_suffix, data_suffix);
 
             // Parse the sidecar; a wgrib2 tail length is resolved on fetch.
-            let Some(parsed) =
-                Self::parse_and_resolve(self.source.index_format, content, &grib_url)
-            else {
+            let Some(parsed) = Self::parse_and_resolve(self.source.index_format, content) else {
                 continue;
             };
 
@@ -612,6 +612,14 @@ impl GribEngine {
             } else {
                 parsed.messages
             };
+
+            if self.source.index_format == index::IndexFormat::Wgrib2 {
+                ambiguities.record(
+                    &grib_url,
+                    &messages,
+                    self.source.config.level_types.as_deref(),
+                );
+            }
 
             let origin: Arc<str> = Arc::from(grib_url.as_str());
             for message in &mut messages {
@@ -644,6 +652,8 @@ impl GribEngine {
                 .unwrap()
                 .insert(path.as_ref().to_string());
         }
+
+        ambiguities.emit(&self.collection_id);
 
         // Apply time_window filtering: remove steps whose valid times fall outside the window
         if let Some(tw_str) = &self.source.config.time_window {
@@ -796,11 +806,7 @@ impl GribEngine {
     /// per index file during scan (hundreds of serial round-trips) for a
     /// record that users typically never query. Instead, the length is
     /// resolved lazily on the first actual fetch of the tail message.
-    fn parse_and_resolve(
-        format: index::IndexFormat,
-        content: &str,
-        grib_url: &str,
-    ) -> Option<index::IndexResult> {
+    fn parse_and_resolve(format: index::IndexFormat, content: &str) -> Option<index::IndexResult> {
         match format {
             index::IndexFormat::EcmwfJson => index::parse_ecmwf_json(content),
             index::IndexFormat::Wgrib2 => {
@@ -831,7 +837,7 @@ impl GribEngine {
                         source_url: None,
                         param: m.step_kind.parameter_name(&m.short_name),
                         step_kind: m.step_kind,
-                        levtype: m.levtype.to_string(),
+                        levtype: m.levtype.into_owned(),
                         level: m.level,
                         offset: m.offset,
                         length: m.length,
@@ -840,19 +846,6 @@ impl GribEngine {
 
                 if messages.is_empty() {
                     return None;
-                }
-
-                for (first, duplicate) in catalog::duplicate_message_keys(&messages) {
-                    tracing::warn!(
-                        source = grib_url,
-                        parameter = %first.param,
-                        level_type = %first.levtype,
-                        // `level` is reserved for severity in flattened JSON logs.
-                        grib_level = first.level,
-                        first_offset = first.offset,
-                        duplicate_offset = duplicate.offset,
-                        "ambiguous wgrib2 catalog key; queries select the first record; payload equivalence is unknown"
-                    );
                 }
 
                 Some(index::IndexResult {
@@ -1839,6 +1832,92 @@ mod tests {
     }
 
     #[test]
+    fn named_surfaces_do_not_alias_or_replace_missing_ground_fields() {
+        for split in [false, true] {
+            let source = TestSource::new();
+            source.write(
+                "f000",
+                &[
+                    ("TMP", "tropopause", message(0, 200.0, [0; 4], 7, 0)),
+                    ("TMP", "surface", message(0, 280.0, [0; 4], 1, 0)),
+                ],
+                0,
+            );
+            source.write(
+                "f001",
+                &[("TMP", "tropopause", message(0, 200.0, [0; 4], 7, 0))],
+                1,
+            );
+            let mut config = source.config();
+            if split {
+                config.level_types = Some(vec![
+                    GribLevelType::Single,
+                    GribLevelType::Pressure,
+                    GribLevelType::Model,
+                ]);
+            }
+            let owner = GribEngine::new("named-levels", &config).unwrap();
+            let views = owner.level_collections();
+            let engine = if split {
+                assert_eq!(views.len(), 1);
+                assert_eq!(views[0].family, Some(GribLevelType::Single));
+                &views[0]
+            } else {
+                &owner
+            };
+            assert!(engine.vertical_extent(&engine.catalog()).is_none());
+            assert_eq!(
+                engine.get_parameter_descriptions()["TMP"].label,
+                "Temperature (surface)"
+            );
+            let CoverageResponse::Single(series) = engine
+                .query_position("POINT(0.5 0.5)", None, Some(&["TMP".into()]), None, None)
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert!((series.ranges["TMP"].values[0].unwrap() - 6.85).abs() < 1e-9);
+            assert_eq!(series.ranges["TMP"].values[1], None);
+            let reference: DateTime<Utc> = "2026-04-05T00:00:00Z".parse().unwrap();
+            let CoverageResponse::Single(area) = engine
+                .query_area("0,0,1,1", Some((reference, reference)), None, None, None)
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert!(area.ranges["TMP"]
+                .values
+                .iter()
+                .all(|v| (v.unwrap() - 6.85).abs() < 1e-9));
+            let tile = engine
+                .get_raster_tile(
+                    [0.0, 0.0, 1.0, 1.0],
+                    1,
+                    1,
+                    Some(reference),
+                    &OutputCrs::Wgs84,
+                    Some("TMP"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!((tile.values.iter_values().next().unwrap().unwrap() - 6.85).abs() < 1e-9);
+            assert!(engine
+                .get_raster_tile(
+                    [0.0, 0.0, 1.0, 1.0],
+                    1,
+                    1,
+                    Some(reference + chrono::Duration::hours(1)),
+                    &OutputCrs::Wgs84,
+                    Some("TMP"),
+                    None,
+                    None,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
     fn metadata_probes_continue_without_new_indexes_and_past_failures() {
         for failures in [false, true] {
             let source = TestSource::new();
@@ -1964,12 +2043,15 @@ mod tests {
     #[test]
     fn real_gfs_index_converts_to_qualified_catalog_and_rejects_mixed_end_times() {
         let fixture = include_str!("../../../testdata/gfs/gfs.t00z.pgrb2.0p25.f006.idx");
-        let parsed =
-            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, fixture, "fixture").unwrap();
+        let parsed = GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, fixture).unwrap();
         assert_eq!(parsed.step, 6);
         assert!(parsed.messages.iter().any(|m| m.param == "APCP_acc_6h"));
         assert!(parsed.messages.iter().any(|m| m.param == "DSWRF_avg_6h"));
         let duplicates: Vec<_> = catalog::duplicate_message_keys(&parsed.messages).collect();
+        assert_eq!(duplicates.len(), 2);
+        assert!(duplicates
+            .iter()
+            .all(|(m, _)| matches!(m.param.as_str(), "APCP_acc_6h" | "ACPCP_acc_6h")));
         let (first, duplicate) = duplicates
             .iter()
             .find(|(first, _)| first.param == "APCP_acc_6h")
@@ -1986,9 +2068,76 @@ mod tests {
             426827357
         );
         let mixed = fixture.replace("0-6 hour acc fcst", "0-12 hour acc fcst");
-        assert!(
-            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, &mixed, "fixture").is_none()
-        );
+        assert!(GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, &mixed).is_none());
+    }
+
+    #[test]
+    fn reported_gfs_index_has_no_ambiguous_keys() {
+        let fixture = include_str!("../../../testdata/gfs/gfs.t00z.pgrb2.0p25.f384.idx");
+        let parsed = GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, fixture).unwrap();
+        assert_eq!(parsed.step, 384);
+        assert!(parsed.messages.len() > 300);
+        assert_eq!(catalog::duplicate_message_keys(&parsed.messages).count(), 0);
+        for message in parsed.messages.iter().filter(|m| m.level.is_none()) {
+            assert_eq!(message.level_type(), Some(GribLevelType::Single));
+        }
+        for (offset, param, levtype) in [
+            (425405878, "HGT", "sfc"),
+            (464273613, "HGT", "cloud_ceiling"),
+            (424563425, "PRES", "sfc"),
+            (465498833, "PRES", "convective_cloud_bottom"),
+            (470130954, "PRES", "convective_cloud_top"),
+            (462575838, "TCDC", "atmosphere"),
+            (477887843, "TCDC", "convective_cloud"),
+            (487869505, "PRES", "tropopause"),
+            (490779458, "HGT", "tropopause"),
+            (425898321, "TMP", "sfc"),
+            (492265846, "TMP", "tropopause"),
+            (5033274, "UGRD", "pbl"),
+            (493248351, "UGRD", "tropopause"),
+            (5640829, "VGRD", "pbl"),
+            (493955379, "VGRD", "tropopause"),
+        ] {
+            let entry = parsed.messages.iter().find(|m| m.offset == offset).unwrap();
+            assert_eq!(entry.param, param);
+            assert_eq!(entry.levtype, levtype);
+            assert_eq!(entry.level_type(), Some(GribLevelType::Single));
+        }
+        for message in parsed
+            .messages
+            .iter()
+            .filter(|m| m.levtype.starts_with("sol:"))
+        {
+            assert_eq!(message.level_type(), None);
+        }
+        for reverse in [false, true] {
+            let mut messages = parsed.messages.clone();
+            if reverse {
+                messages.reverse();
+            }
+            let mut catalog = Catalog::new();
+            catalog.runs.insert(
+                parsed.reference_time,
+                ForecastRun {
+                    reference_time: parsed.reference_time,
+                    steps: [(
+                        parsed.step,
+                        StepFile {
+                            grib_url: "fixture".into(),
+                            messages,
+                        },
+                    )]
+                    .into(),
+                },
+            );
+            catalog.refresh_metadata();
+            let keys = catalog.parameter_keys(&parsed.reference_time).unwrap();
+            assert_eq!(keys["HGT"].levtype, "sfc");
+            assert_eq!(keys["TCDC"].levtype, "atmosphere");
+            assert_eq!(keys["PRMSL"].levtype, "msl");
+            assert_eq!(keys["UGRD"].levtype, "hag");
+            assert_eq!(keys["UGRD"].level, Some(10));
+        }
     }
 
     #[test]
@@ -2000,8 +2149,7 @@ mod tests {
         .unwrap();
         let engine = GribEngine::new("aggregate-test", &cfg).unwrap();
         let index = "1:0:d=2026040800:APCP:surface:6 hour fcst:\n2:100:d=2026040800:APCP:surface:0-6 hour acc fcst:\n3:200:d=2026040800:APCP:surface:3-6 hour acc fcst:\n4:300:d=2026040800:DSWRF:surface:0-6 hour ave fcst:\n";
-        let parsed =
-            GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, index, "synthetic").unwrap();
+        let parsed = GribEngine::parse_and_resolve(index::IndexFormat::Wgrib2, index).unwrap();
         assert_eq!(catalog::duplicate_message_keys(&parsed.messages).count(), 0);
         let rt = parsed.reference_time;
         let mut sf = StepFile {

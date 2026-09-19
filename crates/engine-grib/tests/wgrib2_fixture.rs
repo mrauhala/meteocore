@@ -47,7 +47,7 @@ fn parses_real_gfs_fixture() {
         parsed
             .messages
             .iter()
-            .any(|m| m.short_name == "PRMSL" && m.levtype == "sfc"),
+            .any(|m| m.short_name == "PRMSL" && m.levtype == "msl"),
         "PRMSL at mean sea level must be present"
     );
 

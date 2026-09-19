@@ -18,6 +18,33 @@ pub struct ParameterKey {
 
 pub type ParameterKeys = BTreeMap<String, ParameterKey>;
 
+fn is_named_single_level(levtype: &str) -> bool {
+    matches!(
+        levtype,
+        "sfc"
+            | "msl"
+            | "atmosphere"
+            | "atmosphere_layer"
+            | "tropopause"
+            | "max_wind"
+            | "convective_cloud_bottom"
+            | "convective_cloud_top"
+            | "convective_cloud"
+            | "pbl"
+            | "cloud_ceiling"
+            | "zero_isotherm"
+            | "highest_freezing"
+    )
+}
+
+fn is_near_surface(levtype: &str, level: Option<u32>) -> bool {
+    match levtype {
+        "sfc" | "msl" | "atmosphere" | "atmosphere_layer" | "pbl" => true,
+        "hag" => level.is_some_and(|l| l <= 100),
+        _ => false,
+    }
+}
+
 impl ParameterKey {
     pub fn matches(&self, message: &MessageEntry) -> bool {
         self.param == message.param
@@ -40,7 +67,9 @@ pub struct MessageEntry {
     /// Preserved source statistic/window (wgrib2); JSON sidecars do not carry it.
     pub step_kind: crate::wgrib2_index::StepKind,
     /// Level type: "sfc" (surface), "hag" (height above ground),
-    /// "pl" (pressure level), "sol" (soil), "ml" (model level), "iso" (isentropic).
+    /// "pl" (pressure level), "ml" (model level), "iso" (isentropic), or a
+    /// distinct named single level. Wgrib2 soil layers use "sol:top-bottom"
+    /// in metres to retain both boundaries; ECMWF types are unchanged.
     pub levtype: String,
     /// Level value (e.g., 850 for pressure levels). None for surface.
     pub level: Option<u32>,
@@ -58,7 +87,8 @@ pub struct MessageEntry {
 impl MessageEntry {
     pub fn level_type(&self) -> Option<GribLevelType> {
         match self.levtype.as_str() {
-            "sfc" | "hag" => Some(GribLevelType::Single),
+            "hag" => Some(GribLevelType::Single),
+            named if is_named_single_level(named) => Some(GribLevelType::Single),
             "pl" if self.level.is_some() => Some(GribLevelType::Pressure),
             "ml" if self.level.is_some() => Some(GribLevelType::Model),
             _ => None,
@@ -77,16 +107,11 @@ impl MessageEntry {
         (self.surface_priority(), self.level, &self.levtype)
     }
 
-    /// True if this message represents a near-surface field — either a surface
-    /// type (`sfc`, including MSL / PBL / tropopause / entire-atmosphere in the
-    /// wgrib2 canonical mapping) or a height-above-ground level at or below
-    /// 100 m (covering 2 m temperature, 10 m / 80 m / 100 m winds).
+    /// Near-surface and column products eligible for default queries. Named
+    /// upper-air fields such as tropopause remain single-level products, but
+    /// must not take the place of surface or whole-atmosphere fields.
     pub fn is_near_surface(&self) -> bool {
-        match self.levtype.as_str() {
-            "sfc" => true,
-            "hag" => self.level.is_some_and(|l| l <= 100),
-            _ => false,
-        }
+        is_near_surface(&self.levtype, self.level)
     }
 
     /// Priority score for "how canonical is this surface for the parameter
@@ -96,10 +121,9 @@ impl MessageEntry {
     ///
     /// Rationale:
     /// - `hag` at ≤ 10 m captures the conventional 2 m temperature / 10 m
-    ///   wind defaults, so it outranks plain `sfc` (which for GFS often
-    ///   means skin temperature or planetary boundary layer values).
-    /// - `sfc` comes next (standard surface fields like surface pressure,
-    ///   precipitation rate, MSL pressure).
+    ///   wind defaults, so it outranks plain `sfc` (e.g. skin temperature).
+    /// - Ground, MSL and whole-atmosphere fields outrank named upper-air
+    ///   surfaces/layers, independent of their order in the source index.
     /// - Pressure / model / other levels come last because they represent
     ///   deliberate upper-air measurements, not a default surface view.
     pub fn surface_priority(&self) -> u8 {
@@ -107,12 +131,16 @@ impl MessageEntry {
             ("hag", Some(n)) if n <= 10 => 0,
             ("hag", Some(n)) if n <= 100 => 1,
             ("sfc", _) => 2,
-            ("hag", _) => 3,
-            ("pl", _) => 4,
-            ("ml", _) => 5,
-            ("iso", _) => 6,
-            ("sol", _) => 7,
-            _ => 8,
+            ("msl", _) => 3,
+            ("atmosphere" | "atmosphere_layer", _) => 4,
+            ("hag", _) => 5,
+            ("pbl", _) => 6,
+            (named, _) if is_named_single_level(named) => 7,
+            ("pl", _) => 8,
+            ("ml", _) => 9,
+            ("iso", _) => 10,
+            (soil, _) if soil == "sol" || soil.starts_with("sol:") => 11,
+            _ => 12,
         }
     }
 }
@@ -120,11 +148,11 @@ impl MessageEntry {
 /// Sidecars can repeat a catalog key at distinct offsets (including GFS
 /// accumulation records). Report these without assuming their payloads are
 /// equivalent or inventing a scientific discriminator absent from the index.
-pub(crate) fn duplicate_message_keys(
-    messages: &[MessageEntry],
-) -> impl Iterator<Item = (&MessageEntry, &MessageEntry)> {
+pub(crate) fn duplicate_message_keys<'a>(
+    messages: impl IntoIterator<Item = &'a MessageEntry>,
+) -> impl Iterator<Item = (&'a MessageEntry, &'a MessageEntry)> {
     let mut first = HashMap::new();
-    messages.iter().filter_map(move |message| {
+    messages.into_iter().filter_map(move |message| {
         let key = (&message.param, &message.levtype, message.level);
         match first.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -304,9 +332,7 @@ impl Catalog {
         let mut seen = std::collections::HashSet::new();
         self.all_params_with_levels()
             .into_iter()
-            .filter(|(_, levtype, level)| {
-                levtype == "sfc" || (levtype == "hag" && level.is_some_and(|l| l <= 100))
-            })
+            .filter(|(_, levtype, level)| is_near_surface(levtype, *level))
             .map(|(param, _, _)| param)
             .filter(|p| seen.insert(p.clone()))
             .collect()
