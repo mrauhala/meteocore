@@ -83,6 +83,37 @@ impl ParamMetadata {
     }
 }
 
+/// Exact metadata plus one decoded representative per (level type, name).
+/// Both indexes are updated under the source's single metadata write lock.
+#[derive(Default)]
+struct ParamMetadataCache {
+    by_level: HashMap<ParameterKey, ParamMetadata>,
+    // Nested maps allow borrowed string lookups without allocating a key on
+    // every unprobed-level request. Representatives keep their exact identity.
+    by_type: HashMap<String, HashMap<String, ParameterKey>>,
+}
+
+impl ParamMetadataCache {
+    fn insert(&mut self, key: ParameterKey, meta: ParamMetadata) {
+        self.by_level.entry(key.clone()).or_insert(meta);
+        self.by_type
+            .entry(key.levtype.clone())
+            .or_default()
+            .entry(key.param.clone())
+            .or_insert(key);
+    }
+
+    fn get(&self, key: &ParameterKey, allow_level_fallback: bool) -> Option<&ParamMetadata> {
+        self.by_level.get(key).or_else(|| {
+            if !allow_level_fallback {
+                return None;
+            }
+            let representative = self.by_type.get(&key.levtype)?.get(&key.param)?;
+            self.by_level.get(representative)
+        })
+    }
+}
+
 /// Default model run hours for ECMWF IFS (4 runs per day).
 const DEFAULT_RUN_HOURS: &[u32] = &[0, 6, 12, 18];
 
@@ -163,7 +194,7 @@ struct GribSource {
     index_format: index::IndexFormat,
     /// Parameter metadata keyed by short name AND level identity. Populated
     /// lazily on the first successful decode of each selected product.
-    param_meta: RwLock<HashMap<ParameterKey, ParamMetadata>>,
+    param_meta: RwLock<ParamMetadataCache>,
     /// Last attempted name, so failing probes cannot starve later parameters.
     probe_cursor: Mutex<Option<String>>,
 }
@@ -293,7 +324,7 @@ impl GribEngine {
                 settled_prefixes: Mutex::new(HashSet::new()),
                 last_full_scan: Mutex::new(None),
                 index_format,
-                param_meta: RwLock::new(HashMap::new()),
+                param_meta: RwLock::new(ParamMetadataCache::default()),
                 probe_cursor: Mutex::new(None),
             }),
         };
@@ -706,7 +737,10 @@ impl GribEngine {
                     let Some(keys) = catalog.parameter_keys(&run.reference_time) else {
                         continue;
                     };
-                    for key in keys.values().filter(|key| !cache.contains_key(*key)) {
+                    for key in keys
+                        .values()
+                        .filter(|key| !cache.by_level.contains_key(*key))
+                    {
                         if let Some((sf, m)) = run.steps.values().find_map(|sf| {
                             sf.messages.iter().find(|m| key.matches(m)).map(|m| (sf, m))
                         }) {
@@ -879,7 +913,7 @@ impl GribEngine {
         let short_name = &key.param;
         {
             let cache = self.source.param_meta.read().unwrap();
-            if cache.contains_key(key) {
+            if cache.by_level.contains_key(key) {
                 return;
             }
         }
@@ -913,7 +947,7 @@ impl GribEngine {
         meta.first_surface_value = grid.first_surface_value;
 
         let mut cache = self.source.param_meta.write().unwrap();
-        cache.entry(key.clone()).or_insert(meta);
+        cache.insert(key.clone(), meta);
     }
 
     /// Look up cached parameter metadata. Returns a placeholder (identity
@@ -931,16 +965,7 @@ impl GribEngine {
         let metadata = self.source.param_meta.read().unwrap();
         let mut meta = keys
             .get(short_name)
-            .and_then(|key| {
-                metadata.get(key).or_else(|| {
-                    self.vertical_kind().and_then(|_| {
-                        metadata
-                            .iter()
-                            .find(|(k, _)| k.param == key.param && k.levtype == key.levtype)
-                            .map(|(_, meta)| meta)
-                    })
-                })
-            })
+            .and_then(|key| metadata.get(key, self.vertical_kind().is_some()))
             .cloned()
             .unwrap_or_else(|| ParamMetadata::placeholder(short_name));
         // A vertical collection's parameter describes the whole axis. Its

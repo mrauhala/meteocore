@@ -185,6 +185,11 @@ Levels are exact discrete coordinates, not interpolated. Model levels are not
 converted to geometric heights. Soil-depth/isentropic axes and fractional index
 level values remain unsupported by this split.
 
+Pressure/model parameter labels and units can use a decoded level of the same
+parameter and level type while another level is unprobed; exact-level metadata
+takes precedence. These lookups use shared indexes rather than scanning every
+cached level, and do not fetch additional data.
+
 Without `level_types`, the existing collection ID and canonical-level behavior
 are preserved. Single-level and legacy parameter names select a canonical level
 per run, shared by metadata, position, area and Maps. Missing canonical fields

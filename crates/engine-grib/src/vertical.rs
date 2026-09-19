@@ -231,6 +231,105 @@ mod tests {
     }
 
     #[test]
+    fn metadata_fallback_preserves_type_name_and_exact_level_identity() {
+        let source = TestSource::new();
+        let owner = GribEngine::new("metadata", &source.config()).unwrap();
+        let view = |family: GribLevelType| GribEngine {
+            collection_id: format!("metadata-{}", family.suffix()),
+            family: Some(family),
+            source: owner.source.clone(),
+        };
+        let pressure = view(GribLevelType::Pressure);
+        let model = view(GribLevelType::Model);
+        let single = view(GribLevelType::Single);
+        let key = |name: &str, levtype: &str, level| ParameterKey {
+            param: name.into(),
+            levtype: levtype.into(),
+            level: Some(level),
+        };
+        let lookup = |engine: &GribEngine, key: ParameterKey| {
+            engine.param_metadata_for(
+                &[(key.param.clone(), key.clone())].into_iter().collect(),
+                &key.param,
+            )
+        };
+        let mut grid =
+            reader::decode_message(&message(0, 280.0, [0; 4], 100, 50000), "FIELD").unwrap();
+        owner.populate_metadata(
+            &key("FIELD", "pl", 500),
+            &grid,
+            wgrib2_index::StepKind::Average { start: 0, end: 6 },
+        );
+        // Distinct WMO units under the same provider name must not leak
+        // between the pressure and model indexes.
+        grid.triple = (0, 2, 2); // u-component of wind
+        grid.first_surface_type = 105;
+        grid.first_surface_value = Some(1.0);
+        owner.populate_metadata(
+            &key("FIELD", "ml", 1),
+            &grid,
+            wgrib2_index::StepKind::Instant,
+        );
+
+        let fallback = lookup(&pressure, key("FIELD", "pl", 850));
+        assert_eq!(fallback.source_unit, SourceUnit::Kelvin);
+        assert!((fallback.display.convert(280.0) - 6.85).abs() < 1e-9);
+        assert!(fallback.label().contains("6 h average"));
+        assert_eq!(fallback.first_surface_type, None);
+        assert_eq!(fallback.first_surface_value, None);
+        let model_meta = lookup(&model, key("FIELD", "ml", 137));
+        assert_eq!(model_meta.source_unit, SourceUnit::MetresPerSecond);
+        assert_eq!(model_meta.window_qualifier, None);
+        for missing in [key("OTHER", "pl", 500), key("FIELD", "sol", 500)] {
+            let meta = lookup(&pressure, missing.clone());
+            assert_eq!(meta.label(), missing.param);
+            assert_eq!(meta.display.display_unit, "");
+        }
+
+        // Once the exact level is decoded its own metadata takes precedence,
+        // without changing the representative used for other unprobed levels.
+        grid.triple = (0, 3, 0); // pressure
+        grid.first_surface_type = 100;
+        grid.first_surface_value = Some(85000.0);
+        owner.populate_metadata(
+            &key("FIELD", "pl", 850),
+            &grid,
+            wgrib2_index::StepKind::Instant,
+        );
+        assert_eq!(
+            lookup(&pressure, key("FIELD", "pl", 850)).source_unit,
+            SourceUnit::Pascal
+        );
+        assert_eq!(
+            lookup(&pressure, key("FIELD", "pl", 700)).source_unit,
+            SourceUnit::Kelvin
+        );
+
+        grid.triple = (0, 0, 0);
+        grid.first_surface_type = 103;
+        grid.first_surface_value = Some(2.0);
+        owner.populate_metadata(
+            &key("FIELD", "hag", 2),
+            &grid,
+            wgrib2_index::StepKind::Instant,
+        );
+        for engine in [&single, &owner] {
+            assert!(lookup(engine, key("FIELD", "hag", 2))
+                .label()
+                .contains("2 m above ground"));
+            assert_eq!(
+                lookup(engine, key("FIELD", "hag", 10)).display.display_unit,
+                ""
+            );
+        }
+        assert_eq!(
+            owner.storage_bytes_read(),
+            0,
+            "metadata lookup must not fetch data"
+        );
+    }
+
+    #[test]
     fn render_version_follows_late_default_levels_without_churning_other_families() {
         for (family, surface, first, first_encoded, later, later_encoded) in [
             (

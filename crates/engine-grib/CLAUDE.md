@@ -90,6 +90,10 @@ probes and all query paths share these selectors. A missing canonical level
 is null in a position series and an error in a map/area request; never
 silently substitute an upper-air field. Metadata is cached by that full
 identity, so historical runs with different selected levels keep their labels.
+Pressure/model views may reuse metadata from a decoded level of the same
+parameter and level type until the exact level is decoded. Keep this fallback
+indexed alongside the exact cache under one lock; never scan all cached levels
+on the request path. Single-level and legacy views require exact metadata.
 
 ## v1 limitations (GFS)
 
