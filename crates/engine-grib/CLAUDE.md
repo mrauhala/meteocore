@@ -25,6 +25,14 @@ unlike GeoTIFF's one band per collection.
 - Wgrib2 indexes carry only byte offsets — the last record's length is
   resolved via `DataStore::head()` on fetch. A failed HEAD/read is not cached
   and remains retryable; scanning does not issue a HEAD per index.
+- Fetch new indexes through `DataStore::get_many` in chunks of at most eight.
+  Bound the chunk as well as concurrency so raw sidecar bodies do not collect
+  for the entire scan. Merge in sorted path order, regardless of completion
+  order; mark only successfully parsed indexes as known. Failed reads/parses
+  remain eligible when their prefix is next listed. Do not add per-index HEADs.
+  The ignored `scan_tests::index_scan_latency_replay` test compares one versus
+  eight concurrent reads over 120 indexes with 150 ms simulated GET latency.
+  Run with `--ignored --nocapture`; timings are measurements, not CI gates.
 - Parameter metadata populates lazily: `scan_once` runs a bounded
   eager-probe (≤32 messages per scan) across the newest run's step
   files. Pending probes continue even without new indexes, rotating past
