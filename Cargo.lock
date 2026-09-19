@@ -1489,11 +1489,13 @@ name = "engine-grib"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "chrono",
  "ds-cache",
  "ds-core",
  "ds-poll",
  "ds-storage",
+ "futures",
  "grib",
  "serde",
  "serde_json",

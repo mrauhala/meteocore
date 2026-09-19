@@ -5,6 +5,8 @@ pub mod index;
 mod position;
 pub mod reader;
 #[cfg(test)]
+mod scan_tests;
+#[cfg(test)]
 mod test_support;
 mod time_window;
 pub mod units;
@@ -121,6 +123,10 @@ const DEFAULT_RUN_HOURS: &[u32] = &[0, 6, 12, 18];
 
 /// Number of days to scan back (today + yesterday handles overnight transitions).
 const SCAN_DAYS: u32 = 2;
+
+/// Bound both in-flight index GETs and the number of sidecar bodies retained
+/// before parsing. Shared by all level collections of a source.
+const INDEX_FETCH_CONCURRENCY: usize = 8;
 
 /// How often to force a full re-list of all run prefixes, ignoring the settled
 /// skip. NWP runs publish sequentially so older runs are normally static, but a
@@ -569,89 +575,111 @@ impl GribEngine {
         let mut new_catalog = (*self.source.catalog.load_full()).clone();
         let mut ambiguities = diagnostics::IndexAmbiguities::default();
 
-        for path in &new_paths {
-            // Read index file
-            let bytes = match self.source.store.get(path) {
-                Ok(b) => b,
+        // Fetch one bounded chunk at a time: get_many retains the completed
+        // bodies until it returns. Results are in input order, preserving the
+        // sorted merge order even when downloads finish out of order.
+        for chunk in new_paths.chunks(INDEX_FETCH_CONCURRENCY) {
+            // No HEAD per sidecar: the indexes are already listed and only
+            // their contents are needed. Each GET keeps its own timeout.
+            let results = match self
+                .source
+                .store
+                .get_many(chunk, INDEX_FETCH_CONCURRENCY, None)
+            {
+                Ok(results) => results,
                 Err(e) => {
                     tracing::warn!(
-                        "Collection '{}': failed to read index file {}: {}",
+                        "Collection '{}': index batch fetch failed: {}",
                         self.collection_id,
-                        path,
                         e
                     );
                     continue;
                 }
             };
+            for (path, result) in chunk.iter().zip(results) {
+                let bytes = match result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Collection '{}': failed to read index file {}: {}",
+                            self.collection_id,
+                            path,
+                            e
+                        );
+                        continue;
+                    }
+                };
 
-            let content = match std::str::from_utf8(&bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+                let content = match std::str::from_utf8(&bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
 
-            // Derive GRIB file URL from index file path
-            let grib_url = path.as_ref().replace(index_suffix, data_suffix);
+                // Derive GRIB file URL from index file path
+                let grib_url = path.as_ref().replace(index_suffix, data_suffix);
 
-            // Parse the sidecar; a wgrib2 tail length is resolved on fetch.
-            let Some(parsed) = Self::parse_and_resolve(self.source.index_format, content) else {
-                continue;
-            };
+                // Parse the sidecar; a wgrib2 tail length is resolved on fetch.
+                let Some(parsed) = Self::parse_and_resolve(self.source.index_format, content)
+                else {
+                    continue;
+                };
 
-            let ref_time = parsed.reference_time;
+                let ref_time = parsed.reference_time;
 
-            // Filter messages if param_filter is set
-            let mut messages: Vec<_> = if let Some(filter) = &self.source.param_filter {
-                parsed
-                    .messages
-                    .into_iter()
-                    .filter(|m| {
-                        filter
-                            .iter()
-                            .any(|p| *p == m.param || m.step_kind.parameter_name(p) == m.param)
+                // Filter messages if param_filter is set
+                let mut messages: Vec<_> = if let Some(filter) = &self.source.param_filter {
+                    parsed
+                        .messages
+                        .into_iter()
+                        .filter(|m| {
+                            filter
+                                .iter()
+                                .any(|p| *p == m.param || m.step_kind.parameter_name(p) == m.param)
+                        })
+                        .collect()
+                } else {
+                    parsed.messages
+                };
+
+                if self.source.index_format == index::IndexFormat::Wgrib2 {
+                    ambiguities.record(
+                        &grib_url,
+                        &messages,
+                        self.source.config.level_types.as_deref(),
+                    );
+                }
+
+                let origin: Arc<str> = Arc::from(grib_url.as_str());
+                for message in &mut messages {
+                    message.source_url = Some(origin.clone());
+                }
+
+                let run = new_catalog
+                    .runs
+                    .entry(ref_time)
+                    .or_insert_with(|| ForecastRun {
+                        reference_time: ref_time,
+                        steps: BTreeMap::new(),
+                    });
+
+                // Providers may publish separate surface/pressure/model files,
+                // or one file per parameter, for the same valid time.
+                run.steps
+                    .entry(parsed.step)
+                    .or_insert_with(|| StepFile {
+                        grib_url,
+                        messages: Vec::new(),
                     })
-                    .collect()
-            } else {
-                parsed.messages
-            };
+                    .messages
+                    .extend(messages);
 
-            if self.source.index_format == index::IndexFormat::Wgrib2 {
-                ambiguities.record(
-                    &grib_url,
-                    &messages,
-                    self.source.config.level_types.as_deref(),
-                );
+                // Mark as known
+                self.source
+                    .known_indexes
+                    .lock()
+                    .unwrap()
+                    .insert(path.as_ref().to_string());
             }
-
-            let origin: Arc<str> = Arc::from(grib_url.as_str());
-            for message in &mut messages {
-                message.source_url = Some(origin.clone());
-            }
-
-            let run = new_catalog
-                .runs
-                .entry(ref_time)
-                .or_insert_with(|| ForecastRun {
-                    reference_time: ref_time,
-                    steps: BTreeMap::new(),
-                });
-
-            // Providers may publish separate surface/pressure/model files,
-            // or one file per parameter, for the same valid time.
-            run.steps
-                .entry(parsed.step)
-                .or_insert_with(|| StepFile {
-                    grib_url,
-                    messages: Vec::new(),
-                })
-                .messages
-                .extend(messages);
-
-            // Mark as known
-            self.source
-                .known_indexes
-                .lock()
-                .unwrap()
-                .insert(path.as_ref().to_string());
         }
 
         ambiguities.emit(&self.collection_id);
