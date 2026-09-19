@@ -104,10 +104,14 @@ where
         _permit: permit,
         _admission: admission,
     };
+    let work = move || {
+        let _deadline = ds_core::deadline::enter(Some(deadline));
+        work(budget)
+    };
     let task = if blocking {
-        executor.runtime.spawn_blocking(move || work(budget))
+        executor.runtime.spawn_blocking(work)
     } else {
-        executor.runtime.spawn(async move { work(budget) })
+        executor.runtime.spawn(async move { work() })
     };
     // Keep the permit in the task even after timeout/disconnect: synchronous
     // work may still be running. Never turn a timeout into extra concurrency.
@@ -120,6 +124,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn engine_work_receives_the_same_absolute_deadline() {
+        let executor = Executor::new();
+        for blocking in [false, true] {
+            run_on(&executor, blocking, Duration::from_secs(2), |budget| {
+                assert_eq!(ds_core::deadline::current(), Some(budget.deadline));
+                assert!(ds_core::deadline::check().is_ok());
+            })
+            .await
+            .unwrap();
+        }
+        executor.runtime.shutdown_background();
+    }
 
     #[tokio::test]
     async fn timed_out_work_keeps_its_slot_and_stops_fanout() {

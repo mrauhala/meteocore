@@ -154,3 +154,22 @@ near-surface product before considering acc/ave records, regardless of index
 ordering. Aggregate-only collections fall back to their first aggregate;
 upper-air-only collections to their first message. Raster metadata and actual
 rendering share `StepFile::default_message` so default labels/units agree.
+
+## Position queries
+
+- `query_positions` samples every requested coordinate from each field once,
+  even when the decoded-grid cache is disabled or smaller than the forecast
+  window. Single-point, single-level and profile queries share this path.
+- Keep at most four field fetch/decode jobs in flight per admitted EDR query.
+  Jobs run on the dedicated query runtime with `block_in_place`, including
+  synchronous cache-fill waits; never move storage calls to `spawn_blocking`.
+  Direct off-runtime callers share one fallback runtime.
+- Propagate the absolute EDR deadline to each job and its storage calls. Stop
+  dispatching at expiry and drain running jobs before releasing query admission.
+- Validate all coordinates and the complete points × times × levels × parameters
+  value budget before fetching. Preserve point/time/level ordering regardless of
+  job completion order, and sample missing fields as null for every point.
+- Run the ignored `position::tests::position_latency_replay` test with
+  `--ignored --nocapture` to compare serial and batched reads over 120 steps,
+  with 150 ms simulated per-read latency and the grid cache disabled. It checks
+  equal samples and prints timings/bytes; wall-clock times are not CI gates.

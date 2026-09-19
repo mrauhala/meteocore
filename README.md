@@ -773,6 +773,14 @@ Requested times use the newest run whose published valid-time extent contains
 the request, snapping to the nearest step within that extent. A pinned run never
 falls back to another run.
 
+Position queries fetch/decode each field once for all requested coordinates,
+including `MULTIPOINT`, with at most four field jobs in flight per query. Reads
+share the 30-second EDR deadline. Repeating a query at another coordinate reuses
+decoded fields that still fit in the source's shared cache; a long forecast
+window can exceed that cache and require reads again. After compact decoding,
+120 global 0.25° fields still occupy about 475 MiB, exceeding the default
+`grid_cache_mb = 256` even for one parameter at one level.
+
 **Automatic unit conversion** (config-free):
 
 Unit conversion is driven by the WMO `(discipline, category, parameter_number)` triple read from each GRIB message, not by short-name tables. Source units come from WMO Code Table 4.2 plus per-center overlays for local parameter numbers 192–254.

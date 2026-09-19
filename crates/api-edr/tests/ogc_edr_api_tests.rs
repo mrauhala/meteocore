@@ -1722,6 +1722,137 @@ mod request_budget {
         }
     }
 
+    struct BatchEngine {
+        calls: Arc<AtomicUsize>,
+        deadline: bool,
+    }
+
+    impl EdrEngine for BatchEngine {
+        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            MockEngine.get_locations()
+        }
+        fn get_parameters(&self) -> Vec<String> {
+            MockEngine.get_parameters()
+        }
+        fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+            MockEngine.get_temporal_extent()
+        }
+        fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+            MockEngine.get_spatial_extent()
+        }
+        fn supported_query_types(&self) -> Vec<String> {
+            vec!["position".into()]
+        }
+        fn query_location(
+            &self,
+            id: &str,
+            dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+            p: Option<&[String]>,
+            z: Option<&[f64]>,
+            rt: Option<DateTime<Utc>>,
+        ) -> Result<CoverageResponse, DataServerError> {
+            MockEngine.query_location(id, dt, p, z, rt)
+        }
+        fn query_position(
+            &self,
+            _: &str,
+            _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+            _: Option<&[String]>,
+            _: Option<&[f64]>,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<CoverageResponse, DataServerError> {
+            panic!("handler bypassed the batch override")
+        }
+        fn query_positions(
+            &self,
+            points: &[String],
+            _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+            _: Option<&[String]>,
+            _: Option<&[f64]>,
+            _: Option<DateTime<Utc>>,
+            emit: &mut dyn FnMut(CoverageResponse) -> Result<(), DataServerError>,
+        ) -> Result<(), DataServerError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.deadline {
+                return Err(DataServerError::DeadlineExceeded);
+            }
+            for point in points {
+                let (lat, lon) = ds_core::feature::parse_point_coords(point)?;
+                let mut result = MockEngine::sample_query_result();
+                let DomainDescription::PointSeries { x, y, .. } = &mut result.domain else {
+                    panic!()
+                };
+                *x = lon;
+                *y = lat;
+                emit(CoverageResponse::Single(result))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn position_handler_uses_one_batch_and_preserves_point_order() {
+        for (coords, count) in [("POINT(1%202)", 1), ("MULTIPOINT(1%202,3%204,5%206)", 3)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let app = api_edr::router(make_edr_state(Arc::new(BatchEngine {
+                calls: calls.clone(),
+                deadline: false,
+            })));
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/collections/weather/position?coords={coords}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            if count == 1 {
+                assert_eq!(json["type"], "Coverage");
+                assert_eq!(json["domain"]["axes"]["x"]["values"][0], 1.0);
+            } else {
+                assert_eq!(json["type"], "CoverageCollection");
+                let coverages = json["coverages"].as_array().unwrap();
+                assert_eq!(coverages.len(), count);
+                for (i, coverage) in coverages.iter().enumerate() {
+                    assert_eq!(
+                        coverage["domain"]["axes"]["x"]["values"][0],
+                        (i * 2 + 1) as f64
+                    );
+                    assert_eq!(
+                        coverage["domain"]["axes"]["y"]["values"][0],
+                        (i * 2 + 2) as f64
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_deadline_maps_to_query_timeout() {
+        let app = api_edr::router(make_edr_state(Arc::new(BatchEngine {
+            calls: Arc::new(AtomicUsize::new(0)),
+            deadline: true,
+        })));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/weather/position?coords=POINT(1%202)")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "Timeout");
+    }
+
     #[tokio::test]
     async fn coordinate_limits_reject_before_any_engine_call() {
         let calls = Arc::new(AtomicUsize::new(0));
