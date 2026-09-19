@@ -786,6 +786,13 @@ window can exceed that cache and require reads again. After compact decoding,
 120 global 0.25° fields still occupy about 475 MiB, exceeding the default
 `grid_cache_mb = 256` even for one parameter at one level.
 
+Area and radius queries also load up to four parameter/level fields concurrently.
+The first field determines the grid and supplies its own output values; it is
+not fetched twice when the cache is disabled. The combined output and polygon
+mask budgets are checked before loading the remaining fields. These jobs share
+the EDR deadline and preserve requested level order, missing-field nulls and
+polygon masking.
+
 **Automatic unit conversion** (config-free):
 
 Unit conversion is driven by the WMO `(discipline, category, parameter_number)` triple read from each GRIB message, not by short-name tables. Source units come from WMO Code Table 4.2 plus per-center overlays for local parameter numbers 192–254.

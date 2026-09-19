@@ -166,6 +166,14 @@ workers share the existing 30-second EDR deadline; expiry stops new reads and
 returns 504. Other engines retain their sequential position behavior through the
 default batch hook, with combined output limits checked after each point.
 
+GRIB area/radius queries use the same four-worker limit across parameter/level
+fields. One initial field supplies both geometry and values, including with the
+cache disabled. The 1M-value and polygon-mask budgets are checked before
+allocating the output values or fetching further fields. Results preserve
+requested level order and polygon holes; incompatible grids remain errors.
+On error or deadline expiry, dispatch stops and active workers drain before
+query admission is released.
+
 GRIB wgrib2 accumulation and average fields use duration-qualified parameter
 names, for example `APCP_acc_6h`, `APCP_acc_3h` and `DSWRF_avg_6h`. The time axis
 is the **window end**, with the duration in the parameter label/name; the start

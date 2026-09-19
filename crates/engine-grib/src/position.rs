@@ -1,12 +1,9 @@
 //! Sample every requested coordinate while each forecast field is resident.
 
-use tokio::task::JoinSet;
-
 use super::*;
+#[cfg(test)]
 use crate::runtime::run_fetches;
-
-// Per admitted EDR query: bound simultaneous fetches, decodes and live grids.
-const POSITION_CONCURRENCY: usize = 4;
+use crate::runtime::run_field_jobs;
 
 impl GribEngine {
     pub(crate) fn query_batched_positions(
@@ -177,87 +174,57 @@ impl GribEngine {
         level_keys: &[Arc<ParameterKeys>],
         coords: &Arc<Vec<(f64, f64)>>,
     ) -> Result<Vec<Vec<Option<f64>>>, DataServerError> {
-        let deadline = ds_core::deadline::current();
         let mut samples = vec![vec![None; steps.len() * level_keys.len()]; coords.len()];
-        let mut fields = steps
+        let fields = steps
             .iter()
             .flat_map(|(_, file)| level_keys.iter().map(move |keys| (*file, keys)))
-            .enumerate();
-        run_fetches(async {
-            let mut jobs = JoinSet::new();
-            let mut exhausted = false;
-            let mut fatal = None;
-            loop {
-                if let Err(error) = ds_core::deadline::check() {
-                    fatal = Some(error);
-                }
-                while jobs.len() < POSITION_CONCURRENCY && !exhausted && fatal.is_none() {
-                    let Some((index, (file, keys))) = fields.next() else {
-                        exhausted = true;
-                        break;
-                    };
-                    let Some(entry) = keys
-                        .get(name)
-                        .and_then(|key| file.messages.iter().find(|m| key.matches(m)))
-                    else {
-                        continue; // missing canonical field stays null at every point
-                    };
-                    let url = file.message_url(entry).to_owned();
-                    let entry = entry.clone();
-                    let engine = self.clone();
-                    let coords = coords.clone();
-                    let keys = keys.clone();
-                    let name = name.to_owned();
-                    jobs.spawn(async move {
-                        // Cache single-flight waiters are synchronous too. Free
-                        // this runtime worker during the whole operation, so
-                        // waiting for another fill cannot starve its I/O driver.
-                        tokio::task::block_in_place(|| {
-                            let _deadline = ds_core::deadline::enter(deadline);
-                            ds_core::deadline::check()?;
-                            let result = engine.fetch_grid_by_entry(&url, &entry);
-                            ds_core::deadline::check()?;
-                            let values = result.map(|grid| {
-                                let meta = engine.param_metadata_for(&keys, &name);
-                                coords
-                                    .iter()
-                                    .map(|&(lon, lat)| {
-                                        grid.bilinear_value(lon, lat)
-                                            .map(|v| meta.display.convert(v))
-                                    })
-                                    .collect::<Vec<_>>()
-                            });
-                            Ok::<_, DataServerError>((index, name, values))
+            .enumerate()
+            .filter_map(|(index, (file, keys))| {
+                let entry = keys
+                    .get(name)
+                    .and_then(|key| file.messages.iter().find(|m| key.matches(m)))?;
+                Some((
+                    index,
+                    file.message_url(entry).to_owned(),
+                    entry.clone(),
+                    keys.clone(),
+                ))
+            });
+        let engine = self.clone();
+        let coords = coords.clone();
+        let parameter = name.to_owned();
+        run_field_jobs(
+            fields,
+            move |(index, url, entry, keys)| {
+                // Missing/unreadable fields stay null in position series. Deadlines
+                // and worker failures are fatal and are handled by the scheduler.
+                let values = engine.fetch_grid_by_entry(&url, &entry).map(|grid| {
+                    let meta = engine.param_metadata_for(&keys, &parameter);
+                    coords
+                        .iter()
+                        .map(|&(lon, lat)| {
+                            grid.bilinear_value(lon, lat)
+                                .map(|v| meta.display.convert(v))
                         })
-                    });
-                }
-                let Some(result) = jobs.join_next().await else {
-                    break;
-                };
-                match result {
-                    Ok(Ok((index, _, Ok(values)))) => {
+                        .collect::<Vec<_>>()
+                });
+                Ok((index, values))
+            },
+            |(index, values)| {
+                match values {
+                    Ok(values) => {
                         for (point, value) in samples.iter_mut().zip(values) {
                             point[index] = value;
                         }
                     }
-                    Ok(Ok((_, name, Err(error)))) => {
-                        tracing::debug!(parameter = name, error = %error, "GRIB position field unavailable");
-                    }
-                    Ok(Err(error)) => fatal = Some(error),
                     Err(error) => {
-                        fatal = Some(DataServerError::Engine(format!(
-                            "GRIB position worker failed: {error}"
-                        )))
+                        tracing::debug!(parameter = name, error = %error, "GRIB position field unavailable")
                     }
                 }
-                // On failure/deadline, drain running workers before returning:
-                // the EDR admission permit must outlive all of this query's I/O.
-            }
-            match fatal {
-                Some(error) => Err(error),
-                None => Ok(samples),
-            }
-        })
+                Ok(())
+            },
+        )?;
+        Ok(samples)
     }
 }
 
