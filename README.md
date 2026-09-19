@@ -725,7 +725,7 @@ in the indexed data (after the `parameters` filter):
 
 | Collection | Fields | Vertical axis |
 |---|---|---|
-| `forecast-single` | Surface and fixed-height products, including 2 m temperature, 10 m wind and precipitation | None |
+| `forecast-single` | Surface, fixed-height and named surface/layer products, including 2 m temperature, 10 m wind and precipitation | None |
 | `forecast-pressure` | Isobaric fields (`pl`) | Pressure in hPa |
 | `forecast-model` | Model/hybrid fields (`ml`) | Model level number, dimensionless |
 
@@ -756,6 +756,15 @@ its labels retain qualifiers such as “2 m above ground”. Pressure/model para
 labels describe the field without fixing it to one level. Soil-depth and
 isentropic fields are outside these three families; index levels must be
 non-negative integers (e.g. fractional pressure levels are not supported).
+
+Wgrib2 named surfaces retain distinct identities: ground, mean sea level,
+whole atmosphere, tropopause, cloud ceiling and other named levels are not
+aliases. Canonical selection prefers ground/MSL/whole-atmosphere products over
+named upper-air products, while retaining the usual 2 m/10 m defaults. Soil
+layers retain both depth boundaries internally, even in the legacy view.
+Genuine repeated keys produce one warning summary per scan after parameter
+and level-family filtering, with per-record details at DEBUG; the index alone
+cannot establish whether the payloads match.
 
 A runnable example using the committed pressure-level fixture is
 [`testdata/grib-local/split-levels.toml`](testdata/grib-local/split-levels.toml).

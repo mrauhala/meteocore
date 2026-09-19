@@ -42,8 +42,15 @@ unlike GeoTIFF's one band per collection.
 - Family catalogs, run-level lists and collection-level unions are built on
   the scan path and published with the source catalog. Drop empty steps/runs
   in each family: run selection and instances must reflect that family's data.
-- Single: `sfc`/`hag`, no vertical axis; pressure: `pl`, hPa; model: `ml`,
-  ordinal model/hybrid numbers. Soil/isentropic/fractional levels are excluded.
+- Single: surface, fixed-height and named surface/layer products, no vertical
+  axis; pressure: `pl`, hPa; model: `ml`, ordinal model/hybrid numbers.
+  Soil/isentropic/fractional levels are excluded.
+- Wgrib2 named levels retain distinct level types (ground, MSL, whole
+  atmosphere, tropopause, cloud ceiling, etc.). Never alias them all to `sfc`.
+  Ground/MSL/whole-atmosphere products outrank named upper-air products for
+  canonical selection, independent of index order. Soil layers retain both
+  metre boundaries in `sol:top-bottom`; their integer level is only a legacy
+  ordering hint, not the layer identity or an exposed vertical coordinate.
 - `StepFile` can combine several source files at one run/step. Always use
   `StepFile::message_url(entry)` for reads; offsets are local to that origin.
 - Each catalog carries a nonzero render content version, hashed on the scan
@@ -110,9 +117,11 @@ on the request path. Single-level and legacy views require exact metadata.
   its window variants; an exact key selects one duration. Discover keys
   from the collection before querying. Existing max/min keys remain unchanged.
   Repeated identical catalog keys at different offsets are ambiguous (the real
-  GFS fixture has two `APCP_acc_6h` surface records). Scan logs a warning with
-  both offsets; queries preserve first-record selection. The index alone cannot
-  establish payload equivalence or expose an omitted product discriminator.
+  GFS f006 fixture has repeated `APCP_acc_6h` and `ACPCP_acc_6h` surface records).
+  After parameter/family filtering, scan emits at most one warning summarizing
+  ambiguous files/records with an example and both offsets; full per-record
+  details are DEBUG. Queries preserve first-record selection. The index alone
+  cannot establish payload equivalence or expose an omitted product discriminator.
   Log the optional vertical level as `grib_level`, never `level`: flattened
   JSON reserves `level` for severity, and a duplicate key hides WARN in Loki.
 - Source units still come from the decoded WMO triple: no automatic division

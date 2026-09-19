@@ -16,3 +16,6 @@ ds-cache = { path = "../ds-cache" }
 tracing = "0.1"
 tokio = { version = "1", features = ["sync"] }
 thiserror = "2"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["json"] }

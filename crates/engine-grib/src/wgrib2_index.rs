@@ -11,6 +11,8 @@
 
 #![allow(dead_code)]
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, TimeZone, Utc};
 
 /// Maximum plausible GRIB2 message length. Anything larger indicates a
@@ -67,7 +69,7 @@ impl StepKind {
 #[derive(Debug, Clone)]
 pub struct ParsedMessage {
     pub short_name: String,
-    pub levtype: &'static str,
+    pub levtype: Cow<'static, str>,
     pub level: Option<u32>,
     pub offset: u64,
     pub length: Option<u64>,
@@ -86,24 +88,27 @@ pub struct WgribIndexResult {
 ///
 /// Returns `(canonical_levtype, Option<level_value>)` or `None` if the
 /// descriptor is not recognised.
-pub fn level_desc_to_canonical(desc: &str) -> Option<(&'static str, Option<u32>)> {
+pub fn level_desc_to_canonical(desc: &str) -> Option<(Cow<'static, str>, Option<u32>)> {
     let lower = desc.trim().to_ascii_lowercase();
 
-    // Surface-like aliases with no numeric level.
+    // These are distinct fixed surfaces/layers, not aliases for the ground.
+    // Keep their identities even though they share the no-axis collection.
     match lower.as_str() {
-        "surface" => return Some(("sfc", None)),
-        "mean sea level" => return Some(("sfc", None)),
-        "entire atmosphere" => return Some(("sfc", None)),
-        "entire atmosphere (considered as a single layer)" => return Some(("sfc", None)),
-        "tropopause" => return Some(("sfc", None)),
-        "max wind" => return Some(("sfc", None)),
-        "convective cloud bottom level" => return Some(("sfc", None)),
-        "convective cloud top level" => return Some(("sfc", None)),
-        "convective cloud layer" => return Some(("sfc", None)),
-        "planetary boundary layer" => return Some(("sfc", None)),
-        "cloud ceiling" => return Some(("sfc", None)),
-        "0c isotherm" => return Some(("sfc", None)),
-        "highest tropospheric freezing level" => return Some(("sfc", None)),
+        "surface" => return Some(("sfc".into(), None)),
+        "mean sea level" => return Some(("msl".into(), None)),
+        "entire atmosphere" => return Some(("atmosphere".into(), None)),
+        "entire atmosphere (considered as a single layer)" => {
+            return Some(("atmosphere_layer".into(), None))
+        }
+        "tropopause" => return Some(("tropopause".into(), None)),
+        "max wind" => return Some(("max_wind".into(), None)),
+        "convective cloud bottom level" => return Some(("convective_cloud_bottom".into(), None)),
+        "convective cloud top level" => return Some(("convective_cloud_top".into(), None)),
+        "convective cloud layer" => return Some(("convective_cloud".into(), None)),
+        "planetary boundary layer" => return Some(("pbl".into(), None)),
+        "cloud ceiling" => return Some(("cloud_ceiling".into(), None)),
+        "0c isotherm" => return Some(("zero_isotherm".into(), None)),
+        "highest tropospheric freezing level" => return Some(("highest_freezing".into(), None)),
         _ => {}
     }
 
@@ -111,7 +116,7 @@ pub fn level_desc_to_canonical(desc: &str) -> Option<(&'static str, Option<u32>)
     // "{N} m above ground"
     if let Some(rest) = lower.strip_suffix(" m above ground") {
         if let Some(n) = parse_nonneg_float_to_u32(rest) {
-            return Some(("hag", Some(n)));
+            return Some(("hag".into(), Some(n)));
         }
         return None;
     }
@@ -119,7 +124,7 @@ pub fn level_desc_to_canonical(desc: &str) -> Option<(&'static str, Option<u32>)
     // "{N} mb"
     if let Some(rest) = lower.strip_suffix(" mb") {
         if let Some(n) = parse_nonneg_float_to_u32(rest) {
-            return Some(("pl", Some(n)));
+            return Some(("pl".into(), Some(n)));
         }
         return None;
     }
@@ -127,7 +132,7 @@ pub fn level_desc_to_canonical(desc: &str) -> Option<(&'static str, Option<u32>)
     // "{N} hybrid level"
     if let Some(rest) = lower.strip_suffix(" hybrid level") {
         if let Some(n) = parse_nonneg_float_to_u32(rest) {
-            return Some(("ml", Some(n)));
+            return Some(("ml".into(), Some(n)));
         }
         return None;
     }
@@ -135,7 +140,7 @@ pub fn level_desc_to_canonical(desc: &str) -> Option<(&'static str, Option<u32>)
     // "{N} sigma level"
     if let Some(rest) = lower.strip_suffix(" sigma level") {
         if let Some(n) = parse_nonneg_float_to_u32(rest) {
-            return Some(("ml", Some(n)));
+            return Some(("ml".into(), Some(n)));
         }
         return None;
     }
@@ -143,20 +148,27 @@ pub fn level_desc_to_canonical(desc: &str) -> Option<(&'static str, Option<u32>)
     // "{N} K level" (isentropic). Use case-insensitive match on the "K".
     if let Some(rest) = lower.strip_suffix(" k level") {
         if let Some(n) = parse_nonneg_float_to_u32(rest) {
-            return Some(("iso", Some(n)));
+            return Some(("iso".into(), Some(n)));
         }
         return None;
     }
 
-    // "{N}-{M} m below ground"
+    // Soil layers need both exact boundaries in their identity. The numeric
+    // level remains the coarse lower-depth ordering hint used by the legacy
+    // view; it is not a soil axis (soil is excluded from level collections).
     if let Some(rest) = lower.strip_suffix(" m below ground") {
-        // rest is "{N}-{M}"
-        if let Some((a, _b)) = rest.split_once('-') {
-            if let Some(n) = parse_nonneg_float_floor_u32(a) {
-                return Some(("sol", Some(n)));
-            }
+        let (top, bottom) = rest.split_once('-')?;
+        let top: f64 = top.trim().parse().ok()?;
+        let bottom: f64 = bottom.trim().parse().ok()?;
+        if !top.is_finite()
+            || !bottom.is_finite()
+            || top < 0.0
+            || bottom <= top
+            || top > u32::MAX as f64
+        {
+            return None;
         }
-        return None;
+        return Some((format!("sol:{top}-{bottom}").into(), Some(top as u32)));
     }
 
     None
@@ -182,20 +194,6 @@ fn parse_nonneg_float_to_u32(s: &str) -> Option<u32> {
     }
     // Fractional value that does not round cleanly: skip this record.
     None
-}
-
-/// Parse a non-negative numeric value and floor it to u32. Used for
-/// "{N}-{M} m below ground" where depths may be decimal.
-fn parse_nonneg_float_floor_u32(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if let Ok(n) = s.parse::<u32>() {
-        return Some(n);
-    }
-    let f: f64 = s.parse().ok()?;
-    if !f.is_finite() || f < 0.0 || f > u32::MAX as f64 {
-        return None;
-    }
-    Some(f.floor() as u32)
 }
 
 /// Parse a "d=YYYYMMDDHH" reference-time token.
@@ -494,46 +492,34 @@ mod tests {
     // ---------- Level descriptor tests ----------
 
     #[test]
-    fn level_surface_aliases() {
-        assert_eq!(level_desc_to_canonical("surface"), Some(("sfc", None)));
+    fn named_levels_have_distinct_identities() {
+        let cases = [
+            ("surface", "sfc"),
+            ("mean sea level", "msl"),
+            ("entire atmosphere", "atmosphere"),
+            (
+                "entire atmosphere (considered as a single layer)",
+                "atmosphere_layer",
+            ),
+            ("tropopause", "tropopause"),
+            ("max wind", "max_wind"),
+            ("convective cloud bottom level", "convective_cloud_bottom"),
+            ("convective cloud top level", "convective_cloud_top"),
+            ("convective cloud layer", "convective_cloud"),
+            ("planetary boundary layer", "pbl"),
+            ("cloud ceiling", "cloud_ceiling"),
+            ("0c isotherm", "zero_isotherm"),
+            ("highest tropospheric freezing level", "highest_freezing"),
+        ];
+        let mut identities = std::collections::HashSet::new();
+        for (descriptor, expected) in cases {
+            let mapped = level_desc_to_canonical(descriptor).unwrap();
+            assert_eq!(mapped, (expected.into(), None));
+            assert!(identities.insert(mapped), "collapsed {descriptor}");
+        }
         assert_eq!(
-            level_desc_to_canonical("mean sea level"),
-            Some(("sfc", None))
-        );
-        assert_eq!(
-            level_desc_to_canonical("entire atmosphere"),
-            Some(("sfc", None))
-        );
-        assert_eq!(
-            level_desc_to_canonical("entire atmosphere (considered as a single layer)"),
-            Some(("sfc", None))
-        );
-        assert_eq!(level_desc_to_canonical("tropopause"), Some(("sfc", None)));
-        assert_eq!(level_desc_to_canonical("max wind"), Some(("sfc", None)));
-        assert_eq!(
-            level_desc_to_canonical("convective cloud top level"),
-            Some(("sfc", None))
-        );
-        assert_eq!(
-            level_desc_to_canonical("convective cloud bottom level"),
-            Some(("sfc", None))
-        );
-        assert_eq!(
-            level_desc_to_canonical("convective cloud layer"),
-            Some(("sfc", None))
-        );
-        assert_eq!(
-            level_desc_to_canonical("planetary boundary layer"),
-            Some(("sfc", None))
-        );
-        assert_eq!(
-            level_desc_to_canonical("cloud ceiling"),
-            Some(("sfc", None))
-        );
-        assert_eq!(level_desc_to_canonical("0C isotherm"), Some(("sfc", None)));
-        assert_eq!(
-            level_desc_to_canonical("highest tropospheric freezing level"),
-            Some(("sfc", None))
+            level_desc_to_canonical("  MEAN SEA LEVEL  "),
+            Some(("msl".into(), None))
         );
     }
 
@@ -541,73 +527,77 @@ mod tests {
     fn level_height_above_ground() {
         assert_eq!(
             level_desc_to_canonical("2 m above ground"),
-            Some(("hag", Some(2)))
+            Some(("hag".into(), Some(2)))
         );
         assert_eq!(
             level_desc_to_canonical("10 m above ground"),
-            Some(("hag", Some(10)))
+            Some(("hag".into(), Some(10)))
         );
         assert_eq!(
             level_desc_to_canonical("80 m above ground"),
-            Some(("hag", Some(80)))
+            Some(("hag".into(), Some(80)))
         );
         assert_eq!(
             level_desc_to_canonical("100 m above ground"),
-            Some(("hag", Some(100)))
+            Some(("hag".into(), Some(100)))
         );
     }
 
     #[test]
     fn level_pressure_levels() {
-        assert_eq!(level_desc_to_canonical("500 mb"), Some(("pl", Some(500))));
-        assert_eq!(level_desc_to_canonical("850 mb"), Some(("pl", Some(850))));
+        assert_eq!(
+            level_desc_to_canonical("500 mb"),
+            Some(("pl".into(), Some(500)))
+        );
+        assert_eq!(
+            level_desc_to_canonical("850 mb"),
+            Some(("pl".into(), Some(850)))
+        );
     }
 
     #[test]
     fn level_model_levels() {
         assert_eq!(
             level_desc_to_canonical("1 hybrid level"),
-            Some(("ml", Some(1)))
+            Some(("ml".into(), Some(1)))
         );
         assert_eq!(
             level_desc_to_canonical("20 hybrid level"),
-            Some(("ml", Some(20)))
+            Some(("ml".into(), Some(20)))
         );
         assert_eq!(
             level_desc_to_canonical("5 sigma level"),
-            Some(("ml", Some(5)))
+            Some(("ml".into(), Some(5)))
         );
     }
 
     #[test]
-    fn level_below_ground() {
-        // For "0-0.1 m below ground" we take the shallower (first) depth,
-        // which is 0 — so we return ("sol", Some(0)). This matches the
-        // spec: "use the shallower depth".
-        assert_eq!(
-            level_desc_to_canonical("0-0.1 m below ground"),
-            Some(("sol", Some(0)))
-        );
-        // For "0.1-0.4 m below ground", the shallower depth is 0.1 m;
-        // we floor it to 0 cm in integer metres. Document this: the parser
-        // currently loses sub-metre resolution, which is acceptable for v1
-        // because GFS soil layers are typically aliased by index order.
-        assert_eq!(
-            level_desc_to_canonical("0.1-0.4 m below ground"),
-            Some(("sol", Some(0)))
-        );
-        // A clearly integer layer.
-        assert_eq!(
-            level_desc_to_canonical("1-2 m below ground"),
-            Some(("sol", Some(1)))
-        );
+    fn soil_layer_boundaries_are_not_rounded_out_of_the_identity() {
+        for (desc, identity, ordering) in [
+            ("0-0.1 m below ground", "sol:0-0.1", 0),
+            ("0.1-0.4 m below ground", "sol:0.1-0.4", 0),
+            ("0-0.4 m below ground", "sol:0-0.4", 0),
+            ("1-2 m below ground", "sol:1-2", 1),
+            ("0.00-0.10 m below ground", "sol:0-0.1", 0),
+        ] {
+            assert_eq!(
+                level_desc_to_canonical(desc),
+                Some((identity.into(), Some(ordering)))
+            );
+        }
+        for desc in ["NaN-1", "0-inf", "1-0", "1-1", "-1-2", "0-garbage"] {
+            assert_eq!(
+                level_desc_to_canonical(&format!("{desc} m below ground")),
+                None
+            );
+        }
     }
 
     #[test]
     fn level_isentropic() {
         assert_eq!(
             level_desc_to_canonical("315 K level"),
-            Some(("iso", Some(315)))
+            Some(("iso".into(), Some(315)))
         );
     }
 
@@ -777,7 +767,7 @@ mod tests {
         assert_eq!(result.messages.len(), 4);
 
         assert_eq!(result.messages[0].short_name, "PRMSL");
-        assert_eq!(result.messages[0].levtype, "sfc");
+        assert_eq!(result.messages[0].levtype, "msl");
         assert_eq!(result.messages[0].level, None);
 
         assert_eq!(result.messages[1].short_name, "TMP");

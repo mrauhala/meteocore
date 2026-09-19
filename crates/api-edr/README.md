@@ -199,6 +199,12 @@ per run, shared by metadata, position, area and Maps. Missing canonical fields
 are null in position and errors in area; `z` is rejected. A temperature
 difference such as dewpoint depression stays in K. Area longitude axes remain
 continuous between grid nodes, and global interpolation wraps the grid seam.
+Wgrib2 ground, MSL, whole-atmosphere and other named surfaces/layers retain
+distinct identities within the single-level view. Ground/MSL/whole-atmosphere
+products take precedence over named upper-air fields, independent of index
+order; a missing ground field cannot be replaced by a tropopause field.
+Soil layers retain both depth boundaries internally but remain excluded from
+the three level families.
 
 For datetime selection, a GRIB run must contain the requested start instant
 within its published valid-time extent. An incomplete newer run does not hide
@@ -207,8 +213,9 @@ position returns the steps in the requested interval. Explicit instance pins
 never fall back to another run.
 
 If a wgrib2 index repeats the same parameter/level/window at different offsets,
-the scan warns and queries select the first record. Duration-qualified names
-separate different windows; they cannot recover product distinctions omitted
+the scan emits one summary warning after parameter/family filtering, with
+per-record details at DEBUG, and queries select the first record.
+Duration-qualified names separate different windows; they cannot recover product distinctions omitted
 from the source sidecar, or prove that repeated records contain identical data.
 
 An area query without `parameter-name` prefers the existing near-surface
