@@ -2,6 +2,7 @@ pub mod cache;
 pub mod catalog;
 mod diagnostics;
 pub mod index;
+mod position;
 pub mod reader;
 #[cfg(test)]
 mod test_support;
@@ -1145,130 +1146,31 @@ impl EdrEngine for GribEngine {
         z: Option<&[f64]>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        if self.vertical_kind().is_some() {
-            return self.query_vertical_position(coords, datetime, parameters, z, reference_time);
-        }
-        if z.is_some() {
-            return Err(DataServerError::InvalidParameter(
-                "This collection has no vertical axis".into(),
-            ));
-        }
-        let (lon, lat) = parse_coords(coords)?;
-        let catalog = self.catalog();
-
-        // Run selection (pinned instance, datetime-covering, or latest) is shared
-        // with `resolve_time` via `resolve_run`; this path then enumerates the
-        // run's steps into a time series.
-        let run = resolve_run(&catalog, reference_time, datetime)?;
-        let keys = catalog
-            .parameter_keys(&run.reference_time)
-            .cloned()
-            .unwrap_or_default();
-
-        // Determine which forecast steps to include
-        let steps_to_query: Vec<(u32, &StepFile)> = match datetime {
-            Some((start, end)) => {
-                // If start == end (single instant), return just that step
-                // If interval, return all steps within the range
-                run.steps
-                    .iter()
-                    .filter(|(&step, _)| {
-                        let vt = run.reference_time + chrono::Duration::hours(i64::from(step));
-                        vt >= start && vt <= end
-                    })
-                    .map(|(&s, sf)| (s, sf))
-                    .collect()
-            }
-            None => {
-                // No datetime: return all steps in the latest run (full forecast time series)
-                run.steps.iter().map(|(&s, sf)| (s, sf)).collect()
-            }
-        };
-
-        if steps_to_query.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No forecast steps match the requested time range".to_string(),
-            ));
-        }
-
-        // Determine which parameters to query
-        let query_params: Vec<String> = match parameters {
-            Some(p) => p.to_vec(),
-            None => {
-                // Default to near-surface parameters only (surface + 2m/10m/etc.)
-                let mut seen = std::collections::HashSet::new();
-                steps_to_query
-                    .iter()
-                    .flat_map(|(_, sf)| &sf.messages)
-                    .filter(|m| self.family == Some(GribLevelType::Single) || m.is_near_surface())
-                    .filter(|m| seen.insert(m.param.clone()))
-                    .map(|m| m.param.clone())
-                    .collect()
-            }
-        };
-
-        if self.family.is_some() {
-            self.validate_parameters(&keys, &query_params)?;
-        }
-
-        // Build valid times
-        let valid_times: Vec<DateTime<Utc>> = steps_to_query
-            .iter()
-            .map(|(step, _)| run.reference_time + chrono::Duration::hours(i64::from(*step)))
-            .collect();
-
-        let mut param_descs = std::collections::HashMap::new();
-        let mut ranges = std::collections::HashMap::new();
-
-        for param_name in &query_params {
-            // Collect values across all forecast steps
-            let mut values: Vec<Option<f64>> = Vec::with_capacity(steps_to_query.len());
-            for (_step, step_file) in &steps_to_query {
-                match self.fetch_grid(step_file, param_name, &keys) {
-                    Ok(grid) => {
-                        let raw = grid.bilinear_value(lon, lat);
-                        // Metadata must be resolved AFTER fetch_grid (which
-                        // populates the cache on first decode).
-                        let meta = self.param_metadata_for(&keys, param_name);
-                        values.push(raw.map(|v| meta.display.convert(v)));
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch {param_name} for step: {e}");
-                        values.push(None);
-                    }
-                }
-            }
-
-            let meta = self.param_metadata_for(&keys, param_name);
-            param_descs.insert(
-                param_name.to_string(),
-                ParameterDescription {
-                    label: meta.label(),
-                    unit: meta.display.display_unit.to_string(),
-                    observed_property: param_name.to_string(),
-                },
-            );
-
-            ranges.insert(
-                param_name.to_string(),
-                NdArray {
-                    shape: vec![valid_times.len()],
-                    axis_names: vec!["t".to_string()],
-                    values,
-                },
-            );
-        }
-
-        Ok(CoverageResponse::Single(QueryResult {
-            domain: DomainDescription::PointSeries {
-                x: lon,
-                y: lat,
-                t: valid_times,
-                z: None,
+        let mut result = None;
+        self.query_positions(
+            &[coords.to_owned()],
+            datetime,
+            parameters,
+            z,
+            reference_time,
+            &mut |response| {
+                result = Some(response);
+                Ok(())
             },
-            parameters: param_descs,
-            ranges,
-        }))
+        )?;
+        result.ok_or_else(|| DataServerError::Engine("Position query produced no response".into()))
+    }
+
+    fn query_positions(
+        &self,
+        points: &[String],
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+        emit: &mut dyn FnMut(CoverageResponse) -> Result<(), DataServerError>,
+    ) -> Result<(), DataServerError> {
+        self.query_batched_positions(points, datetime, parameters, z, reference_time, emit)
     }
 
     fn query_area(
@@ -1621,41 +1523,7 @@ impl MapEngine for GribEngine {
 
 /// Parse "POINT(lon lat)" or "lon,lat" coordinates.
 fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
-    let coords = coords.trim();
-
-    // Try POINT(lon lat) format
-    if let Some(inner) = coords
-        .strip_prefix("POINT(")
-        .or_else(|| coords.strip_prefix("POINT ("))
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.split_whitespace().collect();
-        if parts.len() == 2 {
-            let lon: f64 = parts[0].parse().map_err(|_| {
-                DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-            })?;
-            let lat: f64 = parts[1].parse().map_err(|_| {
-                DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-            })?;
-            return Ok((lon, lat));
-        }
-    }
-
-    // Try lon,lat format
-    let parts: Vec<&str> = coords.split(',').collect();
-    if parts.len() == 2 {
-        let lon: f64 = parts[0].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-        })?;
-        return Ok((lon, lat));
-    }
-
-    Err(DataServerError::InvalidParameter(format!(
-        "Cannot parse coordinates: {coords}"
-    )))
+    ds_core::feature::parse_point_coords(coords).map(|(lat, lon)| (lon, lat))
 }
 
 /// Build `(reference_time, prefix)` pairs to scan for the given pattern,

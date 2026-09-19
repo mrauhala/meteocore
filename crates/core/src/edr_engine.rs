@@ -175,6 +175,27 @@ pub trait EdrEngine: Send + Sync {
         ))
     }
 
+    /// Query validated POINT strings in input order. Engines may override this
+    /// to sample all coordinates from each field before releasing it. Emit one
+    /// response per point; stop immediately when the consumer rejects a result
+    /// (for example, because the combined response exceeds its value budget).
+    /// The default preserves sequential behavior for existing engines.
+    fn query_positions(
+        &self,
+        points: &[String],
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+        emit: &mut dyn FnMut(CoverageResponse) -> Result<(), DataServerError>,
+    ) -> Result<(), DataServerError> {
+        for point in points {
+            crate::deadline::check()?;
+            emit(self.query_position(point, datetime, parameters, z, reference_time)?)?;
+        }
+        Ok(())
+    }
+
     /// Execute a trajectory (vertical cross-section) query along a WKT
     /// `LINESTRING`. The result is a CoverageJSON `Section` domain (or a
     /// collection of them, one per timestep): a 2-D field over an

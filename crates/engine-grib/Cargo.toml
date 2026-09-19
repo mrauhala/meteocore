@@ -14,7 +14,7 @@ serde_json = "1"
 arc-swap = "1"
 ds-cache = { path = "../ds-cache" }
 tracing = "0.1"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 thiserror = "2"
 
 [dev-dependencies]

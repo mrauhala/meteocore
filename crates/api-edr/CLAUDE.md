@@ -133,6 +133,13 @@ work, including after client timeout/disconnect. Check `QueryBudget::expired`
 between MULTIPOINT elements. Validate the whole coordinate list before dispatch;
 keep point, byte and combined-value limits and OpenAPI/README documentation aligned.
 
+Position handlers delegate the validated POINT list to `EdrEngine::query_positions`.
+The default queries sequentially; engines may share field reads across points.
+The response callback enforces the combined value limit and cancellation before
+accepting each point. Batch implementations must also check their full allocation
+budget before fetching. The executor installs `ds_core::deadline` for storage
+and engine loops; propagate it explicitly to field workers and map expiry to 504.
+
 ## Shared Common discovery (#739)
 
 Use `api-common` for `/collections` validation, responses, links, Common metadata

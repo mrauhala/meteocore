@@ -93,6 +93,7 @@ fn render_coverage_response(
 /// new `DataServerError` variant cannot map differently per query type.
 fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
     match e {
+        DataServerError::DeadlineExceeded => query_timeout(),
         DataServerError::ResourceExhausted => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"code": "ServerBusy", "description": "Server busy, try again later"})),
@@ -1385,8 +1386,8 @@ async fn run_position_query(
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
     // Split coords into one or more POINT(lon lat) strings. A single POINT is
-    // passed through to the engine as-is; MULTIPOINT is fanned out into one
-    // query per point and assembled into a CoverageCollection.
+    // passed through as one point. Engines can share field reads across the
+    // batch; the default implementation still queries each point in turn.
     let points = split_position_coords(&params.coords).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -1401,19 +1402,10 @@ async fn run_position_query(
         let mut coverages = Vec::with_capacity(points.len());
         let mut values = 0usize;
         let mut collection_response = !single;
-        for point in &points {
+        let mut emit = |response| {
             if budget.expired() {
-                return Err(query_timeout());
+                return Err(DataServerError::DeadlineExceeded);
             }
-            let response = engine
-                .query_position(
-                    point,
-                    datetime,
-                    param_names.as_deref(),
-                    z.as_deref(),
-                    reference_time,
-                )
-                .map_err(|e| map_query_error(&e, "Position"))?;
             collection_response |= matches!(&response, CoverageResponse::Collection(_));
             let batch = match response {
                 CoverageResponse::Single(q) => vec![q],
@@ -1425,13 +1417,27 @@ async fn run_position_query(
                 }
             }
             if values > crate::params::MAX_POSITION_VALUES {
-                return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                return Err(DataServerError::QueryTooLarge(format!(
                     "Position response exceeds {} values",
                     crate::params::MAX_POSITION_VALUES
-                ))));
+                )));
             }
             coverages.extend(batch);
+            Ok(())
+        };
+        if budget.expired() {
+            return Err(query_timeout());
         }
+        engine
+            .query_positions(
+                &points,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                reference_time,
+                &mut emit,
+            )
+            .map_err(|e| map_query_error(&e, "Position"))?;
         if budget.expired() {
             return Err(query_timeout());
         }

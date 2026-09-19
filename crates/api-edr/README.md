@@ -158,6 +158,14 @@ reflectivity via EDR · #673 shared area budget.
 GeoTIFF cold source decodes share a byte budget across APIs; exhausted decode
 admission returns HTTP 503 without a partial CoverageJSON result.
 
+GRIB position queries share each fetched/decoded field across every requested
+coordinate, including `MULTIPOINT` profiles. Up to four field reads/decodes run
+concurrently per admitted query, preserving point/time/level order. The complete
+batch's one-million-value budget is checked before fetching. Storage reads and
+workers share the existing 30-second EDR deadline; expiry stops new reads and
+returns 504. Other engines retain their sequential position behavior through the
+default batch hook, with combined output limits checked after each point.
+
 GRIB wgrib2 accumulation and average fields use duration-qualified parameter
 names, for example `APCP_acc_6h`, `APCP_acc_3h` and `DSWRF_avg_6h`. The time axis
 is the **window end**, with the duration in the parameter label/name; the start

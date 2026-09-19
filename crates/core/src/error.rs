@@ -2,7 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DataServerError {
-    /// An interactive request exhausted its absolute time budget (HTTP 503).
+    /// An interactive request exhausted its absolute time budget
+    /// (HTTP 503 for renders, HTTP 504 for EDR queries).
     #[error("Render deadline exceeded, try again later")]
     DeadlineExceeded,
     /// Shared transient resource admission failed; retry later (HTTP 503).
