@@ -35,10 +35,11 @@ unlike GeoTIFF's one band per collection.
   Run with `--ignored --nocapture`; timings are measurements, not CI gates.
 - Parameter metadata populates lazily: `scan_once` probes ≤32 messages per
   scan, at most eight concurrently, across the newest run's step files.
-  Read headers with 4 KiB read-ahead, skip local-use/grid bodies, and cap each
+  Read headers with 4 KiB read-ahead, skip local-use/unsupported grid bodies, and cap each
   fetched metadata section at 64 KiB. Use the GRIB indicator's length for tail
   probes without HEAD. Never unpack values or fill the grid cache for discovery.
-  Header discovery validates metadata, not grid geometry or packed values;
+  Read the fixed template-3.0 grid header through the shared scan normalizer.
+  Header discovery validates supported geometry and metadata, not packed values;
   a later query still validates/decodes the actual field. Unusually large or
   invalid headers remain unprobed until a successful read or full-field query.
   Pending probes continue even without new indexes, rotating past
@@ -238,3 +239,15 @@ rendering share `StepFile::default_message` so default labels/units agree.
   --nocapture` for a 32-field replay with simulated 150 ms GET latency and no
   decoded cache. It compares serial storage with four concurrent reads, checks
   equal outputs/bytes and prints timings without CI timing thresholds.
+
+## Discovery snapshots
+
+- Publish `RasterInfo` snapshots after catalog changes and successful header/decoded
+  metadata fills. `raster_info_shared` must only clone an Arc; Maps/Tiles/WMS use it.
+- Precompute the sorted valid-time union during catalog publication. Geometry
+  comes from one latest-run representative per view, with missing probes sharing
+  the 32-message budget. Deduplicate parameter/geometry probes by source+offset.
+- Keep only current representative geometries (including known unsupported ones);
+  retry read failures. Never borrow another family's grid or advertise global
+  bounds without a header. Native cells count intervals between GRIB nodes,
+  including a cyclic closing cell, excluding duplicate seam nodes.

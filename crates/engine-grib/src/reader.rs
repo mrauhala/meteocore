@@ -192,6 +192,21 @@ struct GridLayout {
     canonical_scan: bool,
 }
 
+pub(crate) fn grid_geometry(
+    grid_def: &grib::GridDefinition,
+) -> Result<crate::metadata::GridGeometry, String> {
+    let grid = extract_grid_params(grid_def)?;
+    crate::metadata::GridGeometry::new(
+        grid.ni,
+        grid.nj,
+        grid.lon_first,
+        grid.lat_first,
+        grid.lon_inc,
+        grid.lat_inc,
+    )
+    .ok_or_else(|| "invalid geographic grid bounds".into())
+}
+
 /// Normalize the regular-grid geometry to west→east / north→south. The
 /// index iterator handles column-major and alternating-row storage.
 fn extract_grid_params(grid_def: &grib::GridDefinition) -> Result<GridLayout, String> {

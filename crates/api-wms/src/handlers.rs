@@ -154,10 +154,9 @@ pub async fn wms_handler(
                 ))
             })?;
 
-            // One metadata snapshot for all parameter/dimension validation
-            // below. `raster_info()` clones its vecs, so take it once rather
-            // than once per check (parameter, ELEVATION, reference_time).
-            let info = engine.raster_info();
+            // Share one metadata snapshot across parameter, ELEVATION and
+            // reference_time validation below.
+            let info = engine.raster_info_shared();
 
             // Validate `LAYERS=collection/parameter` against the engine's
             // advertised list (mirroring Maps + Tiles). Without this, an
@@ -665,7 +664,7 @@ pub async fn wms_handler(
             let info = state
                 .engines
                 .get(legend_collection_id)
-                .map(|e| e.raster_info());
+                .map(|e| e.raster_info_shared());
             let param = layer_name
                 .split('/')
                 .nth(1)

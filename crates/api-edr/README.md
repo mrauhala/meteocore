@@ -216,7 +216,17 @@ cached level, and do not fetch additional data.
 
 GRIB background metadata probes read message headers without unpacking values or
 filling the decoded-grid cache. Each scan probes at most 32 missing parameter
-identities, eight concurrently, usually with one 4 KiB range per message.
+identities or missing representative geometries, eight concurrently, usually
+with one 4 KiB range per message. The regular latitude/longitude grid header is
+read alongside parameter metadata. Each collection uses a representative field
+from its latest run for spatial bounds; families can use different grids.
+Unknown/unsupported geometry omits the spatial extent until it is known, rather
+than advertising global coverage. Geometry probes refresh for new runs even
+when their parameter units are already cached. A collection is expected to use
+a common grid within each level family; this is not a union of mixed grids.
+Map metadata is published as a shared snapshot, with grid cell counts between
+nodes (including the closing longitude cell on cyclic grids) so advertised
+resolution matches native spacing. Catalog time unions are computed at publication.
 Failed probes remain retryable; labels and units can also populate on a query.
 
 GRIB caches preserve the decoder's `f32` values without widening whole grids;
@@ -282,3 +292,7 @@ choice across searches in the browser session. Resource URLs are clickable.
 The compact HTML catalog summarizes advertised parameter names and UTC coverage.
 It retains time precision and distinguishes an out-of-range page from no matches.
 List/cards preference survives searches; JSON continues to reflect applied filters.
+
+HTML collection catalogs and overviews show vertical bounds, available levels,
+and units from the canonical vertical reference system. Single-level collections
+omit the vertical display. EDR JSON continues to use string coordinates and VRS.

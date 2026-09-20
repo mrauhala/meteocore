@@ -58,6 +58,7 @@
       const form = document.getElementById('map-controls');
       const style = document.getElementById('map-style');
       const time = document.getElementById('map-time');
+      const level = document.getElementById('map-level');
       const previous = document.getElementById('map-time-prev');
       const next = document.getElementById('map-time-next');
       function updateTimeButtons() {
@@ -156,6 +157,7 @@
           url.searchParams.set('width',width); url.searchParams.set('height',height);
           url.searchParams.set('f','image/png'); url.searchParams.set('transparent','true');
           if (selectedTime) url.searchParams.set('datetime',selectedTime); else url.searchParams.delete('datetime');
+          if (level?.value) url.searchParams.set('z',level.value); else url.searchParams.delete('z');
           requestedUrl = url.href;
           if (!activeId) requestText.textContent = requestedUrl;
           status.textContent = activeId ? 'Updating map data… Showing the previous image until ready.' : 'Loading map data…';

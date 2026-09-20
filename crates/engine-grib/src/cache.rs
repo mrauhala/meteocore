@@ -8,6 +8,11 @@ use std::sync::Arc;
 use ds_cache::ByteBoundedCache;
 use ds_core::map_engine::OutputCrs;
 
+pub(crate) fn longitude_wrap_columns(ni: usize, lon_inc: f64) -> Option<f64> {
+    let cols_per_360 = 360.0 / lon_inc;
+    ((ni as f64) >= cols_per_360 - 0.5).then_some(cols_per_360)
+}
+
 /// Cache key: identifies a specific GRIB message.
 /// Uses `Arc<str>` instead of `String` for a smaller allocation (no capacity field).
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -105,8 +110,7 @@ impl DecodedGrid {
     /// store a duplicate seam column (`ni == cols_per_360 + 1`), where a
     /// modulo-`ni` wrap would name the duplicate for some longitudes.
     fn wrap_modulus(&self) -> Option<f64> {
-        let cols_per_360 = 360.0 / self.lon_inc;
-        ((self.ni as f64) >= cols_per_360 - 0.5).then_some(cols_per_360)
+        longitude_wrap_columns(self.ni, self.lon_inc)
     }
 
     /// Wrap a fractional column into `[0, ni)` for (near-)global grids — a

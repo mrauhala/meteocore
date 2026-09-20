@@ -1,6 +1,6 @@
 //! Forecast catalog: maps (reference_time, step) → file + message offsets.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
@@ -282,6 +282,8 @@ pub struct Catalog {
     /// Per-run level union, also precomputed for vertical query selection.
     pub levels: BTreeMap<DateTime<Utc>, Vec<f64>>,
     pub vertical_levels: Vec<f64>,
+    valid_times: Vec<DateTime<Utc>>,
+    param_names: Vec<String>,
 }
 
 impl Catalog {
@@ -308,23 +310,15 @@ impl Catalog {
 
     /// All unique valid times across all runs, sorted.
     pub fn all_valid_times(&self) -> Vec<DateTime<Utc>> {
-        let mut times: Vec<DateTime<Utc>> = self
-            .runs
-            .values()
-            .flat_map(|run| run.valid_times())
-            .collect();
-        times.sort();
-        times.dedup();
-        times
+        self.valid_times.clone()
     }
 
     /// Temporal extent (earliest, latest) across all valid times.
     pub fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-        let times = self.all_valid_times();
-        if times.is_empty() {
-            return None;
-        }
-        Some((times[0], *times.last().unwrap()))
+        self.valid_times
+            .first()
+            .copied()
+            .zip(self.valid_times.last().copied())
     }
 
     /// Parameters are unioned across the run: f000 commonly lacks aggregates.
@@ -339,12 +333,7 @@ impl Catalog {
     }
 
     pub fn all_params(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        self.all_params_with_levels()
-            .into_iter()
-            .map(|(p, _, _)| p)
-            .filter(|p| seen.insert(p.clone()))
-            .collect()
+        self.param_names.clone()
     }
 
     /// All unique parameters with level info from every step in the latest run.
@@ -359,6 +348,13 @@ impl Catalog {
     /// Call after modifying runs, before publishing the immutable snapshot.
     /// Request-time metadata and cache keys must not scan forecast steps.
     pub fn refresh_metadata(&mut self) {
+        self.valid_times = self
+            .runs
+            .values()
+            .flat_map(ForecastRun::valid_times)
+            .collect();
+        self.valid_times.sort_unstable();
+        self.valid_times.dedup();
         // This keys process-local caches, not persistent IDs or public ETags.
         // A content hash preserves hits on no-op rebuilds and cannot reset to
         // an old revision counter when an evicted family reappears.
@@ -366,6 +362,7 @@ impl Catalog {
         self.runs.hash(&mut hasher);
         self.content_version = hasher.finish().max(1);
         self.parameters.clear();
+        self.param_names.clear();
         self.parameter_keys = self
             .runs
             .iter()
@@ -401,6 +398,14 @@ impl Catalog {
                     .push((m.param.clone(), m.levtype.clone(), m.level));
             }
         }
+        let mut seen = HashSet::new();
+        self.param_names = self
+            .parameters
+            .iter()
+            .map(|(name, _, _)| name)
+            .filter(|name| seen.insert(*name))
+            .cloned()
+            .collect();
     }
 
     pub fn refresh_families(&mut self, enabled: &[GribLevelType]) {

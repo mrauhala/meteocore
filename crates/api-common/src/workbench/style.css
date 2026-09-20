@@ -2583,11 +2583,12 @@ a {
 #map-image-link[aria-disabled="true"]{cursor:default;color:var(--muted)}
 .map-controls{padding:20px}
 .js .map-controls.enhanced{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) auto;align-items:end;gap:16px}
+.js .map-controls.enhanced:has(#map-level){grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) minmax(0,.8fr) auto}
 .map-controls label{display:flex;flex-direction:column;gap:8px;min-width:0;max-width:none;margin:0;line-height:24px}
 .map-controls select,.map-controls input{display:block;width:100%;box-sizing:border-box;height:46px;min-height:46px;margin:0;font-size:16px;line-height:24px}
 .map-controls>.btn{box-sizing:border-box;height:46px;min-height:46px;margin:0;white-space:nowrap}
 .map-controls>p{grid-column:1/-1;font-size:14px;color:var(--muted);margin:0}
-@media(max-width:1000px){.js .map-controls.enhanced{grid-template-columns:minmax(0,1fr)}.map-controls>.btn{justify-self:start}}
+@media(max-width:1000px){.js .map-controls.enhanced,.js .map-controls.enhanced:has(#map-level){grid-template-columns:minmax(0,1fr)}.map-controls>.btn{justify-self:start}}
 
 /* Keep time navigation and the style/action row aligned at every width. */
 .map-time-field{display:flex;flex-direction:column;gap:8px;min-width:0}
