@@ -17,6 +17,7 @@ level_types = ["single", "pressure"]
 # AIFS publishes total column water (tcw), not tcwv; cape and sd are unavailable.
 parameters = [
     "2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcw", "sf",
+    "lcc", "mcc", "hcc", "cp",
     "t", "u", "v", "q", "w", "z", "gh",
 ]
 
