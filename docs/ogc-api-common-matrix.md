@@ -42,6 +42,12 @@ source catalog/cache. Single-level fields omit vertical extent; pressure and
 model/hybrid views advertise their own hPa/ordinal axes through the existing
 API-specific representations. This does not add a Common conformance class.
 
+GRIB discovery/HTML update (2026-09-21): regular-grid bounds and native cell
+resolution come from bounded header probes of each view's latest-run representative,
+with unknown geometry omitted. Catalog and overview HTML now show vertical ranges,
+units and available levels, preserving the EDR/Common JSON distinction. Maps HTML
+can select an advertised `z` level. These changes add no conformance classes.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively.
 Part 4 rows concern **collection discovery**, not querying the contents of a
 collection.

@@ -819,7 +819,7 @@ pub async fn collections(
                 );
                 return None;
             };
-            let info = engine.raster_info();
+            let info = engine.raster_info_shared();
             let metadata =
                 build_collection_metadata(config, &info, state.styles.get(&config.id), base);
             Some(api_common::CollectionEntry {
@@ -847,14 +847,14 @@ pub async fn collection(
     let base = &request_base_url(&state, &headers);
     Ok(with_vary(match wanted {
         Wanted::Json => {
-            let info = engine.raster_info();
+            let info = engine.raster_info_shared();
             let styles = state.styles.get(&id);
             Json(build_collection_metadata(config, &info, styles, base)).into_response()
         }
         Wanted::Html => {
             let metadata = build_collection_metadata(
                 config,
-                &engine.raster_info(),
+                &engine.raster_info_shared(),
                 state.styles.get(&id),
                 base,
             );
@@ -942,7 +942,7 @@ pub async fn style_legend(
         ))
     })?;
 
-    let info = engine.raster_info();
+    let info = engine.raster_info_shared();
     // Mirror the render path's validation: an unknown `parameter-name` must
     // 400 with the available list, not fall back to the collection style and
     // emit a legend labelled with a parameter that doesn't exist.
@@ -1066,11 +1066,9 @@ async fn render_map(
     let has_explicit_time = validated.time.is_some();
     let content_crs = crs_to_uri(&validated.crs);
 
-    // Single `raster_info()` call covers both default-time resolution and
-    // parameter-name validation. The trait now documents this as O(1), but
-    // hoisting still saves one Arc-clone-sized allocation per request on
-    // engines that materialise `RasterInfo` lazily.
-    let raster_info = engine.raster_info();
+    // Share one metadata snapshot across default-time resolution and
+    // parameter-name validation.
+    let raster_info = engine.raster_info_shared();
     let time = validated
         .time
         .or_else(|| engine.default_time())

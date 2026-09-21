@@ -140,7 +140,9 @@ not duplicate them.
 
 Maps collection overviews render the advertised map endpoint over the locator.
 The browser requests the visible CRS84 bbox as a Web Mercator PNG (at most
-1024 × 768), with advertised style links and an optional datetime instant. Pan/zoom
+1024 × 768), with advertised style links, an optional datetime instant, and a
+`z` selector when discrete vertical levels are advertised. The selected level is
+included in the rendered-image URL; collection default omits `z`. Pan/zoom
 requests are debounced and superseded fetches are cancelled. Loading/errors are
 explicit; failed requests hide the previous image. The rendered-image URL is
 separate from the collection metadata JSON link. No rendering occurs while
@@ -189,3 +191,10 @@ the map sits beside results on wide screens.
 
 Feature property columns render flat arrays as visible chips, matching item
 details. Empty arrays are explicit; nested structures remain expandable.
+
+Catalog cards and collection overviews display the advertised vertical interval,
+unit and level count. The overview expands the full available `z` values and
+vertical reference system. EDR string coordinates/VRS and Common numeric
+coordinates/units retain their JSON representations; known server VRS definitions
+supply readable axis labels and units. Collections without a vertical extent omit
+these displays and the map level selector.

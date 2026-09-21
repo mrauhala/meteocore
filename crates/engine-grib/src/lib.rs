@@ -2,6 +2,7 @@ mod area;
 pub mod cache;
 pub mod catalog;
 mod diagnostics;
+mod discovery;
 pub mod index;
 mod message_cache;
 mod metadata;
@@ -208,6 +209,7 @@ struct GribSource {
     /// Parameter metadata keyed by short name AND level identity. Populated
     /// on the first successful header probe or decode of each selected product.
     param_meta: RwLock<ParamMetadataCache>,
+    discovery: RwLock<discovery::Discovery>,
     /// Last attempted name, so failing probes cannot starve later parameters.
     probe_cursor: Mutex<Option<String>>,
 }
@@ -355,8 +357,11 @@ impl GribEngine {
                 index_format,
                 param_meta: RwLock::new(ParamMetadataCache::default()),
                 probe_cursor: Mutex::new(None),
+                discovery: RwLock::new(discovery::Discovery::default()),
             }),
         };
+
+        engine.refresh_discovery();
 
         // Do initial scan
         if let Err(e) = engine.scan_once() {
@@ -761,7 +766,7 @@ impl GribEngine {
                 .as_deref()
                 .unwrap_or_default(),
         );
-        self.source.catalog.store(Arc::new(new_catalog));
+        self.publish_catalog(new_catalog);
 
         // Probe one message per distinct short name in the newest run to
         // populate the parameter metadata cache. Without this, the EDR
@@ -780,46 +785,61 @@ impl GribEngine {
     /// the metadata cache will eventually fill in as real queries land on
     /// the missing parameters anyway.
     fn probe_new_parameters(&self) {
-        let catalog = self.catalog();
+        let catalog = self.source.catalog.load_full();
         let catalogs: Vec<&Catalog> = if self.source.config.level_types.is_some() {
             catalog.families.values().map(AsRef::as_ref).collect()
         } else {
             vec![&catalog]
         };
-        let mut todo =
-            {
-                let cache = self.source.param_meta.read().unwrap();
-                let mut todo = BTreeMap::new();
-                for catalog in catalogs {
-                    let Some(run) = catalog.latest_run() else {
-                        continue;
-                    };
-                    let Some(keys) = catalog.parameter_keys(&run.reference_time) else {
-                        continue;
-                    };
-                    for key in keys
+        let geometry_probes = self.geometry_probes(&catalog);
+        let geometry_ids: HashSet<_> = geometry_probes
+            .iter()
+            .map(|&(file, entry)| (file.message_url(entry), entry.offset))
+            .collect();
+        let mut todo = {
+            let cache = self.source.param_meta.read().unwrap();
+            let mut todo = BTreeMap::new();
+            for catalog in catalogs {
+                let Some(run) = catalog.latest_run() else {
+                    continue;
+                };
+                let Some(keys) = catalog.parameter_keys(&run.reference_time) else {
+                    continue;
+                };
+                for key in keys
+                    .values()
+                    .filter(|key| !cache.by_level.contains_key(*key))
+                {
+                    if let Some((sf, m)) = run
+                        .steps
                         .values()
-                        .filter(|key| !cache.by_level.contains_key(*key))
+                        .find_map(|sf| sf.messages.iter().find(|m| key.matches(m)).map(|m| (sf, m)))
                     {
-                        if let Some((sf, m)) = run.steps.values().find_map(|sf| {
-                            sf.messages.iter().find(|m| key.matches(m)).map(|m| (sf, m))
-                        }) {
-                            todo.insert(
-                                format!("{}:{}:{:?}", key.param, key.levtype, key.level),
-                                (sf, m),
-                            );
-                        }
+                        todo.insert(
+                            format!("{}:{}:{:?}", key.param, key.levtype, key.level),
+                            (sf, m),
+                        );
                     }
                 }
-                todo.into_iter().collect::<Vec<_>>()
-            };
+            }
+            for (file, entry) in geometry_probes {
+                todo.insert(
+                    format!("~geometry:{}:{}", file.message_url(entry), entry.offset),
+                    (file, entry),
+                );
+            }
+            let mut seen = HashSet::new();
+            todo.into_iter()
+                .filter(|(_, (file, entry))| seen.insert((file.message_url(entry), entry.offset)))
+                .collect::<Vec<_>>()
+        };
 
         if todo.is_empty() {
             return;
         }
 
         tracing::debug!(
-            "Collection '{}': probing {} new parameters to populate metadata",
+            "Collection '{}': probing {} message headers to populate metadata",
             self.collection_id,
             todo.len()
         );
@@ -833,6 +853,12 @@ impl GribEngine {
             let start = start % todo.len();
             todo.rotate_left(start);
         }
+        // Publish bounds promptly even when hundreds of parameter labels are
+        // pending. Stable ordering preserves the cursor among the other jobs;
+        // these (at most four) reads remain inside the same 32-message budget.
+        todo.sort_by_key(|(_, (file, entry))| {
+            !geometry_ids.contains(&(file.message_url(entry), entry.offset))
+        });
         todo.truncate(MAX_PROBES_PER_SCAN);
         let entries: Vec<_> = todo
             .iter()
@@ -841,16 +867,24 @@ impl GribEngine {
         let results = metadata::read_batch(&self.source.store, &entries);
         // Apply in cursor order, preserving deterministic metadata fallback
         // representatives even when the reads complete out of order.
-        for ((cursor, (_, entry)), result) in todo.into_iter().zip(results) {
+        let mut changed = false;
+        for ((cursor, (file, entry)), result) in todo.into_iter().zip(results) {
             *self.source.probe_cursor.lock().unwrap() = Some(cursor);
             match result {
-                Ok(meta) => self.populate_message_metadata(&entry.key(), &meta, entry.step_kind),
+                Ok(meta) => {
+                    changed |= self.populate_message_metadata(&entry.key(), &meta, entry.step_kind);
+                    changed |=
+                        self.populate_geometry(file.message_url(entry), entry, meta.geometry);
+                }
                 Err(e) => tracing::debug!(
                     "Collection '{}': probe for parameter '{}' failed: {e}",
                     self.collection_id,
                     entry.param
                 ),
             }
+        }
+        if changed {
+            self.refresh_discovery();
         }
     }
 
@@ -953,6 +987,13 @@ impl GribEngine {
             None => load()?,
         };
         self.populate_metadata(&entry.key(), &grid, entry.step_kind);
+        if self.populate_geometry(
+            grib_url,
+            entry,
+            metadata::MessageMetadata::from(grid.as_ref()).geometry,
+        ) {
+            self.refresh_discovery();
+        }
         Ok(grid)
     }
 
@@ -966,7 +1007,9 @@ impl GribEngine {
         grid: &DecodedGrid,
         step_kind: wgrib2_index::StepKind,
     ) {
-        self.populate_message_metadata(key, &metadata::MessageMetadata::from(grid), step_kind);
+        if self.populate_message_metadata(key, &metadata::MessageMetadata::from(grid), step_kind) {
+            self.refresh_discovery();
+        }
     }
 
     fn populate_message_metadata(
@@ -974,12 +1017,12 @@ impl GribEngine {
         key: &ParameterKey,
         message: &metadata::MessageMetadata,
         step_kind: wgrib2_index::StepKind,
-    ) {
+    ) -> bool {
         let short_name = &key.param;
         {
             let cache = self.source.param_meta.read().unwrap();
             if cache.by_level.contains_key(key) {
-                return;
+                return false;
             }
         }
 
@@ -1013,6 +1056,7 @@ impl GribEngine {
 
         let mut cache = self.source.param_meta.write().unwrap();
         cache.insert(key.clone(), meta);
+        true
     }
 
     /// Look up cached parameter metadata. Returns a placeholder (identity
@@ -1190,11 +1234,7 @@ impl EdrEngine for GribEngine {
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
-        // Global grid
-        if self.catalog().runs.is_empty() {
-            return None;
-        }
-        Some([-180.0, -90.0, 180.0, 90.0])
+        self.raster_info_shared().spatial_extent
     }
 
     fn get_vertical_extent(&self) -> Option<ds_core::vertical::VerticalDimension> {
@@ -1365,58 +1405,16 @@ impl MapEngine for GribEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        let catalog = self.catalog();
-        let times = catalog.all_valid_times();
+        (*self.raster_info_shared()).clone()
+    }
 
-        // Build parameter list from catalog using cached metadata (populated
-        // as each parameter is first probed or decoded).
-        let params: Vec<ds_core::map_engine::ParameterInfo> = catalog
-            .all_params()
-            .into_iter()
-            .map(|p| {
-                let meta = self.param_metadata(&catalog, &p);
-                let label = meta.label();
-                ds_core::map_engine::ParameterInfo {
-                    name: p,
-                    title: label,
-                    unit: meta.display.display_unit.to_string(),
-                }
-            })
-            .collect();
-
-        let default_param = catalog
-            .latest_run()
-            .and_then(|run| run.steps.values().next_back())
-            .and_then(StepFile::default_message)
-            .map(|m| m.param.clone())
-            .unwrap_or_else(|| "2t".to_string());
-
-        let default_unit = self
-            .param_metadata(&catalog, &default_param)
-            .display
-            .display_unit
-            .to_string();
-
-        RasterInfo {
-            // Regular lat/lon grids served lon-first -> CRS:84, not the
-            // lat-first EPSG:4326 (which would make a conformant client swap
-            // axes). Matches engine-geotiff/odim/querydata for `storageCrs`.
-            native_crs: "CRS:84".to_string(),
-            spatial_extent: Some([-180.0, -90.0, 180.0, 90.0]),
-            times,
-            parameter: default_param,
-            unit: default_unit,
-            parameters: params,
-            vertical: self.vertical_extent(&catalog),
-            // Grid ni/nj are only known after a message is decoded; the
-            // catalog metadata doesn't carry them, so leave the spatial grid
-            // unadvertised for now (tracked as a follow-up).
-            grid_size: None,
-            layer_subtitle: None,
-            // Each retained forecast run is a selectable reference time (WMS
-            // `reference_time` dimension); ascending, latest last.
-            reference_times: catalog.runs.keys().copied().collect(),
-        }
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
+        let discovery = self.source.discovery.read().unwrap();
+        discovery
+            .views
+            .get(&self.family)
+            .unwrap_or(&discovery.empty)
+            .clone()
     }
 }
 
@@ -1963,7 +1961,7 @@ mod tests {
             },
         );
         catalog.refresh_metadata();
-        engine.source.catalog.store(Arc::new(catalog));
+        engine.publish_catalog(catalog);
         let params = engine.get_parameters();
         assert!(
             params.contains(&"APCP_acc_6h".to_owned()),
@@ -2051,7 +2049,7 @@ mod tests {
             .messages
             .retain(|m| m.step_kind != wgrib2_index::StepKind::Instant);
         catalog.refresh_metadata();
-        engine.source.catalog.store(Arc::new(catalog));
+        engine.publish_catalog(catalog);
         assert_eq!(engine.raster_info().parameter, "APCP_acc_6h");
         let aggregate_only = engine
             .get_raster_tile(

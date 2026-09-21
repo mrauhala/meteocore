@@ -302,3 +302,7 @@ Uncached GetMap requests have a configurable 3 s queue/render deadline
 (`MC_RENDER_TIMEOUT_MS`) and a bounded waiting queue (`MC_RENDER_QUEUE_CAPACITY`,
 default 3× CPU slots). Overload or expiry returns HTTP 503 with `Retry-After: 1`;
 cached images remain available. GeoTIFF remote reads use the same deadline.
+
+GRIB metadata is shared through cached descriptors for capabilities and map
+requests. Bounds come from a header probe of each level collection's latest-run
+representative grid; unknown geometry is omitted rather than marked global.

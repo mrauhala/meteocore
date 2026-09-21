@@ -51,7 +51,7 @@ pub fn get_capabilities_xml(
     // Individual layers (one per collection)
     for (id, config) in collections {
         if let Some(engine) = engines.get(id) {
-            let info = engine.raster_info();
+            let info = engine.raster_info_shared();
 
             if info.parameters.len() > 1 {
                 // Multi-parameter engine: parent layer (not requestable) with

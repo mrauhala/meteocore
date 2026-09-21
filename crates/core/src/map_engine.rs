@@ -441,6 +441,12 @@ pub trait MapEngine: Send + Sync {
     /// per-request, cache it.
     fn raster_info(&self) -> RasterInfo;
 
+    /// Shared metadata for request paths. Engines with cached descriptors can
+    /// override this to avoid cloning parameter and time vectors on every read.
+    fn raster_info_shared(&self) -> std::sync::Arc<RasterInfo> {
+        std::sync::Arc::new(self.raster_info())
+    }
+
     /// An explicit default valid time, independent of the advertised axis.
     /// `None` means use the last advertised timestep (the existing forecast
     /// convention). Alert engines override this with their snapshot's "now"

@@ -258,6 +258,7 @@ async fn engine(count: usize, delay: Duration, cache_mb: u64) -> (GribEngine, Ve
     let source = Arc::get_mut(&mut engine.source).unwrap();
     source.store = DataStore::new(observed);
     source.catalog.store(Arc::new(catalog));
+    engine.refresh_discovery();
     (engine, entries)
 }
 
@@ -309,4 +310,54 @@ async fn metadata_probe_replay() {
         }
         eprintln!("probes=32 headers_only={headers_only} elapsed_ms={} bytes={} cached_grids={} cache_bytes={}", elapsed.as_millis(), engine.storage_bytes_read(), cache.len(), cache.weight());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn geometry_probes_share_scan_normalization_and_skip_unsupported_grid_bodies() {
+    for scan in (0..=240).step_by(16) {
+        let bytes = message(scan, 280.0, [0; 4], 103, 2);
+        let (_, store, path) = source(&bytes).await;
+        let meta = read_metadata(&store, &path, &entry(None)).unwrap();
+        assert_eq!(meta.geometry.unwrap().bbox, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(
+            meta,
+            MessageMetadata::from(&reader::decode_message(&bytes, "TMP").unwrap())
+        );
+    }
+    let mut bytes = message(0, 280.0, [0; 4], 103, 2);
+    bytes[49..51].copy_from_slice(&40u16.to_be_bytes()); // Gaussian template
+    let (_, store, path) = source(&bytes).await;
+    let meta = read_metadata(&store, &path, &entry(None)).unwrap();
+    assert!(meta.geometry.is_none());
+    assert_eq!(
+        meta.triple,
+        (0, 0, 0),
+        "unsupported geometry must not hide parameter units"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn representative_geometry_is_prioritized_inside_the_existing_probe_budget() {
+    let (engine, _) = engine(40, Duration::ZERO, 8).await;
+    let mut catalog = (*engine.catalog()).clone();
+    catalog
+        .runs
+        .values_mut()
+        .next()
+        .unwrap()
+        .steps
+        .values_mut()
+        .next()
+        .unwrap()
+        .messages
+        .reverse();
+    catalog.refresh_metadata();
+    engine.publish_catalog(catalog);
+    let before = engine.storage_bytes_read();
+    engine.probe_new_parameters();
+    assert!(engine.get_spatial_extent().is_some());
+    assert_eq!(engine.storage_bytes_read() - before, 32 * READ_AHEAD as u64);
+    assert_eq!(engine.source.param_meta.read().unwrap().by_level.len(), 32);
+    engine.probe_new_parameters();
+    assert_eq!(engine.source.param_meta.read().unwrap().by_level.len(), 40);
 }

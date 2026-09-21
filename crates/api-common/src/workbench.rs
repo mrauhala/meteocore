@@ -517,7 +517,26 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
         } else {
             controls.push_str("<input id=\"map-time\" type=\"datetime-local\" step=\"1\" aria-describedby=\"map-help\">");
         }
-        controls.push_str("</div></div><button class=\"btn primary\">Update map</button><p id=\"map-help\">Pan or zoom to request the visible area. ");
+        controls.push_str("</div></div>");
+        let vertical = &request["vertical"];
+        let levels = vertical_values(vertical);
+        if !levels.is_empty() {
+            let (label, unit) = vertical_axis(vertical);
+            controls.push_str(&format!(
+                "<label>{}<select id=\"map-level\"><option value=\"\">Collection default</option>",
+                escape(label)
+            ));
+            for level in levels {
+                controls.push_str(&format!(
+                    "<option value=\"{}\">{} {}</option>",
+                    escape(&level),
+                    escape(&level),
+                    escape(unit)
+                ));
+            }
+            controls.push_str("</select></label>");
+        }
+        controls.push_str("<button class=\"btn primary\">Update map</button><p id=\"map-help\">Pan or zoom to request the visible area. ");
         if let Some(times) = times {
             controls.push_str(&format!(
                 "{} advertised times. Arrow buttons load the adjacent time. ",
@@ -581,7 +600,7 @@ pub fn collection_html(
                         styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"legend":legend(style)}));
                     }
                 }
-                json!({"styles":styles,"times":map_times(&doc["extent"]["temporal"])})
+                json!({"styles":styles,"times":map_times(&doc["extent"]["temporal"]),"vertical":doc["extent"]["vertical"]})
             })
     } else {
         None
@@ -594,12 +613,9 @@ pub fn collection_html(
     if let Some(items) = items {
         body.push_str(&anchor(&with_format(items, "html"), "Request data", ""));
     }
-    body.push_str("<a data-collection-tab=\"metadata\" href=\"#metadata\">Metadata &amp; links</a></nav><section id=\"overview\" class=\"collection-view\" data-collection-view><div class=\"detail-layout\"><div><section class=\"panel\"><div class=\"panel-head\"><h2>Spatial &amp; temporal coverage</h2><span class=\"chip\">CRS84</span></div>");
+    body.push_str("<a data-collection-tab=\"metadata\" href=\"#metadata\">Metadata &amp; links</a></nav><section id=\"overview\" class=\"collection-view\" data-collection-view><div class=\"detail-layout\"><div><section class=\"panel\"><div class=\"panel-head\"><h2>Data coverage</h2><span class=\"chip\">CRS84</span></div>");
     if map_request.is_some() {
-        body = body.replace(
-            "<h2>Spatial &amp; temporal coverage</h2>",
-            "<h2>Map data &amp; coverage</h2>",
-        );
+        body = body.replace("<h2>Data coverage</h2>", "<h2>Map data &amp; coverage</h2>");
     }
     let bbox = &doc["extent"]["spatial"]["bbox"][0];
     let interval = &doc["extent"]["temporal"]["interval"][0];
@@ -638,7 +654,7 @@ pub fn collection_html(
     } else {
         body.push_str("<div class=\"empty-state\"><p>Spatial extent not specified.</p></div>");
     }
-    body.push_str(&format!("<div class=\"coverage-facts\"><div class=\"fact\"><small>Start · UTC</small><strong>{}</strong></div><div class=\"fact\"><small>End · UTC</small><strong>{}</strong></div><div class=\"fact wide\"><small>Advertised bounds · CRS84 axis order</small><strong class=\"mono\">{}</strong></div></div></section><section class=\"section-space\"><h2>Request data from this collection</h2>",value_html(&interval[0]),value_html(&interval[1]),value_html(bbox)));
+    body.push_str(&format!("<div class=\"coverage-facts\"><div class=\"fact\"><small>Start · UTC</small><strong>{}</strong></div><div class=\"fact\"><small>End · UTC</small><strong>{}</strong></div><div class=\"fact wide\"><small>Advertised bounds · CRS84 axis order</small><strong class=\"mono\">{}</strong></div>{}</div></section><section class=\"section-space\"><h2>Request data from this collection</h2>",value_html(&interval[0]),value_html(&interval[1]),value_html(bbox),vertical_coverage(&doc["extent"]["vertical"])));
     if let Some(items) = items {
         body.push_str(&format!("<div class=\"callout spaced\">Filter features within this collection by its supported properties, area and time. Inspect the results or copy the GeoJSON request. These filters select data, not collections.</div><div class=\"action-row spaced\">{}{}</div>",anchor(&with_format(items,"html"),"Build a data request →","btn primary"),anchor(&url,"View metadata JSON","btn")));
     }
@@ -657,7 +673,7 @@ pub fn collection_html(
         body.push_str("</div>");
     }
     if api == "maps" {
-        body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
+        body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
         body.push_str(&anchor(
             &format!("{base}/maps/api/docs"),
             "Map request parameters ↗",
@@ -822,6 +838,99 @@ fn collection_time_html(temporal: &Value) -> String {
     )
 }
 
+// EDR uses string coordinates and a VRS; Common uses numbers and a unit.
+// Recognize our canonical VRS definitions without guessing units for unknown CRS.
+fn vertical_axis(vertical: &Value) -> (&str, &str) {
+    use ds_core::vertical::VerticalKind;
+    for kind in [
+        VerticalKind::Pressure,
+        VerticalKind::ModelLevel,
+        VerticalKind::Height,
+        VerticalKind::ElevationAngle,
+        VerticalKind::HeightAboveAntenna,
+        VerticalKind::Isentropic,
+    ] {
+        if vertical["vrs"].as_str() == Some(kind.vrs()) {
+            return (
+                kind.default_label(),
+                vertical["unit"].as_str().unwrap_or(kind.default_unit()),
+            );
+        }
+    }
+    (
+        "Vertical levels",
+        vertical["unit"].as_str().unwrap_or_default(),
+    )
+}
+
+fn vertical_coordinate(value: &Value) -> Option<String> {
+    let text = value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_f64().map(|n| n.to_string()))?;
+    text.parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .map(|_| text)
+}
+
+fn vertical_values(vertical: &Value) -> Vec<String> {
+    vertical["values"]
+        .as_array()
+        .or_else(|| vertical["grid"]["coordinates"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(vertical_coordinate)
+        .collect()
+}
+
+fn vertical_summary(vertical: &Value) -> Option<String> {
+    if !vertical.is_object() {
+        return None;
+    }
+    let (label, unit) = vertical_axis(vertical);
+    let range = &vertical["interval"][0];
+    let bounds = match (
+        vertical_coordinate(&range[0]),
+        vertical_coordinate(&range[1]),
+    ) {
+        (Some(lo), Some(hi)) if lo == hi => lo,
+        (Some(lo), Some(hi)) => format!("{lo}–{hi}"),
+        _ => String::new(),
+    };
+    let levels = vertical_values(vertical);
+    let count = if levels.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} levels", levels.len())
+    };
+    Some(escape(&format!("{label}: {bounds} {unit}{count}")))
+}
+
+fn vertical_coverage(vertical: &Value) -> String {
+    let Some(summary) = vertical_summary(vertical) else {
+        return String::new();
+    };
+    let mut html = format!(
+        "<div class=\"fact wide\"><small>Vertical dimension</small><strong>{summary}</strong>"
+    );
+    let levels = vertical_values(vertical);
+    if !levels.is_empty() {
+        html.push_str(&format!(
+            "<details><summary>Available levels · z</summary><p class=\"mono\">{}</p></details>",
+            escape(&levels.join(", "))
+        ));
+    }
+    if let Some(vrs) = vertical.get("vrs") {
+        html.push_str(&format!(
+            "<details><summary>Vertical reference system</summary>{}</details>",
+            value_html(vrs)
+        ));
+    }
+    html.push_str("</div>");
+    html
+}
+
 fn collection_facts(doc: &Value) -> String {
     let mut facts = String::from("<dl class=\"collection-facts\">");
     let mut fact = |label: &str, value: String| {
@@ -830,6 +939,9 @@ fn collection_facts(doc: &Value) -> String {
             escape(label)
         ))
     };
+    if let Some(summary) = vertical_summary(&doc["extent"]["vertical"]) {
+        fact("Vertical dimension", summary);
+    }
     let temporal = &doc["extent"]["temporal"];
     fact("Time · UTC", collection_time_html(temporal));
     if let Some(resolution) = temporal["grid"]["resolution"].as_str() {
@@ -1250,6 +1362,45 @@ mod tests {
         assert!(map_times(&temporal).is_empty());
         temporal["grid"] = json!({"cellsCount":2,"coordinates":["invalid","2026-09-18T01:00:00Z"]});
         assert!(map_times(&temporal).is_empty());
+    }
+
+    #[test]
+    fn vertical_dimensions_are_visible_in_catalog_overview_and_map_controls() {
+        use ds_core::vertical::VerticalKind;
+        for vertical in [
+            json!({"interval":[[100,1000]],"values":[1000,850,100],"unit":"hPa"}),
+            json!({"interval":[["100","1000"]],"values":["1000","850","100"],"vrs":VerticalKind::Pressure.vrs()}),
+            json!({"interval":[["1","137"]],"values":["137","1"],"vrs":VerticalKind::ModelLevel.vrs()}),
+        ] {
+            let doc = json!({"id":"levels","extent":{"vertical":vertical},"links":[
+                {"rel":"self","href":"https://example.test/maps/collections/levels"},
+                {"rel":"map","href":"https://example.test/maps/collections/levels/map"}]});
+            assert!(collection_facts(&doc).contains("Vertical dimension"));
+            for api in ["edr", "maps", "tiles"] {
+                let html = collection_html("https://example.test", api, &doc, None);
+                let overview = html.split("id=\"metadata\"").next().unwrap();
+                assert!(overview.contains("Vertical dimension"));
+                assert!(overview.contains("Available levels · z"));
+                if api == "maps" {
+                    assert!(overview.contains("id=\"map-level\""));
+                }
+                if vertical["vrs"] == VerticalKind::ModelLevel.vrs() {
+                    assert!(overview.contains("Model level: 1–137"));
+                } else {
+                    assert!(overview.contains("100–1000 hPa"));
+                    assert!(overview.contains("1000, 850, 100"));
+                }
+            }
+        }
+        let doc =
+            json!({"id":"single","links":[{"rel":"map","href":"/maps/collections/single/map"}]});
+        assert!(!collection_facts(&doc).contains("Vertical dimension"));
+        // The script contains the selector name, so assert the actual element.
+        assert!(!collection_html("", "maps", &doc, None).contains("id=\"map-level\""));
+        let malicious = json!({"interval":[[0,1]],"values":[0,"<script>","NaN",1],"unit":"<img onerror=alert(1)>"});
+        assert!(!vertical_coverage(&malicious).contains("<img"));
+        assert!(vertical_coverage(&malicious).contains("&lt;img"));
+        assert_eq!(vertical_values(&malicious), ["0", "1"]);
     }
 
     #[test]

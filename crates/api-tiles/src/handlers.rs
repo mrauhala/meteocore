@@ -873,7 +873,10 @@ pub async fn collections(
         if !seen.insert(config.id.clone()) {
             continue;
         }
-        let raster_info = state.map_engines.get(&config.id).map(|e| e.raster_info());
+        let raster_info = state
+            .map_engines
+            .get(&config.id)
+            .map(|e| e.raster_info_shared());
         let feature = state.feature_engines.get(&config.id);
         let feature_extent = feature.and_then(|e| e.spatial_extent());
         let feature_time = feature.and_then(|e| e.temporal_extent());
@@ -881,10 +884,10 @@ pub async fn collections(
             .as_ref()
             .and_then(|i| i.spatial_extent)
             .or(feature_extent);
-        let time = collection_time(raster_info.as_ref(), feature_time);
+        let time = collection_time(raster_info.as_deref(), feature_time);
         let metadata = build_collection_metadata(
             config,
-            raster_info.as_ref(),
+            raster_info.as_deref(),
             feature_extent,
             feature_time,
             state.styles.get(&config.id),
@@ -910,7 +913,7 @@ pub async fn collection(
     use ds_core::html::Wanted;
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info());
+    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info_shared());
     let feature_extent = state
         .feature_engines
         .get(&id)
@@ -935,7 +938,7 @@ pub async fn collection(
             let styles = state.styles.get(&id);
             Json(build_collection_metadata(
                 config,
-                raster_info.as_ref(),
+                raster_info.as_deref(),
                 feature_extent,
                 feature_time,
                 styles,
@@ -946,7 +949,7 @@ pub async fn collection(
         Wanted::Html => {
             let metadata = build_collection_metadata(
                 config,
-                raster_info.as_ref(),
+                raster_info.as_deref(),
                 feature_extent,
                 feature_time,
                 state.styles.get(&id),
@@ -970,7 +973,7 @@ pub async fn collection_tilesets(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, TilesError> {
     let state = state.load_full();
-    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info());
+    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info_shared());
     let feature_extent = state
         .feature_engines
         .get(&id)
@@ -1317,7 +1320,7 @@ pub async fn style_legend(
         ))
     })?;
 
-    let info = engine.raster_info();
+    let info = engine.raster_info_shared();
     // Mirror the render path's validation: an unknown `parameter-name` must
     // 400 with the available list, not fall back to the collection style and
     // emit a legend labelled with a parameter that doesn't exist.
@@ -1498,10 +1501,10 @@ async fn render_tile(
         _ => crs_to_uri("CRS:84"),
     };
 
-    // Single `raster_info()` call covers both default-time resolution and
+    // Single `raster_info_shared()` call covers both default-time resolution and
     // parameter-name validation. Trait contract is O(1) but we still avoid
     // the redundant call.
-    let raster_info = engine.raster_info();
+    let raster_info = engine.raster_info_shared();
     let time = validated
         .time
         .or_else(|| engine.default_time())

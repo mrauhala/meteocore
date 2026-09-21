@@ -288,3 +288,7 @@ choice across searches in the browser session. Resource URLs are clickable.
 HTML catalogs now use compact search and metadata summaries, retain UTC time
 precision, and distinguish empty offsets from zero matching collections. Returning
 to the first page preserves discovery filters; list/cards preference persists.
+
+The shared collection HTML renderer displays vertical bounds and available levels
+when advertised in metadata. Features collections without a vertical extent
+continue to omit that dimension.

@@ -14,12 +14,58 @@ const MAX_SECTION_BYTES: usize = 64 * 1024;
 #[cfg(test)]
 mod tests;
 
+/// Node bounds and the cells between them. A cyclic longitude axis has a
+/// closing cell; a duplicated seam node does not add another cell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GridGeometry {
+    pub bbox: [f64; 4],
+    pub cells: [u32; 2],
+}
+
+impl GridGeometry {
+    pub(crate) fn new(
+        ni: usize,
+        nj: usize,
+        west: f64,
+        north: f64,
+        dx: f64,
+        dy: f64,
+    ) -> Option<Self> {
+        if ni == 0 || nj == 0 || dx <= 0.0 || dy >= 0.0 {
+            return None;
+        }
+        let south = north + (nj - 1) as f64 * dy;
+        let east = west + (ni - 1) as f64 * dx;
+        if ![west, east, north, south, dx, dy]
+            .iter()
+            .all(|v| v.is_finite())
+            || south < -90.000001
+            || north > 90.000001
+        {
+            return None;
+        }
+        let (west, east, nx) = match crate::cache::longitude_wrap_columns(ni, dx) {
+            Some(columns) => (-180.0, 180.0, columns.round() as u32),
+            None => (
+                ds_core::geo::wrap_lon(west),
+                ds_core::geo::wrap_lon(east),
+                u32::try_from(ni - 1).ok()?,
+            ),
+        };
+        Some(Self {
+            bbox: [west, south.max(-90.0), east, north.min(90.0)],
+            cells: [nx, u32::try_from(nj - 1).ok()?],
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct MessageMetadata {
     pub triple: (u8, u8, u8),
     pub centre: u16,
     pub first_surface_type: u8,
     pub first_surface_value: Option<f64>,
+    pub geometry: Option<GridGeometry>,
 }
 
 impl From<&DecodedGrid> for MessageMetadata {
@@ -29,6 +75,14 @@ impl From<&DecodedGrid> for MessageMetadata {
             centre: grid.centre,
             first_surface_type: grid.first_surface_type,
             first_surface_value: grid.first_surface_value,
+            geometry: GridGeometry::new(
+                grid.ni,
+                grid.nj,
+                grid.lon_first,
+                grid.lat_first,
+                grid.lon_inc,
+                grid.lat_inc,
+            ),
         }
     }
 }
@@ -79,6 +133,7 @@ impl MessageMetadata {
             centre,
             first_surface_type,
             first_surface_value,
+            geometry: None,
         })
     }
 }
@@ -123,8 +178,8 @@ pub(crate) fn read_batch(
     })
 }
 
-/// Read Sections 0, 1 and 4. Skip optional local-use and grid-definition bodies
-/// by their declared lengths; stop before packing/bitmap/value decoding.
+/// Read Sections 0, 1, the regular-grid header in 3, and 4. Skip local-use
+/// and unsupported grid bodies; stop before packing/bitmap/value decoding.
 /// A normal header fits in the first 4 KiB range. Tail records use the GRIB
 /// indicator's own length, so discovering their metadata needs no HEAD.
 pub(crate) fn read_metadata(
@@ -165,6 +220,7 @@ pub(crate) fn read_metadata(
     let mut position: usize = 16;
     let mut previous = 0;
     let mut centre = None;
+    let mut geometry = None;
     loop {
         let header = reader.read(position, 5)?;
         let section_length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
@@ -195,16 +251,29 @@ pub(crate) fn read_metadata(
                 } else {
                     let product = grib::ProdDefinition::from_payload(payload)
                         .map_err(|e| invalid(&e.to_string()))?;
-                    return MessageMetadata::from_product(
+                    let mut metadata = MessageMetadata::from_product(
                         discipline,
                         centre.ok_or_else(|| invalid("missing identification"))?,
                         &product,
-                    );
+                    )?;
+                    metadata.geometry = geometry;
+                    return Ok(metadata);
                 }
             }
-            // Local-use and grid definitions can be large; their contents are
-            // not needed for parameter units or level labels.
-            2 | 3 => {}
+            3 => {
+                // Template 3.0 has a fixed 72-byte header. Do not download an
+                // optional point list or an unsupported template's large body.
+                if section_length >= 14 {
+                    let header = reader.read(position, 14)?;
+                    if header[12..14] == [0, 0] && section_length >= 72 {
+                        let payload = reader.read(position + 5, 67)?.to_vec().into_boxed_slice();
+                        geometry = grib::GridDefinition::from_payload(payload)
+                            .ok()
+                            .and_then(|grid| crate::reader::grid_geometry(&grid).ok());
+                    }
+                }
+            }
+            2 => {}
             _ => unreachable!(),
         }
         previous = number;
