@@ -11,8 +11,14 @@ prefix_pattern = "%Y%m%d/{run}z/aifs-single/0p25/oper/"
 poll_interval_secs = 300
 max_runs = 1
 run_hours = [0, 6, 12, 18]
+# Expose separate ecmwf-aifs-single and ecmwf-aifs-pressure collections.
+# Give the Icechunk example a different ID if enabling both sources.
+level_types = ["single", "pressure"]
 # AIFS publishes total column water (tcw), not tcwv; cape and sd are unavailable.
-parameters = ["2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcw", "sf"]
+parameters = [
+    "2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcw", "sf",
+    "t", "u", "v", "q", "w", "z", "gh",
+]
 
 [wms]
 colormap = "temperature"
