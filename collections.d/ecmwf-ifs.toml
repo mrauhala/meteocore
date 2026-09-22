@@ -21,36 +21,6 @@ parameters = [
 colormap = "temperature"
 
 [[wms.parameters]]
-name = "2t"
-colormap = "temperature"
-
-[[wms.parameters]]
-name = "2d"
-colormap = "temperature"
-
-[[wms.parameters]]
-name = "msl"
-colormap = "viridis"
-min = 950.0
-max = 1050.0
-
-[[wms.parameters]]
-name = "sp"
-colormap = "viridis"
-min = 500.0
-max = 1050.0
-
-[[wms.parameters]]
-name = "tp"
-colormap = "precipitation"
-
-[[wms.parameters]]
-name = "tcc"
-colormap = "grayscale"
-min = 0.0
-max = 100.0
-
-[[wms.parameters]]
 name = "10u"
 colormap = "wind_speed"
 
@@ -63,12 +33,6 @@ name = "tcwv"
 colormap = "viridis"
 min = 0.0
 max = 70.0
-
-[[wms.parameters]]
-name = "mucape"
-colormap = "viridis"
-min = 0.0
-max = 3000.0
 
 [[wms.parameters]]
 name = "sf"
