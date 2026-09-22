@@ -50,8 +50,11 @@ impl Source {
         let version = version_info(collection_id, ic)?;
         let repo = runtime::run(async {
             let storage = build_storage(collection_id, config).await?;
-            // Override only the payload-cache budget; preserve repository-specific
-            // metadata caching, compression, and storage settings.
+            // Repository::open merges overrides into the persisted config,
+            // including a field-by-field CachingConfig::merge. These derived
+            // Defaults leave fields as None (unset), so only num_bytes_chunks
+            // changes; metadata caches, compression, storage and virtual chunk
+            // containers survive. Covered with non-default V1/V2 repositories.
             let options = RepositoryConfig {
                 caching: Some(icechunk::config::CachingConfig {
                     num_bytes_chunks: Some(config.cache_mb.saturating_mul(ds_cache::MIB)),

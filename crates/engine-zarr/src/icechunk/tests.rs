@@ -145,6 +145,82 @@ async fn commit_values(repo: &Repository, value: f32) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_override_preserves_persisted_repository_settings() {
+    use icechunk::{
+        config::{CachingConfig, CompressionConfig, ObjectStoreConfig, S3Options},
+        format::format_constants::SpecVersionBin,
+        storage::{ConcurrencySettings, Settings},
+        virtual_chunks::VirtualChunkContainer,
+    };
+
+    // V1 stores config.yaml; V2 embeds configuration in the repo info object.
+    for version in [SpecVersionBin::V1, SpecVersionBin::V2] {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = icechunk::new_local_filesystem_storage(dir.path())
+            .await
+            .unwrap();
+        let mut persisted = RepositoryConfig {
+            inline_chunk_threshold_bytes: Some(17),
+            get_partial_values_concurrency: Some(3),
+            max_concurrent_requests: Some(7),
+            compression: Some(CompressionConfig {
+                level: Some(1),
+                ..Default::default()
+            }),
+            caching: Some(CachingConfig {
+                num_snapshot_nodes: Some(1234),
+                num_chunk_refs: Some(2345),
+                num_transaction_changes: Some(3456),
+                num_bytes_attributes: Some(4567),
+                num_bytes_chunks: Some(1024 * 1024),
+            }),
+            storage: Some(Settings {
+                concurrency: Some(ConcurrencySettings {
+                    max_concurrent_requests_for_object: Some(3.try_into().unwrap()),
+                    ideal_concurrent_request_size: Some(65536.try_into().unwrap()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        persisted
+            .set_virtual_chunk_container(
+                VirtualChunkContainer::new(
+                    "s3://preserved-virtual-data/".into(),
+                    ObjectStoreConfig::S3(S3Options::default().with_region("us-east-1")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let repo = Repository::create(
+            Some(persisted),
+            storage.clone(),
+            HashMap::new(),
+            Some(version),
+            true,
+        )
+        .await
+        .unwrap();
+        let original = repo.config().clone();
+        drop(repo);
+
+        for cache_mb in [0, 4] {
+            let mut config = config(dir.path());
+            config.cache_mb = cache_mb;
+            let source = Source::open("config-merge", &config).unwrap();
+            let mut expected = original.clone();
+            expected.caching.as_mut().unwrap().num_bytes_chunks = Some(cache_mb * ds_cache::MIB);
+            assert_eq!(source.repo.config(), &expected);
+        }
+        // Opening a reader must not persist its per-server cache override.
+        let reopened = Repository::open(None, storage, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(reopened.config(), &original);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn payload_cache_obeys_budget_and_zero_disables_retention() {
     for enabled in [true, false] {
         let dir = tempfile::tempdir().unwrap();
