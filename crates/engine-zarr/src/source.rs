@@ -53,9 +53,10 @@ impl Source {
         }
     }
 
-    /// Retire the previous plain catalog only after the replacement built
-    /// successfully. Existing cached bytes and sampled windows remain valid;
-    /// uncached old reads fail rather than fetching a newer object's bytes.
+    /// Register the initial plain catalog, or retire its predecessor after a
+    /// successful rebuild has been swapped into the engine. Existing cached
+    /// bytes and sampled windows remain valid; uncached old reads fail rather
+    /// than fetching a newer object's bytes.
     pub(crate) fn publish(&self, store: &EngineStore) {
         match self {
             Self::Plain(source) => {

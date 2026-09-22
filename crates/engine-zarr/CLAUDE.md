@@ -45,11 +45,12 @@ pool: they do not use the Icechunk runtime bridge.
 - **Plain refresh:** `Source::snapshot` creates a fresh `DsStore` generation
   for every candidate catalog. Clients and one object-cache byte budget are shared;
   cache keys include generation and path, including cached missing keys.
-  `cache_mb = 0` disables retention. Call `Source::publish` only after a
-  successful build, immediately before the catalog swap; failed builds never
-  retire the published generation. Retirement forbids uncached reads and
-  discards downloads crossing publication. Old cached bytes and sampled
-  windows remain usable; eviction cannot refill an old catalog from new data.
+  `cache_mb = 0` disables retention. On refresh, call `Source::publish` only
+  after swapping in the successfully built catalog, so new requests cannot
+  load a retired generation; failed builds never retire the published one.
+  Retirement forbids uncached reads and discards downloads crossing retirement.
+  Old cached bytes and sampled windows remain usable; eviction cannot refill
+  an old catalog from new data.
   Preserve retirement as typed `ResourceExhausted` through zarrs storage/codec
   wrappers so interrupted requests return HTTP 503 (render APIs add `Retry-After`).
   Every successful plain poll gets a nonzero render content version, even if

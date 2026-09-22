@@ -162,8 +162,10 @@ impl ZarrEngine {
                     log_loaded(&self.collection_id, &new_catalog);
                 }
                 // One atomic swap updates data + capabilities together.
-                self.source.publish(&store);
                 self.catalog.store(Arc::new(new_catalog));
+                // Make the replacement visible before retiring the old
+                // generation, so new requests never load a retired catalog.
+                self.source.publish(&store);
             }
             Ok(None) => {}
             Err(e) => {

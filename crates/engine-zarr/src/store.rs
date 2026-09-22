@@ -159,8 +159,8 @@ impl DsStore {
         if let Some(bytes) = self.shared.cache.get(&k) {
             return Ok(bytes);
         }
-        // Never refill an old catalog from the current mutable backend after
-        // publication. Check again after I/O to cover a fetch racing refresh.
+        // Never refill a retired catalog from the current mutable backend.
+        // Check again after I/O to cover a fetch racing retirement.
         self.generation.check_active()?;
         let bytes = self
             .shared
