@@ -1,0 +1,44 @@
+id = "ecmwf-aifs"
+title = "ECMWF AIFS Global Forecast"
+description = "AIFS deterministic AI forecast (0.25 deg) from ECMWF open data"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[grib]
+endpoint = "https://s3.eu-central-1.amazonaws.com"
+bucket = "ecmwf-forecasts"
+prefix_pattern = "%Y%m%d/{run}z/aifs-single/0p25/oper/"
+poll_interval_secs = 300
+max_runs = 1
+run_hours = [0, 6, 12, 18]
+level_types = ["single", "pressure"]
+parameters = [
+    "2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcw", "sf",
+    "lcc", "mcc", "hcc", "cp",
+    "t", "u", "v", "q", "w", "z", "gh",
+]
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "tp"
+colormap = "precipitation"
+
+[[wms.parameters]]
+name = "10u"
+colormap = "wind_speed"
+
+[[wms.parameters]]
+name = "10v"
+colormap = "wind_speed"
+
+[[wms.parameters]]
+name = "tcw"
+colormap = "viridis"
+min = 0.0
+max = 70.0
+
+[[wms.parameters]]
+name = "sf"
+colormap = "precipitation"

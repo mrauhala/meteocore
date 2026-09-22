@@ -7,7 +7,7 @@
 #
 # To run it from collections.d:
 #   1. rename this file to drop `.disabled`
-#   2. cargo run -p server --features icechunk -- --collections=ecmwf-aifs-single
+#   2. cargo run -p server --features icechunk -- --collections=ecmwf-aifs-single-icechunk
 #      (the `--collections` filter avoids loading the other, remote, collections)
 #
 # Verified live: serves EDR + WMS/Maps/Tiles. NOTE temperature_2m is in degrees
@@ -18,7 +18,7 @@
 # as the time axis. Selecting older runs (EDR instances / WMS reference_time) is
 # tracked in #337.
 
-id = "ecmwf-aifs-single"
+id = "ecmwf-aifs-single-icechunk"
 title = "ECMWF AIFS-single forecast (Icechunk)"
 description = "ECMWF AIFS deterministic AI forecast, global 0.25° regular lat/lon, as an Icechunk repository on public S3 (dynamical.org, CC-BY-4.0)."
 engine_type = "zarr"
