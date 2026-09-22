@@ -123,6 +123,14 @@ with map reads within the same snapshot. `zarr.icechunk.decoded_cache_mb` bounds
 resident decoded bytes separately from the compressed payload cache (default
 256 MiB, `0` disables). Concurrent requests coalesce chunk fills while retaining
 their own wait deadlines; unsupported or oversized chunks use ordinary reads.
+Zarr and Icechunk position/area/radius reads also share process-wide source
+memory admission (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB). It reserves the
+native subset, conversion/window buffers, and a decode-workspace estimate
+before payload I/O. A read that cannot fit, including concurrent contention,
+returns 503 without waiting while holding other windows. Area windows retain
+their reservation through sampling. This budget is separate from response
+limits, resident caches, and persistent metadata; codec-private scratch and
+encoded object buffers are not allocator-bounded by it.
 
 ## Per-engine query-type matrix
 

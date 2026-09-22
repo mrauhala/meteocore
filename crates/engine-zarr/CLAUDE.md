@@ -57,6 +57,20 @@ through it.**
   The read path branches on `data_type()` and widens every supported
   int/float to `f64`. Fill sentinels are compared against the RAW
   (pre-scale) value; NaN/±inf map to nodata.
+- **Source memory admission:** `read_budget::BUDGET` is process-wide and
+  survives reload/snapshot changes (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB).
+  Reserve before variable payload reads: native subset + typed conversion +
+  raw/physical f64 buffers + axes/window overhead + a four-buffer decode/index
+  allowance. Use full stored chunk shapes, not clipped overlaps. Sharded reads
+  account for full-shard fast paths when decoded-cache splitting is absent.
+  `Window` owns an `Arc<Permit>` until the last window of its span is dropped;
+  position reads hold it through interpolation. Admission fails immediately
+  with `ResourceExhausted`, avoiding waits while holding executor slots or
+  earlier windows. Never move the permit onto the HTTP waiter. The estimate
+  excludes encoded objects, codec-private scratch, catalog metadata, caches,
+  and API outputs. It is not an allocator-enforced memory ceiling. Retrieval
+  is serial, so planning reserves the largest decode unit; parallel retrieval
+  must reserve all simultaneously active units before launching them.
 - **Forecast axes / instances (#337):** with a CF `forecast_reference_time`
   axis AND a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/
   ICON-EU), every run on the reference axis is an EDR instance / WMS
