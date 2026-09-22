@@ -173,6 +173,49 @@ async fn payload_cache_obeys_budget_and_zero_disables_retention() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_maps_read_icechunk_through_render_executor() {
+    // Maps, WMS, and Tiles all use acquire_raster + RenderJob::run. Exercise
+    // actual async file/range reads and shard decoding inside spawn_blocking,
+    // with more requests than render slots and both cold and warm payloads.
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path()).await;
+    for cache_mb in [0, 4] {
+        let mut config = config(dir.path());
+        config.cache_mb = cache_mb;
+        let engine = Arc::new(ZarrEngine::new("render-executor", &config).unwrap());
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        for _ in 0..3 {
+            let start = Arc::new(tokio::sync::Barrier::new(8));
+            let mut requests = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let (engine, slots, start) = (engine.clone(), slots.clone(), start.clone());
+                requests.spawn(async move {
+                    start.wait().await;
+                    let (job, memory) = ds_executor::RenderJob::acquire_raster(slots, 4, 4)
+                        .await
+                        .unwrap();
+                    let worker_memory = memory.clone();
+                    let tile = job
+                        .run(move || {
+                            let _memory = worker_memory;
+                            assert!(ds_core::deadline::current().is_some());
+                            render(&engine)
+                        })
+                        .await
+                        .expect("Icechunk render worker must complete without a panic")
+                        .expect("Icechunk range reads and decoding must succeed");
+                    assert!(tile.values.iter_values().all(|v| v == Some(10.0)));
+                });
+            }
+            while let Some(result) = requests.join_next().await {
+                result.unwrap();
+            }
+            assert_eq!(slots.available_permits(), 4);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renders_reject_expired_deadlines_on_cold_and_warm_reads() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path()).await;

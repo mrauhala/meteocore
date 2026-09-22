@@ -34,6 +34,9 @@ where
     };
     let result = match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            // Hand off an async worker's scheduler core before blocking. On a
+            // spawn_blocking thread (RenderJob), Tokio has no async execution
+            // context to hand off, so block_in_place simply calls the closure.
             tokio::task::block_in_place(|| IO_RUNTIME.block_on(timed))
         }
         // A current-thread runtime cannot block_in_place or enter another

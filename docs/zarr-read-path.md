@@ -46,6 +46,12 @@ Cached and uncached pixels matched exactly. These are single debug-build measure
 
 Network-free tests exercise payload retention with deleted backing files, zero-cache behavior, warm payload reuse across changed snapshots, expired and in-flight deadlines, multiple caller/runtime contexts, no-op refresh, failed refresh/retry, old readers, explicit snapshot/tag selection, same-time data correction, and irregular-grid map/position consistency.
 
+The render-executor regression runs 48 map reads through the same `RenderJob::acquire_raster` / `run` boundary used by Maps, WMS, and Tiles, with four render slots, eight concurrent requests, and caching enabled/disabled. It reads external compressed shards and checks pixels, deadline propagation, and slot release. This covers the blocking-pool context beyond the isolated runtime bridge tests.
+
+Tokio 1.53.1 permits `block_in_place` on a `spawn_blocking` thread: no async scheduler context is active there, so it calls the closure directly. The panic restriction applies to current-thread async execution and `LocalSet`, not blocking-pool workers; see [Tokio's implementation](https://docs.rs/tokio/1.53.1/src/tokio/runtime/scheduler/multi_thread/worker.rs.html#403-509). Icechunk handles current-thread callers separately and drives I/O on its persistent runtime.
+
+A manual HTTP check on 2026-09-22 exercised the public AIFS snapshot above through a locally built server (`cargo build -p server --features icechunk`). At six concurrent requests, all 24 requests returned HTTP 200 PNGs with `X-Cache: MISS`: eight each for Maps, WMS, and Tiles over eight forecast leads. Maps/WMS used the bbox above at 128×128; Tiles used WebMercatorQuad 5/9/18. The six initial reads took 2.68–2.71 seconds and subsequent reads 79–137 ms, with no worker panics. The probe used `MC_RENDER_TIMEOUT_MS=15000` to isolate runtime correctness; these debug-build observations do not establish production latency guarantees.
+
 Run:
 
 ```sh

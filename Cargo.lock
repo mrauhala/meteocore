@@ -1584,6 +1584,7 @@ dependencies = [
  "chrono",
  "ds-cache",
  "ds-core",
+ "ds-executor",
  "ds-poll",
  "ds-storage",
  "futures",
