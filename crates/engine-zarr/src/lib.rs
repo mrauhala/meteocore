@@ -19,6 +19,7 @@ mod cf;
 mod decoded;
 #[cfg(feature = "icechunk")]
 mod icechunk;
+pub mod read_budget;
 #[cfg(feature = "icechunk")]
 mod runtime;
 mod source;

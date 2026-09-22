@@ -23,6 +23,7 @@ use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
 use crate::decoded::{DecodedArray, DecodedCache};
+use crate::read_budget::{self, Budget, Permit};
 use crate::store::EngineStore;
 
 /// The store type backing every Zarr collection. A backend-agnostic wrapper so
@@ -92,6 +93,7 @@ fn convert_sample(raw: f64, scale: f64, offset: f64, fills: &[f64]) -> Option<f6
 
 /// A parsed Zarr store snapshot.
 pub struct Catalog {
+    read_budget: Arc<Budget>,
     /// Pinned Icechunk snapshot; absent for an unversioned plain Zarr store.
     pub revision: Option<String>,
     pub content_version: u64,
@@ -234,6 +236,15 @@ impl Catalog {
             }
         }
         let subset = ArraySubset::new_with_ranges(&ranges);
+        let axes_bytes = (i1 - i0 + 1)
+            .checked_add(j1 - j0 + 1)
+            .and_then(|n| n.checked_mul(size_of::<f64>()))
+            .and_then(|n| n.checked_add(size_of::<Window>()))
+            .and_then(|n| n.checked_mul(nt))
+            .map(|n| n as u64);
+        let reservation =
+            self.read_budget
+                .reserve(&var.array, &subset, axes_bytes, var.decoded.is_some())?;
         let raw = retrieve_raw_f64(&var.array, &subset, var.decoded.as_ref())?;
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
@@ -276,6 +287,7 @@ impl Catalog {
                 data,
                 lons: wl,
                 lats: wla,
+                _reservation: reservation.clone(),
             });
         }
         Ok(Some(windows))
@@ -327,6 +339,13 @@ impl Catalog {
             }
         }
         let subset = ArraySubset::new_with_ranges(&ranges);
+        let output_bytes = time_idx
+            .len()
+            .checked_mul(size_of::<Option<f64>>())
+            .map(|n| n as u64);
+        let _reservation =
+            self.read_budget
+                .reserve(&var.array, &subset, output_bytes, var.decoded.is_some())?;
         let raw = retrieve_raw_f64(&var.array, &subset, var.decoded.as_ref())?;
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
@@ -378,6 +397,8 @@ pub struct Window {
     data: Vec<f64>,
     lons: Vec<f64>,
     lats: Vec<f64>,
+    // Shared by a timestep span; held until its last sampling window is gone.
+    _reservation: Arc<Permit>,
 }
 
 impl Window {
@@ -866,6 +887,7 @@ pub fn build(
     );
 
     Ok(Catalog {
+        read_budget: read_budget::BUDGET.clone(),
         revision,
         content_version,
         vars,
@@ -1181,7 +1203,127 @@ fn retrieve_raw_f64(
 
 #[cfg(test)]
 mod tests {
-    use super::{axis_window, convert_sample};
+    use super::*;
+
+    fn fixture(budget: Arc<Budget>) -> Catalog {
+        let config = ds_core::config::ZarrConfig::auto_local(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zarr-era5-t2m").into(),
+        );
+        let mut catalog = build(
+            Arc::new(crate::build_store("budget-test", &config).unwrap()),
+            "budget-test",
+            None,
+            Arc::new(DecodedCache::new(0)),
+        )
+        .unwrap();
+        catalog.read_budget = budget;
+        catalog
+    }
+
+    #[test]
+    fn window_span_keeps_reservation_until_last_window_is_dropped() {
+        let budget = Arc::new(Budget::new(ds_cache::MIB));
+        let catalog = fixture(budget.clone());
+        let mut windows = catalog
+            .read_window_span(&catalog.vars[0], None, 0..3, catalog.extent)
+            .unwrap()
+            .unwrap();
+        let used = budget.metrics().0;
+        assert!(used > 0);
+        let last = windows.pop().unwrap();
+        drop(windows);
+        assert_eq!(budget.metrics().0, used);
+        assert!(last.sample(5.5, 54.5).is_some());
+        drop(last);
+        assert_eq!(budget.metrics().0, 0);
+        catalog
+            .sample_series(&catalog.vars[0], None, 5.5, 54.5, &[0, 1])
+            .unwrap();
+        assert_eq!(
+            budget.metrics().0,
+            0,
+            "position read releases its working set"
+        );
+    }
+
+    #[test]
+    fn map_admission_precedes_payload_io_and_failed_reads_release_memory() {
+        use ds_core::map_engine::{MapEngine, OutputCrs};
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for item in std::fs::read_dir(from).unwrap() {
+                let item = item.unwrap();
+                let dest = to.join(item.file_name());
+                if item.file_type().unwrap().is_dir() {
+                    copy_tree(&item.path(), &dest);
+                } else {
+                    std::fs::copy(item.path(), dest).unwrap();
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        copy_tree(
+            std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/zarr-era5-t2m"
+            )),
+            dir.path(),
+        );
+        std::fs::write(dir.path().join("t2m/c/0/0/0"), b"invalid gzip").unwrap();
+        let config = ds_core::config::ZarrConfig::auto_local(dir.path().to_string_lossy().into());
+        let engine = crate::ZarrEngine::new("budget-test", &config).unwrap();
+        let render = || {
+            engine.get_raster_tile(
+                [0.0, 49.0, 15.0, 60.0],
+                1,
+                1,
+                None,
+                &OutputCrs::Wgs84,
+                Some("t2m"),
+                None,
+                None,
+            )
+        };
+        for (capacity, exhausted) in [(0, true), (ds_cache::MIB, false)] {
+            let budget = Arc::new(Budget::new(capacity));
+            let mut catalog = build(
+                Arc::new(crate::build_store("budget-test", &config).unwrap()),
+                "budget-test",
+                None,
+                Arc::new(DecodedCache::new(0)),
+            )
+            .unwrap();
+            catalog.read_budget = budget.clone();
+            engine.catalog.store(Arc::new(catalog));
+            let error = render().err().expect("render must fail");
+            if exhausted {
+                assert!(matches!(error, DataServerError::ResourceExhausted));
+                assert_eq!(budget.metrics().2, 1);
+            } else {
+                assert!(
+                    matches!(error, DataServerError::Engine(_)),
+                    "the corrupt payload must be read once admitted"
+                );
+            }
+            assert_eq!(budget.metrics().0, 0);
+        }
+    }
+
+    #[test]
+    fn off_grid_and_expired_reads_do_not_consume_source_budget() {
+        let budget = Arc::new(Budget::new(0));
+        let catalog = fixture(budget.clone());
+        assert!(catalog
+            .read_window(&catalog.vars[0], None, 0, [150.0, -50.0, 160.0, -40.0])
+            .unwrap()
+            .is_none());
+        let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
+        assert!(matches!(
+            catalog.read_window(&catalog.vars[0], None, 0, catalog.extent),
+            Err(DataServerError::DeadlineExceeded)
+        ));
+        assert_eq!(budget.metrics(), (0, 0, 0));
+    }
 
     #[test]
     fn irregular_axis_windows_include_real_brackets_in_both_directions() {

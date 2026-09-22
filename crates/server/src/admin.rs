@@ -901,6 +901,24 @@ static GRIB_MESSAGE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock
 static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new("zarr_decoded_cache", "Zarr decoded chunk cache")
 });
+static ZARR_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "zarr_read_reserved_bytes",
+        "Reserved Zarr source/decode working-set estimate",
+    )
+});
+static ZARR_READ_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "zarr_read_capacity_bytes",
+        "Zarr source/decode admission capacity",
+    )
+});
+static ZARR_READ_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "zarr_read_rejected_total",
+        "Zarr reads rejected by source/decode memory admission",
+    )
+});
 
 // GRIB grid cache (per-collection).
 static GRID_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -5079,6 +5097,12 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     }
 
     if let Ok(engines) = state.zarr_engines.read() {
+        if !engines.is_empty() {
+            let (used, limit, rejected) = engine_zarr::read_budget::metrics();
+            ZARR_READ_USED.set(used.min(i64::MAX as u64) as i64);
+            ZARR_READ_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+            ZARR_READ_REJECTED.feed(rejected);
+        }
         for engine in engines.iter() {
             let collection = engine.collection_id();
             ZARR_DECODED_CACHE_METRICS.update(
