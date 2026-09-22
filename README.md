@@ -1119,7 +1119,7 @@ At most one of `branch` / `tag` / `snapshot` may be set; the default is the HEAD
 
 ```toml
 [[collections]]
-id = "ecmwf-aifs-single-icechung"
+id = "ecmwf-aifs-single-icechunk"
 title = "ECMWF AIFS-single forecast (Icechunk)"
 description = "ECMWF AIFS deterministic AI forecast, global 0.25°, Icechunk on public S3 (dynamical.org)"
 engine_type = "zarr"
@@ -1149,7 +1149,7 @@ min = -30.0       # temperature_2m is already in °C — no unit conversion
 max = 40.0
 ```
 
-Ready-to-use disabled examples ship in `collections.d/` (`ecmwf-aifs-single-icechung.toml.disabled`, `noaa-gfs-icechunk.toml.disabled`, `dwd-icon-eu.toml.disabled`) — rename to drop `.disabled` and run with `--features icechunk`.
+Ready-to-use disabled examples ship in `collections.d/` (`ecmwf-aifs-single-icechunk.toml.disabled`, `noaa-gfs-icechunk.toml.disabled`, `dwd-icon-eu.toml.disabled`) — rename to drop `.disabled` and run with `--features icechunk`.
 
 ## OGC 3D Tiles
 
