@@ -102,7 +102,7 @@ impl DsStore {
 
 /// Wrap any ds-storage error as a zarrs `StorageError` (which has no free-text
 /// variant, so we route through an IO error).
-fn io_err(e: ds_core::error::DataServerError) -> StorageError {
+pub(crate) fn io_err(e: ds_core::error::DataServerError) -> StorageError {
     StorageError::from(Arc::new(std::io::Error::other(e.to_string())))
 }
 
@@ -220,7 +220,7 @@ impl ListableStorageTraits for DsStore {
 /// A backend-agnostic readable + listable store. The catalog and read paths
 /// work over this single concrete type, so `Catalog`/`ZarrEngine` stay
 /// non-generic, while the actual backend — plain [`DsStore`], or the Icechunk
-/// async→sync adapter under the `icechunk` feature — lives behind two upcast
+/// deadline-aware adapter under the `icechunk` feature — lives behind two upcast
 /// trait-object handles to the *same* store.
 ///
 /// We hold separate `Readable` and `Listable` handles (not one
@@ -231,6 +231,7 @@ impl ListableStorageTraits for DsStore {
 pub struct EngineStore {
     readable: Arc<dyn ReadableStorageTraits>,
     listable: Arc<dyn ListableStorageTraits>,
+    pub(crate) revision: Option<String>,
 }
 
 impl EngineStore {
@@ -243,7 +244,14 @@ impl EngineStore {
         Self {
             readable: arc.clone(),
             listable: arc,
+            revision: None,
         }
+    }
+
+    #[cfg(feature = "icechunk")]
+    pub(crate) fn with_revision(mut self, revision: String) -> Self {
+        self.revision = Some(revision);
+        self
     }
 }
 

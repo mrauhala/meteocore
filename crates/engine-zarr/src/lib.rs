@@ -1,17 +1,16 @@
 //! Zarr engine — reads cloud-native multidimensional arrays (Zarr V2/V3) with
 //! CF-conventions metadata and serves them over the EDR API.
 //!
-//! **Scope** (issue #125, Phases 1-2): a local **or** remote (S3/HTTP) Zarr
-//! store on a WGS84/geographic lat-lon grid, multi-variable EDR *position*
+//! **Scope** (issue #125, Phases 1-3): a local **or** remote (S3/HTTP) Zarr
+//! store on a WGS84/geographic lat-lon grid, multi-variable EDR position/area
 //! queries with bilinear interpolation, CF time-axis decoding, CF packing
 //! (`scale_factor`/`add_offset`/`_FillValue`), byte-range chunk reads with an
-//! LRU cache, and a startup warning for pathological chunk shapes. Map/Tiles/WMS
-//! rendering (Phase 3) and projected/per-item-CRS sources (Phase 4) are not
-//! implemented yet.
+//! LRU cache, Map/Tiles/WMS rendering, and chunk-shape diagnostics. Projected
+//! source grids / per-item-CRS sources (Phase 4) are not implemented yet.
 //!
 //! The Zarr format and codec pipeline (blosc/zstd/gzip/crc32c/sharding) are
-//! handled by the `zarrs` crate; all I/O goes through the shared `ds-storage`
-//! object store via [`store::DsStore`]. This engine adds the CF semantics, the
+//! handled by the `zarrs` crate; plain stores use shared `ds-storage` through
+//! [`store::DsStore`], while Icechunk owns its storage. This engine adds CF semantics, the
 //! OGC domain mapping, and the poll-and-swap lifecycle shared by the other
 //! engines.
 
@@ -19,6 +18,9 @@ mod catalog;
 mod cf;
 #[cfg(feature = "icechunk")]
 mod icechunk;
+#[cfg(feature = "icechunk")]
+mod runtime;
+mod source;
 mod store;
 
 use std::collections::HashMap;
@@ -36,8 +38,8 @@ use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, 
 use ds_core::instances::{self, RunInfo};
 
 /// Most variables one EDR area request may address. Each is a separate
-/// blocking store round trip on the request thread (two across the
-/// antimeridian) and they cannot run concurrently (`concurrent_target(1)`).
+/// subset retrieval (two across the antimeridian). Each subset can touch many
+/// chunks, currently read serially (`concurrent_target(1)`).
 const MAX_AREA_VARIABLES: usize = 8;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
@@ -51,9 +53,8 @@ use store::{DsStore, EngineStore};
 /// Engine for serving Zarr arrays over EDR and the Map/Tiles/WMS APIs.
 pub struct ZarrEngine {
     collection_id: String,
-    /// Backend store (plain `ds-storage` local/S3/HTTP, or Icechunk), shared by
-    /// query and poll.
-    store: Arc<EngineStore>,
+    /// Refreshable source; each catalog retains its own read session.
+    source: source::Source,
     /// Parsed snapshot (data + map-capabilities), swapped atomically by the
     /// poll loop. `raster_info()` reads the catalog's cached `RasterInfo`, so it
     /// is O(1) from a snapshot and always consistent with the served data
@@ -70,7 +71,8 @@ impl ZarrEngine {
     /// Open a Zarr store (local directory or remote S3/HTTP) and build the
     /// initial catalog.
     pub fn new(collection_id: &str, config: &ZarrConfig) -> Result<Self, DataServerError> {
-        let store = Arc::new(build_store(collection_id, config)?);
+        let source = source::Source::open(collection_id, config)?;
+        let store = source.snapshot(None)?.expect("initial snapshot");
 
         let param_filter = config.parameters.clone();
         let catalog = catalog::build(store.clone(), collection_id, param_filter.as_deref())?;
@@ -79,7 +81,7 @@ impl ZarrEngine {
 
         Ok(Self {
             collection_id: collection_id.to_string(),
-            store,
+            source,
             catalog: ArcSwap::from_pointee(catalog),
             param_filter,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
@@ -111,12 +113,19 @@ impl ZarrEngine {
     }
 
     fn poll_once(&self) {
-        match catalog::build(
-            self.store.clone(),
-            &self.collection_id,
-            self.param_filter.as_deref(),
-        ) {
-            Ok(new_catalog) => {
+        let published = self.catalog.load().revision.clone();
+        let rebuilt = self
+            .source
+            .snapshot(published.as_deref())
+            .and_then(|store| {
+                store
+                    .map(|store| {
+                        catalog::build(store, &self.collection_id, self.param_filter.as_deref())
+                    })
+                    .transpose()
+            });
+        match rebuilt {
+            Ok(Some(new_catalog)) => {
                 let current = self.catalog.load();
                 if new_catalog.times != current.times
                     || new_catalog.runs.len() != current.runs.len()
@@ -127,6 +136,7 @@ impl ZarrEngine {
                 // One atomic swap updates data + capabilities together.
                 self.catalog.store(Arc::new(new_catalog));
             }
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(
                     "[{}] Zarr poll rebuild failed (keeping previous catalog): {e}",
@@ -314,7 +324,7 @@ impl EdrEngine for ZarrEngine {
             Some([nx, ny]) => ((e - w) / nx.max(1) as f64, (n - s) / ny.max(1) as f64),
             None => (0.0, 0.0),
         };
-        // Every variable is one blocking store round trip on this thread
+        // Every variable is one subset retrieval on this thread
         // (zarrs retrieval is pinned to `concurrent_target(1)` — see the
         // crate notes — so the reads cannot fan out), and an unfiltered
         // request addresses every variable in the store. Cap the count and
@@ -381,8 +391,8 @@ impl EdrEngine for ZarrEngine {
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
         for v in selected {
-            // One blocking store read per (variable, seam side) for the whole
-            // span (Performance rule 9) — `windows[side][step]`; a side
+            // One subset retrieval per (variable, seam side) for the whole
+            // span — `windows[side][step]`; a side
             // entirely off the grid contributes nothing.
             let windows: Vec<Vec<catalog::Window>> = bboxes
                 .iter()
@@ -393,8 +403,10 @@ impl EdrEngine for ZarrEngine {
                 .collect();
             let mut values: Vec<Option<f64>> = Vec::with_capacity(time_idx.len() * ny * nx);
             for &ti in &time_idx {
+                ds_core::deadline::check()?;
                 let step = ti - t0;
                 for (iy, &y) in axes.y.iter().enumerate() {
+                    ds_core::deadline::check()?;
                     for (ix, &x) in axes.x.iter().enumerate() {
                         values.push(if mask[axes.index(ix, iy)] {
                             windows.iter().find_map(|side| side[step].sample(x, y))
@@ -450,6 +462,7 @@ impl EdrEngine for ZarrEngine {
         _z: Option<&[f64]>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        ds_core::deadline::check()?;
         let (lon, lat) = parse_coords(coords)?;
         let cat = self.catalog.load();
         if cat.times.is_empty() {
@@ -504,22 +517,6 @@ impl EdrEngine for ZarrEngine {
 /// - Local: `data_path` (a directory, or an `s3://` / `http(s)://` URL),
 ///   optionally suffixed by `path`. `ds_storage::build_store` picks the backend.
 fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<EngineStore, DataServerError> {
-    // Icechunk source (transactional/versioned repo) takes precedence when
-    // configured. Feature-gated; errors clearly if requested without the build.
-    if config.icechunk.is_some() {
-        #[cfg(feature = "icechunk")]
-        {
-            return icechunk::build_store(collection_id, config);
-        }
-        #[cfg(not(feature = "icechunk"))]
-        {
-            return Err(DataServerError::Config(format!(
-                "Collection '{collection_id}': [zarr.icechunk] is configured but this server was \
-                 built without the 'icechunk' feature"
-            )));
-        }
-    }
-
     if let (Some(endpoint), Some(bucket)) = (config.endpoint.as_deref(), config.bucket.as_deref()) {
         // `path` is required for a remote source — enforced in
         // `ServerConfig::validate` ("remote zarr (endpoint+bucket) requires
@@ -574,6 +571,7 @@ impl MapEngine for ZarrEngine {
         _z: Option<f64>, // Zarr collections expose no vertical dimension yet
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
+        ds_core::deadline::check()?;
         let cat = self.catalog.load();
         let run = cat.resolve_run(reference_time)?;
         let var = match parameter {
@@ -637,6 +635,7 @@ impl MapEngine for ZarrEngine {
                     .map(|env| output_crs.footprint_pixel_window(bbox, env, width, height))
                     .unwrap_or((0, width.saturating_sub(1), 0, height.saturating_sub(1)));
                 for oy in 0..height {
+                    ds_core::deadline::check()?;
                     let in_y = oy >= py_lo && oy <= py_hi;
                     for ox in 0..width {
                         if !in_y || ox < px_lo || ox > px_hi {
@@ -652,6 +651,7 @@ impl MapEngine for ZarrEngine {
                 // `project_node` is cheap here (no inverse projection), so sample
                 // per pixel directly for full accuracy.
                 for row in 0..height {
+                    ds_core::deadline::check()?;
                     let fy = (row as f64 + 0.5) / height as f64;
                     for col in 0..width {
                         let fx = (col as f64 + 0.5) / width as f64;
@@ -671,6 +671,10 @@ impl MapEngine for ZarrEngine {
 
     fn raster_info(&self) -> RasterInfo {
         self.catalog.load().raster_info.clone()
+    }
+
+    fn content_version(&self) -> u64 {
+        self.catalog.load().content_version
     }
 
     fn resolve_time(

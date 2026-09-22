@@ -1,14 +1,9 @@
 //! Icechunk source for the Zarr engine (feature `icechunk`, issue #335).
 //!
 //! Opens an Icechunk repository (transactional/versioned Zarr) read-only at a
-//! chosen version, exposes it through `zarrs_icechunk::AsyncIcechunkStore`, and
-//! bridges that **async** store to the engine's **sync** read path via
-//! `AsyncToSyncStorageAdapter`.
-//!
-//! The bridge blocks on the calling thread exactly like `ds-storage` does
-//! (`block_in_place` inside a runtime, a temporary runtime otherwise). Combined
-//! with the engine's `concurrent_target(1)` retrieval, storage reads never land
-//! on a `rayon` worker — the same invariant that keeps the plain backend safe.
+//! chosen version and exposes it through `zarrs_icechunk::AsyncIcechunkStore`.
+//! Each storage operation, including consuming range streams, observes the
+//! request's absolute deadline on a persistent I/O runtime.
 //!
 //! Icechunk owns its own object storage (S3/local), so this path does **not**
 //! go through `ds-storage` (a deliberate deviation — Icechunk is the storage
@@ -17,69 +12,153 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use icechunk::repository::VersionInfo;
-use icechunk::Repository;
-use zarrs::storage::storage_adapter::async_to_sync::{
-    AsyncToSyncBlockOn, AsyncToSyncStorageAdapter,
+use icechunk::{Repository, RepositoryConfig};
+use zarrs::storage::{
+    byte_range::ByteRangeIterator, AsyncListableStorageTraits, AsyncReadableStorageTraits,
+    ListableStorageTraits, MaybeBytes, MaybeBytesIterator, ReadableStorageTraits, StorageError,
+    StoreKey, StoreKeys, StoreKeysPrefixes, StorePrefix,
 };
 use zarrs_icechunk::AsyncIcechunkStore;
 
 use ds_core::config::{IcechunkConfig, ZarrConfig};
 use ds_core::error::DataServerError;
 
-use crate::store::EngineStore;
+use crate::{
+    runtime,
+    store::{io_err, EngineStore},
+};
 
-/// Drives async futures to completion from the engine's sync read path. Mirrors
-/// `ds-storage`'s bridge: `block_in_place` when already inside a multi-thread
-/// runtime (request/poll worker), a temporary runtime when there is none
-/// (tests). Safe because retrieval is pinned to `concurrent_target(1)`, so this
-/// is never invoked from a `rayon` worker (where `block_in_place` would panic).
-struct TokioBlockOn;
+/// Repository clients and immutable object caches survive snapshot refreshes.
+pub(crate) struct Source {
+    repo: Repository,
+    version: VersionInfo,
+}
 
-impl AsyncToSyncBlockOn for TokioBlockOn {
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-            Err(_) => tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("build temporary tokio runtime")
-                .block_on(future),
-        }
+impl Source {
+    /// Open repository clients once, with the configured payload cache budget.
+    pub(crate) fn open(collection_id: &str, config: &ZarrConfig) -> Result<Self, DataServerError> {
+        let ic = config
+            .icechunk
+            .as_ref()
+            .expect("Icechunk source opened without [zarr.icechunk]");
+
+        let cfg_err =
+            |msg: String| DataServerError::Config(format!("Collection '{collection_id}': {msg}"));
+
+        let version = version_info(collection_id, ic)?;
+        let repo = runtime::run(async {
+            let storage = build_storage(collection_id, config).await?;
+            // Repository::open merges overrides into the persisted config,
+            // including a field-by-field CachingConfig::merge. These derived
+            // Defaults leave fields as None (unset), so only num_bytes_chunks
+            // changes; metadata caches, compression, storage and virtual chunk
+            // containers survive. Covered with non-default V1/V2 repositories.
+            let options = RepositoryConfig {
+                caching: Some(icechunk::config::CachingConfig {
+                    num_bytes_chunks: Some(config.cache_mb.saturating_mul(ds_cache::MIB)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            Repository::open(Some(options), storage, HashMap::new())
+                .await
+                .map_err(|e| cfg_err(format!("failed to open Icechunk repository: {e}")))
+        })?;
+        Ok(Self { repo, version })
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        published: Option<&str>,
+    ) -> Result<Option<Arc<EngineStore>>, DataServerError> {
+        runtime::run(async {
+            let snapshot = self
+                .repo
+                .resolve_version(&self.version)
+                .await
+                .map_err(|e| DataServerError::Storage(format!("resolve Icechunk version: {e}")))?;
+            let revision = snapshot.to_string();
+            if published == Some(revision.as_str()) {
+                return Ok(None);
+            }
+            // Pin the resolved ID so a concurrent commit cannot change the session
+            // between checking its revision and opening it.
+            let session = self
+                .repo
+                .readonly_session(&VersionInfo::SnapshotId(snapshot))
+                .await
+                .map_err(|e| DataServerError::Storage(format!("open Icechunk snapshot: {e}")))?;
+            Ok(Some(Arc::new(
+                EngineStore::new(Store(AsyncIcechunkStore::new(session))).with_revision(revision),
+            )))
+        })
     }
 }
 
-/// Build an [`EngineStore`] backed by an Icechunk repository at the configured
-/// version.
-pub fn build_store(
-    collection_id: &str,
-    config: &ZarrConfig,
-) -> Result<EngineStore, DataServerError> {
-    let ic = config
-        .icechunk
-        .as_ref()
-        .expect("build_store called without [zarr.icechunk]");
+/// Unlike AsyncToSyncBlockOn (whose output type is unconstrained), this bridge
+/// can return a timeout error without panicking or leaving a running I/O task.
+struct Store(AsyncIcechunkStore);
 
-    let cfg_err =
-        |msg: String| DataServerError::Config(format!("Collection '{collection_id}': {msg}"));
-
-    // All repository operations are async; drive them on the calling thread.
-    let session = TokioBlockOn.block_on(async {
-        let storage = build_storage(collection_id, config).await?;
-        let repo = Repository::open(None, storage, HashMap::new())
+fn storage_call<F, T>(future: F) -> Result<T, StorageError>
+where
+    F: std::future::Future<Output = Result<T, StorageError>> + Send,
+    T: Send,
+{
+    runtime::run(async {
+        future
             .await
-            .map_err(|e| cfg_err(format!("failed to open Icechunk repository: {e}")))?;
-        let version = version_info(collection_id, ic)?;
-        repo.readonly_session(&version).await.map_err(|e| {
-            cfg_err(format!(
-                "failed to open Icechunk session ({version:?}): {e}"
-            ))
-        })
-    })?;
+            .map_err(|e| DataServerError::Storage(e.to_string()))
+    })
+    .map_err(io_err)
+}
 
-    let async_store = Arc::new(AsyncIcechunkStore::new(session));
-    let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
-    Ok(EngineStore::new(sync_store))
+impl ReadableStorageTraits for Store {
+    fn get(&self, key: &StoreKey) -> Result<MaybeBytes, StorageError> {
+        storage_call(self.0.get(key))
+    }
+
+    fn get_partial_many<'a>(
+        &'a self,
+        key: &StoreKey,
+        ranges: ByteRangeIterator<'a>,
+    ) -> Result<MaybeBytesIterator<'a>, StorageError> {
+        // Await the stream contents under the SAME deadline as its creation.
+        let bytes = storage_call(async {
+            match self.0.get_partial_many(key, ranges).await? {
+                Some(stream) => stream.try_collect::<Vec<_>>().await.map(Some),
+                None => Ok(None),
+            }
+        })?;
+        match bytes {
+            Some(bytes) => Ok(Some(Box::new(bytes.into_iter().map(Ok)))),
+            None => Ok(None),
+        }
+    }
+
+    fn size_key(&self, key: &StoreKey) -> Result<Option<u64>, StorageError> {
+        storage_call(self.0.size_key(key))
+    }
+
+    fn supports_get_partial(&self) -> bool {
+        true
+    }
+}
+
+impl ListableStorageTraits for Store {
+    fn list(&self) -> Result<StoreKeys, StorageError> {
+        storage_call(self.0.list())
+    }
+    fn list_prefix(&self, prefix: &StorePrefix) -> Result<StoreKeys, StorageError> {
+        storage_call(self.0.list_prefix(prefix))
+    }
+    fn list_dir(&self, prefix: &StorePrefix) -> Result<StoreKeysPrefixes, StorageError> {
+        storage_call(self.0.list_dir(prefix))
+    }
+    fn size_prefix(&self, prefix: &StorePrefix) -> Result<u64, StorageError> {
+        storage_call(self.0.size_prefix(prefix))
+    }
 }
 
 /// Build the Icechunk object-storage backend (S3 or local) for the repo.
@@ -186,3 +265,6 @@ fn version_info(collection_id: &str, ic: &IcechunkConfig) -> Result<VersionInfo,
         ))
     }
 }
+
+#[cfg(test)]
+mod tests;

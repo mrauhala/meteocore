@@ -91,18 +91,24 @@ Violating these has caused production incidents. Never break them.
    vector geometry.
 6. **Engine poll/scan loops run on the dedicated background runtime**
    (`poll_runtime()` in `server/src/main.rs`), never on the request-serving
-   runtime (#221). Do not wrap `ds-storage` calls in `spawn_blocking` — it
-   panics (see rule 7).
+   runtime (#221). Use explicit-runtime `ds-storage` APIs for blocking-pool
+   work (see rule 7).
 7. **`ds-storage` (`DataStore`) is a sync bridge over async object_store**
-   (`block_in_place(|| handle.block_on(..))`, which is only valid on a
-   multi-thread-runtime worker thread). Therefore:
+   (`block_in_place(|| handle.block_on(..))`). Keep its runtime context
+   explicit:
    - Call it from the background poll runtime (or another dedicated runtime).
    - Never from a request-handler task — it parks a request worker.
-   - Never inside `spawn_blocking` — it panics.
+   - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
+     `get_range_on`). Do not rely on an ambient runtime handle.
    - Never from a non-Tokio thread such as a rayon pool — that hits a
      construct-a-new-`Runtime`-per-call fallback (#222). For parallel remote
      fetches, use async concurrency (`join_all`) on the runtime, or pass a
      `Handle` into the worker.
+   - `block_in_place` panics inside current-thread async execution or a
+     `LocalSet`; it does **not** inherently panic inside `spawn_blocking`.
+     Icechunk uses its own persistent I/O runtime and supports `RenderJob`
+     blocking workers; concurrent shard reads through that executor are
+     covered in `crates/engine-zarr/src/icechunk/tests.rs`.
 8. **SQL safety:** every identifier goes through `quote_ident`, every value
    is a `$N` bind, no SQL text inside `format!()`.
    `scripts/check_sql_safety.sh` enforces this in CI.

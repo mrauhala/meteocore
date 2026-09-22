@@ -1018,7 +1018,7 @@ Cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions metadata. 
 **Key characteristics:**
 - **Multi-variable:** every geographic data variable in the store becomes a parameter (and a WMS/Maps/Tiles layer). Restrict with the `parameters` filter.
 - **CF-conventions decoding:** CF time axis, CF packing (`scale_factor`/`add_offset`/`_FillValue`/`missing_value` plus the array's own Zarr fill value). A time axis is **required** (EDR PointSeries needs a `t`).
-- **Storage:** local directory, S3 (`endpoint`+`bucket`+`path`), or HTTP — all via `ds-storage`, with byte-range chunk reads cached in an LRU keyed on full chunk objects (`cache_mb`).
+- **Storage:** plain local/S3/HTTP stores use `ds-storage`, caching full chunk objects (`cache_mb`). Icechunk owns its storage and uses the same setting to bound compressed payload/range caching.
 - **EDR position queries** use bilinear interpolation; ascending/descending and irregular axes are handled via CF axis location.
 - **Rendering** reads a 2-D spatial window covering the request bbox (+1 cell margin), then samples per output pixel (geographic/WebMercator) or via a coarse projection grid (projected output CRS — never per-pixel projection).
 - **Poll-and-swap:** the store is re-read on `poll_interval_secs` so appended time steps surface without a reload; `RasterInfo` is served from a cached snapshot.
@@ -1101,7 +1101,9 @@ If a config sets `[collections.zarr.icechunk]` but the binary was built without 
 - The repo location reuses `data_path` (local) or `endpoint`+`bucket`+`path` (S3); the table selects the **version** to read.
 - The S3 backend uses Icechunk's `object_store` backend (not `aws-sdk-s3`), reusing the same crate `ds-storage` uses (keeps the icechunk feature's binary cost ~8 MB instead of ~28 MB).
 - **Public datasets only.** Anonymous S3 access is used; there is no credential configuration.
-- New snapshots on a branch are picked up on **reload** (`POST /admin/collections/reload`), not on poll.
+- New snapshots on a branch are picked up on `poll_interval_secs`. Unchanged snapshots retain their catalog and caches; failed refreshes keep the previous snapshot and retry. In-flight queries remain pinned to their original snapshot.
+- `cache_mb` bounds Icechunk's compressed payload cache; `0` disables retention. Snapshot changes preserve immutable payload reuse and invalidate rendered images, including corrections at existing times.
+- Storage operations honor request deadlines; background operations have a 30-second timeout. Decoded inner-chunk caching and concurrent retrieval are not implemented yet, so chunk layout still matters for map latency.
 
 ##### Icechunk Config Fields (`[collections.zarr.icechunk]`)
 
@@ -1838,7 +1840,7 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files. Wgrib2 hour-window accumulation/average fields use duration-qualified keys (e.g. `APCP_acc_6h`, `DSWRF_avg_6h`) at the window end; source units are preserved without division by duration. ECMWF JSON sidecars retain their existing naming and semantics.
 - QueryData: uncompressed `.sqd` files only; EDR supports position, area and radius, but only level index 0 is exposed (no selectable vertical dimension). Retains up to `max_runs` (default 4) most-recent files as model runs.
 - Zarr: geographic (WGS84 lat/lon) grids only; EDR supports position, area and radius. Forecast stores expose runs as EDR instances and WMS `DIM_REFERENCE_TIME`, defaulting to the latest run. Native 0–360° longitude axes are not normalized; STAC per-item-CRS and kerchunk modes are not implemented.
-- Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only, new snapshots picked up on reload (not poll)
+- Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only; branch snapshots refresh on poll, explicit snapshot IDs remain pinned
 - 3D Tiles: only `odim-volume` collections support `VolumeEngine`; voxel representation (`EXT_primitive_voxels`) requires CesiumJS ≥ 1.142 and is a CesiumGS draft extension (not in the Khronos registry); voxel octree/time-dynamic voxels are follow-ups; the 3D Tiles API has no `reference_time` parameter yet (model-run pinning; `datetime` selects valid time only)
 
 ## Tech Stack

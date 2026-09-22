@@ -44,8 +44,7 @@ path = "ecmwf-aifs-single-forecast/v0.1.0.icechunk"
 parameters = ["temperature_2m"]
 
 # Presence of this table selects the Icechunk backend. Default version is the
-# HEAD of branch `main`; new forecast cycles surface on
-# `POST /admin/collections/reload`.
+# HEAD of branch `main`; new forecast cycles surface on the poll interval.
 [collections.zarr.icechunk]
 branch = "main"
 region = "us-west-2"

@@ -4,11 +4,11 @@ Zarr V2/V3 multidimensional-array engine (cloud-native, CF conventions),
 tracked in #125. Phases 1–3 ship today: local + remote (S3/HTTP) stores,
 WGS84 lat-lon grids, multi-variable EDR position queries (bilinear), EDR
 area/radius (a CRS84 `Grid` over the polygon bbox at native resolution,
-≤ 256 cells per axis, 1M-value budget, ONE `read_window_span` store read
+≤ 256 cells per axis, 1M-value budget, ONE `read_window_span` subset retrieval
 per variable for the whole timestep span — two across the antimeridian —
 cells outside the polygon masked to null — `QueryPolygon::sample_grid`,
 #671; the NATIVE read is budgeted too via `Catalog::window_dims`, and at
-most 8 variables per request since each is a sequential blocking read — up to 16 round trips across the antimeridian, a deliberate cap, not fan-out; across the seam the two windows do not
+most 8 variables per request since each is a sequential blocking read — up to 16 subsets across the antimeridian, each potentially many network reads; across the seam the two windows do not
 bracket each other, so cells within half a native cell of ±180° on a
 periodic store are nearest-only or null, and a native 0..360 longitude
 axis is not normalised — position and area alike only answer requests in
@@ -31,7 +31,7 @@ through it.**
   (blosc/zstd/gzip/crc32c/sharding/transpose + filesystem + ndarray). This
   engine only adds CF semantics, the OGC domain mapping, the storage bridge,
   and the poll-and-swap lifecycle. blosc/zstd build from C via `cmake`+`cc`.
-- **Storage = ds-storage for every backend:** `src/store.rs` `DsStore`
+- **Plain storage = ds-storage:** `src/store.rs` `DsStore`
   implements zarrs' `ReadableStorageTraits` + `ListableStorageTraits` over
   `ds_storage::DataStore`, with a `quick_cache` LRU of full chunk-object
   bytes (byte ranges served by slicing the cached buffer). Group/child
@@ -91,9 +91,15 @@ errors clearly if the table is set without the feature.
 - Repo location reuses `data_path`/`endpoint`+`bucket`+`path`; the table
   picks the version (`branch` HEAD, default `main`, or `tag`/`snapshot`).
 - `src/store.rs` `EngineStore` is the backend-agnostic wrapper (catalog
-  stays non-generic); `src/icechunk.rs` opens repo → read-only session →
-  `AsyncIcechunkStore` → `AsyncToSyncStorageAdapter` (its `block_on` mirrors
-  ds-storage; safe because retrieval is `concurrent_target(1)`).
+  stays non-generic). `src/source.rs` separates the source from the session:
+  the Icechunk source retains the repository/client and opens a pinned
+  read-only session for each published catalog. `AsyncIcechunkStore` is
+  bridged by the sync Store adapter through `runtime::run`, including full
+  consumption of range streams within the same absolute request deadline.
+  Background I/O has a 30-second per-operation timeout. The persistent
+  runtime supports CLI, current-thread, and blocking-worker callers.
+  Keep `concurrent_target(1)` until parallel retrieval has separate decode
+  admission and deadline propagation.
 - **S3 backend = icechunk's `object_store` backend, NOT `aws-sdk-s3`** (deps
   use `default-features = false, features = ["object-store-s3",
   "object-store-fs"]`; saves ~20 MB binary).
@@ -102,9 +108,21 @@ errors clearly if the table is set without the feature.
   `S3Credentials` arg. Without it, it falls through to the AWS credential
   chain → EC2 IMDS and hangs off-EC2. Public datasets only.
 - Icechunk owns its own object storage (does not go through ds-storage).
-  New snapshots are picked up on **reload**, not poll (v1).
+  `cache_mb` configures its compressed payload cache (0 disables retention).
+  Repository clients and immutable payload caches survive snapshot changes.
+- Poll resolves the selected version and rebuilds only when its snapshot ID
+  changes. Publish session + catalog atomically; failed builds leave the
+  previous revision active and retry the next poll. Explicit snapshots stay
+  pinned; tags resolve their tag target. In-flight readers retain their old
+  snapshot. The snapshot ID also determines the nonzero render content version,
+  so corrections at existing timestamps invalidate images and no-op polls do not.
+- Windows hold compact f64 samples with NaN nodata. Conversion/reordering
+  does not allocate an intermediate Option<f64> buffer.
 - Tests: network-free e2e `cargo test -p engine-zarr --features icechunk`;
   live probe `… --test icechunk -- --ignored --nocapture probe_models`.
+  `src/icechunk/tests.rs` uses non-inline compressed shards to test payload
+  retention, deadlines, refresh failure/retry, pinned reads, and map sampling.
+  Live cache timing: `cargo test -p engine-zarr --features icechunk map_cache_latency_probe -- --ignored --nocapture`.
 
 ## Fixture
 

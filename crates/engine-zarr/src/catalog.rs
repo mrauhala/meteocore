@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -80,11 +81,15 @@ fn convert_sample(raw: f64, scale: f64, offset: f64, fills: &[f64]) -> Option<f6
     if fills.contains(&raw) {
         return None;
     }
-    Some(raw * scale + offset)
+    let value = raw * scale + offset;
+    value.is_finite().then_some(value)
 }
 
 /// A parsed Zarr store snapshot.
 pub struct Catalog {
+    /// Pinned Icechunk snapshot; absent for an unversioned plain Zarr store.
+    pub revision: Option<String>,
+    pub content_version: u64,
     /// Data variables in stable (sorted) order.
     pub vars: Vec<Variable>,
     /// Decoded time axis (ascending), shared across all variables. For a
@@ -189,10 +194,9 @@ impl Catalog {
         Some((i1 - i0 + 1, j1 - j0 + 1))
     }
 
-    /// [`Self::read_window`] for a contiguous span of timesteps in ONE store
-    /// read (one hyperslab, one trip through the blocking storage bridge —
-    /// not one per step), returning one [`Window`] per step in order. Used by
-    /// the EDR area path.
+    /// One subset retrieval across a contiguous span of timesteps, returning
+    /// one window per step. The subset can still require many storage requests
+    /// for its chunks/subchunks; it is not a single network round trip.
     pub fn read_window_span(
         &self,
         var: &Variable,
@@ -200,6 +204,7 @@ impl Catalog {
         time_span: Range<usize>,
         bbox: [f64; 4],
     ) -> Result<Option<Vec<Window>>, DataServerError> {
+        ds_core::deadline::check()?;
         let [west, south, east, north] = bbox;
         let (Some((i0, i1)), Some((j0, j1))) = (
             axis_window(&self.lons, west, east),
@@ -225,7 +230,6 @@ impl Catalog {
         }
         let subset = ArraySubset::new_with_ranges(&ranges);
         let raw = retrieve_raw_f64(&var.array, &subset)?;
-        let conv: Vec<Option<f64>> = raw.iter().map(|&r| var.convert(r)).collect();
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
         let nrow = j1 - j0 + 1;
@@ -241,8 +245,11 @@ impl Catalog {
             } else {
                 (lons.clone(), lats.clone())
             };
-            let mut data = vec![None; nrow * ncol];
+            // Compact physical samples: NaN represents nodata. Do not build
+            // a second Option<f64> buffer just to reorder the same subset.
+            let mut data = vec![f64::NAN; nrow * ncol];
             for r in 0..nrow {
+                ds_core::deadline::check()?;
                 for c in 0..ncol {
                     let mut off = 0usize;
                     for (a, &len) in lens.iter().enumerate() {
@@ -257,7 +264,7 @@ impl Catalog {
                         };
                         off = off * len + idx;
                     }
-                    data[r * ncol + c] = conv[off];
+                    data[r * ncol + c] = var.convert(raw[off]).unwrap_or(f64::NAN);
                 }
             }
             windows.push(Window {
@@ -281,6 +288,7 @@ impl Catalog {
         lat: f64,
         time_idx: &[usize],
     ) -> Result<Vec<Option<f64>>, DataServerError> {
+        ds_core::deadline::check()?;
         let (xb, yb) = match (cf::locate(&self.lons, lon), cf::locate(&self.lats, lat)) {
             (Some(x), Some(y)) => (x, y),
             _ => return Ok(vec![None; time_idx.len()]), // off-grid → all nodata
@@ -316,7 +324,6 @@ impl Catalog {
         let subset = ArraySubset::new_with_ranges(&ranges);
         let raw = retrieve_raw_f64(&var.array, &subset)?;
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
-        let conv: Vec<Option<f64>> = raw.iter().map(|&r| var.convert(r)).collect();
 
         // Local corner offsets within the read window.
         let jc1 = j1 - j0; // 1, or 0 for a single-cell axis
@@ -336,11 +343,12 @@ impl Catalog {
                 };
                 off = off * len + pos;
             }
-            conv.get(off).copied().flatten()
+            raw.get(off).and_then(|&r| var.convert(r))
         };
 
         let mut out = Vec::with_capacity(time_idx.len());
         for &ti in time_idx {
+            ds_core::deadline::check()?;
             // `ti` indexes the global time axis; the read window starts at
             // `t_start`, so shift into local coordinates.
             let t_local = if var.time_axis.is_some() {
@@ -362,7 +370,7 @@ impl Catalog {
 /// bbox, with the slab's own (windowed) coordinate axes. Row-major, row `r` ↔
 /// `lats[r]`, column `c` ↔ `lons[c]`.
 pub struct Window {
-    data: Vec<Option<f64>>,
+    data: Vec<f64>,
     lons: Vec<f64>,
     lats: Vec<f64>,
 }
@@ -409,7 +417,8 @@ impl Window {
             if r < 0 || c < 0 || r >= nrow || c >= ncol {
                 None
             } else {
-                self.data[r as usize * self.lons.len() + c as usize]
+                let value = self.data[r as usize * self.lons.len() + c as usize];
+                value.is_finite().then_some(value)
             }
         };
         bilinear(
@@ -461,6 +470,12 @@ pub fn build(
     collection_id: &str,
     param_filter: Option<&[String]>,
 ) -> Result<Catalog, DataServerError> {
+    let revision = store.revision.clone();
+    let content_version = revision.as_ref().map_or(0, |id| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut hash);
+        hash.finish().max(1)
+    });
     let group = Group::open(store.clone(), "/")
         .map_err(|e| DataServerError::Engine(format!("open Zarr root group: {e}")))?;
     let arrays = group
@@ -588,8 +603,8 @@ pub fn build(
     // Pick the primary time axis (the one that varies → the engine's time
     // dimension). A forecast (reference run + lead) uses the **latest run** and
     // exposes valid = run + lead as the time axis, matching the GRIB convention;
-    // the reference axis is pinned to that latest run. Model-run *selection*
-    // (instances / WMS reference_time) is tracked separately in #337.
+    // the reference axis defaults to that latest run. Explicit instances /
+    // WMS reference_time select another run through resolve_run.
     let forecast = ref_role_dim.is_some() && lead_role_dim.is_some();
     let primary_dim = if forecast {
         lead_role_dim.clone().unwrap()
@@ -844,6 +859,8 @@ pub fn build(
     );
 
     Ok(Catalog {
+        revision,
+        content_version,
         vars,
         times,
         runs,
@@ -986,30 +1003,25 @@ fn warn_bad_chunking(
 /// descending axes (it compares values, not index order).
 fn axis_window(axis: &[f64], min: f64, max: f64) -> Option<(usize, usize)> {
     let n = axis.len();
-    if n == 0 {
+    if n == 0 || !min.is_finite() || !max.is_finite() || min > max {
         return None;
     }
     if n == 1 {
         // Single (collapsed) cell — `Window`/`locate` snap any target to it.
         return Some((0, 0));
     }
-    // Approximate half-cell width from the mean spacing (exact for regular
-    // axes, a reasonable footprint for irregular ones).
-    let span = (axis[n - 1] - axis[0]).abs();
-    let half = (span / (n - 1) as f64) / 2.0;
-
-    let (mut lo, mut hi) = (None, None);
-    for (i, &v) in axis.iter().enumerate() {
-        // Cell i covers roughly [v - half, v + half]; keep it if that overlaps
-        // the requested interval.
-        if v + half >= min && v - half <= max {
-            lo.get_or_insert(i);
-            hi = Some(i);
-        }
+    // Keep the existing advertised edge footprint, but choose the interior
+    // window by ACTUAL coordinate brackets. Mean spacing cannot describe an
+    // irregular interior gap (e.g. [0, 1, 100] around longitude 50).
+    let (edge_min, edge_max) = axis_extent(axis);
+    if max < edge_min || min > edge_max {
+        return None;
     }
-    let lo = lo?.saturating_sub(1);
-    let hi = (hi? + 1).min(n - 1);
-    Some((lo, hi))
+    let start = axis[0].min(axis[n - 1]);
+    let end = axis[0].max(axis[n - 1]);
+    let (a0, a1, _) = cf::locate(axis, min.clamp(start, end))?;
+    let (b0, b1, _) = cf::locate(axis, max.clamp(start, end))?;
+    Some((a0.min(b0).saturating_sub(1), (a1.max(b1) + 1).min(n - 1)))
 }
 
 /// Edge extent `(min, max)` of a centred coordinate axis, expanded by half a
@@ -1091,6 +1103,7 @@ fn retrieve_raw_f64(
     array: &Array<Store>,
     subset: &ArraySubset,
 ) -> Result<Vec<f64>, DataServerError> {
+    ds_core::deadline::check()?;
     let dt = array.data_type();
     let opts = single_threaded_opts();
     macro_rules! read_as {
@@ -1125,12 +1138,24 @@ fn retrieve_raw_f64(
             "unsupported Zarr data type: {dt}"
         )));
     };
+    // The storage trait erases backend error types; recover the typed request
+    // deadline before mapping other codec/storage failures to Engine errors.
+    ds_core::deadline::check()?;
     result.map_err(|e| DataServerError::Engine(format!("Zarr chunk read failed: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::convert_sample;
+    use super::{axis_window, convert_sample};
+
+    #[test]
+    fn irregular_axis_windows_include_real_brackets_in_both_directions() {
+        for axis in [[0.0, 1.0, 100.0], [100.0, 1.0, 0.0]] {
+            assert_eq!(axis_window(&axis, 49.0, 51.0), Some((0, 2)));
+            assert!(axis_window(&axis, 150.0, 160.0).is_none());
+            assert!(axis_window(&axis, 51.0, 49.0).is_none());
+        }
+    }
 
     #[test]
     fn convert_sample_scales_and_maps_nodata() {
@@ -1147,5 +1172,6 @@ mod tests {
         assert_eq!(convert_sample(f64::NAN, 1.0, 0.0, &[]), None);
         assert_eq!(convert_sample(f64::INFINITY, 1.0, 0.0, &[]), None);
         assert_eq!(convert_sample(f64::NEG_INFINITY, 1.0, 0.0, &[]), None);
+        assert_eq!(convert_sample(f64::MAX, 2.0, 0.0, &[]), None);
     }
 }

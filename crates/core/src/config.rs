@@ -1759,7 +1759,8 @@ pub struct ZarrConfig {
     pub poll_interval_secs: u64,
     /// Chunk LRU cache size in MB. Caches full chunk-object bytes for the
     /// byte-range reader (most useful for the remote S3/HTTP backends).
-    /// Default: 256.
+    /// For Icechunk, bounds compressed chunk/range bytes shared across
+    /// snapshots; 0 disables payload retention. Default: 256.
     #[serde(default = "default_zarr_cache_mb")]
     pub cache_mb: u64,
     /// Read the source as an **Icechunk** repository (transactional/versioned
