@@ -5,6 +5,17 @@ use zarrs::array::{
 };
 use zarrs::filesystem::FilesystemStore;
 
+fn estimate(
+    array: &Array<EngineStore>,
+    subset: &ArraySubset,
+    extra_bytes: u64,
+    split_inner_chunks: bool,
+    capacity: u64,
+) -> Result<u64, DataServerError> {
+    let plan = plan(array, subset, extra_bytes, split_inner_chunks, capacity)?;
+    Ok(plan.source + plan.workspace)
+}
+
 fn array(shape: Vec<u64>, chunk: Vec<u64>, inner: Option<Vec<u64>>) -> Array<EngineStore> {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(EngineStore::new(Arc::new(
@@ -81,6 +92,39 @@ fn sharded_estimate_distinguishes_inner_reads_from_full_shard_fast_path() {
         estimate(&a, &all, 0, true, u64::MAX).unwrap(),
         source + 4 * (32 + 256)
     );
+}
+
+#[test]
+fn parallel_admission_reserves_every_active_workspace_and_reduces_fanout() {
+    let a = array(vec![2, 8, 8], vec![2, 8, 8], Some(vec![2, 2, 2]));
+    let subset = a.subset_all();
+    let source = 128 * 24;
+    let workspace = 4 * (32 + 256);
+    for slots in 1..=4 {
+        let budget = Arc::new(Budget::new(source + slots * workspace));
+        let permit = budget.reserve(&a, &subset, Some(0), true).unwrap();
+        assert_eq!(permit.parallelism(), slots as usize);
+        assert_eq!(budget.metrics().0, source + slots * workspace);
+        drop(permit);
+        assert_eq!(budget.metrics().0, 0);
+    }
+    let budget = Arc::new(Budget::new(2 * source + 5 * workspace));
+    let first = budget.reserve(&a, &subset, Some(0), true).unwrap();
+    let second = budget.reserve(&a, &subset, Some(0), true).unwrap();
+    assert_eq!((first.parallelism(), second.parallelism()), (4, 1));
+    assert_eq!(budget.metrics().0, budget.metrics().1);
+    assert!(matches!(
+        budget.reserve(&a, &subset, Some(0), true),
+        Err(DataServerError::ResourceExhausted)
+    ));
+    drop((first, second));
+    assert_eq!(budget.metrics().0, 0);
+
+    // A single inner chunk must retain its previous one-workspace estimate.
+    let one = ArraySubset::new_with_ranges(&[0..1, 0..1, 0..1]);
+    let held = budget.reserve(&a, &one, Some(0), true).unwrap();
+    assert_eq!(held.parallelism(), 1);
+    assert_eq!(budget.metrics().0, 24 + workspace);
 }
 
 #[test]

@@ -10,6 +10,7 @@ ds-storage = { path = "../storage" }
 # Compressed chunk-bytes LRU cache for the remote byte-range reader.
 ds-cache = { path = "../ds-cache" }
 bytes = "1"
+rayon = "1"
 futures = { version = "0.3", optional = true }
 # Zarr V2/V3 format + codec pipeline (blosc/zstd/gzip/crc32c/sharding/transpose).
 # `filesystem` gives the local-directory store used for the Phase-1 backend;

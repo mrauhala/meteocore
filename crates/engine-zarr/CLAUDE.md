@@ -24,7 +24,11 @@ thread's request deadline and explicit runtime context; plain `ds-storage`
 can fall back to constructing a runtime per call.
 `catalog::single_threaded_opts()` pins retrieval to the calling thread via
 `CodecOptions::with_concurrent_target(1)`. **Every `retrieve_*` call MUST go
-through it.**
+through it.** Icechunk's explicit inner-chunk fan-out in `decoded.rs` uses a
+separate, shared four-thread pool, propagates the absolute deadline to every
+job, and admits all active decode workspaces before launch. Each individual
+zarrs retrieval still uses target 1. Do not send plain `DsStore` reads to this
+pool: they do not use the Icechunk runtime bridge.
 
 ## Architecture
 
@@ -68,9 +72,11 @@ through it.**
   with `ResourceExhausted`, avoiding waits while holding executor slots or
   earlier windows. Never move the permit onto the HTTP waiter. The estimate
   excludes encoded objects, codec-private scratch, catalog metadata, caches,
-  and API outputs. It is not an allocator-enforced memory ceiling. Retrieval
-  is serial, so planning reserves the largest decode unit; parallel retrieval
-  must reserve all simultaneously active units before launching them.
+  and API outputs. It is not an allocator-enforced memory ceiling. Icechunk
+  admission reserves the largest decode workspace times the admitted fan-out
+  (up to four touched inner chunks). Reduce fan-out as available memory falls;
+  reject only when even one workspace plus the source buffers cannot fit.
+  The returned permit carries the concurrency limit used by the reader.
 - **Forecast axes / instances (#337):** with a CF `forecast_reference_time`
   axis AND a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/
   ICON-EU), every run on the reference axis is an EDR instance / WMS
@@ -115,8 +121,7 @@ errors clearly if the table is set without the feature.
   consumption of range streams within the same absolute request deadline.
   Background I/O has a 30-second per-operation timeout. The persistent
   runtime supports CLI, current-thread, and blocking-worker callers.
-  Keep `concurrent_target(1)` until parallel retrieval has separate decode
-  admission and deadline propagation.
+  Keep `concurrent_target(1)` within each explicitly admitted chunk job.
 - **S3 backend = icechunk's `object_store` backend, NOT `aws-sdk-s3`** (deps
   use `default-features = false, features = ["object-store-s3",
   "object-store-fs"]`; saves ~20 MB binary).
@@ -131,11 +136,18 @@ errors clearly if the table is set without the feature.
   snapshot ID, array path, and chunk coordinates. The engine owns one budget
   shared across all catalogs; old readers keep their snapshot identity.
   `icechunk.decoded_cache_mb` defaults to 256 MiB, separate from `cache_mb`;
-  zero disables it. Plain mutable stores and shards with outer transforms
-  bypass it. Cache fills expand to at most 64 MiB native chunks, and only if
+  zero disables retention but keeps bounded inner-chunk retrieval. Plain
+  mutable stores and shards with outer transforms bypass this reader. Cache
+  fills expand to at most 64 MiB native chunks, and only if
   they fit the configured budget. This limits cache-fill expansion, not all
-  codec/source memory. Each read retains one chunk at a time while stitching
-  its subset. Failed fills release single-flight guards; waits observe the
+  codec/source memory. Reads process batches no larger than the admitted
+  fan-out, bounding both queued work and completed chunks awaiting copying.
+  A single-chunk batch stays on the caller; larger batches use the shared
+  four-worker pool. Each worker installs/restores the request deadline and
+  drives async storage through the persistent Icechunk runtime; decode runs
+  off the I/O reactor. All jobs join on errors and unwinding before the
+  caller can release its memory permit. Failed fills release single-flight
+  guards; waits observe the
   request deadline (30 seconds without one). CF conversion stays in catalog.
   Expose hit/fill counters and resident/capacity bytes through
   `decoded_cache_metrics()` and per-collection `zarr_decoded_cache_*` metrics.

@@ -34,8 +34,9 @@ type Store = EngineStore;
 /// Codec options that pin chunk retrieval to the **calling thread** by setting
 /// the concurrency target to 1. This is load-bearing: it stops zarrs from
 /// dispatching storage reads onto `rayon` workers, which lose the calling
-/// thread's deadline and runtime context. Parallel retrieval needs explicit
-/// deadline propagation and separate decode admission.
+/// thread's deadline and runtime context. Icechunk's outer fan-out explicitly
+/// propagates deadlines and reserves each active workspace; every individual
+/// chunk job still uses these serial codec options.
 fn single_threaded_opts() -> CodecOptions {
     CodecOptions::default().with_concurrent_target(1)
 }
@@ -245,7 +246,12 @@ impl Catalog {
         let reservation =
             self.read_budget
                 .reserve(&var.array, &subset, axes_bytes, var.decoded.is_some())?;
-        let raw = retrieve_raw_f64(&var.array, &subset, var.decoded.as_ref())?;
+        let raw = retrieve_raw_f64(
+            &var.array,
+            &subset,
+            var.decoded.as_ref(),
+            reservation.parallelism(),
+        )?;
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
         let nrow = j1 - j0 + 1;
@@ -343,10 +349,15 @@ impl Catalog {
             .len()
             .checked_mul(size_of::<Option<f64>>())
             .map(|n| n as u64);
-        let _reservation =
+        let reservation =
             self.read_budget
                 .reserve(&var.array, &subset, output_bytes, var.decoded.is_some())?;
-        let raw = retrieve_raw_f64(&var.array, &subset, var.decoded.as_ref())?;
+        let raw = retrieve_raw_f64(
+            &var.array,
+            &subset,
+            var.decoded.as_ref(),
+            reservation.parallelism(),
+        )?;
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
         // Local corner offsets within the read window.
@@ -1138,7 +1149,7 @@ fn fill_value_as_f64(array: &Array<Store>) -> Option<f64> {
 /// Read an entire array as `Vec<f64>` (used for small coordinate arrays).
 fn read_coord_f64(array: &Array<Store>) -> Result<Vec<f64>, DataServerError> {
     let subset = ArraySubset::new_with_shape(array.shape().to_vec());
-    retrieve_raw_f64(array, &subset, None)
+    retrieve_raw_f64(array, &subset, None, 1)
 }
 
 /// Retrieve an array subset as raw `f64` values (no CF scaling), branching on
@@ -1147,6 +1158,7 @@ fn retrieve_raw_f64(
     array: &Array<Store>,
     subset: &ArraySubset,
     decoded: Option<&DecodedArray>,
+    parallelism: usize,
 ) -> Result<Vec<f64>, DataServerError> {
     ds_core::deadline::check()?;
     let dt = array.data_type();
@@ -1157,7 +1169,7 @@ fn retrieve_raw_f64(
         )));
     }
     let bytes = match decoded {
-        Some(decoded) => decoded.read(array, subset, &opts)?,
+        Some(decoded) => decoded.read(array, subset, &opts, parallelism)?,
         None => {
             let result = array.retrieve_array_subset_opt::<ArrayBytes<'static>>(subset, &opts);
             ds_core::deadline::check()?;

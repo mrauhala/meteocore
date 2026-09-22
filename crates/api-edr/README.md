@@ -131,6 +131,12 @@ returns 503 without waiting while holding other windows. Area windows retain
 their reservation through sampling. This budget is separate from response
 limits, resident caches, and persistent metadata; codec-private scratch and
 encoded object buffers are not allocator-bounded by it.
+Icechunk reads process up to four inner chunks concurrently through a shared
+four-worker pool, even with decoded retention disabled. Admission reserves
+each active decode workspace and reduces concurrency when memory is tight.
+Worker deadlines and reservations remain attached until all chunk jobs finish,
+including error and cancellation paths. Plain Zarr and shards with outer
+transforms retain serial retrieval.
 
 ## Per-engine query-type matrix
 

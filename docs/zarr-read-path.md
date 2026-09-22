@@ -12,16 +12,17 @@ Implementation batches address the map-focused review from 2026-09-22.
 - Spatial windows use f64 samples with NaN nodata and fuse conversion/reordering. Payload allocations fall from approximately 40 to 16 bytes per selected source sample, excluding codecs, coordinate axes, and output. Scaling overflow becomes nodata consistently.
 - CI runs Icechunk unit tests as well as integration tests. Regression fixtures contain non-inline compressed shards.
 - Icechunk retains decoded native inner chunks in a separate per-collection `zarr.icechunk.decoded_cache_mb` budget (default 256 MiB, zero disables). Snapshot ID, array path, and inner-chunk coordinates identify entries. The budget is shared across published snapshots; old readers keep their snapshot keys. Plain mutable Zarr stores bypass decoded retention.
-- Concurrent requests for one chunk share a fill. Each waiter observes its own absolute deadline; failures release the fill guard for retry. Only one chunk is held by a reader while copying its overlap into the requested subset. Retention counts native bytes and estimated key/allocation overhead, without widening entire chunks to f64.
+- Concurrent requests for one chunk share a fill. Each waiter observes its own absolute deadline; failures release the fill guard for retry. Retention counts native bytes and estimated key/allocation overhead, without widening entire chunks to f64.
 - Cache fills read full inner chunks only when their native size is at most 64 MiB and fits the configured budget. Larger chunks, shards with outer transforms, and indeterminate grids retain ordinary subset reads. This is a cache expansion limit, not admission control for all source and codec memory.
 - Startup diagnostics report outer and effective inner shapes, native bytes, and time steps per chunk. Per-collection `zarr_decoded_cache_{hits_total,misses_total,bytes,capacity_bytes}` and Grafana panels expose decoded reuse and occupancy. Misses count fill attempts, including failed ones; successful coalesced waiters count as hits. Bypassed reads and timed-out waits do not increment these counters.
 - Maps/WMS/Tiles and EDR variable reads now share process-wide source-memory admission (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB). Checked estimates reject oversized windows before payload I/O, regardless of output image size. Reservations remain attached to sampling windows and are released on errors, deadline exits, and unwinding. Competing reads fail immediately rather than waiting while holding other windows or executor slots.
+- Icechunk inner-chunk retrieval now processes batches of up to four chunks through a shared four-worker pool. Every worker inherits the absolute request deadline and drives async storage through the persistent I/O runtime; native decoding runs off its reactor. Individual zarrs calls keep `concurrent_target(1)`. All batch jobs join on errors and unwinding before the caller releases its reservation. Completed-but-not-copied chunks and queued jobs are bounded by the batch size. Single-chunk batches stay on the caller. Zero decoded-cache capacity disables retention while preserving concurrent retrieval; plain Zarr and shards with outer transforms keep the ordinary serial path.
 
 ## Source-memory accounting
 
 For a subset with `N` native values of `B` bytes each, admission reserves `N × (2B + 16)` for native bytes, a typed conversion copy, raw f64 values, and physical f64 windows. Window axes/container overhead or position-series output is added with checked arithmetic. Some lifetimes do not overlap; summing them avoids acquiring a second reservation while holding an earlier allocation.
 
-Decode workspace adds `4 × (largest touched native decode unit + its shard index)`. Chunk shapes include stored padding and all forecast leads, even when the selected subset is tiny. Exclusively sharded partial reads use inner chunks; full-shard fast paths and shards with outer transforms use outer chunks. The decoded-cache reader splits whole windows into inner chunks, avoiding that full-shard fast path. Retrieval remains serial, so only the largest workspace is reserved. Parallel reads must reserve the combined active workspace before launch.
+One decode workspace adds `4 × (largest touched native decode unit + its shard index)`. Chunk shapes include stored padding and all forecast leads, even when the selected subset is tiny. Exclusively sharded partial reads use inner chunks; full-shard fast paths and shards with outer transforms use outer chunks. The Icechunk reader splits whole windows into inner chunks, avoiding that full-shard fast path even with decoded retention disabled. Admission adds one workspace per concurrent chunk, up to four touched inner chunks. It selects the largest fan-out that fits currently available memory, down to one, atomically with the reservation. The permit carries this limit to the reader. Plain-Zarr and outer-transform reads reserve one workspace.
 
 The budget is shared by all collections and snapshots and survives reloads. A span's windows share one reservation until its last window is dropped, so HTTP cancellation cannot release memory still used by the executing worker. Budget exhaustion maps to the existing 503 resource-exhausted response. Zero rejects on-grid variable reads; metadata loading and off-grid empty responses do not reserve this budget.
 
@@ -63,13 +64,32 @@ After adding source-memory admission, the same probe passed again on 2026-09-22 
 
 These are single debug-build measurements, excluding HTTP image/metatile caches and PNG encoding. Network variation is substantial; the cold numbers do not establish a regression or improvement. Decoded reuse avoids repeated decompression on overlapping reads but does not remove initial download/decode cost. This is not a controlled GRIB-versus-Icechunk benchmark.
 
+## Cold chunk concurrency experiment
+
+```sh
+cargo test -p engine-zarr --features icechunk --lib chunk_concurrency_latency_probe -- --ignored --nocapture
+```
+
+The probe reads four inner chunks from a 242×241 spatial subset at one reference time and forecast lead, using fresh repository clients and disabled payload/decoded retention. It pins the snapshot, alternates serial/four-worker order across three pairs, and compares every native output byte. This isolates the chunk reader; catalog discovery, map resampling, PNG encoding, and HTTP caches are outside the timer.
+
+On 2026-09-22 against AIFS snapshot `RV08AB14MF5BGZ8YJX3G`, after compilation and other validation had finished:
+
+| Pair | Serial | Four workers |
+|---|---:|---:|
+| 1 (serial first) | 4,363 ms | 3,459 ms |
+| 2 (parallel first) | 5,438 ms | 3,809 ms |
+| 3 (serial first) | 11,327 ms | 5,566 ms |
+
+All outputs matched exactly. An earlier run overlapping local compilation measured serial 6,840/4,624/8,154 ms and parallel 7,037/3,407/4,775 ms. The large spread, small sample, and debug build preclude a fixed speedup claim or production latency guarantee. The deterministic gated-storage tests establish actual overlap and the worker bound independently of network timings. Single-inner-chunk requests do not gain fetch/decode parallelism.
+
+The map-cache probe also passed on the same snapshot after this change: decoded repeat/pan/next-lead reads remained 4 ms, payload-only reads were 66/65/65 ms, and pixels matched exactly across all three cache configurations. The decoded-cache cold read took 2,368 ms and retained the same single 14,113,186-byte entry.
+
 ## Remaining review work
 
-1. Introduce bounded async chunk/subchunk retrieval with explicit decode-memory admission and deadline propagation. Keep `concurrent_target(1)` until the storage/threading contract is changed together.
-2. Fix plain-Zarr mutable metadata/coordinate refresh and cache invalidation. Its source currently retains the existing DsStore behavior; the Icechunk lifecycle fix does not address this.
-3. Extend source-memory admission to encoded-object buffers and codec-specific scratch limits, and refine estimates for cache hits. The current reservation covers native windows and estimated decode/index workspace, not every underlying allocation.
-4. Extend layout diagnostics and decoded-cache metrics with requested/decoded-byte amplification, storage requests/bytes, and fetch/decode/resample timings.
-5. Replace plain-Zarr whole-object shard reads with efficient range retrieval where appropriate, and coalesce overlapping plain-store payload fills.
+1. Fix plain-Zarr mutable metadata/coordinate refresh and cache invalidation. Its source currently retains the existing DsStore behavior; the Icechunk lifecycle fix does not address this.
+2. Extend source-memory admission to encoded-object buffers and codec-specific scratch limits, and refine estimates for cache hits. The current reservation covers native windows and estimated decode/index workspace, not every underlying allocation.
+3. Extend layout diagnostics and decoded-cache metrics with requested/decoded-byte amplification, storage requests/bytes, and fetch/decode/resample timings.
+4. Replace plain-Zarr whole-object shard reads with efficient range retrieval where appropriate, and coalesce overlapping plain-store payload fills. Parallelizing this backend or outer-transformed Icechunk shards needs a separate runtime/admission design.
 
 ## Regression coverage
 
@@ -78,6 +98,8 @@ Network-free tests exercise payload retention with deleted backing files, zero-c
 Decoded-cache tests compare native cached and uncached values across chunks, shards, clipped edges, and missing chunks; cover int16 values/fill, eviction, oversized bypass, corrupt-codec failure/retry, snapshot/array identity, and a waiter whose deadline expires while another caller holds the fill guard. Icechunk tests reuse decoded chunks for a pan, another lead, and an EDR query after deleting external payloads with compressed caching disabled.
 
 Source-memory tests cover tiny subsets inside large padded chunks, oversized native windows with small chunks, inner-chunk versus full-shard estimates, concurrent reservations, last-owner release, deadline/overflow rejection, off-grid reads, span ownership through sampling, and a 1×1 map whose admission fails before reading a corrupt payload. An admitted corrupt read releases its reservation on failure.
+
+Concurrency tests gate actual storage reads to prove overlapping chunk work, the shared four-worker limit across requests, inherited deadlines, and reservation ownership after dropping the waiter. Success, storage failure, deadline expiry, and injected panic all join workers and release memory. After a failed batch, no further batches launch. Admission tests verify one-to-four workspace accounting, reduction under contention, and unchanged single-chunk estimates. Native-value comparisons cover disabled retention as well as cache hits, shard boundaries, edge padding, and missing chunks.
 
 The cache override test creates V1 and V2 repositories with non-default metadata caches, compression, storage concurrency, and a virtual chunk container. It checks the full effective configuration after `Source::open` with caching enabled/disabled, and reopens without overrides to verify that persisted settings are unchanged. Icechunk's `Repository::open` merges the override into persisted settings; the derived configuration defaults leave fields unset rather than replacing their saved values.
 

@@ -7,12 +7,12 @@
 //!
 //! Two invariants make this safe and effective:
 //!
-//! - **Single-threaded retrieval.** The engine drives every read with
+//! - **Single-threaded plain-Zarr retrieval.** The engine drives each read with
 //!   `CodecOptions::with_concurrent_target(1)` (see [`crate::catalog`]), so zarrs
 //!   never dispatches a storage read onto a `rayon` worker. Those workers lose
 //!   the calling thread's deadline and runtime context; ds-storage may create
-//!   a runtime per call. Keep retrieval on the engine execution thread until
-//!   these concerns and decode admission are handled explicitly.
+//!   a runtime per call. Plain reads stay on the engine execution thread;
+//!   Icechunk's separately admitted fan-out uses its own runtime bridge.
 //! - **Whole-object reads + LRU cache.** Non-sharded Zarr chunks are read in
 //!   full; the adapter caches the full object bytes (keyed by store key) and
 //!   serves byte-range requests by slicing the cached buffer, so a time-series
