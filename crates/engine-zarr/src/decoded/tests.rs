@@ -5,7 +5,12 @@ use zarrs::array::{
 };
 use zarrs::filesystem::FilesystemStore;
 
-fn fixture(dir: &std::path::Path, name: &str, sharded: bool, offset: f32) -> Array<EngineStore> {
+pub(super) fn fixture(
+    dir: &std::path::Path,
+    name: &str,
+    sharded: bool,
+    offset: f32,
+) -> Array<EngineStore> {
     let storage = Arc::new(FilesystemStore::new(dir).unwrap());
     let mut builder = ArrayBuilder::new(
         vec![3, 5, 7],
@@ -48,6 +53,7 @@ fn read(reader: &DecodedArray, array: &Array<EngineStore>, subset: &ArraySubset)
                 array,
                 subset,
                 &CodecOptions::default().with_concurrent_target(1),
+                MAX_PARALLEL_CHUNKS,
             )
             .unwrap(),
         subset.shape(),
@@ -108,14 +114,13 @@ fn cache_eviction_and_oversized_bypass_preserve_pixels() {
     let all = array.subset_all();
     let expected = array.retrieve_array_subset::<Vec<f32>>(&all).unwrap();
     assert!(DecodedArray::new(&array, None, "a", Arc::new(DecodedCache::new(MIB))).is_none());
-    assert!(DecodedArray::new(&array, Some("snap"), "a", Arc::new(DecodedCache::new(0))).is_none());
-    for capacity in [1, 512] {
+    for capacity in [0, 1, 512] {
         let cache = Arc::new(DecodedCache::new(capacity));
         let reader = DecodedArray::new(&array, Some("snap"), "a", cache.clone()).unwrap();
         assert_eq!(read(&reader, &array, &all), expected);
         assert_eq!(read(&reader, &array, &all), expected);
         assert!(cache.metrics().bytes <= capacity);
-        if capacity == 1 {
+        if capacity <= 1 {
             assert_eq!(cache.metrics().bytes, 0);
         } else {
             assert!(cache.metrics().misses > 0);
@@ -176,6 +181,7 @@ fn native_integer_chunks_preserve_values_and_fill() {
             &array,
             &all,
             &CodecOptions::default().with_concurrent_target(1),
+            MAX_PARALLEL_CHUNKS,
         )
         .unwrap();
     let values = Vec::<i16>::from_array_bytes(bytes, all.shape(), array.data_type()).unwrap();
@@ -235,7 +241,8 @@ fn failed_decode_is_not_cached_and_retry_succeeds() {
         .read(
             &array,
             &subset,
-            &CodecOptions::default().with_concurrent_target(1)
+            &CodecOptions::default().with_concurrent_target(1),
+            MAX_PARALLEL_CHUNKS,
         )
         .is_err());
     assert_eq!(cache.metrics().bytes, 0);
@@ -275,6 +282,7 @@ fn waiting_for_a_chunk_observes_the_waiters_deadline() {
             &array,
             &ArraySubset::new_with_ranges(&[0..1, 0..1, 0..1]),
             &CodecOptions::default().with_concurrent_target(1),
+            MAX_PARALLEL_CHUNKS,
         );
         release_tx.send(()).unwrap();
         assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));

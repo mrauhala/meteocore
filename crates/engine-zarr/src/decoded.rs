@@ -1,9 +1,10 @@
 //! Snapshot-keyed native decoded chunks. Shards are containers, not cache units.
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use ds_cache::{ByteBoundedCache, CacheMetrics, MIB};
 use ds_core::{deadline, error::DataServerError};
+use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArrayShardedExt, ArraySubset, ChunkGrid, CodecOptions};
 
 use crate::store::EngineStore;
@@ -11,6 +12,18 @@ use crate::store::EngineStore;
 // Never expand a tiny subset into an arbitrarily large cache fill. Oversized
 // chunks retain the ordinary partial-read path, without decoded retention.
 const MAX_CHUNK_BYTES: u64 = 64 * MIB;
+
+// Separate from zarrs' internal parallelism: these workers explicitly inherit
+// deadlines and use Icechunk's persistent I/O runtime. Codec work never runs
+// on the I/O reactor. One shared pool bounds fan-out across collections.
+pub(crate) const MAX_PARALLEL_CHUNKS: usize = 4;
+static READERS: LazyLock<Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>> =
+    LazyLock::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(MAX_PARALLEL_CHUNKS)
+            .thread_name(|i| format!("zarr-chunk-{i}"))
+            .build()
+    });
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct Key {
@@ -52,11 +65,10 @@ impl DecodedArray {
         cache: Arc<DecodedCache>,
     ) -> Option<Self> {
         let revision = revision?;
-        if cache.0.capacity_bytes() == 0
-            // Outer transforms can make an inner chunk require decoding a
-            // whole shard. Keep the ordinary path for those codec layouts.
-            || (array.is_sharded() && !array.is_exclusively_sharded())
-        {
+        // Outer transforms can make an inner chunk require decoding a whole
+        // shard. Keep the ordinary path for those codec layouts. A zero cache
+        // budget disables retention, but still permits bounded inner reads.
+        if array.is_sharded() && !array.is_exclusively_sharded() {
             return None;
         }
         Some(Self {
@@ -72,6 +84,7 @@ impl DecodedArray {
         array: &Array<EngineStore>,
         subset: &ArraySubset,
         options: &CodecOptions,
+        parallelism: usize,
     ) -> Result<ArrayBytes<'static>, DataServerError> {
         deadline::check()?;
         let size = array
@@ -83,48 +96,92 @@ impl DecodedArray {
             return read_native(array, subset, options).map(ArrayBytes::new_flen);
         };
         let mut output = vec![0; length];
-        for indices in chunks.indices() {
+        let mut indices = chunks.indices().into_iter();
+        let parallelism = parallelism.clamp(1, MAX_PARALLEL_CHUNKS);
+        let end = deadline::current();
+        loop {
             deadline::check()?;
-            let Some(chunk) = self.grid.subset(&indices).map_err(error)? else {
-                return read_native(array, subset, options).map(ArrayBytes::new_flen);
+            // Bound queued jobs and completed-but-not-copied buffers as well
+            // as active decodes. Never collect all chunks of a large window.
+            let batch: Vec<_> = indices
+                .by_ref()
+                .take(parallelism)
+                .map(|indices| indices.to_vec())
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            let load = |indices: Vec<u64>| {
+                let _deadline = deadline::enter(end);
+                self.read_chunk(array, subset, options, indices, size)
             };
-            let chunk = chunk.overlap(&array.subset_all()).map_err(error)?;
-            let overlap = chunk.overlap(subset).map_err(error)?;
-            let key = Key {
-                revision: self.revision.clone(),
-                array: self.name.clone(),
-                indices: indices.to_vec(),
-            };
-            let chunk_length = byte_length(chunk.shape(), size)?;
-            let eligible = chunk_length as u64 <= MAX_CHUNK_BYTES
-                && (chunk_length as u64).saturating_add(overhead(&key))
-                    <= self.cache.0.capacity_bytes();
-            let (bytes, source) = if eligible {
-                let end = deadline::current();
-                let wait = end.map_or(Duration::from_secs(30), |end| {
-                    end.saturating_duration_since(Instant::now())
-                });
-                let bytes = self.cache.0.get_or_insert_with_timeout(
-                    &key,
-                    wait,
-                    || read_native(array, &chunk, options).map(Arc::new),
-                    || {
-                        if end.is_some() {
-                            DataServerError::DeadlineExceeded
-                        } else {
-                            error("timed out waiting for a decoded chunk")
-                        }
-                    },
-                )?;
-                (bytes, &chunk)
+            let results: Vec<_> = if batch.len() == 1 {
+                batch.into_iter().map(load).collect()
             } else {
-                (Arc::new(read_native(array, &overlap, options)?), &overlap)
+                // install joins every job even on failure/unwind. The caller
+                // owns its memory permit until workers and results are gone.
+                READERS
+                    .as_ref()
+                    .map_err(error)?
+                    .install(|| batch.into_par_iter().map(load).collect())
             };
             deadline::check()?;
-            copy_overlap(&bytes, source, &mut output, subset, &overlap, size)?;
+            for result in results {
+                let (bytes, source) = result?;
+                let overlap = source.overlap(subset).map_err(error)?;
+                copy_overlap(&bytes, &source, &mut output, subset, &overlap, size)?;
+            }
         }
         deadline::check()?;
         Ok(ArrayBytes::new_flen(output))
+    }
+
+    fn read_chunk(
+        &self,
+        array: &Array<EngineStore>,
+        subset: &ArraySubset,
+        options: &CodecOptions,
+        indices: Vec<u64>,
+        size: usize,
+    ) -> Result<(Arc<Vec<u8>>, ArraySubset), DataServerError> {
+        deadline::check()?;
+        let chunk = self
+            .grid
+            .subset(&indices)
+            .map_err(error)?
+            .ok_or_else(|| error("chunk is outside the grid"))?
+            .overlap(&array.subset_all())
+            .map_err(error)?;
+        let key = Key {
+            revision: self.revision.clone(),
+            array: self.name.clone(),
+            indices,
+        };
+        let chunk_length = byte_length(chunk.shape(), size)?;
+        let eligible = chunk_length as u64 <= MAX_CHUNK_BYTES
+            && (chunk_length as u64).saturating_add(overhead(&key))
+                <= self.cache.0.capacity_bytes();
+        if !eligible {
+            let overlap = chunk.overlap(subset).map_err(error)?;
+            return Ok((Arc::new(read_native(array, &overlap, options)?), overlap));
+        }
+        let end = deadline::current();
+        let wait = end.map_or(Duration::from_secs(30), |end| {
+            end.saturating_duration_since(Instant::now())
+        });
+        let bytes = self.cache.0.get_or_insert_with_timeout(
+            &key,
+            wait,
+            || read_native(array, &chunk, options).map(Arc::new),
+            || {
+                if end.is_some() {
+                    DataServerError::DeadlineExceeded
+                } else {
+                    error("timed out waiting for a decoded chunk")
+                }
+            },
+        )?;
+        Ok((bytes, chunk))
     }
 }
 
@@ -195,3 +252,6 @@ fn error(error: impl std::fmt::Display) -> DataServerError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod concurrency_tests;

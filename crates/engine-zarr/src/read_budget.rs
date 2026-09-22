@@ -50,21 +50,37 @@ impl Budget {
         deadline::check()?;
         let result = (|| {
             let extra_bytes = extra_bytes.ok_or(DataServerError::ResourceExhausted)?;
-            let bytes = estimate(
+            let plan = plan(
                 array,
                 subset,
                 extra_bytes,
                 split_inner_chunks,
                 self.capacity,
             )?;
+            let mut parallelism = 1;
+            let mut bytes = 0;
             self.used
                 .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                    used.checked_add(bytes).filter(|&n| n <= self.capacity)
+                    // Reduce fan-out when memory is tight, down to the same
+                    // single-decode admission required by the serial path.
+                    let available = self.capacity.checked_sub(used)?.checked_sub(plan.source)?;
+                    parallelism = available
+                        .checked_div(plan.workspace)
+                        .unwrap_or(u64::MAX)
+                        .min(plan.parallelism as u64) as usize;
+                    if parallelism == 0 {
+                        return None;
+                    }
+                    bytes = plan
+                        .source
+                        .checked_add(plan.workspace.checked_mul(parallelism as u64)?)?;
+                    used.checked_add(bytes)
                 })
                 .map_err(|_| DataServerError::ResourceExhausted)?;
             Ok(Arc::new(Permit {
                 budget: self.clone(),
                 bytes,
+                parallelism,
             }))
         })();
         if matches!(result, Err(DataServerError::ResourceExhausted)) {
@@ -77,6 +93,13 @@ impl Budget {
 pub(crate) struct Permit {
     budget: Arc<Budget>,
     bytes: u64,
+    parallelism: usize,
+}
+
+impl Permit {
+    pub(crate) fn parallelism(&self) -> usize {
+        self.parallelism
+    }
 }
 
 impl Drop for Permit {
@@ -98,13 +121,19 @@ pub fn metrics() -> (u64, u64, u64) {
 // index buffers. Encoded objects, codec-private scratch, persistent metadata,
 // caches, and API output buffers have separate lifetimes/budgets; this is not
 // an allocator-enforced RSS limit.
-fn estimate(
+struct Plan {
+    source: u64,
+    workspace: u64,
+    parallelism: usize,
+}
+
+fn plan(
     array: &Array<EngineStore>,
     subset: &ArraySubset,
     extra_bytes: u64,
     split_inner_chunks: bool,
     capacity: u64,
-) -> Result<u64, DataServerError> {
+) -> Result<Plan, DataServerError> {
     let exhausted = || DataServerError::ResourceExhausted;
     let native = array.data_type().fixed_size().ok_or_else(exhausted)? as u64;
     let source = bytes(subset.shape(), native * 2 + 16)?
@@ -152,14 +181,34 @@ fn estimate(
             .checked_add(index)
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(exhausted)?;
-        // Retrieval is serial. Parallel reads must instead reserve the sum of
-        // all concurrently active decode units before starting those reads.
+        // A worker holds at most one inner chunk. Multiply the largest
+        // workspace by the admitted worker count when acquiring the permit.
         workspace = workspace.max(current);
         if source.checked_add(workspace).is_none_or(|n| n > capacity) {
             return Err(exhausted());
         }
     }
-    source.checked_add(workspace).ok_or_else(exhausted)
+    let parallelism = if split_inner_chunks {
+        array
+            .subchunk_grid()
+            .chunks_in_array_subset(subset)
+            .map_err(|_| exhausted())?
+            .map_or(1, |chunks| {
+                chunks
+                    .indices()
+                    .into_iter()
+                    .take(crate::decoded::MAX_PARALLEL_CHUNKS)
+                    .count()
+                    .max(1)
+            })
+    } else {
+        1
+    };
+    Ok(Plan {
+        source,
+        workspace,
+        parallelism,
+    })
 }
 
 fn bytes(shape: &[u64], element_size: u64) -> Result<u64, DataServerError> {

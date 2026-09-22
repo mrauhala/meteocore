@@ -533,13 +533,8 @@ async fn failed_refresh_keeps_catalog_and_retries_the_same_revision() {
     assert_ne!(old.times, engine.catalog.load().times);
 }
 
-/// Compare cold/repeated/panned/animated engine reads at one fixed snapshot.
-/// Network and debug-build timings are observations, never CI assertions.
-#[ignore = "public S3 access; manual performance probe"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn map_cache_latency_probe() {
-    use std::time::Instant;
-    let mut config = ZarrConfig {
+fn public_aifs_config() -> ZarrConfig {
+    ZarrConfig {
         data_path: None,
         endpoint: Some("https://s3.us-west-2.amazonaws.com".into()),
         bucket: Some("dynamical-ecmwf-aifs-single".into()),
@@ -556,7 +551,16 @@ async fn map_cache_latency_probe() {
             region: Some("us-west-2".into()),
             force_path_style: Some(true),
         }),
-    };
+    }
+}
+
+/// Compare cold/repeated/panned/animated engine reads at one fixed snapshot.
+/// Network and debug-build timings are observations, never CI assertions.
+#[ignore = "public S3 access; manual performance probe"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn map_cache_latency_probe() {
+    use std::time::Instant;
+    let mut config = public_aifs_config();
     let mut baseline = Vec::new();
     for (cache_mb, decoded_mb) in [(0, 0), (256, 0), (256, 256)] {
         config.cache_mb = cache_mb;
@@ -606,6 +610,63 @@ async fn map_cache_latency_probe() {
             } else {
                 assert_eq!(values, baseline[i], "cache must not change pixels");
             }
+        }
+    }
+}
+
+/// Four cold inner chunks, fresh clients/caches, alternating measurement order.
+#[ignore = "public S3 access; manual performance probe"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunk_concurrency_latency_probe() {
+    use crate::decoded::{DecodedArray, DecodedCache};
+    use zarrs::array::ArrayShardedExt;
+    let mut config = public_aifs_config();
+    let mut baseline = None;
+    for parallelism in [1, 4, 4, 1, 1, 4] {
+        let source = Source::open("chunk-probe", &config).unwrap();
+        let store = source.snapshot(None).unwrap().unwrap();
+        let ic = config.icechunk.as_mut().unwrap();
+        ic.branch = None;
+        ic.snapshot = store.revision.clone();
+        let array = Array::open(store.clone(), "/temperature_2m").unwrap();
+        let inner = array.effective_subchunk_shape().unwrap();
+        let ndim = array.shape().len();
+        let mut ranges = vec![0..1; ndim];
+        for axis in ndim - 2..ndim {
+            ranges[axis] = 0..array.shape()[axis].min(inner[axis].get() + 1);
+        }
+        let subset = ArraySubset::new_with_ranges(&ranges);
+        let cache = Arc::new(DecodedCache::new(0));
+        let reader =
+            DecodedArray::new(&array, store.revision.as_deref(), "temperature_2m", cache).unwrap();
+        let permit = crate::read_budget::BUDGET
+            .reserve(&array, &subset, Some(0), true)
+            .unwrap();
+        assert!(permit.parallelism() >= parallelism);
+        let started = std::time::Instant::now();
+        let bytes = reader
+            .read(
+                &array,
+                &subset,
+                &zarrs::array::CodecOptions::default().with_concurrent_target(1),
+                parallelism,
+            )
+            .unwrap()
+            .into_fixed()
+            .unwrap()
+            .into_owned();
+        eprintln!(
+            "snapshot={:?} subset={ranges:?} parallelism={parallelism} elapsed_ms={}",
+            store.revision,
+            started.elapsed().as_millis()
+        );
+        if let Some(expected) = &baseline {
+            assert_eq!(
+                &bytes, expected,
+                "parallelism must not change native values"
+            );
+        } else {
+            baseline = Some(bytes);
         }
     }
 }
