@@ -14,12 +14,16 @@
 //!   a runtime per call. Plain reads stay on the engine execution thread;
 //!   Icechunk's separately admitted fan-out uses its own runtime bridge.
 //! - **Whole-object reads + LRU cache.** Non-sharded Zarr chunks are read in
-//!   full; the adapter caches the full object bytes (keyed by store key) and
-//!   serves byte-range requests by slicing the cached buffer, so a time-series
-//!   scan over one spatial neighbourhood re-reads each chunk at most once.
+//!   full; the adapter caches object bytes by catalog generation and store key
+//!   and serves byte ranges by slicing retained buffers. Repeated reads within
+//!   one catalog reuse bytes while they remain in the cache.
 //!   (Sharded objects are read whole — a documented Phase-2 trade-off.)
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ds_cache::ByteBoundedCache;
@@ -33,77 +37,146 @@ use zarrs::storage::{
     StoreKey, StoreKeys, StoreKeysPrefixes, StorePrefix,
 };
 
-/// Weights cache entries by payload size (plus a small per-entry overhead).
-/// The `&String` matches the cache's `fn(&K, &V)` weight-fn shape.
-#[allow(clippy::ptr_arg)]
-fn weigh_bytes(key: &String, val: &Bytes) -> u64 {
-    val.len() as u64 + key.len() as u64 + 64
+#[derive(Hash, PartialEq, Eq)]
+struct Key {
+    generation: u64,
+    path: String,
 }
 
-/// A readable + listable zarrs store backed by `ds-storage`.
-pub struct DsStore {
+fn weigh_bytes(key: &Key, val: &Option<Bytes>) -> u64 {
+    val.as_ref().map_or(0, |bytes| bytes.len() as u64) + key.path.len() as u64 + 80
+}
+
+/// Shared across catalog generations: refresh must not multiply cache budgets
+/// or rebuild object-store clients. Missing keys are cached too, so an old
+/// generation can keep returning fill values after a new chunk appears.
+struct Shared {
     store: DataStore,
     /// Object-path prefix prepended to every zarrs key — the store's location
     /// within the bucket. Empty for a locally-rooted store. No leading/trailing
     /// slashes.
     root: String,
-    cache: ByteBoundedCache<String, Bytes>,
+    cache: ByteBoundedCache<Key, Option<Bytes>>,
+}
+
+pub(crate) struct Generation {
+    pub(crate) version: u64,
+    retired: AtomicBool,
+}
+
+impl Generation {
+    fn new() -> Self {
+        // Nonzero and unique across collection rebuilds in this process; seed
+        // from wall time so browser validators also change across restarts.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128 - 1) as u64;
+        let previous = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+                previous.checked_add(1).map(|next| next.max(now))
+            })
+            .expect("Zarr generation counter exhausted");
+        Self {
+            version: (previous + 1).max(now),
+            retired: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
+    fn check_active(&self) -> Result<(), StorageError> {
+        if self.retired.load(Ordering::Acquire) {
+            // The next request can use the current catalog. Preserve this
+            // typed signal through zarrs so HTTP handlers return a retryable 503.
+            Err(io_err(ds_core::error::DataServerError::ResourceExhausted))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A readable + listable store with a generation scoped to one catalog.
+pub struct DsStore {
+    shared: Arc<Shared>,
+    pub(crate) generation: Arc<Generation>,
 }
 
 impl DsStore {
     /// Build an adapter over `store`, rooted at `root` (the store location
     /// within the backend; `""` for a locally-rooted store), with a chunk cache
-    /// of `cache_mb` megabytes (floored at 1 MB).
+    /// of `cache_mb` megabytes shared by all catalog generations. Zero disables
+    /// retention.
     pub fn new(store: DataStore, root: impl Into<String>, cache_mb: u64) -> Self {
-        let max_bytes = cache_mb.saturating_mul(ds_cache::MIB).max(ds_cache::MIB);
+        let max_bytes = cache_mb.saturating_mul(ds_cache::MIB);
         Self {
-            store,
-            root: root.into().trim_matches('/').to_string(),
-            // ~1 MB per chunk is just a sizing hint; eviction is driven by
-            // `max_bytes`.
-            cache: ByteBoundedCache::new(max_bytes, ds_cache::MIB, weigh_bytes),
+            shared: Arc::new(Shared {
+                store,
+                root: root.into().trim_matches('/').to_string(),
+                cache: ByteBoundedCache::new(max_bytes, ds_cache::MIB, weigh_bytes),
+            }),
+            generation: Arc::new(Generation::new()),
+        }
+    }
+
+    pub(crate) fn fresh(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            generation: Arc::new(Generation::new()),
         }
     }
 
     /// Map a zarrs key to a backend object path, applying the root prefix.
     fn object_path(&self, key: &str) -> ObjectPath {
-        if self.root.is_empty() {
+        if self.shared.root.is_empty() {
             ObjectPath::from(key)
         } else {
-            ObjectPath::from(format!("{}/{}", self.root, key))
+            ObjectPath::from(format!("{}/{}", self.shared.root, key))
         }
     }
 
     /// Strip the root prefix from a backend object path, returning the
     /// zarrs-relative key, or `None` if the path is outside the root.
     fn strip_root<'a>(&self, full: &'a str) -> Option<&'a str> {
-        if self.root.is_empty() {
+        if self.shared.root.is_empty() {
             return Some(full);
         }
-        full.strip_prefix(self.root.as_str())
-            .map(|s| s.trim_start_matches('/'))
+        full.strip_prefix(self.shared.root.as_str())?
+            .strip_prefix('/')
     }
 
     /// Fetch a full object, caching it. `None` when the key is absent.
     fn get_full(&self, key: &StoreKey) -> Result<Option<Bytes>, StorageError> {
-        let k = key.as_str();
-        if let Some(b) = self.cache.get(k) {
-            return Ok(Some(b));
+        ds_core::deadline::check().map_err(io_err)?;
+        let k = Key {
+            generation: self.generation.version,
+            path: key.as_str().to_owned(),
+        };
+        if let Some(bytes) = self.shared.cache.get(&k) {
+            return Ok(bytes);
         }
-        match self.store.get_opt(&self.object_path(k)).map_err(io_err)? {
-            Some(b) => {
-                self.cache.insert(k.to_string(), b.clone());
-                Ok(Some(b))
-            }
-            None => Ok(None),
-        }
+        // Never refill a retired catalog from the current mutable backend.
+        // Check again after I/O to cover a fetch racing retirement.
+        self.generation.check_active()?;
+        let bytes = self
+            .shared
+            .store
+            .get_opt(&self.object_path(key.as_str()))
+            .map_err(io_err)?;
+        ds_core::deadline::check().map_err(io_err)?;
+        self.generation.check_active()?;
+        self.shared.cache.insert(k, bytes.clone());
+        Ok(bytes)
     }
 }
 
-/// Wrap any ds-storage error as a zarrs `StorageError` (which has no free-text
-/// variant, so we route through an IO error).
+/// Preserve backend error types inside zarrs's cloneable IO error wrapper.
 pub(crate) fn io_err(e: ds_core::error::DataServerError) -> StorageError {
-    StorageError::from(Arc::new(std::io::Error::other(e.to_string())))
+    StorageError::from(Arc::new(std::io::Error::other(e)))
 }
 
 impl ReadableStorageTraits for DsStore {
@@ -164,10 +237,13 @@ impl ListableStorageTraits for DsStore {
     // the store root of a large remote store, where it would enumerate every
     // chunk key.
     fn list_prefix(&self, prefix: &StorePrefix) -> Result<StoreKeys, StorageError> {
+        self.generation.check_active()?;
         let metas = self
+            .shared
             .store
             .list(&self.object_path(prefix.as_str()))
             .map_err(io_err)?;
+        self.generation.check_active()?;
         let mut keys = Vec::with_capacity(metas.len());
         for m in metas {
             if let Some(rel) = self.strip_root(m.location.as_ref()) {
@@ -180,10 +256,13 @@ impl ListableStorageTraits for DsStore {
     }
 
     fn list_dir(&self, prefix: &StorePrefix) -> Result<StoreKeysPrefixes, StorageError> {
+        self.generation.check_active()?;
         let (objects, prefixes) = self
+            .shared
             .store
             .list_dir(&self.object_path(prefix.as_str()))
             .map_err(io_err)?;
+        self.generation.check_active()?;
         let mut keys = Vec::with_capacity(objects.len());
         for m in objects {
             if let Some(rel) = self.strip_root(m.location.as_ref()) {
@@ -209,10 +288,13 @@ impl ListableStorageTraits for DsStore {
     }
 
     fn size_prefix(&self, prefix: &StorePrefix) -> Result<u64, StorageError> {
+        self.generation.check_active()?;
         let metas = self
+            .shared
             .store
             .list(&self.object_path(prefix.as_str()))
             .map_err(io_err)?;
+        self.generation.check_active()?;
         Ok(metas.iter().map(|m| m.size).sum())
     }
 }
@@ -232,6 +314,7 @@ pub struct EngineStore {
     readable: Arc<dyn ReadableStorageTraits>,
     listable: Arc<dyn ListableStorageTraits>,
     pub(crate) revision: Option<String>,
+    pub(crate) generation: Option<Arc<Generation>>,
 }
 
 impl EngineStore {
@@ -245,6 +328,15 @@ impl EngineStore {
             readable: arc.clone(),
             listable: arc,
             revision: None,
+            generation: None,
+        }
+    }
+
+    pub(crate) fn plain(store: DsStore) -> Self {
+        let generation = store.generation.clone();
+        Self {
+            generation: Some(generation),
+            ..Self::new(store)
         }
     }
 
@@ -327,6 +419,7 @@ mod tests {
             Some("t2m/c/0/0/0")
         );
         assert_eq!(s.strip_root("outside/x"), None);
+        assert_eq!(s.strip_root("zarr/era5.zarr-sibling/t2m/zarr.json"), None);
     }
 
     #[test]
@@ -336,3 +429,6 @@ mod tests {
         assert_eq!(s.strip_root("t2m/zarr.json"), Some("t2m/zarr.json"));
     }
 }
+
+#[cfg(test)]
+mod refresh_tests;

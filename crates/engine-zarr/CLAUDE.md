@@ -38,10 +38,27 @@ pool: they do not use the Icechunk runtime bridge.
   and the poll-and-swap lifecycle. blosc/zstd build from C via `cmake`+`cc`.
 - **Plain storage = ds-storage:** `src/store.rs` `DsStore`
   implements zarrs' `ReadableStorageTraits` + `ListableStorageTraits` over
-  `ds_storage::DataStore`, with a `quick_cache` LRU of full chunk-object
+  `ds_storage::DataStore`, with a `ds-cache` byte-bounded LRU of full object
   bytes (byte ranges served by slicing the cached buffer). Group/child
   discovery uses one-level delimiter listing (`DataStore::list_dir`), not a
   recursive chunk-key walk.
+- **Plain refresh:** `Source::snapshot` creates a fresh `DsStore` generation
+  for every candidate catalog. Clients and one object-cache byte budget are shared;
+  cache keys include generation and path, including cached missing keys.
+  `cache_mb = 0` disables retention. On refresh, call `Source::publish` only
+  after swapping in the successfully built catalog, so new requests cannot
+  load a retired generation; failed builds never retire the published one.
+  Retirement forbids uncached reads and discards downloads crossing retirement.
+  Old cached bytes and sampled windows remain usable; eviction cannot refill
+  an old catalog from new data.
+  Preserve retirement as typed `ResourceExhausted` through zarrs storage/codec
+  wrappers so interrupted requests return HTTP 503 (render APIs add `Retry-After`).
+  Every successful plain poll gets a nonzero render content version, even if
+  metadata is unchanged, because payload corrections need not change metadata.
+  These are cache generations, not transactional object versions: external
+  in-place writes before publication can still affect active uncached reads.
+  Do not claim snapshot isolation for plain Zarr. Keep `revision = None` so
+  plain generations never enable Icechunk decoded caching or worker fan-out.
 - **Catalog** (`catalog::build`): opens the root group, lists child arrays,
   treats 1-D arrays named after their dim as CF coordinate variables,
   classifies dims via `cf::classify_axis` (coord-var

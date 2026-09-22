@@ -13,9 +13,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use zarrs::array::{
-    data_type, Array, ArrayBytes, ArrayShardedExt, ArraySubset, CodecOptions, FromArrayBytes,
+    data_type, Array, ArrayBytes, ArrayError, ArrayShardedExt, ArraySubset, CodecError,
+    CodecOptions, FromArrayBytes,
 };
 use zarrs::group::Group;
+use zarrs::storage::StorageError;
 
 use ds_core::error::DataServerError;
 use ds_core::instances;
@@ -509,11 +511,19 @@ pub fn build(
     decoded_cache: Arc<DecodedCache>,
 ) -> Result<Catalog, DataServerError> {
     let revision = store.revision.clone();
-    let content_version = revision.as_ref().map_or(0, |id| {
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        id.hash(&mut hash);
-        hash.finish().max(1)
-    });
+    let content_version = revision.as_ref().map_or_else(
+        || {
+            store
+                .generation
+                .as_ref()
+                .map_or(0, |generation| generation.version)
+        },
+        |id| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut hash);
+            hash.finish().max(1)
+        },
+    );
     let group = Group::open(store.clone(), "/")
         .map_err(|e| DataServerError::Engine(format!("open Zarr root group: {e}")))?;
     let arrays = group
@@ -1152,6 +1162,26 @@ fn read_coord_f64(array: &Array<Store>) -> Result<Vec<f64>, DataServerError> {
     retrieve_raw_f64(array, &subset, None, 1)
 }
 
+fn chunk_read_error(error: ArrayError) -> DataServerError {
+    // Chunk reads and partial/sharded decoding wrap storage errors differently.
+    // Inspect the typed IO payload: text matching or checking the catalog's
+    // current retirement flag could misclassify an unrelated codec failure.
+    let io = match &error {
+        ArrayError::StorageError(StorageError::IOError(io))
+        | ArrayError::CodecError(CodecError::StorageError(StorageError::IOError(io)))
+        | ArrayError::CodecError(CodecError::IOError(io)) => Some(io),
+        _ => None,
+    };
+    if matches!(
+        io.and_then(|io| io.get_ref())
+            .and_then(|error| error.downcast_ref::<DataServerError>()),
+        Some(DataServerError::ResourceExhausted)
+    ) {
+        return DataServerError::ResourceExhausted;
+    }
+    DataServerError::Engine(format!("Zarr chunk read failed: {error}"))
+}
+
 /// Retrieve an array subset as raw `f64` values (no CF scaling), branching on
 /// the array's data type. Integer and float types are widened to `f64`.
 fn retrieve_raw_f64(
@@ -1173,7 +1203,7 @@ fn retrieve_raw_f64(
         None => {
             let result = array.retrieve_array_subset_opt::<ArrayBytes<'static>>(subset, &opts);
             ds_core::deadline::check()?;
-            result.map_err(|e| DataServerError::Engine(format!("Zarr chunk read failed: {e}")))?
+            result.map_err(chunk_read_error)?
         }
     };
     macro_rules! read_as {
@@ -1207,22 +1237,61 @@ fn retrieve_raw_f64(
             "unsupported Zarr data type: {dt}"
         )));
     };
-    // The storage trait erases backend error types; recover the typed request
-    // deadline before mapping other codec/storage failures to Engine errors.
+    // Recover the typed request deadline before mapping other codec failures.
     ds_core::deadline::check()?;
-    result.map_err(|e| DataServerError::Engine(format!("Zarr chunk read failed: {e}")))
+    result.map_err(chunk_read_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retirement_remains_retryable_through_full_and_partial_shard_reads() {
+        use zarrs::array::{codec::ShardingCodecBuilder, ArrayBuilder};
+        for sharded in [false, true] {
+            let store = Arc::new(EngineStore::plain(crate::store::DsStore::new(
+                ds_storage::DataStore::new(Arc::new(
+                    ds_storage::object_store::memory::InMemory::new(),
+                )),
+                "",
+                0,
+            )));
+            let mut builder = ArrayBuilder::new(vec![4, 4], vec![4, 4], data_type::float32(), 0f32);
+            if sharded {
+                builder.array_to_bytes_codec(Arc::new(
+                    ShardingCodecBuilder::new(
+                        vec![2.try_into().unwrap(); 2],
+                        &data_type::float32(),
+                    )
+                    .build(),
+                ));
+            }
+            let array = builder.build(store.clone(), "/temp").unwrap();
+            let full = ArraySubset::new_with_shape(vec![4, 4]);
+            assert_eq!(
+                retrieve_raw_f64(&array, &full, None, 1).unwrap(),
+                vec![0.; 16],
+                "an active store still returns fill values for missing objects"
+            );
+            store.generation.as_ref().unwrap().retire();
+            for subset in [full, ArraySubset::new_with_ranges(&[1..3, 1..3])] {
+                assert!(matches!(
+                    retrieve_raw_f64(&array, &subset, None, 1),
+                    Err(DataServerError::ResourceExhausted)
+                ));
+            }
+        }
+    }
+
     fn fixture(budget: Arc<Budget>) -> Catalog {
         let config = ds_core::config::ZarrConfig::auto_local(
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zarr-era5-t2m").into(),
         );
         let mut catalog = build(
-            Arc::new(crate::build_store("budget-test", &config).unwrap()),
+            Arc::new(EngineStore::plain(
+                crate::build_store("budget-test", &config).unwrap(),
+            )),
             "budget-test",
             None,
             Arc::new(DecodedCache::new(0)),
@@ -1299,7 +1368,9 @@ mod tests {
         for (capacity, exhausted) in [(0, true), (ds_cache::MIB, false)] {
             let budget = Arc::new(Budget::new(capacity));
             let mut catalog = build(
-                Arc::new(crate::build_store("budget-test", &config).unwrap()),
+                Arc::new(EngineStore::plain(
+                    crate::build_store("budget-test", &config).unwrap(),
+                )),
                 "budget-test",
                 None,
                 Arc::new(DecodedCache::new(0)),
