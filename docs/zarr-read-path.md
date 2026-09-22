@@ -17,6 +17,15 @@ Implementation batches address the map-focused review from 2026-09-22.
 - Startup diagnostics report outer and effective inner shapes, native bytes, and time steps per chunk. Per-collection `zarr_decoded_cache_{hits_total,misses_total,bytes,capacity_bytes}` and Grafana panels expose decoded reuse and occupancy. Misses count fill attempts, including failed ones; successful coalesced waiters count as hits. Bypassed reads and timed-out waits do not increment these counters.
 - Maps/WMS/Tiles and EDR variable reads now share process-wide source-memory admission (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB). Checked estimates reject oversized windows before payload I/O, regardless of output image size. Reservations remain attached to sampling windows and are released on errors, deadline exits, and unwinding. Competing reads fail immediately rather than waiting while holding other windows or executor slots.
 - Icechunk inner-chunk retrieval now processes batches of up to four chunks through a shared four-worker pool. Every worker inherits the absolute request deadline and drives async storage through the persistent I/O runtime; native decoding runs off its reactor. Individual zarrs calls keep `concurrent_target(1)`. All batch jobs join on errors and unwinding before the caller releases its reservation. Completed-but-not-copied chunks and queued jobs are bounded by the batch size. Single-chunk batches stay on the caller. Zero decoded-cache capacity disables retention while preserving concurrent retrieval; plain Zarr and shards with outer transforms keep the ordinary serial path.
+- Plain-Zarr polls now rebuild metadata and coordinates with fresh cache generations. Generation-and-path keys isolate cached payloads and missing keys; object-store clients and one byte budget survive refresh. Zero cache capacity disables retention. Successful builds retire the previous generation and publish a new nonzero render content version; failed builds preserve the published catalog. Same-timestamp payload corrections invalidate rendered images, even if metadata is unchanged.
+
+## Plain-Zarr refresh semantics
+
+Every successful plain-Zarr poll starts a new cache generation, including polls with unchanged metadata. Without a versioned manifest, a metadata-only scan cannot prove that payloads are unchanged. This intentionally trades cache reuse across poll boundaries for visibility of mutable data, without recursively listing every chunk.
+
+Old readers retain their catalog and any cached objects or sampled windows. Once retired, a cache miss fails instead of fetching bytes from the current backend, including after eviction. Downloads that are still in progress when retirement occurs are discarded. Missing keys are retained within the same byte budget, so previously observed fill chunks stay missing for old readers while retained.
+
+Generations are cache isolation, not transactional snapshots. External in-place writes before publication can still affect active uncached reads, and a catalog rebuild itself is not an atomic view of a concurrently modified tree. Publish stable stores, or use Icechunk for atomic updates across objects. An old query needing uncached bytes during refresh can fail and must be retried against the current catalog. An optimization to retain payloads across generations would need object-version validation; reusing path-only keys would reintroduce stale data.
 
 ## Source-memory accounting
 
@@ -86,12 +95,13 @@ The map-cache probe also passed on the same snapshot after this change: decoded 
 
 ## Remaining review work
 
-1. Fix plain-Zarr mutable metadata/coordinate refresh and cache invalidation. Its source currently retains the existing DsStore behavior; the Icechunk lifecycle fix does not address this.
-2. Extend source-memory admission to encoded-object buffers and codec-specific scratch limits, and refine estimates for cache hits. The current reservation covers native windows and estimated decode/index workspace, not every underlying allocation.
-3. Extend layout diagnostics and decoded-cache metrics with requested/decoded-byte amplification, storage requests/bytes, and fetch/decode/resample timings.
-4. Replace plain-Zarr whole-object shard reads with efficient range retrieval where appropriate, and coalesce overlapping plain-store payload fills. Parallelizing this backend or outer-transformed Icechunk shards needs a separate runtime/admission design.
+1. Extend source-memory admission to encoded-object buffers and codec-specific scratch limits, and refine estimates for cache hits. The current reservation covers native windows and estimated decode/index workspace, not every underlying allocation.
+2. Extend layout diagnostics and decoded-cache metrics with requested/decoded-byte amplification, storage requests/bytes, and fetch/decode/resample timings.
+3. Replace plain-Zarr whole-object shard reads with efficient range retrieval where appropriate, and coalesce overlapping plain-store payload fills. Parallelizing this backend or outer-transformed Icechunk shards needs a separate runtime/admission design.
 
 ## Regression coverage
+
+Plain-Zarr tests cover V2 and V3 metadata/coordinate updates, same-time payload corrections, render-version changes, failed rebuild/retry, retained old pixels, missing-key isolation, old-reader failure after eviction, shared byte budgets, and zero retention. A gated localhost HTTP server verifies that a download racing retirement is discarded rather than cached or returned.
 
 Network-free tests exercise payload retention with deleted backing files, zero-cache behavior, warm payload reuse across changed snapshots, expired and in-flight deadlines, multiple caller/runtime contexts, no-op refresh, failed refresh/retry, old readers, explicit snapshot/tag selection, same-time data correction, and irregular-grid map/position consistency.
 

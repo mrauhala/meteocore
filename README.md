@@ -1023,7 +1023,9 @@ Cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions metadata. 
 - **Read memory:** `MC_ZARR_READ_MEMORY_MB` limits admitted source working sets across Maps/WMS/Tiles and EDR, even for a tiny output image spanning a large native grid. The estimate includes native/typed/f64 buffers, window axes, and four native decode/index buffers, using full stored chunk shapes (including edge padding and forecast leads). Reservations survive until sampling finishes. Encoded objects, codec-private scratch, persistent catalog metadata, resident caches, and API output buffers are excluded; this is not a total process-RAM limit. See [read-path details](docs/zarr-read-path.md).
 - **EDR position queries** use bilinear interpolation; ascending/descending and irregular axes are handled via CF axis location.
 - **Rendering** reads a 2-D spatial window covering the request bbox (+1 cell margin), then samples per output pixel (geographic/WebMercator) or via a coarse projection grid (projected output CRS — never per-pixel projection).
-- **Poll-and-swap:** the store is re-read on `poll_interval_secs` so appended time steps surface without a reload; `RasterInfo` is served from a cached snapshot.
+- **Poll-and-swap:** plain-Zarr metadata, coordinates, and payload cache entries are refreshed on `poll_interval_secs`. A successful rebuild publishes a new catalog and render-cache version, including for same-timestamp corrections. Failed rebuilds keep the previous catalog. Object-store clients and the byte budget are shared across generations; `cache_mb = 0` disables retention.
+
+Plain-Zarr generations isolate cache entries; they are not transactional snapshots. Retired readers can finish using cached objects and already sampled windows, but uncached reads (including reads whose objects were evicted) fail instead of refilling from newer data. Downloads crossing publication are discarded. Successful polls also invalidate caches when metadata appears unchanged, because payloads can change independently. In-place writes before publication can still be observed by active readers; publish stable stores or use Icechunk when updates require atomic consistency across objects.
 
 **Supported grids:** geographic (WGS84 lat/lon) only. Projected metre axes are detected and skipped (not mistaken for degrees). A startup WARN fires for pathological chunk shapes (e.g. `time=1, lat=full, lon=full` — one full-domain chunk per timestep is bad for point/time-series queries; the engine still serves).
 
@@ -1052,7 +1054,7 @@ Cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions metadata. 
 | `zarr_version` | no | auto | Metadata version `2` or `3` (advisory — `zarrs` auto-detects). |
 | `parameters` | no | all | Only expose these variables as parameters. |
 | `poll_interval_secs` | no | `300` | Store re-read cadence in seconds. |
-| `cache_mb` | no | `256` | Chunk LRU cache size in MB (most useful for S3/HTTP). |
+| `cache_mb` | no | `256` | Object-cache budget in MiB for plain Zarr; compressed payload budget for Icechunk. Shared across catalog generations; `0` disables retention. |
 | `icechunk` | no | — | `[zarr.icechunk]` table → read an Icechunk repo instead of plain Zarr (see below). Requires the `icechunk` feature. |
 
 \* One of `data_path` **or** `endpoint`+`bucket` must be set.

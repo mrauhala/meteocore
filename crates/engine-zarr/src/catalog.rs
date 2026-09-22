@@ -509,11 +509,19 @@ pub fn build(
     decoded_cache: Arc<DecodedCache>,
 ) -> Result<Catalog, DataServerError> {
     let revision = store.revision.clone();
-    let content_version = revision.as_ref().map_or(0, |id| {
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        id.hash(&mut hash);
-        hash.finish().max(1)
-    });
+    let content_version = revision.as_ref().map_or_else(
+        || {
+            store
+                .generation
+                .as_ref()
+                .map_or(0, |generation| generation.version)
+        },
+        |id| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut hash);
+            hash.finish().max(1)
+        },
+    );
     let group = Group::open(store.clone(), "/")
         .map_err(|e| DataServerError::Engine(format!("open Zarr root group: {e}")))?;
     let arrays = group
@@ -1222,7 +1230,9 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zarr-era5-t2m").into(),
         );
         let mut catalog = build(
-            Arc::new(crate::build_store("budget-test", &config).unwrap()),
+            Arc::new(EngineStore::plain(
+                crate::build_store("budget-test", &config).unwrap(),
+            )),
             "budget-test",
             None,
             Arc::new(DecodedCache::new(0)),
@@ -1299,7 +1309,9 @@ mod tests {
         for (capacity, exhausted) in [(0, true), (ds_cache::MIB, false)] {
             let budget = Arc::new(Budget::new(capacity));
             let mut catalog = build(
-                Arc::new(crate::build_store("budget-test", &config).unwrap()),
+                Arc::new(EngineStore::plain(
+                    crate::build_store("budget-test", &config).unwrap(),
+                )),
                 "budget-test",
                 None,
                 Arc::new(DecodedCache::new(0)),

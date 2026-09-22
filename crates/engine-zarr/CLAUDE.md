@@ -38,10 +38,24 @@ pool: they do not use the Icechunk runtime bridge.
   and the poll-and-swap lifecycle. blosc/zstd build from C via `cmake`+`cc`.
 - **Plain storage = ds-storage:** `src/store.rs` `DsStore`
   implements zarrs' `ReadableStorageTraits` + `ListableStorageTraits` over
-  `ds_storage::DataStore`, with a `quick_cache` LRU of full chunk-object
+  `ds_storage::DataStore`, with a `ds-cache` byte-bounded LRU of full object
   bytes (byte ranges served by slicing the cached buffer). Group/child
   discovery uses one-level delimiter listing (`DataStore::list_dir`), not a
   recursive chunk-key walk.
+- **Plain refresh:** `Source::snapshot` creates a fresh `DsStore` generation
+  for every candidate catalog. Clients and one object-cache byte budget are shared;
+  cache keys include generation and path, including cached missing keys.
+  `cache_mb = 0` disables retention. Call `Source::publish` only after a
+  successful build, immediately before the catalog swap; failed builds never
+  retire the published generation. Retirement forbids uncached reads and
+  discards downloads crossing publication. Old cached bytes and sampled
+  windows remain usable; eviction cannot refill an old catalog from new data.
+  Every successful plain poll gets a nonzero render content version, even if
+  metadata is unchanged, because payload corrections need not change metadata.
+  These are cache generations, not transactional object versions: external
+  in-place writes before publication can still affect active uncached reads.
+  Do not claim snapshot isolation for plain Zarr. Keep `revision = None` so
+  plain generations never enable Icechunk decoded caching or worker fan-out.
 - **Catalog** (`catalog::build`): opens the root group, lists child arrays,
   treats 1-D arrays named after their dim as CF coordinate variables,
   classifies dims via `cf::classify_axis` (coord-var

@@ -50,7 +50,7 @@ use ds_core::model::{
 use ds_core::resample::ProjectionGrid;
 
 use catalog::Catalog;
-use store::{DsStore, EngineStore};
+use store::DsStore;
 
 /// Engine for serving Zarr arrays over EDR and the Map/Tiles/WMS APIs.
 pub struct ZarrEngine {
@@ -91,6 +91,7 @@ impl ZarrEngine {
             param_filter.as_deref(),
             decoded_cache.clone(),
         )?;
+        source.publish(&store);
 
         log_loaded(collection_id, &catalog);
 
@@ -142,16 +143,17 @@ impl ZarrEngine {
                 store
                     .map(|store| {
                         catalog::build(
-                            store,
+                            store.clone(),
                             &self.collection_id,
                             self.param_filter.as_deref(),
                             self.decoded_cache.clone(),
                         )
+                        .map(|catalog| (catalog, store))
                     })
                     .transpose()
             });
         match rebuilt {
-            Ok(Some(new_catalog)) => {
+            Ok(Some((new_catalog, store))) => {
                 let current = self.catalog.load();
                 if new_catalog.times != current.times
                     || new_catalog.runs.len() != current.runs.len()
@@ -160,6 +162,7 @@ impl ZarrEngine {
                     log_loaded(&self.collection_id, &new_catalog);
                 }
                 // One atomic swap updates data + capabilities together.
+                self.source.publish(&store);
                 self.catalog.store(Arc::new(new_catalog));
             }
             Ok(None) => {}
@@ -542,7 +545,7 @@ impl EdrEngine for ZarrEngine {
 ///   `path` within the bucket.
 /// - Local: `data_path` (a directory, or an `s3://` / `http(s)://` URL),
 ///   optionally suffixed by `path`. `ds_storage::build_store` picks the backend.
-fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<EngineStore, DataServerError> {
+fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, DataServerError> {
     if let (Some(endpoint), Some(bucket)) = (config.endpoint.as_deref(), config.bucket.as_deref()) {
         // `path` is required for a remote source — enforced in
         // `ServerConfig::validate` ("remote zarr (endpoint+bucket) requires
@@ -554,7 +557,7 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<EngineStore, 
                  (endpoint={endpoint}, bucket={bucket}): {e}"
             ))
         })?;
-        return Ok(EngineStore::new(DsStore::new(ds, path, config.cache_mb)));
+        return Ok(DsStore::new(ds, path, config.cache_mb));
     }
 
     let data_path = config.data_path.as_deref().ok_or_else(|| {
@@ -577,11 +580,11 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<EngineStore, 
             "Collection '{collection_id}': failed to open Zarr store '{location}': {e}"
         ))
     })?;
-    Ok(EngineStore::new(DsStore::new(
+    Ok(DsStore::new(
         ds,
         prefix.as_ref().to_string(),
         config.cache_mb,
-    )))
+    ))
 }
 
 impl MapEngine for ZarrEngine {
@@ -814,3 +817,6 @@ mod tests {
         assert!(parse_coords("garbage").is_err());
     }
 }
+
+#[cfg(test)]
+mod refresh_tests;

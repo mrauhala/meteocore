@@ -118,6 +118,14 @@ CoverageJSON 1.0 schema.
 Zarr/Icechunk storage reads honor the query deadline. Branch-backed collections
 refresh on their poll interval; each query uses one pinned snapshot, and a failed
 refresh retains the previous catalog. Explicit snapshot IDs remain pinned.
+Plain Zarr rebuilds metadata and coordinates using fresh cache generations on
+each poll, sharing one object-cache byte budget across generations. Failed rebuilds
+keep the published catalog. Retired queries can use retained objects and
+sampled windows; uncached reads or downloads crossing publication fail rather
+than reading newer objects against the old catalog. Zero object-cache capacity
+disables retention. Plain generations do not provide transactional consistency
+against external in-place writes; stable publication or Icechunk is needed for
+atomic updates across objects.
 Icechunk position, area, and radius queries share native decoded inner chunks
 with map reads within the same snapshot. `zarr.icechunk.decoded_cache_mb` bounds
 resident decoded bytes separately from the compressed payload cache (default
