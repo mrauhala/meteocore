@@ -121,8 +121,8 @@ refresh retains the previous catalog. Explicit snapshot IDs remain pinned.
 Plain Zarr rebuilds metadata and coordinates using fresh cache generations on
 each poll, sharing one object-cache byte budget across generations. Failed rebuilds
 keep the published catalog. Retired queries can use retained objects and
-sampled windows; uncached reads or downloads crossing publication fail rather
-than reading newer objects against the old catalog. Zero object-cache capacity
+sampled windows; uncached reads or downloads crossing publication return HTTP 503
+so clients can retry against the current catalog. Zero object-cache capacity
 disables retention. Plain generations do not provide transactional consistency
 against external in-place writes; stable publication or Icechunk is needed for
 atomic updates across objects.

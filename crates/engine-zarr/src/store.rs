@@ -91,9 +91,9 @@ impl Generation {
 
     fn check_active(&self) -> Result<(), StorageError> {
         if self.retired.load(Ordering::Acquire) {
-            Err(io_err(ds_core::error::DataServerError::Storage(
-                "plain Zarr catalog was refreshed; retry the read".into(),
-            )))
+            // The next request can use the current catalog. Preserve this
+            // typed signal through zarrs so HTTP handlers return a retryable 503.
+            Err(io_err(ds_core::error::DataServerError::ResourceExhausted))
         } else {
             Ok(())
         }
@@ -174,10 +174,9 @@ impl DsStore {
     }
 }
 
-/// Wrap any ds-storage error as a zarrs `StorageError` (which has no free-text
-/// variant, so we route through an IO error).
+/// Preserve backend error types inside zarrs's cloneable IO error wrapper.
 pub(crate) fn io_err(e: ds_core::error::DataServerError) -> StorageError {
-    StorageError::from(Arc::new(std::io::Error::other(e.to_string())))
+    StorageError::from(Arc::new(std::io::Error::other(e)))
 }
 
 impl ReadableStorageTraits for DsStore {

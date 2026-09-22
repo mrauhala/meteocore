@@ -50,6 +50,8 @@ pool: they do not use the Icechunk runtime bridge.
   retire the published generation. Retirement forbids uncached reads and
   discards downloads crossing publication. Old cached bytes and sampled
   windows remain usable; eviction cannot refill an old catalog from new data.
+  Preserve retirement as typed `ResourceExhausted` through zarrs storage/codec
+  wrappers so interrupted requests return HTTP 503 (render APIs add `Retry-After`).
   Every successful plain poll gets a nonzero render content version, even if
   metadata is unchanged, because payload corrections need not change metadata.
   These are cache generations, not transactional object versions: external

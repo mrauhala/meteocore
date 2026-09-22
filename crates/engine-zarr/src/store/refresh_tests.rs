@@ -120,10 +120,13 @@ fn a_fetch_racing_retirement_is_discarded() {
         store.generation.retire();
         release.send(()).unwrap();
         let error = worker.join().unwrap().unwrap_err();
-        assert!(
-            error.to_string().contains("catalog was refreshed"),
-            "{error}"
-        );
+        let StorageError::IOError(io) = error else {
+            panic!("retirement must preserve a typed IO payload: {error}");
+        };
+        assert!(matches!(
+            io.get_ref().unwrap().downcast_ref(),
+            Some(ds_core::error::DataServerError::ResourceExhausted)
+        ));
     });
     assert_eq!(
         store.shared.cache.metrics().bytes,

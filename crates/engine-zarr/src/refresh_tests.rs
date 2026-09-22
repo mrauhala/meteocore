@@ -182,16 +182,36 @@ async fn polling_refreshes_metadata_coordinates_and_payloads() {
         assert_eq!(old.times.len(), 1);
         assert_eq!(old.extent[0], 9.5);
         let old_read = old.read_window(&old.vars[0], None, 0, old.extent);
+        let old_series = old.sample_series(&old.vars[0], None, 10.5, 59.5, &[0]);
         if cache_mb == 0 {
             assert!(
-                old_read.is_err(),
-                "retired readers cannot refill from new data"
+                matches!(old_read, Err(DataServerError::ResourceExhausted)),
+                "retired map reads must return a retryable error"
             );
+            assert!(matches!(
+                old_series,
+                Err(DataServerError::ResourceExhausted)
+            ));
         } else {
             let window = old_read.unwrap().unwrap();
             assert_eq!(window.sample(10.5, 59.5), Some(1.));
+            assert_eq!(old_series.unwrap(), vec![Some(1.)]);
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_corruption_is_not_misclassified_as_retryable_after_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    write_store(dir.path(), &[0.], 10., 1.);
+    std::fs::write(dir.path().join("temp/c/0/0/0"), b"invalid gzip").unwrap();
+    let engine = engine(dir.path(), 1);
+    let old = engine.catalog.load_full();
+    let read = || old.sample_series(&old.vars[0], None, 10.5, 59.5, &[0]);
+    assert!(matches!(read(), Err(DataServerError::Engine(_))));
+    engine.poll_once();
+    assert_ne!(engine.content_version(), old.content_version);
+    assert!(matches!(read(), Err(DataServerError::Engine(_))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

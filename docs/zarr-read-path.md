@@ -25,7 +25,7 @@ Every successful plain-Zarr poll starts a new cache generation, including polls 
 
 Old readers retain their catalog and any cached objects or sampled windows. Once retired, a cache miss fails instead of fetching bytes from the current backend, including after eviction. Downloads that are still in progress when retirement occurs are discarded. Missing keys are retained within the same byte budget, so previously observed fill chunks stay missing for old readers while retained.
 
-Generations are cache isolation, not transactional snapshots. External in-place writes before publication can still affect active uncached reads, and a catalog rebuild itself is not an atomic view of a concurrently modified tree. Publish stable stores, or use Icechunk for atomic updates across objects. An old query needing uncached bytes during refresh can fail and must be retried against the current catalog. An optimization to retain payloads across generations would need object-version validation; reusing path-only keys would reintroduce stale data.
+Generations are cache isolation, not transactional snapshots. External in-place writes before publication can still affect active uncached reads, and a catalog rebuild itself is not an atomic view of a concurrently modified tree. Publish stable stores, or use Icechunk for atomic updates across objects. An old query needing uncached bytes during refresh returns HTTP 503 and must be retried against the current catalog; Maps/WMS/Tiles include `Retry-After: 1`. The retirement signal stays typed through zarrs storage/codec wrappers, while unrelated storage or decode failures remain engine errors. An optimization to retain payloads across generations would need object-version validation; reusing path-only keys would reintroduce stale data.
 
 ## Source-memory accounting
 
@@ -101,7 +101,7 @@ The map-cache probe also passed on the same snapshot after this change: decoded 
 
 ## Regression coverage
 
-Plain-Zarr tests cover V2 and V3 metadata/coordinate updates, same-time payload corrections, render-version changes, failed rebuild/retry, retained old pixels, missing-key isolation, old-reader failure after eviction, shared byte budgets, and zero retention. A gated localhost HTTP server verifies that a download racing retirement is discarded rather than cached or returned.
+Plain-Zarr tests cover V2 and V3 metadata/coordinate updates, same-time payload corrections, render-version changes, failed rebuild/retry, retained old pixels, missing-key isolation, old-reader failure after eviction, shared byte budgets, and zero retention. Tests assert retryable errors for retired map/EDR reads and full/partial shard decoding, while cached corruption remains an engine error. A gated localhost HTTP server verifies that a download racing retirement is discarded with a typed retryable error rather than cached or returned.
 
 Network-free tests exercise payload retention with deleted backing files, zero-cache behavior, warm payload reuse across changed snapshots, expired and in-flight deadlines, multiple caller/runtime contexts, no-op refresh, failed refresh/retry, old readers, explicit snapshot/tag selection, same-time data correction, and irregular-grid map/position consistency.
 
