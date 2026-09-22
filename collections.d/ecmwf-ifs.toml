@@ -11,40 +11,14 @@ prefix_pattern = "%Y%m%d/{run}z/ifs/0p25/oper/"
 poll_interval_secs = 300
 max_runs = 1
 run_hours = [0, 6, 12, 18]
-parameters = ["2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcwv", "cape", "sf", "sd"]
+level_types = ["single", "pressure"]
+parameters = [
+    "2t", "2d", "10u", "10v", "10fg", "10fg3", "msl", "sp", "tp", "tcc", "tcwv", "mucape", "sf", "sd",
+    "t", "u", "v", "w", "q", "r", "z", "gh", "vo", "d",
+]
 
 [wms]
 colormap = "temperature"
-
-[[wms.parameters]]
-name = "2t"
-colormap = "temperature"
-
-[[wms.parameters]]
-name = "2d"
-colormap = "temperature"
-
-[[wms.parameters]]
-name = "msl"
-colormap = "viridis"
-min = 950.0
-max = 1050.0
-
-[[wms.parameters]]
-name = "sp"
-colormap = "viridis"
-min = 500.0
-max = 1050.0
-
-[[wms.parameters]]
-name = "tp"
-colormap = "precipitation"
-
-[[wms.parameters]]
-name = "tcc"
-colormap = "grayscale"
-min = 0.0
-max = 100.0
 
 [[wms.parameters]]
 name = "10u"
@@ -59,12 +33,6 @@ name = "tcwv"
 colormap = "viridis"
 min = 0.0
 max = 70.0
-
-[[wms.parameters]]
-name = "cape"
-colormap = "viridis"
-min = 0.0
-max = 3000.0
 
 [[wms.parameters]]
 name = "sf"
