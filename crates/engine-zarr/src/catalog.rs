@@ -12,7 +12,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use zarrs::array::{data_type, Array, ArraySubset, CodecOptions};
+use zarrs::array::{
+    data_type, Array, ArrayBytes, ArrayShardedExt, ArraySubset, CodecOptions, FromArrayBytes,
+};
 use zarrs::group::Group;
 
 use ds_core::error::DataServerError;
@@ -20,6 +22,7 @@ use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
+use crate::decoded::{DecodedArray, DecodedCache};
 use crate::store::EngineStore;
 
 /// The store type backing every Zarr collection. A backend-agnostic wrapper so
@@ -29,8 +32,9 @@ type Store = EngineStore;
 
 /// Codec options that pin chunk retrieval to the **calling thread** by setting
 /// the concurrency target to 1. This is load-bearing: it stops zarrs from
-/// dispatching storage reads onto `rayon` workers, where ds-storage's
-/// `block_in_place` bridge would panic (see [`crate::store`]).
+/// dispatching storage reads onto `rayon` workers, which lose the calling
+/// thread's deadline and runtime context. Parallel retrieval needs explicit
+/// deadline propagation and separate decode admission.
 fn single_threaded_opts() -> CodecOptions {
     CodecOptions::default().with_concurrent_target(1)
 }
@@ -40,6 +44,7 @@ pub struct Variable {
     pub name: String,
     /// Opened zarr array handle, used for on-demand chunk reads.
     array: Array<Store>,
+    decoded: Option<DecodedArray>,
     pub units: String,
     pub label: String,
     /// Axis index of the time dimension within this variable's dim order. For a
@@ -229,7 +234,7 @@ impl Catalog {
             }
         }
         let subset = ArraySubset::new_with_ranges(&ranges);
-        let raw = retrieve_raw_f64(&var.array, &subset)?;
+        let raw = retrieve_raw_f64(&var.array, &subset, var.decoded.as_ref())?;
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
         let nrow = j1 - j0 + 1;
@@ -322,7 +327,7 @@ impl Catalog {
             }
         }
         let subset = ArraySubset::new_with_ranges(&ranges);
-        let raw = retrieve_raw_f64(&var.array, &subset)?;
+        let raw = retrieve_raw_f64(&var.array, &subset, var.decoded.as_ref())?;
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
         // Local corner offsets within the read window.
@@ -469,6 +474,7 @@ pub fn build(
     store: Arc<Store>,
     collection_id: &str,
     param_filter: Option<&[String]>,
+    decoded_cache: Arc<DecodedCache>,
 ) -> Result<Catalog, DataServerError> {
     let revision = store.revision.clone();
     let content_version = revision.as_ref().map_or(0, |id| {
@@ -821,6 +827,7 @@ pub fn build(
 
         vars.push(Variable {
             name: name.clone(),
+            decoded: DecodedArray::new(&array, revision.as_deref(), name, decoded_cache.clone()),
             array,
             units,
             label,
@@ -979,6 +986,21 @@ fn warn_bad_chunking(
     let Ok(chunk) = array.chunk_shape(&vec![0u64; ndim]) else {
         return;
     };
+    let inner = array.effective_subchunk_shape();
+    let effective = inner.as_ref().unwrap_or(&chunk);
+    let native_bytes = array.data_type().fixed_size().and_then(|size| {
+        effective
+            .iter()
+            .try_fold(size as u64, |n, dim| n.checked_mul(dim.get()))
+    });
+    tracing::info!(
+        collection = collection_id, parameter = name,
+        outer_chunk_shape = ?chunk, effective_inner_shape = ?inner,
+        native_chunk_bytes = ?native_bytes,
+        time_steps_per_chunk = time_axis.map(|a| effective[a].get()).unwrap_or(1),
+        "Zarr chunk layout (uncompressed size estimate)"
+    );
+    let chunk = effective;
     let time_chunk = time_axis.map(|a| chunk[a].get()).unwrap_or(n_times);
     let lat_chunk = chunk[lat_axis].get();
     let lon_chunk = chunk[lon_axis].get();
@@ -1094,7 +1116,7 @@ fn fill_value_as_f64(array: &Array<Store>) -> Option<f64> {
 /// Read an entire array as `Vec<f64>` (used for small coordinate arrays).
 fn read_coord_f64(array: &Array<Store>) -> Result<Vec<f64>, DataServerError> {
     let subset = ArraySubset::new_with_shape(array.shape().to_vec());
-    retrieve_raw_f64(array, &subset)
+    retrieve_raw_f64(array, &subset, None)
 }
 
 /// Retrieve an array subset as raw `f64` values (no CF scaling), branching on
@@ -1102,14 +1124,27 @@ fn read_coord_f64(array: &Array<Store>) -> Result<Vec<f64>, DataServerError> {
 fn retrieve_raw_f64(
     array: &Array<Store>,
     subset: &ArraySubset,
+    decoded: Option<&DecodedArray>,
 ) -> Result<Vec<f64>, DataServerError> {
     ds_core::deadline::check()?;
     let dt = array.data_type();
     let opts = single_threaded_opts();
+    if !dtype_supported(dt) {
+        return Err(DataServerError::Engine(format!(
+            "unsupported Zarr data type: {dt}"
+        )));
+    }
+    let bytes = match decoded {
+        Some(decoded) => decoded.read(array, subset, &opts)?,
+        None => {
+            let result = array.retrieve_array_subset_opt::<ArrayBytes<'static>>(subset, &opts);
+            ds_core::deadline::check()?;
+            result.map_err(|e| DataServerError::Engine(format!("Zarr chunk read failed: {e}")))?
+        }
+    };
     macro_rules! read_as {
         ($t:ty) => {
-            array
-                .retrieve_array_subset_opt::<Vec<$t>>(subset, &opts)
+            Vec::<$t>::from_array_bytes(bytes, subset.shape(), dt)
                 .map(|v| v.into_iter().map(|x| x as f64).collect::<Vec<f64>>())
         };
     }

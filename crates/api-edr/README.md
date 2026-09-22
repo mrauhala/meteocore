@@ -118,6 +118,11 @@ CoverageJSON 1.0 schema.
 Zarr/Icechunk storage reads honor the query deadline. Branch-backed collections
 refresh on their poll interval; each query uses one pinned snapshot, and a failed
 refresh retains the previous catalog. Explicit snapshot IDs remain pinned.
+Icechunk position, area, and radius queries share native decoded inner chunks
+with map reads within the same snapshot. `zarr.icechunk.decoded_cache_mb` bounds
+resident decoded bytes separately from the compressed payload cache (default
+256 MiB, `0` disables). Concurrent requests coalesce chunk fills while retaining
+their own wait deadlines; unsupported or oversized chunks use ordinary reads.
 
 ## Per-engine query-type matrix
 

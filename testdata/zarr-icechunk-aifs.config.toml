@@ -17,8 +17,8 @@
 #
 # This is a forecast (init_time = model run, lead_time = offset): the engine uses
 # the LATEST run and exposes valid time (= run + lead) as the time axis, so the
-# temporal extent is the latest run's ~15-day forecast. Selecting an older run
-# (EDR instances / WMS reference_time) is tracked in #337.
+# temporal extent is the latest run's ~15-day forecast. Select older runs via
+# EDR instances or WMS reference_time.
 
 [server]
 host = "127.0.0.1"
@@ -42,12 +42,14 @@ path = "ecmwf-aifs-single-forecast/v0.1.0.icechunk"
 # Focused demo. The repo also has wind_u_10m/wind_v_10m,
 # pressure_reduced_to_mean_sea_level, precipitation_surface, and ~13 more.
 parameters = ["temperature_2m"]
+# cache_mb = 256             # compressed payload/range cache (MiB)
 
 # Presence of this table selects the Icechunk backend. Default version is the
 # HEAD of branch `main`; new forecast cycles surface on the poll interval.
 [collections.zarr.icechunk]
 branch = "main"
 region = "us-west-2"
+# decoded_cache_mb = 256     # additional native inner-chunk cache (MiB)
 
 [collections.wms]
 colormap = "temperature"

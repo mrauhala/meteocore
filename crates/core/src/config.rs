@@ -1790,12 +1790,16 @@ impl ZarrConfig {
     }
 }
 
-/// Icechunk version selector for `[collections.zarr.icechunk]`.
+/// Icechunk settings for `[collections.zarr.icechunk]`.
 ///
 /// At most one of `branch` / `tag` / `snapshot` may be set; the default is the
 /// HEAD of branch `main`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct IcechunkConfig {
+    /// Per-collection decoded native chunk cache in MiB, separate from the
+    /// compressed payload cache (`zarr.cache_mb`). 0 disables retention.
+    #[serde(default = "default_zarr_cache_mb")]
+    pub decoded_cache_mb: u64,
     /// Read the HEAD of this branch (default: `main`).
     pub branch: Option<String>,
     /// Read this tag.
@@ -4116,6 +4120,19 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         // Default (no selector) is also fine — implies branch main HEAD.
         let cfg2 = zarr_collection("data_path = \"x\"\n[collections.zarr.icechunk]\n");
         assert!(cfg2.validate().is_ok());
+    }
+
+    #[test]
+    fn zarr_icechunk_decoded_cache_default_and_disable_are_independent_of_payload_cache() {
+        for (setting, expected) in [("", 256), ("decoded_cache_mb = 0\n", 0)] {
+            let cfg = zarr_collection(&format!(
+                "data_path = \"x\"\ncache_mb = 17\n[collections.zarr.icechunk]\n{setting}"
+            ));
+            assert!(cfg.validate().is_ok());
+            let zarr = cfg.collections[0].zarr.as_ref().unwrap();
+            assert_eq!(zarr.cache_mb, 17);
+            assert_eq!(zarr.icechunk.as_ref().unwrap().decoded_cache_mb, expected);
+        }
     }
 
     #[test]

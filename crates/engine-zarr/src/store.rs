@@ -2,17 +2,17 @@
 //!
 //! Bridges zarrs's synchronous `ReadableStorageTraits` / `ListableStorageTraits`
 //! to the shared `ds-storage` object-store layer (local, S3, HTTP), so the Zarr
-//! engine reaches every backend through the same code path as the other engines
-//! (#125 Phase 2).
+//! engine reaches plain Zarr stores through the same code path as the other
+//! engines (#125 Phase 2). Icechunk uses its own storage adapter and runtime.
 //!
 //! Two invariants make this safe and effective:
 //!
 //! - **Single-threaded retrieval.** The engine drives every read with
 //!   `CodecOptions::with_concurrent_target(1)` (see [`crate::catalog`]), so zarrs
-//!   never dispatches a storage read onto a `rayon` worker. ds-storage's
-//!   `block_in_place` bridge is valid on the calling request/poll thread but
-//!   *panics* on a rayon pool thread — so the single-thread setting is
-//!   load-bearing, not just a tuning knob (CLAUDE.md storage rules).
+//!   never dispatches a storage read onto a `rayon` worker. Those workers lose
+//!   the calling thread's deadline and runtime context; ds-storage may create
+//!   a runtime per call. Keep retrieval on the engine execution thread until
+//!   these concerns and decode admission are handled explicitly.
 //! - **Whole-object reads + LRU cache.** Non-sharded Zarr chunks are read in
 //!   full; the adapter caches the full object bytes (keyed by store key) and
 //!   serves byte-range requests by slicing the cached buffer, so a time-series

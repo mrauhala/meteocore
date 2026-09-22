@@ -1103,7 +1103,9 @@ If a config sets `[collections.zarr.icechunk]` but the binary was built without 
 - **Public datasets only.** Anonymous S3 access is used; there is no credential configuration.
 - New snapshots on a branch are picked up on `poll_interval_secs`. Unchanged snapshots retain their catalog and caches; failed refreshes keep the previous snapshot and retry. In-flight queries remain pinned to their original snapshot.
 - `cache_mb` bounds Icechunk's compressed payload cache; `0` disables retention. Snapshot changes preserve immutable payload reuse and invalidate rendered images, including corrections at existing times.
-- Storage operations honor request deadlines; background operations have a 30-second timeout. Decoded inner-chunk caching and concurrent retrieval are not implemented yet, so chunk layout still matters for map latency.
+- `icechunk.decoded_cache_mb` separately bounds native decoded inner-chunk retention (default 256 MiB, `0` disables). Overlapping maps, pans, forecast leads, and EDR queries share chunks within a snapshot. Concurrent fills for the same chunk are coalesced; waiting observes each request's deadline. Snapshot and array identity prevent stale decoded reuse after corrections.
+- Cache fills expand reads only for inner chunks up to 64 MiB that fit the configured budget. Larger chunks and shards with outer transforms use the existing partial-read path. The cache budget covers resident entries, including estimated overhead; it does not bound all active source/codec buffers. Plain mutable Zarr stores do not use this decoded cache.
+- Storage operations honor request deadlines; background operations have a 30-second timeout. Retrieval remains serial, so chunk layout and cold network reads still matter for map latency. Startup logs report effective inner chunk shapes and native sizes; `/metrics` exposes per-collection `zarr_decoded_cache_*` hits, misses, bytes, and capacity, with Grafana panels. See [read-path measurements and remaining work](docs/zarr-read-path.md).
 
 ##### Icechunk Config Fields (`[collections.zarr.icechunk]`)
 
@@ -1114,6 +1116,7 @@ At most one of `branch` / `tag` / `snapshot` may be set; the default is the HEAD
 | `branch` | no | `main` | Read the HEAD of this branch. |
 | `tag` | no | — | Read this tag. |
 | `snapshot` | no | — | Read this exact (immutable) snapshot id. |
+| `decoded_cache_mb` | no | `256` | Native decoded inner-chunk cache in MiB, additional to `zarr.cache_mb`. `0` disables retention. Shared across the collection's readers and snapshots, with snapshot-specific keys. |
 | `region` | no | — | S3 region for the repo's object store (needed for AWS; ignored for local). |
 | `force_path_style` | no | `true` | S3 path-style addressing. Set `false` for virtual-host style. |
 
@@ -1140,6 +1143,7 @@ parameters = ["temperature_2m"]
 [collections.zarr.icechunk]
 branch = "main"
 region = "us-west-2"
+# decoded_cache_mb = 256    # separate from the compressed payload cache
 
 [collections.wms]
 colormap = "temperature"
