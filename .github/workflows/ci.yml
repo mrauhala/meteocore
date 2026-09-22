@@ -78,11 +78,11 @@ jobs:
 
     # The Zarr engine's `icechunk` feature is off by default (heavy dep tree),
     # so the default jobs above don't compile it. Guard it from bitrot: lint +
-    # run its network-free end-to-end test (#335).
+    # run its network-free unit and end-to-end tests (#335).
     - name: Clippy + test engine-zarr icechunk feature
       run: |
         cargo clippy -p engine-zarr --features icechunk --all-targets -- -D warnings
-        cargo test -p engine-zarr --features icechunk --test icechunk
+        cargo test -p engine-zarr --features icechunk
 
   # RustSec advisory gate (#584). Deliberately a separate job from `check`:
   # it needs no compilation (it reads Cargo.lock), finishes in well under a

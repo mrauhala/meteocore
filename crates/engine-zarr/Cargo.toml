@@ -10,6 +10,7 @@ ds-storage = { path = "../storage" }
 # Compressed chunk-bytes LRU cache for the remote byte-range reader.
 ds-cache = { path = "../ds-cache" }
 bytes = "1"
+futures = { version = "0.3", optional = true }
 # Zarr V2/V3 format + codec pipeline (blosc/zstd/gzip/crc32c/sharding/transpose).
 # `filesystem` gives the local-directory store used for the Phase-1 backend;
 # `ndarray` is the multi-dimensional element view used to slice chunks.
@@ -32,7 +33,7 @@ tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread"
 thiserror = "2"
 
 # Icechunk support (#335) — optional/feature-gated; heavy transactional engine.
-# `zarrs/async` is required for the async Icechunk store + the async→sync adapter.
+# `zarrs/async` is required for the async Icechunk store + deadline-aware bridge.
 # Select only the `object_store`-based S3 backend (+ local filesystem), NOT
 # icechunk's default `s3` backend which pulls the full `aws-sdk-s3` tree — we
 # reuse the same `object_store` crate `ds-storage` already links. The
@@ -49,7 +50,7 @@ zarrs_icechunk = { version = "0.5.1", optional = true, default-features = false,
 ] }
 
 [features]
-icechunk = ["dep:icechunk", "dep:zarrs_icechunk", "zarrs/async"]
+icechunk = ["dep:icechunk", "dep:zarrs_icechunk", "dep:futures", "zarrs/async"]
 
 [dev-dependencies]
 tempfile = "3"
