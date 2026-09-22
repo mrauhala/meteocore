@@ -42,6 +42,13 @@ pool: they do not use the Icechunk runtime bridge.
   bytes (byte ranges served by slicing the cached buffer). Group/child
   discovery uses one-level delimiter listing (`DataStore::list_dir`), not a
   recursive chunk-key walk.
+  Payload fills use `ByteBoundedCache::get_or_insert_with_timeout`, scoped by
+  generation and key. Bound waits by the caller's deadline (30s without one)
+  and check the deadline again after waiting. Release Tokio workers with
+  `block_in_place` around the synchronous wait/fill so the owner's I/O can
+  progress. Failed owners release the guard for retry; recheck the new owner's
+  deadline and retirement before fetching. Existing waiters share even
+  non-retained results (zero cache or oversized objects).
 - **Plain refresh:** `Source::snapshot` creates a fresh `DsStore` generation
   for every candidate catalog. Clients and one object-cache byte budget are shared;
   cache keys include generation and path, including cached missing keys.

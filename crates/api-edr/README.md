@@ -123,8 +123,11 @@ each poll, sharing one object-cache byte budget across generations. Failed rebui
 keep the published catalog. A replacement becomes visible before the previous
 generation is retired. Retired queries can use retained objects and
 sampled windows; uncached reads or downloads crossing retirement return HTTP 503
-so clients can retry against the current catalog. Zero object-cache capacity
-disables retention. Plain generations do not provide transactional consistency
+so clients can retry against the current catalog. Concurrent reads of the same
+plain object within one generation share its download while preserving each
+waiter's deadline. Zero object-cache capacity disables retention, but existing
+waiters still share a completed download, as they do for oversized objects.
+Plain generations do not provide transactional consistency
 against external in-place writes; stable publication or Icechunk is needed for
 atomic updates across objects.
 Icechunk position, area, and radius queries share native decoded inner chunks
