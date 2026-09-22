@@ -16,6 +16,7 @@
 
 mod catalog;
 mod cf;
+mod decoded;
 #[cfg(feature = "icechunk")]
 mod icechunk;
 #[cfg(feature = "icechunk")]
@@ -55,6 +56,7 @@ pub struct ZarrEngine {
     collection_id: String,
     /// Refreshable source; each catalog retains its own read session.
     source: source::Source,
+    decoded_cache: Arc<decoded::DecodedCache>,
     /// Parsed snapshot (data + map-capabilities), swapped atomically by the
     /// poll loop. `raster_info()` reads the catalog's cached `RasterInfo`, so it
     /// is O(1) from a snapshot and always consistent with the served data
@@ -75,13 +77,26 @@ impl ZarrEngine {
         let store = source.snapshot(None)?.expect("initial snapshot");
 
         let param_filter = config.parameters.clone();
-        let catalog = catalog::build(store.clone(), collection_id, param_filter.as_deref())?;
+        let decoded_cache = Arc::new(decoded::DecodedCache::new(
+            config
+                .icechunk
+                .as_ref()
+                .map_or(0, |ic| ic.decoded_cache_mb)
+                .saturating_mul(ds_cache::MIB),
+        ));
+        let catalog = catalog::build(
+            store.clone(),
+            collection_id,
+            param_filter.as_deref(),
+            decoded_cache.clone(),
+        )?;
 
         log_loaded(collection_id, &catalog);
 
         Ok(Self {
             collection_id: collection_id.to_string(),
             source,
+            decoded_cache,
             catalog: ArcSwap::from_pointee(catalog),
             param_filter,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
@@ -112,6 +127,11 @@ impl ZarrEngine {
         &self.collection_id
     }
 
+    /// Native decoded chunk retention shared by the collection's snapshots.
+    pub fn decoded_cache_metrics(&self) -> ds_cache::CacheMetrics {
+        self.decoded_cache.metrics()
+    }
+
     fn poll_once(&self) {
         let published = self.catalog.load().revision.clone();
         let rebuilt = self
@@ -120,7 +140,12 @@ impl ZarrEngine {
             .and_then(|store| {
                 store
                     .map(|store| {
-                        catalog::build(store, &self.collection_id, self.param_filter.as_deref())
+                        catalog::build(
+                            store,
+                            &self.collection_id,
+                            self.param_filter.as_deref(),
+                            self.decoded_cache.clone(),
+                        )
                     })
                     .transpose()
             });

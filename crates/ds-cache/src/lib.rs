@@ -202,6 +202,34 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         Ok(value)
     }
 
+    /// Single-flight lookup with a bounded wait for another caller's fill.
+    /// The timeout applies to waiting, not to `with`; the caller must bound
+    /// its own I/O/compute. Failed fills release the guard for a later retry.
+    pub fn get_or_insert_with_timeout<Q, E>(
+        &self,
+        key: &Q,
+        timeout: std::time::Duration,
+        with: impl FnOnce() -> Result<V, E>,
+        timed_out: impl FnOnce() -> E,
+    ) -> Result<V, E>
+    where
+        Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
+    {
+        match self.cache.get_value_or_guard(key, Some(timeout)) {
+            quick_cache::sync::GuardResult::Value(value) => {
+                self.record_hit();
+                Ok(value)
+            }
+            quick_cache::sync::GuardResult::Guard(guard) => {
+                self.record_miss();
+                let value = with()?;
+                let _ = guard.insert(value.clone());
+                Ok(value)
+            }
+            quick_cache::sync::GuardResult::Timeout => Err(timed_out()),
+        }
+    }
+
     /// Count one hit (for wrappers using [`Self::get_untracked`]).
     pub fn record_hit(&self) {
         self.hits.fetch_add(1, Ordering::Relaxed);
@@ -322,6 +350,80 @@ mod tests {
             .unwrap();
         assert_eq!(ok, vec![42]);
         assert_eq!(cache.stats(), (0, 2), "both attempts were misses");
+    }
+
+    #[test]
+    fn timed_single_flight_wait_does_not_cancel_owner_or_block_other_keys() {
+        use std::{sync::mpsc, time::Duration};
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let owner = scope.spawn(move || {
+                cache.get_or_insert_with_timeout(
+                    &"key".to_string(),
+                    Duration::from_secs(2),
+                    || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok::<_, &str>(vec![42])
+                    },
+                    || "owner timeout",
+                )
+            });
+            started_rx.recv().unwrap();
+            let waiter = cache.get_or_insert_with_timeout(
+                &"key".to_string(),
+                Duration::from_millis(10),
+                || panic!("waiter must not start another fill"),
+                || "timeout",
+            );
+            let other = cache.get_or_insert_with_timeout(
+                &"other".to_string(),
+                Duration::ZERO,
+                || Ok::<_, &str>(vec![7]),
+                || "other timeout",
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(waiter, Err("timeout"));
+            assert_eq!(other, Ok(vec![7]));
+            assert_eq!(owner.join().unwrap(), Ok(vec![42]));
+            assert_eq!(
+                cache.get_or_insert_with_timeout(
+                    &"key".to_string(),
+                    Duration::ZERO,
+                    || panic!("owner populated the cache"),
+                    || "timeout"
+                ),
+                Ok(vec![42])
+            );
+        });
+    }
+
+    #[test]
+    fn timed_single_flight_failure_can_be_retried() {
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        let key = "key".to_string();
+        assert_eq!(
+            cache.get_or_insert_with_timeout(
+                &key,
+                std::time::Duration::ZERO,
+                || Err::<Vec<u8>, _>("failed"),
+                || "timeout"
+            ),
+            Err("failed")
+        );
+        assert_eq!(
+            cache.get_or_insert_with_timeout(
+                &key,
+                std::time::Duration::ZERO,
+                || Ok::<_, &str>(vec![42]),
+                || "timeout"
+            ),
+            Ok(vec![42])
+        );
+        assert_eq!(cache.stats(), (0, 2));
     }
 
     #[test]

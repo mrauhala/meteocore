@@ -19,8 +19,9 @@ NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5).
 ## The one load-bearing rule
 
 **`concurrent_target(1)` is correctness, not tuning.** `zarrs` parallelises
-multi-chunk retrieval with rayon by default and would call the storage layer
-from rayon workers — where `ds-storage`'s `block_in_place` bridge PANICS.
+multi-chunk retrieval with rayon by default. Those workers lose the calling
+thread's request deadline and explicit runtime context; plain `ds-storage`
+can fall back to constructing a runtime per call.
 `catalog::single_threaded_opts()` pins retrieval to the calling thread via
 `CodecOptions::with_concurrent_target(1)`. **Every `retrieve_*` call MUST go
 through it.**
@@ -52,8 +53,8 @@ through it.**
   `raster_info()` is a cached `ArcSwap<RasterInfo>` rebuilt on catalog swap
   (#211). Window sampling uses `cf::locate` (ascending/descending/irregular
   axes); the window read inherits `concurrent_target(1)`.
-- **Reads:** `retrieve_array_subset_opt::<Vec<T>>` requires the exact dtype,
-  so the read path branches on `data_type()` and widens every supported
+- **Reads:** retrieve native `ArrayBytes`, then convert using the exact dtype.
+  The read path branches on `data_type()` and widens every supported
   int/float to `f64`. Fill sentinels are compared against the RAW
   (pre-scale) value; NaN/±inf map to nodata.
 - **Forecast axes / instances (#337):** with a CF `forecast_reference_time`
@@ -66,7 +67,9 @@ through it.**
   render path and both cache-key resolvers (`resolve_time`,
   `resolve_reference_time`) share that selection (#507/#521).
 - **Bad-chunking WARN:** `time=1, lat=full, lon=full` chunking is
-  pathological for point queries; logged at startup, still served.
+  pathological for point queries; use effective inner shapes for sharded
+  arrays. Startup also logs outer/inner shapes, native bytes, and time steps
+  per chunk to expose temporal decode amplification in map reads.
 
 ## APIs
 
@@ -110,6 +113,18 @@ errors clearly if the table is set without the feature.
 - Icechunk owns its own object storage (does not go through ds-storage).
   `cache_mb` configures its compressed payload cache (0 disables retention).
   Repository clients and immutable payload caches survive snapshot changes.
+- `src/decoded.rs` caches native inner chunks with `ds-cache`, keyed by
+  snapshot ID, array path, and chunk coordinates. The engine owns one budget
+  shared across all catalogs; old readers keep their snapshot identity.
+  `icechunk.decoded_cache_mb` defaults to 256 MiB, separate from `cache_mb`;
+  zero disables it. Plain mutable stores and shards with outer transforms
+  bypass it. Cache fills expand to at most 64 MiB native chunks, and only if
+  they fit the configured budget. This limits cache-fill expansion, not all
+  codec/source memory. Each read retains one chunk at a time while stitching
+  its subset. Failed fills release single-flight guards; waits observe the
+  request deadline (30 seconds without one). CF conversion stays in catalog.
+  Expose hit/fill counters and resident/capacity bytes through
+  `decoded_cache_metrics()` and per-collection `zarr_decoded_cache_*` metrics.
 - Poll resolves the selected version and rebuilds only when its snapshot ID
   changes. Publish session + catalog atomically; failed builds leave the
   previous revision active and retry the next poll. Explicit snapshots stay

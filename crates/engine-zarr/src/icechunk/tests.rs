@@ -103,6 +103,7 @@ fn config(dir: &std::path::Path) -> ZarrConfig {
     let mut config = ZarrConfig::auto_local(dir.to_string_lossy().into_owned());
     config.cache_mb = 4;
     config.icechunk = Some(IcechunkConfig {
+        decoded_cache_mb: 0,
         branch: Some("main".into()),
         tag: None,
         snapshot: None,
@@ -255,9 +256,10 @@ async fn concurrent_maps_read_icechunk_through_render_executor() {
     // with more requests than render slots and both cold and warm payloads.
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path()).await;
-    for cache_mb in [0, 4] {
+    for (cache_mb, decoded_mb) in [(0, 0), (4, 0), (0, 4)] {
         let mut config = config(dir.path());
         config.cache_mb = cache_mb;
+        config.icechunk.as_mut().unwrap().decoded_cache_mb = decoded_mb;
         let engine = Arc::new(ZarrEngine::new("render-executor", &config).unwrap());
         let slots = Arc::new(tokio::sync::Semaphore::new(4));
         for _ in 0..3 {
@@ -288,7 +290,56 @@ async fn concurrent_maps_read_icechunk_through_render_executor() {
             }
             assert_eq!(slots.available_permits(), 4);
         }
+        if decoded_mb > 0 {
+            let metrics = engine.decoded_cache_metrics();
+            assert_eq!(
+                metrics.misses, 6,
+                "one fill per inner chunk across all requests"
+            );
+            assert!(metrics.hits > 0);
+            assert!(metrics.bytes <= metrics.capacity_bytes);
+        }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decoded_inner_chunks_reuse_other_leads_and_preserve_deadlines_without_payload_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path()).await;
+    let mut config = config(dir.path());
+    config.cache_mb = 0;
+    config.icechunk.as_mut().unwrap().decoded_cache_mb = 4;
+    let engine = ZarrEngine::new("decoded", &config).unwrap();
+    render(&engine).unwrap();
+    let metrics = engine.decoded_cache_metrics();
+    assert_eq!(metrics.misses, 6);
+    assert!(
+        metrics.bytes < 4096,
+        "retain the small native chunks, not expanded f64 windows"
+    );
+    std::fs::remove_dir_all(dir.path().join("chunks")).unwrap();
+    let tile = engine
+        .get_raster_tile(
+            [49.2, 59.2, 51.2, 59.8],
+            8,
+            8,
+            Some(engine.get_available_times().unwrap()[1]),
+            &OutputCrs::Wgs84,
+            Some("temp"),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(tile.values.iter_values().all(|v| v == Some(10.0)));
+    assert!(engine
+        .query_position("POINT(50 59.5)", None, Some(&["temp".into()]), None, None)
+        .is_ok());
+    assert_eq!(engine.decoded_cache_metrics().misses, 6);
+    let _deadline = ds_core::deadline::enter(Some(std::time::Instant::now()));
+    assert!(matches!(
+        render(&engine),
+        Err(DataServerError::DeadlineExceeded)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -371,8 +422,11 @@ async fn irregular_grid_map_matches_position_sample() {
 async fn polling_swaps_snapshots_preserves_old_readers_and_versions_render_content() {
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture(dir.path()).await;
-    let config = config(dir.path());
+    let mut config = config(dir.path());
+    config.cache_mb = 0;
+    config.icechunk.as_mut().unwrap().decoded_cache_mb = 4;
     let engine = ZarrEngine::new("refresh", &config).unwrap();
+    render(&engine).unwrap();
     let old = engine.catalog.load_full();
     let version = engine.content_version();
     assert_ne!(version, 0);
@@ -495,6 +549,7 @@ async fn map_cache_latency_probe() {
         poll_interval_secs: 300,
         cache_mb: 0,
         icechunk: Some(IcechunkConfig {
+            decoded_cache_mb: 0,
             branch: Some("main".into()),
             tag: None,
             snapshot: None,
@@ -503,14 +558,18 @@ async fn map_cache_latency_probe() {
         }),
     };
     let mut baseline = Vec::new();
-    for cache_mb in [0, 256] {
+    for (cache_mb, decoded_mb) in [(0, 0), (256, 0), (256, 256)] {
         config.cache_mb = cache_mb;
+        config.icechunk.as_mut().unwrap().decoded_cache_mb = decoded_mb;
         let engine = ZarrEngine::new("cache-probe", &config).unwrap();
         let cat = engine.catalog.load_full();
         let ic = config.icechunk.as_mut().unwrap();
         ic.branch = None;
         ic.snapshot = cat.revision.clone();
-        eprintln!("snapshot={:?} cache_mb={cache_mb}", cat.revision);
+        eprintln!(
+            "snapshot={:?} cache_mb={cache_mb} decoded_mb={decoded_mb}",
+            cat.revision
+        );
         let times = engine.get_available_times().unwrap();
         for (i, (name, bbox, time)) in [
             ("cold", [20., 55., 30., 65.], times[0]),
@@ -537,7 +596,11 @@ async fn map_cache_latency_probe() {
             let elapsed = start.elapsed();
             let values: Vec<_> = tile.values.iter_values().collect();
             assert!(values.iter().any(Option::is_some));
-            eprintln!("cache_mb={cache_mb} {name}: {} ms", elapsed.as_millis());
+            eprintln!(
+                "cache_mb={cache_mb} decoded_mb={decoded_mb} {name}: {} ms {:?}",
+                elapsed.as_millis(),
+                engine.decoded_cache_metrics()
+            );
             if cache_mb == 0 {
                 baseline.push(values);
             } else {

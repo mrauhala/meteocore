@@ -833,66 +833,74 @@ static METATILE_DECLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
-// Compressed GRIB messages are shared by all level views of a source.
-static GRIB_MESSAGE_CACHE_COUNTERS: LazyLock<[IntCounterVec; 2]> = LazyLock::new(|| {
-    ["hits", "misses"].map(|suffix| {
-        let counter = IntCounterVec::new(
-            Opts::new(
-                format!("grib_message_cache_{suffix}_total"),
-                format!("GRIB compressed-message cache {suffix}"),
-            ),
-            &["collection"],
-        )
-        .unwrap();
-        REGISTRY.register(Box::new(counter.clone())).unwrap();
-        counter
-    })
-});
+/// Standard cache metrics labelled by collection; callers hold the scrape-state lock.
+struct CollectionCacheMetricSet {
+    counters: [IntCounterVec; 2],
+    gauges: [IntGaugeVec; 2],
+}
 
-static GRIB_MESSAGE_CACHE_GAUGES: LazyLock<[IntGaugeVec; 2]> = LazyLock::new(|| {
-    [
-        ("bytes", "Bytes held in the GRIB compressed-message cache"),
-        (
-            "capacity_bytes",
-            "Configured GRIB compressed-message cache capacity in bytes",
-        ),
-    ]
-    .map(|(suffix, help)| {
-        let gauge = IntGaugeVec::new(
-            Opts::new(format!("grib_message_cache_{suffix}"), help),
-            &["collection"],
-        )
-        .unwrap();
-        REGISTRY.register(Box::new(gauge.clone())).unwrap();
-        gauge
-    })
-});
+impl CollectionCacheMetricSet {
+    fn new(prefix: &str, display: &str) -> Self {
+        let counters = ["hits", "misses"].map(|suffix| {
+            let counter = IntCounterVec::new(
+                Opts::new(
+                    format!("{prefix}_{suffix}_total"),
+                    format!("{display} {suffix}"),
+                ),
+                &["collection"],
+            )
+            .unwrap();
+            REGISTRY.register(Box::new(counter.clone())).unwrap();
+            counter
+        });
+        let gauges = [
+            ("bytes", "Resident bytes"),
+            ("capacity_bytes", "Configured capacity in bytes"),
+        ]
+        .map(|(suffix, help)| {
+            let gauge = IntGaugeVec::new(
+                Opts::new(format!("{prefix}_{suffix}"), format!("{display}: {help}")),
+                &["collection"],
+            )
+            .unwrap();
+            REGISTRY.register(Box::new(gauge.clone())).unwrap();
+            gauge
+        });
+        Self { counters, gauges }
+    }
 
-fn update_grib_message_cache_metrics(
-    collection: &str,
-    metrics: ds_cache::CacheMetrics,
-    previous: &mut (u64, u64),
-) {
-    let current = (metrics.hits, metrics.misses);
-    // Match the per-source grid cache's reload rebaselining policy.
-    if current.0 >= previous.0 && current.1 >= previous.1 {
-        for (counter, delta) in GRIB_MESSAGE_CACHE_COUNTERS
+    fn update(&self, collection: &str, metrics: ds_cache::CacheMetrics, previous: &mut (u64, u64)) {
+        let current = (metrics.hits, metrics.misses);
+        // Match the per-source grid cache's reload rebaselining policy.
+        if current.0 >= previous.0 && current.1 >= previous.1 {
+            for (counter, delta) in self
+                .counters
+                .iter()
+                .zip([current.0 - previous.0, current.1 - previous.1])
+            {
+                counter.with_label_values(&[collection]).inc_by(delta);
+            }
+        }
+        *previous = current;
+        for (gauge, value) in self
+            .gauges
             .iter()
-            .zip([current.0 - previous.0, current.1 - previous.1])
+            .zip([metrics.bytes, metrics.capacity_bytes])
         {
-            counter.with_label_values(&[collection]).inc_by(delta);
+            gauge
+                .with_label_values(&[collection])
+                .set(value.min(i64::MAX as u64) as i64);
         }
     }
-    *previous = current;
-    for (gauge, value) in GRIB_MESSAGE_CACHE_GAUGES
-        .iter()
-        .zip([metrics.bytes, metrics.capacity_bytes])
-    {
-        gauge
-            .with_label_values(&[collection])
-            .set(value.min(i64::MAX as u64) as i64);
-    }
 }
+
+// Compressed GRIB messages are shared by all level views of a source.
+static GRIB_MESSAGE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
+    CollectionCacheMetricSet::new("grib_message_cache", "GRIB compressed-message cache")
+});
+static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
+    CollectionCacheMetricSet::new("zarr_decoded_cache", "Zarr decoded chunk cache")
+});
 
 // GRIB grid cache (per-collection).
 static GRID_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -971,6 +979,7 @@ struct CacheCounterState {
     tile: HashMap<String, (u64, u64)>,
     grid: HashMap<String, (u64, u64)>,
     grib_message: HashMap<String, (u64, u64)>,
+    zarr_decoded: HashMap<String, (u64, u64)>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -5069,11 +5078,25 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
+    if let Ok(engines) = state.zarr_engines.read() {
+        for engine in engines.iter() {
+            let collection = engine.collection_id();
+            ZARR_DECODED_CACHE_METRICS.update(
+                collection,
+                engine.decoded_cache_metrics(),
+                counter_state
+                    .zarr_decoded
+                    .entry(collection.to_owned())
+                    .or_default(),
+            );
+        }
+    }
+
     // GRIB grid cache: per-source (all its level collections share it).
     if let Ok(engines) = state.grib_engines.read() {
         for engine in engines.iter() {
             let collection = engine.collection_id();
-            update_grib_message_cache_metrics(
+            GRIB_MESSAGE_CACHE_METRICS.update(
                 collection,
                 engine.message_cache_metrics(),
                 counter_state
@@ -5710,37 +5733,44 @@ mod tests {
     }
 
     #[test]
-    fn grib_message_cache_metrics_track_deltas_and_rebaseline_on_reload() {
-        let collection = "grib-message-metrics-test";
-        let mut previous = (0, 0);
-        for (hits, misses, bytes, capacity_bytes, expected) in [
-            (3, 5, 100, 1024, [3, 5]),
-            (3, 5, 100, 1024, [3, 5]), // repeated scrape
-            (5, 6, 200, 1024, [5, 6]),
-            (0, 0, 0, 0, [5, 6]), // reload disables the cache
-            (2, 4, 50, 2048, [7, 10]),
+    fn collection_cache_metrics_track_deltas_and_rebaseline_on_reload() {
+        for (metrics, collection) in [
+            (
+                &*super::GRIB_MESSAGE_CACHE_METRICS,
+                "grib-message-metrics-test",
+            ),
+            (
+                &*super::ZARR_DECODED_CACHE_METRICS,
+                "zarr-decoded-metrics-test",
+            ),
         ] {
-            super::update_grib_message_cache_metrics(
-                collection,
-                ds_cache::CacheMetrics {
-                    hits,
-                    misses,
-                    bytes,
-                    capacity_bytes,
-                },
-                &mut previous,
-            );
-            for (counter, expected) in super::GRIB_MESSAGE_CACHE_COUNTERS.iter().zip(expected) {
-                assert_eq!(counter.with_label_values(&[collection]).get(), expected);
-            }
-            for (gauge, expected) in super::GRIB_MESSAGE_CACHE_GAUGES
-                .iter()
-                .zip([bytes, capacity_bytes])
-            {
-                assert_eq!(
-                    gauge.with_label_values(&[collection]).get(),
-                    expected as i64
+            let mut previous = (0, 0);
+            for (hits, misses, bytes, capacity_bytes, expected) in [
+                (3, 5, 100, 1024, [3, 5]),
+                (3, 5, 100, 1024, [3, 5]), // repeated scrape
+                (5, 6, 200, 1024, [5, 6]),
+                (0, 0, 0, 0, [5, 6]), // reload disables the cache
+                (2, 4, 50, 2048, [7, 10]),
+            ] {
+                metrics.update(
+                    collection,
+                    ds_cache::CacheMetrics {
+                        hits,
+                        misses,
+                        bytes,
+                        capacity_bytes,
+                    },
+                    &mut previous,
                 );
+                for (counter, expected) in metrics.counters.iter().zip(expected) {
+                    assert_eq!(counter.with_label_values(&[collection]).get(), expected);
+                }
+                for (gauge, expected) in metrics.gauges.iter().zip([bytes, capacity_bytes]) {
+                    assert_eq!(
+                        gauge.with_label_values(&[collection]).get(),
+                        expected as i64
+                    );
+                }
             }
         }
     }

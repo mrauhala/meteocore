@@ -267,6 +267,7 @@ async fn probe_models() {
             poll_interval_secs: 300,
             cache_mb: 128,
             icechunk: Some(IcechunkConfig {
+                decoded_cache_mb: 0,
                 branch: Some("main".into()),
                 tag: None,
                 snapshot: None,
@@ -324,6 +325,7 @@ async fn reads_local_icechunk_repo() {
         poll_interval_secs: 300,
         cache_mb: 64,
         icechunk: Some(IcechunkConfig {
+            decoded_cache_mb: 0,
             branch: Some("main".into()),
             tag: None,
             snapshot: None,
