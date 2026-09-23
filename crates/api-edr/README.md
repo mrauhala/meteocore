@@ -146,6 +146,9 @@ reads add a two-copy allowance before collection and retain it through native
 retrieval, including compressed-cache hits and coalesced waiters. Native decoded
 cache hits do not need encoded admission. Numeric-variable gzip/zstd outputs
 are capped by the declared codec representation, including sharded layouts;
+if bounded-codec setup fails for one variable, catalog discovery warns and
+omits that variable while retaining usable ones. Catalog construction still
+fails if no usable variables remain. During reads,
 bounded intermediate outputs acquire additional capacity allowances through
 retrieval. Invalid frame lengths remain engine errors, while admission failures
 and expired deadlines preserve their typed errors. Other codecs, codec-private

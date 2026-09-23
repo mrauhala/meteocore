@@ -82,7 +82,9 @@ pool: they do not use the Icechunk runtime bridge.
   axes resolve to `Other`, not degrees), validates lat/lon monotonic,
   exposes remaining geographic data variables as parameters. **A time axis
   is required** (PointSeries needs `t`). Unsupported-dtype variables are
-  skipped at build with a WARN.
+  skipped at build with a WARN. Bounded-codec setup failures likewise warn and
+  skip only the affected variable; never expose it with unbounded decoders as
+  a fallback. A catalog with no usable geographic variables still fails.
 - **Rendering (Phase 3):** `get_raster_tile` reads a 2-D spatial window
   covering the bbox (`Catalog::read_window`, +1 cell margin), then samples
   per output pixel — per-pixel only for cheap `Wgs84`/`WebMercator`
