@@ -151,7 +151,8 @@ pub fn format_iso8601_duration(seconds: i64) -> Option<String> {
 /// OGC API Common Part 2 `extent.temporal.grid` descriptor.
 ///
 /// Serialises (via `serde`, the only serialization dependency ds-core carries)
-/// to `{ "cellsCount": N, "resolution": "<ISO 8601>" }` for a regular series or
+/// to `{ "cellsCount": N, "resolution": "<ISO 8601>", "firstCoordinate": "<rfc3339>" }`
+/// for a regular series or
 /// `{ "cellsCount": N, "coordinates": [<rfc3339>, …] }` for an irregular one.
 /// Defined here — not in the API crates — so the Maps and Tiles
 /// `extent.temporal.grid` builders share one definition and the JSON shape
@@ -164,6 +165,8 @@ pub enum TemporalGrid {
         #[serde(rename = "cellsCount")]
         cells_count: usize,
         resolution: String,
+        #[serde(rename = "firstCoordinate")]
+        first_coordinate: String,
     },
     Irregular {
         #[serde(rename = "cellsCount")]
@@ -185,6 +188,7 @@ pub fn temporal_grid(times: &[DateTime<Utc>]) -> Option<TemporalGrid> {
         return Some(TemporalGrid::Regular {
             cells_count,
             resolution,
+            first_coordinate: times[0].to_rfc3339(),
         });
     }
     let coordinates = times.iter().map(|t| t.to_rfc3339()).collect();
@@ -392,7 +396,8 @@ mod tests {
             temporal_grid(&regular),
             Some(TemporalGrid::Regular {
                 cells_count: 2,
-                resolution: "PT5M".to_string()
+                resolution: "PT5M".to_string(),
+                first_coordinate: "2024-01-01T00:00:00+00:00".to_string(),
             })
         );
         let irregular = [

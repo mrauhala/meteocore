@@ -47,6 +47,11 @@ pub struct GridAxis {
     #[serde(rename = "cellsCount")]
     pub cells_count: u32,
     pub resolution: f64,
+    /// Required by the Common regular-grid schema, which permits null. Bounds
+    /// and cell counts do not establish sample registration (center vs edge)
+    /// or axis direction, so keep the first sample unknown until engines expose it.
+    #[serde(rename = "firstCoordinate")]
+    pub first_coordinate: Option<f64>,
 }
 
 /// `extent.temporal`: one `[start, end]` RFC 3339 interval plus the shared
@@ -110,10 +115,12 @@ pub fn build_extent(
                         GridAxis {
                             cells_count: nx,
                             resolution: lon_span / nx as f64,
+                            first_coordinate: None,
                         },
                         GridAxis {
                             cells_count: ny,
                             resolution: lat_span / ny as f64,
+                            first_coordinate: None,
                         },
                     ]);
                 }

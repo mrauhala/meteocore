@@ -4674,6 +4674,7 @@ dependencies = [
  "engine-zarr",
  "http-body",
  "http-body-util",
+ "jsonschema",
  "notify",
  "prometheus",
  "quick-xml",
