@@ -1580,6 +1580,7 @@ name = "engine-zarr"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "bytes",
  "chrono",
  "ds-cache",
@@ -1587,6 +1588,7 @@ dependencies = [
  "ds-executor",
  "ds-poll",
  "ds-storage",
+ "flate2",
  "futures",
  "icechunk",
  "rayon",
@@ -1598,6 +1600,7 @@ dependencies = [
  "tracing",
  "zarrs",
  "zarrs_icechunk",
+ "zstd",
 ]
 
 [[package]]

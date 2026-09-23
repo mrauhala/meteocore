@@ -16,6 +16,7 @@
 
 mod catalog;
 mod cf;
+mod codec_limits;
 mod decoded;
 mod encoded;
 #[cfg(feature = "icechunk")]

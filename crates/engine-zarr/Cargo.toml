@@ -10,6 +10,9 @@ ds-storage = { path = "../storage" }
 # Compressed chunk-bytes LRU cache for the remote byte-range reader.
 ds-cache = { path = "../ds-cache" }
 bytes = "1"
+flate2 = "1"
+zstd = { version = "0.13", default-features = false, features = ["experimental"] }
+async-trait = { version = "0.1", optional = true }
 rayon = "1"
 futures = { version = "0.3", optional = true }
 # Zarr V2/V3 format + codec pipeline (blosc/zstd/gzip/crc32c/sharding/transpose).
@@ -51,7 +54,7 @@ zarrs_icechunk = { version = "0.5.1", optional = true, default-features = false,
 ] }
 
 [features]
-icechunk = ["dep:icechunk", "dep:zarrs_icechunk", "dep:futures", "zarrs/async"]
+icechunk = ["dep:icechunk", "dep:zarrs_icechunk", "dep:futures", "dep:async-trait", "zarrs/async"]
 
 [dev-dependencies]
 ds-executor = { path = "../ds-executor" }

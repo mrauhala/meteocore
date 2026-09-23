@@ -518,6 +518,22 @@ pub fn build(
     param_filter: Option<&[String]>,
     decoded_cache: Arc<DecodedCache>,
 ) -> Result<Catalog, DataServerError> {
+    build_with_codec_setup(
+        store,
+        collection_id,
+        param_filter,
+        decoded_cache,
+        crate::codec_limits::bounded_array,
+    )
+}
+
+fn build_with_codec_setup(
+    store: Arc<Store>,
+    collection_id: &str,
+    param_filter: Option<&[String]>,
+    decoded_cache: Arc<DecodedCache>,
+    configure_codecs: impl Fn(Array<Store>) -> Result<Array<Store>, DataServerError>,
+) -> Result<Catalog, DataServerError> {
     let revision = store.revision.clone();
     let content_version = revision.as_ref().map_or_else(
         || {
@@ -809,6 +825,16 @@ pub fn build(
             );
             continue;
         }
+
+        let array = match configure_codecs(array) {
+            Ok(array) => array,
+            Err(error) => {
+                tracing::warn!(
+                    "collection '{collection_id}': variable '{name}' codec setup failed: {error}; skipping"
+                );
+                continue;
+            }
+        };
 
         let shape = array.shape();
         if shape[lat_axis] as usize != lats.len() || shape[lon_axis] as usize != lons.len() {
@@ -1180,12 +1206,13 @@ pub(crate) fn chunk_read_error(error: ArrayError) -> DataServerError {
         | ArrayError::CodecError(CodecError::IOError(io)) => Some(io),
         _ => None,
     };
-    if matches!(
-        io.and_then(|io| io.get_ref())
-            .and_then(|error| error.downcast_ref::<DataServerError>()),
-        Some(DataServerError::ResourceExhausted)
-    ) {
-        return DataServerError::ResourceExhausted;
+    match io
+        .and_then(|io| io.get_ref())
+        .and_then(|error| error.downcast_ref::<DataServerError>())
+    {
+        Some(DataServerError::ResourceExhausted) => return DataServerError::ResourceExhausted,
+        Some(DataServerError::DeadlineExceeded) => return DataServerError::DeadlineExceeded,
+        _ => {}
     }
     DataServerError::Engine(format!("Zarr chunk read failed: {error}"))
 }
@@ -1253,6 +1280,50 @@ fn retrieve_raw_f64(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_setup_failure_skips_only_the_affected_variable() {
+        let config = ds_core::config::ZarrConfig::auto_local(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zarr-era5-t2m").into(),
+        );
+        // Inject at codec setup: malformed metadata would fail earlier during
+        // child-array discovery and would not exercise this failure boundary.
+        for reject_all in [false, true] {
+            let result = build_with_codec_setup(
+                Arc::new(EngineStore::plain(
+                    crate::build_store("codec-setup-test", &config).unwrap(),
+                )),
+                "codec-setup-test",
+                None,
+                Arc::new(DecodedCache::new(0)),
+                |array| {
+                    if reject_all || array.path().as_str() == "/t2m" {
+                        Err(DataServerError::Engine(
+                            "unsupported shard configuration".into(),
+                        ))
+                    } else {
+                        crate::codec_limits::bounded_array(array)
+                    }
+                },
+            );
+            if reject_all {
+                assert!(matches!(result, Err(DataServerError::Engine(message))
+                    if message == "Zarr store has no usable geographic data variables"));
+            } else {
+                let catalog = result.unwrap();
+                assert_eq!(catalog.vars.len(), 1);
+                assert_eq!(catalog.vars[0].name, "t2m_packed");
+                assert_eq!(catalog.raster_info.parameters.len(), 1);
+                assert_eq!(catalog.raster_info.parameter, "t2m_packed");
+                let window = catalog
+                    .read_window(&catalog.vars[0], None, 0, catalog.extent)
+                    .unwrap()
+                    .unwrap();
+                let expected = 273.15 + 0.1 * 54.5 + 0.01 * 5.5;
+                assert!((window.sample(5.5, 54.5).unwrap() - expected).abs() < 0.01);
+            }
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retirement_remains_retryable_through_full_and_partial_shard_reads() {
@@ -1358,7 +1429,15 @@ mod tests {
             )),
             dir.path(),
         );
-        std::fs::write(dir.path().join("t2m/c/0/0/0"), b"invalid gzip").unwrap();
+        let payload_path = dir.path().join("t2m/c/0/0/0");
+        let valid_payload = std::fs::read(&payload_path).unwrap();
+        use std::io::Write;
+        let mut bomb = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        bomb.write_all(&vec![42; 2 * ds_cache::MIB as usize])
+            .unwrap();
+        let bomb = bomb.finish().unwrap();
+        assert!(bomb.len() < 16 * 1024);
+        std::fs::write(&payload_path, b"invalid gzip").unwrap();
         let config = ds_core::config::ZarrConfig::auto_local(dir.path().to_string_lossy().into());
         let engine = crate::ZarrEngine::new("budget-test", &config).unwrap();
         let render = || {
@@ -1373,18 +1452,26 @@ mod tests {
                 None,
             )
         };
-        for (capacity, oversized_payload, exhausted) in [
-            (0, false, true),
-            (ds_cache::MIB, false, false),
-            (ds_cache::MIB, true, true),
+        for (capacity, payload, exhausted) in [
+            (0, "corrupt", true),
+            (ds_cache::MIB, "corrupt", false),
+            (ds_cache::MIB, "oversized", true),
+            (ds_cache::MIB, "bomb", false),
+            (ds_cache::MIB, "valid", false),
         ] {
-            if oversized_payload {
+            if payload == "oversized" {
                 // The native window fits, but this encoded object does not.
                 // Reject from its metadata before reading/decoding the corrupt body.
-                std::fs::File::create(dir.path().join("t2m/c/0/0/0"))
+                std::fs::File::create(&payload_path)
                     .unwrap()
                     .set_len(2 * ds_cache::MIB)
                     .unwrap();
+            } else if payload == "bomb" {
+                // The encoded object fits, but the decoded body exceeds the
+                // declared native chunk. Fail before allocating that body.
+                std::fs::write(&payload_path, &bomb).unwrap();
+            } else if payload == "valid" {
+                std::fs::write(&payload_path, &valid_payload).unwrap();
             }
             let budget = Arc::new(Budget::new(capacity));
             let mut catalog = build(
@@ -1398,6 +1485,14 @@ mod tests {
             .unwrap();
             catalog.read_budget = budget.clone();
             engine.catalog.store(Arc::new(catalog));
+            if payload == "valid" {
+                assert!(
+                    render().is_ok(),
+                    "a fresh catalog can retry after corruption"
+                );
+                assert_eq!(budget.metrics().0, 0);
+                continue;
+            }
             let error = render().err().expect("render must fail");
             if exhausted {
                 assert!(
