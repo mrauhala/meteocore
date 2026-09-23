@@ -1,5 +1,5 @@
 use super::*;
-use ds_storage::object_store::{http::HttpBuilder, local::LocalFileSystem, ClientOptions};
+use ds_storage::object_store::local::LocalFileSystem;
 
 fn local(path: &std::path::Path, cache_mb: u64) -> DsStore {
     DsStore::new(
@@ -72,53 +72,16 @@ async fn refresh_shares_the_byte_budget_and_zero_disables_retention() {
 
 #[test]
 fn a_fetch_racing_retirement_is_discarded() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let backend = HttpBuilder::new()
-        .with_url(format!("http://{}", listener.local_addr().unwrap()))
-        .with_client_options(ClientOptions::new().with_allow_http(true))
-        .build()
-        .unwrap();
-    let store = DsStore::new(DataStore::new(Arc::new(backend)), "", 1);
-    let (started, ready) = mpsc::channel();
-    let (release, resume) = mpsc::channel();
+    let server = super::test_server::HttpStore::new(1);
+    let store = &server.store;
     std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let end = Instant::now() + Duration::from_secs(10);
-            let mut socket = loop {
-                match listener.accept() {
-                    Ok((socket, _)) => break socket,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < end, "client did not connect");
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(error) => panic!("{error}"),
-                }
-            };
-            socket.set_nonblocking(false).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                socket.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            started.send(()).unwrap();
-            resume.recv_timeout(Duration::from_secs(10)).unwrap();
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnew")
-                .unwrap();
+        let worker = scope.spawn(|| {
+            let _deadline = ds_core::deadline::enter(Some(Instant::now() + Duration::from_secs(5)));
+            store.get(&StoreKey::new("chunk").unwrap())
         });
-        let worker = scope.spawn(|| store.get(&StoreKey::new("chunk").unwrap()));
-        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let request = server.next("/chunk");
         store.generation.retire();
-        release.send(()).unwrap();
+        request.reply(200, b"new");
         let error = worker.join().unwrap().unwrap_err();
         let StorageError::IOError(io) = error else {
             panic!("retirement must preserve a typed IO payload: {error}");

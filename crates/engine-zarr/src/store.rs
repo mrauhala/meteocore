@@ -18,12 +18,15 @@
 //!   and serves byte ranges by slicing retained buffers. Repeated reads within
 //!   one catalog reuse bytes while they remain in the cache.
 //!   (Sharded objects are read whole — a documented Phase-2 trade-off.)
+//!   Concurrent reads of one generation/key share a fill, even when the result
+//!   is too large to retain or the cache is disabled. Waits observe each caller's
+//!   deadline and yield Tokio runtime workers so storage I/O can progress.
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ds_cache::ByteBoundedCache;
@@ -37,7 +40,7 @@ use zarrs::storage::{
     StoreKey, StoreKeys, StoreKeysPrefixes, StorePrefix,
 };
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct Key {
     generation: u64,
     path: String,
@@ -156,21 +159,58 @@ impl DsStore {
             generation: self.generation.version,
             path: key.as_str().to_owned(),
         };
-        if let Some(bytes) = self.shared.cache.get(&k) {
+        if let Some(bytes) = self.shared.cache.get_untracked(&k) {
+            self.shared.cache.record_hit();
             return Ok(bytes);
         }
-        // Never refill a retired catalog from the current mutable backend.
-        // Check again after I/O to cover a fetch racing retirement.
+        // Fail retired misses before waiting for an in-flight download. Cached
+        // old bytes above remain usable, including cached missing objects.
         self.generation.check_active()?;
-        let bytes = self
-            .shared
-            .store
-            .get_opt(&self.object_path(key.as_str()))
-            .map_err(io_err)?;
+        let end = ds_core::deadline::current();
+        let wait = end.map_or(Duration::from_secs(30), |end| {
+            end.saturating_duration_since(Instant::now())
+        });
+        let fill = || {
+            self.shared.cache.get_or_insert_with_timeout(
+                &k,
+                wait,
+                || {
+                    // A failed owner can hand the fill to a waiter. Recheck that
+                    // caller's deadline and generation before starting fresh I/O.
+                    ds_core::deadline::check().map_err(io_err)?;
+                    self.generation.check_active()?;
+                    let bytes = self
+                        .shared
+                        .store
+                        .get_opt(&self.object_path(key.as_str()))
+                        .map_err(io_err)?;
+                    ds_core::deadline::check().map_err(io_err)?;
+                    self.generation.check_active()?;
+                    Ok(bytes)
+                },
+                || {
+                    io_err(if end.is_some() {
+                        ds_core::error::DataServerError::DeadlineExceeded
+                    } else {
+                        ds_core::error::DataServerError::Storage(
+                            "timed out waiting for a Zarr object download".into(),
+                        )
+                    })
+                },
+            )
+        };
+        // EDR async workers must yield while waiting so the owner's I/O can
+        // progress. RenderJob uses spawn_blocking: block_in_place runs directly
+        // there, preserving its runtime handle for ds-storage. Handle presence
+        // does not identify the worker kind; block_in_place handles both.
+        let result = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(fill)
+        } else {
+            fill()
+        };
+        // Successful fills can wake waiters whose deadlines have just expired.
         ds_core::deadline::check().map_err(io_err)?;
-        self.generation.check_active()?;
-        self.shared.cache.insert(k, bytes.clone());
-        Ok(bytes)
+        result
     }
 }
 
@@ -432,3 +472,9 @@ mod tests {
 
 #[cfg(test)]
 mod refresh_tests;
+
+#[cfg(test)]
+mod coalescing_tests;
+
+#[cfg(test)]
+mod test_server;

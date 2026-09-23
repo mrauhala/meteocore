@@ -159,6 +159,46 @@ fn render(engine: &ZarrEngine, longitude: f64) -> Vec<Option<f64>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_maps_read_plain_zarr_through_render_executor() {
+    let dir = tempfile::tempdir().unwrap();
+    write_store(dir.path(), &[0.], 10., 1.);
+    for cache_mb in [0, 1] {
+        let engine = Arc::new(engine(dir.path(), cache_mb));
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        // More callers than slots, with repeated waves covering cold and warm
+        // payloads. This reaches real async file reads and gzip decoding via
+        // MapEngine::get_raster_tile on RenderJob's blocking pool.
+        for _ in 0..3 {
+            let start = Arc::new(tokio::sync::Barrier::new(8));
+            let mut requests = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let (engine, slots, start) = (engine.clone(), slots.clone(), start.clone());
+                requests.spawn(async move {
+                    start.wait().await;
+                    let (job, memory) = ds_executor::RenderJob::acquire_raster(slots, 2, 2)
+                        .await
+                        .unwrap();
+                    let worker_memory = memory.clone();
+                    let values = job
+                        .run(move || {
+                            let _memory = worker_memory;
+                            assert!(ds_core::deadline::current().is_some());
+                            render(&engine, 10.)
+                        })
+                        .await
+                        .expect("plain-Zarr render worker must complete without a panic");
+                    assert_eq!(values, vec![Some(1.); 4]);
+                });
+            }
+            while let Some(result) = requests.join_next().await {
+                result.unwrap();
+            }
+            assert_eq!(slots.available_permits(), 4);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn polling_refreshes_metadata_coordinates_and_payloads() {
     for cache_mb in [0, 1] {
         let dir = tempfile::tempdir().unwrap();

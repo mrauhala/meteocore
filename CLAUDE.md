@@ -100,6 +100,12 @@ Violating these has caused production incidents. Never break them.
    - Never from a request-handler task — it parks a request worker.
    - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
      `get_range_on`). Do not rely on an ambient runtime handle.
+     The plain-Zarr adapter is a tested exception: the same synchronous
+     `get_opt`/cache-fill path serves EDR async workers and `RenderJob` blocking
+     workers. Its `block_in_place` bridge releases an async worker and runs
+     directly on a blocking worker, retaining that worker's runtime handle.
+     Keep both async-worker progress and actual render-executor regressions
+     in `crates/engine-zarr/src/store/coalescing_tests.rs` and `refresh_tests.rs`.
    - Never from a non-Tokio thread such as a rayon pool — that hits a
      construct-a-new-`Runtime`-per-call fallback (#222). For parallel remote
      fetches, use async concurrency (`join_all`) on the runtime, or pass a
@@ -322,9 +328,10 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   the pool starves and every collection's p99 spikes — multi-second, even at
   low load (#221, #208). That is why poll loops run on `poll_runtime()`.
   A blocking scan may additionally use `tokio::task::spawn_blocking` (the
-  ODIM HDF5 scan does) — but never when it calls `ds-storage` (panics;
-  Critical Rule 7). The grib/geotiff/querydata poll bodies still do blocking
-  I/O directly and are safe only because they run on the background runtime.
+  ODIM HDF5 scan does). Storage calls from those workers must follow the
+  runtime-handle guidance in Critical Rule 7. The grib/geotiff/querydata poll
+  bodies still do blocking I/O directly and are safe only because they run on
+  the background runtime.
 - **Background metadata refresh must not contend with request serving.**
   Discovering new data (S3 LIST, STAC HTTP, GRIB index, COG header) is
   background work — keep it off request-serving workers.

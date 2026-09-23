@@ -102,10 +102,11 @@ impl DataStore {
     }
 
     /// Like [`Self::get`], but drives the fetch on an explicitly-provided
-    /// runtime `Handle` (`handle.block_on`) instead of `block_in_place`. Use
-    /// from a `spawn_blocking` pool thread — where `block_in_place` *panics*
-    /// (e.g. the PVOL lazy pixel reader on a render / trajectory request that
-    /// runs inside `spawn_blocking`). Must NOT be called from within a running
+    /// runtime `Handle` (`handle.block_on`) instead of selecting an ambient
+    /// handle. Prefer this for blocking-pool or foreign workers when the I/O
+    /// runtime is supplied by their caller. `block_in_place` does not inherently
+    /// panic on `spawn_blocking`; it runs the closure directly there.
+    /// Must NOT be called from within a running
     /// future on a request worker (an async execution context — `handle.block_on`
     /// panics there); use [`Self::get`] for that.
     #[allow(clippy::needless_question_mark)]
@@ -189,8 +190,11 @@ impl DataStore {
     ///
     /// Drives the whole batch on ONE bridge call, so — like every other
     /// [`DataStore`] method — it is safe at startup and on a multi-thread
-    /// runtime worker (`block_in_place`) but MUST NOT be wrapped in
-    /// `spawn_blocking` or called from a rayon worker.
+    /// runtime worker (`block_in_place`). On a `spawn_blocking` worker the
+    /// bridge runs directly using its attached runtime. Foreign threads without
+    /// a handle create a temporary runtime; parallel callers should instead
+    /// drive async storage with a supplied handle. Current-thread async tasks
+    /// and `LocalSet` are unsupported.
     #[allow(clippy::type_complexity)]
     pub fn get_many(
         &self,
@@ -317,7 +321,7 @@ impl DataStore {
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Bridge async to sync. Uses `block_in_place` when inside a tokio runtime
-    /// (safe from async handlers via multi-threaded scheduler), or creates a
+    /// (releases a multi-threaded scheduler worker), or creates a
     /// temporary runtime otherwise (for use in non-async contexts like startup).
     /// All operations are subject to a 30-second timeout to prevent hung connections.
     fn block_on<F, T>(&self, future: F) -> Result<T, DataServerError>
@@ -333,9 +337,10 @@ impl DataStore {
     /// whose total wall-time legitimately exceeds a single request's budget
     /// and which apply their own per-item timeouts; a batch-wide cap would
     /// wrongly fail the whole batch. Same thread-context rules as
-    /// [`Self::block_on_with`] with `None`: valid on a runtime worker
-    /// (`block_in_place`) or off-runtime (temporary runtime), never on a
-    /// `spawn_blocking`/rayon thread.
+    /// [`Self::block_on_with`] with `None`: a multi-threaded async worker yields
+    /// via `block_in_place`, a blocking-pool worker runs directly, and a foreign
+    /// thread without a handle creates a temporary runtime. Current-thread
+    /// async tasks and `LocalSet` are unsupported.
     fn block_on_untimed<F, T>(&self, future: F) -> Result<T, DataServerError>
     where
         F: std::future::Future<Output = T>,
@@ -352,10 +357,10 @@ impl DataStore {
 
     /// Core sync→async bridge. With an explicit `handle` (caller is on a
     /// non-Tokio thread such as a rayon worker) it drives the future on that
-    /// runtime via `handle.block_on` — no `block_in_place` (which would panic
-    /// off a worker thread) and no per-call `Runtime::new`. With `None` it
-    /// uses `block_in_place` when already inside a runtime, else spins up a
-    /// temporary runtime (tests / CLI).
+    /// runtime via `handle.block_on`, without ambient runtime lookup or per-call
+    /// `Runtime::new`. With `None` it uses `block_in_place` around the ambient
+    /// handle: this yields an async worker or runs directly on a blocking-pool
+    /// worker. With no handle it creates a temporary runtime (tests / CLI).
     fn block_on_with<F, T>(
         &self,
         handle: Option<&tokio::runtime::Handle>,
@@ -797,7 +802,7 @@ mod tests {
 
     // get_range_on must work when called from a thread that is NOT a Tokio
     // worker (mirrors the rayon tile-fetch pool): it should drive the fetch on
-    // the supplied handle, not panic via block_in_place, and not spin up a new
+    // the supplied handle, without ambient runtime lookup or spinning up a new
     // Runtime per call (#222).
     #[tokio::test(flavor = "multi_thread")]
     async fn get_range_on_from_foreign_thread() {
