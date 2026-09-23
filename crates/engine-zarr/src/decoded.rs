@@ -58,6 +58,7 @@ pub(crate) struct DecodedArray {
     revision: Arc<str>,
     name: Arc<str>,
     grid: ChunkGrid,
+    headroom: crate::codec_limits::headroom::Plan,
 }
 
 struct PreparedChunk {
@@ -67,6 +68,7 @@ struct PreparedChunk {
     // Keep the pin/decode allowance until loading fails or transfers it to
     // LoadedChunk. Field order also releases a cached Arc before its permit.
     permit: Option<Arc<Permit>>,
+    credit: u64,
 }
 
 impl PreparedChunk {
@@ -107,6 +109,7 @@ impl DecodedArray {
             revision: revision.into(),
             name: name.into(),
             grid: array.subchunk_grid(),
+            headroom: crate::codec_limits::headroom::Plan::new(array),
         })
     }
 
@@ -149,32 +152,63 @@ impl DecodedArray {
             while batch.len() < parallelism {
                 let Some(next) = indices.peek() else { break };
                 let mut chunk = self.prepare_chunk(array, subset, next.to_vec(), size)?;
+                let mut serial = false;
                 chunk.permit = if let Some(budget) = &budget {
                     let bytes = chunk.reservation_bytes(array).map_err(|err| match err {
                         DataServerError::ResourceExhausted => budget.reject(),
                         err => err,
                     })?;
-                    let Some(permit) = budget.try_reserve_bytes(bytes)? else {
-                        if batch.is_empty() {
-                            return Err(budget.reject());
-                        }
+                    let headroom = if chunk.cached.is_some() {
+                        Some(0)
+                    } else {
+                        self.headroom.bytes(array, &chunk.source)
+                    };
+                    serial = headroom.is_none();
+                    if serial && !batch.is_empty() {
+                        break;
+                    }
+                    let total = bytes.checked_add(headroom.unwrap_or(0));
+                    let permit = total
+                        .map(|total| budget.try_reserve_bytes(total))
+                        .transpose()?
+                        .flatten();
+                    if let Some(permit) = permit {
+                        chunk.credit = headroom.unwrap_or(0);
+                        Some(permit)
+                    } else if !batch.is_empty() {
                         // Drop this unadmitted Arc before I/O. Retry its index
                         // after copying and releasing the current batch.
                         break;
-                    };
-                    Some(permit)
+                    } else {
+                        // Encoder bounds can greatly exceed actual compressed
+                        // sizes. If only the native workspace fits, run one
+                        // chunk and admit its actual storage/codec sizes later.
+                        serial = true;
+                        Some(
+                            budget
+                                .try_reserve_bytes(bytes)?
+                                .ok_or_else(|| budget.reject())?,
+                        )
+                    }
                 } else {
                     None
                 };
                 batch.push(chunk);
                 indices.next();
+                if serial {
+                    break;
+                }
             }
             if batch.is_empty() {
                 break;
             }
-            let load = |chunk| {
+            let load = |chunk: PreparedChunk| {
                 let _deadline = deadline::enter(end);
-                let _encoded = crate::encoded::enter(budget.clone());
+                let _encoded = crate::encoded::enter_prepaid(
+                    budget.clone(),
+                    chunk.permit.clone(),
+                    chunk.credit,
+                );
                 self.load_chunk(array, options, chunk)
             };
             let results: Vec<_> =
@@ -236,6 +270,7 @@ impl DecodedArray {
                 key: None,
                 cached: None,
                 permit: None,
+                credit: 0,
             });
         }
         // Hold the exact hit used for admission: eviction must never turn it
@@ -246,6 +281,7 @@ impl DecodedArray {
             key: Some(key),
             cached,
             permit: None,
+            credit: 0,
         })
     }
 

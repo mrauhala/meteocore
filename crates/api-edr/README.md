@@ -163,6 +163,11 @@ four-worker pool, even with decoded retention disabled. Admission reserves
 each active cold workspace or cached buffer and reduces concurrency when
 memory is tight. These chunk reservations end after copying into the source
 window; the window's reservation remains through sampling.
+For common gzip/zstd/Blosc/CRC32C layouts, cold admission includes encoded,
+intermediate, and scratch headroom estimated from metadata. Retrieval consumes
+that allowance before reserving extra capacity. Unknown layouts and estimates
+too large for a single chunk use serial actual-size admission; conservative
+bounds can reduce concurrency, but do not become new codec-output limits.
 Worker deadlines and reservations remain attached until all chunk jobs finish,
 including error and cancellation paths. Plain Zarr and shards with outer
 transforms retain serial retrieval.

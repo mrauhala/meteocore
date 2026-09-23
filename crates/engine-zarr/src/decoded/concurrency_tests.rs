@@ -324,9 +324,9 @@ fn tight_budgets_reduce_cold_and_mixed_batches_without_rejecting() {
                     .unwrap();
             }
             // 105 source values; each cold chunk needs four 192-byte native
-            // buffers and the probe's two 16-byte encoded buffers. Padding
+            // buffers and two copies of gzip's 242-byte encoder bound. Padding
             // counts even for the missing edge chunks.
-            let budget = Arc::new(Budget::new(2520 + slots * (768 + 32)));
+            let budget = Arc::new(Budget::new(2520 + slots * (768 + 484)));
             let (started, ready) = mpsc::channel();
             let probe = Arc::new(Probe {
                 deadline: None,
@@ -397,5 +397,85 @@ fn tight_budgets_reduce_cold_and_mixed_batches_without_rejecting() {
             drop(source);
             assert_eq!(budget.metrics().0, 0);
         }
+    }
+}
+
+#[test]
+fn headroom_prevents_native_fanout_from_exhausting_the_encoded_budget() {
+    let _exclusive = GATED_TESTS.lock().unwrap();
+    // 3072 bytes would admit four native workspaces with no space for even
+    // one encoded buffer. 800 fits one actual read but not its encoder bound.
+    for (available, expected_workers, unknown) in
+        [(3072, 2, false), (800, 1, false), (MIB, 1, true)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let original = super::tests::fixture(dir.path(), "/a", false, 0.0);
+        let subset = original.subset_all();
+        let options = crate::catalog::single_threaded_opts();
+        let expected = read_native(&original, &subset, &options).unwrap();
+        let budget = Arc::new(Budget::new(2520 + available));
+        let (started, ready) = mpsc::channel();
+        let probe = Arc::new(Probe {
+            deadline: None,
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            started,
+            open: Mutex::new(false),
+            wake: Condvar::new(),
+            budget: budget.clone(),
+            outcome: Outcome::Success,
+        });
+        let array = Array::open(
+            Arc::new(EngineStore::new(ProbedStore {
+                inner: original.storage().clone(),
+                probe: probe.clone(),
+            })),
+            "/a",
+        )
+        .unwrap();
+        let mut reader = DecodedArray::new(
+            &array,
+            Some("snapshot"),
+            "a",
+            Arc::new(DecodedCache::new(0)),
+        )
+        .unwrap();
+        if unknown {
+            reader.headroom = crate::codec_limits::headroom::Plan::Unknown;
+        }
+        let source = budget.reserve(&array, &subset, Some(0), true).unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let _encoded = crate::encoded::enter(Some(budget.clone()));
+                reader.read(&array, &subset, &options, source.parallelism())
+            });
+            for _ in 0..expected_workers {
+                ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            assert_eq!(probe.active.load(Ordering::SeqCst), expected_workers);
+            assert!(budget.metrics().0 <= budget.metrics().1);
+            assert_eq!(
+                budget.metrics().0,
+                if expected_workers == 2 { 5024 } else { 3320 }
+            );
+            assert_eq!(budget.metrics().2, 0);
+            *probe.open.lock().unwrap() = true;
+            probe.wake.notify_all();
+            assert_eq!(
+                worker
+                    .join()
+                    .unwrap()
+                    .unwrap()
+                    .into_fixed()
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+        });
+        assert!(probe.peak.load(Ordering::SeqCst) <= expected_workers);
+        assert_eq!(budget.metrics(), (2520, 2520 + available, 0));
+        drop(source);
+        assert_eq!(budget.metrics().0, 0);
     }
 }
