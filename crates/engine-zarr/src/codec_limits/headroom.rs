@@ -137,8 +137,9 @@ impl Chain {
             }
             representation = step.codec.encoded_representation(&representation);
         }
-        // The collected body and zarrs' owned encoded copy coexist. All codec
-        // allowances remain live through retrieval, so sum them conservatively.
+        // The collected body, encoded copy, and intermediates remain admitted
+        // through retrieval. Scratch credit can be reused after each native
+        // call; summing its bounds here remains a conservative prepayment.
         codec_bytes.checked_add(representation.size()?.checked_mul(2)?)
     }
 }

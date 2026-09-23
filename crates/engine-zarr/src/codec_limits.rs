@@ -180,7 +180,12 @@ impl BytesToBytesCodecTraits for BoundedCodec {
         let intermediate = matches!(representation, BytesRepresentation::BoundedSize(_));
         let output = match self.kind {
             Kind::Blosc => {
-                blosc::validate_and_admit(&bytes, representation, false)?;
+                let _frame = blosc::validate_and_admit(
+                    &bytes,
+                    representation,
+                    false,
+                    crate::encoded::current().as_ref(),
+                )?;
                 self.inner
                     .decode(bytes, representation, options)?
                     .into_owned()
@@ -220,17 +225,17 @@ impl BytesToBytesCodecTraits for BoundedCodec {
         self: Arc<Self>,
         input: Arc<dyn BytesPartialDecoderTraits>,
         representation: &BytesRepresentation,
-        options: &CodecOptions,
+        _options: &CodecOptions,
     ) -> Result<Arc<dyn BytesPartialDecoderTraits>, CodecError> {
         if matches!(self.kind, Kind::Blosc) {
             // Validate the full encoded frame before upstream getitem sees it.
             // Keep block-level partial decoding; a full-decode fallback would
             // amplify small map/position reads.
-            self.inner.clone().partial_decoder(
-                Arc::new(blosc::CheckedInput::new(input, *representation)),
-                representation,
-                options,
-            )
+            Ok(Arc::new(blosc::PartialDecoder::new(
+                input,
+                self.inner.clone(),
+                *representation,
+            )))
         } else {
             Ok(Arc::new(CodecPartialDefault::new_bytes(
                 input,
@@ -245,17 +250,14 @@ impl BytesToBytesCodecTraits for BoundedCodec {
         self: Arc<Self>,
         input: Arc<dyn zarrs::array::codec::api::AsyncBytesPartialDecoderTraits>,
         representation: &BytesRepresentation,
-        options: &CodecOptions,
+        _options: &CodecOptions,
     ) -> Result<Arc<dyn zarrs::array::codec::api::AsyncBytesPartialDecoderTraits>, CodecError> {
         if matches!(self.kind, Kind::Blosc) {
-            self.inner
-                .clone()
-                .async_partial_decoder(
-                    Arc::new(blosc::CheckedInput::new(input, *representation)),
-                    representation,
-                    options,
-                )
-                .await
+            Ok(Arc::new(blosc::PartialDecoder::new(
+                input,
+                self.inner.clone(),
+                *representation,
+            )))
         } else {
             Ok(Arc::new(CodecPartialDefault::new_bytes(
                 input,

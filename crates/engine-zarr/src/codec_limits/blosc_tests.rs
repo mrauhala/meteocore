@@ -4,6 +4,10 @@ use zarrs::{
     storage::byte_range::ByteRange,
 };
 
+#[cfg(feature = "icechunk")]
+#[path = "blosc_async_tests.rs"]
+mod asynchronous;
+
 pub(super) fn codec() -> BoundedCodec {
     configured(BloscCompressor::LZ4, BloscShuffleMode::Shuffle)
 }
@@ -193,9 +197,18 @@ fn blosc_scratch_and_intermediate_admission_is_typed_and_released() {
                 let _scope = crate::encoded::enter(Some(budget.clone()));
                 let output = decode().unwrap();
                 assert_eq!(output, raw[..if partial { 4 } else { raw.len() }]);
-                assert!(budget.metrics().0 > 0);
+                let retained = if matches!(repr, BytesRepresentation::BoundedSize(_)) {
+                    2048
+                } else {
+                    0
+                };
+                assert_eq!(budget.metrics().0, retained, "native scratch has ended");
                 drop(output);
-                assert!(budget.metrics().0 > 0, "allowances live through retrieval");
+                assert_eq!(
+                    budget.metrics().0,
+                    retained,
+                    "intermediate copies still live through retrieval"
+                );
             }
             assert_eq!(budget.metrics().0, 0);
             let budget = Arc::new(crate::read_budget::Budget::new(0));
@@ -214,6 +227,175 @@ fn blosc_scratch_and_intermediate_admission_is_typed_and_released() {
             ));
         }
     }
+}
+
+#[test]
+fn sequential_blosc_calls_reuse_scratch_while_encoded_buffers_remain_admitted() {
+    let options = crate::catalog::single_threaded_opts();
+    let codec = Arc::new(codec());
+    let raw = vec![0; 1024];
+    let encoded = codec.encode(Cow::Borrowed(&raw), &options).unwrap();
+    let block = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as u64;
+    let typesize = u64::from(encoded[3]);
+    let repr = BytesRepresentation::FixedSize(1024);
+    let decoder = codec
+        .clone()
+        .partial_decoder(Arc::new(Cow::Owned(encoded.to_vec())), &repr, &options)
+        .unwrap();
+    for partial in [false, true] {
+        let scratch = block * if partial { 3 } else { 2 } + 4 * typesize;
+        let budget = Arc::new(crate::read_budget::Budget::new(14 + scratch));
+        let scope = crate::encoded::enter(Some(budget.clone()));
+        crate::encoded::current()
+            .unwrap()
+            .object("payload", 7)
+            .unwrap();
+        for _ in 0..8 {
+            let output = if partial {
+                let regions = std::iter::once_with(|| {
+                    assert_eq!(
+                        budget.metrics().0,
+                        14 + scratch,
+                        "getitem is still admitted"
+                    );
+                    ByteRange::FromStart(60, Some(12))
+                });
+                decoder
+                    .partial_decode_many(Box::new(regions), &options)
+                    .unwrap()
+                    .unwrap()
+                    .remove(0)
+            } else {
+                codec
+                    .decode(Cow::Borrowed(&encoded), &repr, &options)
+                    .unwrap()
+            };
+            assert_eq!(output.as_ref(), &raw[..if partial { 12 } else { 1024 }]);
+            assert_eq!(budget.metrics(), (14, 14 + scratch, 0));
+        }
+        drop(scope);
+        assert_eq!(budget.metrics().0, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_multichunk_reads_fit_one_scratch_allowance_with_cold_and_cached_payloads() {
+    use zarrs::{
+        array::{data_type, ArrayBuilder},
+        filesystem::FilesystemStore,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = crate::catalog::single_threaded_opts();
+    let writer = ArrayBuilder::new(vec![8, 8], vec![4, 4], data_type::float32(), -999.0f32)
+        .bytes_to_bytes_codecs(vec![codec().inner])
+        .build(Arc::new(FilesystemStore::new(dir.path()).unwrap()), "/a")
+        .unwrap();
+    writer.store_metadata().unwrap();
+    let subset = writer.subset_all();
+    let expected: Vec<f32> = (0..64).map(|n| n as f32).collect();
+    writer
+        .store_array_subset_opt(&subset, expected.clone(), &options)
+        .unwrap();
+    let mut encoded_bytes = 0;
+    let mut scratch = 0;
+    let mut paths = Vec::new();
+    for indices in [[0, 0], [0, 1], [1, 0], [1, 1]] {
+        let path = dir.path().join(writer.chunk_key(&indices).as_str());
+        let bytes = std::fs::read(&path).unwrap();
+        encoded_bytes += 2 * bytes.len() as u64;
+        scratch = scratch.max(
+            3 * u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()))
+                + 4 * u64::from(bytes[3]),
+        );
+        paths.push(path);
+    }
+    let config = ds_core::config::ZarrConfig::auto_local(dir.path().to_string_lossy().into_owned());
+    let store = Arc::new(EngineStore::plain(
+        crate::build_store("scratch", &config).unwrap(),
+    ));
+    let array = bounded_array(Array::open(store, "/a").unwrap()).unwrap();
+    // 64 source values * 24 bytes, plus four 64-byte native buffers. Encoded
+    // copies of all four chunks remain charged; only native scratch is reused.
+    let baseline = 1536 + 256;
+    let budget = Arc::new(crate::read_budget::Budget::new(
+        baseline + encoded_bytes + scratch,
+    ));
+    let source = budget.reserve(&array, &subset, Some(0), false).unwrap();
+    assert_eq!(budget.metrics().0, baseline);
+    for cached in [false, true] {
+        if cached {
+            for path in &paths {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let scope = crate::encoded::enter(Some(budget.clone()));
+        let actual: Vec<f32> = array.retrieve_array_subset_opt(&subset, &options).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(budget.metrics().0, baseline + encoded_bytes);
+        assert_eq!(budget.metrics().2, 0);
+        drop(scope);
+        assert_eq!(budget.metrics().0, baseline);
+    }
+    drop(source);
+    assert_eq!(budget.metrics().0, 0);
+}
+
+#[test]
+fn partial_scratch_releases_on_invalid_ranges_and_unwinding() {
+    let options = crate::catalog::single_threaded_opts();
+    let codec = Arc::new(codec());
+    let encoded = codec
+        .encode(Cow::Owned(vec![0; 1024]), &options)
+        .unwrap()
+        .into_owned();
+    let scratch = 3 * u64::from(u32::from_le_bytes(encoded[8..12].try_into().unwrap()))
+        + 4 * u64::from(encoded[3]);
+    let decoder = codec
+        .partial_decoder(
+            Arc::new(Cow::Owned(encoded)),
+            &BytesRepresentation::FixedSize(1024),
+            &options,
+        )
+        .unwrap();
+    let budget = Arc::new(crate::read_budget::Budget::new(scratch));
+    let _scope = crate::encoded::enter(Some(budget.clone()));
+    for bad in [
+        ByteRange::FromStart(1025, None),
+        ByteRange::FromStart(1020, Some(8)),
+        ByteRange::FromStart(u64::MAX, Some(1)),
+        ByteRange::Suffix(1025),
+    ] {
+        let regions = [ByteRange::FromStart(0, Some(4)), bad];
+        let result = decoder.partial_decode_many(Box::new(regions.into_iter()), &options);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("outside the frame"));
+        assert_eq!(budget.metrics(), (0, scratch, 0));
+    }
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let regions = std::iter::once_with(|| {
+            assert_eq!(
+                budget.metrics().0,
+                scratch,
+                "scratch covers the upstream decoder call"
+            );
+            panic!("upstream iterator panic");
+        });
+        decoder.partial_decode_many(Box::new(regions), &options)
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(budget.metrics(), (0, scratch, 0));
+    assert_eq!(
+        decoder
+            .partial_decode(ByteRange::Suffix(4), &options)
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[0; 4]
+    );
+    assert_eq!(budget.metrics(), (0, scratch, 0));
 }
 
 #[cfg(feature = "icechunk")]
@@ -244,7 +426,7 @@ async fn blosc_async_partial_reads_preserve_values_and_bounds() {
             .await;
         if valid {
             assert_eq!(result.unwrap().unwrap().as_ref(), &raw[60..72]);
-            assert!(budget.metrics().0 > 0);
+            assert_eq!(budget.metrics().0, 0, "getitem scratch is released");
         } else {
             assert!(matches!(
                 crate::catalog::chunk_read_error(result.unwrap_err().into()),
