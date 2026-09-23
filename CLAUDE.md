@@ -181,6 +181,16 @@ cargo audit                          # exactly what CI enforces
   crates and for GitHub Actions; purely transitive crates are refreshed by
   `cargo update`, prompted by the scheduled audit run.
 
+### CodeQL scanning
+
+`.github/workflows/codeql.yml` scans Rust, Actions, JavaScript/TypeScript, and
+Python with `security-extended` on PRs to `main`, main pushes, and weekly.
+Rust uses `build-mode: none` and the extractor's default all-features selection,
+including Icechunk. Inspect extraction warnings when assessing coverage.
+Results live in GitHub's Security → Code scanning tab. Triage the initial
+baseline before configuring required merge checks; keep the RustSec audit gate
+for dependency advisories. Dependabot updates the pinned CodeQL action.
+
 ## Project Tracking
 
 Backlog is in GitHub Issues: https://github.com/mrauhala/meteocore/issues

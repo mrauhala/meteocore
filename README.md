@@ -1836,6 +1836,22 @@ cargo test -p engine-geotiff # GeoTIFF engine tests
 
 CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 schema](https://schemas.opengis.net/covjson/1.0/coveragejson.json) stored in `schemas/coveragejson.json`.
 
+### Code security scanning
+
+[CodeQL](.github/workflows/codeql.yml) scans Rust, GitHub Actions,
+JavaScript/TypeScript, and Python with the `security-extended` query suite on
+pull requests to `main`, pushes to `main`, and weekly. It also supports manual
+runs from the Actions tab. Results appear in
+[Security → Code scanning](https://github.com/mrauhala/meteocore/security/code-scanning)
+and on pull requests.
+
+Rust uses CodeQL's `none` build mode; the extractor handles build scripts and
+procedural macros and enables all Cargo features by default, including
+`engine-zarr/icechunk`. Review extraction warnings as well as alerts, since
+dependency or macro failures can reduce analysis coverage. Triage the initial
+baseline before adding CodeQL to required merge checks. The existing RustSec
+`cargo audit` job continues to check dependency advisories.
+
 ## Known Limitations
 
 - CSV/GeoJSON data loaded into memory at startup; GeoTIFF reads tiles on demand
