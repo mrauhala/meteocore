@@ -52,7 +52,7 @@ fn read(reader: &DecodedArray, array: &Array<EngineStore>, subset: &ArraySubset)
             .read(
                 array,
                 subset,
-                &CodecOptions::default().with_concurrent_target(1),
+                &crate::catalog::single_threaded_opts(),
                 MAX_PARALLEL_CHUNKS,
             )
             .unwrap(),
@@ -75,7 +75,7 @@ fn cached_chunks_match_subsets_across_shards_edges_and_missing_chunks() {
             let expected = array
                 .retrieve_array_subset_opt::<Vec<f32>>(
                     &subset,
-                    &CodecOptions::default().with_concurrent_target(1),
+                    &crate::catalog::single_threaded_opts(),
                 )
                 .unwrap();
             assert_eq!(read(&reader, &array, &subset), expected);
@@ -180,7 +180,7 @@ fn native_integer_chunks_preserve_values_and_fill() {
         .read(
             &array,
             &all,
-            &CodecOptions::default().with_concurrent_target(1),
+            &crate::catalog::single_threaded_opts(),
             MAX_PARALLEL_CHUNKS,
         )
         .unwrap();
@@ -241,7 +241,7 @@ fn failed_decode_is_not_cached_and_retry_succeeds() {
         .read(
             &array,
             &subset,
-            &CodecOptions::default().with_concurrent_target(1),
+            &crate::catalog::single_threaded_opts(),
             MAX_PARALLEL_CHUNKS,
         )
         .is_err());
@@ -281,7 +281,7 @@ fn waiting_for_a_chunk_observes_the_waiters_deadline() {
         let result = reader.read(
             &array,
             &ArraySubset::new_with_ranges(&[0..1, 0..1, 0..1]),
-            &CodecOptions::default().with_concurrent_target(1),
+            &crate::catalog::single_threaded_opts(),
             MAX_PARALLEL_CHUNKS,
         );
         release_tx.send(()).unwrap();

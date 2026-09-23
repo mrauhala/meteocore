@@ -34,13 +34,15 @@ use crate::store::EngineStore;
 type Store = EngineStore;
 
 /// Codec options that pin chunk retrieval to the **calling thread** by setting
-/// the concurrency target to 1. This is load-bearing: it stops zarrs from
-/// dispatching storage reads onto `rayon` workers, which lose the calling
+/// both the concurrency target and minimum chunk concurrency to 1. This stops
+/// zarrs from dispatching storage reads onto `rayon` workers, which lose the calling
 /// thread's deadline and runtime context. Icechunk's outer fan-out explicitly
 /// propagates deadlines and reserves each active workspace; every individual
 /// chunk job still uses these serial codec options.
-fn single_threaded_opts() -> CodecOptions {
-    CodecOptions::default().with_concurrent_target(1)
+pub(crate) fn single_threaded_opts() -> CodecOptions {
+    CodecOptions::default()
+        .with_concurrent_target(1)
+        .with_chunk_concurrent_minimum(1)
 }
 
 /// A single exposed data variable (one EDR/Map parameter).
@@ -248,12 +250,15 @@ impl Catalog {
         let reservation =
             self.read_budget
                 .reserve(&var.array, &subset, axes_bytes, var.decoded.is_some())?;
-        let raw = retrieve_raw_f64(
-            &var.array,
-            &subset,
-            var.decoded.as_ref(),
-            reservation.parallelism(),
-        )?;
+        let raw = {
+            let _encoded = crate::encoded::enter(Some(self.read_budget.clone()));
+            retrieve_raw_f64(
+                &var.array,
+                &subset,
+                var.decoded.as_ref(),
+                reservation.parallelism(),
+            )?
+        };
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
         let nrow = j1 - j0 + 1;
@@ -354,12 +359,15 @@ impl Catalog {
         let reservation =
             self.read_budget
                 .reserve(&var.array, &subset, output_bytes, var.decoded.is_some())?;
-        let raw = retrieve_raw_f64(
-            &var.array,
-            &subset,
-            var.decoded.as_ref(),
-            reservation.parallelism(),
-        )?;
+        let raw = {
+            let _encoded = crate::encoded::enter(Some(self.read_budget.clone()));
+            retrieve_raw_f64(
+                &var.array,
+                &subset,
+                var.decoded.as_ref(),
+                reservation.parallelism(),
+            )?
+        };
         let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
 
         // Local corner offsets within the read window.
@@ -1162,7 +1170,7 @@ fn read_coord_f64(array: &Array<Store>) -> Result<Vec<f64>, DataServerError> {
     retrieve_raw_f64(array, &subset, None, 1)
 }
 
-fn chunk_read_error(error: ArrayError) -> DataServerError {
+pub(crate) fn chunk_read_error(error: ArrayError) -> DataServerError {
     // Chunk reads and partial/sharded decoding wrap storage errors differently.
     // Inspect the typed IO payload: text matching or checking the catalog's
     // current retirement flag could misclassify an unrelated codec failure.
@@ -1365,7 +1373,19 @@ mod tests {
                 None,
             )
         };
-        for (capacity, exhausted) in [(0, true), (ds_cache::MIB, false)] {
+        for (capacity, oversized_payload, exhausted) in [
+            (0, false, true),
+            (ds_cache::MIB, false, false),
+            (ds_cache::MIB, true, true),
+        ] {
+            if oversized_payload {
+                // The native window fits, but this encoded object does not.
+                // Reject from its metadata before reading/decoding the corrupt body.
+                std::fs::File::create(dir.path().join("t2m/c/0/0/0"))
+                    .unwrap()
+                    .set_len(2 * ds_cache::MIB)
+                    .unwrap();
+            }
             let budget = Arc::new(Budget::new(capacity));
             let mut catalog = build(
                 Arc::new(EngineStore::plain(
@@ -1380,7 +1400,10 @@ mod tests {
             engine.catalog.store(Arc::new(catalog));
             let error = render().err().expect("render must fail");
             if exhausted {
-                assert!(matches!(error, DataServerError::ResourceExhausted));
+                assert!(
+                    matches!(error, DataServerError::ResourceExhausted),
+                    "{error:?}"
+                );
                 assert_eq!(budget.metrics().2, 1);
             } else {
                 assert!(

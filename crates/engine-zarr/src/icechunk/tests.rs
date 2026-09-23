@@ -250,6 +250,172 @@ async fn payload_cache_obeys_budget_and_zero_disables_retention() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_full_and_range_reads_reserve_before_external_payload_io() {
+    use crate::{encoded, read_budget::Budget};
+    use zarrs::storage::byte_range::ByteRange;
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path()).await;
+    let mut config = config(dir.path());
+    config.cache_mb = 0;
+    let source = Source::open("encoded", &config).unwrap();
+    let store = source.snapshot(None).unwrap().unwrap();
+    let key = StoreKey::new("temp/c/0/0/0").unwrap();
+    let size = store.size_key(&key).unwrap().unwrap();
+    let budget = Arc::new(Budget::new(size * 4));
+    let full = {
+        let _scope = encoded::enter(Some(budget.clone()));
+        let full = store.get(&key).unwrap().unwrap();
+        assert_eq!(budget.metrics().0, size * 2);
+        full
+    };
+    assert_eq!(budget.metrics().0, 0);
+    let ranges = [
+        ByteRange::from(0..8),
+        ByteRange::Suffix(4),
+        ByteRange::FromStart(8, None),
+    ];
+    {
+        let _scope = encoded::enter(Some(budget.clone()));
+        let bytes = store
+            .get_partial_many(&key, Box::new(ranges.into_iter()))
+            .unwrap()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            bytes,
+            vec![
+                full.slice(..8),
+                full.slice(full.len() - 4..),
+                full.slice(8..)
+            ]
+        );
+        assert_eq!(budget.metrics().0, (size + 4) * 2);
+    }
+    assert_eq!(budget.metrics().0, 0);
+    std::fs::remove_dir_all(dir.path().join("chunks")).unwrap();
+    for partial in [false, true] {
+        let limit = if partial {
+            (size + 4) * 2 - 1
+        } else {
+            size * 2 - 1
+        };
+        let budget = Arc::new(Budget::new(limit));
+        {
+            let _scope = encoded::enter(Some(budget.clone()));
+            let error = if partial {
+                store
+                    .get_partial_many(&key, Box::new(ranges.into_iter()))
+                    .err()
+                    .unwrap()
+            } else {
+                store.get(&key).unwrap_err()
+            };
+            assert!(
+                matches!(error, StorageError::IOError(error) if matches!(
+                    error.get_ref().and_then(|e| e.downcast_ref::<DataServerError>()),
+                    Some(DataServerError::ResourceExhausted)
+                )),
+                "admission must precede the now-missing payload read"
+            );
+        }
+        assert_eq!(budget.metrics(), (0, limit, 1));
+    }
+    assert!(
+        store.get(&key).is_err(),
+        "without admission the deleted payload is a storage failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decoded_cache_hits_need_no_encoded_reservation_and_misses_keep_typed_errors() {
+    use crate::{
+        decoded::{DecodedArray, DecodedCache},
+        encoded,
+        read_budget::Budget,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path()).await;
+    let mut config = config(dir.path());
+    config.cache_mb = 0;
+    let source = Source::open("encoded", &config).unwrap();
+    let store = source.snapshot(None).unwrap().unwrap();
+    let array = Array::open(store.clone(), "/temp").unwrap();
+    let reader = DecodedArray::new(
+        &array,
+        store.revision.as_deref(),
+        "temp",
+        Arc::new(DecodedCache::new(ds_cache::MIB)),
+    )
+    .unwrap();
+    let subset = array.subset_all();
+    let options = crate::catalog::single_threaded_opts();
+    let budget = Arc::new(Budget::new(0));
+    {
+        let _scope = encoded::enter(Some(budget.clone()));
+        assert!(matches!(
+            reader.read(&array, &subset, &options, 4),
+            Err(DataServerError::ResourceExhausted)
+        ));
+    }
+    // A rejected fill must release its placeholder so a later admitted read works.
+    let expected = reader
+        .read(&array, &subset, &options, 4)
+        .unwrap()
+        .into_fixed()
+        .unwrap()
+        .into_owned();
+    std::fs::remove_dir_all(dir.path().join("chunks")).unwrap();
+    let _scope = encoded::enter(Some(budget.clone()));
+    let actual = reader
+        .read(&array, &subset, &options, 4)
+        .unwrap()
+        .into_fixed()
+        .unwrap()
+        .into_owned();
+    assert_eq!(actual, expected);
+    assert_eq!(budget.metrics().0, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_icechunk_payloads_still_return_fill_under_encoded_admission() {
+    use crate::{encoded, read_budget::Budget};
+    use zarrs::storage::{byte_range::ByteRange, AsyncWritableStorageTraits};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path()).await;
+    let writer = AsyncIcechunkStore::new(repo.writable_session("main").await.unwrap());
+    let key = StoreKey::new("temp/c/0/0/0").unwrap();
+    writer.erase(&key).await.unwrap();
+    writer
+        .session()
+        .write()
+        .await
+        .commit("missing shard")
+        .execute()
+        .await
+        .unwrap();
+    let source = Source::open("missing", &config(dir.path())).unwrap();
+    let store = source.snapshot(None).unwrap().unwrap();
+    let array = Array::open(store.clone(), "/temp").unwrap();
+    let budget = Arc::new(Budget::new(0));
+    let _scope = encoded::enter(Some(budget.clone()));
+    assert!(store.get(&key).unwrap().is_none());
+    let ranges = [ByteRange::from(16..32), ByteRange::Suffix(16)];
+    assert!(store
+        .get_partial_many(&key, Box::new(ranges.into_iter()))
+        .unwrap()
+        .is_none());
+    let values = array
+        .retrieve_array_subset_opt::<Vec<f32>>(
+            &array.subset_all(),
+            &crate::catalog::single_threaded_opts(),
+        )
+        .unwrap();
+    assert!(values.iter().all(|value| value.is_nan()));
+    assert_eq!(budget.metrics().0, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_maps_read_icechunk_through_render_executor() {
     // Maps, WMS, and Tiles all use acquire_raster + RenderJob::run. Exercise
     // actual async file/range reads and shard decoding inside spawn_blocking,
@@ -648,7 +814,7 @@ async fn chunk_concurrency_latency_probe() {
             .read(
                 &array,
                 &subset,
-                &zarrs::array::CodecOptions::default().with_concurrent_target(1),
+                &crate::catalog::single_threaded_opts(),
                 parallelism,
             )
             .unwrap()

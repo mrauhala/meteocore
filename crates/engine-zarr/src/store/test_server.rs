@@ -20,6 +20,14 @@ pub(super) struct Request {
 }
 
 impl Request {
+    pub(super) fn headers(&mut self, status: u16, size: u64) {
+        write!(
+            self.socket,
+            "HTTP/1.1 {status} Test\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    }
+
     pub(super) fn reply(mut self, status: u16, body: &[u8]) {
         write!(
             self.socket,

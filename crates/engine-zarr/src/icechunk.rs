@@ -116,7 +116,29 @@ where
 
 impl ReadableStorageTraits for Store {
     fn get(&self, key: &StoreKey) -> Result<MaybeBytes, StorageError> {
-        storage_call(self.0.get(key))
+        let Some(encoded) = crate::encoded::current() else {
+            return storage_call(self.0.get(key));
+        };
+        runtime::run(async {
+            // Icechunk gets this length from the pinned chunk reference, not
+            // an extra payload HEAD. Missing chunk references have size zero.
+            let size = self
+                .0
+                .size_key(key)
+                .await
+                .map_err(storage_error)?
+                .unwrap_or(0);
+            encoded.object(key.as_str(), size)?;
+            let bytes = self.0.get(key).await.map_err(storage_error)?;
+            if bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() as u64 > size)
+            {
+                return Err(DataServerError::ResourceExhausted);
+            }
+            Ok(bytes)
+        })
+        .map_err(io_err)
     }
 
     fn get_partial_many<'a>(
@@ -124,17 +146,58 @@ impl ReadableStorageTraits for Store {
         key: &StoreKey,
         ranges: ByteRangeIterator<'a>,
     ) -> Result<MaybeBytesIterator<'a>, StorageError> {
-        // Await the stream contents under the SAME deadline as its creation.
-        let bytes = storage_call(async {
-            match self.0.get_partial_many(key, ranges).await? {
-                Some(stream) => stream.try_collect::<Vec<_>>().await.map(Some),
+        let encoded = crate::encoded::current();
+        let ranges: Vec<_> = ranges.collect();
+        // Creation and consumption of the stream share one absolute deadline.
+        let bytes = runtime::run(async {
+            let admitted = if let Some(encoded) = encoded {
+                let size = self
+                    .0
+                    .size_key(key)
+                    .await
+                    .map_err(storage_error)?
+                    .unwrap_or(0);
+                // getsize reports zero for an absent chunk. The upstream
+                // multi-range stream otherwise turns absence into a per-item
+                // error; preserve the fill-chunk semantics of get().
+                if size == 0 && self.0.get(key).await.map_err(storage_error)?.is_none() {
+                    return Ok(None);
+                }
+                // Reserve the entire operation before Icechunk launches any
+                // range futures or collects their results.
+                let length = ranges.iter().try_fold(0u64, |total, range| {
+                    total
+                        .checked_add(range_length(*range, size)?)
+                        .ok_or(DataServerError::ResourceExhausted)
+                })?;
+                encoded.ranges(length)?;
+                Some(length)
+            } else {
+                None
+            };
+            match self
+                .0
+                .get_partial_many(key, Box::new(ranges.into_iter()))
+                .await
+                .map_err(storage_error)?
+            {
+                Some(stream) => {
+                    let bytes: Vec<bytes::Bytes> =
+                        stream.try_collect().await.map_err(storage_error)?;
+                    let actual = bytes
+                        .iter()
+                        .try_fold(0u64, |n, bytes| n.checked_add(bytes.len() as u64))
+                        .ok_or(DataServerError::ResourceExhausted)?;
+                    if admitted.is_some_and(|length| actual > length) {
+                        return Err(DataServerError::ResourceExhausted);
+                    }
+                    Ok(Some(bytes))
+                }
                 None => Ok(None),
             }
-        })?;
-        match bytes {
-            Some(bytes) => Ok(Some(Box::new(bytes.into_iter().map(Ok)))),
-            None => Ok(None),
-        }
+        })
+        .map_err(io_err)?;
+        Ok(bytes.map(|bytes| Box::new(bytes.into_iter().map(Ok)) as _))
     }
 
     fn size_key(&self, key: &StoreKey) -> Result<Option<u64>, StorageError> {
@@ -143,6 +206,32 @@ impl ReadableStorageTraits for Store {
 
     fn supports_get_partial(&self) -> bool {
         true
+    }
+}
+
+fn storage_error(error: StorageError) -> DataServerError {
+    DataServerError::Storage(error.to_string())
+}
+
+fn range_length(
+    range: zarrs::storage::byte_range::ByteRange,
+    size: u64,
+) -> Result<u64, DataServerError> {
+    use zarrs::storage::byte_range::ByteRange;
+    match range {
+        ByteRange::Suffix(length) => Ok(length.min(size)),
+        ByteRange::FromStart(start, length) => {
+            let end = match length {
+                Some(length) => start
+                    .checked_add(length)
+                    .ok_or(DataServerError::ResourceExhausted)?
+                    .min(size),
+                None => size,
+            };
+            // A missing chunk reference has size zero. Let the backend retain
+            // its missing-key/range semantics without rejecting fill chunks.
+            Ok(end.saturating_sub(start))
+        }
     }
 }
 

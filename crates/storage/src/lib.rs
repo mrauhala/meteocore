@@ -3,6 +3,7 @@
 //! Provides a synchronous `DataStore` over the `object_store` crate,
 //! supporting local filesystem, S3, and HTTP backends.
 
+mod admitted;
 pub mod discovery;
 mod error;
 
@@ -369,12 +370,27 @@ impl DataStore {
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
+        self.block_on_result(handle, async {
+            future
+                .await
+                .map_err(|e| DataServerError::from(StorageError::from(e)))
+        })
+    }
+
+    fn block_on_result<F, T>(
+        &self,
+        handle: Option<&tokio::runtime::Handle>,
+        future: F,
+    ) -> Result<T, DataServerError>
+    where
+        F: std::future::Future<Output = Result<T, DataServerError>>,
+    {
         let deadline = ds_core::deadline::current();
         ds_core::deadline::check()?;
         let timed = async {
             let end = deadline.unwrap_or_else(|| std::time::Instant::now() + Self::REQUEST_TIMEOUT);
             match tokio::time::timeout_at(end.into(), future).await {
-                Ok(result) => result.map_err(|e| DataServerError::from(StorageError::from(e))),
+                Ok(result) => result,
                 Err(_) if deadline.is_some() => Err(DataServerError::DeadlineExceeded),
                 Err(_) => Err(DataServerError::Storage(
                     "Request timed out after 30s".into(),

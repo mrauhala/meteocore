@@ -17,6 +17,7 @@
 mod catalog;
 mod cf;
 mod decoded;
+mod encoded;
 #[cfg(feature = "icechunk")]
 mod icechunk;
 pub mod read_budget;
@@ -41,7 +42,7 @@ use ds_core::instances::{self, RunInfo};
 
 /// Most variables one EDR area request may address. Each is a separate
 /// subset retrieval (two across the antimeridian). Each subset can touch many
-/// chunks, currently read serially (`concurrent_target(1)`).
+/// chunks, currently read with serial codec options.
 const MAX_AREA_VARIABLES: usize = 8;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
@@ -356,7 +357,7 @@ impl EdrEngine for ZarrEngine {
             None => (0.0, 0.0),
         };
         // Every variable is one subset retrieval on this thread
-        // (zarrs retrieval is pinned to `concurrent_target(1)` — see the
+        // (zarrs retrieval uses serial codec options — see the
         // crate notes — so the reads cannot fan out), and an unfiltered
         // request addresses every variable in the store. Cap the count and
         // point at `parameter-name` rather than stall the worker N times.
