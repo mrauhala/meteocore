@@ -157,7 +157,11 @@ omits that variable while retaining usable ones. Catalog construction still
 fails if no usable variables remain. During reads,
 bounded intermediate outputs acquire additional capacity allowances through
 retrieval. Blosc also validates frame/block sizes before full and partial
-decoding and admits its size-dependent native scratch buffers. Invalid frame
+decoding and admits its size-dependent native scratch buffers. Scratch
+allowances end after each decoder call, releasing extra capacity and returning
+prepaid credit for sequential reuse; encoded/intermediate copies remain
+admitted through retrieval. Partial Blosc ranges are validated before native
+decoding, including overflowing and out-of-bounds ranges. Invalid frame
 lengths remain engine errors, while admission failures and expired deadlines
 preserve their typed errors. Other codecs, compressor-private contexts,
 and transport/internal storage buffers remain outside the estimate;

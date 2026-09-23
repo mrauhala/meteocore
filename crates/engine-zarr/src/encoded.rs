@@ -1,7 +1,9 @@
 //! Encoded-buffer admission for one synchronous native retrieval.
 //!
 //! zarrs converts storage Bytes into owned codec Vecs, so a guard attached only
-//! to Bytes would release too early. Keep reservations until retrieval returns.
+//! to Bytes would release too early. Keep encoded/intermediate reservations
+//! until retrieval returns. Blosc scratch has separate guards that end once
+//! the native call has freed its temporary buffers.
 //! Repeated plain whole-object lookups share an allowance within this scope;
 //! range operations accumulate conservatively. Each Icechunk chunk job gets a
 //! separate scope, bounding retention to its decode rather than the whole map.
@@ -40,21 +42,59 @@ struct Held {
 
 impl Held {
     fn reserve(&mut self, budget: &Arc<Budget>, bytes: u64) -> Result<(), DataServerError> {
+        let (_, permit) = self.allocate(budget, bytes)?;
+        if let Some(permit) = permit {
+            self.permits.push(permit);
+        }
+        Ok(())
+    }
+
+    fn allocate(
+        &mut self,
+        budget: &Arc<Budget>,
+        bytes: u64,
+    ) -> Result<(u64, Option<Arc<Permit>>), DataServerError> {
         ds_core::deadline::check()?;
         let prepaid = self.credit.min(bytes);
-        if bytes > prepaid {
-            self.permits.push(budget.reserve_bytes(bytes - prepaid)?);
-        }
+        let permit = (bytes > prepaid)
+            .then(|| budget.reserve_bytes(bytes - prepaid))
+            .transpose()?;
         self.credit -= prepaid;
-        Ok(())
+        Ok((prepaid, permit))
+    }
+}
+
+/// Only for native scratch proven to be freed when the guarded call returns.
+/// Encoded copies and intermediate outputs still belong to the retrieval scope.
+#[must_use = "keep scratch admission alive until the native call returns"]
+pub(crate) struct Scratch {
+    context: Arc<Context>,
+    _permit: Option<Arc<Permit>>,
+    credit: u64,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        drop(self._permit.take());
+        let mut held = self.context.held.lock().unwrap();
+        held.credit = held
+            .credit
+            .checked_add(self.credit)
+            .expect("returning borrowed prepaid credit cannot overflow");
     }
 }
 
 impl Context {
     /// Blosc's serial/getitem scratch scales with the validated block size.
-    /// Retain its allowance through retrieval alongside codec-owned copies.
-    pub(crate) fn codec_scratch(&self, bytes: u64) -> Result<(), DataServerError> {
-        self.held.lock().unwrap().reserve(&self.budget, bytes)
+    /// Release additional capacity and return borrowed credit after the native
+    /// call. Overlapping calls must hold separate guards, even in one context.
+    pub(crate) fn codec_scratch(self: &Arc<Self>, bytes: u64) -> Result<Scratch, DataServerError> {
+        let (credit, permit) = self.held.lock().unwrap().allocate(&self.budget, bytes)?;
+        Ok(Scratch {
+            context: self.clone(),
+            _permit: permit,
+            credit,
+        })
     }
 
     /// Intermediate compressed representations can exceed the native chunk
@@ -138,6 +178,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlapping_scratch_guards_cannot_share_credit_and_keep_the_owner_alive() {
+        let budget = Arc::new(Budget::new(132));
+        let permit = budget.reserve_bytes(100).unwrap();
+        let scope = enter_prepaid(Some(budget.clone()), Some(permit), 64);
+        let context = current().unwrap();
+        let first = context.codec_scratch(48).unwrap();
+        let second = context.codec_scratch(48).unwrap(); // 16 prepaid + 32 extra
+        assert_eq!(budget.metrics(), (132, 132, 0));
+        assert!(context.codec_scratch(1).is_err());
+        drop(second);
+        assert_eq!(budget.metrics(), (100, 132, 1));
+        let replacement = context.codec_scratch(48).unwrap();
+        assert_eq!(budget.metrics().0, 132);
+        drop(scope);
+        drop(context);
+        drop(first);
+        assert_eq!(
+            budget.metrics().0,
+            132,
+            "the last call still owns its allowance"
+        );
+        drop(replacement);
+        assert_eq!(budget.metrics().0, 0);
+    }
+
+    #[test]
+    fn scratch_refunds_are_isolated_from_encoded_and_intermediate_allowances() {
+        let budget = Arc::new(Budget::new(160));
+        let permit = budget.reserve_bytes(100).unwrap();
+        let scope = enter_prepaid(Some(budget.clone()), Some(permit), 60);
+        let context = current().unwrap();
+        context.object("payload", 20).unwrap(); // 40 credit retained
+        let scratch = context.codec_scratch(40).unwrap(); // 20 credit + 20 extra
+        context.intermediate(10).unwrap(); // 20 extra retained
+        assert_eq!(budget.metrics().0, 140);
+        drop(scratch);
+        assert_eq!(budget.metrics().0, 120);
+        // The refunded 20 can be reused for an encoded copy, but never refunds
+        // the 40 encoded bytes or 20 intermediate bytes still live in zarrs.
+        context.object("another", 10).unwrap();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scratch = context.codec_scratch(40).unwrap();
+            assert_eq!(budget.metrics().0, 160);
+            panic!("decoder unwind");
+        }));
+        assert!(failed.is_err());
+        assert_eq!(budget.metrics().0, 120);
+        assert!(context.codec_scratch(41).is_err());
+        drop(context);
+        drop(scope);
+        assert_eq!(budget.metrics(), (0, 160, 1));
+    }
+
+    #[test]
     fn prepaid_credit_covers_actual_allocations_and_retains_its_owner() {
         let budget = Arc::new(Budget::new(180));
         let permit = budget.reserve_bytes(120).unwrap();
@@ -154,7 +248,7 @@ mod tests {
         }
         context.object("a", 20).unwrap(); // 40 prepaid
         context.intermediate(15).unwrap(); // 30 prepaid
-        context.codec_scratch(30).unwrap(); // 10 prepaid + 20 extra
+        let scratch = context.codec_scratch(30).unwrap(); // 10 prepaid + 20 extra
         assert_eq!(budget.metrics(), (140, 180, 0));
         context.object("a", 25).unwrap(); // same object grows by two copies of 5
         assert_eq!(budget.metrics().0, 150);
@@ -170,6 +264,8 @@ mod tests {
             "storage futures keep both reservations live"
         );
         drop(context);
+        assert_eq!(budget.metrics().0, 150, "scratch retains the prepaid owner");
+        drop(scratch);
         assert_eq!(budget.metrics().0, 0);
     }
 

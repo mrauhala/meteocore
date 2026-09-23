@@ -1,18 +1,28 @@
 //! Preflight Blosc frames without replacing its block-level partial decoder.
 use super::*;
+use std::sync::Mutex;
 use zarrs::{
     array::codec::bytes_to_bytes::blosc::blosc_validate,
     storage::{
-        byte_range::{extract_byte_ranges, ByteRangeIterator},
+        byte_range::{extract_byte_ranges, ByteRange, ByteRangeIterator},
         StorageError,
     },
 };
+
+mod partial;
+pub(super) use partial::PartialDecoder;
+
+pub(super) struct Frame {
+    length: u64,
+    _scratch: Option<crate::encoded::Scratch>,
+}
 
 pub(super) fn validate_and_admit(
     bytes: &[u8],
     representation: &BytesRepresentation,
     partial: bool,
-) -> Result<(), CodecError> {
+    context: Option<&Arc<crate::encoded::Context>>,
+) -> Result<Frame, CodecError> {
     check_deadline()?;
     let limit = representation.size().ok_or_else(|| {
         CodecError::Other("Blosc decoding requires a bounded representation".into())
@@ -37,29 +47,76 @@ pub(super) fn validate_and_admit(
     if block == 0 || block > length as u64 || block > MAX_BLOCK || typesize == 0 {
         return Err(CodecError::Other("invalid Blosc block/type size".into()));
     }
-    if let Some(context) = crate::encoded::current() {
+    let scratch = if let Some(context) = context {
         // serial_blosc uses 2*block + 4*typesize; getitem uses 3*block +
         // 4*typesize, independently of how few values the request selects.
         let scratch = block * if partial { 3 } else { 2 } + 4 * typesize;
-        context.codec_scratch(scratch).map_err(io_error)?;
+        let scratch = context.codec_scratch(scratch).map_err(io_error)?;
         if matches!(representation, BytesRepresentation::BoundedSize(_)) {
             context.intermediate(length).map_err(io_error)?;
         }
-    }
-    Ok(())
+        Some(scratch)
+    } else {
+        None
+    };
+    Ok(Frame {
+        length: length as u64,
+        _scratch: scratch,
+    })
 }
 
-pub(super) struct CheckedInput<T: ?Sized> {
+// One state per decoder invocation, never shared between overlapping calls.
+// CheckedInput acquires scratch only once the frame is available; the outer
+// partial decoder retains it until upstream getitem has returned/unwound.
+#[derive(Default)]
+struct Call {
+    context: Option<Arc<crate::encoded::Context>>,
+    frames: Vec<Frame>,
+    invalid_range: bool,
+}
+
+impl Call {
+    fn new() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            context: crate::encoded::current(),
+            ..Default::default()
+        }))
+    }
+
+    fn check_range(&mut self, range: ByteRange) -> bool {
+        let valid = !self.invalid_range
+            && self.frames.last().is_some_and(|frame| match range {
+                ByteRange::FromStart(start, Some(length)) => start
+                    .checked_add(length)
+                    .is_some_and(|end| end <= frame.length),
+                ByteRange::FromStart(start, None) => start <= frame.length,
+                ByteRange::Suffix(length) => length <= frame.length,
+            });
+        self.invalid_range |= !valid;
+        valid
+    }
+}
+
+struct CheckedInput<T: ?Sized> {
     inner: Arc<T>,
     representation: BytesRepresentation,
+    call: Arc<Mutex<Call>>,
 }
 
 impl<T: ?Sized> CheckedInput<T> {
-    pub(super) fn new(inner: Arc<T>, representation: BytesRepresentation) -> Self {
+    fn new(inner: Arc<T>, representation: BytesRepresentation, call: Arc<Mutex<Call>>) -> Self {
         Self {
             inner,
             representation,
+            call,
         }
+    }
+
+    fn admit(&self, bytes: &[u8]) -> Result<(), CodecError> {
+        let context = self.call.lock().unwrap().context.clone();
+        let frame = validate_and_admit(bytes, &self.representation, true, context.as_ref())?;
+        self.call.lock().unwrap().frames.push(frame);
+        Ok(())
     }
 }
 
@@ -80,7 +137,7 @@ impl BytesPartialDecoderTraits for CheckedInput<dyn BytesPartialDecoderTraits> {
         check_deadline()?;
         let value = self.inner.decode(options)?;
         if let Some(bytes) = &value {
-            validate_and_admit(bytes, &self.representation, true)?;
+            self.admit(bytes)?;
         }
         Ok(value)
     }
@@ -125,7 +182,7 @@ impl AsyncBytesPartialDecoderTraits for CheckedInput<dyn AsyncBytesPartialDecode
         check_deadline()?;
         let value = self.inner.decode(options).await?;
         if let Some(bytes) = &value {
-            validate_and_admit(bytes, &self.representation, true)?;
+            self.admit(bytes)?;
         }
         Ok(value)
     }
