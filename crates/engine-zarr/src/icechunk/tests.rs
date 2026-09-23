@@ -15,6 +15,13 @@ use zarrs::{
 /// External chunk objects and compressed inner chunks exercise the range-read
 /// path used by remote maps (the original tiny fixture is entirely inline).
 async fn fixture(dir: &std::path::Path) -> Repository {
+    fixture_with_codec(dir, Arc::new(GzipCodec::new(1).unwrap())).await
+}
+
+async fn fixture_with_codec(
+    dir: &std::path::Path,
+    codec: Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>,
+) -> Repository {
     let storage = icechunk::new_local_filesystem_storage(dir).await.unwrap();
     let repo = Repository::create(
         Some(RepositoryConfig {
@@ -73,7 +80,7 @@ async fn fixture(dir: &std::path::Path) -> Repository {
         ],
         &data_type::float32(),
     )
-    .bytes_to_bytes_codecs(vec![Arc::new(GzipCodec::new(1).unwrap())])
+    .bytes_to_bytes_codecs(vec![codec])
     .build();
     let array = ArrayBuilder::new(vec![2, 2, 3], vec![2, 2, 3], data_type::float32(), f32::NAN)
         .array_to_bytes_codec(Arc::new(shard))
@@ -111,6 +118,90 @@ fn config(dir: &std::path::Path) -> ZarrConfig {
         force_path_style: None,
     });
     config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blosc_maps_reject_oversized_inner_frames_and_recover_after_refresh() {
+    use zarrs::{
+        array::codec::{BloscCodec, BloscCompressor, BloscShuffleMode},
+        storage::{AsyncReadableStorageTraits, AsyncWritableStorageTraits},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let codec = BloscCodec::new(
+        BloscCompressor::Zstd,
+        1.try_into().unwrap(),
+        None,
+        BloscShuffleMode::BitShuffle,
+        Some(4),
+    )
+    .unwrap();
+    let repo = fixture_with_codec(dir.path(), Arc::new(codec)).await;
+    let engines: Vec<_> = [0, 1]
+        .into_iter()
+        .map(|decoded_mb| {
+            let mut config = config(dir.path());
+            config.icechunk.as_mut().unwrap().decoded_cache_mb = decoded_mb;
+            let engine = ZarrEngine::new("blosc", &config).unwrap();
+            for _ in 0..2 {
+                assert!(render(&engine)
+                    .unwrap()
+                    .values
+                    .iter_values()
+                    .all(|v| v == Some(10.)));
+            }
+            engine
+        })
+        .collect();
+    let writer = AsyncIcechunkStore::new(repo.writable_session("main").await.unwrap());
+    let key = StoreKey::new("temp/c/0/0/0").unwrap();
+    let original = writer.get(&key).await.unwrap().unwrap();
+    let mut corrupt = original.to_vec();
+    // Six inner chunks; the default shard index is six (offset,length) pairs
+    // plus CRC32C at the end. Keep offsets, encoded sizes and the index intact.
+    let index_start = corrupt.len() - (6 * 16 + 4);
+    for chunk in 0..6 {
+        let entry = index_start + chunk * 16;
+        let offset = u64::from_le_bytes(corrupt[entry..entry + 8].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_le_bytes(corrupt[offset + 4..offset + 8].try_into().unwrap()),
+            8
+        );
+        corrupt[offset + 4..offset + 8].copy_from_slice(&16u32.to_le_bytes());
+    }
+    writer.set(&key, corrupt.into()).await.unwrap();
+    writer
+        .session()
+        .write()
+        .await
+        .commit("oversized Blosc inner frames")
+        .execute()
+        .await
+        .unwrap();
+    for engine in &engines {
+        engine.poll_once();
+        assert!(
+            matches!(render(engine), Err(DataServerError::Engine(message))
+            if message.contains("Blosc output does not match"))
+        );
+    }
+    let writer = AsyncIcechunkStore::new(repo.writable_session("main").await.unwrap());
+    writer.set(&key, original).await.unwrap();
+    writer
+        .session()
+        .write()
+        .await
+        .commit("repair inner frames")
+        .execute()
+        .await
+        .unwrap();
+    for engine in &engines {
+        engine.poll_once();
+        assert!(render(engine)
+            .unwrap()
+            .values
+            .iter_values()
+            .all(|v| v == Some(10.)));
+    }
 }
 
 fn render(engine: &ZarrEngine) -> Result<ds_core::map_engine::RasterTile, DataServerError> {

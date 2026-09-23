@@ -33,6 +33,17 @@ struct Held {
 }
 
 impl Context {
+    /// Blosc's serial/getitem scratch scales with the validated block size.
+    /// Retain its allowance through retrieval alongside codec-owned copies.
+    pub(crate) fn codec_scratch(&self, bytes: u64) -> Result<(), DataServerError> {
+        self.held
+            .lock()
+            .unwrap()
+            .permits
+            .push(self.budget.reserve_bytes(bytes)?);
+        Ok(())
+    }
+
     /// Intermediate compressed representations can exceed the native chunk
     /// estimate (nested compression or an outer-compressed shard). Admit their
     /// growing output separately, including a reallocation/copy allowance.
@@ -49,7 +60,7 @@ impl Context {
     }
 
     /// Two copies cover the collected body and zarrs' owned encoded buffer.
-    /// Transport buffers and codec-private allocations are separate estimates.
+    /// Transport buffers and compressor-private contexts are separate estimates.
     pub(crate) fn object(&self, key: &str, size: u64) -> Result<(), DataServerError> {
         let mut held = self.held.lock().unwrap();
         let previous = held.objects.get(key).copied().unwrap_or(0);

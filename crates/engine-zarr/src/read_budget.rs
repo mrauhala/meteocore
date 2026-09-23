@@ -141,7 +141,7 @@ pub fn metrics() -> (u64, u64, u64) {
 // admit all native/conversion buffers together before payload reads.
 // Decode workspace is a conservative four-native-buffer allowance, plus shard
 // index buffers. Encoded reads acquire additional reservations at collection.
-// Codec-private scratch, persistent metadata, caches, and API outputs remain
+// Other codec-private scratch, persistent metadata, caches, and API outputs remain
 // separate from this estimate; it is not an allocator-enforced RSS limit.
 struct Plan {
     source: u64,

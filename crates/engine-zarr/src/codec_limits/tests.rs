@@ -218,7 +218,7 @@ fn native_outputs_use_the_existing_workspace_and_expired_decodes_stay_typed() {
 #[test]
 fn shard_round_trips_preserve_inner_reads_fill_and_metadata_with_outer_compression() {
     let options = crate::catalog::single_threaded_opts();
-    for codec in codecs() {
+    for codec in codecs().into_iter().chain([super::blosc_tests::codec()]) {
         for outer in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let storage = Arc::new(FilesystemStore::new(dir.path()).unwrap());
@@ -282,11 +282,14 @@ fn shard_round_trips_preserve_inner_reads_fill_and_metadata_with_outer_compressi
 #[test]
 fn independent_v2_compressed_fortran_arrays_keep_layout_and_chunk_keys() {
     let options = crate::catalog::single_threaded_opts();
-    for codec in codecs() {
+    for codec in codecs().into_iter().chain([super::blosc_tests::codec()]) {
         let dir = tempfile::tempdir().unwrap();
         let compressor = match codec.kind {
             Kind::Gzip => serde_json::json!({"id":"gzip", "level":1}),
             Kind::Zstd => serde_json::json!({"id":"zstd", "level":1, "checksum":true}),
+            Kind::Blosc => serde_json::json!({
+                "id":"blosc", "cname":"lz4", "clevel":1, "shuffle":1, "blocksize":64
+            }),
         };
         let metadata = serde_json::to_vec(&serde_json::json!({
             "zarr_format":2, "shape":[2,3], "chunks":[2,3],
@@ -312,6 +315,11 @@ fn independent_v2_compressed_fortran_arrays_keep_layout_and_chunk_keys() {
                 writer.finish().unwrap()
             }
             Kind::Zstd => zstd::bulk::compress(&raw, 1).unwrap(),
+            Kind::Blosc => codec
+                .inner
+                .encode(Cow::Borrowed(&raw), &options)
+                .unwrap()
+                .into_owned(),
         };
         std::fs::write(dir.path().join("0.0"), encoded).unwrap();
         let storage = Arc::new(EngineStore::new(Arc::new(
@@ -338,8 +346,17 @@ fn stacked_compression_in_nested_shards_remains_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(FilesystemStore::new(dir.path()).unwrap());
     let [gzip, zstd] = codecs();
+    // The intermediate gzip stream is opaque bytes, not float32 elements.
+    let blosc = BloscCodec::new(
+        zarrs::array::codec::BloscCompressor::LZ4,
+        1.try_into().unwrap(),
+        None,
+        zarrs::array::codec::BloscShuffleMode::NoShuffle,
+        Some(1),
+    )
+    .unwrap();
     let inner = ShardingCodecBuilder::new(vec![2.try_into().unwrap(); 2], &data_type::float32())
-        .bytes_to_bytes_codecs(vec![gzip.inner, zstd.inner])
+        .bytes_to_bytes_codecs(vec![gzip.inner, Arc::new(blosc), zstd.inner])
         .build();
     let outer = ShardingCodecBuilder::new(vec![4.try_into().unwrap(); 2], &data_type::float32())
         .array_to_bytes_codec(Arc::new(inner))
