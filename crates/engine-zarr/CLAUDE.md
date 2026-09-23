@@ -99,8 +99,8 @@ pool: they do not use the Icechunk runtime bridge.
 - **Source memory admission:** `read_budget::BUDGET` is process-wide and
   survives reload/snapshot changes (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB).
   Reserve before variable payload reads: native subset + typed conversion +
-  raw/physical f64 buffers + axes/window overhead + a four-buffer decode/index
-  allowance. Use full stored chunk shapes, not clipped overlaps. Sharded reads
+  raw/physical f64 buffers + axes/window overhead. Cold reads also reserve a
+  four-buffer decode/index allowance. Use full stored chunk shapes, not clipped overlaps. Sharded reads
   account for full-shard fast paths when decoded-cache splitting is absent.
   `Window` owns an `Arc<Permit>` until the last window of its span is dropped;
   position reads hold it through interpolation. Admission fails immediately
@@ -124,11 +124,16 @@ pool: they do not use the Icechunk runtime bridge.
   Other codecs and coordinate discovery are not wrapped.
   Each chunk worker installs a fresh scope with the caller's budget. Never
   attach these permits to resident cache entries or HTTP waiters. Transport and
-  Icechunk internal buffers beyond requested ranges remain outside the estimate. It is not an allocator-enforced memory ceiling. Icechunk
-  admission reserves the largest decode workspace times the admitted fan-out
-  (up to four touched inner chunks). Reduce fan-out as available memory falls;
-  reject only when even one workspace plus the source buffers cannot fit.
-  The returned permit carries the concurrency limit used by the reader.
+  Icechunk internal buffers beyond requested ranges remain outside the estimate.
+  It is not an allocator-enforced memory ceiling. Icechunk reserves source
+  buffers first; `decoded.rs` admits up to four chunks after cache lookup.
+  Hits reserve pinned Vec capacity, misses/bypasses the full decode/index
+  workspace. Keep the exact admitted hit Arc through copying, including if
+  evicted; never relookup and fall back to an unadmitted decode. Release chunk
+  permits after copying, before sampling. Drop unadmitted candidates before
+  batch I/O and reduce fan-out when another slot cannot fit; only rejecting
+  the first slot counts as a failed request. Coalesced misses conservatively
+  retain their workspace. Encoded/codec headroom is still admitted later.
 - **Forecast axes / instances (#337):** with a CF `forecast_reference_time`
   axis AND a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/
   ICON-EU), every run on the reference axis is an EDR instance / WMS
@@ -194,7 +199,7 @@ errors clearly if the table is set without the feature.
   they fit the configured budget. This limits cache-fill expansion, not all
   codec/source memory. Reads process batches no larger than the admitted
   fan-out, bounding both queued work and completed chunks awaiting copying.
-  A single-chunk batch stays on the caller; larger batches use the shared
+  Single-chunk and entirely cached batches stay on the caller; others use the shared
   four-worker pool. Each worker installs/restores the request deadline and
   drives async storage through the persistent Icechunk runtime; decode runs
   off the I/O reactor. All jobs join on errors and unwinding before the

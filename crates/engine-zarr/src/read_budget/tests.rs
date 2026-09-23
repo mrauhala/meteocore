@@ -13,7 +13,7 @@ fn estimate(
     capacity: u64,
 ) -> Result<u64, DataServerError> {
     let plan = plan(array, subset, extra_bytes, split_inner_chunks, capacity)?;
-    Ok(plan.source + plan.workspace)
+    Ok(plan.source + workspace_bytes(array, subset, split_inner_chunks)?)
 }
 
 fn array(shape: Vec<u64>, chunk: Vec<u64>, inner: Option<Vec<u64>>) -> Array<EngineStore> {
@@ -95,23 +95,14 @@ fn sharded_estimate_distinguishes_inner_reads_from_full_shard_fast_path() {
 }
 
 #[test]
-fn parallel_admission_reserves_every_active_workspace_and_reduces_fanout() {
+fn decoded_reads_admit_source_before_looking_up_chunks() {
     let a = array(vec![2, 8, 8], vec![2, 8, 8], Some(vec![2, 2, 2]));
     let subset = a.subset_all();
     let source = 128 * 24;
-    let workspace = 4 * (32 + 256);
-    for slots in 1..=4 {
-        let budget = Arc::new(Budget::new(source + slots * workspace));
-        let permit = budget.reserve(&a, &subset, Some(0), true).unwrap();
-        assert_eq!(permit.parallelism(), slots as usize);
-        assert_eq!(budget.metrics().0, source + slots * workspace);
-        drop(permit);
-        assert_eq!(budget.metrics().0, 0);
-    }
-    let budget = Arc::new(Budget::new(2 * source + 5 * workspace));
+    let budget = Arc::new(Budget::new(2 * source));
     let first = budget.reserve(&a, &subset, Some(0), true).unwrap();
     let second = budget.reserve(&a, &subset, Some(0), true).unwrap();
-    assert_eq!((first.parallelism(), second.parallelism()), (4, 1));
+    assert_eq!((first.parallelism(), second.parallelism()), (4, 4));
     assert_eq!(budget.metrics().0, budget.metrics().1);
     assert!(matches!(
         budget.reserve(&a, &subset, Some(0), true),
@@ -120,11 +111,35 @@ fn parallel_admission_reserves_every_active_workspace_and_reduces_fanout() {
     drop((first, second));
     assert_eq!(budget.metrics().0, 0);
 
-    // A single inner chunk must retain its previous one-workspace estimate.
+    // Workspace admission happens after lookup, even for one inner chunk.
     let one = ArraySubset::new_with_ranges(&[0..1, 0..1, 0..1]);
     let held = budget.reserve(&a, &one, Some(0), true).unwrap();
     assert_eq!(held.parallelism(), 1);
-    assert_eq!(budget.metrics().0, 24 + workspace);
+    assert_eq!(budget.metrics().0, 24);
+}
+
+#[test]
+fn smaller_batches_do_not_count_as_rejected_requests() {
+    let budget = Arc::new(Budget::new(100));
+    let held = budget.reserve_bytes(60).unwrap();
+    assert!(budget.try_reserve_bytes(60).unwrap().is_none());
+    assert_eq!(budget.metrics(), (60, 100, 0));
+    assert!(matches!(
+        budget.reserve_bytes(60),
+        Err(DataServerError::ResourceExhausted)
+    ));
+    assert_eq!(budget.metrics(), (60, 100, 1));
+    drop(held);
+    let held = budget.try_reserve_bytes(100).unwrap().unwrap();
+    assert_eq!(budget.metrics(), (100, 100, 1));
+    assert!(budget.try_reserve_bytes(u64::MAX).unwrap().is_none());
+    drop(held);
+    let _deadline = deadline::enter(Some(std::time::Instant::now()));
+    assert!(matches!(
+        budget.try_reserve_bytes(0),
+        Err(DataServerError::DeadlineExceeded)
+    ));
+    assert_eq!(budget.metrics(), (0, 100, 1));
 }
 
 #[test]

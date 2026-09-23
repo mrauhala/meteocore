@@ -299,3 +299,103 @@ fn concurrent_requests_share_the_worker_limit() {
     assert_eq!(probe.active.load(Ordering::SeqCst), 0);
     assert_eq!(budget.metrics().0, 0);
 }
+
+#[test]
+fn tight_budgets_reduce_cold_and_mixed_batches_without_rejecting() {
+    let _exclusive = GATED_TESTS.lock().unwrap();
+    for cached_first in [false, true] {
+        for slots in 1..=3 {
+            let dir = tempfile::tempdir().unwrap();
+            let original = super::tests::fixture(dir.path(), "/a", false, 0.0);
+            let subset = original.subset_all();
+            let options = crate::catalog::single_threaded_opts();
+            let expected = read_native(&original, &subset, &options).unwrap();
+            let cache = Arc::new(DecodedCache::new(if cached_first { MIB } else { 0 }));
+            if cached_first {
+                let reader =
+                    DecodedArray::new(&original, Some("snapshot"), "a", cache.clone()).unwrap();
+                reader
+                    .read(
+                        &original,
+                        &ArraySubset::new_with_ranges(&[0..1, 0..1, 0..1]),
+                        &options,
+                        1,
+                    )
+                    .unwrap();
+            }
+            // 105 source values; each cold chunk needs four 192-byte native
+            // buffers and the probe's two 16-byte encoded buffers. Padding
+            // counts even for the missing edge chunks.
+            let budget = Arc::new(Budget::new(2520 + slots * (768 + 32)));
+            let (started, ready) = mpsc::channel();
+            let probe = Arc::new(Probe {
+                deadline: None,
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                started,
+                open: Mutex::new(false),
+                wake: Condvar::new(),
+                budget: budget.clone(),
+                outcome: Outcome::Success,
+            });
+            let array = Array::open(
+                Arc::new(EngineStore::new(ProbedStore {
+                    inner: original.storage().clone(),
+                    probe: probe.clone(),
+                })),
+                "/a",
+            )
+            .unwrap();
+            let reader = DecodedArray::new(&array, Some("snapshot"), "a", cache).unwrap();
+            let source = budget.reserve(&array, &subset, Some(0), true).unwrap();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let _encoded = crate::encoded::enter(Some(budget.clone()));
+                    reader.read(&array, &subset, &options, source.parallelism())
+                });
+                // With a cached first chunk, its pin uses part of the first
+                // batch's capacity; later all-cold batches reach `slots`.
+                let first_batch = if cached_first {
+                    (slots - 1).max(1)
+                } else {
+                    slots
+                };
+                for _ in 0..first_batch {
+                    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                assert_eq!(probe.active.load(Ordering::SeqCst), first_batch as usize);
+                assert_eq!(budget.metrics().2, 0);
+                *probe.open.lock().unwrap() = true;
+                probe.wake.notify_all();
+                assert_eq!(
+                    worker
+                        .join()
+                        .unwrap()
+                        .unwrap()
+                        .into_fixed()
+                        .unwrap()
+                        .as_ref(),
+                    expected
+                );
+            });
+            assert!(probe.peak.load(Ordering::SeqCst) <= slots as usize);
+            assert!(
+                probe.calls.load(Ordering::SeqCst) > slots as usize,
+                "multiple batches must complete"
+            );
+            assert_eq!(
+                budget.metrics().0,
+                2520,
+                "chunk reservations end before sampling"
+            );
+            assert_eq!(
+                budget.metrics().2,
+                0,
+                "reducing a batch is not a rejected request"
+            );
+            drop(source);
+            assert_eq!(budget.metrics().0, 0);
+        }
+    }
+}

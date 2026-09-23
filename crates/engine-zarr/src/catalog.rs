@@ -1382,28 +1382,40 @@ mod tests {
 
     #[test]
     fn window_span_keeps_reservation_until_last_window_is_dropped() {
-        let budget = Arc::new(Budget::new(ds_cache::MIB));
-        let catalog = fixture(budget.clone());
-        let mut windows = catalog
-            .read_window_span(&catalog.vars[0], None, 0..3, catalog.extent)
-            .unwrap()
-            .unwrap();
-        let used = budget.metrics().0;
-        assert!(used > 0);
-        let last = windows.pop().unwrap();
-        drop(windows);
-        assert_eq!(budget.metrics().0, used);
-        assert!(last.sample(5.5, 54.5).is_some());
-        drop(last);
-        assert_eq!(budget.metrics().0, 0);
-        catalog
-            .sample_series(&catalog.vars[0], None, 5.5, 54.5, &[0, 1])
-            .unwrap();
-        assert_eq!(
-            budget.metrics().0,
-            0,
-            "position read releases its working set"
-        );
+        for decoded in [false, true] {
+            let budget = Arc::new(Budget::new(ds_cache::MIB));
+            let mut catalog = fixture(budget.clone());
+            if decoded {
+                for var in &mut catalog.vars {
+                    var.decoded = DecodedArray::new(
+                        &var.array,
+                        Some("snapshot"),
+                        &var.name,
+                        Arc::new(DecodedCache::new(ds_cache::MIB)),
+                    );
+                }
+            }
+            let mut windows = catalog
+                .read_window_span(&catalog.vars[0], None, 0..3, catalog.extent)
+                .unwrap()
+                .unwrap();
+            let used = budget.metrics().0;
+            assert!(used > 0);
+            let last = windows.pop().unwrap();
+            drop(windows);
+            assert_eq!(budget.metrics().0, used);
+            assert!(last.sample(5.5, 54.5).is_some());
+            drop(last);
+            assert_eq!(budget.metrics().0, 0);
+            catalog
+                .sample_series(&catalog.vars[0], None, 5.5, 54.5, &[0, 1])
+                .unwrap();
+            assert_eq!(
+                budget.metrics().0,
+                0,
+                "position read releases its working set"
+            );
+        }
     }
 
     #[test]

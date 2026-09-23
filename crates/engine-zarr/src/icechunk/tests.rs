@@ -449,7 +449,7 @@ async fn decoded_cache_hits_need_no_encoded_reservation_and_misses_keep_typed_er
             Err(DataServerError::ResourceExhausted)
         ));
     }
-    // A rejected fill must release its placeholder so a later admitted read works.
+    // A rejected admission must not poison a later cache fill.
     let expected = reader
         .read(&array, &subset, &options, 4)
         .unwrap()
@@ -457,6 +457,9 @@ async fn decoded_cache_hits_need_no_encoded_reservation_and_misses_keep_typed_er
         .unwrap()
         .into_owned();
     std::fs::remove_dir_all(dir.path().join("chunks")).unwrap();
+    // All six cached 8-byte inner chunks fit, but even one cold read's
+    // native/index workspace (416 bytes) cannot. No encoded payloads remain.
+    let budget = Arc::new(Budget::new(48));
     let _scope = encoded::enter(Some(budget.clone()));
     let actual = reader
         .read(&array, &subset, &options, 4)
@@ -900,6 +903,7 @@ async fn chunk_concurrency_latency_probe() {
             .reserve(&array, &subset, Some(0), true)
             .unwrap();
         assert!(permit.parallelism() >= parallelism);
+        let _encoded = crate::encoded::enter(Some(crate::read_budget::BUDGET.clone()));
         let started = std::time::Instant::now();
         let bytes = reader
             .read(
