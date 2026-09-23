@@ -302,13 +302,16 @@
         checkbox.addEventListener('change', function () {
             state.enabled = checkbox.checked;
             card.classList.toggle('active', state.enabled);
+            if (state.enabled && !state.hasZoomed && collection.spatial_extent) {
+                // Reach the initial viewport before showing the source. Flying
+                // with it visible requests intermediate zoom levels as well as
+                // the final tiles, multiplying cold reads for large grids.
+                fitMapToExtent(collection.spatial_extent, false);
+                state.hasZoomed = true;
+            }
             layerHandles.forEach(function (h) {
                 h.setVisible(state.enabled);
             });
-            if (state.enabled && !state.hasZoomed && collection.spatial_extent) {
-                fitMapToExtent(collection.spatial_extent);
-                state.hasZoomed = true;
-            }
         });
 
         return li;
@@ -323,11 +326,11 @@
         dl.appendChild(dd);
     }
 
-    function fitMapToExtent(extent) {
+    function fitMapToExtent(extent, animate = true) {
         const south = Math.max(extent[1], -85);
         const north = Math.min(extent[3], 85);
         const bounds = new maplibregl.LngLatBounds([extent[0], south], [extent[2], north]);
-        map.fitBounds(bounds, { padding: 80, maxZoom: 10, duration: 600 });
+        map.fitBounds(bounds, { padding: 80, maxZoom: 10, duration: 600, animate });
     }
 
     function formatExtent(e) {

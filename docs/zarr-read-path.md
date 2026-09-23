@@ -122,6 +122,56 @@ The map-cache probe also passed on the same snapshot after this change: decoded 
 
 The bounded gzip/zstd change passed the map-cache probe on 2026-09-23 against snapshot `4E5WWS7GJXT83MVQF260`. All configurations produced identical pixels. Warm decoded repeat/pan/next-lead reads were 4/4/4 ms, and payload-only reads were 66/67/66 ms. The decoded-cache cold read took 2,303 ms and retained one 14,113,186-byte entry. These debug-build observations are consistent with earlier warm-read timings; they are not a controlled before/after benchmark or a GRIB comparison.
 
+## ICON-EU production preview burst
+
+On 2026-09-23, the deployed image at `dee3cc4` (through #783) exposed a
+separate concurrency problem. Enabling ICON-EU in a fresh `/preview` tab
+generated 57 tile requests across zoom levels 2, 3 and 4 in roughly 0.6 seconds.
+Six failed with 503 in 0.223–2.784 ms. Zarr admission rejections increased;
+render deadline and render queue rejection counters did not. The source budget
+was the default 1 GiB; configured `MC_RENDER_MEMORY_MB=4096` controls a separate
+output budget. The host had about 40 GiB available at the measurement time.
+
+A controlled six-request burst bypassed the rendered-image cache with
+`parameter-name=temperature_2m&datetime=2026-09-27T21%3A00%3A00Z`. Relative to
+`/tiles/collections/dwd-icon-eu/tiles/WebMercatorQuad/`, the requests were
+`3/3/5`, `3/3/3`, `3/3/4`, `3/2/3`, `4/5/7`, and `4/4/9`.
+Four returned 200/MISS in 50.5–176.1 ms; the last two returned 503 in 3.3 and
+1.0 ms. Sampling at approximately 25 ms observed 972.38 MiB reserved; the
+instantaneous peak may have been higher. Both rejected tiles then succeeded
+sequentially with 200/MISS in 74.6 and 79.4 ms. This isolates admission under
+concurrency, not cold-S3 latency: decoded and compressed caches can still help
+render-cache misses. Reservations returned to zero after the burst.
+
+Startup diagnostics reported float32 inner chunks `[1,93,219,153]` inside
+`[1,93,657,1377]` shards for all four ICON-EU parameters. A public metadata read
+at snapshot `B3FKRVXJG1TVZ3RFGTN0` confirmed these shapes and one inner Blosc
+stage (`cname=zstd`) for temperature and precipitation. Each 11.89 MiB decoded
+chunk spans all 93 forecast leads. The 27 spatial chunks need 320.95 MiB per
+parameter/run before entry overhead, while the default 256 MiB decoded cache
+holds only 21. Broad views and parameter switches can therefore evict useful
+chunks. Neither the serial-path change in #784 nor the stacked-Blosc estimate
+change in #785 addresses this ordinary, single-Blosc inner-chunk layout.
+
+The preview now fits the collection extent without animation before making
+its layers visible on first enable. Re-enabling leaves the current view alone;
+the explicit "Zoom to extent" action remains animated. A local browser smoke
+check with the shipped MapLibre, ICON-EU manifest extent, and synthetic PNG
+responses requested zoom levels 2/3/4 before the change and only level 4 after.
+This removes intermediate-view work, but the six-request production result
+shows that backend admission still needs attention.
+
+Remaining operational experiments are a larger `MC_ZARR_READ_MEMORY_MB` and
+ICON-EU decoded cache, with memory/latency monitoring and the same burst replay.
+512 MiB can retain approximately one complete parameter/run; 1536 MiB can
+retain approximately all four. These are sizing estimates, not tested production
+settings. The original logs also contained 19 render timeouts near the default
+three-second deadline; increasing that timeout alone cannot fix millisecond
+admission failures. Cross-request admission and tighter estimates remain #777;
+rejection-stage visibility, cold stage timings, and release-build concurrent
+benchmarks belong to #778. Source-bound request filtering needs care where a
+collection's reported extent changes with time or parameter.
+
 ## Remaining review work
 
 1. [#777](https://github.com/mrauhala/meteocore/issues/777): encoded/intermediate allowances now release between stored chunks on serial reads, and Blosc scratch releases after each decoder call. Stacked Blosc chains prepay peak scratch rather than the sum of sequential calls. Further shortening within a single chunk's codec/index chain still needs an ownership proof. Coalesced decoded waiters avoid duplicate cold allowances, and replacement owners must pass admission. Common cold layouts prepay encoded/intermediate/scratch headroom; unknown or oversized estimates use serial actual-size admission. More precise size estimates and additional layouts can improve concurrency. Compressor-private contexts, other codecs, and coordinate/metadata discovery remain outside these explicit bounds.

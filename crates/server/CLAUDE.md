@@ -190,6 +190,11 @@ and `render_deadline_exceeded_total` are exposed in /metrics and Grafana.
   `MapEngine::default_time()`. The slider selects it rather than the last
   value; preview time-window filtering must preserve that default (CAP's
   active-now view can precede future warning boundaries).
+- First enabling a preview collection fits its extent without animation,
+  before setting its layers visible. Keep that order: a visible source during
+  the initial flight requests intermediate zoom levels and can exhaust cold
+  Icechunk read admission. Re-enabling preserves the current view; the explicit
+  "Zoom to extent" action remains animated.
 
 ## Remote radar startup recovery (#190)
 
