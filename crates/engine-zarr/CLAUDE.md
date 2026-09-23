@@ -111,6 +111,12 @@ pool: they do not use the Icechunk runtime bridge.
   before collection. Plain storage admits GET response sizes and cache hits;
   Icechunk admits immutable full/range lengths before launching reads. Keep
   scopes through native retrieval, because zarrs copies Bytes into codec Vecs.
+  Plain/outer-transform reads use `retrieval::serial`: one scope per stored
+  chunk, released after its synchronous decode-into call. Keep all inner/index
+  allowances through that call, including nested shards and outer compression.
+  Never clear a live context between codec calls. The single output view borrows
+  its destination exclusively until the call returns; keep the serial options
+  and upstream partial/full-shard paths, without extra chunk buffers or fetches.
   Gzip/zstd/Blosc fixed outputs use the native workspace; bounded intermediate
   outputs add two-copy capacity admission through the same scope before growth.
   Do not trust frame headers to increase codec output limits. Preserve typed

@@ -22,6 +22,7 @@ mod encoded;
 #[cfg(feature = "icechunk")]
 mod icechunk;
 pub mod read_budget;
+mod retrieval;
 #[cfg(feature = "icechunk")]
 mod runtime;
 mod source;

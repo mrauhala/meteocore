@@ -281,6 +281,7 @@ fn shard_round_trips_preserve_inner_reads_fill_and_metadata_with_outer_compressi
 
 #[test]
 fn independent_v2_compressed_fortran_arrays_keep_layout_and_chunk_keys() {
+    use zarrs::array::FromArrayBytes;
     let options = crate::catalog::single_threaded_opts();
     for codec in codecs().into_iter().chain([super::blosc_tests::codec()]) {
         let dir = tempfile::tempdir().unwrap();
@@ -292,7 +293,7 @@ fn independent_v2_compressed_fortran_arrays_keep_layout_and_chunk_keys() {
             }),
         };
         let metadata = serde_json::to_vec(&serde_json::json!({
-            "zarr_format":2, "shape":[2,3], "chunks":[2,3],
+            "zarr_format":2, "shape":[2,6], "chunks":[2,3],
             "dtype":"<f4", "compressor":compressor, "fill_value":-999,
             "order":"F", "filters":null, "dimension_separator":"."
         }))
@@ -321,19 +322,30 @@ fn independent_v2_compressed_fortran_arrays_keep_layout_and_chunk_keys() {
                 .unwrap()
                 .into_owned(),
         };
-        std::fs::write(dir.path().join("0.0"), encoded).unwrap();
+        std::fs::write(dir.path().join("0.0"), &encoded).unwrap();
+        std::fs::write(dir.path().join("0.1"), &encoded).unwrap();
         let storage = Arc::new(EngineStore::new(Arc::new(
             FilesystemStore::new(dir.path()).unwrap(),
         )));
         let array = bounded_array(Array::open(storage, "/").unwrap()).unwrap();
-        let values: Vec<f32> = array
-            .retrieve_array_subset_opt(&array.subset_all(), &options)
-            .unwrap();
-        assert_eq!(values, [0., 1., 2., 3., 4., 5.]);
-        let values: Vec<f32> = array
-            .retrieve_array_subset_opt(&ArraySubset::new_with_ranges(&[0..2, 1..3]), &options)
-            .unwrap();
-        assert_eq!(values, [1., 2., 4., 5.]);
+        let budget = Arc::new(crate::read_budget::Budget::new(ds_cache::MIB));
+        let _scope = crate::encoded::enter(Some(budget.clone()));
+        for (subset, expected) in [
+            (
+                array.subset_all(),
+                vec![0., 1., 2., 0., 1., 2., 3., 4., 5., 3., 4., 5.],
+            ),
+            (
+                ArraySubset::new_with_ranges(&[0..2, 1..5]),
+                vec![1., 2., 0., 1., 4., 5., 3., 4.],
+            ),
+        ] {
+            let bytes = crate::retrieval::serial(&array, &subset, &options).unwrap();
+            let values =
+                Vec::<f32>::from_array_bytes(bytes, subset.shape(), array.data_type()).unwrap();
+            assert_eq!(values, expected);
+            assert_eq!(budget.metrics().0, 0);
+        }
         assert_eq!(array.attributes()["units"], "K");
         assert_eq!(std::fs::read(dir.path().join(".zarray")).unwrap(), metadata);
         assert!(!dir.path().join("zarr.json").exists());
