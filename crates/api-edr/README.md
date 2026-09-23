@@ -137,8 +137,10 @@ resident decoded bytes separately from the compressed payload cache (default
 their own wait deadlines; unsupported or oversized chunks use ordinary reads.
 Zarr and Icechunk position/area/radius reads also share process-wide source
 memory admission (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB). It reserves the
-native subset, conversion/window buffers, and a decode-workspace estimate
-before payload I/O. A read that cannot fit, including concurrent contention,
+native subset and conversion/window buffers before payload I/O. Cold chunks
+also reserve a decode-workspace estimate; decoded hits reserve only the
+capacity of the buffer held through copying, including if evicted meanwhile.
+A read that cannot fit, including concurrent contention,
 returns 503 without waiting while holding other windows. Area windows retain
 their reservation through sampling. This budget is separate from response
 limits, resident caches, and persistent metadata. Encoded full-object/range
@@ -158,7 +160,9 @@ and transport/internal storage buffers remain outside the estimate;
 it is not an RSS limit.
 Icechunk reads process up to four inner chunks concurrently through a shared
 four-worker pool, even with decoded retention disabled. Admission reserves
-each active decode workspace and reduces concurrency when memory is tight.
+each active cold workspace or cached buffer and reduces concurrency when
+memory is tight. These chunk reservations end after copying into the source
+window; the window's reservation remains through sampling.
 Worker deadlines and reservations remain attached until all chunk jobs finish,
 including error and cancellation paths. Plain Zarr and shards with outer
 transforms retain serial retrieval.

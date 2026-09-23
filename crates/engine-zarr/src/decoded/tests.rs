@@ -108,6 +108,97 @@ fn cache_keys_separate_arrays_and_snapshots() {
 }
 
 #[test]
+fn cached_windows_fit_without_cold_workspace_and_release_batch_reservations() {
+    use crate::{encoded, read_budget::Budget};
+
+    for sharded in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let array = fixture(dir.path(), "/a", sharded, 0.0);
+        let array = crate::codec_limits::bounded_array(array).unwrap();
+        let subset = array.subset_all();
+        let cache = Arc::new(DecodedCache::new(MIB));
+        let reader = DecodedArray::new(&array, Some("snapshot"), "a", cache.clone()).unwrap();
+        // The 105-value f32 window needs 2520 bytes for native/conversion
+        // buffers. Another 192 bytes can pin the largest cached chunk, but
+        // cannot admit a cold decode (including full padded shapes/indexes).
+        let budget = Arc::new(Budget::new(2520 + 192));
+        let source = budget.reserve(&array, &subset, Some(0), true).unwrap();
+        {
+            let _scope = encoded::enter(Some(budget.clone()));
+            assert!(matches!(
+                reader.read(&array, &subset, &crate::catalog::single_threaded_opts(), 4),
+                Err(DataServerError::ResourceExhausted)
+            ));
+        }
+        assert_eq!(budget.metrics(), (2520, 2712, 1));
+        assert_eq!(
+            cache.metrics().misses,
+            0,
+            "reject before attempting a cache fill"
+        );
+
+        let expected = read(&reader, &array, &subset);
+        let chunks = cache.metrics().misses;
+        std::fs::remove_dir_all(dir.path().join("a")).unwrap();
+        {
+            let _scope = encoded::enter(Some(budget.clone()));
+            assert_eq!(read(&reader, &array, &subset), expected);
+        }
+        assert_eq!(
+            cache.metrics().hits,
+            chunks,
+            "one hit per chunk, including retried batch slots"
+        );
+        assert_eq!(
+            budget.metrics(),
+            (2520, 2712, 1),
+            "only source buffers survive the read"
+        );
+        drop(source);
+        assert_eq!(budget.metrics().0, 0);
+    }
+}
+
+#[test]
+fn admitted_cached_buffer_survives_eviction_without_a_cold_read() {
+    use crate::{encoded, read_budget::Budget};
+
+    let dir = tempfile::tempdir().unwrap();
+    let array = fixture(dir.path(), "/a", true, 0.0);
+    let subset = ArraySubset::new_with_ranges(&[0..1, 0..1, 0..1]);
+    let cache = Arc::new(DecodedCache::new(MIB));
+    let reader = DecodedArray::new(&array, Some("snapshot"), "a", cache.clone()).unwrap();
+    assert_eq!(read(&reader, &array, &subset), vec![0.0]);
+    let budget = Arc::new(Budget::new(32));
+    let mut prepared = reader
+        .prepare_chunk(&array, &subset, vec![0, 0, 0], 4)
+        .unwrap();
+    prepared.permit = Some(
+        budget
+            .reserve_bytes(prepared.reservation_bytes(&array).unwrap())
+            .unwrap(),
+    );
+    assert_eq!(budget.metrics(), (32, 32, 0));
+    cache.0.retain(|_, _| false);
+    assert_eq!(cache.metrics().bytes, 0);
+    std::fs::remove_dir_all(dir.path().join("a")).unwrap();
+    let _scope = encoded::enter(Some(budget.clone()));
+    let loaded = reader
+        .load_chunk(&array, &crate::catalog::single_threaded_opts(), prepared)
+        .unwrap();
+    assert_eq!(&loaded.bytes[..4], &0.0f32.to_ne_bytes());
+    assert_eq!(
+        budget.metrics(),
+        (32, 32, 0),
+        "pin remains charged after eviction and loading"
+    );
+    assert_eq!(cache.metrics().hits, 1);
+    assert_eq!(cache.metrics().misses, 1);
+    drop(loaded);
+    assert_eq!(budget.metrics().0, 0);
+}
+
+#[test]
 fn cache_eviction_and_oversized_bypass_preserve_pixels() {
     let dir = tempfile::tempdir().unwrap();
     let array = fixture(dir.path(), "/a", true, 0.0);

@@ -38,26 +38,40 @@ impl Budget {
         )
     }
 
-    /// Additional encoded storage or intermediate codec capacity. Never wait
-    /// while holding a native window.
+    /// Transient chunk, encoded storage or intermediate codec capacity. Never
+    /// wait while holding a native window.
     pub(crate) fn reserve_bytes(
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<Arc<Permit>, DataServerError> {
+        self.try_reserve_bytes(bytes)?.ok_or_else(|| self.reject())
+    }
+
+    /// Probe another batch slot without counting reduced fan-out as a rejected
+    /// request. The caller must reject if even the first slot cannot fit.
+    pub(crate) fn try_reserve_bytes(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<Option<Arc<Permit>>, DataServerError> {
         deadline::check()?;
-        self.used
+        let reserved = self
+            .used
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|&n| n <= self.capacity)
             })
-            .map_err(|_| {
-                self.rejected.fetch_add(1, Ordering::Relaxed);
-                DataServerError::ResourceExhausted
-            })?;
-        Ok(Arc::new(Permit {
-            budget: self.clone(),
-            bytes,
-            parallelism: 1,
+            .is_ok();
+        Ok(reserved.then(|| {
+            Arc::new(Permit {
+                budget: self.clone(),
+                bytes,
+                parallelism: 1,
+            })
         }))
+    }
+
+    pub(crate) fn reject(&self) -> DataServerError {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        DataServerError::ResourceExhausted
     }
 
     /// Fail fast: callers already own an executor slot, and may hold another
@@ -79,30 +93,19 @@ impl Budget {
                 split_inner_chunks,
                 self.capacity,
             )?;
-            let mut parallelism = 1;
-            let mut bytes = 0;
+            let bytes = plan
+                .source
+                .checked_add(plan.workspace)
+                .ok_or(DataServerError::ResourceExhausted)?;
             self.used
                 .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                    // Reduce fan-out when memory is tight, down to the same
-                    // single-decode admission required by the serial path.
-                    let available = self.capacity.checked_sub(used)?.checked_sub(plan.source)?;
-                    parallelism = available
-                        .checked_div(plan.workspace)
-                        .unwrap_or(u64::MAX)
-                        .min(plan.parallelism as u64) as usize;
-                    if parallelism == 0 {
-                        return None;
-                    }
-                    bytes = plan
-                        .source
-                        .checked_add(plan.workspace.checked_mul(parallelism as u64)?)?;
-                    used.checked_add(bytes)
+                    used.checked_add(bytes).filter(|&n| n <= self.capacity)
                 })
                 .map_err(|_| DataServerError::ResourceExhausted)?;
             Ok(Arc::new(Permit {
                 budget: self.clone(),
                 bytes,
-                parallelism,
+                parallelism: plan.parallelism,
             }))
         })();
         if matches!(result, Err(DataServerError::ResourceExhausted)) {
@@ -119,6 +122,8 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
+    /// Requested fan-out limit for a source reservation. The decoded reader
+    /// must still admit each chunk separately after cache lookup.
     pub(crate) fn parallelism(&self) -> usize {
         self.parallelism
     }
@@ -139,8 +144,9 @@ pub fn metrics() -> (u64, u64, u64) {
 // Account for native subset bytes + a typed conversion copy + raw f64 + the
 // physical f64 sampling window. Some lifetimes do not overlap: deliberately
 // admit all native/conversion buffers together before payload reads.
-// Decode workspace is a conservative four-native-buffer allowance, plus shard
-// index buffers. Encoded reads acquire additional reservations at collection.
+// The decoded reader admits chunk buffers separately after the cache lookup;
+// other paths reserve one decode workspace together with the source window.
+// Encoded reads acquire additional reservations at collection.
 // Other codec-private scratch, persistent metadata, caches, and API outputs remain
 // separate from this estimate; it is not an allocator-enforced RSS limit.
 struct Plan {
@@ -162,6 +168,44 @@ fn plan(
         .checked_add(extra_bytes)
         .filter(|&n| n <= capacity)
         .ok_or_else(exhausted)?;
+    let workspace = if split_inner_chunks {
+        0
+    } else {
+        workspace_bytes(array, subset, false)?
+    };
+    let parallelism = if split_inner_chunks {
+        array
+            .subchunk_grid()
+            .chunks_in_array_subset(subset)
+            .map_err(|_| exhausted())?
+            .map_or(1, |chunks| {
+                chunks
+                    .indices()
+                    .into_iter()
+                    .take(crate::decoded::MAX_PARALLEL_CHUNKS)
+                    .count()
+                    .max(1)
+            })
+    } else {
+        1
+    };
+    Ok(Plan {
+        source,
+        workspace,
+        parallelism,
+    })
+}
+
+/// Four native/index buffers for a cold read. Use full stored shapes even
+/// when the requested region clips a padded chunk. Cached reads skip this
+/// estimate and instead reserve the capacity of the buffer they keep alive.
+pub(crate) fn workspace_bytes(
+    array: &Array<EngineStore>,
+    subset: &ArraySubset,
+    split_inner_chunks: bool,
+) -> Result<u64, DataServerError> {
+    let exhausted = || DataServerError::ResourceExhausted;
+    let native = array.data_type().fixed_size().ok_or_else(exhausted)? as u64;
     let chunks = array
         .chunks_in_array_subset(subset)
         .map_err(|_| exhausted())?
@@ -203,34 +247,9 @@ fn plan(
             .checked_add(index)
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(exhausted)?;
-        // A worker holds at most one inner chunk. Multiply the largest
-        // workspace by the admitted worker count when acquiring the permit.
         workspace = workspace.max(current);
-        if source.checked_add(workspace).is_none_or(|n| n > capacity) {
-            return Err(exhausted());
-        }
     }
-    let parallelism = if split_inner_chunks {
-        array
-            .subchunk_grid()
-            .chunks_in_array_subset(subset)
-            .map_err(|_| exhausted())?
-            .map_or(1, |chunks| {
-                chunks
-                    .indices()
-                    .into_iter()
-                    .take(crate::decoded::MAX_PARALLEL_CHUNKS)
-                    .count()
-                    .max(1)
-            })
-    } else {
-        1
-    };
-    Ok(Plan {
-        source,
-        workspace,
-        parallelism,
-    })
+    Ok(workspace)
 }
 
 fn bytes(shape: &[u64], element_size: u64) -> Result<u64, DataServerError> {

@@ -7,7 +7,10 @@ use ds_core::{deadline, error::DataServerError};
 use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArrayShardedExt, ArraySubset, ChunkGrid, CodecOptions};
 
-use crate::store::EngineStore;
+use crate::{
+    read_budget::{workspace_bytes, Permit},
+    store::EngineStore,
+};
 
 // Never expand a tiny subset into an arbitrarily large cache fill. Oversized
 // chunks retain the ordinary partial-read path, without decoded retention.
@@ -57,6 +60,34 @@ pub(crate) struct DecodedArray {
     grid: ChunkGrid,
 }
 
+struct PreparedChunk {
+    source: ArraySubset,
+    key: Option<Key>,
+    cached: Option<Arc<Vec<u8>>>,
+    // Keep the pin/decode allowance until loading fails or transfers it to
+    // LoadedChunk. Field order also releases a cached Arc before its permit.
+    permit: Option<Arc<Permit>>,
+}
+
+impl PreparedChunk {
+    fn reservation_bytes(&self, array: &Array<EngineStore>) -> Result<u64, DataServerError> {
+        if let Some(bytes) = &self.cached {
+            // A resident entry may be evicted while this read holds its Arc.
+            // Charge the actual pinned capacity, without decode/index workspace.
+            Ok(bytes.capacity() as u64)
+        } else {
+            workspace_bytes(array, &self.source, true)
+        }
+    }
+}
+
+struct LoadedChunk {
+    bytes: Arc<Vec<u8>>,
+    source: ArraySubset,
+    // Drop the buffer before releasing its reservation, including on errors.
+    _permit: Option<Arc<Permit>>,
+}
+
 impl DecodedArray {
     pub(crate) fn new(
         array: &Array<EngineStore>,
@@ -92,60 +123,96 @@ impl DecodedArray {
             .fixed_size()
             .ok_or_else(|| error("non-numeric chunk"))?;
         let length = byte_length(subset.shape(), size)?;
+        let budget = crate::encoded::current().map(|context| context.budget.clone());
         let Some(chunks) = self.grid.chunks_in_array_subset(subset).map_err(error)? else {
+            let _workspace = budget
+                .as_ref()
+                .map(|budget| {
+                    let bytes = workspace_bytes(array, subset, false).map_err(|err| match err {
+                        DataServerError::ResourceExhausted => budget.reject(),
+                        err => err,
+                    })?;
+                    budget.reserve_bytes(bytes)
+                })
+                .transpose()?;
             return read_native(array, subset, options).map(ArrayBytes::new_flen);
         };
         let mut output = vec![0; length];
-        let mut indices = chunks.indices().into_iter();
+        let mut indices = chunks.indices().into_iter().peekable();
         let parallelism = parallelism.clamp(1, MAX_PARALLEL_CHUNKS);
         let end = deadline::current();
-        let budget = crate::encoded::current().map(|context| context.budget.clone());
         loop {
             deadline::check()?;
             // Bound queued jobs and completed-but-not-copied buffers as well
             // as active decodes. Never collect all chunks of a large window.
-            let batch: Vec<_> = indices
-                .by_ref()
-                .take(parallelism)
-                .map(|indices| indices.to_vec())
-                .collect();
+            let mut batch = Vec::with_capacity(parallelism);
+            while batch.len() < parallelism {
+                let Some(next) = indices.peek() else { break };
+                let mut chunk = self.prepare_chunk(array, subset, next.to_vec(), size)?;
+                chunk.permit = if let Some(budget) = &budget {
+                    let bytes = chunk.reservation_bytes(array).map_err(|err| match err {
+                        DataServerError::ResourceExhausted => budget.reject(),
+                        err => err,
+                    })?;
+                    let Some(permit) = budget.try_reserve_bytes(bytes)? else {
+                        if batch.is_empty() {
+                            return Err(budget.reject());
+                        }
+                        // Drop this unadmitted Arc before I/O. Retry its index
+                        // after copying and releasing the current batch.
+                        break;
+                    };
+                    Some(permit)
+                } else {
+                    None
+                };
+                batch.push(chunk);
+                indices.next();
+            }
             if batch.is_empty() {
                 break;
             }
-            let load = |indices: Vec<u64>| {
+            let load = |chunk| {
                 let _deadline = deadline::enter(end);
                 let _encoded = crate::encoded::enter(budget.clone());
-                self.read_chunk(array, subset, options, indices, size)
+                self.load_chunk(array, options, chunk)
             };
-            let results: Vec<_> = if batch.len() == 1 {
-                batch.into_iter().map(load).collect()
-            } else {
-                // install joins every job even on failure/unwind. The caller
-                // owns its memory permit until workers and results are gone.
-                READERS
-                    .as_ref()
-                    .map_err(error)?
-                    .install(|| batch.into_par_iter().map(load).collect())
-            };
+            let results: Vec<_> =
+                if batch.len() == 1 || batch.iter().all(|chunk| chunk.cached.is_some()) {
+                    batch.into_iter().map(load).collect()
+                } else {
+                    // install joins every job even on failure/unwind. The caller
+                    // and each result retain their reservations until copying.
+                    READERS
+                        .as_ref()
+                        .map_err(error)?
+                        .install(|| batch.into_par_iter().map(load).collect())
+                };
             deadline::check()?;
             for result in results {
-                let (bytes, source) = result?;
-                let overlap = source.overlap(subset).map_err(error)?;
-                copy_overlap(&bytes, &source, &mut output, subset, &overlap, size)?;
+                let chunk = result?;
+                let overlap = chunk.source.overlap(subset).map_err(error)?;
+                copy_overlap(
+                    &chunk.bytes,
+                    &chunk.source,
+                    &mut output,
+                    subset,
+                    &overlap,
+                    size,
+                )?;
             }
         }
         deadline::check()?;
         Ok(ArrayBytes::new_flen(output))
     }
 
-    fn read_chunk(
+    fn prepare_chunk(
         &self,
         array: &Array<EngineStore>,
         subset: &ArraySubset,
-        options: &CodecOptions,
         indices: Vec<u64>,
         size: usize,
-    ) -> Result<(Arc<Vec<u8>>, ArraySubset), DataServerError> {
+    ) -> Result<PreparedChunk, DataServerError> {
         deadline::check()?;
         let chunk = self
             .grid
@@ -164,26 +231,59 @@ impl DecodedArray {
             && (chunk_length as u64).saturating_add(overhead(&key))
                 <= self.cache.0.capacity_bytes();
         if !eligible {
-            let overlap = chunk.overlap(subset).map_err(error)?;
-            return Ok((Arc::new(read_native(array, &overlap, options)?), overlap));
+            return Ok(PreparedChunk {
+                source: chunk.overlap(subset).map_err(error)?,
+                key: None,
+                cached: None,
+                permit: None,
+            });
         }
-        let end = deadline::current();
-        let wait = end.map_or(Duration::from_secs(30), |end| {
-            end.saturating_duration_since(Instant::now())
-        });
-        let bytes = self.cache.0.get_or_insert_with_timeout(
-            &key,
-            wait,
-            || read_native(array, &chunk, options).map(Arc::new),
-            || {
-                if end.is_some() {
-                    DataServerError::DeadlineExceeded
-                } else {
-                    error("timed out waiting for a decoded chunk")
-                }
-            },
-        )?;
-        Ok((bytes, chunk))
+        // Hold the exact hit used for admission: eviction must never turn it
+        // into a cold read that has only reserved a cached buffer's capacity.
+        let cached = self.cache.0.get_untracked(&key);
+        Ok(PreparedChunk {
+            source: chunk,
+            key: Some(key),
+            cached,
+            permit: None,
+        })
+    }
+
+    fn load_chunk(
+        &self,
+        array: &Array<EngineStore>,
+        options: &CodecOptions,
+        mut chunk: PreparedChunk,
+    ) -> Result<LoadedChunk, DataServerError> {
+        deadline::check()?;
+        let bytes = if let Some(bytes) = chunk.cached.take() {
+            self.cache.0.record_hit();
+            bytes
+        } else if let Some(key) = chunk.key.take() {
+            let end = deadline::current();
+            let wait = end.map_or(Duration::from_secs(30), |end| {
+                end.saturating_duration_since(Instant::now())
+            });
+            self.cache.0.get_or_insert_with_timeout(
+                &key,
+                wait,
+                || read_native(array, &chunk.source, options).map(Arc::new),
+                || {
+                    if end.is_some() {
+                        DataServerError::DeadlineExceeded
+                    } else {
+                        error("timed out waiting for a decoded chunk")
+                    }
+                },
+            )?
+        } else {
+            Arc::new(read_native(array, &chunk.source, options)?)
+        };
+        Ok(LoadedChunk {
+            bytes,
+            source: chunk.source,
+            _permit: chunk.permit,
+        })
     }
 }
 
