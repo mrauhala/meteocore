@@ -144,15 +144,17 @@ their reservation through sampling. This budget is separate from response
 limits, resident caches, and persistent metadata. Encoded full-object/range
 reads add a two-copy allowance before collection and retain it through native
 retrieval, including compressed-cache hits and coalesced waiters. Native decoded
-cache hits do not need encoded admission. Numeric-variable gzip/zstd outputs
+cache hits do not need encoded admission. Numeric-variable gzip/zstd/Blosc outputs
 are capped by the declared codec representation, including sharded layouts;
 if bounded-codec setup fails for one variable, catalog discovery warns and
 omits that variable while retaining usable ones. Catalog construction still
 fails if no usable variables remain. During reads,
 bounded intermediate outputs acquire additional capacity allowances through
-retrieval. Invalid frame lengths remain engine errors, while admission failures
-and expired deadlines preserve their typed errors. Other codecs, codec-private
-scratch, and transport/internal storage buffers remain outside the estimate;
+retrieval. Blosc also validates frame/block sizes before full and partial
+decoding and admits its size-dependent native scratch buffers. Invalid frame
+lengths remain engine errors, while admission failures and expired deadlines
+preserve their typed errors. Other codecs, compressor-private contexts,
+and transport/internal storage buffers remain outside the estimate;
 it is not an RSS limit.
 Icechunk reads process up to four inner chunks concurrently through a shared
 four-worker pool, even with decoded retention disabled. Admission reserves

@@ -1,7 +1,7 @@
-//! Bound gzip/zstd output by the codec chain's decoded representation.
+//! Bound compressed output by the codec chain's decoded representation.
 //!
-//! zarrs 0.23 ignores that representation in these two decoders. Keep its
-//! metadata, encoding and shard machinery, replacing only decompression.
+//! zarrs 0.23 ignores that representation in gzip/zstd/Blosc decoders. Keep
+//! its metadata, encoding and shard machinery, bounding decompression.
 use std::{borrow::Cow, io::Read, sync::Arc};
 
 use ds_core::{deadline, error::DataServerError};
@@ -9,11 +9,11 @@ use zarrs::{
     array::{
         codec::{
             api::{
-                BytesToBytesCodecTraits, CodecError, CodecMetadataOptions, CodecOptions,
-                CodecTraits, PartialDecoderCapability, PartialEncoderCapability,
-                RecommendedConcurrency,
+                BytesPartialDecoderTraits, BytesToBytesCodecTraits, CodecError,
+                CodecMetadataOptions, CodecOptions, CodecPartialDefault, CodecTraits,
+                PartialDecoderCapability, PartialEncoderCapability, RecommendedConcurrency,
             },
-            CodecChain, GzipCodec, ShardingCodec, ZstdCodec,
+            BloscCodec, CodecChain, GzipCodec, ShardingCodec, ZstdCodec,
         },
         Array, ArrayBytesRaw, BytesRepresentation,
     },
@@ -23,6 +23,8 @@ use zarrs::{
 };
 
 use crate::store::EngineStore;
+
+mod blosc;
 
 pub(crate) fn bounded_array(
     array: Array<EngineStore>,
@@ -76,6 +78,8 @@ fn bounded_chain(chain: &CodecChain) -> Result<Option<CodecChain>, CodecError> {
                 Kind::Gzip
             } else if codec.as_any().is::<ZstdCodec>() {
                 Kind::Zstd
+            } else if codec.as_any().is::<BloscCodec>() {
+                Kind::Blosc
             } else {
                 return codec.clone();
             };
@@ -99,6 +103,7 @@ fn bounded_chain(chain: &CodecChain) -> Result<Option<CodecChain>, CodecError> {
 enum Kind {
     Gzip,
     Zstd,
+    Blosc,
 }
 
 #[derive(Debug)]
@@ -164,15 +169,21 @@ impl BytesToBytesCodecTraits for BoundedCodec {
         &self,
         bytes: ArrayBytesRaw<'a>,
         representation: &BytesRepresentation,
-        _options: &CodecOptions,
+        options: &CodecOptions,
     ) -> Result<ArrayBytesRaw<'a>, CodecError> {
         check_deadline()?;
         let limit = representation.size().ok_or_else(|| {
-            CodecError::Other("gzip/zstd decoding requires a bounded representation".into())
+            CodecError::Other("compressed decoding requires a bounded representation".into())
         })?;
         let limit = usize::try_from(limit).map_err(|_| exhausted())?;
         let intermediate = matches!(representation, BytesRepresentation::BoundedSize(_));
         let output = match self.kind {
+            Kind::Blosc => {
+                blosc::validate_and_admit(&bytes, representation, false)?;
+                self.inner
+                    .decode(bytes, representation, options)?
+                    .into_owned()
+            }
             Kind::Gzip => {
                 // Keep the upstream single-member gzip semantics. Probe EOF
                 // after filling the destination to validate trailers/checksums
@@ -202,6 +213,55 @@ impl BytesToBytesCodecTraits for BoundedCodec {
             ));
         }
         Ok(Cow::Owned(output))
+    }
+
+    fn partial_decoder(
+        self: Arc<Self>,
+        input: Arc<dyn BytesPartialDecoderTraits>,
+        representation: &BytesRepresentation,
+        options: &CodecOptions,
+    ) -> Result<Arc<dyn BytesPartialDecoderTraits>, CodecError> {
+        if matches!(self.kind, Kind::Blosc) {
+            // Validate the full encoded frame before upstream getitem sees it.
+            // Keep block-level partial decoding; a full-decode fallback would
+            // amplify small map/position reads.
+            self.inner.clone().partial_decoder(
+                Arc::new(blosc::CheckedInput::new(input, *representation)),
+                representation,
+                options,
+            )
+        } else {
+            Ok(Arc::new(CodecPartialDefault::new_bytes(
+                input,
+                *representation,
+                self.into_dyn(),
+            )))
+        }
+    }
+
+    #[cfg(feature = "icechunk")]
+    async fn async_partial_decoder(
+        self: Arc<Self>,
+        input: Arc<dyn zarrs::array::codec::api::AsyncBytesPartialDecoderTraits>,
+        representation: &BytesRepresentation,
+        options: &CodecOptions,
+    ) -> Result<Arc<dyn zarrs::array::codec::api::AsyncBytesPartialDecoderTraits>, CodecError> {
+        if matches!(self.kind, Kind::Blosc) {
+            self.inner
+                .clone()
+                .async_partial_decoder(
+                    Arc::new(blosc::CheckedInput::new(input, *representation)),
+                    representation,
+                    options,
+                )
+                .await
+        } else {
+            Ok(Arc::new(CodecPartialDefault::new_bytes(
+                input,
+                *representation,
+                self.into_dyn(),
+            )))
+        }
     }
 }
 
@@ -290,3 +350,6 @@ fn error(error: impl std::fmt::Display) -> DataServerError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod blosc_tests;
