@@ -157,6 +157,12 @@ pool: they do not use the Icechunk runtime bridge.
   estimate together with each cold workspace. `encoded::enter_prepaid` keeps
   that reservation alive and consumes its credit before admitting actual-size
   growth; never give multiple scopes the same credit or attach it to caches.
+  Within a recognized bytes-codec chain, prepay the maximum Blosc scratch
+  allowance, not the sum: serial full calls return before the next call, and
+  partial calls finish decoding their input before acquiring their own scratch.
+  Encoded/intermediate copies remain additive. This relies on the per-call
+  scratch guards and both serial options; every concurrent chunk still owns
+  its own allowance. Keep actual-size growth checks and the unknown fallback.
   Unknown layouts (including nested shards), or one estimate that cannot fit,
   use a serial cold batch with actual-size admission. Preserve this fallback:
   encoder bounds are conservative hints, not new frame/output validity limits.

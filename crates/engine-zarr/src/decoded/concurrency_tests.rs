@@ -15,6 +15,9 @@ static GATED_TESTS: Mutex<()> = Mutex::new(());
 #[path = "coalescing_tests.rs"]
 mod coalescing;
 
+#[path = "scratch_tests.rs"]
+mod scratch;
+
 #[derive(Clone, Copy)]
 enum Outcome {
     Success,

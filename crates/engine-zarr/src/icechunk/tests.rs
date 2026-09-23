@@ -22,6 +22,13 @@ async fn fixture_with_codec(
     dir: &std::path::Path,
     codec: Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>,
 ) -> Repository {
+    fixture_with_codecs(dir, vec![codec]).await
+}
+
+async fn fixture_with_codecs(
+    dir: &std::path::Path,
+    codecs: Vec<Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>>,
+) -> Repository {
     let storage = icechunk::new_local_filesystem_storage(dir).await.unwrap();
     let repo = Repository::create(
         Some(RepositoryConfig {
@@ -80,7 +87,7 @@ async fn fixture_with_codec(
         ],
         &data_type::float32(),
     )
-    .bytes_to_bytes_codecs(vec![codec])
+    .bytes_to_bytes_codecs(codecs)
     .build();
     let array = ArrayBuilder::new(vec![2, 2, 3], vec![2, 2, 3], data_type::float32(), f32::NAN)
         .array_to_bytes_codec(Arc::new(shard))
@@ -537,6 +544,86 @@ async fn cold_shards_keep_encoded_and_blosc_scratch_headroom_under_tight_budgets
         assert_eq!(budget.metrics(), (288, 1952, 0));
         drop(permit);
         assert_eq!(budget.metrics().0, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stacked_blosc_shards_fit_peak_scratch_headroom_with_cold_and_cached_payloads() {
+    use crate::{
+        decoded::{DecodedArray, DecodedCache},
+        encoded,
+        read_budget::Budget,
+    };
+    use zarrs::array::{
+        codec::{BloscCodec, BloscCompressor, BloscShuffleMode},
+        FromArrayBytes,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let codecs: Vec<Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>> = [
+        (BloscShuffleMode::Shuffle, 4),
+        (BloscShuffleMode::NoShuffle, 1),
+    ]
+    .into_iter()
+    .map(|(shuffle, typesize)| {
+        Arc::new(
+            BloscCodec::new(
+                BloscCompressor::LZ4,
+                1.try_into().unwrap(),
+                None,
+                shuffle,
+                Some(typesize),
+            )
+            .unwrap(),
+        ) as Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>
+    })
+    .collect();
+    fixture_with_codecs(dir.path(), codecs).await;
+    let options = crate::catalog::single_threaded_opts();
+    for cache_mb in [0, 4] {
+        let mut config = config(dir.path());
+        config.cache_mb = cache_mb;
+        let source = Source::open("peak-scratch", &config).unwrap();
+        let store = source.snapshot(None).unwrap().unwrap();
+        let array =
+            crate::codec_limits::bounded_array(Array::open(store.clone(), "/temp").unwrap())
+                .unwrap();
+        let reader = DecodedArray::new(
+            &array,
+            store.revision.as_deref(),
+            "temp",
+            Arc::new(DecodedCache::new(0)),
+        )
+        .unwrap();
+        for subset in [
+            array.subset_all(),
+            ArraySubset::new_with_ranges(&[0..1, 0..2, 0..3]),
+        ] {
+            let source_bytes = subset.num_elements() * 24;
+            // Each eight-byte inner chunk: 416 native/index workspace bytes,
+            // 328 retained encoded/intermediate bytes, 1092 peak scratch bytes.
+            // The previous sum also reserved the first Blosc stage's 1044.
+            let per_chunk = 416 + 328 + 1092;
+            let budget = Arc::new(Budget::new(source_bytes + 2 * per_chunk));
+            let permit = budget.reserve(&array, &subset, Some(0), true).unwrap();
+            let scope = encoded::enter(Some(budget.clone()));
+            for _ in 0..2 {
+                let bytes = reader
+                    .read(&array, &subset, &options, permit.parallelism())
+                    .unwrap();
+                assert_eq!(
+                    Vec::<f32>::from_array_bytes(bytes, subset.shape(), array.data_type()).unwrap(),
+                    vec![10.; subset.num_elements() as usize]
+                );
+                assert_eq!(
+                    budget.metrics(),
+                    (source_bytes, source_bytes + 2 * per_chunk, 0)
+                );
+            }
+            drop(scope);
+            drop(permit);
+            assert_eq!(budget.metrics().0, 0);
+        }
     }
 }
 

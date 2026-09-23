@@ -121,6 +121,7 @@ impl Chain {
     fn bytes(&self, native: u64) -> Option<u64> {
         let mut representation = BytesRepresentation::FixedSize(native);
         let mut codec_bytes = 0u64;
+        let mut scratch = 0u64;
         for step in &self.0 {
             let size = representation.size()?;
             // The recognized encoder bounds use small additions/multipliers.
@@ -132,15 +133,20 @@ impl Chain {
             if step.blosc {
                 // The validated block cannot exceed decoded length; a frame's
                 // typesize is one byte. Cover getitem as well as full decode.
-                codec_bytes =
-                    codec_bytes.checked_add(size.checked_mul(3)?.checked_add(4 * 255)?)?;
+                scratch = scratch.max(size.checked_mul(3)?.checked_add(4 * 255)?);
             }
             representation = step.codec.encoded_representation(&representation);
         }
         // The collected body, encoded copy, and intermediates remain admitted
-        // through retrieval. Scratch credit can be reused after each native
-        // call; summing its bounds here remains a conservative prepayment.
-        codec_bytes.checked_add(representation.size()?.checked_mul(2)?)
+        // through retrieval. Serial codec-chain steps release their scratch
+        // before the next step acquires it: full decode advances only after
+        // each call returns, and partial decode obtains its input before
+        // admitting its own scratch. Prepay the peak, keeping all encoded and
+        // intermediate allowances additive. Independent chunk jobs still need
+        // independent credit; unknown/nested layouts keep their serial fallback.
+        codec_bytes
+            .checked_add(representation.size()?.checked_mul(2)?)?
+            .checked_add(scratch)
     }
 }
 
