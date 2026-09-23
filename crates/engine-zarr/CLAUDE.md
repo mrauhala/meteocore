@@ -35,8 +35,12 @@ pool: they do not use the Icechunk runtime bridge.
 
 - The Zarr format + codec pipeline is handled by the `zarrs` crate
   (blosc/zstd/gzip/crc32c/sharding/transpose + filesystem + ndarray). This
-  engine only adds CF semantics, the OGC domain mapping, the storage bridge,
-  and the poll-and-swap lifecycle. blosc/zstd build from C via `cmake`+`cc`.
+  engine adds CF semantics, the OGC domain mapping, the storage bridge,
+  and the poll-and-swap lifecycle. `codec_limits` replaces gzip/zstd decoding
+  for numeric variable arrays: cap output by the codec representation, retain
+  upstream metadata/encoding and actual sharding codecs for partial reads.
+  Recurse through inner/index chains; preserve V2 chunk keys and transposes.
+  blosc/zstd build from C via `cmake`+`cc`.
 - **Plain storage = ds-storage:** `src/store.rs` `DsStore`
   implements zarrs' `ReadableStorageTraits` + `ListableStorageTraits` over
   `ds_storage::DataStore`, with a `ds-cache` byte-bounded LRU of full object
@@ -105,6 +109,11 @@ pool: they do not use the Icechunk runtime bridge.
   before collection. Plain storage admits GET response sizes and cache hits;
   Icechunk admits immutable full/range lengths before launching reads. Keep
   scopes through native retrieval, because zarrs copies Bytes into codec Vecs.
+  Gzip/zstd fixed outputs use the native workspace; bounded intermediate
+  outputs add two-copy capacity admission through the same scope before growth.
+  Do not trust frame headers to increase codec output limits. Preserve typed
+  allocation/admission failures and deadline errors through `chunk_read_error`.
+  Other codecs (including Blosc) and coordinate discovery are not wrapped.
   Each chunk worker installs a fresh scope with the caller's budget. Never
   attach these permits to resident cache entries or HTTP waiters. Transport and
   Icechunk internal buffers beyond requested ranges remain outside the estimate. It is not an allocator-enforced memory ceiling. Icechunk

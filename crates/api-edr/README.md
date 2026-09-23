@@ -144,8 +144,13 @@ their reservation through sampling. This budget is separate from response
 limits, resident caches, and persistent metadata. Encoded full-object/range
 reads add a two-copy allowance before collection and retain it through native
 retrieval, including compressed-cache hits and coalesced waiters. Native decoded
-cache hits do not need encoded admission. Codec-private scratch and transport/
-internal storage buffers remain outside the estimate; it is not an RSS limit.
+cache hits do not need encoded admission. Numeric-variable gzip/zstd outputs
+are capped by the declared codec representation, including sharded layouts;
+bounded intermediate outputs acquire additional capacity allowances through
+retrieval. Invalid frame lengths remain engine errors, while admission failures
+and expired deadlines preserve their typed errors. Other codecs, codec-private
+scratch, and transport/internal storage buffers remain outside the estimate;
+it is not an RSS limit.
 Icechunk reads process up to four inner chunks concurrently through a shared
 four-worker pool, even with decoded retention disabled. Admission reserves
 each active decode workspace and reduces concurrency when memory is tight.

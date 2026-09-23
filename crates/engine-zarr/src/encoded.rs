@@ -33,6 +33,21 @@ struct Held {
 }
 
 impl Context {
+    /// Intermediate compressed representations can exceed the native chunk
+    /// estimate (nested compression or an outer-compressed shard). Admit their
+    /// growing output separately, including a reallocation/copy allowance.
+    pub(crate) fn intermediate(&self, additional: usize) -> Result<(), DataServerError> {
+        let bytes = (additional as u64)
+            .checked_mul(2)
+            .ok_or(DataServerError::ResourceExhausted)?;
+        self.held
+            .lock()
+            .unwrap()
+            .permits
+            .push(self.budget.reserve_bytes(bytes)?);
+        Ok(())
+    }
+
     /// Two copies cover the collected body and zarrs' owned encoded buffer.
     /// Transport buffers and codec-private allocations are separate estimates.
     pub(crate) fn object(&self, key: &str, size: u64) -> Result<(), DataServerError> {

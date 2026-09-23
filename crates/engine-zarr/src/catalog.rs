@@ -810,6 +810,8 @@ pub fn build(
             continue;
         }
 
+        let array = crate::codec_limits::bounded_array(array)?;
+
         let shape = array.shape();
         if shape[lat_axis] as usize != lats.len() || shape[lon_axis] as usize != lons.len() {
             tracing::warn!(
@@ -1180,12 +1182,13 @@ pub(crate) fn chunk_read_error(error: ArrayError) -> DataServerError {
         | ArrayError::CodecError(CodecError::IOError(io)) => Some(io),
         _ => None,
     };
-    if matches!(
-        io.and_then(|io| io.get_ref())
-            .and_then(|error| error.downcast_ref::<DataServerError>()),
-        Some(DataServerError::ResourceExhausted)
-    ) {
-        return DataServerError::ResourceExhausted;
+    match io
+        .and_then(|io| io.get_ref())
+        .and_then(|error| error.downcast_ref::<DataServerError>())
+    {
+        Some(DataServerError::ResourceExhausted) => return DataServerError::ResourceExhausted,
+        Some(DataServerError::DeadlineExceeded) => return DataServerError::DeadlineExceeded,
+        _ => {}
     }
     DataServerError::Engine(format!("Zarr chunk read failed: {error}"))
 }
@@ -1358,7 +1361,15 @@ mod tests {
             )),
             dir.path(),
         );
-        std::fs::write(dir.path().join("t2m/c/0/0/0"), b"invalid gzip").unwrap();
+        let payload_path = dir.path().join("t2m/c/0/0/0");
+        let valid_payload = std::fs::read(&payload_path).unwrap();
+        use std::io::Write;
+        let mut bomb = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        bomb.write_all(&vec![42; 2 * ds_cache::MIB as usize])
+            .unwrap();
+        let bomb = bomb.finish().unwrap();
+        assert!(bomb.len() < 16 * 1024);
+        std::fs::write(&payload_path, b"invalid gzip").unwrap();
         let config = ds_core::config::ZarrConfig::auto_local(dir.path().to_string_lossy().into());
         let engine = crate::ZarrEngine::new("budget-test", &config).unwrap();
         let render = || {
@@ -1373,18 +1384,26 @@ mod tests {
                 None,
             )
         };
-        for (capacity, oversized_payload, exhausted) in [
-            (0, false, true),
-            (ds_cache::MIB, false, false),
-            (ds_cache::MIB, true, true),
+        for (capacity, payload, exhausted) in [
+            (0, "corrupt", true),
+            (ds_cache::MIB, "corrupt", false),
+            (ds_cache::MIB, "oversized", true),
+            (ds_cache::MIB, "bomb", false),
+            (ds_cache::MIB, "valid", false),
         ] {
-            if oversized_payload {
+            if payload == "oversized" {
                 // The native window fits, but this encoded object does not.
                 // Reject from its metadata before reading/decoding the corrupt body.
-                std::fs::File::create(dir.path().join("t2m/c/0/0/0"))
+                std::fs::File::create(&payload_path)
                     .unwrap()
                     .set_len(2 * ds_cache::MIB)
                     .unwrap();
+            } else if payload == "bomb" {
+                // The encoded object fits, but the decoded body exceeds the
+                // declared native chunk. Fail before allocating that body.
+                std::fs::write(&payload_path, &bomb).unwrap();
+            } else if payload == "valid" {
+                std::fs::write(&payload_path, &valid_payload).unwrap();
             }
             let budget = Arc::new(Budget::new(capacity));
             let mut catalog = build(
@@ -1398,6 +1417,14 @@ mod tests {
             .unwrap();
             catalog.read_budget = budget.clone();
             engine.catalog.store(Arc::new(catalog));
+            if payload == "valid" {
+                assert!(
+                    render().is_ok(),
+                    "a fresh catalog can retry after corruption"
+                );
+                assert_eq!(budget.metrics().0, 0);
+                continue;
+            }
             let error = render().err().expect("render must fail");
             if exhausted {
                 assert!(

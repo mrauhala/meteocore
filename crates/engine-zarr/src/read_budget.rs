@@ -38,8 +38,8 @@ impl Budget {
         )
     }
 
-    /// Additional encoded storage bytes, discovered from response headers or
-    /// an immutable chunk reference. Never wait while holding a native window.
+    /// Additional encoded storage or intermediate codec capacity. Never wait
+    /// while holding a native window.
     pub(crate) fn reserve_bytes(
         self: &Arc<Self>,
         bytes: u64,
