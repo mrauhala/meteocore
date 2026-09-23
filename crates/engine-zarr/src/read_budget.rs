@@ -146,7 +146,7 @@ pub fn metrics() -> (u64, u64, u64) {
 // admit all native/conversion buffers together before payload reads.
 // The decoded reader admits chunk buffers separately after the cache lookup;
 // other paths reserve one decode workspace together with the source window.
-// Encoded reads acquire additional reservations at collection.
+// Encoded reads consume prepaid headroom or reserve additional bytes at collection.
 // Other codec-private scratch, persistent metadata, caches, and API outputs remain
 // separate from this estimate; it is not an allocator-enforced RSS limit.
 struct Plan {

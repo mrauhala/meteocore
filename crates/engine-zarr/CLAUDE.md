@@ -133,7 +133,15 @@ pool: they do not use the Icechunk runtime bridge.
   permits after copying, before sampling. Drop unadmitted candidates before
   batch I/O and reduce fan-out when another slot cannot fit; only rejecting
   the first slot counts as a failed request. Coalesced misses conservatively
-  retain their workspace. Encoded/codec headroom is still admitted later.
+  retain their workspace. `codec_limits::headroom` parses common bytes/transpose
+  and gzip/zstd/Blosc/CRC32C layouts once with the decoded reader, including
+  ordinary shard inner/index chains. Reserve its encoded/intermediate/scratch
+  estimate together with each cold workspace. `encoded::enter_prepaid` keeps
+  that reservation alive and consumes its credit before admitting actual-size
+  growth; never give multiple scopes the same credit or attach it to caches.
+  Unknown layouts (including nested shards), or one estimate that cannot fit,
+  use a serial cold batch with actual-size admission. Preserve this fallback:
+  encoder bounds are conservative hints, not new frame/output validity limits.
 - **Forecast axes / instances (#337):** with a CF `forecast_reference_time`
   axis AND a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/
   ICON-EU), every run on the reference axis is an EDR instance / WMS

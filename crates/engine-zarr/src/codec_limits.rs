@@ -25,6 +25,7 @@ use zarrs::{
 use crate::store::EngineStore;
 
 mod blosc;
+pub(crate) mod headroom;
 
 pub(crate) fn bounded_array(
     array: Array<EngineStore>,

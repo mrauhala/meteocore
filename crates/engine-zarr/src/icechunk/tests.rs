@@ -472,6 +472,75 @@ async fn decoded_cache_hits_need_no_encoded_reservation_and_misses_keep_typed_er
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_shards_keep_encoded_and_blosc_scratch_headroom_under_tight_budgets() {
+    use crate::{
+        decoded::{DecodedArray, DecodedCache},
+        encoded,
+        read_budget::Budget,
+    };
+    use zarrs::array::{
+        codec::{BloscCodec, BloscCompressor, BloscShuffleMode},
+        FromArrayBytes,
+    };
+
+    let codecs: Vec<Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>> = vec![
+        Arc::new(GzipCodec::new(1).unwrap()),
+        Arc::new(
+            BloscCodec::new(
+                BloscCompressor::LZ4,
+                1.try_into().unwrap(),
+                None,
+                BloscShuffleMode::Shuffle,
+                Some(4),
+            )
+            .unwrap(),
+        ),
+    ];
+    for codec in codecs {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_with_codec(dir.path(), codec).await;
+        let mut config = config(dir.path());
+        config.cache_mb = 0;
+        let source = Source::open("headroom", &config).unwrap();
+        let store = source.snapshot(None).unwrap().unwrap();
+        let array =
+            crate::codec_limits::bounded_array(Array::open(store.clone(), "/temp").unwrap())
+                .unwrap();
+        let subset = array.subset_all();
+        let reader = DecodedArray::new(
+            &array,
+            store.revision.as_deref(),
+            "temp",
+            Arc::new(DecodedCache::new(0)),
+        )
+        .unwrap();
+        // Source: 12 f32 values. Each inner chunk: 8 native bytes + 96
+        // index bytes, times four buffers. Native-only admission filled the
+        // entire transient budget with four chunks and rejected encoded I/O.
+        let budget = Arc::new(Budget::new(288 + 4 * 416));
+        let permit = budget.reserve(&array, &subset, Some(0), true).unwrap();
+        {
+            let _encoded = encoded::enter(Some(budget.clone()));
+            let bytes = reader
+                .read(
+                    &array,
+                    &subset,
+                    &crate::catalog::single_threaded_opts(),
+                    permit.parallelism(),
+                )
+                .unwrap();
+            assert_eq!(
+                Vec::<f32>::from_array_bytes(bytes, subset.shape(), array.data_type()).unwrap(),
+                vec![10.; 12]
+            );
+        }
+        assert_eq!(budget.metrics(), (288, 1952, 0));
+        drop(permit);
+        assert_eq!(budget.metrics().0, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_icechunk_payloads_still_return_fill_under_encoded_admission() {
     use crate::{encoded, read_budget::Budget};
     use zarrs::storage::{byte_range::ByteRange, AsyncWritableStorageTraits};
