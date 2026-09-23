@@ -46,7 +46,11 @@ pool: they do not use the Icechunk runtime bridge.
   generation and key. Bound waits by the caller's deadline (30s without one)
   and check the deadline again after waiting. Release Tokio workers with
   `block_in_place` around the synchronous wait/fill so the owner's I/O can
-  progress. Failed owners release the guard for retry; recheck the new owner's
+  progress. On `RenderJob`'s `spawn_blocking` workers this is a direct call,
+  using the worker's existing runtime handle; it does not panic or create a
+  per-read runtime. The adapter deliberately supports both execution contexts,
+  covered by HTTP coalescing and actual map reads through the render executor.
+  Failed owners release the guard for retry; recheck the new owner's
   deadline and retirement before fetching. Existing waiters share even
   non-retained results (zero cache or oversized objects).
 - **Plain refresh:** `Source::snapshot` creates a fresh `DsStore` generation

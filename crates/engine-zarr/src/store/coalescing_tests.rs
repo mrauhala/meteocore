@@ -238,3 +238,84 @@ fn tokio_workers_remain_available_while_waiting_for_an_object() {
     }
     assert_eq!(server.calls(), 1);
 }
+
+#[test]
+fn render_executor_reads_plain_http_payloads_and_preserves_deadlines() {
+    let server = HttpStore::new(1);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let slots = Arc::new(tokio::sync::Semaphore::new(4));
+    let (started, ready) = std::sync::mpsc::channel();
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            let (store, slots, started) = (server.store.clone(), slots.clone(), started.clone());
+            runtime.spawn(async move {
+                let (job, memory) = ds_executor::RenderJob::acquire_raster(slots, 2, 2)
+                    .await
+                    .unwrap();
+                let worker_memory = memory.clone();
+                job.run(move || {
+                    let _memory = worker_memory;
+                    // Exercise the real Maps/WMS/Tiles spawn_blocking boundary,
+                    // retaining its deadline instead of installing a test one.
+                    let end = deadline::current().expect("RenderJob installs a deadline");
+                    assert!(tokio::runtime::Handle::try_current().is_ok());
+                    started.send(()).unwrap();
+                    let result = store.get(&StoreKey::new("chunk").unwrap());
+                    assert_eq!(deadline::current(), Some(end));
+                    result
+                })
+                .await
+                .expect("plain-Zarr render workers must not panic")
+            })
+        })
+        .collect();
+    let request = server.next("/chunk");
+    for _ in 0..4 {
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    server.assert_idle();
+    request.reply(200, b"shared");
+    for reader in readers {
+        assert_eq!(
+            runtime.block_on(reader).unwrap().unwrap().unwrap().as_ref(),
+            b"shared"
+        );
+    }
+    assert_eq!(slots.available_permits(), 4);
+    assert_eq!(
+        server.calls(),
+        1,
+        "blocking-pool renders share the HTTP fill"
+    );
+
+    // Both cache hits and misses reject expiry inside the render worker,
+    // without starting another download or losing the typed deadline error.
+    for key in ["chunk", "uncached"] {
+        let store = server.store.clone();
+        let slots = slots.clone();
+        let result = runtime.block_on(async {
+            let (job, memory) = ds_executor::RenderJob::acquire_raster(slots, 2, 2)
+                .await
+                .unwrap();
+            let worker_memory = memory.clone();
+            job.run(move || {
+                let _memory = worker_memory;
+                let _expired = deadline::enter(Some(Instant::now()));
+                store.get(&StoreKey::new(key).unwrap())
+            })
+            .await
+            .unwrap()
+        });
+        assert!(matches!(
+            core_error(&result.unwrap_err()),
+            Some(DataServerError::DeadlineExceeded)
+        ));
+    }
+    server.assert_idle();
+    assert_eq!(server.calls(), 1);
+    assert_eq!(slots.available_permits(), 4);
+}

@@ -199,9 +199,10 @@ impl DsStore {
                 },
             )
         };
-        // Plain storage drives async I/O on the caller's Tokio runtime. A
-        // synchronous cache wait must release its worker too, or waiters can
-        // occupy every worker needed to complete the owner's download.
+        // EDR async workers must yield while waiting so the owner's I/O can
+        // progress. RenderJob uses spawn_blocking: block_in_place runs directly
+        // there, preserving its runtime handle for ds-storage. Handle presence
+        // does not identify the worker kind; block_in_place handles both.
         let result = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(fill)
         } else {
