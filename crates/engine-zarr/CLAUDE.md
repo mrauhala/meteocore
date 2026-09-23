@@ -132,8 +132,13 @@ pool: they do not use the Icechunk runtime bridge.
   evicted; never relookup and fall back to an unadmitted decode. Release chunk
   permits after copying, before sampling. Drop unadmitted candidates before
   batch I/O and reduce fan-out when another slot cannot fit; only rejecting
-  the first slot counts as a failed request. Coalesced misses conservatively
-  retain their workspace. `codec_limits::headroom` parses common bytes/transpose
+  the first slot counts as a failed request. Claim cache fills before cold
+  admission. Coalesced readers wait with source buffers only, then admit and
+  pin the returned Vec capacity. Replacement owners must pass cold admission;
+  on failure/unwind drop encoded scopes and native permits before the fill
+  guard wakes a successor. Only wait on the caller with an empty batch; flush
+  queued claims before a busy lookup, and never wait on shared decode workers.
+  `codec_limits::headroom` parses common bytes/transpose
   and gzip/zstd/Blosc/CRC32C layouts once with the decoded reader, including
   ordinary shard inner/index chains. Reserve its encoded/intermediate/scratch
   estimate together with each cold workspace. `encoded::enter_prepaid` keeps
