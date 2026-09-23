@@ -8,8 +8,8 @@
 //! Two invariants make this safe and effective:
 //!
 //! - **Single-threaded plain-Zarr retrieval.** The engine drives each read with
-//!   `CodecOptions::with_concurrent_target(1)` (see [`crate::catalog`]), so zarrs
-//!   never dispatches a storage read onto a `rayon` worker. Those workers lose
+//!   target and minimum chunk concurrency set to one (see [`crate::catalog`]).
+//!   This stops zarrs dispatching storage reads onto `rayon` workers, which lose
 //!   the calling thread's deadline and runtime context; ds-storage may create
 //!   a runtime per call. Plain reads stay on the engine execution thread;
 //!   Icechunk's separately admitted fan-out uses its own runtime bridge.
@@ -155,11 +155,20 @@ impl DsStore {
     /// Fetch a full object, caching it. `None` when the key is absent.
     fn get_full(&self, key: &StoreKey) -> Result<Option<Bytes>, StorageError> {
         ds_core::deadline::check().map_err(io_err)?;
+        let encoded = crate::encoded::current();
+        let admit = |size| {
+            encoded
+                .as_ref()
+                .map_or(Ok(()), |context| context.object(key.as_str(), size))
+        };
         let k = Key {
             generation: self.generation.version,
             path: key.as_str().to_owned(),
         };
         if let Some(bytes) = self.shared.cache.get_untracked(&k) {
+            if let Some(bytes) = &bytes {
+                admit(bytes.len() as u64).map_err(io_err)?;
+            }
             self.shared.cache.record_hit();
             return Ok(bytes);
         }
@@ -179,11 +188,13 @@ impl DsStore {
                     // caller's deadline and generation before starting fresh I/O.
                     ds_core::deadline::check().map_err(io_err)?;
                     self.generation.check_active()?;
-                    let bytes = self
-                        .shared
-                        .store
-                        .get_opt(&self.object_path(key.as_str()))
-                        .map_err(io_err)?;
+                    let path = self.object_path(key.as_str());
+                    let bytes = if encoded.is_some() {
+                        self.shared.store.get_opt_admitted(&path, admit)
+                    } else {
+                        self.shared.store.get_opt(&path)
+                    }
+                    .map_err(io_err)?;
                     ds_core::deadline::check().map_err(io_err)?;
                     self.generation.check_active()?;
                     Ok(bytes)
@@ -210,7 +221,13 @@ impl DsStore {
         };
         // Successful fills can wake waiters whose deadlines have just expired.
         ds_core::deadline::check().map_err(io_err)?;
-        result
+        let bytes = result?;
+        // Coalesced readers need their own allowance for zarrs' owned copy,
+        // even when another reader paid for the shared download.
+        if let Some(bytes) = &bytes {
+            admit(bytes.len() as u64).map_err(io_err)?;
+        }
+        Ok(bytes)
     }
 }
 
@@ -475,6 +492,9 @@ mod refresh_tests;
 
 #[cfg(test)]
 mod coalescing_tests;
+
+#[cfg(test)]
+mod encoded_tests;
 
 #[cfg(test)]
 mod test_server;

@@ -99,6 +99,7 @@ impl DecodedArray {
         let mut indices = chunks.indices().into_iter();
         let parallelism = parallelism.clamp(1, MAX_PARALLEL_CHUNKS);
         let end = deadline::current();
+        let budget = crate::encoded::current().map(|context| context.budget.clone());
         loop {
             deadline::check()?;
             // Bound queued jobs and completed-but-not-copied buffers as well
@@ -113,6 +114,7 @@ impl DecodedArray {
             }
             let load = |indices: Vec<u64>| {
                 let _deadline = deadline::enter(end);
+                let _encoded = crate::encoded::enter(budget.clone());
                 self.read_chunk(array, subset, options, indices, size)
             };
             let results: Vec<_> = if batch.len() == 1 {
@@ -204,7 +206,7 @@ fn read_native(
     // Preserve the typed deadline even when the codec erased the storage error.
     deadline::check()?;
     let bytes = result
-        .map_err(error)?
+        .map_err(crate::catalog::chunk_read_error)?
         .into_fixed()
         .map_err(error)?
         .into_owned();

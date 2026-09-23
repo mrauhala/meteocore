@@ -42,6 +42,11 @@ impl Probe {
             return read();
         }
         assert_eq!(deadline::current(), self.deadline);
+        let encoded = crate::encoded::current().expect("chunk worker inherits its encoded budget");
+        assert!(Arc::ptr_eq(&encoded.budget, &self.budget));
+        encoded
+            .object(key.as_str(), 16)
+            .map_err(crate::store::io_err)?;
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
@@ -138,7 +143,7 @@ fn fanout_joins_workers_and_holds_memory_on_success_error_panic_and_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let original = super::tests::fixture(dir.path(), "/a", false, 0.0);
         let subset = original.subset_all();
-        let options = CodecOptions::default().with_concurrent_target(1);
+        let options = crate::catalog::single_threaded_opts();
         let expected = read_native(&original, &subset, &options).unwrap();
         let budget = Arc::new(Budget::new(MIB));
         let (started, ready) = mpsc::channel();
@@ -174,8 +179,10 @@ fn fanout_joins_workers_and_holds_memory_on_success_error_panic_and_deadline() {
         assert_eq!(permit.parallelism(), MAX_PARALLEL_CHUNKS);
         std::thread::scope(|scope| {
             let worker_permit = permit.clone();
+            let worker_budget = budget.clone();
             let worker = scope.spawn(move || {
                 let _deadline = deadline::enter(Some(end));
+                let _encoded = crate::encoded::enter(Some(worker_budget));
                 let permit = worker_permit;
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     reader.read(&array, &subset, &options, permit.parallelism())
@@ -228,7 +235,7 @@ fn concurrent_requests_share_the_worker_limit() {
     let dir = tempfile::tempdir().unwrap();
     let original = super::tests::fixture(dir.path(), "/a", false, 0.0);
     let subset = original.subset_all();
-    let options = CodecOptions::default().with_concurrent_target(1);
+    let options = crate::catalog::single_threaded_opts();
     let expected = read_native(&original, &subset, &options).unwrap();
     let budget = Arc::new(Budget::new(MIB));
     let (started, ready) = mpsc::channel();
@@ -261,7 +268,9 @@ fn concurrent_requests_share_the_worker_limit() {
             let reader =
                 DecodedArray::new(array, Some("snapshot"), "a", Arc::new(DecodedCache::new(0)))
                     .unwrap();
+            let worker_budget = budget.clone();
             workers.push(scope.spawn(move || {
+                let _encoded = crate::encoded::enter(Some(worker_budget));
                 start.wait();
                 reader.read(array, subset, options, permit.parallelism())
             }));

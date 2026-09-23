@@ -141,8 +141,11 @@ native subset, conversion/window buffers, and a decode-workspace estimate
 before payload I/O. A read that cannot fit, including concurrent contention,
 returns 503 without waiting while holding other windows. Area windows retain
 their reservation through sampling. This budget is separate from response
-limits, resident caches, and persistent metadata; codec-private scratch and
-encoded object buffers are not allocator-bounded by it.
+limits, resident caches, and persistent metadata. Encoded full-object/range
+reads add a two-copy allowance before collection and retain it through native
+retrieval, including compressed-cache hits and coalesced waiters. Native decoded
+cache hits do not need encoded admission. Codec-private scratch and transport/
+internal storage buffers remain outside the estimate; it is not an RSS limit.
 Icechunk reads process up to four inner chunks concurrently through a shared
 four-worker pool, even with decoded retention disabled. Admission reserves
 each active decode workspace and reduces concurrency when memory is tight.

@@ -38,6 +38,28 @@ impl Budget {
         )
     }
 
+    /// Additional encoded storage bytes, discovered from response headers or
+    /// an immutable chunk reference. Never wait while holding a native window.
+    pub(crate) fn reserve_bytes(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<Arc<Permit>, DataServerError> {
+        deadline::check()?;
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|&n| n <= self.capacity)
+            })
+            .map_err(|_| {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                DataServerError::ResourceExhausted
+            })?;
+        Ok(Arc::new(Permit {
+            budget: self.clone(),
+            bytes,
+            parallelism: 1,
+        }))
+    }
+
     /// Fail fast: callers already own an executor slot, and may hold another
     /// window (e.g. across the antimeridian). Waiting here can deadlock them.
     pub(crate) fn reserve(
@@ -116,11 +138,11 @@ pub fn metrics() -> (u64, u64, u64) {
 
 // Account for native subset bytes + a typed conversion copy + raw f64 + the
 // physical f64 sampling window. Some lifetimes do not overlap: deliberately
-// reserve the sum so a request never needs to acquire more while holding memory.
+// admit all native/conversion buffers together before payload reads.
 // Decode workspace is a conservative four-native-buffer allowance, plus shard
-// index buffers. Encoded objects, codec-private scratch, persistent metadata,
-// caches, and API output buffers have separate lifetimes/budgets; this is not
-// an allocator-enforced RSS limit.
+// index buffers. Encoded reads acquire additional reservations at collection.
+// Codec-private scratch, persistent metadata, caches, and API outputs remain
+// separate from this estimate; it is not an allocator-enforced RSS limit.
 struct Plan {
     source: u64,
     workspace: u64,

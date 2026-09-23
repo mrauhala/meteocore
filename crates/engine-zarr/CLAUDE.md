@@ -18,12 +18,13 @@ NOT yet: per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5).
 
 ## The one load-bearing rule
 
-**`concurrent_target(1)` is correctness, not tuning.** `zarrs` parallelises
+**Serial codec options are correctness, not tuning.** `zarrs` parallelises
 multi-chunk retrieval with rayon by default. Those workers lose the calling
 thread's request deadline and explicit runtime context; plain `ds-storage`
 can fall back to constructing a runtime per call.
 `catalog::single_threaded_opts()` pins retrieval to the calling thread via
-`CodecOptions::with_concurrent_target(1)`. **Every `retrieve_*` call MUST go
+`concurrent_target(1)` AND `chunk_concurrent_minimum(1)`. The default minimum
+of four otherwise overrides the target on multi-chunk reads. **Every `retrieve_*` call MUST go
 through it.** Icechunk's explicit inner-chunk fan-out in `decoded.rs` uses a
 separate, shared four-thread pool, propagates the absolute deadline to every
 job, and admits all active decode workspaces before launch. Each individual
@@ -84,7 +85,7 @@ pool: they do not use the Icechunk runtime bridge.
   `project_node`; via `ProjectionGrid` for `Projected` output (#203).
   `raster_info()` is a cached `ArcSwap<RasterInfo>` rebuilt on catalog swap
   (#211). Window sampling uses `cf::locate` (ascending/descending/irregular
-  axes); the window read inherits `concurrent_target(1)`.
+  axes); the window read inherits the same serial codec options.
 - **Reads:** retrieve native `ArrayBytes`, then convert using the exact dtype.
   The read path branches on `data_type()` and widens every supported
   int/float to `f64`. Fill sentinels are compared against the RAW
@@ -98,9 +99,15 @@ pool: they do not use the Icechunk runtime bridge.
   `Window` owns an `Arc<Permit>` until the last window of its span is dropped;
   position reads hold it through interpolation. Admission fails immediately
   with `ResourceExhausted`, avoiding waits while holding executor slots or
-  earlier windows. Never move the permit onto the HTTP waiter. The estimate
-  excludes encoded objects, codec-private scratch, catalog metadata, caches,
-  and API outputs. It is not an allocator-enforced memory ceiling. Icechunk
+  earlier windows. Never move the permit onto the HTTP waiter. The native estimate
+  excludes codec-private scratch, catalog metadata, caches, and API outputs.
+  `encoded::enter` adds two-copy encoded-buffer allowances from the same budget
+  before collection. Plain storage admits GET response sizes and cache hits;
+  Icechunk admits immutable full/range lengths before launching reads. Keep
+  scopes through native retrieval, because zarrs copies Bytes into codec Vecs.
+  Each chunk worker installs a fresh scope with the caller's budget. Never
+  attach these permits to resident cache entries or HTTP waiters. Transport and
+  Icechunk internal buffers beyond requested ranges remain outside the estimate. It is not an allocator-enforced memory ceiling. Icechunk
   admission reserves the largest decode workspace times the admitted fan-out
   (up to four touched inner chunks). Reduce fan-out as available memory falls;
   reject only when even one workspace plus the source buffers cannot fit.
@@ -149,7 +156,7 @@ errors clearly if the table is set without the feature.
   consumption of range streams within the same absolute request deadline.
   Background I/O has a 30-second per-operation timeout. The persistent
   runtime supports CLI, current-thread, and blocking-worker callers.
-  Keep `concurrent_target(1)` within each explicitly admitted chunk job.
+  Keep both serial codec options within each explicitly admitted chunk job.
 - **S3 backend = icechunk's `object_store` backend, NOT `aws-sdk-s3`** (deps
   use `default-features = false, features = ["object-store-s3",
   "object-store-fs"]`; saves ~20 MB binary).
