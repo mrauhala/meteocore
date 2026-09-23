@@ -12,6 +12,9 @@ use zarrs::storage::{
 
 static GATED_TESTS: Mutex<()> = Mutex::new(());
 
+#[path = "coalescing_tests.rs"]
+mod coalescing;
+
 #[derive(Clone, Copy)]
 enum Outcome {
     Success,

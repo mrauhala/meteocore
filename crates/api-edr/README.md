@@ -140,6 +140,10 @@ memory admission (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB). It reserves the
 native subset and conversion/window buffers before payload I/O. Cold chunks
 also reserve a decode-workspace estimate; decoded hits reserve only the
 capacity of the buffer held through copying, including if evicted meanwhile.
+Coalesced decoded readers hold only their source buffers while waiting, then
+admit the returned buffer capacity. A reader taking over a failed fill must
+pass cold admission before decoding. Cache waits retain individual deadlines
+and run outside the shared decode pool, after completing any queued batch.
 A read that cannot fit, including concurrent contention,
 returns 503 without waiting while holding other windows. Area windows retain
 their reservation through sampling. This budget is separate from response

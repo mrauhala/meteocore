@@ -2,13 +2,13 @@
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use ds_cache::{ByteBoundedCache, CacheMetrics, MIB};
+use ds_cache::{ByteBoundedCache, CacheEntry, CacheFillGuard, CacheMetrics, MIB};
 use ds_core::{deadline, error::DataServerError};
 use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArrayShardedExt, ArraySubset, ChunkGrid, CodecOptions};
 
 use crate::{
-    read_budget::{workspace_bytes, Permit},
+    read_budget::{workspace_bytes, Budget, Permit},
     store::EngineStore,
 };
 
@@ -61,17 +61,19 @@ pub(crate) struct DecodedArray {
     headroom: crate::codec_limits::headroom::Plan,
 }
 
-struct PreparedChunk {
+struct PreparedChunk<'a> {
     source: ArraySubset,
-    key: Option<Key>,
     cached: Option<Arc<Vec<u8>>>,
     // Keep the pin/decode allowance until loading fails or transfers it to
     // LoadedChunk. Field order also releases a cached Arc before its permit.
     permit: Option<Arc<Permit>>,
     credit: u64,
+    // Release admission before waking a replacement owner on error/unwind.
+    // Claims are made before admission, so waiters cannot reserve cold work.
+    fill: Option<CacheFillGuard<'a, Key, Arc<Vec<u8>>>>,
 }
 
-impl PreparedChunk {
+impl PreparedChunk<'_> {
     fn reservation_bytes(&self, array: &Array<EngineStore>) -> Result<u64, DataServerError> {
         if let Some(bytes) = &self.cached {
             // A resident entry may be evicted while this read holds its Arc.
@@ -151,7 +153,29 @@ impl DecodedArray {
             let mut batch = Vec::with_capacity(parallelism);
             while batch.len() < parallelism {
                 let Some(next) = indices.peek() else { break };
-                let mut chunk = self.prepare_chunk(array, subset, next.to_vec(), size)?;
+                // Never wait while holding another fill claim or queued chunk:
+                // two overlapping requests could otherwise wait on each other.
+                // Flush the batch first; only its first lookup may wait, on the
+                // caller rather than one of the shared decode workers.
+                let wait = if batch.is_empty() {
+                    end.map_or(Duration::from_secs(30), |end| {
+                        end.saturating_duration_since(Instant::now())
+                    })
+                } else {
+                    Duration::ZERO
+                };
+                let Some(mut chunk) =
+                    self.prepare_chunk(array, subset, next.to_vec(), size, wait)?
+                else {
+                    if !batch.is_empty() {
+                        break;
+                    }
+                    return Err(if end.is_some() {
+                        DataServerError::DeadlineExceeded
+                    } else {
+                        error("timed out waiting for a decoded chunk")
+                    });
+                };
                 let mut serial = false;
                 chunk.permit = if let Some(budget) = &budget {
                     let bytes = chunk.reservation_bytes(array).map_err(|err| match err {
@@ -202,14 +226,9 @@ impl DecodedArray {
             if batch.is_empty() {
                 break;
             }
-            let load = |chunk: PreparedChunk| {
+            let load = |chunk: PreparedChunk<'_>| {
                 let _deadline = deadline::enter(end);
-                let _encoded = crate::encoded::enter_prepaid(
-                    budget.clone(),
-                    chunk.permit.clone(),
-                    chunk.credit,
-                );
-                self.load_chunk(array, options, chunk)
+                self.load_chunk(array, options, chunk, budget.clone())
             };
             let results: Vec<_> =
                 if batch.len() == 1 || batch.iter().all(|chunk| chunk.cached.is_some()) {
@@ -246,7 +265,8 @@ impl DecodedArray {
         subset: &ArraySubset,
         indices: Vec<u64>,
         size: usize,
-    ) -> Result<PreparedChunk, DataServerError> {
+        wait: Duration,
+    ) -> Result<Option<PreparedChunk<'_>>, DataServerError> {
         deadline::check()?;
         let chunk = self
             .grid
@@ -265,55 +285,60 @@ impl DecodedArray {
             && (chunk_length as u64).saturating_add(overhead(&key))
                 <= self.cache.0.capacity_bytes();
         if !eligible {
-            return Ok(PreparedChunk {
+            return Ok(Some(PreparedChunk {
                 source: chunk.overlap(subset).map_err(error)?,
-                key: None,
                 cached: None,
                 permit: None,
                 credit: 0,
-            });
+                fill: None,
+            }));
         }
         // Hold the exact hit used for admission: eviction must never turn it
         // into a cold read that has only reserved a cached buffer's capacity.
-        let cached = self.cache.0.get_untracked(&key);
-        Ok(PreparedChunk {
+        let entry = self.cache.0.get_value_or_guard_untracked(&key, wait);
+        deadline::check()?;
+        let (cached, fill) = match entry {
+            CacheEntry::Value(bytes) => (Some(bytes), None),
+            CacheEntry::Vacant(guard) => (None, Some(guard)),
+            CacheEntry::Timeout => return Ok(None),
+        };
+        Ok(Some(PreparedChunk {
             source: chunk,
-            key: Some(key),
             cached,
             permit: None,
             credit: 0,
-        })
+            fill,
+        }))
     }
 
     fn load_chunk(
         &self,
         array: &Array<EngineStore>,
         options: &CodecOptions,
-        mut chunk: PreparedChunk,
+        mut chunk: PreparedChunk<'_>,
+        budget: Option<Arc<Budget>>,
     ) -> Result<LoadedChunk, DataServerError> {
         deadline::check()?;
         let bytes = if let Some(bytes) = chunk.cached.take() {
             self.cache.0.record_hit();
             bytes
-        } else if let Some(key) = chunk.key.take() {
-            let end = deadline::current();
-            let wait = end.map_or(Duration::from_secs(30), |end| {
-                end.saturating_duration_since(Instant::now())
-            });
-            self.cache.0.get_or_insert_with_timeout(
-                &key,
-                wait,
-                || read_native(array, &chunk.source, options).map(Arc::new),
-                || {
-                    if end.is_some() {
-                        DataServerError::DeadlineExceeded
-                    } else {
-                        error("timed out waiting for a decoded chunk")
-                    }
-                },
-            )?
         } else {
-            Arc::new(read_native(array, &chunk.source, options)?)
+            if chunk.fill.is_some() {
+                self.cache.0.record_miss();
+            }
+            let result = {
+                let _encoded =
+                    crate::encoded::enter_prepaid(budget, chunk.permit.clone(), chunk.credit);
+                read_native(array, &chunk.source, options)
+            };
+            // End encoded admission before an error drops the chunk's native
+            // permit and then its fill claim. A successor must be able to admit
+            // its own work, not race reservations retained by the failed owner.
+            let bytes = Arc::new(result?);
+            if let Some(fill) = chunk.fill.take() {
+                let _ = fill.insert(bytes.clone());
+            }
+            bytes
         };
         Ok(LoadedChunk {
             bytes,

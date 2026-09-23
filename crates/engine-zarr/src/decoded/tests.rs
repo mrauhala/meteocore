@@ -171,7 +171,8 @@ fn admitted_cached_buffer_survives_eviction_without_a_cold_read() {
     assert_eq!(read(&reader, &array, &subset), vec![0.0]);
     let budget = Arc::new(Budget::new(32));
     let mut prepared = reader
-        .prepare_chunk(&array, &subset, vec![0, 0, 0], 4)
+        .prepare_chunk(&array, &subset, vec![0, 0, 0], 4, Duration::ZERO)
+        .unwrap()
         .unwrap();
     prepared.permit = Some(
         budget
@@ -184,7 +185,12 @@ fn admitted_cached_buffer_survives_eviction_without_a_cold_read() {
     std::fs::remove_dir_all(dir.path().join("a")).unwrap();
     let _scope = encoded::enter(Some(budget.clone()));
     let loaded = reader
-        .load_chunk(&array, &crate::catalog::single_threaded_opts(), prepared)
+        .load_chunk(
+            &array,
+            &crate::catalog::single_threaded_opts(),
+            prepared,
+            Some(budget.clone()),
+        )
         .unwrap();
     assert_eq!(&loaded.bytes[..4], &0.0f32.to_ne_bytes());
     assert_eq!(

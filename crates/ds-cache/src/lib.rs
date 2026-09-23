@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// depending on `quick_cache` directly.
 pub use quick_cache::Equivalent;
 
+mod entry;
+pub use entry::{CacheEntry, CacheFillGuard};
+
 /// One mebibyte, for `*_MB` → bytes conversions.
 pub const MIB: u64 = 1024 * 1024;
 
@@ -227,6 +230,31 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
                 Ok(value)
             }
             quick_cache::sync::GuardResult::Timeout => Err(timed_out()),
+        }
+    }
+
+    /// Look up a value or claim its single-flight fill without counting a hit
+    /// or miss. A zero timeout probes without waiting for an existing owner.
+    ///
+    /// Callers can acquire compute resources only after receiving a vacant
+    /// entry, and keep the guard through that compute. Dropping the guard on
+    /// admission failure, error or panic lets another caller claim the fill;
+    /// that caller must acquire its own resources before computing. Pair this
+    /// with [`Self::record_hit`] / [`Self::record_miss`] when work actually runs.
+    pub fn get_value_or_guard_untracked<Q>(
+        &self,
+        key: &Q,
+        timeout: std::time::Duration,
+    ) -> CacheEntry<'_, K, V>
+    where
+        Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
+    {
+        match self.cache.get_value_or_guard(key, Some(timeout)) {
+            quick_cache::sync::GuardResult::Value(value) => CacheEntry::Value(value),
+            quick_cache::sync::GuardResult::Guard(guard) => {
+                CacheEntry::Vacant(CacheFillGuard(guard))
+            }
+            quick_cache::sync::GuardResult::Timeout => CacheEntry::Timeout,
         }
     }
 
