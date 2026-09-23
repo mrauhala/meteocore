@@ -7,6 +7,8 @@
 //! Repeated plain whole-object lookups share an allowance within this scope;
 //! range operations accumulate conservatively. Each Icechunk chunk job gets a
 //! separate scope, bounding retention to its decode rather than the whole map.
+//! Plain/outer-transform reads likewise scope each stored chunk in retrieval.rs;
+//! all nested shard/index copies stay admitted until that chunk finishes.
 //! Cold chunk admission may prepay encoded/codec headroom. Consume that credit
 //! before growing the scope's reservation; it belongs to exactly one scope.
 use std::{

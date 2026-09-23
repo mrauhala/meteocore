@@ -541,6 +541,134 @@ async fn cold_shards_keep_encoded_and_blosc_scratch_headroom_under_tight_budgets
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outer_compressed_shards_release_temporary_admission_between_chunks() {
+    use crate::{
+        decoded::{DecodedArray, DecodedCache},
+        encoded,
+        read_budget::Budget,
+    };
+    use zarrs::array::{ArrayBytes, FromArrayBytes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path()).await;
+    let store = Arc::new(AsyncIcechunkStore::new(
+        repo.writable_session("main").await.unwrap(),
+    ));
+    let writer = ArrayBuilder::new(
+        vec![2, 2, 3],
+        vec![1, 2, 1],
+        data_type::float32(),
+        -999.0f32,
+    )
+    .array_to_bytes_codec(Arc::new(
+        ShardingCodecBuilder::new(vec![1.try_into().unwrap(); 3], &data_type::float32())
+            .bytes_to_bytes_codecs(vec![Arc::new(GzipCodec::new(1).unwrap())])
+            .build(),
+    ))
+    .bytes_to_bytes_codecs(vec![Arc::new(GzipCodec::new(1).unwrap())])
+    .dimension_names(Some(["time", "lat", "lon"]))
+    .build(store.clone(), "/outer")
+    .unwrap();
+    writer.async_store_metadata().await.unwrap();
+    writer
+        .async_store_array_subset(&writer.subset_all(), vec![17.0f32; 12])
+        .await
+        .unwrap();
+    store
+        .session()
+        .write()
+        .await
+        .commit("outer compressed shards")
+        .execute()
+        .await
+        .unwrap();
+    let options = crate::catalog::single_threaded_opts();
+    for cache_mb in [0, 4] {
+        let mut config = config(dir.path());
+        config.cache_mb = cache_mb;
+        // Even with decoded retention enabled, outer transforms use the serial
+        // path and admit full stored chunks plus intermediate shard bodies.
+        config.icechunk.as_mut().unwrap().decoded_cache_mb = 1;
+        let open = || {
+            let source = Source::open("scopes", &config).unwrap();
+            let store = source.snapshot(None).unwrap().unwrap();
+            crate::codec_limits::bounded_array(Array::open(store, "/outer").unwrap()).unwrap()
+        };
+        for subset in [
+            writer.subset_all(),
+            ArraySubset::new_with_ranges(&[0..1, 0..1, 0..3]),
+        ] {
+            let array = open();
+            assert!(DecodedArray::new(
+                &array,
+                Some("snapshot"),
+                "outer",
+                Arc::new(DecodedCache::new(ds_cache::MIB))
+            )
+            .is_none());
+            let probe = Arc::new(Budget::new(ds_cache::MIB));
+            let permit = probe.reserve(&array, &subset, Some(0), false).unwrap();
+            let baseline = probe.metrics().0;
+            let mut maximum = 0;
+            for indices in array
+                .chunks_in_array_subset(&subset)
+                .unwrap()
+                .unwrap()
+                .indices()
+            {
+                let overlap = array
+                    .chunk_subset(&indices)
+                    .unwrap()
+                    .overlap(&subset)
+                    .unwrap();
+                let _scope = encoded::enter(Some(probe.clone()));
+                let _: ArrayBytes = array.retrieve_array_subset_opt(&overlap, &options).unwrap();
+                maximum = maximum.max(probe.metrics().0 - baseline);
+            }
+            drop(permit);
+            let array = open(); // Fresh payload cache for the first read.
+            let budget = Arc::new(Budget::new(baseline + maximum));
+            let permit = budget.reserve(&array, &subset, Some(0), false).unwrap();
+            let scope = encoded::enter(Some(budget.clone()));
+            for _ in 0..2 {
+                let bytes = crate::retrieval::serial(&array, &subset, &options).unwrap();
+                assert_eq!(
+                    Vec::<f32>::from_array_bytes(bytes, subset.shape(), array.data_type()).unwrap(),
+                    vec![17.; subset.num_elements() as usize]
+                );
+                assert_eq!(budget.metrics(), (baseline, baseline + maximum, 0));
+            }
+            assert!(matches!(
+                array
+                    .retrieve_array_subset_opt::<ArrayBytes>(&subset, &options)
+                    .map_err(crate::catalog::chunk_read_error),
+                Err(DataServerError::ResourceExhausted)
+            ));
+            drop(scope);
+            assert_eq!(budget.metrics().0, baseline);
+            drop(permit);
+            assert_eq!(budget.metrics().0, 0);
+        }
+        let engine = ZarrEngine::new("outer", &config).unwrap();
+        assert!(engine
+            .get_raster_tile(
+                [0., 59., 100., 60.],
+                3,
+                2,
+                None,
+                &OutputCrs::Wgs84,
+                Some("outer"),
+                None,
+                None
+            )
+            .unwrap()
+            .values
+            .iter_values()
+            .all(|value| value == Some(17.)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_icechunk_payloads_still_return_fill_under_encoded_admission() {
     use crate::{encoded, read_budget::Budget};
     use zarrs::storage::{byte_range::ByteRange, AsyncWritableStorageTraits};

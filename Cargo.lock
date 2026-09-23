@@ -1598,6 +1598,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unsafe_cell_slice",
  "zarrs",
  "zarrs_icechunk",
  "zstd",

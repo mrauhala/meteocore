@@ -149,7 +149,11 @@ returns 503 without waiting while holding other windows. Area windows retain
 their reservation through sampling. This budget is separate from response
 limits, resident caches, and persistent metadata. Encoded full-object/range
 reads add a two-copy allowance before collection and retain it through native
-retrieval, including compressed-cache hits and coalesced waiters. Native decoded
+retrieval, including compressed-cache hits and coalesced waiters. Plain Zarr and
+outer-transformed Icechunk arrays release encoded/intermediate allowances after
+each stored chunk finishes, so completed chunks do not accumulate reservations
+over a position, area, or radius window. Inner/index buffers stay admitted until
+that chunk finishes; native/source buffers remain covered through sampling. Native decoded
 cache hits do not need encoded admission. Numeric-variable gzip/zstd/Blosc outputs
 are capped by the declared codec representation, including sharded layouts;
 if bounded-codec setup fails for one variable, catalog discovery warns and

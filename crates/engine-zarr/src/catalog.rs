@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use zarrs::array::{
-    data_type, Array, ArrayBytes, ArrayError, ArrayShardedExt, ArraySubset, CodecError,
-    CodecOptions, FromArrayBytes,
+    data_type, Array, ArrayError, ArrayShardedExt, ArraySubset, CodecError, CodecOptions,
+    FromArrayBytes,
 };
 use zarrs::group::Group;
 use zarrs::storage::StorageError;
@@ -1235,11 +1235,7 @@ fn retrieve_raw_f64(
     }
     let bytes = match decoded {
         Some(decoded) => decoded.read(array, subset, &opts, parallelism)?,
-        None => {
-            let result = array.retrieve_array_subset_opt::<ArrayBytes<'static>>(subset, &opts);
-            ds_core::deadline::check()?;
-            result.map_err(chunk_read_error)?
-        }
+        None => crate::retrieval::serial(array, subset, &opts)?,
     };
     macro_rules! read_as {
         ($t:ty) => {

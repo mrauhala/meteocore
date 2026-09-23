@@ -281,7 +281,7 @@ fn sequential_blosc_calls_reuse_scratch_while_encoded_buffers_remain_admitted() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_multichunk_reads_fit_one_scratch_allowance_with_cold_and_cached_payloads() {
     use zarrs::{
-        array::{data_type, ArrayBuilder},
+        array::{data_type, ArrayBuilder, FromArrayBytes},
         filesystem::FilesystemStore,
     };
 
@@ -303,7 +303,7 @@ async fn plain_multichunk_reads_fit_one_scratch_allowance_with_cold_and_cached_p
     for indices in [[0, 0], [0, 1], [1, 0], [1, 1]] {
         let path = dir.path().join(writer.chunk_key(&indices).as_str());
         let bytes = std::fs::read(&path).unwrap();
-        encoded_bytes += 2 * bytes.len() as u64;
+        encoded_bytes = encoded_bytes.max(2 * bytes.len() as u64);
         scratch = scratch.max(
             3 * u64::from(u32::from_le_bytes(bytes[8..12].try_into().unwrap()))
                 + 4 * u64::from(bytes[3]),
@@ -315,8 +315,8 @@ async fn plain_multichunk_reads_fit_one_scratch_allowance_with_cold_and_cached_p
         crate::build_store("scratch", &config).unwrap(),
     ));
     let array = bounded_array(Array::open(store, "/a").unwrap()).unwrap();
-    // 64 source values * 24 bytes, plus four 64-byte native buffers. Encoded
-    // copies of all four chunks remain charged; only native scratch is reused.
+    // 64 source values * 24 bytes, plus four 64-byte native buffers. Temporary
+    // capacity fits one chunk's encoded copies and one native scratch buffer.
     let baseline = 1536 + 256;
     let budget = Arc::new(crate::read_budget::Budget::new(
         baseline + encoded_bytes + scratch,
@@ -330,9 +330,11 @@ async fn plain_multichunk_reads_fit_one_scratch_allowance_with_cold_and_cached_p
             }
         }
         let scope = crate::encoded::enter(Some(budget.clone()));
-        let actual: Vec<f32> = array.retrieve_array_subset_opt(&subset, &options).unwrap();
+        let bytes = crate::retrieval::serial(&array, &subset, &options).unwrap();
+        let actual =
+            Vec::<f32>::from_array_bytes(bytes, subset.shape(), array.data_type()).unwrap();
         assert_eq!(actual, expected);
-        assert_eq!(budget.metrics().0, baseline + encoded_bytes);
+        assert_eq!(budget.metrics().0, baseline);
         assert_eq!(budget.metrics().2, 0);
         drop(scope);
         assert_eq!(budget.metrics().0, baseline);
