@@ -340,9 +340,11 @@ pub fn property_table(properties: &Value) -> String {
 
 pub fn document_links(doc: &Value) -> String {
     let mut body = String::from("<div class=\"endpoint-list resource-links\">");
-    // Relations are often advertised twice (short and registered URI form);
-    // list each target once, under the first relation that names it.
-    let mut listed: Vec<(&str, &str)> = Vec::new();
+    // Relations are often advertised twice (short and registered URI form)
+    // with the same href, type and title; list such a pair once, under the
+    // first relation. Differently titled links to one resource (a tileset
+    // list offered as map and vector tilesets) each stay visible.
+    let mut listed: Vec<(&str, &str, &str)> = Vec::new();
     if let Some(links) = doc["links"].as_array() {
         for link in links {
             let href = link["href"].as_str().unwrap_or_default();
@@ -351,10 +353,11 @@ pub fn document_links(doc: &Value) -> String {
                 continue;
             }
             let media = link["type"].as_str().unwrap_or_default();
-            if listed.contains(&(href, media)) {
+            let title = link["title"].as_str().unwrap_or_default();
+            if listed.contains(&(href, media, title)) {
                 continue;
             }
-            listed.push((href, media));
+            listed.push((href, media, title));
             let label = link["title"].as_str().unwrap_or(rel);
             let human = matches!(
                 rel,
@@ -1591,17 +1594,29 @@ mod tests {
 
     #[test]
     fn resource_links_list_each_target_once() {
+        let tiles = "https://x/tiles/collections/a/tiles";
         let doc = json!({"links":[
-            {"rel":"conformance","href":"https://x/maps/conformance","type":"application/json"},
-            {"rel":rel::CONFORMANCE,"href":"https://x/maps/conformance","type":"application/json"},
+            {"rel":"conformance","href":"https://x/maps/conformance","type":"application/json","title":"Conformance"},
+            {"rel":rel::CONFORMANCE,"href":"https://x/maps/conformance","type":"application/json","title":"Conformance"},
             {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/png"},
-            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/jpeg"}
+            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/jpeg"},
+            {"rel":"tiles","href":tiles,"type":"application/json","title":"Tilesets"},
+            {"rel":rel::TILESETS_MAP,"href":tiles,"type":"application/json","title":"Map tilesets"},
+            {"rel":rel::TILESETS_VECTOR,"href":tiles,"type":"application/json","title":"Vector tilesets"}
         ]});
         let html = document_links(&doc);
         assert_eq!(html.matches("maps/conformance?f=html").count(), 1);
         assert!(!html.contains(rel::CONFORMANCE));
         // Distinct representations of one resource remain separate entries.
         assert_eq!(html.matches("image/").count(), 2);
+        // Differently titled offers of one resource keep their relations.
+        for title in ["Tilesets", "Map tilesets", "Vector tilesets"] {
+            assert!(
+                html.contains(&format!("<strong>{title}</strong>")),
+                "{title}"
+            );
+        }
+        assert!(html.contains(rel::TILESETS_VECTOR));
     }
 
     #[test]
