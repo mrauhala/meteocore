@@ -792,10 +792,18 @@ async fn main() {
         .nest("/edr", api_edr::router(edr_swap.clone()))
         .nest("/features", api_features::router(features_swap.clone()))
         .nest("/wms", api_wms::router(wms_swap.clone()))
-        .nest("/maps", api_maps::router(maps_swap.clone()))
-        .nest("/tiles", api_tiles::router(tiles_swap.clone()))
+        .nest(
+            api_common::mounts::MAPS,
+            api_maps::router(maps_swap.clone()),
+        )
+        .nest(
+            api_common::mounts::TILES,
+            api_tiles::router(tiles_swap.clone()),
+        )
         .nest("/3dtiles", api_3dtiles::router(tiles_3d_swap.clone()))
-        // Trailing-slash variants so /edr/, /features/, /maps/, /tiles/, /3dtiles/ also work
+        // Trailing-slash variants for /edr/, /features/ and /3dtiles/. Maps and
+        // Tiles need none: `NormalizePathLayer` below trims the slash before
+        // routing, and their handlers require the router's `Mount` extension.
         .route(
             "/3dtiles/",
             get(api_3dtiles::handlers::landing_page).with_state(tiles_3d_swap),
@@ -807,14 +815,6 @@ async fn main() {
         .route(
             "/features/",
             get(api_features::handlers::landing_page).with_state(features_swap),
-        )
-        .route(
-            "/maps/",
-            get(api_maps::handlers::landing_page).with_state(maps_swap),
-        )
-        .route(
-            "/tiles/",
-            get(api_tiles::handlers::landing_page).with_state(tiles_swap),
         )
         .route(
             "/health",
@@ -1112,8 +1112,11 @@ async fn root_landing_page(
         ds_core::html::Wanted::Json => Json(document).into_response(),
         ds_core::html::Wanted::Html => {
             axum::response::Html(api_common::workbench::landing_document(
-                base,
-                "",
+                api_common::workbench::Surface {
+                    base,
+                    root: base,
+                    api: "",
+                },
                 "MeteoCore API",
                 document["description"].as_str().unwrap_or_default(),
                 &document,

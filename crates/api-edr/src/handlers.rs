@@ -378,8 +378,11 @@ pub async fn landing_page(
                 Some("This document as JSON"),
             ));
             Html(api_common::workbench::landing_html(
-                base,
-                "edr",
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::EDR),
+                    api: "edr",
+                },
                 title,
                 description,
                 &views,
@@ -989,7 +992,13 @@ pub async fn conformance(
                 ),
             ];
             Html(api_common::workbench::conformance_html(
-                base, "edr", &classes, &nav,
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::EDR),
+                    api: "edr",
+                },
+                &classes,
+                &nav,
             ))
             .into_response()
         }
@@ -1022,7 +1031,15 @@ pub async fn collections(
             })
         })
         .collect();
-    api_common::collections_response(&format!("{base}/edr/collections"), request, entries)
+    api_common::collections_response(
+        api_common::workbench::Surface {
+            base,
+            root: &format!("{base}{}", api_common::mounts::EDR),
+            api: "edr",
+        },
+        request,
+        entries,
+    )
 }
 
 /// GET /edr/collections/{id} — Collection detail
@@ -1048,8 +1065,11 @@ pub async fn collection(
         Wanted::Html => {
             let metadata = build_collection_metadata(engine.as_ref(), config, base, None);
             Html(api_common::workbench::collection_html(
-                base,
-                "edr",
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::EDR),
+                    api: "edr",
+                },
                 &metadata,
                 config.license.as_ref(),
             ))
@@ -1123,7 +1143,11 @@ pub async fn instances(
                 ),
             ];
             Html(api_common::workbench::instances_html(
-                base,
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::EDR),
+                    api: "edr",
+                },
                 &format!("{} — instances", config.title),
                 &cards,
                 &nav,
@@ -1222,8 +1246,11 @@ pub async fn instance(
         Wanted::Html => {
             let metadata = build_collection_metadata(engine.as_ref(), config, base, Some(&run));
             Html(api_common::workbench::collection_html(
-                base,
-                "edr",
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::EDR),
+                    api: "edr",
+                },
                 &metadata,
                 config.license.as_ref(),
             ))

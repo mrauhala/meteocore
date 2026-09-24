@@ -186,8 +186,11 @@ pub async fn landing_page(
                 Some("This document as JSON"),
             ));
             Html(api_common::workbench::landing_html(
-                base,
-                "features",
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    api: "features",
+                },
                 title,
                 description,
                 &views,
@@ -224,7 +227,13 @@ pub async fn conformance(
                 ),
             ];
             Html(api_common::workbench::conformance_html(
-                base, "features", &classes, &nav,
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    api: "features",
+                },
+                &classes,
+                &nav,
             ))
             .into_response()
         }
@@ -561,7 +570,15 @@ pub async fn collections(
             })
         })
         .collect();
-    api_common::collections_response(&format!("{base}/features/collections"), request, entries)
+    api_common::collections_response(
+        api_common::workbench::Surface {
+            base,
+            root: &format!("{base}{}", api_common::mounts::FEATURES),
+            api: "features",
+        },
+        request,
+        entries,
+    )
 }
 
 /// GET /features/collections/{id} — Collection detail
@@ -583,8 +600,11 @@ pub async fn collection(
         Wanted::Html => {
             let metadata = build_collection_metadata(engine.as_ref(), config, base);
             Html(api_common::workbench::collection_html(
-                base,
-                "features",
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    api: "features",
+                },
                 &metadata,
                 config.license.as_ref(),
             ))

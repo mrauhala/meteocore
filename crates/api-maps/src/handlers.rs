@@ -5,9 +5,12 @@ use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use axum::Extension;
 use axum::Json;
 use serde_json::json;
 
+use api_common::workbench::Surface;
+use api_common::{mounts, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::map_engine::MapEngine;
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
@@ -132,16 +135,17 @@ fn with_vary(mut resp: Response) -> Response {
 
 /// The link entries advertised for one style: the styled-map endpoint and the
 /// machine-readable legend. One builder so the `/collections/{id}` and
-/// `/collections/{id}/styles` representations can't drift.
-fn style_links(collection_id: &str, style_name: &str, base_url: &str) -> serde_json::Value {
+/// `/collections/{id}/styles` representations can't drift. `root` is the
+/// absolute API root (base URL + mount).
+fn style_links(collection_id: &str, style_name: &str, root: &str) -> serde_json::Value {
     json!([
         {
-            "href": format!("{base_url}/maps/collections/{collection_id}/styles/{style_name}/map"),
+            "href": format!("{root}/collections/{collection_id}/styles/{style_name}/map"),
             "rel": "map",
             "type": "image/png"
         },
         {
-            "href": format!("{base_url}/maps/collections/{collection_id}/styles/{style_name}/legend"),
+            "href": format!("{root}/collections/{collection_id}/styles/{style_name}/legend"),
             "rel": "legend",
             "type": "application/json"
         }
@@ -153,6 +157,7 @@ fn build_collection_metadata(
     info: &ds_core::map_engine::RasterInfo,
     styles: Option<&HashMap<String, StyleInfo>>,
     base_url: &str,
+    root: &str,
 ) -> serde_json::Value {
     let mut crs_list: Vec<&str> = params::supported_crs_list().to_vec();
     // Deduplicate
@@ -186,7 +191,7 @@ fn build_collection_metadata(
                 style_list.push(json!({
                     "id": s.name,
                     "title": s.title,
-                    "links": style_links(&config.id, &s.name, base_url)
+                    "links": style_links(&config.id, &s.name, root)
                 }));
             }
         }
@@ -194,19 +199,19 @@ fn build_collection_metadata(
 
     let mut links = vec![
         json!({
-            "href": format!("{base_url}/maps/collections/{}", config.id),
+            "href": format!("{root}/collections/{}", config.id),
             "rel": "self",
             "type": "application/json",
             "title": config.title
         }),
         json!({
-            "href": format!("{base_url}/maps/collections/{}/map", config.id),
+            "href": format!("{root}/collections/{}/map", config.id),
             "rel": "map",
             "type": "image/png",
             "title": "Map"
         }),
         json!({
-            "href": format!("{base_url}/maps/collections/{}/styles", config.id),
+            "href": format!("{root}/collections/{}/styles", config.id),
             "rel": "styles",
             "type": "application/json",
             "title": "Styles"
@@ -219,7 +224,7 @@ fn build_collection_metadata(
     // through the Tiles API (the standalone `/tiles` router still serves it).
     if config.apis.iter().any(|a| a == "tiles") {
         links.push(json!({
-            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
+            "href": format!("{base_url}{}/collections/{}/tiles", mounts::TILES, config.id),
             "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map",
             "type": "application/json",
             "title": "Map tilesets"
@@ -272,9 +277,10 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /maps/ — Landing page
+/// GET {mount}/ — Landing page
 pub async fn landing_page(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
@@ -282,36 +288,37 @@ pub async fn landing_page(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let title = "MeteoCore - Maps";
     let description = "Metocean Data Server — OGC API Maps";
     // (href, rel, type, title) — one source for both representations.
     let links = [
         (
-            format!("{base}/maps/"),
+            format!("{root}/"),
             "self",
             "application/json",
             "This document",
         ),
         (
-            format!("{base}/maps/api"),
+            format!("{root}/api"),
             "service-desc",
             "application/vnd.oai.openapi+json;version=3.0",
             "API definition",
         ),
         (
-            format!("{base}/maps/api/docs"),
+            format!("{root}/api/docs"),
             "service-doc",
             "text/html",
             "API documentation",
         ),
         (
-            format!("{base}/maps/conformance"),
+            format!("{root}/conformance"),
             "conformance",
             "application/json",
             "Conformance classes",
         ),
         (
-            format!("{base}/maps/collections"),
+            format!("{root}/collections"),
             "data",
             "application/json",
             "Collections",
@@ -334,13 +341,16 @@ pub async fn landing_page(
             // rel="alternate" to the JSON representation (parity with the
             // collection-detail HTML page).
             views.push(LinkView::new(
-                format!("{base}/maps/?f=json"),
+                format!("{root}/?f=json"),
                 "alternate",
                 Some("This document as JSON"),
             ));
             Html(api_common::workbench::landing_html(
-                base,
-                "maps",
+                Surface {
+                    base,
+                    root,
+                    api: "maps",
+                },
                 title,
                 description,
                 &views,
@@ -357,15 +367,19 @@ fn format_parameter() -> serde_json::Value {
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
-/// GET /maps/api — OpenAPI 3.0.3 definition
-pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+/// GET {mount}/api — OpenAPI 3.0.3 definition. Path keys include the mount.
+pub async fn api_definition(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+) -> impl IntoResponse {
     let state = state.load_full();
+    let m = mount.0;
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
 
-        // GET /maps/collections/{id}
-        let detail_path = format!("/maps/collections/{id}");
+        // GET {mount}/collections/{id}
+        let detail_path = format!("{m}/collections/{id}");
         collection_paths[&detail_path] = json!({
             "get": {
                 "summary": format!("Get {} collection metadata", config.title),
@@ -379,8 +393,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/map
-        let map_path = format!("/maps/collections/{id}/map");
+        // GET {mount}/collections/{id}/map
+        let map_path = format!("{m}/collections/{id}/map");
         collection_paths[&map_path] = json!({
             "get": {
                 "summary": format!("Get map for {}", config.title),
@@ -419,8 +433,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/styles
-        let styles_path = format!("/maps/collections/{id}/styles");
+        // GET {mount}/collections/{id}/styles
+        let styles_path = format!("{m}/collections/{id}/styles");
         collection_paths[&styles_path] = json!({
             "get": {
                 "summary": format!("List styles for {}", config.title),
@@ -441,8 +455,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/styles/{styleId}/map
-        let styled_map_path = format!("/maps/collections/{id}/styles/{{styleId}}/map");
+        // GET {mount}/collections/{id}/styles/{styleId}/map
+        let styled_map_path = format!("{m}/collections/{id}/styles/{{styleId}}/map");
         collection_paths[&styled_map_path] = json!({
             "get": {
                 "summary": format!("Get styled map for {}", config.title),
@@ -488,8 +502,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/styles/{styleId}/legend
-        let legend_path = format!("/maps/collections/{id}/styles/{{styleId}}/legend");
+        // GET {mount}/collections/{id}/styles/{styleId}/legend
+        let legend_path = format!("{m}/collections/{id}/styles/{{styleId}}/legend");
         collection_paths[&legend_path] = json!({
             "get": {
                 "summary": format!("Get style legend for {}", config.title),
@@ -539,7 +553,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     }
 
     let mut paths = json!({
-        "/maps/": {
+        format!("{m}/"): {
             "get": {
                 "summary": "Landing page",
                 "operationId": "getLandingPage",
@@ -549,7 +563,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         },
-        "/maps/conformance": {
+        format!("{m}/conformance"): {
             "get": {
                 "summary": "Conformance classes",
                 "operationId": "getConformance",
@@ -559,7 +573,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         },
-        "/maps/collections": {"get": api_common::collection_operation()}
+        format!("{m}/collections"): {"get": api_common::collection_operation()}
     });
 
     // Merge collection paths into main paths
@@ -725,10 +739,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     Json(openapi)
 }
 
-/// GET /maps/api/docs — Swagger UI
-pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// GET {mount}/api/docs — Swagger UI
+pub async fn api_docs(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/maps/api", request_base_url(&state, &headers));
+    let spec_url = format!("{}/api", mount.root(&request_base_url(&state, &headers)));
     (
         [
             (
@@ -760,9 +778,10 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
     }
 }
 
-/// GET /maps/conformance
+/// GET {mount}/conformance
 pub async fn conformance(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
@@ -770,6 +789,7 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let classes = api_common::conformance_classes(&[
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
@@ -785,29 +805,37 @@ pub async fn conformance(
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {
             let nav = [
-                LinkView::new(format!("{base}/maps/"), "up", Some("Landing page")),
+                LinkView::new(format!("{root}/"), "up", Some("Landing page")),
                 LinkView::new(
-                    format!("{base}/maps/conformance?f=json"),
+                    format!("{root}/conformance?f=json"),
                     "alternate",
                     Some("This document as JSON"),
                 ),
             ];
             Html(api_common::workbench::conformance_html(
-                base, "maps", &classes, &nav,
+                Surface {
+                    base,
+                    root,
+                    api: "maps",
+                },
+                &classes,
+                &nav,
             ))
             .into_response()
         }
     }))
 }
 
-/// GET /maps/collections
+/// GET {mount}/collections
 pub async fn collections(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     request: api_common::CollectionRequest,
     headers: HeaderMap,
 ) -> Response {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let entries = state
         .collections
         .values()
@@ -821,7 +849,7 @@ pub async fn collections(
             };
             let info = engine.raster_info_shared();
             let metadata =
-                build_collection_metadata(config, &info, state.styles.get(&config.id), base);
+                build_collection_metadata(config, &info, state.styles.get(&config.id), base, root);
             Some(api_common::CollectionEntry {
                 config,
                 metadata,
@@ -830,13 +858,22 @@ pub async fn collections(
             })
         })
         .collect();
-    api_common::collections_response(&format!("{base}/maps/collections"), request, entries)
+    api_common::collections_response(
+        Surface {
+            base,
+            root,
+            api: "maps",
+        },
+        request,
+        entries,
+    )
 }
 
-/// GET /maps/collections/{id} — Collection detail
+/// GET {mount}/collections/{id} — Collection detail
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
@@ -845,11 +882,12 @@ pub async fn collection(
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, &id)?;
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     Ok(with_vary(match wanted {
         Wanted::Json => {
             let info = engine.raster_info_shared();
             let styles = state.styles.get(&id);
-            Json(build_collection_metadata(config, &info, styles, base)).into_response()
+            Json(build_collection_metadata(config, &info, styles, base, root)).into_response()
         }
         Wanted::Html => {
             let metadata = build_collection_metadata(
@@ -857,10 +895,14 @@ pub async fn collection(
                 &engine.raster_info_shared(),
                 state.styles.get(&id),
                 base,
+                root,
             );
             Html(api_common::workbench::collection_html(
-                base,
-                "maps",
+                Surface {
+                    base,
+                    root,
+                    api: "maps",
+                },
                 &metadata,
                 config.license.as_ref(),
             ))
@@ -869,15 +911,16 @@ pub async fn collection(
     }))
 }
 
-/// GET /maps/collections/{id}/styles
+/// GET {mount}/collections/{id}/styles
 pub async fn styles(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, MapsError> {
     let state = state.load_full();
     let (_engine, config) = lookup_engine(&state, &id)?;
-    let base = &request_base_url(&state, &headers);
+    let root = &mount.root(&request_base_url(&state, &headers));
 
     let mut style_list = Vec::new();
     if let Some(layer_styles) = state.styles.get(&id) {
@@ -896,7 +939,7 @@ pub async fn styles(
                 style_list.push(json!({
                     "id": s.name,
                     "title": s.title,
-                    "links": style_links(&config.id, &s.name, base)
+                    "links": style_links(&config.id, &s.name, root)
                 }));
             }
         }
@@ -906,7 +949,7 @@ pub async fn styles(
         "styles": style_list,
         "links": [
             {
-                "href": format!("{base}/maps/collections/{}/styles", id),
+                "href": format!("{root}/collections/{}/styles", id),
                 "rel": "self",
                 "type": "application/json"
             }
@@ -914,7 +957,7 @@ pub async fn styles(
     })))
 }
 
-/// GET /maps/collections/{id}/styles/{styleId}/legend
+/// GET {mount}/collections/{id}/styles/{styleId}/legend
 ///
 /// `?f=json` (the default) returns the machine-readable legend — palette
 /// stops, value range, interpolation — so a client can draw its own legend;
@@ -1010,7 +1053,7 @@ pub async fn style_legend(
     }
 }
 
-/// GET /maps/collections/{id}/map — render map with default style
+/// GET {mount}/collections/{id}/map — render map with default style
 pub async fn get_map(
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -1020,7 +1063,7 @@ pub async fn get_map(
     render_map(&id, "default", params, headers, state).await
 }
 
-/// GET /maps/collections/{id}/styles/{styleId}/map — render map with named style
+/// GET {mount}/collections/{id}/styles/{styleId}/map — render map with named style
 pub async fn get_styled_map(
     headers: HeaderMap,
     Path((id, style_id)): Path<(String, String)>,

@@ -4,11 +4,18 @@ pub mod params;
 pub mod tilematrixset;
 
 use axum::routing::get;
-use axum::Router;
+use axum::{Extension, Router};
 
 pub use handlers::{AppState, TilesState};
 
+/// The Tiles service router, mounted at [`api_common::mounts::TILES`].
 pub fn router(state: AppState) -> Router {
+    router_at(state, api_common::mounts::TILES)
+}
+
+/// The Tiles router for a `mount` path below the external base URL. Every
+/// link the handlers emit is built from base URL + `mount`.
+pub fn router_at(state: AppState, mount: &'static str) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
         .route("/api", get(handlers::api_definition))
@@ -39,4 +46,5 @@ pub fn router(state: AppState) -> Router {
             get(handlers::style_legend),
         )
         .with_state(state)
+        .layer(Extension(api_common::Mount(mount)))
 }

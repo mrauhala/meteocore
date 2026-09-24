@@ -29,6 +29,28 @@ pub const CONFORMANCE_CLASSES: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/html",
 ];
 
+/// Paths at which the per-API services are mounted below the external base URL.
+/// The server nests each router here; cross-API links target these services.
+pub mod mounts {
+    pub const EDR: &str = "/edr";
+    pub const FEATURES: &str = "/features";
+    pub const MAPS: &str = "/maps";
+    pub const TILES: &str = "/tiles";
+}
+
+/// Mount path of an API router below the external base URL, supplied to its
+/// handlers as a request extension. Links are built from base URL + mount, so
+/// one handler set can serve both a per-API service and a shared root (#789).
+#[derive(Clone, Copy, Debug)]
+pub struct Mount(pub &'static str);
+
+impl Mount {
+    /// Absolute URL of the API root (landing page), without a trailing slash.
+    pub fn root(self, base: &str) -> String {
+        format!("{base}{}", self.0)
+    }
+}
+
 pub fn conformance_classes(api_classes: &[&'static str]) -> Vec<&'static str> {
     CONFORMANCE_CLASSES
         .iter()
@@ -87,13 +109,15 @@ pub struct CollectionEntry<'a> {
     pub time: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
-/// Filter, page and represent a collection list. `url` is the externally resolved
-/// absolute URL of this API's `/collections` resource (including any proxy prefix).
+/// Filter, page and represent a collection list at `{surface.root}/collections`.
+/// The root is the externally resolved absolute API root (including any proxy
+/// prefix and the API mount).
 pub fn collections_response(
-    url: &str,
+    surface: workbench::Surface<'_>,
     request: CollectionRequest,
     mut entries: Vec<CollectionEntry<'_>>,
 ) -> Response {
+    let url = &format!("{}/collections", surface.root);
     entries.sort_by(|a, b| a.config.id.cmp(&b.config.id));
     let facets: Vec<_> = entries
         .iter()
@@ -178,6 +202,7 @@ pub fn collections_response(
                 })
                 .collect();
             Html(workbench::collections_html(
+                surface,
                 url,
                 &request.query,
                 &request.search,

@@ -16,6 +16,10 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
 - Adapters supply metadata and extents from their registry snapshot. Time bounds
   and advertised collection metadata must agree. Preserve EDR's distinct extent
   representation. Do not infer a sampling grid from feature interval endpoints.
+- Never hard-code an API path such as `/maps/…` in a Maps/Tiles link, OpenAPI key
+  or HTML URL: build it from `Mount::root(base)` (the `Mount` extension added by
+  `router_at`). Cross-API links use `mounts::*`. Pass the workbench a `Surface`;
+  gate its data panels on advertised links, not on the API kind (#789).
 - Shared metadata owns keywords, license and representation links. API-specific
   fields may override id/title for instances; do not override shared links.
 - Conformance declarations are deliberate. Part 4 searchable-collections is absent

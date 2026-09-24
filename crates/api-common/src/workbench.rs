@@ -7,15 +7,40 @@ use ds_core::config::LicenseConfig;
 use ds_core::html::{escape, LinkView};
 use serde_json::{json, Value};
 
+use crate::mounts;
+
 const CSS: &str = include_str!("workbench/style.css");
 const SCRIPT: &str = include_str!("workbench/app.js");
 const THEME: &str = include_str!("workbench/theme.js");
-const APIS: &[(&str, &str)] = &[
-    ("edr", "EDR"),
-    ("features", "Features"),
-    ("maps", "Maps"),
-    ("tiles", "Tiles"),
+/// API workspaces offered by the switcher: (kind, label, mount path).
+const APIS: &[(&str, &str, &str)] = &[
+    ("edr", "EDR", mounts::EDR),
+    ("features", "Features", mounts::FEATURES),
+    ("maps", "Maps", mounts::MAPS),
+    ("tiles", "Tiles", mounts::TILES),
 ];
+
+/// Where a page's API lives. `base` is the server's external base URL (for
+/// server-wide assets and the API switcher); `root` is the absolute root of the
+/// API the page belongs to (base URL + mount); `api` is the API kind shown in
+/// navigation, empty for the server-wide service index (whose root is `base`).
+#[derive(Clone, Copy, Debug)]
+pub struct Surface<'a> {
+    pub base: &'a str,
+    pub root: &'a str,
+    pub api: &'a str,
+}
+
+/// Registered OGC link relation for a collection's map resource (Maps Req 46).
+const REL_MAP: &str = "http://www.opengis.net/def/rel/ogc/1.0/map";
+
+/// First link carrying the short or registered map relation.
+fn map_link(links: &[Value]) -> Option<&str> {
+    links
+        .iter()
+        .find(|l| l["rel"] == "map" || l["rel"] == REL_MAP)
+        .and_then(|l| l["href"].as_str())
+}
 
 pub fn path_segment(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes())
@@ -84,8 +109,7 @@ pub fn icon(name: &str) -> String {
 }
 
 pub struct Page<'a> {
-    pub base: &'a str,
-    pub api: &'a str,
+    pub surface: Surface<'a>,
     pub title: &'a str,
     pub json_url: &'a str,
 }
@@ -103,8 +127,7 @@ impl Page<'_> {
         labels: &[(&str, &str)],
     ) -> String {
         let Self {
-            base,
-            api,
+            surface: Surface { base, root, api },
             title,
             json_url,
         } = self;
@@ -112,25 +135,30 @@ impl Page<'_> {
         let current_path = json_url.split('?').next().unwrap_or(json_url);
         let api_title = APIS
             .iter()
-            .find(|(id, _)| id == api)
-            .map_or("MeteoCore", |(_, name)| *name);
+            .find(|(id, _, _)| id == api)
+            .map_or("MeteoCore", |(_, name, _)| *name);
         let api_nav = APIS
             .iter()
-            .map(|(id, name)| {
+            .map(|(id, name, mount)| {
                 anchor(
-                    &format!("{base}/{id}/?f=html"),
+                    &format!("{base}{mount}/?f=html"),
                     name,
                     if id == api { "active" } else { "" },
                 )
             })
             .collect::<String>();
-        let workspace_api = if api.is_empty() { "features" } else { api };
+        // The service index has no API of its own; its sidebar opens Features.
+        let (workspace_api, workspace_root) = if api.is_empty() {
+            ("features", format!("{base}{}", mounts::FEATURES))
+        } else {
+            (*api, root.to_string())
+        };
         let options = APIS
             .iter()
-            .map(|(id, name)| {
+            .map(|(id, name, mount)| {
                 format!(
                     "<option value=\"{}\" {}>{name}</option>",
-                    escape(&format!("{base}/{id}/?f=html")),
+                    escape(&format!("{base}{mount}/?f=html")),
                     if *id == workspace_api { "selected" } else { "" }
                 )
             })
@@ -143,7 +171,7 @@ impl Page<'_> {
                 ("/api/docs", "API reference"),
                 ("/conformance", "Standards"),
             ] {
-                let path = format!("{base}/{workspace_api}{suffix}");
+                let path = format!("{workspace_root}{suffix}");
                 if suffix == "/api/docs" {
                     nav.push_str(
                         "<div class=\"nav-divider\"></div><div class=\"nav-label\">RESOURCES</div>",
@@ -186,9 +214,9 @@ impl Page<'_> {
         if !api.is_empty() {
             crumbs.push_str(&format!(
                 "<span>/</span>{}",
-                anchor(&format!("{base}/{api}/?f=html"), api_title, "")
+                anchor(&format!("{root}/?f=html"), api_title, "")
             ));
-            let prefix = format!("{base}/{api}/");
+            let prefix = format!("{root}/");
             let mut path = prefix.trim_end_matches('/').to_string();
             if let Some(rest) = current_path.strip_prefix(&prefix) {
                 for segment in rest.split('/').filter(|s| !s.is_empty()) {
@@ -221,22 +249,17 @@ impl Page<'_> {
                 }
             }
         }
-        let json_type = if *api == "features"
-            && current_path
-                .strip_prefix(&format!("{base}/features/collections/"))
-                .and_then(|rest| rest.split('/').nth(1))
-                == Some("items")
-        {
+        // Feature items (`…/collections/{id}/items[/{featureId}]`) are GeoJSON.
+        let items = current_path
+            .strip_prefix(&format!("{root}/collections/"))
+            .is_some_and(|tail| tail.split('/').nth(1) == Some("items"));
+        let json_type = if items {
             "application/geo+json"
         } else {
             "application/json"
         };
         let curl = format!("curl --get '{}'", json_url.replace('\'', "'\"'\"'"));
-        let catalog = current_path.trim_end_matches('/') == format!("{base}/{api}/collections");
-        let items = *api == "features"
-            && current_path
-                .strip_prefix(&format!("{base}/features/collections/"))
-                .is_some_and(|tail| tail.split('/').nth(1) == Some("items"));
+        let catalog = current_path.trim_end_matches('/') == format!("{root}/collections");
         let request_content = format!(
             r#"<div class="request-identity"><span class="method">GET</span><code id="request-url">{json_url}</code></div><div class="request-tools"><span class="request-note">Applied request · JSON representation</span><button class="btn small enhanced" data-copy="{json_url}">Copy URL</button><button class="btn small enhanced" data-copy="{curl}">Copy cURL</button><a class="btn small" href="{json_url}">Open JSON ↗</a></div>"#,
             json_url = escape(safe_href(json_url)),
@@ -320,8 +343,10 @@ pub fn document_links(doc: &Value) -> String {
                 continue;
             }
             let label = link["title"].as_str().unwrap_or(rel);
-            let human = matches!(rel, "data" | "child" | "collection" | "conformance" | "up")
-                || rel == "items" && href.contains("/features/");
+            let human = matches!(
+                rel,
+                "data" | "child" | "collection" | "conformance" | "up" | "items"
+            );
             let target = if human {
                 with_format(href, "html")
             } else {
@@ -343,32 +368,29 @@ pub fn document_links(doc: &Value) -> String {
 }
 
 pub fn landing_html(
-    base: &str,
-    api: &str,
+    surface: Surface<'_>,
     title: &str,
     description: &str,
     links: &[LinkView],
 ) -> String {
     let doc = json!({"links":links.iter().map(|l|json!({"href":l.href,"rel":l.rel,"title":l.title})).collect::<Vec<_>>()});
-    landing_document(base, api, title, description, &doc)
+    landing_document(surface, title, description, &doc)
 }
 
 pub fn landing_document(
-    base: &str,
-    api: &str,
+    surface: Surface<'_>,
     title: &str,
     description: &str,
     doc: &Value,
 ) -> String {
-    let url = format!(
-        "{base}/{}?f=json",
-        if api.is_empty() {
-            String::new()
-        } else {
-            format!("{api}/")
-        }
-    );
-    let discovery = if api.is_empty() { "features" } else { api };
+    let Surface { base, root, api } = surface;
+    let url = format!("{root}/?f=json");
+    // The service index has no catalog of its own; its search opens Features.
+    let discovery = if api.is_empty() {
+        format!("{base}{}", mounts::FEATURES)
+    } else {
+        root.to_owned()
+    };
     let mut body = page_heading(title, description);
     body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resources</h2></div><div class=\"resource-table\">");
     for link in doc["links"].as_array().into_iter().flatten() {
@@ -378,7 +400,7 @@ pub fn landing_document(
             rel == "child"
                 && APIS
                     .iter()
-                    .any(|(id, _)| href.trim_end_matches('/').ends_with(&format!("/{id}")))
+                    .any(|(_, _, mount)| href.trim_end_matches('/').ends_with(mount))
         } else {
             matches!(rel, "data" | "conformance" | "service-desc")
         };
@@ -401,20 +423,19 @@ pub fn landing_document(
         "tiles" => "Open a collection and follow its tileset links. Select a tile matrix set and tile coordinates to request map or vector tiles.",
         _ => "Choose an API and a collection first. Then request features, environmental values, map images or tiles using that collection's supported operations.",
     };
-    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{base}/{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,base=escape(base),arrow=icon("arrow")));
+    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(&discovery),arrow=icon("arrow")));
     body.push_str("<section class=\"section-space\"><div class=\"section-header\"><h2>API definitions &amp; resource links</h2></div>");
     body.push_str(&document_links(doc));
     body.push_str("</section>");
     Page {
-        base,
-        api,
+        surface,
         title,
         json_url: &url,
     }
     .render(&body, "")
 }
 
-pub fn conformance_html(base: &str, api: &str, classes: &[&str], nav: &[LinkView]) -> String {
+pub fn conformance_html(surface: Surface<'_>, classes: &[&str], nav: &[LinkView]) -> String {
     let url = nav
         .iter()
         .find(|l| l.rel == "alternate")
@@ -427,8 +448,7 @@ pub fn conformance_html(base: &str, api: &str, classes: &[&str], nav: &[LinkView
     }
     body.push_str("</ul>");
     Page {
-        base,
-        api,
+        surface,
         title: "Conformance classes",
         json_url: url,
     }
@@ -559,11 +579,11 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
 }
 
 pub fn collection_html(
-    base: &str,
-    api: &str,
+    surface: Surface<'_>,
     doc: &Value,
     license: Option<&LicenseConfig>,
 ) -> String {
+    let Surface { base, root, api } = surface;
     let title = doc["title"]
         .as_str()
         .filter(|title| !title.trim().is_empty())
@@ -576,14 +596,14 @@ pub fn collection_html(
         .and_then(|l| l["href"].as_str())
         .unwrap_or_default();
     let url = with_format(href, "json");
-    let catalog = format!("{base}/{api}/collections");
+    let catalog = format!("{root}/collections");
+    // Data access follows the advertised links, not the API the page is
+    // served by, so a collection offering several mechanisms shows each.
     let items = links
         .and_then(|ls| ls.iter().find(|l| l["rel"] == "items"))
-        .and_then(|l| l["href"].as_str())
-        .filter(|_| api == "features");
-    let map_request = if api == "maps" {
-        links.and_then(|ls| ls.iter().find(|l| l["rel"] == "map"))
-            .and_then(|l| l["href"].as_str())
+        .and_then(|l| l["href"].as_str());
+    let map_request = {
+        links.and_then(|ls| map_link(ls))
             .filter(|href| safe_href(href) != "#")
             .map(|href| {
                 let legend = |style: &Value| style["links"].as_array()
@@ -596,14 +616,12 @@ pub fn collection_html(
                 for style in doc["styles"].as_array().into_iter().flatten() {
                     // The collection map endpoint already renders this style.
                     if style["id"] == "default" { continue; }
-                    if let Some(href) = style["links"].as_array().and_then(|ls|ls.iter().find(|l|l["rel"]=="map")).and_then(|l|l["href"].as_str()).filter(|href|safe_href(href)!="#") {
+                    if let Some(href) = style["links"].as_array().and_then(|ls|map_link(ls)).filter(|href|safe_href(href)!="#") {
                         styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"legend":legend(style)}));
                     }
                 }
                 json!({"styles":styles,"times":map_times(&doc["extent"]["temporal"]),"vertical":doc["extent"]["vertical"]})
             })
-    } else {
-        None
     };
     let kind = doc["itemType"]
         .as_str()
@@ -665,17 +683,17 @@ pub fn collection_html(
                 let target = if name == "instances" {
                     with_format(href, "html")
                 } else {
-                    format!("{base}/edr/api/docs")
+                    format!("{root}/api/docs")
                 };
                 body.push_str(&format!("<div class=\"endpoint\"><div><strong>{} query</strong><code>{}</code><p>{}</p></div>{}</div>",escape(name),escape(href),value_html(&query["link"]["variables"]["output_formats"]),anchor(&target,if name=="instances"{"Browse runs →"}else{"API docs ↗"},"btn small")));
             }
         }
         body.push_str("</div>");
     }
-    if api == "maps" {
+    if map_request.is_some() {
         body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
         body.push_str(&anchor(
-            &format!("{base}/maps/api/docs"),
+            &format!("{root}/api/docs"),
             "Map request parameters ↗",
             "btn",
         ));
@@ -726,8 +744,7 @@ pub fn collection_html(
     body.push_str(&document_links(doc));
     body.push_str("</div></section></section>");
     Page {
-        base,
-        api,
+        surface,
         title,
         json_url: &url,
     }
@@ -1036,6 +1053,7 @@ fn collection_facts(doc: &Value) -> String {
 }
 
 pub fn collections_html(
+    surface: Surface<'_>,
     url: &str,
     query: &SearchQueryParams,
     search: &SearchParams,
@@ -1043,8 +1061,7 @@ pub fn collections_html(
     docs: &[CollectionView<'_>],
     nav: &[LinkView],
 ) -> String {
-    let api_root = url.strip_suffix("/collections").unwrap_or(url);
-    let (base, api) = api_root.rsplit_once('/').unwrap_or(("", api_root));
+    let api = surface.api;
     let json_url = format!(
         "{url}{}",
         query.query_string_with_format(search.limit, search.offset, "json")
@@ -1212,8 +1229,7 @@ pub fn collections_html(
     body.push_str(&pagination(nav));
     body.push_str("</div></section></div>");
     Page {
-        base,
-        api,
+        surface,
         title: "Collections",
         json_url: &json_url,
     }
@@ -1250,7 +1266,7 @@ pub fn pagination(nav: &[LinkView]) -> String {
 
 /// Model-run navigation uses the same shell without claiming collection search.
 pub fn instances_html(
-    base: &str,
+    surface: Surface<'_>,
     title: &str,
     cards: &[ds_core::html::CollectionCard],
     nav: &[LinkView],
@@ -1282,8 +1298,7 @@ pub fn instances_html(
     }
     body.push_str("</div>");
     Page {
-        base,
-        api: "edr",
+        surface,
         title,
         json_url: url,
     }
@@ -1301,6 +1316,26 @@ pub fn instances_html(
 mod tests {
     use super::*;
 
+    const MAPS_PROXY: Surface<'static> = Surface {
+        base: "https://example.test/proxy",
+        root: "https://example.test/proxy/maps",
+        api: "maps",
+    };
+
+    /// Render a collection page for an API at its per-API mount below `base`.
+    fn collection(base: &str, api: &str, doc: &Value, license: Option<&LicenseConfig>) -> String {
+        let root = format!("{base}/{api}");
+        collection_html(
+            Surface {
+                base,
+                root: &root,
+                api,
+            },
+            doc,
+            license,
+        )
+    }
+
     #[test]
     fn catalog_empty_page_keeps_filters_and_does_not_claim_zero_matches() {
         let query = SearchQueryParams::from_pairs(vec![
@@ -1312,7 +1347,7 @@ mod tests {
         .unwrap();
         let search = query.parse().unwrap();
         let url = "https://example.test/proxy/maps/collections";
-        let html = collections_html(url, &query, &search, 3, &[], &[]);
+        let html = collections_html(MAPS_PROXY, url, &query, &search, 3, &[], &[]);
         assert!(html.contains("3 matching collections"));
         assert!(html.contains("This page is outside the results."));
         assert!(html.contains("No page at offset 1000"));
@@ -1321,7 +1356,7 @@ mod tests {
         assert!(!html.contains("No collections match these filters."));
         let first = format!("{url}{}", query.query_string_with_format(12, 0, "html"));
         assert!(html.contains(&format!("href=\"{}\">Go to first page", escape(&first))));
-        let empty = collections_html(url, &query, &search, 0, &[], &[]);
+        let empty = collections_html(MAPS_PROXY, url, &query, &search, 0, &[], &[]);
         assert!(empty.contains("No collections match these filters."));
         assert!(empty.contains("0 results"));
         assert!(!empty.contains("Go to first page"));
@@ -1377,7 +1412,7 @@ mod tests {
                 {"rel":"map","href":"https://example.test/maps/collections/levels/map"}]});
             assert!(collection_facts(&doc).contains("Vertical dimension"));
             for api in ["edr", "maps", "tiles"] {
-                let html = collection_html("https://example.test", api, &doc, None);
+                let html = collection("https://example.test", api, &doc, None);
                 let overview = html.split("id=\"metadata\"").next().unwrap();
                 assert!(overview.contains("Vertical dimension"));
                 assert!(overview.contains("Available levels · z"));
@@ -1396,7 +1431,7 @@ mod tests {
             json!({"id":"single","links":[{"rel":"map","href":"/maps/collections/single/map"}]});
         assert!(!collection_facts(&doc).contains("Vertical dimension"));
         // The script contains the selector name, so assert the actual element.
-        assert!(!collection_html("", "maps", &doc, None).contains("id=\"map-level\""));
+        assert!(!collection("", "maps", &doc, None).contains("id=\"map-level\""));
         let malicious = json!({"interval":[[0,1]],"values":[0,"<script>","NaN",1],"unit":"<img onerror=alert(1)>"});
         assert!(!vertical_coverage(&malicious).contains("<img"));
         assert!(vertical_coverage(&malicious).contains("&lt;img"));
@@ -1415,7 +1450,7 @@ mod tests {
             title: "Use with attribution".into(),
             url: None,
         };
-        let html = collection_html(base, "maps", &doc, Some(&license));
+        let html = collection(base, "maps", &doc, Some(&license));
         let crumbs = html
             .split("id=\"breadcrumbs\"")
             .nth(1)
@@ -1480,7 +1515,7 @@ mod tests {
             {"rel":"self","href":format!("{base}/maps/collections/a")},
             {"rel":"map","href":format!("{base}/maps/collections/a/map")}
         ],"styles":[{"title":"Rain & snow","links":[{"rel":"map","href":format!("{base}/maps/collections/a/styles/rain/map")}]},{"title":"Unsafe","links":[{"rel":"map","href":"javascript:alert(1)"}]}]});
-        let html = collection_html(base, "maps", &doc, None);
+        let html = collection(base, "maps", &doc, None);
         let data = html
             .split("id=\"map-data\" hidden>")
             .nth(1)
@@ -1503,14 +1538,21 @@ mod tests {
         assert!(html.contains(&format!(
             "id=\"json-link\" href=\"{base}/maps/collections/a?f=json\""
         )));
-        assert!(!collection_html(base, "features", &doc, None).contains("id=\"map-controls\""));
+        // The preview follows the advertised map link, whichever API serves the page.
+        assert!(collection(base, "features", &doc, None).contains("id=\"map-controls\""));
+        let mut no_map = doc.clone();
+        no_map["links"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|l| l["rel"] != "map");
+        assert!(!collection(base, "maps", &no_map, None).contains("id=\"map-controls\""));
     }
 
     #[test]
     fn shell_and_metadata_escape_content_and_retain_proxy_prefix() {
         let attack = "</script><script>alert(1)</script>";
         let doc = json!({"id":"a","title":attack,"description":attack,"custom":{"nested":attack},"links":[{"rel":"self","href":"https://example.test/prefix/maps/collections/a"},{"rel":"license","href":"javascript:alert(1)","title":attack}]});
-        let html = collection_html("https://example.test/prefix", "maps", &doc, None);
+        let html = collection("https://example.test/prefix", "maps", &doc, None);
         assert!(!html.contains(attack));
         assert!(html.contains(&escape(attack)));
         assert!(!html.contains("href=\"javascript:"));
