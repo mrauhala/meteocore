@@ -1084,158 +1084,161 @@ pub async fn collection(
     use ds_core::html::Wanted;
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info_shared());
-    let feature_extent = state
-        .feature_engines
-        .get(&id)
-        .and_then(|e| e.spatial_extent());
-    let feature_time = state
-        .feature_engines
-        .get(&id)
-        .and_then(|e| e.temporal_extent());
-    let config = state
-        .collections
-        .get(&id)
-        .or_else(|| state.feature_collections.get(&id))
-        .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
-    if raster_info.is_none() && !state.feature_engines.contains_key(&id) {
-        return Err(TilesError::NotFound(format!(
-            "Collection '{id}' has no tile source"
-        )));
-    }
+    let sources = tile_sources(&state, &id)?;
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);
+    let metadata = build_collection_metadata(
+        sources.config,
+        sources.raster_info.as_deref(),
+        sources.feature_extent,
+        sources.feature_time,
+        sources.has_vector,
+        state.styles.get(&id),
+        root,
+    );
     Ok(with_vary(match wanted {
-        Wanted::Json => {
-            let styles = state.styles.get(&id);
-            Json(build_collection_metadata(
-                config,
-                raster_info.as_deref(),
-                feature_extent,
-                feature_time,
-                state.feature_engines.contains_key(&id),
-                styles,
+        Wanted::Json => Json(metadata).into_response(),
+        Wanted::Html => Html(api_common::workbench::collection_html(
+            Surface {
+                base,
                 root,
-            ))
-            .into_response()
-        }
-        Wanted::Html => {
-            let metadata = build_collection_metadata(
-                config,
-                raster_info.as_deref(),
-                feature_extent,
-                feature_time,
-                state.feature_engines.contains_key(&id),
-                state.styles.get(&id),
-                root,
-            );
-            Html(api_common::workbench::collection_html(
-                Surface {
-                    base,
-                    root,
-                    api: "tiles",
-                },
-                &metadata,
-                config.license.as_ref(),
-            ))
-            .into_response()
-        }
+                api: "tiles",
+            },
+            &metadata,
+            sources.config.license.as_ref(),
+        ))
+        .into_response(),
     }))
 }
 
 /// The tile sources a collection registers with the Tiles service.
 struct TileSources<'a> {
     config: &'a CollectionConfig,
-    has_raster: bool,
+    raster_info: Option<Arc<ds_core::map_engine::RasterInfo>>,
     has_vector: bool,
-    spatial_extent: Option<[f64; 4]>,
+    feature_extent: Option<[f64; 4]>,
+    feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+}
+
+/// The kind of tiles in a tileset (its Tiles `dataType`).
+#[derive(Clone, Copy, PartialEq)]
+enum TileKind {
+    Map,
+    Vector,
+}
+
+impl TileSources<'_> {
+    fn kinds(&self) -> impl Iterator<Item = TileKind> {
+        let map = self.raster_info.is_some().then_some(TileKind::Map);
+        let vector = self.has_vector.then_some(TileKind::Vector);
+        map.into_iter().chain(vector)
+    }
+
+    /// The kind `…/tiles/{tileMatrixSetId}` describes. That path holds one
+    /// tileset per tiling scheme, so a collection serving both kinds exposes
+    /// its map tileset there; the shared root gives each kind its own tileset
+    /// resource (#789 Phase 1: map tiles under `…/map/tiles`).
+    fn resource_kind(&self) -> TileKind {
+        if self.raster_info.is_some() {
+            TileKind::Map
+        } else {
+            TileKind::Vector
+        }
+    }
+
+    fn spatial_extent(&self) -> Option<[f64; 4]> {
+        self.raster_info
+            .as_ref()
+            .and_then(|i| i.spatial_extent)
+            .or(self.feature_extent)
+    }
 }
 
 /// Resolve a collection's tile sources, or 404 when it serves no tiles.
 fn tile_sources<'a>(state: &'a TilesState, id: &str) -> Result<TileSources<'a>, TilesError> {
-    let raster_info = state.map_engines.get(id).map(|e| e.raster_info_shared());
-    let feature_extent = state
-        .feature_engines
-        .get(id)
-        .and_then(|e| e.spatial_extent());
     let config = state
         .collections
         .get(id)
         .or_else(|| state.feature_collections.get(id))
         .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
-    let has_raster = raster_info.is_some();
-    let has_vector = state.feature_engines.contains_key(id);
-    if !has_raster && !has_vector {
+    let raster_info = state.map_engines.get(id).map(|e| e.raster_info_shared());
+    let feature = state.feature_engines.get(id);
+    if raster_info.is_none() && feature.is_none() {
         return Err(TilesError::NotFound(format!(
             "Collection '{id}' has no tile source"
         )));
     }
     Ok(TileSources {
         config,
-        has_raster,
-        has_vector,
-        spatial_extent: raster_info
-            .as_ref()
-            .and_then(|i| i.spatial_extent)
-            .or(feature_extent),
+        raster_info,
+        has_vector: feature.is_some(),
+        feature_extent: feature.and_then(|e| e.spatial_extent()),
+        feature_time: feature.and_then(|e| e.temporal_extent()),
     })
 }
 
-/// Tileset metadata for one tile matrix set (Tiles Req 8): the registered
-/// tiling scheme, templated tile links and a `self` link to the full tileset
-/// resource, which a tileset list entry must carry (Req 10 B).
+/// Tileset metadata for one tiling scheme and kind of tiles (Tiles Req 8):
+/// the registered tiling scheme and a templated link to tiles of that kind.
+/// The tileset served at `…/tiles/{tileMatrixSetId}` also carries the `self`
+/// link a tileset list entry needs (Req 10 B).
 fn tileset_json(
     root: &str,
     sources: &TileSources<'_>,
     tms: &tilematrixset::TileMatrixSetDef,
+    kind: TileKind,
 ) -> serde_json::Value {
     let id = &sources.config.id;
     let tms_id = tms.id;
     let tileset = format!("{root}/collections/{id}/tiles/{tms_id}");
-    let mut links = vec![
-        json!({
+    let mut links = Vec::new();
+    if kind == sources.resource_kind() {
+        links.push(json!({
             "href": tileset,
             "rel": "self",
             "type": "application/json",
             "title": "This tileset"
-        }),
-        json!({
-            "href": format!("{root}/tileMatrixSets/{tms_id}"),
-            "rel": rel::TILING_SCHEME,
-            "type": "application/json"
-        }),
-    ];
-    if sources.has_raster {
-        links.push(json!({
-            "href": format!("{tileset}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"),
-            "rel": "item",
-            "type": "image/png",
-            "templated": true
         }));
     }
-    if sources.has_vector {
-        links.push(json!({
-            "href": format!("{tileset}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt"),
-            "rel": "item",
-            "type": MVT_CONTENT_TYPE,
-            "templated": true
-        }));
-    }
+    links.push(json!({
+        "href": format!("{root}/tileMatrixSets/{tms_id}"),
+        "rel": rel::TILING_SCHEME,
+        "type": "application/json"
+    }));
+    let (data_type, item, media_type) = match kind {
+        TileKind::Map => (
+            "map",
+            format!("{tileset}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"),
+            "image/png",
+        ),
+        TileKind::Vector => (
+            "vector",
+            format!("{tileset}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt"),
+            MVT_CONTENT_TYPE,
+        ),
+    };
+    links.push(json!({
+        "href": item,
+        "rel": "item",
+        "type": media_type,
+        "templated": true
+    }));
     let mut tileset = json!({
-        "title": format!("{} ({})", sources.config.title, tms.title),
-        "dataType": if sources.has_raster { "map" } else { "vector" },
+        "title": format!("{} ({}, {data_type} tiles)", sources.config.title, tms.title),
+        "dataType": data_type,
         "crs": tms.crs,
         "tileMatrixSetURI": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{tms_id}"),
         "links": links,
     });
-    if let Some(bbox) = sources.spatial_extent {
+    if let Some(bbox) = sources.spatial_extent() {
         tileset["tileMatrixSetLimits"] =
             json!(tms.limits_for_extent(bbox, params::DEFAULT_MAX_ZOOM));
     }
     tileset
 }
 
-/// GET {mount}/collections/{id}/tiles — List tilesets for a collection
+/// GET {mount}/collections/{id}/tiles — List tilesets for a collection: one
+/// per tiling scheme and kind of tiles, so a collection serving map and
+/// vector tiles lists both with their own `dataType`.
 pub async fn collection_tilesets(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -1248,7 +1251,12 @@ pub async fn collection_tilesets(
     let tilesets: Vec<_> = SUPPORTED_TILE_MATRIX_SETS
         .iter()
         .filter_map(|tms_id| tilematrixset::get_tile_matrix_set(tms_id))
-        .map(|tms| tileset_json(root, &sources, tms))
+        .flat_map(|tms| {
+            sources
+                .kinds()
+                .map(|kind| tileset_json(root, &sources, tms, kind))
+                .collect::<Vec<_>>()
+        })
         .collect();
 
     Ok(Json(json!({
@@ -1270,18 +1278,19 @@ pub async fn collection_tileset(
 ) -> Result<impl IntoResponse, TilesError> {
     let state = state.load_full();
     let sources = tile_sources(&state, &id)?;
-    let tms = SUPPORTED_TILE_MATRIX_SETS
-        .contains(&tms_id.as_str())
-        .then(|| tilematrixset::get_tile_matrix_set(&tms_id))
-        .flatten()
-        .ok_or_else(|| {
-            TilesError::NotFound(format!(
-                "TileMatrixSet '{tms_id}' not found. Available: {}",
-                SUPPORTED_TILE_MATRIX_SETS.join(", ")
-            ))
-        })?;
+    let tms = tilematrixset::get_tile_matrix_set(&tms_id).ok_or_else(|| {
+        TilesError::NotFound(format!(
+            "TileMatrixSet '{tms_id}' not found. Available: {}",
+            SUPPORTED_TILE_MATRIX_SETS.join(", ")
+        ))
+    })?;
     let root = &mount.root(&request_base_url(&state, &headers));
-    Ok(Json(tileset_json(root, &sources, tms)))
+    Ok(Json(tileset_json(
+        root,
+        &sources,
+        tms,
+        sources.resource_kind(),
+    )))
 }
 
 /// MVT MIME type registered with IANA.

@@ -31,7 +31,10 @@ Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Base route:
 | Part 8 Sorting (draft) | partial | `sortby` implemented (#605 rule: validated against `FeatureEngine::sortables`, 400 naming the valid ones) but the class is not declared and no `/sortables` resource exists |
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
-Part 2 (collections, json, html). Collection discovery supports `bbox`,
+Part 2 (collections, json, html). The landing page links `/conformance` and
+`/collections` with both the short `conformance`/`data` relations this standard
+requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
+/ `…/data` relations Common Part 1 names. Collection discovery supports `bbox`,
 `bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `limit`, `offset` and `f` through
 [api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
 return structured HTTP 400 errors. Filters run before paging; JSON/HTML links

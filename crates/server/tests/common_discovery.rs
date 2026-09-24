@@ -744,6 +744,42 @@ async fn landing_pages_advertise_short_and_registered_relations() {
     }
 }
 
+/// Tiles Req 13: each registered `tilesets-*` relation must lead to tilesets
+/// of the kind it names. A collection serving map and vector tiles lists one
+/// tileset per tiling scheme and kind, each linking only tiles of its kind.
+#[tokio::test]
+async fn mixed_tile_collections_list_a_tileset_per_kind() {
+    let (app, prefix) = app("tiles");
+    let doc = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+    for (relation, data_type, media_type) in [
+        (api_common::rel::TILESETS_MAP, "map", "image/png"),
+        (
+            api_common::rel::TILESETS_VECTOR,
+            "vector",
+            "application/vnd.mapbox-vector-tile",
+        ),
+    ] {
+        let list = get_json(&app, link(&doc, relation)).await;
+        let typed: Vec<_> = list["tilesets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["dataType"] == data_type)
+            .collect();
+        assert_eq!(typed.len(), 2, "one {data_type} tileset per tiling scheme");
+        for tileset in typed {
+            let items: Vec<_> = tileset["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["rel"] == "item")
+                .collect();
+            assert!(!items.is_empty());
+            assert!(items.iter().all(|l| l["type"] == media_type), "{tileset}");
+        }
+    }
+}
+
 /// Every advertised JSON link below `BASE` that is not a URI template.
 fn json_links(doc: &Value, out: &mut Vec<String>) {
     match doc {

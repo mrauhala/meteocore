@@ -219,7 +219,6 @@ pub fn collections_response(
                 .collect();
             Html(workbench::collections_html(
                 surface,
-                url,
                 &request.query,
                 &request.search,
                 result.number_matched,

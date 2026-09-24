@@ -134,11 +134,19 @@ impl Page<'_> {
             .iter()
             .find(|(id, _, _)| id == api)
             .map_or("MeteoCore", |(_, name, _)| *name);
+        // The current API opens at this page's root, wherever it is mounted.
+        let api_home = |id: &str, mount: &str| {
+            if id == *api {
+                format!("{root}/?f=html")
+            } else {
+                format!("{base}{mount}/?f=html")
+            }
+        };
         let api_nav = APIS
             .iter()
             .map(|(id, name, mount)| {
                 anchor(
-                    &format!("{base}{mount}/?f=html"),
+                    &api_home(id, mount),
                     name,
                     if id == api { "active" } else { "" },
                 )
@@ -155,7 +163,7 @@ impl Page<'_> {
             .map(|(id, name, mount)| {
                 format!(
                     "<option value=\"{}\" {}>{name}</option>",
-                    escape(&format!("{base}{mount}/?f=html")),
+                    escape(&api_home(id, mount)),
                     if *id == workspace_api { "selected" } else { "" }
                 )
             })
@@ -695,10 +703,16 @@ pub fn collection_html(
         }
         body.push_str("</div>");
     }
-    if map_request.is_some() {
+    if let Some(map_href) = links
+        .and_then(|ls| map_link(ls))
+        .filter(|_| map_request.is_some())
+    {
         body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
+        // Document the map request at the API serving the map link, which
+        // need not be the API rendering this page.
+        let map_api = map_href.split("/collections/").next().unwrap_or(root);
         body.push_str(&anchor(
-            &format!("{root}/api/docs"),
+            &format!("{map_api}/api/docs"),
             "Map request parameters ↗",
             "btn",
         ));
@@ -1059,7 +1073,6 @@ fn collection_facts(doc: &Value) -> String {
 
 pub fn collections_html(
     surface: Surface<'_>,
-    url: &str,
     query: &SearchQueryParams,
     search: &SearchParams,
     matched: usize,
@@ -1067,6 +1080,7 @@ pub fn collections_html(
     nav: &[LinkView],
 ) -> String {
     let api = surface.api;
+    let url = &format!("{}/collections", surface.root);
     let json_url = format!(
         "{url}{}",
         query.query_string_with_format(search.limit, search.offset, "json")
@@ -1352,7 +1366,7 @@ mod tests {
         .unwrap();
         let search = query.parse().unwrap();
         let url = "https://example.test/proxy/maps/collections";
-        let html = collections_html(MAPS_PROXY, url, &query, &search, 3, &[], &[]);
+        let html = collections_html(MAPS_PROXY, &query, &search, 3, &[], &[]);
         assert!(html.contains("3 matching collections"));
         assert!(html.contains("This page is outside the results."));
         assert!(html.contains("No page at offset 1000"));
@@ -1361,7 +1375,7 @@ mod tests {
         assert!(!html.contains("No collections match these filters."));
         let first = format!("{url}{}", query.query_string_with_format(12, 0, "html"));
         assert!(html.contains(&format!("href=\"{}\">Go to first page", escape(&first))));
-        let empty = collections_html(MAPS_PROXY, url, &query, &search, 0, &[], &[]);
+        let empty = collections_html(MAPS_PROXY, &query, &search, 0, &[], &[]);
         assert!(empty.contains("No collections match these filters."));
         assert!(empty.contains("0 results"));
         assert!(!empty.contains("Go to first page"));
@@ -1551,6 +1565,28 @@ mod tests {
             .unwrap()
             .retain(|l| l["rel"] != "map");
         assert!(!collection(base, "maps", &no_map, None).contains("id=\"map-controls\""));
+    }
+
+    #[test]
+    fn navigation_and_map_docs_follow_the_serving_and_linked_apis() {
+        let base = "https://example.test";
+        let doc = json!({"id":"a","links":[
+            {"rel":"self","href":"https://example.test/features/collections/a"},
+            {"rel":rel::MAP,"href":"https://example.test/maps/collections/a/map"}]});
+        // A page served at a relocated mount keeps its own API root active.
+        let html = collection_html(
+            Surface {
+                base,
+                root: "https://example.test/relocated/features",
+                api: "features",
+            },
+            &doc,
+            None,
+        );
+        assert!(html.contains("value=\"https://example.test/relocated/features/?f=html\" selected"));
+        assert!(html.contains("value=\"https://example.test/maps/?f=html\""));
+        // Map request parameters are documented by the API serving the map.
+        assert!(html.contains("href=\"https://example.test/maps/api/docs\">Map request parameters"));
     }
 
     #[test]
