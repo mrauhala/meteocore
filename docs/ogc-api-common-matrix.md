@@ -48,6 +48,13 @@ with unknown geometry omitted. Catalog and overview HTML now show vertical range
 units and available levels, preserving the EDR/Common JSON distinction. Maps HTML
 can select an advertised `z` level. These changes add no conformance classes.
 
+Schema validation update (2026-09-24): the unmodified Common Parts 2 and 4
+OpenAPI bundles at `3828187` are now [vendored with provenance](../schemas/README.md)
+and used by the cross-API response tests. Regular temporal grids now include
+`firstCoordinate`; spatial grids explicitly report it as null because the engine
+metadata does not expose sample registration or axis direction. These checks
+add no conformance classes and do not supersede the historical assessment above.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively.
 Part 4 rows concern **collection discovery**, not querying the contents of a
 collection.
@@ -158,8 +165,10 @@ collection.
    for EDR 1.1. Maps/Tiles emit numeric vertical intervals, units and coordinates,
    but lack a semantic `definition`/`vrs` and vertical grid `cellsCount` required
    by the current uniform-dimensions class. Geographic spatial and raster temporal
-   grid descriptors exist, but projected spatial grids and general additional
-   axes do not. No API advertises the uniform-dimensions class.
+   grid descriptors exist. Regular temporal grids identify their first timestamp;
+   spatial grids use the schema's nullable `firstCoordinate` because sample
+   registration and axis direction are unknown. Projected spatial grids and
+   general additional axes do not. No API advertises the uniform-dimensions class.
 8. Features item property filters and `sortby` work on supporting engines. Neither
    provides Part 3 `/queryables` or `/sortables` resources. OpenAPI schemas and
    EDR `parameter_names` likewise do not establish Part 3 support.
@@ -252,6 +261,16 @@ filters/counts/temporal adapters, validates representation links and unknown or
 duplicate parameter errors, exercises text operators and phrase matching, and
 compares OpenAPI and Common declarations. This
 verifies the updated source behavior without depending on production catalog data.
+
+The suite also validates successful JSON landing, conformance, collection-list
+and collection-detail responses against both pinned Common bundles. It covers
+regular/irregular grids, missing extents, vertical metadata, filtered and empty
+pages, and navigation links. Negative controls demonstrate rejection of malformed
+nested response fields. Validation resolves local references and OpenAPI nullable
+types offline, with date-time format checks enabled. Standard resource paths are
+independent of the current fixture mount prefixes, allowing reuse for shared-root
+discovery. See the [schema inventory](../schemas/README.md) for hashes, refresh
+instructions and coverage limits (including error representations and UAD).
 
 No full OGC abstract test suite was executed for this assessment. Existing unit
 and integration tests and hand-written OpenAPI documents are useful evidence,

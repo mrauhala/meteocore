@@ -1836,6 +1836,11 @@ cargo test -p engine-geotiff # GeoTIFF engine tests
 
 CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 schema](https://schemas.opengis.net/covjson/1.0/coveragejson.json) stored in `schemas/coveragejson.json`.
 
+Common discovery JSON is validated against the [vendored OGC API Common Part 2
+and Part 4 bundles](schemas/README.md) by `cargo test -p server --test common_discovery`.
+The same suite checks filtering, paging and navigation behavior across the API
+adapters; schema validation alone does not establish full OGC conformance.
+
 ### Code security scanning
 
 [CodeQL](.github/workflows/codeql.yml) scans Rust, GitHub Actions,

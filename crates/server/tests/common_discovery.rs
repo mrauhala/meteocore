@@ -17,10 +17,14 @@ use ds_core::{
     feature_engine::FeatureEngine,
     map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile},
     model::{CoverageResponse, Location},
+    vertical::{VerticalDimension, VerticalKind},
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+#[path = "common_discovery/schema.rs"]
+mod schema;
 
 const BASE: &str = "https://example.test/base";
 const SURFACES: &[&str] = &["edr", "maps", "tiles", "vector-tiles", "features"];
@@ -30,6 +34,8 @@ const FILTERS: &str =
 struct Fixture {
     bbox: Option<[f64; 4]>,
     time: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    times: Vec<DateTime<Utc>>,
+    vertical: Option<VerticalDimension>,
 }
 
 impl EdrEngine for Fixture {
@@ -51,6 +57,12 @@ impl EdrEngine for Fixture {
     }
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         self.time
+    }
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        (!self.times.is_empty()).then(|| self.times.clone())
+    }
+    fn get_vertical_extent(&self) -> Option<VerticalDimension> {
+        self.vertical.clone()
     }
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         self.bbox
@@ -93,12 +105,12 @@ impl MapEngine for Fixture {
         RasterInfo {
             native_crs: "CRS:84".into(),
             spatial_extent: self.bbox,
-            times: self.time.map(|(a, b)| vec![a, b]).unwrap_or_default(),
+            times: self.times.clone(),
             parameter: "rain".into(),
             unit: "mm".into(),
             parameters: vec![],
-            vertical: None,
-            grid_size: None,
+            vertical: self.vertical.clone(),
+            grid_size: self.bbox.map(|_| [80, 80]),
             layer_subtitle: None,
             reference_times: vec![],
         }
@@ -147,7 +159,23 @@ fn app(surface: &str) -> (Router, String) {
             "a-outside" => Some([0.0, 0.0, 1.0, 1.0]),
             _ => Some([21.0, 61.0, 29.0, 69.0]),
         };
-        let fixture = Arc::new(Fixture { bbox, time });
+        let times = time
+            .map(|(start, end)| {
+                if id == "d-match" {
+                    vec![start, start + chrono::Duration::minutes(20), end]
+                } else {
+                    vec![start, end]
+                }
+            })
+            .unwrap_or_default();
+        let vertical = (id == "c-match")
+            .then(|| VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0, 700.0]));
+        let fixture = Arc::new(Fixture {
+            bbox,
+            time,
+            times,
+            vertical,
+        });
         edr.insert(id.into(), fixture.clone());
         maps.insert(id.into(), fixture.clone());
         features.insert(id.into(), fixture);
@@ -244,6 +272,102 @@ fn link<'a>(doc: &'a Value, rel: &str) -> &'a str {
         .unwrap()["href"]
         .as_str()
         .unwrap()
+}
+
+#[tokio::test]
+async fn common_metadata_validates_against_pinned_part_2_and_part_4() {
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        for path in ["/", "/conformance"] {
+            let url = format!("{prefix}{}", path.trim_end_matches('/'));
+            let doc = get_json(&app, &url).await;
+            schema::assert_valid(path, &doc, surface);
+        }
+        for query in [
+            String::new(),
+            format!("?{FILTERS}&limit=1&offset=1"),
+            "?query=nonexistent".into(),
+            "?offset=999".into(),
+        ] {
+            let url = format!("{prefix}/collections{query}");
+            let doc = get_json(&app, &url).await;
+            schema::assert_valid("/collections", &doc, &url);
+            for collection in doc["collections"].as_array().unwrap() {
+                let id = collection["id"].as_str().unwrap();
+                let url = format!("{prefix}/collections/{id}");
+                let detail = get_json(&app, &url).await;
+                schema::assert_valid("/collections/{collectionId}", &detail, &url);
+            }
+            for rel in ["next", "prev"] {
+                if doc["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l["rel"] == rel)
+                {
+                    let url = link(&doc, rel);
+                    let page = get_json(&app, url).await;
+                    schema::assert_valid("/collections", &page, url);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn common_schema_validation_rejects_broken_nested_responses() {
+    let (app, prefix) = app("maps");
+    let list = get_json(&app, &format!("{prefix}/collections")).await;
+    schema::assert_valid("/collections", &list, "negative-control baseline");
+    for (pointer, replacement) in [
+        ("/collections/0/id", json!("")),
+        ("/collections/0/links/0/href", json!(123)),
+        ("/collections/0/extent/spatial/bbox/0", json!([1, 2, 3])),
+        (
+            "/collections/0/extent/temporal/interval/0/0",
+            json!("not-a-date"),
+        ),
+        (
+            "/collections/0/extent/spatial/grid/0/cellsCount",
+            json!("80"),
+        ),
+        ("/numberReturned", json!(-1)),
+    ] {
+        let mut broken = list.clone();
+        *broken.pointer_mut(pointer).expect("fixture field exists") = replacement;
+        schema::assert_invalid("/collections", &broken, pointer);
+    }
+    for pointer in [
+        "/collections/0/id",
+        "/collections/0/links/0/rel",
+        "/collections/0/extent/spatial/grid/0/firstCoordinate",
+        "/collections/0/extent/temporal/grid/firstCoordinate",
+    ] {
+        let mut broken = list.clone();
+        let (parent, field) = pointer.rsplit_once('/').unwrap();
+        assert!(broken
+            .pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(field)
+            .is_some());
+        schema::assert_invalid("/collections", &broken, pointer);
+    }
+    let mut open_interval = list.clone();
+    open_interval["collections"][0]["extent"]["temporal"]["interval"][0][0] = Value::Null;
+    schema::assert_valid(
+        "/collections",
+        &open_interval,
+        "OpenAPI nullable interval endpoint",
+    );
+    schema::assert_invalid("/", &json!({}), "missing landing links");
+    schema::assert_invalid("/conformance", &json!({}), "missing conformsTo");
+    schema::assert_invalid(
+        "/collections/{collectionId}",
+        &json!({}),
+        "missing collection id/links",
+    );
 }
 
 #[tokio::test]

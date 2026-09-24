@@ -95,6 +95,15 @@ cargo test -p server --test common_discovery
 cargo test -p ds-core -p api-edr -p api-features -p api-maps -p api-tiles
 ```
 
+The contract suite validates successful JSON landing/conformance/list/detail
+responses against the [pinned Common Part 2 and Part 4 bundles](../../schemas/README.md),
+offline. Resource schemas are selected by standard paths; API mount prefixes
+are fixture setup, ready to change with shared-root discovery. This does not
+establish full Part 4 or Uniform Additional Dimensions conformance. Regular
+temporal grids include their first timestamp; spatial grids emit a nullable
+`firstCoordinate` because engines expose bounds/counts without sample registration
+or axis direction.
+
 ## HTML API workbench
 
 `workbench` renders the shared server/API landing pages, conformance, collection
