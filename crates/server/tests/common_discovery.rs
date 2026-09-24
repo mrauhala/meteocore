@@ -727,6 +727,23 @@ async fn workbench_exposes_supported_queries_and_same_resource_json_on_every_sur
     }
 }
 
+/// Common Part 1 Req 13 names the registered conformance relation; Features
+/// and EDR (and their test suites) require the short `conformance`/`data`.
+/// Every landing page carries both, pointing at the same resources.
+#[tokio::test]
+async fn landing_pages_advertise_short_and_registered_relations() {
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let doc = get_json(&app, &prefix).await;
+        for (short, registered) in [
+            ("conformance", api_common::rel::CONFORMANCE),
+            ("data", api_common::rel::DATA),
+        ] {
+            assert_eq!(link(&doc, short), link(&doc, registered), "{surface}");
+        }
+    }
+}
+
 /// Every advertised JSON link below `BASE` that is not a URI template.
 fn json_links(doc: &Value, out: &mut Vec<String>) {
     match doc {

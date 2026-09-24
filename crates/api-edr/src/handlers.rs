@@ -349,8 +349,20 @@ pub async fn landing_page(
             "Conformance classes",
         ),
         (
+            format!("{base}/edr/conformance"),
+            api_common::rel::CONFORMANCE,
+            "application/json",
+            "Conformance classes",
+        ),
+        (
             format!("{base}/edr/collections"),
             "data",
+            "application/json",
+            "Collections",
+        ),
+        (
+            format!("{base}/edr/collections"),
+            api_common::rel::DATA,
             "application/json",
             "Collections",
         ),

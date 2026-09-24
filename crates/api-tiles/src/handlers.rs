@@ -10,7 +10,7 @@ use axum::Json;
 use serde_json::json;
 
 use api_common::workbench::Surface;
-use api_common::Mount;
+use api_common::{rel, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
@@ -161,6 +161,7 @@ fn build_collection_metadata(
     raster_info: Option<&ds_core::map_engine::RasterInfo>,
     feature_extent: Option<[f64; 4]>,
     feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    has_vector: bool,
     styles: Option<&HashMap<String, StyleInfo>>,
     root: &str,
 ) -> serde_json::Value {
@@ -196,6 +197,14 @@ fn build_collection_metadata(
                                 config.id, s.name
                             ),
                             "rel": "legend",
+                            "type": "application/json"
+                        },
+                        {
+                            "href": format!(
+                                "{root}/collections/{}/styles/{}/legend",
+                                config.id, s.name
+                            ),
+                            "rel": rel::LEGEND,
                             "type": "application/json"
                         }
                     ]
@@ -249,7 +258,8 @@ fn build_collection_metadata(
     // CRS84 first (stable sort keeps the rest in order).
     crs_uris.sort_by_key(|c| *c != CRS84_URI);
 
-    let links = vec![
+    let tilesets = format!("{root}/collections/{}/tiles", config.id);
+    let mut links = vec![
         json!({
             "href": format!("{root}/collections/{}", config.id),
             "rel": "self",
@@ -257,12 +267,30 @@ fn build_collection_metadata(
             "title": config.title
         }),
         json!({
-            "href": format!("{root}/collections/{}/tiles", config.id),
+            "href": tilesets,
             "rel": "tiles",
             "type": "application/json",
             "title": "Tilesets"
         }),
     ];
+    // Tiles Req 13 (geodata-tilesets): the registered relation names the kind
+    // of tiles in the list; one list may hold both, as the standard allows.
+    if raster_info.is_some() {
+        links.push(json!({
+            "href": tilesets,
+            "rel": rel::TILESETS_MAP,
+            "type": "application/json",
+            "title": "Map tilesets"
+        }));
+    }
+    if has_vector {
+        links.push(json!({
+            "href": tilesets,
+            "rel": rel::TILESETS_VECTOR,
+            "type": "application/json",
+            "title": "Vector tilesets"
+        }));
+    }
 
     let mut metadata = api_common::collection_metadata(
         config,
@@ -386,14 +414,32 @@ pub async fn landing_page(
             "Conformance classes",
         ),
         (
+            format!("{root}/conformance"),
+            rel::CONFORMANCE,
+            "application/json",
+            "Conformance classes",
+        ),
+        (
             format!("{root}/collections"),
             "data",
             "application/json",
             "Collections",
         ),
         (
+            format!("{root}/collections"),
+            rel::DATA,
+            "application/json",
+            "Collections",
+        ),
+        (
             format!("{root}/tileMatrixSets"),
             "tiling-schemes",
+            "application/json",
+            "Tile matrix sets",
+        ),
+        (
+            format!("{root}/tileMatrixSets"),
+            rel::TILING_SCHEMES,
             "application/json",
             "Tile matrix sets",
         ),
@@ -919,6 +965,7 @@ pub async fn collections(
             raster_info.as_deref(),
             feature_extent,
             feature_time,
+            feature.is_some(),
             state.styles.get(&config.id),
             root,
         );
@@ -980,6 +1027,7 @@ pub async fn collection(
                 raster_info.as_deref(),
                 feature_extent,
                 feature_time,
+                state.feature_engines.contains_key(&id),
                 styles,
                 root,
             ))
@@ -991,6 +1039,7 @@ pub async fn collection(
                 raster_info.as_deref(),
                 feature_extent,
                 feature_time,
+                state.feature_engines.contains_key(&id),
                 state.styles.get(&id),
                 root,
             );
@@ -1076,7 +1125,7 @@ pub async fn collection_tilesets(
 
         let mut links = vec![json!({
             "href": format!("{root}/tileMatrixSets/{tms_id}"),
-            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
+            "rel": rel::TILING_SCHEME,
             "type": "application/json"
         })];
         links.extend(item_links);

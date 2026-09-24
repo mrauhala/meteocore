@@ -55,6 +55,15 @@ and used by the cross-API response tests. Regular temporal grids now include
 metadata does not expose sample registration or axis direction. These checks
 add no conformance classes and do not supersede the historical assessment above.
 
+Link relation update (2026-09-24, [#789](https://github.com/mrauhala/meteocore/issues/789)
+Phase 0): landing pages add the registered `…/rel/ogc/1.0/conformance` relation
+that Part 1 Req 13 B names, and `…/data`, next to the short `conformance`/`data`
+forms Features and EDR require. Collection links follow the registered relations
+of the access standards (Maps `…/map`, `…/styles`, `…/legend`; Tiles
+`…/tilesets-map`/`…/tilesets-vector` by the registered tile kind). Cross-API
+tileset links now follow the Tiles registries rather than the `apis` list.
+Maps and Tiles build links from their router mount. No Common class changes.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively.
 Part 4 rows concern **collection discovery**, not querying the contents of a
 collection.

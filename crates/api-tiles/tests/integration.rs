@@ -1650,6 +1650,21 @@ mod mvt {
     }
 
     #[tokio::test]
+    async fn vector_collection_advertises_the_registered_vector_tilesets_relation() {
+        let (status, _, body) = fetch("/collections/places").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let rels: Vec<&str> = json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["rel"].as_str())
+            .collect();
+        assert!(rels.contains(&api_common::rel::TILESETS_VECTOR));
+        assert!(!rels.contains(&api_common::rel::TILESETS_MAP));
+    }
+
+    #[tokio::test]
     async fn pbf_route_returns_200_with_mvt_content_type() {
         let (status, headers, body) =
             fetch("/collections/places/tiles/WebMercatorQuad/0/0/0?f=mvt").await;
@@ -2629,6 +2644,38 @@ async fn exhausted_memory_budget_rejects_uncached_tile() {
     );
     assert_eq!(ds_executor::budget::RENDER_MEMORY.available(), 0);
     assert_eq!(ds_executor::budget::RENDER_MEMORY.rejected(), 1);
+}
+
+/// Tiles Req 13 (geodata-tilesets): the collection names its tileset list
+/// with the registered relation for the kind of tiles it holds.
+#[tokio::test]
+async fn raster_collection_advertises_the_registered_map_tilesets_relation() {
+    let (_, json) = get("/collections/radar").await;
+    let links = json["links"].as_array().unwrap();
+    let map = links
+        .iter()
+        .find(|l| l["rel"] == api_common::rel::TILESETS_MAP)
+        .expect("raster collection must advertise tilesets-map");
+    assert!(map["href"]
+        .as_str()
+        .unwrap()
+        .ends_with("/tiles/collections/radar/tiles"));
+    assert!(!links
+        .iter()
+        .any(|l| l["rel"] == api_common::rel::TILESETS_VECTOR));
+    let (_, landing) = get("/").await;
+    let landing = landing["links"].as_array().unwrap();
+    let href = |rel: &str| {
+        landing
+            .iter()
+            .find(|l| l["rel"] == rel)
+            .map(|l| l["href"].clone())
+    };
+    assert!(href(api_common::rel::TILING_SCHEMES).is_some());
+    assert_eq!(
+        href(api_common::rel::TILING_SCHEMES),
+        href("tiling-schemes")
+    );
 }
 
 #[tokio::test]

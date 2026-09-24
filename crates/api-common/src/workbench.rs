@@ -7,7 +7,7 @@ use ds_core::config::LicenseConfig;
 use ds_core::html::{escape, LinkView};
 use serde_json::{json, Value};
 
-use crate::mounts;
+use crate::{mounts, rel};
 
 const CSS: &str = include_str!("workbench/style.css");
 const SCRIPT: &str = include_str!("workbench/app.js");
@@ -31,14 +31,11 @@ pub struct Surface<'a> {
     pub api: &'a str,
 }
 
-/// Registered OGC link relation for a collection's map resource (Maps Req 46).
-const REL_MAP: &str = "http://www.opengis.net/def/rel/ogc/1.0/map";
-
-/// First link carrying the short or registered map relation.
+/// First link carrying the short or registered map relation (Maps Req 46).
 fn map_link(links: &[Value]) -> Option<&str> {
     links
         .iter()
-        .find(|l| l["rel"] == "map" || l["rel"] == REL_MAP)
+        .find(|l| l["rel"] == "map" || l["rel"] == rel::MAP)
         .and_then(|l| l["href"].as_str())
 }
 
@@ -335,6 +332,9 @@ pub fn property_table(properties: &Value) -> String {
 
 pub fn document_links(doc: &Value) -> String {
     let mut body = String::from("<div class=\"endpoint-list resource-links\">");
+    // Relations are often advertised twice (short and registered URI form);
+    // list each target once, under the first relation that names it.
+    let mut listed: Vec<(&str, &str)> = Vec::new();
     if let Some(links) = doc["links"].as_array() {
         for link in links {
             let href = link["href"].as_str().unwrap_or_default();
@@ -342,6 +342,11 @@ pub fn document_links(doc: &Value) -> String {
             if matches!(rel, "self" | "alternate") {
                 continue;
             }
+            let media = link["type"].as_str().unwrap_or_default();
+            if listed.contains(&(href, media)) {
+                continue;
+            }
+            listed.push((href, media));
             let label = link["title"].as_str().unwrap_or(rel);
             let human = matches!(
                 rel,
@@ -1546,6 +1551,21 @@ mod tests {
             .unwrap()
             .retain(|l| l["rel"] != "map");
         assert!(!collection(base, "maps", &no_map, None).contains("id=\"map-controls\""));
+    }
+
+    #[test]
+    fn resource_links_list_each_target_once() {
+        let doc = json!({"links":[
+            {"rel":"conformance","href":"https://x/maps/conformance","type":"application/json"},
+            {"rel":rel::CONFORMANCE,"href":"https://x/maps/conformance","type":"application/json"},
+            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/png"},
+            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/jpeg"}
+        ]});
+        let html = document_links(&doc);
+        assert_eq!(html.matches("maps/conformance?f=html").count(), 1);
+        assert!(!html.contains(rel::CONFORMANCE));
+        // Distinct representations of one resource remain separate entries.
+        assert_eq!(html.matches("image/").count(), 2);
     }
 
     #[test]

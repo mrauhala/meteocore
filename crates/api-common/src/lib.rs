@@ -38,6 +38,22 @@ pub mod mounts {
     pub const TILES: &str = "/tiles";
 }
 
+/// Registered OGC link relation types. Standards print some as `https://`
+/// aliases; the register's canonical `http://` form is what their test suites
+/// match. Features and EDR also require the short `conformance` and `data`
+/// relations on the landing page, so those are emitted in both forms.
+pub mod rel {
+    pub const CONFORMANCE: &str = "http://www.opengis.net/def/rel/ogc/1.0/conformance";
+    pub const DATA: &str = "http://www.opengis.net/def/rel/ogc/1.0/data";
+    pub const MAP: &str = "http://www.opengis.net/def/rel/ogc/1.0/map";
+    pub const STYLES: &str = "http://www.opengis.net/def/rel/ogc/1.0/styles";
+    pub const LEGEND: &str = "http://www.opengis.net/def/rel/ogc/1.0/legend";
+    pub const TILESETS_MAP: &str = "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map";
+    pub const TILESETS_VECTOR: &str = "http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector";
+    pub const TILING_SCHEME: &str = "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme";
+    pub const TILING_SCHEMES: &str = "http://www.opengis.net/def/rel/ogc/1.0/tiling-schemes";
+}
+
 /// Mount path of an API router below the external base URL, supplied to its
 /// handlers as a request extension. Links are built from base URL + mount, so
 /// one handler set can serve both a per-API service and a shared root (#789).

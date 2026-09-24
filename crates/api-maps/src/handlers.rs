@@ -10,7 +10,7 @@ use axum::Json;
 use serde_json::json;
 
 use api_common::workbench::Surface;
-use api_common::{mounts, Mount};
+use api_common::{mounts, rel, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::map_engine::MapEngine;
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
@@ -141,18 +141,17 @@ fn with_vary(mut resp: Response) -> Response {
 /// machine-readable legend. One builder so the `/collections/{id}` and
 /// `/collections/{id}/styles` representations can't drift. `root` is the
 /// absolute API root (base URL + mount).
+///
+/// Each relation is advertised in its short form and as the registered OGC
+/// relation (Maps Req 53 styled-map links, the legend recommendation).
 fn style_links(collection_id: &str, style_name: &str, root: &str) -> serde_json::Value {
+    let map = format!("{root}/collections/{collection_id}/styles/{style_name}/map");
+    let legend = format!("{root}/collections/{collection_id}/styles/{style_name}/legend");
     json!([
-        {
-            "href": format!("{root}/collections/{collection_id}/styles/{style_name}/map"),
-            "rel": "map",
-            "type": "image/png"
-        },
-        {
-            "href": format!("{root}/collections/{collection_id}/styles/{style_name}/legend"),
-            "rel": "legend",
-            "type": "application/json"
-        }
+        {"href": map, "rel": "map", "type": "image/png"},
+        {"href": map, "rel": rel::MAP, "type": "image/png"},
+        {"href": legend, "rel": "legend", "type": "application/json"},
+        {"href": legend, "rel": rel::LEGEND, "type": "application/json"}
     ])
 }
 
@@ -215,9 +214,23 @@ fn build_collection_metadata(
             "type": "image/png",
             "title": "Map"
         }),
+        // The registered relation Maps Req 46 requires (and the Maps test
+        // suite looks for); the short form above stays for existing clients.
+        json!({
+            "href": format!("{root}/collections/{}/map", config.id),
+            "rel": rel::MAP,
+            "type": "image/png",
+            "title": "Map"
+        }),
         json!({
             "href": format!("{root}/collections/{}/styles", config.id),
             "rel": "styles",
+            "type": "application/json",
+            "title": "Styles"
+        }),
+        json!({
+            "href": format!("{root}/collections/{}/styles", config.id),
+            "rel": rel::STYLES,
             "type": "application/json",
             "title": "Styles"
         }),
@@ -230,7 +243,7 @@ fn build_collection_metadata(
     if map_tilesets {
         links.push(json!({
             "href": format!("{base_url}{}/collections/{}/tiles", mounts::TILES, config.id),
-            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map",
+            "rel": rel::TILESETS_MAP,
             "type": "application/json",
             "title": "Map tilesets"
         }));
@@ -323,8 +336,20 @@ pub async fn landing_page(
             "Conformance classes",
         ),
         (
+            format!("{root}/conformance"),
+            rel::CONFORMANCE,
+            "application/json",
+            "Conformance classes",
+        ),
+        (
             format!("{root}/collections"),
             "data",
+            "application/json",
+            "Collections",
+        ),
+        (
+            format!("{root}/collections"),
+            rel::DATA,
             "application/json",
             "Collections",
         ),

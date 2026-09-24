@@ -766,6 +766,34 @@ mod collections {
     }
 
     #[tokio::test]
+    async fn collection_links_carry_registered_relations() {
+        // Maps Req 46 (collection → map), Req 53 (styled maps) and the legend
+        // recommendation name registered relations; the Maps test suite only
+        // finds maps through them. Short forms remain for existing clients.
+        let (_, json) = get("/collections/radar").await;
+        let href = |links: &Value, rel: &str| {
+            links
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["rel"] == rel)
+                .map(|l| l["href"].as_str().unwrap().to_owned())
+        };
+        let links = &json["links"];
+        assert!(href(links, api_common::rel::MAP).is_some());
+        assert_eq!(href(links, api_common::rel::MAP), href(links, "map"));
+        assert_eq!(href(links, api_common::rel::STYLES), href(links, "styles"));
+        let styles = json["styles"].as_array().unwrap();
+        assert!(!styles.is_empty());
+        for style in styles {
+            let links = &style["links"];
+            assert!(href(links, api_common::rel::MAP).is_some());
+            assert_eq!(href(links, api_common::rel::MAP), href(links, "map"));
+            assert_eq!(href(links, api_common::rel::LEGEND), href(links, "legend"));
+        }
+    }
+
+    #[tokio::test]
     async fn collection_omits_tilesets_map_link_when_tiles_did_not_register_it() {
         // `apis` may list tiles for a collection the Tiles service does not
         // render as map tiles; the link must follow the Tiles registry (#789).

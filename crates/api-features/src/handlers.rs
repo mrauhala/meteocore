@@ -162,8 +162,20 @@ pub async fn landing_page(
             "Conformance classes",
         ),
         (
+            format!("{base}/features/conformance"),
+            api_common::rel::CONFORMANCE,
+            "application/json",
+            "Conformance classes",
+        ),
+        (
             format!("{base}/features/collections"),
             "data",
+            "application/json",
+            "Collections",
+        ),
+        (
+            format!("{base}/features/collections"),
+            api_common::rel::DATA,
             "application/json",
             "Collections",
         ),
@@ -866,7 +878,7 @@ fn build_collection_metadata(
                 api_common::mounts::TILES,
                 config.id
             ),
-            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector",
+            "rel": api_common::rel::TILESETS_VECTOR,
             "type": "application/json",
             "title": "Vector tilesets"
         }));
