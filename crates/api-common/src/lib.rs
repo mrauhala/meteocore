@@ -1,6 +1,8 @@
 //! Shared OGC API Common HTTP plumbing and HTML representations. Pure search
 //! and extent policy stays in ds-core; adapters supply metadata and engine facets.
 
+pub mod caching;
+pub mod shared;
 pub mod workbench;
 
 use axum::extract::{FromRequestParts, Query};
@@ -52,6 +54,7 @@ pub mod rel {
     pub const TILESETS_VECTOR: &str = "http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector";
     pub const TILING_SCHEME: &str = "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme";
     pub const TILING_SCHEMES: &str = "http://www.opengis.net/def/rel/ogc/1.0/tiling-schemes";
+    pub const GEODATA: &str = "http://www.opengis.net/def/rel/ogc/1.0/geodata";
 }
 
 /// Mount path of an API router below the external base URL, supplied to its
@@ -65,6 +68,21 @@ impl Mount {
     pub fn root(self, base: &str) -> String {
         format!("{base}{}", self.0)
     }
+}
+
+/// The API a response belongs to, recorded as a response extension for
+/// request logs and metrics: routes of a shared root carry no API segment.
+#[derive(Clone, Copy, Debug)]
+pub struct ApiKind(pub &'static str);
+
+/// Tag every response of `router` with `kind` (see [`ApiKind`]).
+pub fn tag_api_kind(router: axum::Router, kind: &'static str) -> axum::Router {
+    router.layer(axum::middleware::map_response(
+        move |mut response: Response| async move {
+            response.extensions_mut().insert(ApiKind(kind));
+            response
+        },
+    ))
 }
 
 pub fn conformance_classes(api_classes: &[&'static str]) -> Vec<&'static str> {

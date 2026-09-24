@@ -12,8 +12,10 @@ use crate::{mounts, rel};
 const CSS: &str = include_str!("workbench/style.css");
 const SCRIPT: &str = include_str!("workbench/app.js");
 const THEME: &str = include_str!("workbench/theme.js");
-/// API workspaces offered by the switcher: (kind, label, mount path).
+/// API workspaces offered by the switcher: (kind, label, mount path). The
+/// shared OGC API root (#789) is mounted at the server root.
 const APIS: &[(&str, &str, &str)] = &[
+    (crate::shared::WORKSPACE, "OGC API", ""),
     ("edr", "EDR", mounts::EDR),
     ("features", "Features", mounts::FEATURES),
     ("maps", "Maps", mounts::MAPS),
@@ -217,10 +219,13 @@ impl Page<'_> {
         }
         let mut crumbs = anchor(&format!("{base}/?f=html"), "MeteoCore", "");
         if !api.is_empty() {
-            crumbs.push_str(&format!(
-                "<span>/</span>{}",
-                anchor(&format!("{root}/?f=html"), api_title, "")
-            ));
+            // An API mounted at the server root is already the first crumb.
+            if root != base {
+                crumbs.push_str(&format!(
+                    "<span>/</span>{}",
+                    anchor(&format!("{root}/?f=html"), api_title, "")
+                ));
+            }
             let prefix = format!("{root}/");
             let mut path = prefix.trim_end_matches('/').to_string();
             if let Some(rest) = current_path.strip_prefix(&prefix) {
@@ -414,9 +419,9 @@ pub fn landing_document(
         let href = link["href"].as_str().unwrap_or_default();
         let primary = if api.is_empty() {
             rel == "child"
-                && APIS
-                    .iter()
-                    .any(|(_, _, mount)| href.trim_end_matches('/').ends_with(mount))
+                && APIS.iter().any(|(_, _, mount)| {
+                    !mount.is_empty() && href.trim_end_matches('/').ends_with(mount)
+                })
         } else {
             matches!(rel, "data" | "conformance" | "service-desc")
         };
@@ -437,6 +442,7 @@ pub fn landing_document(
         "edr" => "Open a collection to see its supported data queries and parameters. Choose a location, position or area query, then use the linked API reference to supply the required inputs.",
         "maps" => "Open a collection to see its map resources. Use the map preview to inspect the data, or the API reference to request an image for an area, time and style.",
         "tiles" => "Open a collection and follow its tileset links. Select a tile matrix set and tile coordinates to request map or vector tiles.",
+        crate::shared::WORKSPACE => "Open a collection to see every way to access it: map images, map tiles and vector tiles, as the collection offers them. The per-API services remain available below.",
         _ => "Choose an API and a collection first. Then request features, environmental values, map images or tiles using that collection's supported operations.",
     };
     body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(&discovery),arrow=icon("arrow")));
@@ -719,7 +725,7 @@ pub fn collection_html(
             "Map request parameters ↗",
             "btn",
         ));
-    } else if api == "tiles" {
+    } else if api == "tiles" || api == crate::shared::WORKSPACE {
         body.push_str(&document_links(doc));
     }
     body.push_str("</section></div><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Collection details</h2></div><div class=\"panel-body\"><dl class=\"definition\">");

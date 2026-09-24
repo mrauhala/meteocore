@@ -112,6 +112,10 @@ impl MapEngine for InvalidParamEngine {
 // ---------------------------------------------------------------------------
 
 fn build_router() -> axum::Router {
+    api_tiles::router(build_state())
+}
+
+fn build_state() -> api_tiles::AppState {
     let engine: Arc<dyn MapEngine> = Arc::new(MockMapEngine::new());
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -179,7 +183,7 @@ fn build_router() -> axum::Router {
     );
     styles_map.insert("radar".to_string(), layer_styles);
 
-    let state = Arc::new(ArcSwap::from_pointee(TilesState {
+    Arc::new(ArcSwap::from_pointee(TilesState {
         map_engines: engines,
         collections,
         styles: styles_map,
@@ -190,8 +194,7 @@ fn build_router() -> axum::Router {
         vector_tile_cache: Arc::new(VectorTileCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
-    }));
-    api_tiles::router(state)
+    }))
 }
 
 /// A Tiles router backed by a caller-supplied engine, for exercising
@@ -1510,6 +1513,10 @@ mod mvt {
     }
 
     fn build_mvt_router() -> axum::Router {
+        api_tiles::router(build_mvt_state())
+    }
+
+    fn build_mvt_state() -> api_tiles::AppState {
         let engine: Arc<dyn FeatureEngine> = Arc::new(PointFeatureEngine::three_points());
         let mut feature_engines = HashMap::new();
         let mut feature_collections = HashMap::new();
@@ -1539,7 +1546,7 @@ mod mvt {
             },
         );
 
-        let state = Arc::new(ArcSwap::from_pointee(TilesState {
+        Arc::new(ArcSwap::from_pointee(TilesState {
             map_engines: HashMap::new(),
             collections: HashMap::new(),
             styles: HashMap::new(),
@@ -1550,8 +1557,7 @@ mod mvt {
             vector_tile_cache: Arc::new(VectorTileCache::new(16)),
             base_url: String::new(),
             trust_proxy_headers: false,
-        }));
-        api_tiles::router(state)
+        }))
     }
 
     /// Mock engine that always returns at least one more feature than the
@@ -1658,6 +1664,51 @@ mod mvt {
             .to_bytes()
             .to_vec();
         (status, headers, body)
+    }
+
+    /// Shared-root vector tiles (`…/tiles`, no `?f=mvt`) are the per-API
+    /// service's MVT bytes; raster selectors are rejected, not ignored.
+    #[tokio::test]
+    async fn shared_root_vector_tiles_match_the_per_api_service() {
+        let state = build_mvt_state();
+        let (status, headers, body) = get_raw_on(
+            api_tiles::router(state.clone()),
+            "/collections/places/tiles/WebMercatorQuad/0/0/0?f=mvt",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let shared = shared_router(state);
+        let (shared_status, shared_headers, shared_body) = get_raw_on(
+            shared.clone(),
+            "/collections/places/tiles/WebMercatorQuad/0/0/0",
+        )
+        .await;
+        assert_eq!(shared_status, StatusCode::OK);
+        assert_eq!(body, shared_body);
+        assert_eq!(headers["etag"], shared_headers["etag"]);
+        assert_eq!(
+            shared_headers["content-type"],
+            "application/vnd.mapbox-vector-tile"
+        );
+        for query in [
+            "f=image/png",
+            "datetime=2024-01-01T00:00:00Z",
+            "elevation=0.5",
+            "parameter-name=x",
+        ] {
+            let (status, _, _) = get_raw_on(
+                shared.clone(),
+                &format!("/collections/places/tiles/WebMercatorQuad/0/0/0?{query}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
+        let (status, _, _) = get_raw_on(shared, "/collections/places/map/tiles").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a vector collection has no map tiles"
+        );
     }
 
     #[tokio::test]
@@ -2655,6 +2706,98 @@ async fn exhausted_memory_budget_rejects_uncached_tile() {
     );
     assert_eq!(ds_executor::budget::RENDER_MEMORY.available(), 0);
     assert_eq!(ds_executor::budget::RENDER_MEMORY.rejected(), 1);
+}
+
+/// The Tiles routes of the shared OGC API root (#789), mounted at the root.
+fn shared_router(state: api_tiles::AppState) -> axum::Router {
+    use api_common::shared::BuildingBlock;
+    api_tiles::TilesBlock::new(state)
+        .routes()
+        .layer(axum::Extension(api_common::Mount("")))
+}
+
+async fn get_raw_on(app: axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, headers, body)
+}
+
+/// Shared-root map tiles (Tiles Table 8 `…/map/tiles`) are the per-API
+/// service's tiles: same handler, renderer and cache, so the same bytes.
+#[tokio::test]
+async fn shared_root_map_tiles_match_the_per_api_service() {
+    let state = build_state();
+    for (per_api, shared) in [
+        (
+            "/collections/radar/tiles/WebMercatorQuad/1/0/1",
+            "/collections/radar/map/tiles/WebMercatorQuad/1/0/1",
+        ),
+        (
+            "/collections/radar/styles/grayscale/tiles/WebMercatorQuad/1/0/1",
+            "/collections/radar/styles/grayscale/map/tiles/WebMercatorQuad/1/0/1",
+        ),
+    ] {
+        let (status, headers, body) = get_raw_on(api_tiles::router(state.clone()), per_api).await;
+        assert_eq!(status, StatusCode::OK, "{per_api}");
+        let (shared_status, shared_headers, shared_body) =
+            get_raw_on(shared_router(state.clone()), shared).await;
+        assert_eq!(shared_status, StatusCode::OK, "{shared}");
+        assert_eq!(body, shared_body, "{shared}");
+        assert_eq!(headers["etag"], shared_headers["etag"]);
+        assert_eq!(headers["content-type"], shared_headers["content-type"]);
+    }
+    // Vector tiles have their own path at the shared root.
+    let (status, _, _) = get_raw_on(
+        shared_router(state.clone()),
+        "/collections/radar/map/tiles/WebMercatorQuad/0/0/0?f=mvt",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = get_raw_on(shared_router(state), "/collections/radar/tiles").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a raster collection has no vector tiles"
+    );
+}
+
+/// Styled map tilesets: one list per style, each tileset naming its style and
+/// linking to its own resource; an unknown style is 404.
+#[tokio::test]
+async fn shared_root_lists_styled_map_tilesets() {
+    let app = shared_router(build_state());
+    let (status, _, body) =
+        get_raw_on(app.clone(), "/collections/radar/styles/grayscale/map/tiles").await;
+    assert_eq!(status, StatusCode::OK);
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    for tileset in list["tilesets"].as_array().unwrap() {
+        assert_eq!(tileset["style"]["id"], "grayscale");
+        assert_eq!(tileset["dataType"], "map");
+        let links = tileset["links"].as_array().unwrap();
+        let own = links.iter().find(|l| l["rel"] == "self").unwrap()["href"]
+            .as_str()
+            .unwrap();
+        assert!(own.starts_with("/collections/radar/styles/grayscale/map/tiles/"));
+        let (status, _, _) = get_raw_on(app.clone(), own).await;
+        assert_eq!(status, StatusCode::OK, "{own}");
+        let item = links.iter().find(|l| l["rel"] == "item").unwrap()["href"]
+            .as_str()
+            .unwrap();
+        assert!(item.starts_with(own) && item.ends_with("/{tileMatrix}/{tileRow}/{tileCol}"));
+    }
+    let (status, _, _) = get_raw_on(app, "/collections/radar/styles/nope/map/tiles").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// Tiles Req 10 B / abstract test A.9: each tileset list entry links to its

@@ -1,11 +1,13 @@
 pub mod error;
 pub mod handlers;
 pub mod params;
+pub mod shared;
 
 use axum::routing::get;
 use axum::{Extension, Router};
 
 pub use handlers::{AppState, MapsState};
+pub use shared::MapsBlock;
 
 /// The Maps service router, mounted at [`api_common::mounts::MAPS`].
 pub fn router(state: AppState) -> Router {

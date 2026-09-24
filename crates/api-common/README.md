@@ -14,6 +14,27 @@ and API-specific fields.
 | `collection_operation` | OpenAPI discovery operation, supported parameters, JSON/HTML responses and structured 400 errors |
 | `CONFORMANCE_CLASSES` | One Common class inventory, combined with each API's own declarations |
 
+## Shared OGC API root
+
+`shared` composes OGC API standards as building blocks under one root
+([#789](https://github.com/mrauhala/meteocore/issues/789)), mounted by the server
+at `/`. A `BuildingBlock` contributes its conformance classes, landing links,
+OpenAPI paths/components, data-access routes and, per collection, a
+`Contribution` of standard fields and access links. The composer serves the
+Common resources — landing page, `/api` (one merged OpenAPI 3.0 document),
+`/conformance` (the union), `/collections` and `/collections/{id}` — and merges
+each collection's contributions: links concatenate in block order, the first
+block to describe a field wins, and `styles` merge by id so Tiles can add
+per-style map tilesets to Maps' entries. Common metadata routes get the
+conditional-GET middleware (`caching`); data routes keep their own ETags. Each
+block's responses carry an `ApiKind` for request logs and the `api` metrics
+label. Blocks reuse their per-API service's state, so reloads reach both.
+
+Maps and Tiles are the blocks today. Tiles uses the Tiles Table 8 layout at the
+shared root: map tiles under `…/map/tiles`, styled map tiles under
+`…/styles/{styleId}/map/tiles`, vector tiles (MVT) under `…/tiles`, each list
+with its own tileset resources.
+
 ## Mounts and links
 
 `mounts` names where the server nests each per-API service (`/edr`, `/features`,

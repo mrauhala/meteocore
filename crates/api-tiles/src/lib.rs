@@ -1,12 +1,14 @@
 pub mod error;
 pub mod handlers;
 pub mod params;
+pub mod shared;
 pub mod tilematrixset;
 
 use axum::routing::get;
 use axum::{Extension, Router};
 
 pub use handlers::{AppState, TilesState};
+pub use shared::TilesBlock;
 
 /// The Tiles service router, mounted at [`api_common::mounts::TILES`].
 pub fn router(state: AppState) -> Router {
