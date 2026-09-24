@@ -942,6 +942,7 @@ mod tests {
             collections: HashMap::new(),
             base_url: String::new(),
             trust_proxy_headers: false,
+            vector_tileset_ids: Default::default(),
         }
     }
 
@@ -967,6 +968,7 @@ mod tests {
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             base_url: String::new(),
             trust_proxy_headers: false,
+            map_tileset_ids: Default::default(),
         }
     }
 

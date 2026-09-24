@@ -196,6 +196,8 @@ fn maps_state(
     configs: HashMap<String, CollectionConfig>,
     maps: HashMap<String, Arc<dyn MapEngine>>,
 ) -> api_maps::AppState {
+    // The Tiles fixture renders every collection as map tiles.
+    let map_tileset_ids = configs.keys().cloned().collect();
     Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
         engines: maps,
         collections: configs,
@@ -204,6 +206,7 @@ fn maps_state(
         rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
         base_url: BASE.into(),
         trust_proxy_headers: false,
+        map_tileset_ids,
     }))
 }
 
@@ -252,6 +255,8 @@ fn app(surface: &str) -> (Router, String) {
         "features" => api_features::router(Arc::new(ArcSwap::from_pointee(
             api_features::handlers::FeaturesState {
                 engines: features,
+                // The Tiles fixture encodes every collection as vector tiles.
+                vector_tileset_ids: configs.keys().cloned().collect(),
                 collections: configs,
                 base_url: BASE.into(),
                 trust_proxy_headers: false,

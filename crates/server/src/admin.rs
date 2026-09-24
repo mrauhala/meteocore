@@ -3609,6 +3609,12 @@ pub fn load_collections(
     // Set initial render semaphore total gauge
     RENDER_SEMAPHORE_TOTAL.set(render_concurrency as i64);
 
+    // Cross-API tileset links follow what the Tiles service actually
+    // registered, not the `apis` list: a nowcast renders only map tiles and a
+    // polar-volume network registers per-site ids (#789).
+    let map_tileset_ids = tiles_engines.keys().cloned().collect();
+    let vector_tileset_ids = tiles_feature_engines.keys().cloned().collect();
+
     LoadResult {
         edr_state: EdrState {
             engines: edr_engines,
@@ -3622,6 +3628,7 @@ pub fn load_collections(
             collections: feature_collections,
             base_url: base_url.to_string(),
             trust_proxy_headers,
+            vector_tileset_ids,
         },
         wms_state: WmsState {
             engines: map_engines,
@@ -3641,6 +3648,7 @@ pub fn load_collections(
             rendered_cache: rendered_cache.clone(),
             base_url: base_url.to_string(),
             trust_proxy_headers,
+            map_tileset_ids,
         },
         tiles_state: TilesState {
             map_engines: tiles_engines,
@@ -6247,6 +6255,34 @@ mod tests {
             "boot health should explain the degraded state: {:?}",
             h.error
         );
+    }
+
+    #[test]
+    fn cross_api_tileset_links_follow_the_tiles_registries() {
+        // A nowcast listing features + tiles renders only map tiles. Its
+        // Features view must not advertise a vector tileset (#789); Maps
+        // advertises the map tileset the Tiles service really serves.
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = ["wms", "maps", "tiles", "features"]
+            .map(String::from)
+            .to_vec();
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[tm35_source_collection("radar"), nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        assert!(result.tiles_state.map_engines.contains_key("nc"));
+        assert!(!result.tiles_state.feature_engines.contains_key("nc"));
+        assert!(result.features_state.engines.contains_key("nc"));
+        assert!(!result.features_state.vector_tileset_ids.contains("nc"));
+        assert!(result.maps_state.map_tileset_ids.contains("nc"));
+        // The source lists no tiles API, so Maps must not link to tiles for it.
+        assert!(!result.maps_state.map_tileset_ids.contains("radar"));
     }
 
     // --- reload preserves the warm render caches (ReusableCaches) ---

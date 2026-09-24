@@ -120,6 +120,7 @@ fn build_router() -> axum::Router {
         collections,
         base_url: String::new(),
         trust_proxy_headers: false,
+        vector_tileset_ids: Default::default(),
     })))
 }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -32,6 +32,10 @@ pub struct MapsState {
     pub base_url: String,
     /// Honour reverse-proxy forwarding headers when generating self-links (#12).
     pub trust_proxy_headers: bool,
+    /// Collections the Tiles service renders as map tiles. The `tilesets-map`
+    /// link is advertised only for these, so it never names a tileset list
+    /// that does not exist (`apis` alone cannot tell, #789).
+    pub map_tileset_ids: HashSet<String>,
 }
 
 pub type AppState = Arc<ArcSwap<MapsState>>;
@@ -156,6 +160,7 @@ fn build_collection_metadata(
     config: &CollectionConfig,
     info: &ds_core::map_engine::RasterInfo,
     styles: Option<&HashMap<String, StyleInfo>>,
+    map_tilesets: bool,
     base_url: &str,
     root: &str,
 ) -> serde_json::Value {
@@ -220,9 +225,9 @@ fn build_collection_metadata(
 
     // Map tilesets — rendered (raster) tiles are an OGC API Maps "map
     // tileset", discoverable from the maps collection via the `tilesets-map`
-    // relation. Only advertise it when the operator exposed this collection
-    // through the Tiles API (the standalone `/tiles` router still serves it).
-    if config.apis.iter().any(|a| a == "tiles") {
+    // relation. Only advertise it when the Tiles service actually registered
+    // this collection for raster tiles (the per-API `/tiles` router serves it).
+    if map_tilesets {
         links.push(json!({
             "href": format!("{base_url}{}/collections/{}/tiles", mounts::TILES, config.id),
             "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map",
@@ -848,8 +853,14 @@ pub async fn collections(
                 return None;
             };
             let info = engine.raster_info_shared();
-            let metadata =
-                build_collection_metadata(config, &info, state.styles.get(&config.id), base, root);
+            let metadata = build_collection_metadata(
+                config,
+                &info,
+                state.styles.get(&config.id),
+                state.map_tileset_ids.contains(&config.id),
+                base,
+                root,
+            );
             Some(api_common::CollectionEntry {
                 config,
                 metadata,
@@ -887,13 +898,23 @@ pub async fn collection(
         Wanted::Json => {
             let info = engine.raster_info_shared();
             let styles = state.styles.get(&id);
-            Json(build_collection_metadata(config, &info, styles, base, root)).into_response()
+            let map_tilesets = state.map_tileset_ids.contains(&id);
+            Json(build_collection_metadata(
+                config,
+                &info,
+                styles,
+                map_tilesets,
+                base,
+                root,
+            ))
+            .into_response()
         }
         Wanted::Html => {
             let metadata = build_collection_metadata(
                 config,
                 &engine.raster_info_shared(),
                 state.styles.get(&id),
+                state.map_tileset_ids.contains(&id),
                 base,
                 root,
             );

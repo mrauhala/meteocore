@@ -61,6 +61,7 @@ async fn geojson_source_arrays_survive_item_and_listing_responses() {
             collections: HashMap::from([("sample".into(), config)]),
             base_url: "https://example.test".into(),
             trust_proxy_headers: false,
+            vector_tileset_ids: Default::default(),
         },
     )));
 
