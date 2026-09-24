@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -28,6 +28,10 @@ pub struct FeaturesState {
     pub base_url: String,
     /// Honour reverse-proxy forwarding headers when generating self-links (#12).
     pub trust_proxy_headers: bool,
+    /// Collections the Tiles service encodes as vector tiles. The
+    /// `tilesets-vector` link is advertised only for these, so it never names
+    /// a tileset list that does not exist or holds map tiles (#789).
+    pub vector_tileset_ids: HashSet<String>,
 }
 
 pub type AppState = Arc<ArcSwap<FeaturesState>>;
@@ -158,8 +162,20 @@ pub async fn landing_page(
             "Conformance classes",
         ),
         (
+            format!("{base}/features/conformance"),
+            api_common::rel::CONFORMANCE,
+            "application/json",
+            "Conformance classes",
+        ),
+        (
             format!("{base}/features/collections"),
             "data",
+            "application/json",
+            "Collections",
+        ),
+        (
+            format!("{base}/features/collections"),
+            api_common::rel::DATA,
             "application/json",
             "Collections",
         ),
@@ -186,8 +202,11 @@ pub async fn landing_page(
                 Some("This document as JSON"),
             ));
             Html(api_common::workbench::landing_html(
-                base,
-                "features",
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    api: "features",
+                },
                 title,
                 description,
                 &views,
@@ -224,7 +243,13 @@ pub async fn conformance(
                 ),
             ];
             Html(api_common::workbench::conformance_html(
-                base, "features", &classes, &nav,
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    api: "features",
+                },
+                &classes,
+                &nav,
             ))
             .into_response()
         }
@@ -555,13 +580,26 @@ pub async fn collections(
             };
             Some(api_common::CollectionEntry {
                 config,
-                metadata: build_collection_metadata(engine.as_ref(), config, base),
+                metadata: build_collection_metadata(
+                    engine.as_ref(),
+                    config,
+                    state.vector_tileset_ids.contains(&config.id),
+                    base,
+                ),
                 bbox: engine.spatial_extent(),
                 time: engine.temporal_extent(),
             })
         })
         .collect();
-    api_common::collections_response(&format!("{base}/features/collections"), request, entries)
+    api_common::collections_response(
+        api_common::workbench::Surface {
+            base,
+            root: &format!("{base}{}", api_common::mounts::FEATURES),
+            api: "features",
+        },
+        request,
+        entries,
+    )
 }
 
 /// GET /features/collections/{id} — Collection detail
@@ -577,14 +615,26 @@ pub async fn collection(
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &request_base_url(&state, &headers);
     Ok(with_vary(match wanted {
-        Wanted::Json => {
-            Json(build_collection_metadata(engine.as_ref(), config, base)).into_response()
-        }
+        Wanted::Json => Json(build_collection_metadata(
+            engine.as_ref(),
+            config,
+            state.vector_tileset_ids.contains(&id),
+            base,
+        ))
+        .into_response(),
         Wanted::Html => {
-            let metadata = build_collection_metadata(engine.as_ref(), config, base);
-            Html(api_common::workbench::collection_html(
+            let metadata = build_collection_metadata(
+                engine.as_ref(),
+                config,
+                state.vector_tileset_ids.contains(&id),
                 base,
-                "features",
+            );
+            Html(api_common::workbench::collection_html(
+                api_common::workbench::Surface {
+                    base,
+                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    api: "features",
+                },
                 &metadata,
                 config.license.as_ref(),
             ))
@@ -793,6 +843,7 @@ pub async fn item(
 fn build_collection_metadata(
     engine: &dyn FeatureEngine,
     config: &CollectionConfig,
+    vector_tilesets: bool,
     base_url: &str,
 ) -> serde_json::Value {
     let total = engine.feature_count();
@@ -812,18 +863,22 @@ fn build_collection_metadata(
         }),
     ];
 
-    // If this collection is also exposed through OGC API Tiles, advertise the
-    // tilesets list so clients can discover the vector-tile representation
+    // If the Tiles service also encodes this collection as vector tiles,
+    // advertise the tilesets list so clients can discover that representation
     // without probing. Per OGC API – Tiles 1.0 §7.1, the `tilesets-vector`
     // relation targets the tilesets list resource (`application/json`), not a
     // tile URL template — the per-tile URL template lives one level deeper
     // inside the tilesets-list response as `rel: item`. Linking to the list
     // also avoids hardcoding `WebMercatorQuad`; the list enumerates every
     // supported TileMatrixSet.
-    if config.apis.iter().any(|a| a == "tiles") {
+    if vector_tilesets {
         links.push(json!({
-            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
-            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector",
+            "href": format!(
+                "{base_url}{}/collections/{}/tiles",
+                api_common::mounts::TILES,
+                config.id
+            ),
+            "rel": api_common::rel::TILESETS_VECTOR,
             "type": "application/json",
             "title": "Vector tilesets"
         }));

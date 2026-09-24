@@ -5,9 +5,12 @@ use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use axum::Extension;
 use axum::Json;
 use serde_json::json;
 
+use api_common::workbench::Surface;
+use api_common::{rel, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
@@ -158,8 +161,9 @@ fn build_collection_metadata(
     raster_info: Option<&ds_core::map_engine::RasterInfo>,
     feature_extent: Option<[f64; 4]>,
     feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    has_vector: bool,
     styles: Option<&HashMap<String, StyleInfo>>,
-    base_url: &str,
+    root: &str,
 ) -> serde_json::Value {
     let mut tms_links = Vec::new();
     for tms_id in SUPPORTED_TILE_MATRIX_SETS {
@@ -189,10 +193,18 @@ fn build_collection_metadata(
                     "links": [
                         {
                             "href": format!(
-                                "{base_url}/tiles/collections/{}/styles/{}/legend",
+                                "{root}/collections/{}/styles/{}/legend",
                                 config.id, s.name
                             ),
                             "rel": "legend",
+                            "type": "application/json"
+                        },
+                        {
+                            "href": format!(
+                                "{root}/collections/{}/styles/{}/legend",
+                                config.id, s.name
+                            ),
+                            "rel": rel::LEGEND,
                             "type": "application/json"
                         }
                     ]
@@ -246,20 +258,39 @@ fn build_collection_metadata(
     // CRS84 first (stable sort keeps the rest in order).
     crs_uris.sort_by_key(|c| *c != CRS84_URI);
 
-    let links = vec![
+    let tilesets = format!("{root}/collections/{}/tiles", config.id);
+    let mut links = vec![
         json!({
-            "href": format!("{base_url}/tiles/collections/{}", config.id),
+            "href": format!("{root}/collections/{}", config.id),
             "rel": "self",
             "type": "application/json",
             "title": config.title
         }),
         json!({
-            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
+            "href": tilesets,
             "rel": "tiles",
             "type": "application/json",
             "title": "Tilesets"
         }),
     ];
+    // Tiles Req 13 (geodata-tilesets): the registered relation names the kind
+    // of tiles in the list; one list may hold both, as the standard allows.
+    if raster_info.is_some() {
+        links.push(json!({
+            "href": tilesets,
+            "rel": rel::TILESETS_MAP,
+            "type": "application/json",
+            "title": "Map tilesets"
+        }));
+    }
+    if has_vector {
+        links.push(json!({
+            "href": tilesets,
+            "rel": rel::TILESETS_VECTOR,
+            "type": "application/json",
+            "title": "Vector tilesets"
+        }));
+    }
 
     let mut metadata = api_common::collection_metadata(
         config,
@@ -342,9 +373,10 @@ fn build_extent(
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /tiles/ — Landing page
+/// GET {mount}/ — Landing page
 pub async fn landing_page(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
@@ -352,43 +384,62 @@ pub async fn landing_page(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let title = "MeteoCore - Tiles";
     let description = "Metocean Data Server \u{2014} OGC API Tiles";
     // (href, rel, type, title) — one source for both representations.
     let links = [
         (
-            format!("{base}/tiles/"),
+            format!("{root}/"),
             "self",
             "application/json",
             "This document",
         ),
         (
-            format!("{base}/tiles/api"),
+            format!("{root}/api"),
             "service-desc",
             "application/vnd.oai.openapi+json;version=3.0",
             "API definition",
         ),
         (
-            format!("{base}/tiles/api/docs"),
+            format!("{root}/api/docs"),
             "service-doc",
             "text/html",
             "API documentation",
         ),
         (
-            format!("{base}/tiles/conformance"),
+            format!("{root}/conformance"),
             "conformance",
             "application/json",
             "Conformance classes",
         ),
         (
-            format!("{base}/tiles/collections"),
+            format!("{root}/conformance"),
+            rel::CONFORMANCE,
+            "application/json",
+            "Conformance classes",
+        ),
+        (
+            format!("{root}/collections"),
             "data",
             "application/json",
             "Collections",
         ),
         (
-            format!("{base}/tiles/tileMatrixSets"),
+            format!("{root}/collections"),
+            rel::DATA,
+            "application/json",
+            "Collections",
+        ),
+        (
+            format!("{root}/tileMatrixSets"),
             "tiling-schemes",
+            "application/json",
+            "Tile matrix sets",
+        ),
+        (
+            format!("{root}/tileMatrixSets"),
+            rel::TILING_SCHEMES,
             "application/json",
             "Tile matrix sets",
         ),
@@ -410,13 +461,16 @@ pub async fn landing_page(
             // rel="alternate" to the JSON representation (parity with the
             // collection-detail HTML page).
             views.push(LinkView::new(
-                format!("{base}/tiles/?f=json"),
+                format!("{root}/?f=json"),
                 "alternate",
                 Some("This document as JSON"),
             ));
             Html(api_common::workbench::landing_html(
-                base,
-                "tiles",
+                Surface {
+                    base,
+                    root,
+                    api: "tiles",
+                },
                 title,
                 description,
                 &views,
@@ -433,9 +487,13 @@ fn format_parameter() -> serde_json::Value {
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
-/// GET /tiles/api — OpenAPI 3.0.3 definition
-pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+/// GET {mount}/api — OpenAPI 3.0.3 definition. Path keys include the mount.
+pub async fn api_definition(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+) -> impl IntoResponse {
     let state = state.load_full();
+    let m = mount.0;
     let mut collection_paths = json!({});
     // A collection may be raster-only, vector-only, or both. Iterate the
     // union of `collections` (raster) and `feature_collections` (vector),
@@ -456,7 +514,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         let has_raster = state.map_engines.contains_key(id);
         let has_vector = state.feature_engines.contains_key(id);
 
-        collection_paths[format!("/tiles/collections/{id}")] = json!({
+        collection_paths[format!("{m}/collections/{id}")] = json!({
             "get": {
                 "summary": format!("Get {} collection metadata", config.title),
                 "operationId": format!("getCollection_{id}"),
@@ -469,13 +527,32 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        collection_paths[format!("/tiles/collections/{id}/tiles")] = json!({
+        collection_paths[format!("{m}/collections/{id}/tiles")] = json!({
             "get": {
                 "summary": format!("List tilesets for {}", config.title),
                 "operationId": format!("getTilesets_{id}"),
                 "tags": [id],
                 "responses": {
                     "200": {"description": "Available tilesets"}
+                }
+            }
+        });
+
+        collection_paths[format!("{m}/collections/{id}/tiles/{{tileMatrixSetId}}")] = json!({
+            "get": {
+                "summary": format!("Get tileset metadata for {}", config.title),
+                "operationId": format!("getTileset_{id}"),
+                "tags": [id],
+                "parameters": [{
+                    "name": "tileMatrixSetId",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string", "enum": SUPPORTED_TILE_MATRIX_SETS},
+                    "description": "Tile matrix set identifier"
+                }],
+                "responses": {
+                    "200": {"description": "Tileset metadata"},
+                    "404": {"description": "Collection or tile matrix set not found"}
                 }
             }
         });
@@ -502,7 +579,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             );
         }
 
-        collection_paths[format!("/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}")] = json!({
+        collection_paths[format!(
+            "{m}/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+        )] = json!({
             "get": {
                 "summary": format!("Get tile for {}", config.title),
                 "operationId": format!("getTile_{id}"),
@@ -557,7 +636,73 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         // have no styles registry entry and the route would 404, so only
         // advertise it where a MapEngine is registered.
         if has_raster {
-            collection_paths[format!("/tiles/collections/{id}/styles/{{styleId}}/legend")] = json!({
+            collection_paths[format!("{m}/collections/{id}/styles/{{styleId}}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}")] = json!({
+                "get": {
+                    "summary": format!("Get styled map tile for {}", config.title),
+                    "operationId": format!("getStyledTile_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {
+                            "name": "styleId",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "string"},
+                            "description": "Style identifier"
+                        },
+                        {
+                            "name": "tileMatrixSetId",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "string", "enum": SUPPORTED_TILE_MATRIX_SETS},
+                            "description": "Tile matrix set identifier"
+                        },
+                        {
+                            "name": "tileMatrix",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "integer", "minimum": 0, "maximum": params::MAX_ZOOM_LEVEL},
+                            "description": "Zoom level"
+                        },
+                        {
+                            "name": "tileRow",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "integer", "minimum": 0},
+                            "description": "Row index"
+                        },
+                        {
+                            "name": "tileCol",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "integer", "minimum": 0},
+                            "description": "Column index"
+                        },
+                        {"$ref": "#/components/parameters/datetime"},
+                        {"$ref": "#/components/parameters/elevation"},
+                        {
+                            "name": "f",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "string", "default": "image/png", "enum": ["image/png", "image/jpeg", "image/webp"]},
+                            "description": "Raster output format. Vector tiles are not styled; `mvt` returns 400."
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Styled map tile",
+                            "content": {
+                                "image/png": {"schema": {"type": "string", "format": "binary"}},
+                                "image/jpeg": {"schema": {"type": "string", "format": "binary"}},
+                                "image/webp": {"schema": {"type": "string", "format": "binary"}}
+                            }
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Collection, style or tile not found"},
+                        "500": {"description": "Server error"}
+                    }
+                }
+            });
+            collection_paths[format!("{m}/collections/{id}/styles/{{styleId}}/legend")] = json!({
                 "get": {
                     "summary": format!("Get style legend for {}", config.title),
                     "operationId": format!("getStyleLegend_{id}"),
@@ -607,7 +752,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     }
 
     let mut paths = json!({
-        "/tiles/": {
+        format!("{m}/"): {
             "get": {
                 "summary": "Landing page",
                 "operationId": "getLandingPage",
@@ -615,7 +760,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "responses": { "200": {"description": "Landing page"} }
             }
         },
-        "/tiles/conformance": {
+        format!("{m}/conformance"): {
             "get": {
                 "summary": "Conformance classes",
                 "operationId": "getConformance",
@@ -623,15 +768,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "responses": { "200": {"description": "Conformance classes"} }
             }
         },
-        "/tiles/collections": {"get": api_common::collection_operation()},
-        "/tiles/tileMatrixSets": {
+        format!("{m}/collections"): {"get": api_common::collection_operation()},
+        format!("{m}/tileMatrixSets"): {
             "get": {
                 "summary": "List supported tile matrix sets",
                 "operationId": "getTileMatrixSets",
                 "responses": { "200": {"description": "List of tile matrix sets"} }
             }
         },
-        "/tiles/tileMatrixSets/{tileMatrixSetId}": {
+        format!("{m}/tileMatrixSets/{{tileMatrixSetId}}"): {
             "get": {
                 "summary": "Get tile matrix set definition",
                 "operationId": "getTileMatrixSet",
@@ -734,10 +879,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     Json(openapi)
 }
 
-/// GET /tiles/api/docs — Swagger UI
-pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// GET {mount}/api/docs — Swagger UI
+pub async fn api_docs(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/tiles/api", request_base_url(&state, &headers));
+    let spec_url = format!("{}/api", mount.root(&request_base_url(&state, &headers)));
     (
         [
             (
@@ -769,9 +918,10 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
     }
 }
 
-/// GET /tiles/conformance
+/// GET {mount}/conformance
 pub async fn conformance(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
@@ -779,10 +929,12 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let classes = api_common::conformance_classes(&[
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
+        "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets",
         "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
         "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/png",
@@ -793,28 +945,35 @@ pub async fn conformance(
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {
             let nav = [
-                LinkView::new(format!("{base}/tiles/"), "up", Some("Landing page")),
+                LinkView::new(format!("{root}/"), "up", Some("Landing page")),
                 LinkView::new(
-                    format!("{base}/tiles/conformance?f=json"),
+                    format!("{root}/conformance?f=json"),
                     "alternate",
                     Some("This document as JSON"),
                 ),
             ];
             Html(api_common::workbench::conformance_html(
-                base, "tiles", &classes, &nav,
+                Surface {
+                    base,
+                    root,
+                    api: "tiles",
+                },
+                &classes,
+                &nav,
             ))
             .into_response()
         }
     }))
 }
 
-/// GET /tiles/tileMatrixSets — List supported tile matrix sets
+/// GET {mount}/tileMatrixSets — List supported tile matrix sets
 pub async fn tile_matrix_sets(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let state = state.load_full();
-    let base = &request_base_url(&state, &headers);
+    let root = &mount.root(&request_base_url(&state, &headers));
     let sets: Vec<serde_json::Value> = SUPPORTED_TILE_MATRIX_SETS
         .iter()
         .filter_map(|id| {
@@ -825,7 +984,7 @@ pub async fn tile_matrix_sets(
                 "uri": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{}", tms.id),
                 "crs": tms.crs,
                 "links": [{
-                    "href": format!("{base}/tiles/tileMatrixSets/{}", tms.id),
+                    "href": format!("{root}/tileMatrixSets/{}", tms.id),
                     "rel": "self",
                     "type": "application/json"
                 }]
@@ -836,14 +995,14 @@ pub async fn tile_matrix_sets(
     Json(json!({
         "tileMatrixSets": sets,
         "links": [{
-            "href": format!("{base}/tiles/tileMatrixSets"),
+            "href": format!("{root}/tileMatrixSets"),
             "rel": "self",
             "type": "application/json"
         }]
     }))
 }
 
-/// GET /tiles/tileMatrixSets/{tileMatrixSetId} — Get tile matrix set definition
+/// GET {mount}/tileMatrixSets/{tileMatrixSetId} — Get tile matrix set definition
 pub async fn tile_matrix_set(Path(tms_id): Path<String>) -> Result<impl IntoResponse, TilesError> {
     let tms = tilematrixset::get_tile_matrix_set(&tms_id).ok_or_else(|| {
         TilesError::NotFound(format!(
@@ -855,14 +1014,16 @@ pub async fn tile_matrix_set(Path(tms_id): Path<String>) -> Result<impl IntoResp
     Ok(Json(tms.to_json()))
 }
 
-/// GET /tiles/collections — List tile-enabled collections
+/// GET {mount}/collections — List tile-enabled collections
 pub async fn collections(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     request: api_common::CollectionRequest,
     headers: HeaderMap,
 ) -> Response {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let mut seen = std::collections::HashSet::new();
     let mut entries = Vec::new();
     for config in state
@@ -890,8 +1051,9 @@ pub async fn collections(
             raster_info.as_deref(),
             feature_extent,
             feature_time,
+            feature.is_some(),
             state.styles.get(&config.id),
-            base,
+            root,
         );
         entries.push(api_common::CollectionEntry {
             config,
@@ -900,166 +1062,235 @@ pub async fn collections(
             time,
         });
     }
-    api_common::collections_response(&format!("{base}/tiles/collections"), request, entries)
+    api_common::collections_response(
+        Surface {
+            base,
+            root,
+            api: "tiles",
+        },
+        request,
+        entries,
+    )
 }
 
-/// GET /tiles/collections/{id} — Collection detail
+/// GET {mount}/collections/{id} — Collection detail
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     use ds_core::html::Wanted;
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info_shared());
-    let feature_extent = state
-        .feature_engines
-        .get(&id)
-        .and_then(|e| e.spatial_extent());
-    let feature_time = state
-        .feature_engines
-        .get(&id)
-        .and_then(|e| e.temporal_extent());
-    let config = state
-        .collections
-        .get(&id)
-        .or_else(|| state.feature_collections.get(&id))
-        .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
-    if raster_info.is_none() && !state.feature_engines.contains_key(&id) {
-        return Err(TilesError::NotFound(format!(
-            "Collection '{id}' has no tile source"
-        )));
-    }
+    let sources = tile_sources(&state, &id)?;
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
+    let metadata = build_collection_metadata(
+        sources.config,
+        sources.raster_info.as_deref(),
+        sources.feature_extent,
+        sources.feature_time,
+        sources.has_vector,
+        state.styles.get(&id),
+        root,
+    );
     Ok(with_vary(match wanted {
-        Wanted::Json => {
-            let styles = state.styles.get(&id);
-            Json(build_collection_metadata(
-                config,
-                raster_info.as_deref(),
-                feature_extent,
-                feature_time,
-                styles,
+        Wanted::Json => Json(metadata).into_response(),
+        Wanted::Html => Html(api_common::workbench::collection_html(
+            Surface {
                 base,
-            ))
-            .into_response()
-        }
-        Wanted::Html => {
-            let metadata = build_collection_metadata(
-                config,
-                raster_info.as_deref(),
-                feature_extent,
-                feature_time,
-                state.styles.get(&id),
-                base,
-            );
-            Html(api_common::workbench::collection_html(
-                base,
-                "tiles",
-                &metadata,
-                config.license.as_ref(),
-            ))
-            .into_response()
-        }
+                root,
+                api: "tiles",
+            },
+            &metadata,
+            sources.config.license.as_ref(),
+        ))
+        .into_response(),
     }))
 }
 
-/// GET /tiles/collections/{id}/tiles — List tilesets for a collection
-pub async fn collection_tilesets(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, TilesError> {
-    let state = state.load_full();
-    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info_shared());
-    let feature_extent = state
-        .feature_engines
-        .get(&id)
-        .and_then(|e| e.spatial_extent());
+/// The tile sources a collection registers with the Tiles service.
+struct TileSources<'a> {
+    config: &'a CollectionConfig,
+    raster_info: Option<Arc<ds_core::map_engine::RasterInfo>>,
+    has_vector: bool,
+    feature_extent: Option<[f64; 4]>,
+    feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+}
+
+/// The kind of tiles in a tileset (its Tiles `dataType`).
+#[derive(Clone, Copy, PartialEq)]
+enum TileKind {
+    Map,
+    Vector,
+}
+
+impl TileSources<'_> {
+    fn kinds(&self) -> impl Iterator<Item = TileKind> {
+        let map = self.raster_info.is_some().then_some(TileKind::Map);
+        let vector = self.has_vector.then_some(TileKind::Vector);
+        map.into_iter().chain(vector)
+    }
+
+    /// The kind `…/tiles/{tileMatrixSetId}` describes. That path holds one
+    /// tileset per tiling scheme, so a collection serving both kinds exposes
+    /// its map tileset there; the shared root gives each kind its own tileset
+    /// resource (#789 Phase 1: map tiles under `…/map/tiles`).
+    fn resource_kind(&self) -> TileKind {
+        if self.raster_info.is_some() {
+            TileKind::Map
+        } else {
+            TileKind::Vector
+        }
+    }
+
+    fn spatial_extent(&self) -> Option<[f64; 4]> {
+        self.raster_info
+            .as_ref()
+            .and_then(|i| i.spatial_extent)
+            .or(self.feature_extent)
+    }
+}
+
+/// Resolve a collection's tile sources, or 404 when it serves no tiles.
+fn tile_sources<'a>(state: &'a TilesState, id: &str) -> Result<TileSources<'a>, TilesError> {
     let config = state
         .collections
-        .get(&id)
-        .or_else(|| state.feature_collections.get(&id))
+        .get(id)
+        .or_else(|| state.feature_collections.get(id))
         .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
-    let has_raster = raster_info.is_some();
-    let has_vector = state.feature_engines.contains_key(&id);
-    if !has_raster && !has_vector {
+    let raster_info = state.map_engines.get(id).map(|e| e.raster_info_shared());
+    let feature = state.feature_engines.get(id);
+    if raster_info.is_none() && feature.is_none() {
         return Err(TilesError::NotFound(format!(
             "Collection '{id}' has no tile source"
         )));
     }
-    let base = &request_base_url(&state, &headers);
+    Ok(TileSources {
+        config,
+        raster_info,
+        has_vector: feature.is_some(),
+        feature_extent: feature.and_then(|e| e.spatial_extent()),
+        feature_time: feature.and_then(|e| e.temporal_extent()),
+    })
+}
 
-    let max_zoom = params::DEFAULT_MAX_ZOOM;
-    let spatial_extent = raster_info
-        .as_ref()
-        .and_then(|i| i.spatial_extent)
-        .or(feature_extent);
-
-    let mut tilesets = Vec::new();
-    for tms_id in SUPPORTED_TILE_MATRIX_SETS {
-        let tms = match tilematrixset::get_tile_matrix_set(tms_id) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let limits = spatial_extent.map(|bbox| tms.limits_for_extent(bbox, max_zoom));
-
-        let mut item_links = Vec::new();
-        if has_raster {
-            item_links.push(json!({
-                "href": format!(
-                    "{base}/tiles/collections/{}/tiles/{tms_id}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}",
-                    config.id
-                ),
-                "rel": "item",
-                "type": "image/png",
-                "templated": true
-            }));
-        }
-        if has_vector {
-            item_links.push(json!({
-                "href": format!(
-                    "{base}/tiles/collections/{}/tiles/{tms_id}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt",
-                    config.id
-                ),
-                "rel": "item",
-                "type": MVT_CONTENT_TYPE,
-                "templated": true
-            }));
-        }
-
-        let mut links = vec![json!({
-            "href": format!("{base}/tiles/tileMatrixSets/{tms_id}"),
-            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
-            "type": "application/json"
-        })];
-        links.extend(item_links);
-
-        let mut tileset = json!({
-            "dataType": if has_raster { "map" } else { "vector" },
-            "crs": tms.crs,
-            "tileMatrixSetURI": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{tms_id}"),
-            "links": links,
-        });
-
-        if let Some(limits) = limits {
-            tileset["tileMatrixSetLimits"] = json!(limits);
-        }
-
-        tilesets.push(tileset);
+/// Tileset metadata for one tiling scheme and kind of tiles (Tiles Req 8):
+/// the registered tiling scheme and a templated link to tiles of that kind.
+/// The tileset served at `…/tiles/{tileMatrixSetId}` also carries the `self`
+/// link a tileset list entry needs (Req 10 B).
+fn tileset_json(
+    root: &str,
+    sources: &TileSources<'_>,
+    tms: &tilematrixset::TileMatrixSetDef,
+    kind: TileKind,
+) -> serde_json::Value {
+    let id = &sources.config.id;
+    let tms_id = tms.id;
+    let tileset = format!("{root}/collections/{id}/tiles/{tms_id}");
+    let mut links = Vec::new();
+    if kind == sources.resource_kind() {
+        links.push(json!({
+            "href": tileset,
+            "rel": "self",
+            "type": "application/json",
+            "title": "This tileset"
+        }));
     }
+    links.push(json!({
+        "href": format!("{root}/tileMatrixSets/{tms_id}"),
+        "rel": rel::TILING_SCHEME,
+        "type": "application/json"
+    }));
+    let (data_type, item, media_type) = match kind {
+        TileKind::Map => (
+            "map",
+            format!("{tileset}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"),
+            "image/png",
+        ),
+        TileKind::Vector => (
+            "vector",
+            format!("{tileset}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt"),
+            MVT_CONTENT_TYPE,
+        ),
+    };
+    links.push(json!({
+        "href": item,
+        "rel": "item",
+        "type": media_type,
+        "templated": true
+    }));
+    let mut tileset = json!({
+        "title": format!("{} ({}, {data_type} tiles)", sources.config.title, tms.title),
+        "dataType": data_type,
+        "crs": tms.crs,
+        "tileMatrixSetURI": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{tms_id}"),
+        "links": links,
+    });
+    if let Some(bbox) = sources.spatial_extent() {
+        tileset["tileMatrixSetLimits"] =
+            json!(tms.limits_for_extent(bbox, params::DEFAULT_MAX_ZOOM));
+    }
+    tileset
+}
+
+/// GET {mount}/collections/{id}/tiles — List tilesets for a collection: one
+/// per tiling scheme and kind of tiles, so a collection serving map and
+/// vector tiles lists both with their own `dataType`.
+pub async fn collection_tilesets(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, TilesError> {
+    let state = state.load_full();
+    let sources = tile_sources(&state, &id)?;
+    let root = &mount.root(&request_base_url(&state, &headers));
+    let tilesets: Vec<_> = SUPPORTED_TILE_MATRIX_SETS
+        .iter()
+        .filter_map(|tms_id| tilematrixset::get_tile_matrix_set(tms_id))
+        .flat_map(|tms| {
+            sources
+                .kinds()
+                .map(|kind| tileset_json(root, &sources, tms, kind))
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
     Ok(Json(json!({
         "tilesets": tilesets,
         "links": [{
-            "href": format!("{base}/tiles/collections/{}/tiles", id),
+            "href": format!("{root}/collections/{}/tiles", id),
             "rel": "self",
             "type": "application/json"
         }]
     })))
+}
+
+/// GET {mount}/collections/{id}/tiles/{tileMatrixSetId} — Tileset metadata
+pub async fn collection_tileset(
+    Path((id, tms_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, TilesError> {
+    let state = state.load_full();
+    let sources = tile_sources(&state, &id)?;
+    let tms = tilematrixset::get_tile_matrix_set(&tms_id).ok_or_else(|| {
+        TilesError::NotFound(format!(
+            "TileMatrixSet '{tms_id}' not found. Available: {}",
+            SUPPORTED_TILE_MATRIX_SETS.join(", ")
+        ))
+    })?;
+    let root = &mount.root(&request_base_url(&state, &headers));
+    Ok(Json(tileset_json(
+        root,
+        &sources,
+        tms,
+        sources.resource_kind(),
+    )))
 }
 
 /// MVT MIME type registered with IANA.
@@ -1254,7 +1485,7 @@ async fn render_vector_tile(
         .into_response())
 }
 
-/// GET /tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
+/// GET {mount}/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
 ///
 /// Content-negotiated between raster (PNG/JPEG/WebP, default) and Mapbox
 /// Vector Tile (`?f=mvt`). The latter routes through the `FeatureEngine`
@@ -1292,7 +1523,7 @@ pub async fn get_tile(
     .map(|r| r.into_response())
 }
 
-/// GET /tiles/collections/{id}/styles/{styleId}/legend
+/// GET {mount}/collections/{id}/styles/{styleId}/legend
 ///
 /// `?f=json` (the default) returns the machine-readable legend — palette
 /// stops, value range, interpolation — so a client can draw its own legend;
@@ -1388,7 +1619,7 @@ pub async fn style_legend(
     }
 }
 
-/// GET /tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
+/// GET {mount}/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
 pub async fn get_styled_tile(
     headers: HeaderMap,
     Path((id, style_id, tms_id, tile_matrix, tile_row, tile_col)): Path<(

@@ -121,12 +121,14 @@ fn instant(s: &str) -> DateTime<Utc> {
     s.parse().unwrap()
 }
 
-fn app(surface: &str) -> (Router, String) {
-    let api = if surface == "vector-tiles" {
-        "tiles"
-    } else {
-        surface
-    };
+type Catalog = (
+    HashMap<String, CollectionConfig>,
+    HashMap<String, Arc<dyn EdrEngine>>,
+    HashMap<String, Arc<dyn MapEngine>>,
+    HashMap<String, Arc<dyn FeatureEngine>>,
+);
+
+fn catalog() -> Catalog {
     let mut configs = HashMap::new();
     let mut edr: HashMap<String, Arc<dyn EdrEngine>> = HashMap::new();
     let mut maps: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
@@ -187,6 +189,59 @@ fn app(surface: &str) -> (Router, String) {
         .unwrap();
         configs.insert(id.into(), config);
     }
+    (configs, edr, maps, features)
+}
+
+fn maps_state(
+    configs: HashMap<String, CollectionConfig>,
+    maps: HashMap<String, Arc<dyn MapEngine>>,
+) -> api_maps::AppState {
+    // The Tiles fixture renders every collection as map tiles.
+    let map_tileset_ids = configs.keys().cloned().collect();
+    Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
+        engines: maps,
+        collections: configs,
+        styles: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
+        base_url: BASE.into(),
+        trust_proxy_headers: false,
+        map_tileset_ids,
+    }))
+}
+
+fn tiles_state(
+    configs: HashMap<String, CollectionConfig>,
+    maps: HashMap<String, Arc<dyn MapEngine>>,
+    features: HashMap<String, Arc<dyn FeatureEngine>>,
+    vector_only: bool,
+) -> api_tiles::AppState {
+    Arc::new(ArcSwap::from_pointee(api_tiles::TilesState {
+        map_engines: if vector_only { HashMap::new() } else { maps },
+        collections: if vector_only {
+            HashMap::new()
+        } else {
+            configs.clone()
+        },
+        // Raster+vector duplicates must not duplicate catalog entries.
+        feature_engines: features,
+        feature_collections: configs,
+        styles: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
+        vector_tile_cache: Arc::new(ds_mvt::VectorTileCache::new(1)),
+        base_url: BASE.into(),
+        trust_proxy_headers: false,
+    }))
+}
+
+fn app(surface: &str) -> (Router, String) {
+    let api = if surface == "vector-tiles" {
+        "tiles"
+    } else {
+        surface
+    };
+    let (configs, edr, maps, features) = catalog();
     let router = match surface {
         "edr" => api_edr::router(Arc::new(ArcSwap::from_pointee(
             api_edr::handlers::EdrState {
@@ -200,40 +255,20 @@ fn app(surface: &str) -> (Router, String) {
         "features" => api_features::router(Arc::new(ArcSwap::from_pointee(
             api_features::handlers::FeaturesState {
                 engines: features,
+                // The Tiles fixture encodes every collection as vector tiles.
+                vector_tileset_ids: configs.keys().cloned().collect(),
                 collections: configs,
                 base_url: BASE.into(),
                 trust_proxy_headers: false,
             },
         ))),
-        "maps" => api_maps::router(Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
-            engines: maps,
-            collections: configs,
-            styles: HashMap::new(),
-            render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
-            base_url: BASE.into(),
-            trust_proxy_headers: false,
-        }))),
-        "tiles" | "vector-tiles" => {
-            let vector_only = surface == "vector-tiles";
-            api_tiles::router(Arc::new(ArcSwap::from_pointee(api_tiles::TilesState {
-                map_engines: if vector_only { HashMap::new() } else { maps },
-                collections: if vector_only {
-                    HashMap::new()
-                } else {
-                    configs.clone()
-                },
-                // Raster+vector duplicates must not duplicate catalog entries.
-                feature_engines: features,
-                feature_collections: configs,
-                styles: HashMap::new(),
-                render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-                rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
-                vector_tile_cache: Arc::new(ds_mvt::VectorTileCache::new(1)),
-                base_url: BASE.into(),
-                trust_proxy_headers: false,
-            })))
-        }
+        "maps" => api_maps::router(maps_state(configs, maps)),
+        "tiles" | "vector-tiles" => api_tiles::router(tiles_state(
+            configs,
+            maps,
+            features,
+            surface == "vector-tiles",
+        )),
         _ => unreachable!(),
     };
     let prefix = format!("/base/{api}");
@@ -689,5 +724,141 @@ async fn workbench_exposes_supported_queries_and_same_resource_json_on_every_sur
         assert!(detail.contains("Coverage &amp; metadata"));
         assert!(detail.contains("2024-01-01"));
         assert!(detail.contains("Back to collections"));
+    }
+}
+
+/// Common Part 1 Req 13 names the registered conformance relation; Features
+/// and EDR (and their test suites) require the short `conformance`/`data`.
+/// Every landing page carries both, pointing at the same resources.
+#[tokio::test]
+async fn landing_pages_advertise_short_and_registered_relations() {
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let doc = get_json(&app, &prefix).await;
+        for (short, registered) in [
+            ("conformance", api_common::rel::CONFORMANCE),
+            ("data", api_common::rel::DATA),
+        ] {
+            assert_eq!(link(&doc, short), link(&doc, registered), "{surface}");
+        }
+    }
+}
+
+/// Tiles Req 13: each registered `tilesets-*` relation must lead to tilesets
+/// of the kind it names. A collection serving map and vector tiles lists one
+/// tileset per tiling scheme and kind, each linking only tiles of its kind.
+#[tokio::test]
+async fn mixed_tile_collections_list_a_tileset_per_kind() {
+    let (app, prefix) = app("tiles");
+    let doc = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+    for (relation, data_type, media_type) in [
+        (api_common::rel::TILESETS_MAP, "map", "image/png"),
+        (
+            api_common::rel::TILESETS_VECTOR,
+            "vector",
+            "application/vnd.mapbox-vector-tile",
+        ),
+    ] {
+        let list = get_json(&app, link(&doc, relation)).await;
+        let typed: Vec<_> = list["tilesets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["dataType"] == data_type)
+            .collect();
+        assert_eq!(typed.len(), 2, "one {data_type} tileset per tiling scheme");
+        for tileset in typed {
+            let items: Vec<_> = tileset["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["rel"] == "item")
+                .collect();
+            assert!(!items.is_empty());
+            assert!(items.iter().all(|l| l["type"] == media_type), "{tileset}");
+        }
+    }
+}
+
+/// Every advertised JSON link below `BASE` that is not a URI template.
+fn json_links(doc: &Value, out: &mut Vec<String>) {
+    match doc {
+        Value::Array(values) => values.iter().for_each(|v| json_links(v, out)),
+        Value::Object(map) => {
+            if let (Some(href), Some(_)) = (map.get("href").and_then(Value::as_str), map.get("rel"))
+            {
+                let media = map.get("type").and_then(Value::as_str).unwrap_or("");
+                if href.starts_with(BASE)
+                    && media.contains("json")
+                    && map.get("templated") != Some(&json!(true))
+                {
+                    out.push(href.to_owned());
+                }
+            }
+            map.values().for_each(|v| json_links(v, out));
+        }
+        _ => {}
+    }
+}
+
+/// Maps and Tiles build every link from their router's mount (#789): relocated
+/// below another prefix, each advertised JSON resource must still resolve and
+/// stay on that mount. Cross-API links target the per-API Tiles service.
+#[tokio::test]
+async fn relocated_maps_and_tiles_advertise_only_resolvable_links_on_their_mount() {
+    let (configs, _, maps, features) = catalog();
+    let tiles = tiles_state(configs.clone(), maps.clone(), features, false);
+    let app = Router::new()
+        .nest(
+            "/base/relocated/maps",
+            api_maps::router_at(maps_state(configs, maps), "/relocated/maps"),
+        )
+        .nest(
+            "/base/relocated/tiles",
+            api_tiles::router_at(tiles.clone(), "/relocated/tiles"),
+        )
+        .nest("/base/tiles", api_tiles::router(tiles));
+    let legacy_tiles = format!("{BASE}{}/", api_common::mounts::TILES);
+    for mount in ["/relocated/maps", "/relocated/tiles"] {
+        let own = format!("{BASE}{mount}/");
+        let mut queue = vec![own.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(url) = queue.pop() {
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            assert!(
+                url.starts_with(&own) || url.starts_with(&legacy_tiles),
+                "{mount} advertised a link outside its mount: {url}"
+            );
+            // The server trims trailing slashes before routing; so does the crawl.
+            let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+            let path = path.trim_end_matches('/');
+            let target = if query.is_empty() {
+                path.to_owned()
+            } else {
+                format!("{path}?{query}")
+            };
+            let doc = get_json(&app, &target).await;
+            let mut links = Vec::new();
+            json_links(&doc, &mut links);
+            queue.extend(links);
+        }
+        for resource in ["/conformance", "/collections", "/collections/c-match"] {
+            assert!(
+                seen.iter()
+                    .any(|u| u.split('?').next() == Some(&format!("{own}{}", &resource[1..]))),
+                "{mount}: crawl never reached {resource}; visited {seen:?}"
+            );
+        }
+        let api = get_json(&app, &format!("{own}api")).await;
+        assert!(
+            api["paths"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|path| path.starts_with(mount)),
+            "{mount}: OpenAPI paths must include the mount"
+        );
     }
 }

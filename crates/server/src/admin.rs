@@ -3609,6 +3609,12 @@ pub fn load_collections(
     // Set initial render semaphore total gauge
     RENDER_SEMAPHORE_TOTAL.set(render_concurrency as i64);
 
+    // Cross-API tileset links follow what the Tiles service actually
+    // registered, not the `apis` list: a nowcast renders only map tiles and a
+    // polar-volume network registers per-site ids (#789).
+    let map_tileset_ids = tiles_engines.keys().cloned().collect();
+    let vector_tileset_ids = tiles_feature_engines.keys().cloned().collect();
+
     LoadResult {
         edr_state: EdrState {
             engines: edr_engines,
@@ -3622,6 +3628,7 @@ pub fn load_collections(
             collections: feature_collections,
             base_url: base_url.to_string(),
             trust_proxy_headers,
+            vector_tileset_ids,
         },
         wms_state: WmsState {
             engines: map_engines,
@@ -3641,6 +3648,7 @@ pub fn load_collections(
             rendered_cache: rendered_cache.clone(),
             base_url: base_url.to_string(),
             trust_proxy_headers,
+            map_tileset_ids,
         },
         tiles_state: TilesState {
             map_engines: tiles_engines,
@@ -5476,6 +5484,12 @@ pub async fn metrics_middleware(
 /// Derive (api, collection_id, query_type) from a real URI path and the
 /// matched route template.
 ///
+/// The API comes from the template's per-API mount segment (`/edr/…`,
+/// `/maps/…`). The collection id is read from the URI at the position of
+/// `{id}` in the template, so it does not depend on the mount. Routes of the
+/// planned shared OGC API root (#789) have no mount segment and are left
+/// unattributed until that router can state each route's API.
+///
 /// Examples:
 ///   `/edr/collections/weather/position`, `/edr/collections/{id}/position`
 ///     -> ("edr", Some("weather"), "position")
@@ -5489,22 +5503,31 @@ fn classify_route<'a>(
     uri_path: &'a str,
     matched: Option<&'a str>,
 ) -> (&'a str, Option<&'a str>, &'a str) {
-    let segs: Vec<&str> = uri_path.trim_matches('/').split('/').collect();
-    let api = match segs.first().copied() {
-        Some("edr") | Some("features") | Some("wms") | Some("maps") | Some("tiles") => segs[0],
-        _ => "",
-    };
+    let template = matched.unwrap_or(uri_path);
+    let template_segs: Vec<&str> = template.trim_matches('/').split('/').collect();
+    let uri_segs: Vec<&str> = uri_path.trim_matches('/').split('/').collect();
+    let api = template_segs
+        .first()
+        .copied()
+        .filter(|s| matches!(*s, "edr" | "features" | "wms" | "maps" | "tiles"))
+        .unwrap_or("");
 
-    let collection_id = if segs.get(1) == Some(&"collections") {
-        segs.get(2).copied().filter(|s| !s.is_empty())
-    } else {
-        None
+    // Unmatched requests have no template; take the segment after the first
+    // `collections` of the path itself.
+    let id_index = match matched {
+        Some(_) => template_segs.iter().position(|s| *s == "{id}"),
+        None => uri_segs
+            .iter()
+            .position(|s| *s == "collections")
+            .map(|i| i + 1),
     };
+    let collection_id = id_index
+        .and_then(|i| uri_segs.get(i).copied())
+        .filter(|s| !s.is_empty());
 
     // Derive the query/operation type from the matched route template,
     // falling back to the real URI path when no template is available.
     // For e.g. `/edr/collections/{id}/position` this yields "position".
-    let template = matched.unwrap_or(uri_path);
     let query_type = template
         .trim_matches('/')
         .rsplit('/')
@@ -6196,6 +6219,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cross_api_tileset_links_follow_the_tiles_registries() {
+        // A nowcast listing features + tiles renders only map tiles. Its
+        // Features view must not advertise a vector tileset (#789); Maps
+        // advertises the map tileset the Tiles service really serves.
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = ["wms", "maps", "tiles", "features"]
+            .map(String::from)
+            .to_vec();
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[tm35_source_collection("radar"), nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        assert!(result.tiles_state.map_engines.contains_key("nc"));
+        assert!(!result.tiles_state.feature_engines.contains_key("nc"));
+        assert!(result.features_state.engines.contains_key("nc"));
+        assert!(!result.features_state.vector_tileset_ids.contains("nc"));
+        assert!(result.maps_state.map_tileset_ids.contains("nc"));
+        // The source lists no tiles API, so Maps must not link to tiles for it.
+        assert!(!result.maps_state.map_tileset_ids.contains("radar"));
+    }
+
     // --- reload preserves the warm render caches (ReusableCaches) ---
 
     #[test]
@@ -6847,6 +6898,25 @@ mod tests {
         assert_eq!(api, "edr");
         assert_eq!(coll, Some("weather"));
         assert_eq!(qt, "position");
+    }
+
+    #[test]
+    fn classifies_collection_id_by_template_position_under_any_mount() {
+        let (api, coll, _) = classify_route(
+            "/proxy/maps/collections/radar/map",
+            Some("/proxy/maps/collections/{id}/map"),
+        );
+        assert_eq!(api, "");
+        assert_eq!(coll, Some("radar"));
+        assert_eq!(
+            classify_route("/collections/radar/map", Some("/collections/{id}/map")),
+            ("", Some("radar"), "map")
+        );
+        // A matched route without `{id}` names no collection.
+        assert_eq!(
+            classify_route("/maps/collections", Some("/maps/collections")).1,
+            None
+        );
     }
 
     #[test]

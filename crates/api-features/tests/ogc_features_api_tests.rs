@@ -161,6 +161,7 @@ fn build_router() -> axum::Router {
         collections,
         base_url: String::new(),
         trust_proxy_headers: false,
+        vector_tileset_ids: Default::default(),
     }));
     api_features::router(state)
 }
@@ -424,7 +425,11 @@ mod vector_tile_discovery {
     use super::*;
 
     fn build_router_with_tiles() -> axum::Router {
-        // Router seeded with a collection that advertises both Features and
+        api_features::router(build_state_with_tiles())
+    }
+
+    fn build_state_with_tiles() -> api_features::handlers::AppState {
+        // State seeded with a collection that advertises both Features and
         // Tiles, mirroring how server/admin.rs would wire a real geojson
         // collection that the operator opted into vector tiles for.
         let engine: Arc<dyn FeatureEngine> = Arc::new(MockFeatureEngine::new());
@@ -455,13 +460,13 @@ mod vector_tile_discovery {
                 preview: None,
             },
         );
-        let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
+        Arc::new(ArcSwap::from_pointee(FeaturesState {
             engines,
             collections,
             base_url: String::new(),
             trust_proxy_headers: false,
-        }));
-        api_features::router(state)
+            vector_tileset_ids: ["cities".to_string()].into(),
+        }))
     }
 
     async fn fetch(uri: &str) -> Value {
@@ -513,6 +518,28 @@ mod vector_tile_discovery {
         );
         assert!(!href.contains("WebMercatorQuad"));
         assert!(!href.contains("f=mvt"));
+    }
+
+    #[tokio::test]
+    async fn collection_omits_tileset_link_when_tiles_serves_no_vector_tiles() {
+        // `apis` lists tiles, but the Tiles service may only render map tiles
+        // for the collection (nowcast) or register other ids (per-site
+        // volumes). The link follows the vector-tile registry (#789).
+        let app = {
+            let mut state = (**build_state_with_tiles().load()).clone();
+            state.vector_tileset_ids.clear();
+            api_features::router(Arc::new(ArcSwap::from_pointee(state)))
+        };
+        let req = Request::builder()
+            .uri("/collections/cities")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["links"].as_array().unwrap().iter().any(|l| {
+            l["rel"].as_str() == Some("http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector")
+        }));
     }
 
     #[tokio::test]
@@ -930,6 +957,7 @@ mod metadata_extras {
             collections,
             base_url: String::new(),
             trust_proxy_headers: false,
+            vector_tileset_ids: Default::default(),
         }));
         api_features::router(state)
     }

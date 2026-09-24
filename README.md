@@ -293,6 +293,7 @@ The render semaphore (2× CPU cores, minimum 8) and rendered-image cache are sha
 /tiles/collections                             Tiles collection listing
 /tiles/collections/{id}                        Tiles collection detail
 /tiles/collections/{id}/tiles                  List tilesets for collection
+/tiles/collections/{id}/tiles/{tms}            Tileset metadata for one tiling scheme
 /tiles/collections/{id}/tiles/{tms}/{z}/{row}/{col}              Get tile (PNG/JPEG/WebP, or MVT via ?f=mvt)
 /tiles/collections/{id}/styles/{styleId}/tiles/{tms}/{z}/{row}/{col}  Get styled tile
 
@@ -1537,6 +1538,7 @@ Serves raster data via `MapEngine` (sharing styles, semaphore, and rendered-imag
 | `GET /tiles/tileMatrixSets/{tileMatrixSetId}` | Tiling scheme definition (matrices, CRS, scale denominators) |
 | `GET /tiles/collections/{id}` | Collection metadata (`dataType: map` or `vector`, TMS links, styles) |
 | `GET /tiles/collections/{id}/tiles` | List tilesets for a collection, including `tileMatrixSetLimits` per zoom |
+| `GET /tiles/collections/{id}/tiles/{tms}` | Tileset metadata for one tiling scheme: tiling-scheme link, templated tile links, limits (each list entry links here as `self`) |
 | `GET /tiles/collections/{id}/tiles/{tms}/{z}/{row}/{col}` | Get a tile (raster default, MVT via `?f=mvt`) |
 | `GET /tiles/collections/{id}/styles/{styleId}/tiles/{tms}/{z}/{row}/{col}` | Get a styled raster tile; `?f=mvt` is rejected here |
 

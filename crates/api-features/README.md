@@ -31,7 +31,10 @@ Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Base route:
 | Part 8 Sorting (draft) | partial | `sortby` implemented (#605 rule: validated against `FeatureEngine::sortables`, 400 naming the valid ones) but the class is not declared and no `/sortables` resource exists |
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
-Part 2 (collections, json, html). Collection discovery supports `bbox`,
+Part 2 (collections, json, html). The landing page links `/conformance` and
+`/collections` with both the short `conformance`/`data` relations this standard
+requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
+/ `…/data` relations Common Part 1 names. Collection discovery supports `bbox`,
 `bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `limit`, `offset` and `f` through
 [api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
 return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
@@ -61,7 +64,7 @@ imply a regular sampling grid.
 | `/features/api`, `/api/docs` | ✓ | OpenAPI 3.0 + Swagger UI |
 | `/features/conformance` | ✓ | JSON + HTML |
 | `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
-| `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the collection also lists `tiles` in `apis` |
+| `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the Tiles service registered the collection for vector tiles (listing `tiles` in `apis` is not enough: a nowcast renders only map tiles) |
 | `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
 | `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |

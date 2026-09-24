@@ -504,8 +504,11 @@ pub(crate) fn features_html(
     }
     body.push_str("</aside></div>");
     ui::Page {
-        base,
-        api: "features",
+        surface: ui::Surface {
+            base,
+            root: &format!("{base}{}", api_common::mounts::FEATURES),
+            api: "features",
+        },
         title: &page_title,
         json_url: &json_url,
     }

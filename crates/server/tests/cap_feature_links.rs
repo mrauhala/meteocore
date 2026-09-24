@@ -100,6 +100,7 @@ async fn cap_identifiers_round_trip_through_json_and_html_links() {
                 collections: HashMap::from([("cap".into(), config)]),
                 base_url: BASE.into(),
                 trust_proxy_headers: false,
+                vector_tileset_ids: Default::default(),
             },
         ))),
     );
