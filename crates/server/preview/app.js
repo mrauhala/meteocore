@@ -519,7 +519,7 @@
         // No `attribution`: MapLibre renders it via innerHTML.
         map.addSource(sourceId, {
             type: 'vector',
-            tiles: [vectorTileUrlFor(collection, currentTime(state))]
+            tiles: [vectorTileUrlFor(collection)]
         });
 
         const layerIds = [fillLayerId, lineLayerId, pointLayerId];
@@ -595,16 +595,13 @@
                     map.setLayoutProperty(id, 'visibility', v);
                 });
             },
-            refreshForTime: function () {
-                const src = map.getSource(sourceId);
-                if (src && typeof src.setTiles === 'function') {
-                    src.setTiles([vectorTileUrlFor(collection, currentTime(state))]);
-                }
-            }
+            // Vector tiles have no time axis: the server encodes the
+            // collection's current features and rejects `datetime`.
+            refreshForTime: function () {}
         };
     }
 
-    function vectorTileUrlFor(collection, time) {
+    function vectorTileUrlFor(collection) {
         let template = collection.tiles.vector.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
         template = template.replace('{tileMatrix}', '{z}');
@@ -614,15 +611,13 @@
         // page origin so 127.0.0.1↔localhost mismatch in `server.base_url`
         // doesn't trip CSP `connect-src 'self'`.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
-        template = window.location.origin + template;
-        return appendTimeParam(template, time);
+        return window.location.origin + template;
     }
 
     function appendTimeParam(template, time) {
         if (!time) return template;
-        // Bypass MapLibre's per-source HTTP cache for time changes by including
-        // the timestamp in the query string. Tile handler already honours the
-        // `datetime` query param at crates/api-tiles/src/handlers.rs:577.
+        // Map tiles honour `datetime`; including it also keys MapLibre's
+        // per-source HTTP cache by time. Vector tiles take no time.
         const sep = template.indexOf('?') === -1 ? '?' : '&';
         return template + sep + 'datetime=' + encodeURIComponent(time);
     }

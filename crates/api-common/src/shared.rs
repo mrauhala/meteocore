@@ -94,6 +94,8 @@ pub struct SharedApi {
     mount: &'static str,
     blocks: Vec<Arc<dyn BuildingBlock>>,
     related: Vec<RelatedLink>,
+    /// Common classes plus every block's, de-duplicated once.
+    conformance: Vec<&'static str>,
 }
 
 impl SharedApi {
@@ -104,25 +106,22 @@ impl SharedApi {
         related: Vec<RelatedLink>,
     ) -> Self {
         assert!(!blocks.is_empty(), "a shared OGC API root needs a block");
+        let mut conformance: Vec<&'static str> = crate::CONFORMANCE_CLASSES.to_vec();
+        for class in blocks.iter().flat_map(|b| b.conformance()) {
+            if !conformance.contains(class) {
+                conformance.push(class);
+            }
+        }
         Self {
             mount,
             blocks,
             related,
+            conformance,
         }
     }
 
     fn base(&self, headers: &HeaderMap) -> String {
         self.blocks[0].base_url(headers)
-    }
-
-    fn conformance_classes(&self) -> Vec<&'static str> {
-        let mut classes: Vec<&'static str> = crate::CONFORMANCE_CLASSES.to_vec();
-        for class in self.blocks.iter().flat_map(|b| b.conformance()) {
-            if !classes.contains(class) {
-                classes.push(class);
-            }
-        }
-        classes
     }
 }
 
@@ -277,7 +276,7 @@ async fn conformance(
         Ok(wanted) => wanted,
         Err(response) => return *response,
     };
-    let classes = api.conformance_classes();
+    let classes = &api.conformance;
     with_vary(match wanted {
         Wanted::Json => Json(json!({"conformsTo": classes})).into_response(),
         Wanted::Html => {
@@ -297,7 +296,7 @@ async fn conformance(
                     root,
                     api: WORKSPACE,
                 },
-                &classes,
+                classes,
                 &nav,
             ))
             .into_response()
@@ -438,7 +437,16 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
         first.bbox,
         first.time,
     );
+    // Discovery bounds follow the advertised extent: they come from the block
+    // whose `extent` is kept, so search never matches bounds the description
+    // does not show (api-common CLAUDE.md).
+    let mut has_extent = fields.contains_key("extent");
     for contribution in contributions {
+        if !has_extent && contribution.fields.contains_key("extent") {
+            bbox = contribution.bbox;
+            time = contribution.time;
+            has_extent = true;
+        }
         for (key, value) in contribution.fields {
             match fields.entry(key) {
                 Entry::Vacant(entry) => {
@@ -452,8 +460,6 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
             }
         }
         links.extend(contribution.links);
-        bbox = bbox.or(contribution.bbox);
-        time = time.or(contribution.time);
     }
     let mut all = vec![json!({
         "href": format!("{root}/collections/{}", config.id),
@@ -596,6 +602,24 @@ mod tests {
             bbox: None,
             time: None,
         }
+    }
+
+    #[test]
+    fn discovery_bounds_follow_the_advertised_extent() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let span = Some((t("2026-01-01T00:00:00Z"), t("2026-01-02T00:00:00Z")));
+        let mut maps = contribution("c", json!({"extent": {"spatial": {}}}), vec![]);
+        maps.bbox = Some([0.0, 0.0, 1.0, 1.0]);
+        let mut tiles = contribution("c", json!({"extent": {"temporal": {}}}), vec![]);
+        tiles.time = span;
+        let merged = merge(vec![maps, tiles], "https://x").unwrap();
+        assert_eq!(merged.time, None, "Maps' extent advertises no time");
+        assert_eq!(merged.bbox, Some([0.0, 0.0, 1.0, 1.0]));
+        // Without an extent of its own, the first block defers to the next.
+        let first = contribution("c", json!({}), vec![]);
+        let mut second = contribution("c", json!({"extent": {"temporal": {}}}), vec![]);
+        second.time = span;
+        assert_eq!(merge(vec![first, second], "https://x").unwrap().time, span);
     }
 
     #[test]

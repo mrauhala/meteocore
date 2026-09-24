@@ -86,19 +86,19 @@ impl BuildingBlock for TilesBlock {
         let state = self.state.load();
         let mut paths = handlers::tile_matrix_set_openapi_paths(mount);
         paths.extend(collection_openapi_paths(&state, mount));
-        OpenApiFragment {
-            paths,
-            components: match json!({"parameters": {
-                "datetime": {"name": "datetime", "in": "query", "required": false,
-                             "schema": {"type": "string"}, "description": "ISO 8601 timestamp"},
-                "elevation": {"name": "elevation", "in": "query", "required": false,
-                              "schema": {"type": "number"},
-                              "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."}
-            }}) {
-                Value::Object(components) => components,
-                _ => Map::new(),
-            },
-        }
+        // The shared layout references only these per-API components; its
+        // tile-format parameters are inline (they differ from Maps' `f`).
+        let per_api = handlers::openapi_components();
+        let parameters: Map<String, Value> = ["datetime", "elevation"]
+            .into_iter()
+            .filter_map(|name| {
+                let definition = per_api["parameters"].get(name)?.clone();
+                Some((name.to_owned(), definition))
+            })
+            .collect();
+        let mut components = Map::new();
+        components.insert("parameters".into(), Value::Object(parameters));
+        OpenApiFragment { paths, components }
     }
 
     fn routes(&self) -> Router {
