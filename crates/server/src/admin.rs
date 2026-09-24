@@ -5468,15 +5468,15 @@ pub async fn metrics_middleware(
     // acceptable — no handler in this codebase streams.
     if let Some(len) = http_body::Body::size_hint(response.body()).exact() {
         HTTP_RESPONSE_BYTES
-            .with_label_values(&[&method, &path, api])
+            .with_label_values(&[method.as_str(), path.as_str(), api])
             .inc_by(len);
     }
 
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&[&method, &path, &status, api])
+        .with_label_values(&[method.as_str(), path.as_str(), status.as_str(), api])
         .inc();
     HTTP_REQUEST_DURATION
-        .with_label_values(&[&method, &path, api])
+        .with_label_values(&[method.as_str(), path.as_str(), api])
         .observe(duration);
 
     response
