@@ -5476,10 +5476,19 @@ pub async fn metrics_middleware(
 /// Derive (api, collection_id, query_type) from a real URI path and the
 /// matched route template.
 ///
+/// The API comes from the template, not the first URI segment: a per-API
+/// mount (`/edr/…`, `/maps/…`) names it directly, while shared-root OGC API
+/// routes (#789) are attributed by their resource path below
+/// `/collections/{id}`. The collection id is read from the URI at the
+/// position of `{id}` in the template, so it does not depend on the mount.
+///
 /// Examples:
 ///   `/edr/collections/weather/position`, `/edr/collections/{id}/position`
 ///     -> ("edr", Some("weather"), "position")
 ///   `/tiles/collections/radar/tiles/WebMercatorQuad/5/10/20`
+///     -> ("tiles", Some("radar"), "tiles")
+///   `/collections/radar/map/tiles/WebMercatorQuad/5/10/20`,
+///   `/collections/{id}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}`
 ///     -> ("tiles", Some("radar"), "tiles")
 ///   `/features/collections/roads/items/42`
 ///     -> ("features", Some("roads"), "items")
@@ -5489,22 +5498,31 @@ fn classify_route<'a>(
     uri_path: &'a str,
     matched: Option<&'a str>,
 ) -> (&'a str, Option<&'a str>, &'a str) {
-    let segs: Vec<&str> = uri_path.trim_matches('/').split('/').collect();
-    let api = match segs.first().copied() {
-        Some("edr") | Some("features") | Some("wms") | Some("maps") | Some("tiles") => segs[0],
+    let template = matched.unwrap_or(uri_path);
+    let template_segs: Vec<&str> = template.trim_matches('/').split('/').collect();
+    let uri_segs: Vec<&str> = uri_path.trim_matches('/').split('/').collect();
+    let api = match template_segs.first().copied() {
+        Some(api @ ("edr" | "features" | "wms" | "maps" | "tiles")) => api,
+        Some("collections" | "tileMatrixSets") => shared_root_api(&template_segs),
         _ => "",
     };
 
-    let collection_id = if segs.get(1) == Some(&"collections") {
-        segs.get(2).copied().filter(|s| !s.is_empty())
-    } else {
-        None
+    // Unmatched requests have no template; take the segment after the first
+    // `collections` of the path itself.
+    let id_index = match matched {
+        Some(_) => template_segs.iter().position(|s| *s == "{id}"),
+        None => uri_segs
+            .iter()
+            .position(|s| *s == "collections")
+            .map(|i| i + 1),
     };
+    let collection_id = id_index
+        .and_then(|i| uri_segs.get(i).copied())
+        .filter(|s| !s.is_empty());
 
     // Derive the query/operation type from the matched route template,
     // falling back to the real URI path when no template is available.
     // For e.g. `/edr/collections/{id}/position` this yields "position".
-    let template = matched.unwrap_or(uri_path);
     let query_type = template
         .trim_matches('/')
         .rsplit('/')
@@ -5512,6 +5530,41 @@ fn classify_route<'a>(
         .unwrap_or("");
 
     (api, collection_id, query_type)
+}
+
+/// The API owning a shared-root route template (no per-API mount segment),
+/// from its resource path. Common discovery resources belong to no single API.
+fn shared_root_api(template_segs: &[&str]) -> &'static str {
+    if template_segs.first() == Some(&"tileMatrixSets") {
+        return "tiles";
+    }
+    let resource = template_segs
+        .iter()
+        .position(|s| *s == "{id}")
+        .map_or(&[][..], |i| &template_segs[i + 1..]);
+    if resource.contains(&"tiles") {
+        "tiles"
+    } else if resource.contains(&"items") {
+        "features"
+    } else if resource.contains(&"map") || resource.first() == Some(&"styles") {
+        "maps"
+    } else if resource.iter().any(|s| {
+        matches!(
+            *s,
+            "position"
+                | "area"
+                | "radius"
+                | "trajectory"
+                | "cube"
+                | "corridor"
+                | "locations"
+                | "instances"
+        )
+    }) {
+        "edr"
+    } else {
+        ""
+    }
 }
 
 /// Request ID attached to an incoming request via extensions so that
@@ -6847,6 +6900,97 @@ mod tests {
         assert_eq!(api, "edr");
         assert_eq!(coll, Some("weather"));
         assert_eq!(qt, "position");
+    }
+
+    #[test]
+    fn classifies_shared_root_routes_by_resource() {
+        for (uri, template, api, coll, qt) in [
+            (
+                "/collections/radar/map/tiles/WebMercatorQuad/5/10/20",
+                "/collections/{id}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
+                "tiles",
+                Some("radar"),
+                "tiles",
+            ),
+            (
+                "/collections/radar/styles/rain/map/tiles/WebMercatorQuad",
+                "/collections/{id}/styles/{styleId}/map/tiles/{tileMatrixSetId}",
+                "tiles",
+                Some("radar"),
+                "tiles",
+            ),
+            (
+                "/collections/roads/tiles/WebMercatorQuad/5/10/20",
+                "/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
+                "tiles",
+                Some("roads"),
+                "tiles",
+            ),
+            (
+                "/collections/radar/styles/rain/map",
+                "/collections/{id}/styles/{styleId}/map",
+                "maps",
+                Some("radar"),
+                "map",
+            ),
+            (
+                "/collections/radar/styles/rain/legend",
+                "/collections/{id}/styles/{styleId}/legend",
+                "maps",
+                Some("radar"),
+                "legend",
+            ),
+            (
+                "/collections/roads/items/42",
+                "/collections/{id}/items/{featureId}",
+                "features",
+                Some("roads"),
+                "items",
+            ),
+            (
+                "/collections/weather/position",
+                "/collections/{id}/position",
+                "edr",
+                Some("weather"),
+                "position",
+            ),
+            (
+                "/collections/radar",
+                "/collections/{id}",
+                "",
+                Some("radar"),
+                "collections",
+            ),
+            (
+                "/tileMatrixSets/WebMercatorQuad",
+                "/tileMatrixSets/{tileMatrixSetId}",
+                "tiles",
+                None,
+                "tileMatrixSets",
+            ),
+            ("/conformance", "/conformance", "", None, "conformance"),
+        ] {
+            assert_eq!(
+                classify_route(uri, Some(template)),
+                (api, coll, qt),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_collection_id_by_template_position_under_any_mount() {
+        let (api, coll, _) = classify_route(
+            "/proxy/maps/collections/radar/map",
+            Some("/proxy/maps/collections/{id}/map"),
+        );
+        assert_eq!(api, "");
+        assert_eq!(coll, Some("radar"));
+        // A matched route without `{id}` names no collection.
+        assert_eq!(
+            classify_route("/maps/collections", Some("/maps/collections")).1,
+            None
+        );
     }
 
     #[test]
