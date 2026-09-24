@@ -25,9 +25,11 @@ use tower::ServiceExt;
 
 #[path = "common_discovery/schema.rs"]
 mod schema;
+#[path = "common_discovery/tms.rs"]
+mod tms;
 
 const BASE: &str = "https://example.test/base";
-const SURFACES: &[&str] = &["edr", "maps", "tiles", "vector-tiles", "features"];
+const SURFACES: &[&str] = &["edr", "maps", "tiles", "vector-tiles", "features", "shared"];
 const FILTERS: &str =
     "bbox=20,60,30,70&bbox-crs=CRS84&datetime=2024-01-01T00%3A30%3A00Z&q=RaDaR%20%26%20hail&query=%2Bweather%20-wind";
 
@@ -235,7 +237,30 @@ fn tiles_state(
     }))
 }
 
+/// The shared OGC API root (#789) with the Maps and Tiles blocks, mounted
+/// at the server root below the proxy prefix.
+fn shared_api() -> api_common::shared::SharedApi {
+    let (configs, _, maps, features) = catalog();
+    api_common::shared::SharedApi::new(
+        "",
+        vec![
+            Arc::new(api_maps::MapsBlock::new(maps_state(
+                configs.clone(),
+                maps.clone(),
+            ))),
+            Arc::new(api_tiles::TilesBlock::new(tiles_state(
+                configs, maps, features, false,
+            ))),
+        ],
+        vec![],
+    )
+}
+
 fn app(surface: &str) -> (Router, String) {
+    if surface == "shared" {
+        let router = api_common::shared::router(shared_api());
+        return (Router::new().nest("/base", router), "/base".into());
+    }
     let api = if surface == "vector-tiles" {
         "tiles"
     } else {
@@ -860,5 +885,226 @@ async fn relocated_maps_and_tiles_advertise_only_resolvable_links_on_their_mount
                 .all(|path| path.starts_with(mount)),
             "{mount}: OpenAPI paths must include the mount"
         );
+    }
+}
+
+/// The server trims trailing slashes before routing; so does a crawl.
+fn routable(url: &str) -> String {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let path = path.trim_end_matches('/');
+    if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    }
+}
+
+/// Follow every advertised JSON link below `BASE` from `start`, returning each
+/// visited URL with its document. Every link must resolve.
+async fn crawl(app: &Router, start: &str) -> Vec<(String, Value)> {
+    let mut queue = vec![start.to_owned()];
+    let mut seen = std::collections::HashSet::new();
+    let mut visited = Vec::new();
+    while let Some(url) = queue.pop() {
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        let doc = get_json(app, &routable(&url)).await;
+        let mut links = Vec::new();
+        json_links(&doc, &mut links);
+        queue.extend(links);
+        visited.push((url, doc));
+    }
+    visited
+}
+
+/// Common Part 2 §6.2 and #789: one landing page, conformance declaration,
+/// OpenAPI document and catalog, each collection advertising every access
+/// mechanism its blocks serve — map, map tilesets (Tiles Table 8
+/// `…/map/tiles`) and vector tilesets (`…/tiles`).
+#[tokio::test]
+async fn shared_root_composes_maps_and_tiles_over_one_catalog() {
+    let (app, prefix) = app("shared");
+    let landing = get_json(&app, &prefix).await;
+    for (short, registered, target) in [
+        ("conformance", api_common::rel::CONFORMANCE, "/conformance"),
+        ("data", api_common::rel::DATA, "/collections"),
+        (
+            "tiling-schemes",
+            api_common::rel::TILING_SCHEMES,
+            "/tileMatrixSets",
+        ),
+    ] {
+        assert_eq!(link(&landing, short), format!("{BASE}{target}"));
+        assert_eq!(link(&landing, short), link(&landing, registered));
+    }
+    assert_eq!(link(&landing, "service-desc"), format!("{BASE}/api"));
+    let classes = get_json(&app, &format!("{prefix}/conformance")).await["conformsTo"].clone();
+    for class in [
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
+        "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets",
+        "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt",
+    ] {
+        assert!(
+            classes.as_array().unwrap().iter().any(|c| c == class),
+            "{class}"
+        );
+    }
+    let doc = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+    assert_eq!(link(&doc, "self"), format!("{BASE}/collections/c-match"));
+    assert_eq!(
+        link(&doc, api_common::rel::MAP),
+        format!("{BASE}/collections/c-match/map")
+    );
+    assert_eq!(
+        link(&doc, api_common::rel::TILESETS_MAP),
+        format!("{BASE}/collections/c-match/map/tiles")
+    );
+    assert_eq!(
+        link(&doc, api_common::rel::TILESETS_VECTOR),
+        format!("{BASE}/collections/c-match/tiles")
+    );
+    // Maps describes the fields it shares with Tiles (first block wins).
+    assert!(doc["crs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "http://www.opengis.net/def/crs/EPSG/0/3067"));
+    assert!(doc.get("tileMatrixSetLinks").is_none());
+    let (status, _, _) = get(&app, &format!("{prefix}/collections/nope"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Common metadata is cacheable and revalidates (matrix note [3] fixed here).
+    let (_, headers, _) = get(&app, &format!("{prefix}/collections"), None).await;
+    let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+    assert!(headers.contains_key(header::CACHE_CONTROL));
+    let revalidated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{prefix}/collections"))
+                .header(header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    // The HTML workspace belongs to the shared root, with one root crumb.
+    let (_, _, html) = get(&app, &format!("{prefix}/collections/c-match?f=html"), None).await;
+    assert!(html.contains("id=\"map-controls\""));
+    assert!(html.contains(&format!("href=\"{BASE}/api/docs\">Map request parameters")));
+    let crumbs = html.split("id=\"breadcrumbs\"").nth(1).unwrap();
+    let crumbs = crumbs.split("</nav>").next().unwrap();
+    assert_eq!(
+        crumbs.matches(&format!("href=\"{BASE}/?f=html\"")).count(),
+        1
+    );
+}
+
+/// Every link the shared root advertises resolves; every tileset (list entry
+/// or resource) validates against the pinned TMS 2.0 tileset schema and names
+/// its own `self` resource, and every tiling scheme validates as a TMS.
+#[tokio::test]
+async fn shared_root_links_resolve_and_tilesets_validate_against_tms_2() {
+    let (app, _) = app("shared");
+    let visited = crawl(&app, &format!("{BASE}/")).await;
+    let mut tilesets = 0;
+    for (url, doc) in &visited {
+        assert!(url.starts_with(BASE), "{url}");
+        let entries: Vec<&Value> = match doc.get("tilesets") {
+            Some(list) => list.as_array().unwrap().iter().collect(),
+            None if doc.get("dataType").is_some() && doc.get("tileMatrixSetURI").is_some() => {
+                vec![doc]
+            }
+            None => vec![],
+        };
+        for tileset in entries {
+            tms::assert_tileset(tileset, url);
+            assert!(
+                tileset["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l["rel"] == "self"),
+                "{url}: shared-root tilesets each have their own resource"
+            );
+            tilesets += 1;
+        }
+        if url.contains("/tileMatrixSets/") {
+            tms::assert_tile_matrix_set(doc, url);
+        }
+    }
+    // Map, styled-map-free fixture: 6 collections × (map + vector lists and
+    // resources) × 2 tiling schemes.
+    assert!(
+        tilesets >= 6 * 2 * 2 * 2,
+        "crawl reached {tilesets} tilesets"
+    );
+    // Negative control: the validator is not vacuous.
+    assert!(!tms::is_valid_tileset(&json!({"dataType": "map"})));
+}
+
+/// Per-API Tiles tilesets satisfy the same TMS 2.0 schema.
+#[tokio::test]
+async fn per_api_tilesets_validate_against_tms_2() {
+    for surface in ["tiles", "vector-tiles"] {
+        let (app, prefix) = app(surface);
+        let list = get_json(&app, &format!("{prefix}/collections/c-match/tiles")).await;
+        for tileset in list["tilesets"].as_array().unwrap() {
+            tms::assert_tileset(tileset, surface);
+        }
+        let tms = get_json(&app, &format!("{prefix}/tileMatrixSets/WebMercatorQuad")).await;
+        tms::assert_tile_matrix_set(&tms, surface);
+    }
+}
+
+/// The shared OpenAPI document is valid OpenAPI 3.0, its operation ids are
+/// unique, and blocks agree on every component they both define (the
+/// composer keeps the first).
+#[tokio::test]
+async fn shared_openapi_is_valid_and_blocks_agree_on_shared_components() {
+    let (app, prefix) = app("shared");
+    let doc = get_json(&app, &format!("{prefix}/api")).await;
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
+    let validator = jsonschema::Validator::new(&schema).unwrap();
+    let errors: Vec<_> = validator
+        .iter_errors(&doc)
+        .map(|e| format!("{e} at {}", e.instance_path()))
+        .collect();
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let mut ids = std::collections::HashSet::new();
+    for item in doc["paths"].as_object().unwrap().values() {
+        for operation in item.as_object().unwrap().values() {
+            let id = operation["operationId"].as_str().unwrap();
+            assert!(ids.insert(id.to_owned()), "duplicate operationId {id}");
+        }
+    }
+    for path in [
+        "/collections/c-match/map",
+        "/collections/c-match/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
+        "/collections/c-match/styles/{styleId}/map/tiles",
+        "/collections/c-match/tiles/{tileMatrixSetId}",
+        "/tileMatrixSets/{tileMatrixSetId}",
+        "/collections/{collectionId}",
+    ] {
+        assert!(doc["paths"].get(path).is_some(), "{path}");
+    }
+    use api_common::shared::BuildingBlock;
+    let (configs, _, maps, features) = catalog();
+    let maps_fragment =
+        api_maps::MapsBlock::new(maps_state(configs.clone(), maps.clone())).openapi("");
+    let tiles_fragment =
+        api_tiles::TilesBlock::new(tiles_state(configs, maps, features, false)).openapi("");
+    for (section, entries) in &tiles_fragment.components {
+        for (name, definition) in entries.as_object().unwrap() {
+            if let Some(existing) = maps_fragment
+                .components
+                .get(section)
+                .and_then(|m| m.get(name))
+            {
+                assert_eq!(existing, definition, "{section}/{name} differs");
+            }
+        }
     }
 }
