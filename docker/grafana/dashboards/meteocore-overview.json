@@ -457,34 +457,9 @@
           "legendFormat": "total"
         },
         {
-          "expr": "sum(rate(http_requests_total{path=~\"/wms.*\"}[5m]))",
+          "expr": "sum by (api) (rate(http_requests_total{api!=\"\"}[5m]))",
           "refId": "B",
-          "legendFormat": "wms"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/tiles.*\"}[5m]))",
-          "refId": "C",
-          "legendFormat": "tiles"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/maps.*\"}[5m]))",
-          "refId": "D",
-          "legendFormat": "maps"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/edr.*\"}[5m]))",
-          "refId": "E",
-          "legendFormat": "edr"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/features.*\"}[5m]))",
-          "refId": "F",
-          "legendFormat": "features"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/3dtiles.*\"}[5m]))",
-          "refId": "G",
-          "legendFormat": "3dtiles"
+          "legendFormat": "{{api}}"
         }
       ]
     },
@@ -635,29 +610,9 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/wms.*\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, api) (rate(http_request_duration_seconds_bucket{api!=\"\"}[5m])))",
           "refId": "A",
-          "legendFormat": "wms"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/tiles.*\"}[5m])))",
-          "refId": "B",
-          "legendFormat": "tiles"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/edr.*\"}[5m])))",
-          "refId": "C",
-          "legendFormat": "edr"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/features.*\"}[5m])))",
-          "refId": "D",
-          "legendFormat": "features"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/3dtiles.*\"}[5m])))",
-          "refId": "E",
-          "legendFormat": "3dtiles"
+          "legendFormat": "{{api}}"
         }
       ]
     },
@@ -1640,24 +1595,9 @@
           "legendFormat": "total"
         },
         {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/wms.*\"}[5m]))",
+          "expr": "sum by (api) (rate(http_response_bytes_total{api!=\"\"}[5m]))",
           "refId": "B",
-          "legendFormat": "wms"
-        },
-        {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/tiles.*\"}[5m]))",
-          "refId": "C",
-          "legendFormat": "tiles"
-        },
-        {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/edr.*\"}[5m]))",
-          "refId": "D",
-          "legendFormat": "edr"
-        },
-        {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/3dtiles.*\"}[5m]))",
-          "refId": "E",
-          "legendFormat": "3dtiles"
+          "legendFormat": "{{api}}"
         }
       ]
     },

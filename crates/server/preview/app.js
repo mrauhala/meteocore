@@ -482,14 +482,14 @@
     }
 
     // Convert an OGC API Tiles URL template
-    //   /tiles/.../{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
+    //   /collections/{id}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
     // into the form MapLibre raster sources understand
-    //   /tiles/.../WebMercatorQuad/{z}/{y}/{x}
+    //   /collections/{id}/map/tiles/WebMercatorQuad/{z}/{y}/{x}
     // Placeholder names come from the axum route (see preview.rs), not from
     // the generic `{tms}`/`{z}` which the server would reject.
     function tileUrlFor(collection, styleId, time, parameter) {
         const raster = collection.tiles.raster;
-        // 'default' style uses the plain /tiles/... route, not /styles/default/...
+        // 'default' style uses the plain …/map/tiles route, not /styles/default/...
         const useStyled = styleId && styleId !== 'default' && raster.styled_url_template;
         let template = useStyled ? raster.styled_url_template : raster.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');

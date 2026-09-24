@@ -699,8 +699,10 @@ fn serialize_temporal(
     Value::Object(obj)
 }
 
-// Template placeholders match the axum route variables registered by
-// api-tiles (`/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}`).
+// Templates target the shared OGC API root (#789): map tiles under
+// `/collections/{id}/map/tiles/…`, vector tiles (MVT) under
+// `/collections/{id}/tiles/…`. Placeholders match the axum route variables
+// (`{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}`).
 // Using `{tms}` and `{z}` here would yield a path that the server rejects
 // with a 404 — even though the URL looks "tile-shaped" it doesn't match
 // the registered route names.
@@ -708,7 +710,7 @@ fn vector_tile_descriptor(id: &str, base_url: &str) -> Value {
     json!({
         "tile_matrix_sets": ["WebMercatorQuad", "WorldCRS84Quad"],
         "url_template": format!(
-            "{base_url}/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt"
+            "{base_url}/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
         ),
         "media_type": "application/vnd.mapbox-vector-tile"
     })
@@ -722,7 +724,7 @@ fn raster_tile_descriptor(
     let mut desc = json!({
         "tile_matrix_sets": ["WebMercatorQuad", "WorldCRS84Quad"],
         "url_template": format!(
-            "{base_url}/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+            "{base_url}/collections/{id}/map/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
         ),
         "media_type": "image/png"
     });
@@ -750,7 +752,7 @@ fn raster_tile_descriptor(
         {
             desc["default_style"] = json!(default_style);
             desc["styled_url_template"] = json!(format!(
-                "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+                "{base_url}/collections/{id}/styles/{{styleId}}/map/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
             ));
         }
     }
@@ -1198,7 +1200,7 @@ mod tests {
         let radar = by_id["radar"];
         let raster_url = radar["tiles"]["raster"]["url_template"].as_str().unwrap();
         assert!(
-            raster_url.starts_with("https://api.example.com/tiles/collections/radar/tiles/"),
+            raster_url.starts_with("https://api.example.com/collections/radar/map/tiles/"),
             "raster url_template must carry the absolute base, got: {raster_url}"
         );
         assert!(
@@ -1215,20 +1217,23 @@ mod tests {
         assert!(radar["tiles"]["raster"].get("default_style").is_none());
         assert!(radar["tiles"].get("vector").is_none());
 
-        // Vector-only collection: tiles.vector present with ?f=mvt; tiles.raster absent.
+        // Vector-only collection: tiles.vector present (MVT path); tiles.raster absent.
         let stations = by_id["stations"];
         let vector_url = stations["tiles"]["vector"]["url_template"]
             .as_str()
             .unwrap();
         assert!(
-            vector_url.starts_with("https://api.example.com/tiles/collections/stations/tiles/"),
+            vector_url.starts_with("https://api.example.com/collections/stations/tiles/"),
             "vector url_template must carry the absolute base, got: {vector_url}"
         );
         assert!(
             vector_url.contains("{tileMatrixSetId}") && vector_url.contains("{tileMatrix}"),
             "vector url_template must use the axum route's placeholder names, got: {vector_url}"
         );
-        assert!(vector_url.contains("f=mvt"));
+        assert!(
+            !vector_url.contains('?'),
+            "shared-root vector tiles need no ?f=mvt"
+        );
         assert!(stations["tiles"].get("raster").is_none());
     }
 
@@ -1284,7 +1289,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            url.starts_with("https://radar.example.com/tiles/collections/radar/tiles/"),
+            url.starts_with("https://radar.example.com/collections/radar/map/tiles/"),
             "manifest tile URL must use the proxy host, got: {url}"
         );
     }
