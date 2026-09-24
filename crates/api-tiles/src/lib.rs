@@ -34,6 +34,10 @@ pub fn router_at(state: AppState, mount: &'static str) -> Router {
             get(handlers::collection_tilesets),
         )
         .route(
+            "/collections/{id}/tiles/{tileMatrixSetId}",
+            get(handlers::collection_tileset),
+        )
+        .route(
             "/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
             get(handlers::get_tile),
         )

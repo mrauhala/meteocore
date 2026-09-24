@@ -364,6 +364,17 @@ mod conformance {
     }
 
     #[tokio::test]
+    async fn declares_geodata_tilesets() {
+        // Collections link their `…/tiles` list with a registered
+        // `tilesets-*` relation (Req 13) and the list resolves (Req 14).
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(classes
+            .iter()
+            .any(|c| c == "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets"));
+    }
+
+    #[tokio::test]
     async fn declares_mvt() {
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
@@ -2644,6 +2655,73 @@ async fn exhausted_memory_budget_rejects_uncached_tile() {
     );
     assert_eq!(ds_executor::budget::RENDER_MEMORY.available(), 0);
     assert_eq!(ds_executor::budget::RENDER_MEMORY.rejected(), 1);
+}
+
+/// Tiles Req 10 B / abstract test A.9: each tileset list entry links to its
+/// full tileset resource at `…/tiles/{tileMatrixSetId}`, which resolves to
+/// Req 8 metadata (tiling scheme, templated tile links).
+#[tokio::test]
+async fn tileset_list_entries_link_to_resolvable_tileset_resources() {
+    let (status, list) = get("/collections/radar/tiles").await;
+    assert_eq!(status, StatusCode::OK);
+    let tilesets = list["tilesets"].as_array().unwrap();
+    assert_eq!(
+        tilesets.len(),
+        api_tiles::tilematrixset::SUPPORTED_TILE_MATRIX_SETS.len()
+    );
+    for entry in tilesets {
+        let tms_id = entry["tileMatrixSetURI"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let self_href = entry["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "self")
+            .expect("tileset list entries need a self link")["href"]
+            .as_str()
+            .unwrap();
+        // The fixture's base URL is empty and the router is not nested.
+        let path = self_href.strip_prefix("/tiles").unwrap();
+        assert_eq!(path, format!("/collections/radar/tiles/{tms_id}"));
+        assert!(entry["title"].as_str().is_some_and(|t| t.contains("Radar")));
+        let (status, tileset) = get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(tileset["dataType"], "map");
+        assert_eq!(tileset["crs"], entry["crs"]);
+        assert_eq!(tileset["tileMatrixSetURI"], entry["tileMatrixSetURI"]);
+        let links = tileset["links"].as_array().unwrap();
+        assert!(links
+            .iter()
+            .any(|l| l["rel"] == api_common::rel::TILING_SCHEME
+                && l["href"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/tileMatrixSets/{tms_id}"))));
+        // Req 8 E–G; NOTE 2 forbids a {tileMatrixSetId} template variable.
+        let item = links
+            .iter()
+            .find(|l| l["rel"] == "item")
+            .expect("tileset needs a templated tile link");
+        assert_eq!(item["templated"], true);
+        let template = item["href"].as_str().unwrap();
+        assert!(template.ends_with(&format!(
+            "/collections/radar/tiles/{tms_id}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+        )));
+    }
+    let (status, _) = get("/collections/radar/tiles/NotATileMatrixSet").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get("/collections/nonexistent/tiles/WebMercatorQuad").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, api) = get("/api").await;
+    let paths = api["paths"].as_object().unwrap();
+    assert!(paths.contains_key("/tiles/collections/radar/tiles/{tileMatrixSetId}"));
+    assert!(paths.contains_key(
+        "/tiles/collections/radar/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"
+    ));
 }
 
 /// Tiles Req 13 (geodata-tilesets): the collection names its tileset list
