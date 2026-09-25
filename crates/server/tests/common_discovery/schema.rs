@@ -124,6 +124,80 @@ pub fn assert_valid(path: &str, body: &Value, context: &str) {
     }
 }
 
+/// The pinned bundles' `extent` also accepts any object through a general
+/// extension branch, so a dimension that breaks the Uniform Additional
+/// Dimensions rules still passes `assert_valid`. Validate every extent member
+/// besides `spatial`/`temporal` against the UAD dimension schema itself, as a
+/// UAD-aware validator does.
+static DIMENSIONS: LazyLock<Vec<(u8, Validator)>> = LazyLock::new(|| {
+    BUNDLES
+        .iter()
+        .map(|&(part, source)| {
+            let bundle: Value = serde_json::from_str(source).expect("pinned Common bundle parses");
+            let dimension = bundle
+                .pointer("/components/schemas/extent/allOf/1/anyOf/1/additionalProperties")
+                .expect("UAD dimension schema")
+                .clone();
+            let mut schema = json!({
+                "allOf": [dimension],
+                "components": {"schemas": bundle["components"]["schemas"]},
+            });
+            normalize_nullable(&mut schema);
+            check_local_refs(&schema, &schema);
+            let validator = jsonschema::options()
+                .with_draft(Draft::Draft4)
+                .build(&schema)
+                .unwrap_or_else(|error| panic!("Part {part} UAD dimension: {error}"));
+            (part, validator)
+        })
+        .collect()
+});
+
+pub fn assert_dimensions_valid(collection: &Value, context: &str) {
+    let Some(extent) = collection["extent"].as_object() else {
+        return;
+    };
+    for (name, dimension) in extent {
+        if name == "spatial" || name == "temporal" {
+            continue;
+        }
+        for (part, validator) in DIMENSIONS.iter() {
+            let errors: Vec<_> = validator
+                .iter_errors(dimension)
+                .map(|error| format!("{} at {}", error, error.instance_path()))
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "Common Part {part} UAD {context} extent.{name}:\n{}",
+                errors.join("\n")
+            );
+        }
+    }
+    for bbox in collection["extent"]["spatial"]["bbox"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let b: Vec<f64> = bbox
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let (lons, lats) = if b.len() == 6 {
+            ([b[0], b[3]], [b[1], b[4]])
+        } else {
+            ([b[0], b[2]], [b[1], b[3]])
+        };
+        assert!(
+            lons.iter().all(|x| (-180.0..=180.0).contains(x))
+                && lats.iter().all(|y| (-90.0..=90.0).contains(y))
+                && lats[0] <= lats[1],
+            "{context}: bbox {b:?} outside the CRS84 domain"
+        );
+    }
+}
+
 pub fn assert_invalid(path: &str, body: &Value, context: &str) {
     for schemas in SCHEMAS.iter() {
         assert!(

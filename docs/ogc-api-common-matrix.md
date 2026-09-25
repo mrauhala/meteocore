@@ -113,7 +113,7 @@ collection.
 | Native CRS metadata (`storageCrs`) | No | Partial — known CRS URI only | Partial — known raster CRS URI only | Yes — CRS84 |
 | Native spatial bounds (`storageCrsBbox`) | No | No [6] | No [6] | N/A — storage and extent both CRS84 |
 | Scale/cell-size suitability metadata (`minScaleDenominator`, `maxScaleDenominator`, `minCellSize`, `maxCellSize`) | No | No | No | No |
-| Vertical extent information | Partial — EDR-specific representation [7] | Partial — levels/unit/grid [7] | Partial — raster levels/unit/grid [7] | No |
+| Vertical extent information | Partial — EDR-specific representation [7] | Yes — interval/vrs/unit/levels grid [7] | Yes — raster interval/vrs/unit/levels grid [7] | No |
 | Uniform Additional Dimensions class (§8) | No — EDR extent model [7] | Partial — no full class support [7] | Partial — no full class support [7] | No |
 | Regular spatial grid description (§8.2) | No Common grid descriptor | Partial — geographic grids only | Partial — geographic raster grids only | N/A — feature data |
 | Regular/irregular temporal grid description (§8.2) | No — EDR `temporal.values` instead | Yes — available raster time series | Partial — raster only | No — intervals only [5] |
@@ -183,8 +183,12 @@ collection.
    This deserves both an implementation fix and a standards wording review.
 7. EDR intentionally retains its own string-valued vertical and timestep metadata
    for EDR 1.1. Maps/Tiles emit numeric vertical intervals, units and coordinates,
-   but lack a semantic `definition`/`vrs` and vertical grid `cellsCount` required
-   by the current uniform-dimensions class. Geographic spatial and raster temporal
+   with the dimension's `vrs` (a registered URI, or inline WKT2 as EDR uses) and a
+   vertical irregular grid with `cellsCount`, so each additional dimension
+   validates against the uniform-dimensions schema (2026-09-25; the contract
+   suite checks it strictly, since the bundle's extension branch accepts any
+   object). Advertised bboxes are normalized to the CRS84 domain on every API,
+   and an extent describing no area is omitted. Geographic spatial and raster temporal
    grid descriptors exist. Regular temporal grids identify their first timestamp;
    spatial grids use the schema's nullable `firstCoordinate` because sample
    registration and axis direction are unknown. Projected spatial grids and

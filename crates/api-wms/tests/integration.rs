@@ -1362,6 +1362,82 @@ fn site_collection_config(id: &str) -> CollectionConfig {
     }
 }
 
+/// Mock engine advertising a fixed spatial extent, for the capabilities bbox.
+struct ExtentMockMapEngine([f64; 4]);
+
+impl MapEngine for ExtentMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![None; (width * height) as usize].into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: Some(self.0),
+            times: Vec::new(),
+            parameter: "t2m".into(),
+            unit: "K".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        }
+    }
+}
+
+/// The WMS 1.3.0 schema bounds `EX_GeographicBoundingBox` to ±180°/±90°. A
+/// global 0.25° grid's cell edges reach past both and become the whole globe;
+/// an extent that is still the empty-accumulator sentinel emits no box at all
+/// rather than ±1.8e308.
+#[test]
+fn capabilities_bbox_stays_in_the_crs84_domain() {
+    let capabilities = |extent: [f64; 4]| {
+        let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+        engines.insert("grid".to_string(), Arc::new(ExtentMockMapEngine(extent)));
+        let collections = HashMap::from([("grid".to_string(), site_collection_config("grid"))]);
+        let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+        let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+        String::from_utf8(xml).expect("capabilities XML is UTF-8")
+    };
+
+    let xml = capabilities([-180.125, -90.125, 179.875, 90.125]);
+    for element in [
+        "<westBoundLongitude>-180.000000</westBoundLongitude>",
+        "<eastBoundLongitude>180.000000</eastBoundLongitude>",
+        "<southBoundLatitude>-90.000000</southBoundLatitude>",
+        "<northBoundLatitude>90.000000</northBoundLatitude>",
+    ] {
+        assert!(xml.contains(element), "missing {element}; got:\n{xml}");
+    }
+    assert!(
+        xml.contains(
+            r#"<BoundingBox CRS="CRS:84" minx="-180.000000" miny="-90.000000" maxx="180.000000" maxy="90.000000"/>"#
+        ),
+        "CRS:84 BoundingBox must match; got:\n{xml}"
+    );
+
+    let xml = capabilities([f64::MAX, f64::MAX, f64::MIN, f64::MIN]);
+    assert!(
+        !xml.contains("EX_GeographicBoundingBox") && !xml.contains("<BoundingBox"),
+        "a sentinel extent must emit no bounding box; got:\n{xml}"
+    );
+}
+
 /// A multi-parameter (PVOL site) collection emits, per WMS spec, a
 /// non-requestable parent layer plus one requestable child layer per
 /// parameter. The child `<Name>` stays `{id}/{quantity}` (the requestable

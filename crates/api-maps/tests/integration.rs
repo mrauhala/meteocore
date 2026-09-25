@@ -1774,8 +1774,14 @@ mod vertical_extent {
         // OGC API Common Part 2 additive form.
         assert_eq!(v["unit"], "deg");
         assert_eq!(v["grid"]["coordinates"], serde_json::json!([0.5, 1.5, 5.0]));
-        // vrs is intentionally omitted for radar elevation angle.
-        assert!(v.get("vrs").is_none());
+        // A Uniform Additional Dimension needs a reference system and a grid
+        // cell count (Common Part 2); radar elevation angle has no registered
+        // URI, so its vrs is the inline WKT2 EDR also advertises.
+        assert_eq!(
+            v["vrs"],
+            ds_core::vertical::VerticalKind::ElevationAngle.vrs()
+        );
+        assert_eq!(v["grid"]["cellsCount"], 3);
     }
 
     /// A `VerticalDimension` with no levels must not emit `"interval": null`

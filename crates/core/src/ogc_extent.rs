@@ -11,7 +11,7 @@
 //! `temporal.grid`. `api-edr` therefore keeps its own builder.
 
 use crate::datetime::{temporal_grid, TemporalGrid};
-use crate::geo::{crs84_bbox_spans, is_crs84_grid};
+use crate::geo::{crs84_bbox_spans, crs84_extent, is_crs84_grid};
 use crate::vertical::VerticalDimension;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -64,20 +64,27 @@ pub struct TemporalExtent {
     pub grid: Option<TemporalGrid>,
 }
 
-/// `extent.vertical`: numeric `[lo, hi]` interval, the level values, the unit
-/// symbol, and the level coordinates. `vrs` is omitted — the only kind in use
-/// (radar elevation angle) has no standard OGC vertical-CRS URI.
+/// `extent.vertical`, a Common Part 2 Uniform Additional Dimension: a numeric
+/// `[lo, hi]` interval, its vertical reference system, the level values, the
+/// unit symbol and the irregular level grid. UAD requires exactly one of
+/// `definition`, `trs` or `vrs` beside `interval`; `vrs` is the dimension's
+/// [`VerticalKind::vrs`](crate::vertical::VerticalKind::vrs), a registered
+/// URI or an inline WKT2 CRS when none is registered (as EDR advertises).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VerticalExtent {
     pub interval: Vec<[f64; 2]>,
+    pub vrs: &'static str,
     pub values: Vec<f64>,
     pub unit: String,
     pub grid: VerticalGrid,
 }
 
-/// `extent.vertical.grid`: the explicit level coordinates.
+/// `extent.vertical.grid`: an irregular grid of the explicit level
+/// coordinates. Common Part 2 grids require `cellsCount`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VerticalGrid {
+    #[serde(rename = "cellsCount")]
+    pub cells_count: usize,
     pub coordinates: Vec<f64>,
 }
 
@@ -87,7 +94,8 @@ pub struct VerticalGrid {
 ///
 /// - `spatial_extent` — WGS84 bbox `[west, south, east, north]`. Callers with a
 ///   raster source pass its bbox; vector-only callers (Tiles, Features) pass a
-///   feature bbox.
+///   feature bbox. It is normalized to the CRS84 domain
+///   ([`crs84_extent`]); a box describing no area is omitted.
 /// - `grid_size` / `native_crs` — native cell counts `[nx, ny]` and CRS label.
 ///   The per-axis `grid` resolution is emitted **only** for geographic
 ///   (lon/lat) grids: projected cells aren't degree-regular, so a single
@@ -102,12 +110,14 @@ pub fn build_extent(
     times: &[DateTime<Utc>],
     vertical: Option<&VerticalDimension>,
 ) -> Option<Extent> {
-    let spatial = spatial_extent.map(|bbox| {
-        // Grid resolution only for geographic grids with positive spans.
+    let spatial = spatial_extent.and_then(|raw| {
+        let bbox = crs84_extent(raw)?;
+        // Grid resolution only for geographic grids with positive spans, from
+        // the raw cell-edge span (clamping at a pole would skew it).
         // `crs84_bbox_spans` keeps the spans positive across the anti-meridian.
         let grid = grid_size.and_then(|[nx, ny]| {
             if nx > 0 && ny > 0 && is_crs84_grid(native_crs) {
-                let (lon_span, lat_span) = crs84_bbox_spans(bbox);
+                let (lon_span, lat_span) = crs84_bbox_spans(raw);
                 // Skip a degenerate (zero-span) bbox: 0.0/nx would emit
                 // "resolution": 0.0, which is invalid per OGC API Common Part 2.
                 if lon_span > 0.0 && lat_span > 0.0 {
@@ -127,11 +137,11 @@ pub fn build_extent(
             }
             None
         });
-        SpatialExtent {
+        Some(SpatialExtent {
             bbox: vec![bbox],
             crs: CRS84_URI,
             grid,
-        }
+        })
     });
 
     // Temporal — present only when there is at least one timestamp. The
@@ -150,9 +160,11 @@ pub fn build_extent(
     let vertical = vertical.and_then(|v| {
         v.extent().map(|(lo, hi)| VerticalExtent {
             interval: vec![[lo, hi]],
+            vrs: v.kind.vrs(),
             values: v.levels.clone(),
             unit: v.unit().to_string(),
             grid: VerticalGrid {
+                cells_count: v.levels.len(),
                 coordinates: v.levels.clone(),
             },
         })
@@ -261,5 +273,36 @@ mod tests {
         assert_eq!(v.interval, vec![[0.5, 3.0]]);
         assert_eq!(v.values, vec![0.5, 1.5, 3.0]);
         assert_eq!(v.grid.coordinates, vec![0.5, 1.5, 3.0]);
+        assert_eq!(v.grid.cells_count, 3);
+        assert_eq!(v.vrs, VerticalKind::ElevationAngle.vrs());
+    }
+
+    #[test]
+    fn spatial_extent_is_normalized_to_the_crs84_domain() {
+        let global = build_extent(
+            Some([-180.125, -90.125, 179.875, 90.125]),
+            Some([1440, 721]),
+            "CRS:84",
+            &[],
+            None,
+        )
+        .unwrap();
+        let spatial = global.spatial.unwrap();
+        assert_eq!(spatial.bbox, vec![[-180.0, -90.0, 180.0, 90.0]]);
+        let grid = spatial.grid.unwrap();
+        assert!((grid[0].resolution - 0.25).abs() < 1e-12);
+        assert!((grid[1].resolution - 0.25).abs() < 1e-12, "raw cell span");
+        // An extent that saw no valid point is not advertised at all.
+        let times = vec![t("2026-06-02T00:00:00Z")];
+        let sentinel = build_extent(
+            Some([f64::MAX, f64::MAX, f64::MIN, f64::MIN]),
+            None,
+            "projected",
+            &times,
+            None,
+        )
+        .unwrap();
+        assert!(sentinel.spatial.is_none());
+        assert!(sentinel.temporal.is_some());
     }
 }

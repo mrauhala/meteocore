@@ -1172,11 +1172,13 @@ impl TileSources<'_> {
         }
     }
 
+    /// The CRS84-domain extent advertised for search and tile-matrix limits.
     pub(crate) fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.raster_info
             .as_ref()
             .and_then(|i| i.spatial_extent)
             .or(self.feature_extent)
+            .and_then(ds_core::geo::crs84_extent)
     }
 
     /// Temporal bounds for discovery, with the same precedence as `extent`.
