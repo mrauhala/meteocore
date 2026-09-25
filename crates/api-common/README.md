@@ -158,6 +158,16 @@ runs and Features item pages use the same shell. The JSON link and copyable URL 
 cURL always represent the current resource with its applied filters and paging;
 unsubmitted edits appear separately in the request preview.
 
+A collection page's heading shows one chip per OGC API it is available
+through — Maps, Tiles, Features, EDR — derived from its advertised links, not
+from the API serving the page. Its map preview draws with whatever the
+collection advertises: Maps (one image per view), map tiles (the Web Mercator
+map tileset, per style) or vector tiles (the Web Mercator vector tileset, one
+layer named after the collection). With more than one, a "Draw with" switch
+picks among them; a collection advertising only tiles still gets a preview.
+Style, time and level apply to Maps and map tiles; vector tiles are unstyled,
+and a vector-only collection shows no legend panel.
+
 The collection builder derives its fields from `CollectionParameter::ALL`.
 Search and paging use ordinary GET requests. Optional advanced controls omit
 empty values; literal `+` operators are form-encoded. Unsupported Common sorting,

@@ -54,13 +54,25 @@
     if (element.dataset.quicklook === 'true' && data.features.length) inspect(data.features[0]);
     // Render the viewport in Web Mercator so image pixels align with MapLibre.
     // Bounds come from the map; projection math remains in the existing API.
-    function installRasterPreview() {
+    // Draw the collection with Maps (one image per view), its map tiles, or
+    // its vector tiles, whichever it advertises; a switch picks among several.
+    function installRasterPreview(extentBounds) {
+      const request = data.mapRequest;
+      const modes = request.modes || ['maps'];
+      const modeInputs = [...document.querySelectorAll('input[name="map-mode"]')];
+      const currentMode = () => modeInputs.find(input => input.checked)?.value || modes[0];
       const form = document.getElementById('map-controls');
       const style = document.getElementById('map-style');
       const time = document.getElementById('map-time');
       const level = document.getElementById('map-level');
       const previous = document.getElementById('map-time-prev');
       const next = document.getElementById('map-time-next');
+      const help = document.getElementById('map-help');
+      const submit = form.querySelector('button.primary');
+      const mapsHelp = help?.textContent;
+      const styleField = style.closest('label');
+      const timeField = time.closest('.map-time-field');
+      const levelField = level?.closest('label');
       function updateTimeButtons() {
         if (!previous || !next) return;
         previous.disabled = time.selectedIndex === 1;
@@ -82,8 +94,9 @@
       const legendLink = document.getElementById('map-legend-link');
       const legendStatus = document.getElementById('map-legend-status');
       let legendGeneration = 0, activeLegend, legendObjectUrl;
+      // Vector-only collections have no legend panel.
       async function showLegend(href, title) {
-        if (activeLegend === href) return;
+        if (!legendStatus || activeLegend === href) return;
         activeLegend = href;
         const current = ++legendGeneration;
         legendImage.hidden = true; legendLink.hidden = true;
@@ -118,6 +131,11 @@
           if (current === legendGeneration) { activeLegend = undefined; legendStatus.textContent = 'Legend unavailable.'; }
         }
       }
+      function noLegend(text) {
+        if (!legendStatus) return;
+        activeLegend = undefined; ++legendGeneration;
+        legendImage.hidden = true; legendLink.hidden = true; legendStatus.textContent = text;
+      }
       let pending, generation = 0, timer, activeId, staged;
       function discardStaged() {
         if (!staged) return;
@@ -126,13 +144,123 @@
         if (map.getSource(staged.id)) map.removeSource(staged.id);
         staged = undefined;
       }
+      function clearImage() {
+        discardStaged();
+        if (activeId) { map.removeLayer(activeId); map.removeSource(activeId); activeId = undefined; }
+      }
+      const TILE_LAYERS = ['map-tiles','map-vector-fill','map-vector-line','map-vector-points'];
+      function clearTiles() {
+        TILE_LAYERS.forEach(id => { if (map.getLayer(id)) map.removeLayer(id); });
+        ['map-tiles','map-vector'].forEach(id => { if (map.getSource(id)) map.removeSource(id); });
+      }
       function disableImageLink() {
         link.removeAttribute('href'); link.setAttribute('aria-disabled','true');
       }
-      async function render() {
+      function selectedTimeValue() {
+        return time.value ? (time.type === 'datetime-local' ? new Date(`${time.value}Z`).toISOString() : time.value) : '';
+      }
+      function sameOrigin(href) {
+        // Tile URL templates carry literal `{z}`-style placeholders.
+        try {
+          const url = new URL(href.replace(/[{}]/g,''), location.href);
+          return url.origin === location.origin && ['http:','https:'].includes(url.protocol);
+        } catch (_) { return false; }
+      }
+      // The Web Mercator tileset of one kind from an advertised tileset list
+      // (a per-API list may hold map and vector tilesets side by side).
+      const tilesets = new Map();
+      function webMercatorTileset(listHref, dataType) {
+        const key = `${dataType} ${listHref}`;
+        if (!tilesets.has(key)) {
+          tilesets.set(key, (async () => {
+            if (!sameOrigin(listHref)) throw new Error('Tileset list must use this server.');
+            const response = await fetch(listHref,{headers:{Accept:'application/json'},signal:AbortSignal.timeout(15000)});
+            if (!response.ok) throw new Error(`Tileset list unavailable (HTTP ${response.status}).`);
+            const list = await response.json();
+            const tileset = (list.tilesets || []).find(t =>
+              (!t.dataType || t.dataType === dataType) && /\/WebMercatorQuad$/.test(t.tileMatrixSetURI || ''));
+            const item = tileset?.links?.find(l => l.rel === 'item');
+            if (!item || !sameOrigin(item.href)) throw new Error('This collection advertises no Web Mercator tileset.');
+            const zooms = (tileset.tileMatrixSetLimits || []).map(l => Number(l.tileMatrix)).filter(Number.isFinite);
+            return {
+              template: item.href.replace('{tileMatrix}','{z}').replace('{tileRow}','{y}').replace('{tileCol}','{x}'),
+              minzoom: zooms.length ? Math.min(...zooms) : 0,
+              maxzoom: zooms.length ? Math.max(...zooms) : 22,
+              self: tileset.links.find(l => l.rel === 'self')?.href || listHref
+            };
+          })().catch(error => { tilesets.delete(key); throw error; }));
+        }
+        return tilesets.get(key);
+      }
+      function applyMode() {
+        const mode = currentMode();
+        const vector = mode === 'vector';
+        [styleField, timeField, levelField, submit].forEach(field => { if (field) field.hidden = vector; });
+        // A vector-only collection has nothing to choose: no controls at all.
+        form.hidden = vector && modes.length === 1;
+        for (const option of style.options) {
+          option.disabled = mode === 'maps' ? !option.value : mode === 'tiles' ? !option.dataset.tiles : false;
+        }
+        if (style.selectedOptions[0]?.disabled) {
+          const first = [...style.options].find(option => !option.disabled);
+          if (first) first.selected = true;
+        }
+        link.textContent = mode === 'maps' ? 'Open rendered image ↗' : 'Open tileset metadata ↗';
+        if (help) help.textContent = mode === 'maps' ? mapsHelp
+          : mode === 'tiles' ? 'Map tiles load as you pan and zoom. Choose a style, time or level, then Update map.'
+          : 'Vector tiles load as you pan and zoom: feature geometry in one outline color.';
+      }
+      async function renderTiles(mode) {
+        const current = ++generation;
+        pending?.abort(); clearTimeout(timer); clearImage(); clearTiles();
+        const vector = mode === 'vector';
+        const option = style.selectedOptions[0];
+        const selectedStyle = vector ? 'Vector tiles' : option.textContent;
+        const selectedTime = selectedTimeValue();
+        try {
+          status.textContent = 'Loading tileset…';
+          const tileset = await webMercatorTileset(vector ? request.vector.href : option.dataset.tiles, vector ? 'vector' : 'map');
+          if (current !== generation) return;
+          const params = new URLSearchParams();
+          if (!vector && selectedTime) params.set('datetime',selectedTime);
+          if (!vector && level?.value) params.set('elevation',level.value);
+          const query = params.toString();
+          const template = query ? `${tileset.template}${tileset.template.includes('?') ? '&' : '?'}${query}` : tileset.template;
+          const source = { type: vector ? 'vector' : 'raster', tiles: [template], minzoom: tileset.minzoom, maxzoom: tileset.maxzoom };
+          if (!vector) source.tileSize = 256;
+          if (extentBounds && !extentBounds.isEmpty()) source.bounds = extentBounds.toArray().flat();
+          const before = map.getLayer('border-halo') ? 'border-halo' : 'outlines';
+          if (vector) {
+            const colors = palette(), layer = request.vector.layer;
+            map.addSource('map-vector',source);
+            const kind = types => ['match',['geometry-type'],types,true,false];
+            map.addLayer({id:'map-vector-fill',type:'fill',source:'map-vector','source-layer':layer,filter:kind(['Polygon','MultiPolygon']),paint:{'fill-color':colors.ink,'fill-opacity':0.2}},before);
+            map.addLayer({id:'map-vector-line',type:'line',source:'map-vector','source-layer':layer,filter:['!',kind(['Point','MultiPoint'])],paint:{'line-color':colors.ink,'line-width':1.5}},before);
+            map.addLayer({id:'map-vector-points',type:'circle',source:'map-vector','source-layer':layer,filter:kind(['Point','MultiPoint']),paint:{'circle-color':colors.ink,'circle-radius':4,'circle-stroke-color':colors.land,'circle-stroke-width':1}},before);
+            noLegend('Vector tiles draw feature geometry in one color; there is no legend.');
+          } else {
+            map.addSource('map-tiles',source);
+            map.addLayer({id:'map-tiles',type:'raster',source:'map-tiles',paint:{'raster-opacity':0.85,'raster-fade-duration':0}},before);
+            showLegend(option.dataset.legend, selectedStyle);
+          }
+          link.href = tileset.self; link.removeAttribute('aria-disabled');
+          requestText.textContent = template;
+          status.textContent = vector ? 'Vector tiles · loading as you pan and zoom'
+            : `Map tiles · ${selectedStyle} · ${selectedTime || 'collection default time'}`;
+        } catch (error) {
+          if (current !== generation) return;
+          clearTiles(); disableImageLink();
+          status.textContent = error.message || 'Tiles unavailable.';
+        }
+      }
+      function render() {
+        const mode = currentMode();
+        return mode === 'maps' ? renderImage() : renderTiles(mode);
+      }
+      async function renderImage() {
         if (!element.clientWidth || !element.clientHeight) return;
         const current = ++generation;
-        discardStaged();
+        discardStaged(); clearTiles();
         pending?.abort(); pending = new AbortController();
         const controller = pending;
         const timeout = setTimeout(() => controller.abort(), 15000);
@@ -140,7 +268,7 @@
         try {
           const selectedStyle = style.selectedOptions[0].textContent;
           const selectedLegend = style.selectedOptions[0].dataset.legend;
-          const selectedTime = time.value ? (time.type === 'datetime-local' ? new Date(`${time.value}Z`).toISOString() : time.value) : '';
+          const selectedTime = selectedTimeValue();
           const url = new URL(style.value, location.href);
           if (url.origin !== location.origin || !['http:','https:'].includes(url.protocol)) throw new Error('Map endpoint must use this server.');
           const bounds = map.getBounds();
@@ -190,8 +318,7 @@
           map.on('render',onRender); map.triggerRepaint();
         } catch (error) {
           if (current !== generation) return;
-          discardStaged();
-          if (activeId) { map.removeLayer(activeId); map.removeSource(activeId); activeId = undefined; }
+          clearImage();
           activeLegend = undefined;
           ++legendGeneration; legendImage.hidden = true; legendLink.hidden = true;
           legendStatus.textContent = 'Legend will appear after the map loads.';
@@ -201,13 +328,17 @@
         } finally { clearTimeout(timeout); }
       }
       function schedule() {
+        // Tiles follow the view by themselves; only a map image is re-requested.
+        if (currentMode() !== 'maps') return;
         // Invalidate immediately so an old response cannot replace a new view.
         ++generation; pending?.abort(); discardStaged(); clearTimeout(timer);
         timer = setTimeout(render,300);
       }
       form.addEventListener('submit',event => { event.preventDefault(); clearTimeout(timer); render(); });
+      modeInputs.forEach(input => input.addEventListener('change',() => { applyMode(); clearTimeout(timer); render(); }));
       map.on('moveend',schedule);
       new ResizeObserver(() => { if (element.clientWidth && element.clientHeight) map.resize(); }).observe(element);
+      applyMode();
       render();
     }
     map.on('style.load', async () => {
@@ -227,7 +358,7 @@
       data.features.forEach(feature => geometry(feature.geometry));
       if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 45, maxZoom: data.mapRequest ? 8 : 5, duration: 0 });
       status.textContent = element.dataset.quicklook === 'true' ? 'Current page · select a shape for a quick look.' : 'Advertised geometry · general-purpose locator.';
-      if (data.mapRequest) installRasterPreview();
+      if (data.mapRequest) installRasterPreview(bounds);
       map.on('click', event => {
         if (element.dataset.quicklook !== 'true') return;
         const { x, y } = event.point;
@@ -275,6 +406,10 @@
         labelCountries();map.on('moveend',labelCountries);
       } catch (_) { if (!data.mapRequest) status.textContent += ' Geographic backdrop unavailable.'; }
     });
-    map.on('error', () => { status.textContent = 'Map unavailable; coordinates remain available below.'; });
+    map.on('error', event => {
+      // A tile that fails to load leaves the rest of the tiled view usable.
+      if (['map-tiles','map-vector'].includes(event.sourceId)) { status.textContent = 'Some tiles failed to load; the rest of the view is shown.'; return; }
+      status.textContent = 'Map unavailable; coordinates remain available below.';
+    });
   } catch (_) { status.textContent = 'Map unavailable; coordinates remain available below.'; }
 })();

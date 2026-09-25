@@ -400,6 +400,10 @@ main {
   gap:6px;
   flex-wrap:wrap;
 }
+/* The OGC APIs a collection is available through (collection page). */
+.api-chip {
+  font-weight:600;
+}
 .search-panel {
   border:1px solid var(--line);
   border-radius:10px;
@@ -2588,6 +2592,13 @@ a {
 .map-controls select,.map-controls input{display:block;width:100%;box-sizing:border-box;height:46px;min-height:46px;margin:0;font-size:16px;line-height:24px}
 .map-controls>.btn{box-sizing:border-box;height:46px;min-height:46px;margin:0;white-space:nowrap}
 .map-controls>p{grid-column:1/-1;font-size:14px;color:var(--muted);margin:0}
+/* Maps / map tiles / vector tiles switch: its own full-width row. The
+   grid and flex rules above would otherwise override the hidden attribute. */
+.map-controls>.map-mode{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;border:0;margin:0;padding:0;min-width:0}
+.map-mode legend{float:left;padding:0;margin-right:4px;font-weight:600}
+.map-mode label{flex-direction:row;align-items:center;gap:6px;line-height:24px}
+.map-mode input{width:auto;height:auto;min-height:0}
+.map-controls [hidden],.js .map-controls.enhanced[hidden]{display:none!important}
 @media(max-width:1000px){.js .map-controls.enhanced,.js .map-controls.enhanced:has(#map-level){grid-template-columns:minmax(0,1fr)}.map-controls>.btn{justify-self:start}}
 
 /* Keep time navigation and the style/action row aligned at every width. */

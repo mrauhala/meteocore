@@ -44,6 +44,52 @@ fn map_link(links: &[Value]) -> Option<&str> {
         .and_then(|l| l["href"].as_str())
 }
 
+/// First link carrying the registered `tilesets-map` relation (Tiles Req 13).
+fn map_tilesets_link(links: &[Value]) -> Option<&str> {
+    links
+        .iter()
+        .find(|l| l["rel"] == rel::TILESETS_MAP)
+        .and_then(|l| l["href"].as_str())
+}
+
+/// First link carrying the registered `tilesets-vector` relation.
+fn vector_tilesets_link(links: &[Value]) -> Option<&str> {
+    links
+        .iter()
+        .find(|l| l["rel"] == rel::TILESETS_VECTOR)
+        .and_then(|l| l["href"].as_str())
+}
+
+/// The OGC APIs a collection description advertises access through, as
+/// `(label, chip class, description)`. Derived from its links, not from the
+/// API serving the page, so a shared-root collection lists every mechanism.
+fn api_chips(doc: &Value) -> Vec<(&'static str, &'static str, &'static str)> {
+    let links = doc["links"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let has = |rel: &str| links.iter().any(|l| l["rel"] == rel);
+    let mut chips = Vec::new();
+    if map_link(links).is_some() {
+        chips.push(("Maps", "purple", "OGC API - Maps: rendered map images"));
+    }
+    if links.iter().any(|l| {
+        l["rel"]
+            .as_str()
+            .is_some_and(|r| r.starts_with(TILESETS_REL_PREFIX))
+    }) {
+        chips.push(("Tiles", "amber", "OGC API - Tiles: map or vector tiles"));
+    }
+    if has("items") {
+        chips.push(("Features", "teal", "OGC API - Features: feature items"));
+    }
+    if doc["data_queries"].is_object() {
+        chips.push((
+            "EDR",
+            "teal",
+            "OGC API - EDR: position, area and other data queries",
+        ));
+    }
+    chips
+}
+
 pub fn path_segment(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes())
         .collect::<String>()
@@ -515,11 +561,42 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
     let raster = features.get("mapRequest");
     let mut controls = String::new();
     if let Some(request) = raster {
-        controls.push_str("<form id=\"map-controls\" class=\"map-controls enhanced\"><label>Style<select id=\"map-style\">");
+        controls.push_str("<form id=\"map-controls\" class=\"map-controls enhanced\">");
+        let modes: Vec<&str> = request["modes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        // Both Maps and Tiles serve this collection: let the viewer choose
+        // which one draws the preview.
+        if modes.len() > 1 {
+            controls.push_str("<fieldset class=\"map-mode\"><legend>Draw with</legend>");
+            for (i, (mode, label)) in [
+                ("maps", "Maps · one image per view"),
+                ("tiles", "Map tiles"),
+                ("vector", "Vector tiles"),
+            ]
+            .into_iter()
+            .filter(|(mode, _)| modes.contains(mode))
+            .enumerate()
+            {
+                controls.push_str(&format!(
+                    "<label><input type=\"radio\" name=\"map-mode\" value=\"{mode}\"{}> {label}</label>",
+                    if i == 0 { " checked" } else { "" }
+                ));
+            }
+            controls.push_str("</fieldset>");
+        }
+        controls.push_str(&format!(
+            "<label>Style<select id=\"map-style\" data-mode=\"{}\">",
+            escape(modes.first().copied().unwrap_or("maps"))
+        ));
         for style in request["styles"].as_array().into_iter().flatten() {
             controls.push_str(&format!(
-                "<option value=\"{}\" data-legend=\"{}\">{}</option>",
-                escape(safe_href(style["href"].as_str().unwrap_or_default())),
+                "<option value=\"{}\" data-tiles=\"{}\" data-legend=\"{}\">{}</option>",
+                escape(style["href"].as_str().map(safe_href).unwrap_or_default()),
+                escape(style["tiles"].as_str().map(safe_href).unwrap_or_default()),
                 escape(style["legend"].as_str().map(safe_href).unwrap_or_default()),
                 escape(style["title"].as_str().unwrap_or("Default"))
             ));
@@ -609,32 +686,57 @@ pub fn collection_html(
     let items = links
         .and_then(|ls| ls.iter().find(|l| l["rel"] == "items"))
         .and_then(|l| l["href"].as_str());
-    let map_request = {
-        links.and_then(|ls| map_link(ls))
-            .filter(|href| safe_href(href) != "#")
-            .map(|href| {
-                let legend = |style: &Value| style["links"].as_array()
-                    .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend" || l["rel"] == rel::LEGEND))
-                    .and_then(|l|l["href"].as_str()).filter(|href|safe_href(href) != "#")
-                    .map(str::to_owned);
-                let default_legend = doc["styles"].as_array()
-                    .and_then(|styles|styles.iter().find(|s|s["id"] == "default")).and_then(legend);
-                let mut styles = vec![json!({"title":"Collection default","href":href,"legend":default_legend})];
-                for style in doc["styles"].as_array().into_iter().flatten() {
-                    // The collection map endpoint already renders this style.
-                    if style["id"] == "default" { continue; }
-                    if let Some(href) = style["links"].as_array().and_then(|ls|map_link(ls)).filter(|href|safe_href(href)!="#") {
-                        styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"legend":legend(style)}));
-                    }
-                }
-                json!({"styles":styles,"times":map_times(&doc["extent"]["temporal"]),"vertical":doc["extent"]["vertical"]})
-            })
-    };
+    // The preview draws with Maps (one image per view), map tiles and/or
+    // vector tiles (Web Mercator tilesets), whichever the collection
+    // advertises. Each style carries its own map link and map-tileset list
+    // when it has them; vector tiles are unstyled, one layer per collection.
+    let safe = |href: &&str| safe_href(href) != "#";
+    let map_href = links.and_then(|ls| map_link(ls)).filter(safe);
+    let tiles_href = links.and_then(|ls| map_tilesets_link(ls)).filter(safe);
+    let vector_href = links.and_then(|ls| vector_tilesets_link(ls)).filter(safe);
+    let map_request = (map_href.is_some() || tiles_href.is_some() || vector_href.is_some()).then(|| {
+        let legend = |style: &Value| style["links"].as_array()
+            .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend" || l["rel"] == rel::LEGEND))
+            .and_then(|l|l["href"].as_str()).filter(safe)
+            .map(str::to_owned);
+        let default_style = doc["styles"].as_array()
+            .and_then(|styles|styles.iter().find(|s|s["id"] == "default"));
+        let default_legend = default_style.and_then(legend);
+        let mut styles = vec![json!({"title":"Collection default","href":map_href,"tiles":tiles_href,"legend":default_legend})];
+        for style in doc["styles"].as_array().into_iter().flatten() {
+            // The collection map and tileset endpoints already render this style.
+            if style["id"] == "default" { continue; }
+            let style_links = style["links"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let href = map_link(style_links).filter(safe);
+            let tiles = map_tilesets_link(style_links).filter(safe);
+            if href.is_some() || tiles.is_some() {
+                styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"tiles":tiles,"legend":legend(style)}));
+            }
+        }
+        let modes: Vec<&str> = [map_href.map(|_| "maps"), tiles_href.map(|_| "tiles"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
+        json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"times":map_times(&doc["extent"]["temporal"]),"vertical":doc["extent"]["vertical"]})
+    });
     let kind = doc["itemType"]
         .as_str()
         .or(doc["dataType"].as_str())
         .unwrap_or("Environmental data");
-    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\"><span class=\"chip teal\">{}</span><span class=\"chip\">{}</span></div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(api),escape(kind),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()));
+    // One chip per OGC API the collection is available through. Its kind
+    // (`itemType`/`dataType`) is under "Collection details" as Resource; a
+    // `feature` chip beside a `Features` one only read as a duplicate.
+    let chips = api_chips(doc);
+    let api_chips = if chips.is_empty() {
+        format!("<span class=\"chip teal\">{}</span>", escape(api))
+    } else {
+        chips
+            .iter()
+            .map(|(label, class, description)| {
+                format!(
+                    "<span class=\"chip api-chip {class}\" title=\"{description}\">{label}</span>"
+                )
+            })
+            .collect()
+    };
+    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()));
     if let Some(items) = items {
         body.push_str(&anchor(&with_format(items, "html"), "Request data", ""));
     }
@@ -697,10 +799,7 @@ pub fn collection_html(
         }
         body.push_str("</div>");
     }
-    if let Some(map_href) = links
-        .and_then(|ls| map_link(ls))
-        .filter(|_| map_request.is_some())
-    {
+    if let Some(map_href) = map_href.filter(|_| map_request.is_some()) {
         body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
         // Document the map request at the API serving the map link, which
         // need not be the API rendering this page.
@@ -752,7 +851,8 @@ pub fn collection_html(
         body.push_str("<span class=\"muted\">Not advertised</span>");
     }
     body.push_str("</div></div></div></section>");
-    if map_request.is_some() {
+    // Maps and map tiles have styled legends; vector tiles do not.
+    if map_href.is_some() || tiles_href.is_some() {
         body.push_str("<section class=\"panel enhanced\"><div class=\"panel-head\"><h2>Map legend</h2></div><div class=\"map-legend\"><span id=\"map-legend-status\">Legend will appear after the map loads.</span><a id=\"map-legend-link\" hidden><img id=\"map-legend-image\" alt=\"Selected map style legend\" hidden></a></div></section>");
     }
     body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
@@ -1618,6 +1718,115 @@ mod tests {
         assert!(request.contains("Map request parameters"));
         assert!(request.contains("https://x/collections/a/map/tiles"));
         assert!(request.contains("https://x/collections/a/tiles"));
+    }
+
+    /// The heading lists every OGC API the collection advertises, from its
+    /// links rather than from the API serving the page.
+    #[test]
+    fn heading_chips_name_every_advertised_api() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let chips = |doc: &Value| {
+            let html = collection_html(shared, doc, None);
+            let row = html
+                .split("aria-label=\"Available through\">")
+                .nth(1)
+                .unwrap()
+                .split("</div>")
+                .next()
+                .unwrap()
+                .to_owned();
+            ["Maps", "Tiles", "Features", "EDR", crate::shared::WORKSPACE]
+                .into_iter()
+                .filter(|label| row.contains(&format!(">{label}</span>")))
+                .collect::<Vec<_>>()
+        };
+        let all = json!({"id":"a","links":[
+            {"rel":"self","href":"https://x/collections/a"},
+            {"rel":rel::MAP,"href":"https://x/collections/a/map"},
+            {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/a/tiles"},
+            {"rel":"items","href":"https://x/collections/a/items","type":"application/geo+json"}]});
+        assert_eq!(chips(&all), ["Maps", "Tiles", "Features"]);
+        let features = json!({"id":"b","itemType":"feature","links":[
+            {"rel":"items","href":"https://x/collections/b/items","type":"application/geo+json"}]});
+        assert_eq!(chips(&features), ["Features"]);
+        // The kind is a detail row, not a second "feature" chip.
+        let html = collection_html(shared, &features, None);
+        let row = html
+            .split("aria-label=\"Available through\">")
+            .nth(1)
+            .unwrap();
+        assert!(!row.split("</div>").next().unwrap().contains(">feature<"));
+        assert!(html.contains("<dt>Resource</dt><dd>feature</dd>"));
+        let edr = json!({"id":"c","links":[],"data_queries":{"position":{}}});
+        assert_eq!(chips(&edr), ["EDR"]);
+        // Nothing advertised: the serving API still labels the page.
+        assert_eq!(
+            chips(&json!({"id":"d","links":[]})),
+            [crate::shared::WORKSPACE]
+        );
+    }
+
+    /// With both Maps and Tiles (and vector tiles) the preview offers a choice
+    /// of what draws it; each style carries its own map-tileset list.
+    #[test]
+    fn map_preview_offers_maps_map_tiles_and_vector_tiles() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let doc = json!({"id":"cap","extent":{"spatial":{"bbox":[[20,60,30,70]]}},
+            "links":[
+                {"rel":"self","href":"https://x/collections/cap"},
+                {"rel":rel::MAP,"href":"https://x/collections/cap/map"},
+                {"rel":rel::TILESETS_MAP,"href":"https://x/collections/cap/map/tiles"},
+                {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/cap/tiles"}],
+            "styles":[{"id":"severity","title":"Severity","links":[
+                {"rel":rel::MAP,"href":"https://x/collections/cap/styles/severity/map"},
+                {"rel":rel::TILESETS_MAP,"href":"https://x/collections/cap/styles/severity/map/tiles"}]}]});
+        let html = collection_html(shared, &doc, None);
+        for mode in ["maps", "tiles", "vector"] {
+            assert!(
+                html.contains(&format!("name=\"map-mode\" value=\"{mode}\"")),
+                "{mode}"
+            );
+        }
+        assert!(html.contains("value=\"maps\" checked"));
+        assert!(html.contains("data-tiles=\"https://x/collections/cap/map/tiles\""));
+        assert!(html.contains("data-tiles=\"https://x/collections/cap/styles/severity/map/tiles\""));
+        let data = html.split("id=\"map-data\" hidden>").nth(1).unwrap();
+        let data: Value =
+            serde_json::from_str(&data.split("</div>").next().unwrap().replace("&quot;", "\""))
+                .unwrap();
+        assert_eq!(
+            data["mapRequest"]["modes"],
+            json!(["maps", "tiles", "vector"])
+        );
+        assert_eq!(
+            data["mapRequest"]["vector"],
+            json!({"href":"https://x/collections/cap/tiles","layer":"cap"})
+        );
+
+        // One mechanism: no switch. Map tiles alone still get a preview.
+        let mut maps_only = doc.clone();
+        maps_only["links"].as_array_mut().unwrap().truncate(2);
+        let html = collection_html(shared, &maps_only, None);
+        assert!(html.contains("id=\"map-controls\""));
+        // (The inlined map script names the input too; check the switch itself.)
+        assert!(!html.contains("<fieldset class=\"map-mode\">"));
+        let mut tiles_only = doc.clone();
+        tiles_only["links"].as_array_mut().unwrap().remove(1);
+        tiles_only["links"].as_array_mut().unwrap().truncate(2);
+        tiles_only["styles"] = json!([]);
+        let html = collection_html(shared, &tiles_only, None);
+        assert!(html.contains("id=\"map-controls\""));
+        assert!(html.contains("data-mode=\"tiles\""));
+        // (The inlined map script names the input too; check the switch itself.)
+        assert!(!html.contains("<fieldset class=\"map-mode\">"));
     }
 
     #[test]
