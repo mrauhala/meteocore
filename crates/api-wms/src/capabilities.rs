@@ -259,8 +259,12 @@ fn write_layer_metadata(
         write_text_element(writer, "CRS", crs);
     }
 
-    // Geographic bounding box
-    if let Some([west, south, east, north]) = info.spatial_extent {
+    // Geographic bounding box, normalised to the CRS84 domain the schema's
+    // longitude/latitude types allow: a global grid's cell edges reach past
+    // ±180°/±90°, and an extent that never saw a point is no extent.
+    if let Some([west, south, east, north]) =
+        info.spatial_extent.and_then(ds_core::geo::crs84_extent)
+    {
         let _ = writer.write_event(Event::Start(BytesStart::new("EX_GeographicBoundingBox")));
         write_text_element(writer, "westBoundLongitude", &format!("{west:.6}"));
         write_text_element(writer, "eastBoundLongitude", &format!("{east:.6}"));

@@ -26,11 +26,16 @@ Spec: OGC API - EDR 1.1 (OGC 19-086r6). Base route: `/edr`.
 | `edr-geojson` | ✗ | same reason (a test pins that it is *not* declared) |
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
-Part 2 (collections, json, html). Collection discovery supports `bbox`,
+Part 2 (collections, json, html). The landing page links `/conformance` and
+`/collections` with both the short `conformance`/`data` relations this standard
+requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
+/ `…/data` relations Common Part 1 names. Collection discovery supports `bbox`,
 `bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `limit`, `offset` and `f` through
 [api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
 return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
-preserve filters and the negotiated format. Collection descriptions expose HTML
+preserve filters and the negotiated format. Advertised spatial extents are normalized to the CRS84
+domain (grid cell edges past ±180°/±90° are clamped; an extent describing no area
+is omitted), matching the other APIs and collection search. Collection descriptions expose HTML
 alternate links and configured keywords/license metadata through the shared helper.
 
 Text discovery supports whitespace-normalized whole-word phrases in `q`, and
@@ -196,7 +201,7 @@ transforms retain serial retrieval.
 | CSV | ✓ | – | ✓ | ✓ | – | n/a | stations whose point is inside the polygon (≤ 500) |
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | polygon-tested |
 | GRIB | – | ✓ | ✓ | ✓ | – | ✓ | Grid over the polygon's bbox at native resolution (≤ 1M values across levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
-| QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps |
+| QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Lat/lon, rotated, stereographic and LCC grids (including the tangent-cone MEPS grid, on the sphere its file declares); a projected grid's extent is its projected rectangle's edges, not its corners' lon/lat box |
 | Zarr | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, one subset retrieval per variable for the whole time span (each may read multiple chunks) (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
 | ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | polar sampling; trajectory = RHI cross-section |

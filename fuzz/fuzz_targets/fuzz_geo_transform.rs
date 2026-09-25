@@ -47,6 +47,17 @@ fuzz_target!(|data: &[u8]| {
             lon0: param1.clamp(-std::f64::consts::PI, std::f64::consts::PI),
             false_e: 0.0,
             false_n: 0.0,
+            radius: None,
+        },
+        // Tangent cone on a sphere (the QueryData MEPS shape).
+        Crs::LambertConformalConic {
+            lat1: 1.1,
+            lat2: 1.1,
+            lat0: 1.1,
+            lon0: param2.clamp(-std::f64::consts::PI, std::f64::consts::PI),
+            false_e: 0.0,
+            false_n: 0.0,
+            radius: Some(6_371_220.0),
         },
     ];
 

@@ -7,15 +7,88 @@ use ds_core::config::LicenseConfig;
 use ds_core::html::{escape, LinkView};
 use serde_json::{json, Value};
 
+use crate::{mounts, rel};
+
 const CSS: &str = include_str!("workbench/style.css");
 const SCRIPT: &str = include_str!("workbench/app.js");
 const THEME: &str = include_str!("workbench/theme.js");
-const APIS: &[(&str, &str)] = &[
-    ("edr", "EDR"),
-    ("features", "Features"),
-    ("maps", "Maps"),
-    ("tiles", "Tiles"),
+/// API workspaces offered by the switcher: (kind, label, mount path). The
+/// shared OGC API root (#789) is mounted at the server root.
+const APIS: &[(&str, &str, &str)] = &[
+    (crate::shared::WORKSPACE, "OGC API", ""),
+    ("edr", "EDR", mounts::EDR),
+    ("features", "Features", mounts::FEATURES),
+    ("maps", "Maps", mounts::MAPS),
+    ("tiles", "Tiles", mounts::TILES),
 ];
+
+/// Where a page's API lives. `base` is the server's external base URL (for
+/// server-wide assets and the API switcher); `root` is the absolute root of the
+/// API the page belongs to (base URL + mount, `base` itself for the shared
+/// OGC API root); `api` is the API kind shown in navigation.
+#[derive(Clone, Copy, Debug)]
+pub struct Surface<'a> {
+    pub base: &'a str,
+    pub root: &'a str,
+    pub api: &'a str,
+}
+
+/// Registered relations naming a list of tilesets (Tiles Req 13).
+const TILESETS_REL_PREFIX: &str = "http://www.opengis.net/def/rel/ogc/1.0/tilesets-";
+
+/// First link carrying the short or registered map relation (Maps Req 46).
+fn map_link(links: &[Value]) -> Option<&str> {
+    links
+        .iter()
+        .find(|l| l["rel"] == "map" || l["rel"] == rel::MAP)
+        .and_then(|l| l["href"].as_str())
+}
+
+/// First link carrying the registered `tilesets-map` relation (Tiles Req 13).
+fn map_tilesets_link(links: &[Value]) -> Option<&str> {
+    links
+        .iter()
+        .find(|l| l["rel"] == rel::TILESETS_MAP)
+        .and_then(|l| l["href"].as_str())
+}
+
+/// First link carrying the registered `tilesets-vector` relation.
+fn vector_tilesets_link(links: &[Value]) -> Option<&str> {
+    links
+        .iter()
+        .find(|l| l["rel"] == rel::TILESETS_VECTOR)
+        .and_then(|l| l["href"].as_str())
+}
+
+/// The OGC APIs a collection description advertises access through, as
+/// `(label, chip class, description)`. Derived from its links, not from the
+/// API serving the page, so a shared-root collection lists every mechanism.
+fn api_chips(doc: &Value) -> Vec<(&'static str, &'static str, &'static str)> {
+    let links = doc["links"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let has = |rel: &str| links.iter().any(|l| l["rel"] == rel);
+    let mut chips = Vec::new();
+    if map_link(links).is_some() {
+        chips.push(("Maps", "purple", "OGC API - Maps: rendered map images"));
+    }
+    if links.iter().any(|l| {
+        l["rel"]
+            .as_str()
+            .is_some_and(|r| r.starts_with(TILESETS_REL_PREFIX))
+    }) {
+        chips.push(("Tiles", "amber", "OGC API - Tiles: map or vector tiles"));
+    }
+    if has("items") {
+        chips.push(("Features", "teal", "OGC API - Features: feature items"));
+    }
+    if doc["data_queries"].is_object() {
+        chips.push((
+            "EDR",
+            "teal",
+            "OGC API - EDR: position, area and other data queries",
+        ));
+    }
+    chips
+}
 
 pub fn path_segment(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes())
@@ -84,8 +157,7 @@ pub fn icon(name: &str) -> String {
 }
 
 pub struct Page<'a> {
-    pub base: &'a str,
-    pub api: &'a str,
+    pub surface: Surface<'a>,
     pub title: &'a str,
     pub json_url: &'a str,
 }
@@ -103,8 +175,7 @@ impl Page<'_> {
         labels: &[(&str, &str)],
     ) -> String {
         let Self {
-            base,
-            api,
+            surface: Surface { base, root, api },
             title,
             json_url,
         } = self;
@@ -112,25 +183,33 @@ impl Page<'_> {
         let current_path = json_url.split('?').next().unwrap_or(json_url);
         let api_title = APIS
             .iter()
-            .find(|(id, _)| id == api)
-            .map_or("MeteoCore", |(_, name)| *name);
+            .find(|(id, _, _)| id == api)
+            .map_or("MeteoCore", |(_, name, _)| *name);
+        // The current API opens at this page's root, wherever it is mounted.
+        let api_home = |id: &str, mount: &str| {
+            if id == *api {
+                format!("{root}/?f=html")
+            } else {
+                format!("{base}{mount}/?f=html")
+            }
+        };
         let api_nav = APIS
             .iter()
-            .map(|(id, name)| {
+            .map(|(id, name, mount)| {
                 anchor(
-                    &format!("{base}/{id}/?f=html"),
+                    &api_home(id, mount),
                     name,
                     if id == api { "active" } else { "" },
                 )
             })
             .collect::<String>();
-        let workspace_api = if api.is_empty() { "features" } else { api };
+        let (workspace_api, workspace_root) = (*api, *root);
         let options = APIS
             .iter()
-            .map(|(id, name)| {
+            .map(|(id, name, mount)| {
                 format!(
                     "<option value=\"{}\" {}>{name}</option>",
-                    escape(&format!("{base}/{id}/?f=html")),
+                    escape(&api_home(id, mount)),
                     if *id == workspace_api { "selected" } else { "" }
                 )
             })
@@ -143,7 +222,7 @@ impl Page<'_> {
                 ("/api/docs", "API reference"),
                 ("/conformance", "Standards"),
             ] {
-                let path = format!("{base}/{workspace_api}{suffix}");
+                let path = format!("{workspace_root}{suffix}");
                 if suffix == "/api/docs" {
                     nav.push_str(
                         "<div class=\"nav-divider\"></div><div class=\"nav-label\">RESOURCES</div>",
@@ -183,12 +262,15 @@ impl Page<'_> {
             }
         }
         let mut crumbs = anchor(&format!("{base}/?f=html"), "MeteoCore", "");
-        if !api.is_empty() {
-            crumbs.push_str(&format!(
-                "<span>/</span>{}",
-                anchor(&format!("{base}/{api}/?f=html"), api_title, "")
-            ));
-            let prefix = format!("{base}/{api}/");
+        {
+            // An API mounted at the server root is already the first crumb.
+            if root != base {
+                crumbs.push_str(&format!(
+                    "<span>/</span>{}",
+                    anchor(&format!("{root}/?f=html"), api_title, "")
+                ));
+            }
+            let prefix = format!("{root}/");
             let mut path = prefix.trim_end_matches('/').to_string();
             if let Some(rest) = current_path.strip_prefix(&prefix) {
                 for segment in rest.split('/').filter(|s| !s.is_empty()) {
@@ -221,22 +303,17 @@ impl Page<'_> {
                 }
             }
         }
-        let json_type = if *api == "features"
-            && current_path
-                .strip_prefix(&format!("{base}/features/collections/"))
-                .and_then(|rest| rest.split('/').nth(1))
-                == Some("items")
-        {
+        // Feature items (`…/collections/{id}/items[/{featureId}]`) are GeoJSON.
+        let items = current_path
+            .strip_prefix(&format!("{root}/collections/"))
+            .is_some_and(|tail| tail.split('/').nth(1) == Some("items"));
+        let json_type = if items {
             "application/geo+json"
         } else {
             "application/json"
         };
         let curl = format!("curl --get '{}'", json_url.replace('\'', "'\"'\"'"));
-        let catalog = current_path.trim_end_matches('/') == format!("{base}/{api}/collections");
-        let items = *api == "features"
-            && current_path
-                .strip_prefix(&format!("{base}/features/collections/"))
-                .is_some_and(|tail| tail.split('/').nth(1) == Some("items"));
+        let catalog = current_path.trim_end_matches('/') == format!("{root}/collections");
         let request_content = format!(
             r#"<div class="request-identity"><span class="method">GET</span><code id="request-url">{json_url}</code></div><div class="request-tools"><span class="request-note">Applied request · JSON representation</span><button class="btn small enhanced" data-copy="{json_url}">Copy URL</button><button class="btn small enhanced" data-copy="{curl}">Copy cURL</button><a class="btn small" href="{json_url}">Open JSON ↗</a></div>"#,
             json_url = escape(safe_href(json_url)),
@@ -312,6 +389,11 @@ pub fn property_table(properties: &Value) -> String {
 
 pub fn document_links(doc: &Value) -> String {
     let mut body = String::from("<div class=\"endpoint-list resource-links\">");
+    // Relations are often advertised twice (short and registered URI form)
+    // with the same href, type and title; list such a pair once, under the
+    // first relation. Differently titled links to one resource (a tileset
+    // list offered as map and vector tilesets) each stay visible.
+    let mut listed: Vec<(&str, &str, &str)> = Vec::new();
     if let Some(links) = doc["links"].as_array() {
         for link in links {
             let href = link["href"].as_str().unwrap_or_default();
@@ -319,9 +401,17 @@ pub fn document_links(doc: &Value) -> String {
             if matches!(rel, "self" | "alternate") {
                 continue;
             }
+            let media = link["type"].as_str().unwrap_or_default();
+            let title = link["title"].as_str().unwrap_or_default();
+            if listed.contains(&(href, media, title)) {
+                continue;
+            }
+            listed.push((href, media, title));
             let label = link["title"].as_str().unwrap_or(rel);
-            let human = matches!(rel, "data" | "child" | "collection" | "conformance" | "up")
-                || rel == "items" && href.contains("/features/");
+            let human = matches!(
+                rel,
+                "data" | "child" | "collection" | "conformance" | "up" | "items"
+            );
             let target = if human {
                 with_format(href, "html")
             } else {
@@ -334,7 +424,7 @@ pub fn document_links(doc: &Value) -> String {
                 escape(href),
                 escape(rel),
                 escape(link["type"].as_str().unwrap_or("Linked resource")),
-                if rel == "map" { " · requires bbox; use the map controls to build a request" } else { "" }
+                if rel == "map" || rel == rel::MAP { " · requires bbox; use the map controls to build a request" } else { "" }
             ));
         }
     }
@@ -343,46 +433,30 @@ pub fn document_links(doc: &Value) -> String {
 }
 
 pub fn landing_html(
-    base: &str,
-    api: &str,
+    surface: Surface<'_>,
     title: &str,
     description: &str,
     links: &[LinkView],
 ) -> String {
     let doc = json!({"links":links.iter().map(|l|json!({"href":l.href,"rel":l.rel,"title":l.title})).collect::<Vec<_>>()});
-    landing_document(base, api, title, description, &doc)
+    landing_document(surface, title, description, &doc)
 }
 
 pub fn landing_document(
-    base: &str,
-    api: &str,
+    surface: Surface<'_>,
     title: &str,
     description: &str,
     doc: &Value,
 ) -> String {
-    let url = format!(
-        "{base}/{}?f=json",
-        if api.is_empty() {
-            String::new()
-        } else {
-            format!("{api}/")
-        }
-    );
-    let discovery = if api.is_empty() { "features" } else { api };
+    let Surface { base, root, api } = surface;
+    let url = format!("{root}/?f=json");
+    let discovery = root;
     let mut body = page_heading(title, description);
     body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resources</h2></div><div class=\"resource-table\">");
     for link in doc["links"].as_array().into_iter().flatten() {
         let rel = link["rel"].as_str().unwrap_or_default();
         let href = link["href"].as_str().unwrap_or_default();
-        let primary = if api.is_empty() {
-            rel == "child"
-                && APIS
-                    .iter()
-                    .any(|(id, _)| href.trim_end_matches('/').ends_with(&format!("/{id}")))
-        } else {
-            matches!(rel, "data" | "conformance" | "service-desc")
-        };
-        if !primary {
+        if !matches!(rel, "data" | "conformance" | "service-desc") {
             continue;
         }
         let target = if rel == "service-desc" {
@@ -399,22 +473,22 @@ pub fn landing_document(
         "edr" => "Open a collection to see its supported data queries and parameters. Choose a location, position or area query, then use the linked API reference to supply the required inputs.",
         "maps" => "Open a collection to see its map resources. Use the map preview to inspect the data, or the API reference to request an image for an area, time and style.",
         "tiles" => "Open a collection and follow its tileset links. Select a tile matrix set and tile coordinates to request map or vector tiles.",
+        crate::shared::WORKSPACE => "Open a collection to see every way to access it: map images, map tiles and vector tiles, as the collection offers them. The per-API services remain available below.",
         _ => "Choose an API and a collection first. Then request features, environmental values, map images or tiles using that collection's supported operations.",
     };
-    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{base}/{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,base=escape(base),arrow=icon("arrow")));
+    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
     body.push_str("<section class=\"section-space\"><div class=\"section-header\"><h2>API definitions &amp; resource links</h2></div>");
     body.push_str(&document_links(doc));
     body.push_str("</section>");
     Page {
-        base,
-        api,
+        surface,
         title,
         json_url: &url,
     }
     .render(&body, "")
 }
 
-pub fn conformance_html(base: &str, api: &str, classes: &[&str], nav: &[LinkView]) -> String {
+pub fn conformance_html(surface: Surface<'_>, classes: &[&str], nav: &[LinkView]) -> String {
     let url = nav
         .iter()
         .find(|l| l.rel == "alternate")
@@ -427,8 +501,7 @@ pub fn conformance_html(base: &str, api: &str, classes: &[&str], nav: &[LinkView
     }
     body.push_str("</ul>");
     Page {
-        base,
-        api,
+        surface,
         title: "Conformance classes",
         json_url: url,
     }
@@ -488,11 +561,42 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
     let raster = features.get("mapRequest");
     let mut controls = String::new();
     if let Some(request) = raster {
-        controls.push_str("<form id=\"map-controls\" class=\"map-controls enhanced\"><label>Style<select id=\"map-style\">");
+        controls.push_str("<form id=\"map-controls\" class=\"map-controls enhanced\">");
+        let modes: Vec<&str> = request["modes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        // Both Maps and Tiles serve this collection: let the viewer choose
+        // which one draws the preview.
+        if modes.len() > 1 {
+            controls.push_str("<fieldset class=\"map-mode\"><legend>Draw with</legend>");
+            for (i, (mode, label)) in [
+                ("maps", "Maps · one image per view"),
+                ("tiles", "Map tiles"),
+                ("vector", "Vector tiles"),
+            ]
+            .into_iter()
+            .filter(|(mode, _)| modes.contains(mode))
+            .enumerate()
+            {
+                controls.push_str(&format!(
+                    "<label><input type=\"radio\" name=\"map-mode\" value=\"{mode}\"{}> {label}</label>",
+                    if i == 0 { " checked" } else { "" }
+                ));
+            }
+            controls.push_str("</fieldset>");
+        }
+        controls.push_str(&format!(
+            "<label>Style<select id=\"map-style\" data-mode=\"{}\">",
+            escape(modes.first().copied().unwrap_or("maps"))
+        ));
         for style in request["styles"].as_array().into_iter().flatten() {
             controls.push_str(&format!(
-                "<option value=\"{}\" data-legend=\"{}\">{}</option>",
-                escape(safe_href(style["href"].as_str().unwrap_or_default())),
+                "<option value=\"{}\" data-tiles=\"{}\" data-legend=\"{}\">{}</option>",
+                escape(style["href"].as_str().map(safe_href).unwrap_or_default()),
+                escape(style["tiles"].as_str().map(safe_href).unwrap_or_default()),
                 escape(style["legend"].as_str().map(safe_href).unwrap_or_default()),
                 escape(style["title"].as_str().unwrap_or("Default"))
             ));
@@ -559,11 +663,11 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool) -> String {
 }
 
 pub fn collection_html(
-    base: &str,
-    api: &str,
+    surface: Surface<'_>,
     doc: &Value,
     license: Option<&LicenseConfig>,
 ) -> String {
+    let Surface { base, root, api } = surface;
     let title = doc["title"]
         .as_str()
         .filter(|title| !title.trim().is_empty())
@@ -576,40 +680,63 @@ pub fn collection_html(
         .and_then(|l| l["href"].as_str())
         .unwrap_or_default();
     let url = with_format(href, "json");
-    let catalog = format!("{base}/{api}/collections");
+    let catalog = format!("{root}/collections");
+    // Data access follows the advertised links, not the API the page is
+    // served by, so a collection offering several mechanisms shows each.
     let items = links
         .and_then(|ls| ls.iter().find(|l| l["rel"] == "items"))
-        .and_then(|l| l["href"].as_str())
-        .filter(|_| api == "features");
-    let map_request = if api == "maps" {
-        links.and_then(|ls| ls.iter().find(|l| l["rel"] == "map"))
-            .and_then(|l| l["href"].as_str())
-            .filter(|href| safe_href(href) != "#")
-            .map(|href| {
-                let legend = |style: &Value| style["links"].as_array()
-                    .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend"))
-                    .and_then(|l|l["href"].as_str()).filter(|href|safe_href(href) != "#")
-                    .map(str::to_owned);
-                let default_legend = doc["styles"].as_array()
-                    .and_then(|styles|styles.iter().find(|s|s["id"] == "default")).and_then(legend);
-                let mut styles = vec![json!({"title":"Collection default","href":href,"legend":default_legend})];
-                for style in doc["styles"].as_array().into_iter().flatten() {
-                    // The collection map endpoint already renders this style.
-                    if style["id"] == "default" { continue; }
-                    if let Some(href) = style["links"].as_array().and_then(|ls|ls.iter().find(|l|l["rel"]=="map")).and_then(|l|l["href"].as_str()).filter(|href|safe_href(href)!="#") {
-                        styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"legend":legend(style)}));
-                    }
-                }
-                json!({"styles":styles,"times":map_times(&doc["extent"]["temporal"]),"vertical":doc["extent"]["vertical"]})
-            })
-    } else {
-        None
-    };
+        .and_then(|l| l["href"].as_str());
+    // The preview draws with Maps (one image per view), map tiles and/or
+    // vector tiles (Web Mercator tilesets), whichever the collection
+    // advertises. Each style carries its own map link and map-tileset list
+    // when it has them; vector tiles are unstyled, one layer per collection.
+    let safe = |href: &&str| safe_href(href) != "#";
+    let map_href = links.and_then(|ls| map_link(ls)).filter(safe);
+    let tiles_href = links.and_then(|ls| map_tilesets_link(ls)).filter(safe);
+    let vector_href = links.and_then(|ls| vector_tilesets_link(ls)).filter(safe);
+    let map_request = (map_href.is_some() || tiles_href.is_some() || vector_href.is_some()).then(|| {
+        let legend = |style: &Value| style["links"].as_array()
+            .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend" || l["rel"] == rel::LEGEND))
+            .and_then(|l|l["href"].as_str()).filter(safe)
+            .map(str::to_owned);
+        let default_style = doc["styles"].as_array()
+            .and_then(|styles|styles.iter().find(|s|s["id"] == "default"));
+        let default_legend = default_style.and_then(legend);
+        let mut styles = vec![json!({"title":"Collection default","href":map_href,"tiles":tiles_href,"legend":default_legend})];
+        for style in doc["styles"].as_array().into_iter().flatten() {
+            // The collection map and tileset endpoints already render this style.
+            if style["id"] == "default" { continue; }
+            let style_links = style["links"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let href = map_link(style_links).filter(safe);
+            let tiles = map_tilesets_link(style_links).filter(safe);
+            if href.is_some() || tiles.is_some() {
+                styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"tiles":tiles,"legend":legend(style)}));
+            }
+        }
+        let modes: Vec<&str> = [map_href.map(|_| "maps"), tiles_href.map(|_| "tiles"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
+        json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"times":map_times(&doc["extent"]["temporal"]),"vertical":doc["extent"]["vertical"]})
+    });
     let kind = doc["itemType"]
         .as_str()
         .or(doc["dataType"].as_str())
         .unwrap_or("Environmental data");
-    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\"><span class=\"chip teal\">{}</span><span class=\"chip\">{}</span></div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(api),escape(kind),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()));
+    // One chip per OGC API the collection is available through. Its kind
+    // (`itemType`/`dataType`) is under "Collection details" as Resource; a
+    // `feature` chip beside a `Features` one only read as a duplicate.
+    let chips = api_chips(doc);
+    let api_chips = if chips.is_empty() {
+        format!("<span class=\"chip teal\">{}</span>", escape(api))
+    } else {
+        chips
+            .iter()
+            .map(|(label, class, description)| {
+                format!(
+                    "<span class=\"chip api-chip {class}\" title=\"{description}\">{label}</span>"
+                )
+            })
+            .collect()
+    };
+    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()));
     if let Some(items) = items {
         body.push_str(&anchor(&with_format(items, "html"), "Request data", ""));
     }
@@ -665,22 +792,37 @@ pub fn collection_html(
                 let target = if name == "instances" {
                     with_format(href, "html")
                 } else {
-                    format!("{base}/edr/api/docs")
+                    format!("{root}/api/docs")
                 };
                 body.push_str(&format!("<div class=\"endpoint\"><div><strong>{} query</strong><code>{}</code><p>{}</p></div>{}</div>",escape(name),escape(href),value_html(&query["link"]["variables"]["output_formats"]),anchor(&target,if name=="instances"{"Browse runs →"}else{"API docs ↗"},"btn small")));
             }
         }
         body.push_str("</div>");
     }
-    if api == "maps" {
+    if let Some(map_href) = map_href.filter(|_| map_request.is_some()) {
         body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
+        // Document the map request at the API serving the map link, which
+        // need not be the API rendering this page.
+        let map_api = map_href.split("/collections/").next().unwrap_or(root);
         body.push_str(&anchor(
-            &format!("{base}/maps/api/docs"),
+            &format!("{map_api}/api/docs"),
             "Map request parameters ↗",
             "btn",
         ));
-    } else if api == "tiles" {
-        body.push_str(&document_links(doc));
+    }
+    // Tilesets are listed whenever advertised, next to any map preview.
+    let tilesets: Vec<Value> = links
+        .into_iter()
+        .flatten()
+        .filter(|l| {
+            l["rel"]
+                .as_str()
+                .is_some_and(|r| r == "tiles" || r.starts_with(TILESETS_REL_PREFIX))
+        })
+        .cloned()
+        .collect();
+    if !tilesets.is_empty() {
+        body.push_str(&document_links(&json!({ "links": tilesets })));
     }
     body.push_str("</section></div><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Collection details</h2></div><div class=\"panel-body\"><dl class=\"definition\">");
     body.push_str(&format!(
@@ -709,7 +851,8 @@ pub fn collection_html(
         body.push_str("<span class=\"muted\">Not advertised</span>");
     }
     body.push_str("</div></div></div></section>");
-    if map_request.is_some() {
+    // Maps and map tiles have styled legends; vector tiles do not.
+    if map_href.is_some() || tiles_href.is_some() {
         body.push_str("<section class=\"panel enhanced\"><div class=\"panel-head\"><h2>Map legend</h2></div><div class=\"map-legend\"><span id=\"map-legend-status\">Legend will appear after the map loads.</span><a id=\"map-legend-link\" hidden><img id=\"map-legend-image\" alt=\"Selected map style legend\" hidden></a></div></section>");
     }
     body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
@@ -726,8 +869,7 @@ pub fn collection_html(
     body.push_str(&document_links(doc));
     body.push_str("</div></section></section>");
     Page {
-        base,
-        api,
+        surface,
         title,
         json_url: &url,
     }
@@ -1036,15 +1178,15 @@ fn collection_facts(doc: &Value) -> String {
 }
 
 pub fn collections_html(
-    url: &str,
+    surface: Surface<'_>,
     query: &SearchQueryParams,
     search: &SearchParams,
     matched: usize,
     docs: &[CollectionView<'_>],
     nav: &[LinkView],
 ) -> String {
-    let api_root = url.strip_suffix("/collections").unwrap_or(url);
-    let (base, api) = api_root.rsplit_once('/').unwrap_or(("", api_root));
+    let api = surface.api;
+    let url = &format!("{}/collections", surface.root);
     let json_url = format!(
         "{url}{}",
         query.query_string_with_format(search.limit, search.offset, "json")
@@ -1212,8 +1354,7 @@ pub fn collections_html(
     body.push_str(&pagination(nav));
     body.push_str("</div></section></div>");
     Page {
-        base,
-        api,
+        surface,
         title: "Collections",
         json_url: &json_url,
     }
@@ -1250,7 +1391,7 @@ pub fn pagination(nav: &[LinkView]) -> String {
 
 /// Model-run navigation uses the same shell without claiming collection search.
 pub fn instances_html(
-    base: &str,
+    surface: Surface<'_>,
     title: &str,
     cards: &[ds_core::html::CollectionCard],
     nav: &[LinkView],
@@ -1282,8 +1423,7 @@ pub fn instances_html(
     }
     body.push_str("</div>");
     Page {
-        base,
-        api: "edr",
+        surface,
         title,
         json_url: url,
     }
@@ -1301,6 +1441,26 @@ pub fn instances_html(
 mod tests {
     use super::*;
 
+    const MAPS_PROXY: Surface<'static> = Surface {
+        base: "https://example.test/proxy",
+        root: "https://example.test/proxy/maps",
+        api: "maps",
+    };
+
+    /// Render a collection page for an API at its per-API mount below `base`.
+    fn collection(base: &str, api: &str, doc: &Value, license: Option<&LicenseConfig>) -> String {
+        let root = format!("{base}/{api}");
+        collection_html(
+            Surface {
+                base,
+                root: &root,
+                api,
+            },
+            doc,
+            license,
+        )
+    }
+
     #[test]
     fn catalog_empty_page_keeps_filters_and_does_not_claim_zero_matches() {
         let query = SearchQueryParams::from_pairs(vec![
@@ -1312,7 +1472,7 @@ mod tests {
         .unwrap();
         let search = query.parse().unwrap();
         let url = "https://example.test/proxy/maps/collections";
-        let html = collections_html(url, &query, &search, 3, &[], &[]);
+        let html = collections_html(MAPS_PROXY, &query, &search, 3, &[], &[]);
         assert!(html.contains("3 matching collections"));
         assert!(html.contains("This page is outside the results."));
         assert!(html.contains("No page at offset 1000"));
@@ -1321,7 +1481,7 @@ mod tests {
         assert!(!html.contains("No collections match these filters."));
         let first = format!("{url}{}", query.query_string_with_format(12, 0, "html"));
         assert!(html.contains(&format!("href=\"{}\">Go to first page", escape(&first))));
-        let empty = collections_html(url, &query, &search, 0, &[], &[]);
+        let empty = collections_html(MAPS_PROXY, &query, &search, 0, &[], &[]);
         assert!(empty.contains("No collections match these filters."));
         assert!(empty.contains("0 results"));
         assert!(!empty.contains("Go to first page"));
@@ -1377,7 +1537,7 @@ mod tests {
                 {"rel":"map","href":"https://example.test/maps/collections/levels/map"}]});
             assert!(collection_facts(&doc).contains("Vertical dimension"));
             for api in ["edr", "maps", "tiles"] {
-                let html = collection_html("https://example.test", api, &doc, None);
+                let html = collection("https://example.test", api, &doc, None);
                 let overview = html.split("id=\"metadata\"").next().unwrap();
                 assert!(overview.contains("Vertical dimension"));
                 assert!(overview.contains("Available levels · z"));
@@ -1396,7 +1556,7 @@ mod tests {
             json!({"id":"single","links":[{"rel":"map","href":"/maps/collections/single/map"}]});
         assert!(!collection_facts(&doc).contains("Vertical dimension"));
         // The script contains the selector name, so assert the actual element.
-        assert!(!collection_html("", "maps", &doc, None).contains("id=\"map-level\""));
+        assert!(!collection("", "maps", &doc, None).contains("id=\"map-level\""));
         let malicious = json!({"interval":[[0,1]],"values":[0,"<script>","NaN",1],"unit":"<img onerror=alert(1)>"});
         assert!(!vertical_coverage(&malicious).contains("<img"));
         assert!(vertical_coverage(&malicious).contains("&lt;img"));
@@ -1415,7 +1575,7 @@ mod tests {
             title: "Use with attribution".into(),
             url: None,
         };
-        let html = collection_html(base, "maps", &doc, Some(&license));
+        let html = collection(base, "maps", &doc, Some(&license));
         let crumbs = html
             .split("id=\"breadcrumbs\"")
             .nth(1)
@@ -1480,7 +1640,7 @@ mod tests {
             {"rel":"self","href":format!("{base}/maps/collections/a")},
             {"rel":"map","href":format!("{base}/maps/collections/a/map")}
         ],"styles":[{"title":"Rain & snow","links":[{"rel":"map","href":format!("{base}/maps/collections/a/styles/rain/map")}]},{"title":"Unsafe","links":[{"rel":"map","href":"javascript:alert(1)"}]}]});
-        let html = collection_html(base, "maps", &doc, None);
+        let html = collection(base, "maps", &doc, None);
         let data = html
             .split("id=\"map-data\" hidden>")
             .nth(1)
@@ -1503,14 +1663,204 @@ mod tests {
         assert!(html.contains(&format!(
             "id=\"json-link\" href=\"{base}/maps/collections/a?f=json\""
         )));
-        assert!(!collection_html(base, "features", &doc, None).contains("id=\"map-controls\""));
+        // The preview follows the advertised map link, whichever API serves the page.
+        assert!(collection(base, "features", &doc, None).contains("id=\"map-controls\""));
+        let mut no_map = doc.clone();
+        no_map["links"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|l| l["rel"] != "map");
+        assert!(!collection(base, "maps", &no_map, None).contains("id=\"map-controls\""));
+    }
+
+    #[test]
+    fn navigation_and_map_docs_follow_the_serving_and_linked_apis() {
+        let base = "https://example.test";
+        let doc = json!({"id":"a","links":[
+            {"rel":"self","href":"https://example.test/features/collections/a"},
+            {"rel":rel::MAP,"href":"https://example.test/maps/collections/a/map"}]});
+        // A page served at a relocated mount keeps its own API root active.
+        let html = collection_html(
+            Surface {
+                base,
+                root: "https://example.test/relocated/features",
+                api: "features",
+            },
+            &doc,
+            None,
+        );
+        assert!(html.contains("value=\"https://example.test/relocated/features/?f=html\" selected"));
+        assert!(html.contains("value=\"https://example.test/maps/?f=html\""));
+        // Map request parameters are documented by the API serving the map.
+        assert!(html.contains("href=\"https://example.test/maps/api/docs\">Map request parameters"));
+    }
+
+    #[test]
+    fn request_section_lists_tilesets_next_to_the_map_preview() {
+        let doc = json!({"id":"a","links":[
+            {"rel":"self","href":"https://x/collections/a"},
+            {"rel":rel::MAP,"href":"https://x/collections/a/map"},
+            {"rel":rel::TILESETS_MAP,"href":"https://x/collections/a/map/tiles","type":"application/json","title":"Map tilesets"},
+            {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/a/tiles","type":"application/json","title":"Vector tilesets"}]});
+        let surface = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let html = collection_html(surface, &doc, None);
+        let request = html
+            .split("<h2>Request data from this collection</h2>")
+            .nth(1)
+            .unwrap()
+            .split("</section>")
+            .next()
+            .unwrap();
+        assert!(request.contains("Map request parameters"));
+        assert!(request.contains("https://x/collections/a/map/tiles"));
+        assert!(request.contains("https://x/collections/a/tiles"));
+    }
+
+    /// The heading lists every OGC API the collection advertises, from its
+    /// links rather than from the API serving the page.
+    #[test]
+    fn heading_chips_name_every_advertised_api() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let chips = |doc: &Value| {
+            let html = collection_html(shared, doc, None);
+            let row = html
+                .split("aria-label=\"Available through\">")
+                .nth(1)
+                .unwrap()
+                .split("</div>")
+                .next()
+                .unwrap()
+                .to_owned();
+            ["Maps", "Tiles", "Features", "EDR", crate::shared::WORKSPACE]
+                .into_iter()
+                .filter(|label| row.contains(&format!(">{label}</span>")))
+                .collect::<Vec<_>>()
+        };
+        let all = json!({"id":"a","links":[
+            {"rel":"self","href":"https://x/collections/a"},
+            {"rel":rel::MAP,"href":"https://x/collections/a/map"},
+            {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/a/tiles"},
+            {"rel":"items","href":"https://x/collections/a/items","type":"application/geo+json"}]});
+        assert_eq!(chips(&all), ["Maps", "Tiles", "Features"]);
+        let features = json!({"id":"b","itemType":"feature","links":[
+            {"rel":"items","href":"https://x/collections/b/items","type":"application/geo+json"}]});
+        assert_eq!(chips(&features), ["Features"]);
+        // The kind is a detail row, not a second "feature" chip.
+        let html = collection_html(shared, &features, None);
+        let row = html
+            .split("aria-label=\"Available through\">")
+            .nth(1)
+            .unwrap();
+        assert!(!row.split("</div>").next().unwrap().contains(">feature<"));
+        assert!(html.contains("<dt>Resource</dt><dd>feature</dd>"));
+        let edr = json!({"id":"c","links":[],"data_queries":{"position":{}}});
+        assert_eq!(chips(&edr), ["EDR"]);
+        // Nothing advertised: the serving API still labels the page.
+        assert_eq!(
+            chips(&json!({"id":"d","links":[]})),
+            [crate::shared::WORKSPACE]
+        );
+    }
+
+    /// With both Maps and Tiles (and vector tiles) the preview offers a choice
+    /// of what draws it; each style carries its own map-tileset list.
+    #[test]
+    fn map_preview_offers_maps_map_tiles_and_vector_tiles() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let doc = json!({"id":"cap","extent":{"spatial":{"bbox":[[20,60,30,70]]}},
+            "links":[
+                {"rel":"self","href":"https://x/collections/cap"},
+                {"rel":rel::MAP,"href":"https://x/collections/cap/map"},
+                {"rel":rel::TILESETS_MAP,"href":"https://x/collections/cap/map/tiles"},
+                {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/cap/tiles"}],
+            "styles":[{"id":"severity","title":"Severity","links":[
+                {"rel":rel::MAP,"href":"https://x/collections/cap/styles/severity/map"},
+                {"rel":rel::TILESETS_MAP,"href":"https://x/collections/cap/styles/severity/map/tiles"}]}]});
+        let html = collection_html(shared, &doc, None);
+        for mode in ["maps", "tiles", "vector"] {
+            assert!(
+                html.contains(&format!("name=\"map-mode\" value=\"{mode}\"")),
+                "{mode}"
+            );
+        }
+        assert!(html.contains("value=\"maps\" checked"));
+        assert!(html.contains("data-tiles=\"https://x/collections/cap/map/tiles\""));
+        assert!(html.contains("data-tiles=\"https://x/collections/cap/styles/severity/map/tiles\""));
+        let data = html.split("id=\"map-data\" hidden>").nth(1).unwrap();
+        let data: Value =
+            serde_json::from_str(&data.split("</div>").next().unwrap().replace("&quot;", "\""))
+                .unwrap();
+        assert_eq!(
+            data["mapRequest"]["modes"],
+            json!(["maps", "tiles", "vector"])
+        );
+        assert_eq!(
+            data["mapRequest"]["vector"],
+            json!({"href":"https://x/collections/cap/tiles","layer":"cap"})
+        );
+
+        // One mechanism: no switch. Map tiles alone still get a preview.
+        let mut maps_only = doc.clone();
+        maps_only["links"].as_array_mut().unwrap().truncate(2);
+        let html = collection_html(shared, &maps_only, None);
+        assert!(html.contains("id=\"map-controls\""));
+        // (The inlined map script names the input too; check the switch itself.)
+        assert!(!html.contains("<fieldset class=\"map-mode\">"));
+        let mut tiles_only = doc.clone();
+        tiles_only["links"].as_array_mut().unwrap().remove(1);
+        tiles_only["links"].as_array_mut().unwrap().truncate(2);
+        tiles_only["styles"] = json!([]);
+        let html = collection_html(shared, &tiles_only, None);
+        assert!(html.contains("id=\"map-controls\""));
+        assert!(html.contains("data-mode=\"tiles\""));
+        // (The inlined map script names the input too; check the switch itself.)
+        assert!(!html.contains("<fieldset class=\"map-mode\">"));
+    }
+
+    #[test]
+    fn resource_links_list_each_target_once() {
+        let tiles = "https://x/tiles/collections/a/tiles";
+        let doc = json!({"links":[
+            {"rel":"conformance","href":"https://x/maps/conformance","type":"application/json","title":"Conformance"},
+            {"rel":rel::CONFORMANCE,"href":"https://x/maps/conformance","type":"application/json","title":"Conformance"},
+            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/png"},
+            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/jpeg"},
+            {"rel":"tiles","href":tiles,"type":"application/json","title":"Tilesets"},
+            {"rel":rel::TILESETS_MAP,"href":tiles,"type":"application/json","title":"Map tilesets"},
+            {"rel":rel::TILESETS_VECTOR,"href":tiles,"type":"application/json","title":"Vector tilesets"}
+        ]});
+        let html = document_links(&doc);
+        assert_eq!(html.matches("maps/conformance?f=html").count(), 1);
+        assert!(!html.contains(rel::CONFORMANCE));
+        // Distinct representations of one resource remain separate entries.
+        assert_eq!(html.matches("image/").count(), 2);
+        // Differently titled offers of one resource keep their relations.
+        for title in ["Tilesets", "Map tilesets", "Vector tilesets"] {
+            assert!(
+                html.contains(&format!("<strong>{title}</strong>")),
+                "{title}"
+            );
+        }
+        assert!(html.contains(rel::TILESETS_VECTOR));
     }
 
     #[test]
     fn shell_and_metadata_escape_content_and_retain_proxy_prefix() {
         let attack = "</script><script>alert(1)</script>";
         let doc = json!({"id":"a","title":attack,"description":attack,"custom":{"nested":attack},"links":[{"rel":"self","href":"https://example.test/prefix/maps/collections/a"},{"rel":"license","href":"javascript:alert(1)","title":attack}]});
-        let html = collection_html("https://example.test/prefix", "maps", &doc, None);
+        let html = collection("https://example.test/prefix", "maps", &doc, None);
         assert!(!html.contains(attack));
         assert!(html.contains(&escape(attack)));
         assert!(!html.contains("href=\"javascript:"));

@@ -59,10 +59,8 @@ pub(crate) fn poll_runtime() -> &'static tokio::runtime::Handle {
 use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::middleware;
-use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Json, Router, ServiceExt};
-use serde_json::json;
+use axum::{Router, ServiceExt};
 use tokio::signal;
 use tower::Layer;
 use tower_http::compression::CompressionLayer;
@@ -774,28 +772,41 @@ async fn main() {
         }
     }
 
-    let root_state = server_state.clone();
+    // The shared OGC API root (#789): Maps, Tiles and Features as building
+    // blocks over the per-API services' own state, so reloads reach both
+    // surfaces. Block order is field precedence for a collection several
+    // blocks describe (api-common CLAUDE.md).
+    let shared_api = api_common::shared::SharedApi::new(
+        "",
+        vec![
+            Arc::new(api_maps::MapsBlock::new(maps_swap.clone())),
+            Arc::new(api_tiles::TilesBlock::new(tiles_swap.clone())),
+            Arc::new(api_features::FeaturesBlock::new(features_swap.clone())),
+        ],
+        related_services(),
+    );
 
     // Public routes get permissive CORS (OGC APIs, health, metrics)
     let mut public = Router::new()
-        .route(
-            "/",
-            get(
-                move |axum::extract::Query(format): axum::extract::Query<
-                    ds_core::html::FormatParams,
-                >,
-                      headers: axum::http::HeaderMap| {
-                    root_landing_page(root_state.clone(), format, headers)
-                },
-            ),
-        )
+        .merge(api_common::shared::router(shared_api))
         .nest("/edr", api_edr::router(edr_swap.clone()))
-        .nest("/features", api_features::router(features_swap.clone()))
+        .nest(
+            api_common::mounts::FEATURES,
+            api_features::router(features_swap.clone()),
+        )
         .nest("/wms", api_wms::router(wms_swap.clone()))
-        .nest("/maps", api_maps::router(maps_swap.clone()))
-        .nest("/tiles", api_tiles::router(tiles_swap.clone()))
+        .nest(
+            api_common::mounts::MAPS,
+            api_maps::router(maps_swap.clone()),
+        )
+        .nest(
+            api_common::mounts::TILES,
+            api_tiles::router(tiles_swap.clone()),
+        )
         .nest("/3dtiles", api_3dtiles::router(tiles_3d_swap.clone()))
-        // Trailing-slash variants so /edr/, /features/, /maps/, /tiles/, /3dtiles/ also work
+        // Trailing-slash variants for /edr/ and /3dtiles/. Maps, Tiles and
+        // Features need none: `NormalizePathLayer` below trims the slash before
+        // routing, and their handlers require the router's `Mount` extension.
         .route(
             "/3dtiles/",
             get(api_3dtiles::handlers::landing_page).with_state(tiles_3d_swap),
@@ -803,18 +814,6 @@ async fn main() {
         .route(
             "/edr/",
             get(api_edr::handlers::landing_page).with_state(edr_swap),
-        )
-        .route(
-            "/features/",
-            get(api_features::handlers::landing_page).with_state(features_swap),
-        )
-        .route(
-            "/maps/",
-            get(api_maps::handlers::landing_page).with_state(maps_swap),
-        )
-        .route(
-            "/tiles/",
-            get(api_tiles::handlers::landing_page).with_state(tiles_swap),
         )
         .route(
             "/health",
@@ -974,158 +973,38 @@ async fn shutdown_signal() {
     }
 }
 
-async fn root_landing_page(
-    state: AdminState,
-    format: ds_core::html::FormatParams,
-    headers: axum::http::HeaderMap,
-) -> axum::response::Response {
-    let wanted = match ds_core::html::negotiate(
-        format.f.as_deref(),
-        headers
-            .get(axum::http::header::ACCEPT)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        Ok(wanted) => wanted,
-        Err(error) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({"code":"BadRequest", "description":error.to_string()})),
-            )
-                .into_response()
+/// Services outside the shared OGC API, linked from its landing page: the
+/// per-API OGC API services, WMS, 3D Tiles and operational endpoints.
+fn related_services() -> Vec<api_common::shared::RelatedLink> {
+    let link = |path: &str, rel: &'static str, media_type: &'static str, title: &str| {
+        api_common::shared::RelatedLink {
+            path: path.to_string(),
+            rel,
+            media_type,
+            title: title.to_string(),
         }
     };
-    let edr_state = state.edr.load_full();
-    let base = &ds_core::proxy::resolve_base_url(
-        &edr_state.base_url,
-        edr_state.trust_proxy_headers,
-        |name| headers.get(name).and_then(|v| v.to_str().ok()),
-    );
-    let document = json!({
-        "title": "MeteoCore",
-        "description": "Metocean Data Server implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0",
-        "links": [
-            {
-                "href": format!("{base}/"),
-                "rel": "self",
-                "type": "application/json",
-                "title": "This document"
-            },
-            {
-                "href": format!("{base}/edr/"),
-                "rel": "child",
-                "type": "application/json",
-                "title": "EDR API"
-            },
-            {
-                "href": format!("{base}/edr/api"),
-                "rel": "service-desc",
-                "type": "application/vnd.oai.openapi+json;version=3.0",
-                "title": "EDR API definition"
-            },
-            {
-                "href": format!("{base}/edr/api/docs"),
-                "rel": "service-doc",
-                "type": "text/html",
-                "title": "EDR API documentation"
-            },
-            {
-                "href": format!("{base}/features/"),
-                "rel": "child",
-                "type": "application/json",
-                "title": "Features API"
-            },
-            {
-                "href": format!("{base}/features/api"),
-                "rel": "service-desc",
-                "type": "application/vnd.oai.openapi+json;version=3.0",
-                "title": "Features API definition"
-            },
-            {
-                "href": format!("{base}/features/api/docs"),
-                "rel": "service-doc",
-                "type": "text/html",
-                "title": "Features API documentation"
-            },
-            {
-                "href": format!("{base}/wms?SERVICE=WMS&REQUEST=GetCapabilities"),
-                "rel": "service-desc",
-                "type": "text/xml",
-                "title": "WMS 1.3.0 Capabilities"
-            },
-            {
-                "href": format!("{base}/maps/"),
-                "rel": "child",
-                "type": "application/json",
-                "title": "Maps API"
-            },
-            {
-                "href": format!("{base}/maps/api"),
-                "rel": "service-desc",
-                "type": "application/vnd.oai.openapi+json;version=3.0",
-                "title": "Maps API definition"
-            },
-            {
-                "href": format!("{base}/maps/api/docs"),
-                "rel": "service-doc",
-                "type": "text/html",
-                "title": "Maps API documentation"
-            },
-            {
-                "href": format!("{base}/tiles/"),
-                "rel": "child",
-                "type": "application/json",
-                "title": "Tiles API"
-            },
-            {
-                "href": format!("{base}/tiles/api"),
-                "rel": "service-desc",
-                "type": "application/vnd.oai.openapi+json;version=3.0",
-                "title": "Tiles API definition"
-            },
-            {
-                "href": format!("{base}/tiles/api/docs"),
-                "rel": "service-doc",
-                "type": "text/html",
-                "title": "Tiles API documentation"
-            },
-            {
-                "href": format!("{base}/3dtiles/"),
-                "rel": "child",
-                "type": "application/json",
-                "title": "3D Tiles API"
-            },
-            {
-                "href": format!("{base}/health"),
-                "rel": "health",
-                "type": "application/json",
-                "title": "Health status"
-            },
-            {
-                "href": format!("{base}/metrics"),
-                "rel": "metrics",
-                "type": "text/plain",
-                "title": "Prometheus metrics"
-            }
-        ]
-    });
-    let mut response = match wanted {
-        ds_core::html::Wanted::Json => Json(document).into_response(),
-        ds_core::html::Wanted::Html => {
-            axum::response::Html(api_common::workbench::landing_document(
-                base,
-                "",
-                "MeteoCore API",
-                document["description"].as_str().unwrap_or_default(),
-                &document,
-            ))
-            .into_response()
-        }
-    };
-    response.headers_mut().append(
-        axum::http::header::VARY,
-        axum::http::HeaderValue::from_static("accept"),
-    );
-    response
+    let json = "application/json";
+    vec![
+        link("/edr/", "child", json, "EDR API"),
+        link(
+            "/features/",
+            "child",
+            json,
+            "Features API (per-API service)",
+        ),
+        link("/maps/", "child", json, "Maps API (per-API service)"),
+        link("/tiles/", "child", json, "Tiles API (per-API service)"),
+        link("/3dtiles/", "child", json, "3D Tiles API"),
+        link(
+            "/wms?SERVICE=WMS&REQUEST=GetCapabilities",
+            "related",
+            "text/xml",
+            "WMS 1.3.0 Capabilities",
+        ),
+        link("/health", "health", json, "Health status"),
+        link("/metrics", "metrics", "text/plain", "Prometheus metrics"),
+    ]
 }
 
 #[cfg(test)]

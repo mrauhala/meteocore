@@ -241,9 +241,16 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   ds-render for
   api-wms/api-maps, and api-edr for its `f=png` time-series plots — never on
   engine crates. API state is a registry of engines keyed by collection ID.
-- **EDR, Features, Maps, Tiles, and WMS are separate services** with separate
-  base routes (`/edr/...`, `/features/...`, `/maps/...`, `/tiles/...`,
-  `/wms/...`).
+- **The shared OGC API root at `/` (#789)** composes OGC API standards as
+  `api_common::shared::BuildingBlock`s — Maps, Tiles and Features — over one
+  landing page, conformance, OpenAPI document and collection catalog. Blocks
+  reuse their per-API service's state (no second registry). Every standard is
+  also its own per-API service with its own base route (`/edr/...`,
+  `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`); build Maps, Tiles
+  and Features links from the router's `Mount`, never a hard-coded prefix.
+  EDR stays at `/edr` only (EDR 1.1 requires every `/collections` entry to be
+  an EDR collection; #789 Phase 3). See
+  `crates/api-common/CLAUDE.md` for the composition rules.
 - **Collection routing is dynamic.** Handlers look up engines from a
   `HashMap<String, Arc<dyn …Engine>>` by collection ID from the URL path.
   Never hardcode collection IDs.
@@ -312,7 +319,9 @@ Same pattern for api-edr, api-features, api-maps, api-tiles:
 1. Add the handler in `handlers.rs`, the route in `lib.rs`, new query params
    in `params.rs`, new response formats in `response.rs`.
 2. **Always update `api_definition()` in `handlers.rs`** so the OpenAPI spec
-   includes the new path.
+   includes the new path. Tag every operation — with its collection id, or an
+   `api_common::openapi_tags` group — or Swagger UI files it under "default"
+   (enforced by `common_discovery`).
 3. **An unknown query parameter must not be silently ignored.** serde drops
    unrecognized fields, so a parameter that is parsed but never validated
    returns 200 having done nothing — indistinguishable from success at the

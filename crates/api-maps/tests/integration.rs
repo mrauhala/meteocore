@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -172,11 +172,19 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
+        map_tileset_ids: Default::default(),
     }));
     api_maps::router(state)
 }
 
+/// `apis` is the collection config; the Tiles service registers the
+/// collection for raster tiles exactly when `apis` lists it, as at load time.
 fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
+    let map_tilesets = apis.iter().any(|a| a == "tiles");
+    build_router_with_tilesets(apis, map_tilesets)
+}
+
+fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Router {
     let engine: Arc<dyn MapEngine> = Arc::new(MockMapEngine::new());
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -252,6 +260,11 @@ fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
+        map_tileset_ids: if map_tilesets {
+            HashSet::from(["radar".to_string()])
+        } else {
+            HashSet::new()
+        },
     }));
     api_maps::router(state)
 }
@@ -327,6 +340,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
+        map_tileset_ids: Default::default(),
     }));
     let (_, json) = get_on(api_maps::router(state), &format!("/collections/{id}")).await;
     json
@@ -376,6 +390,7 @@ fn router_with(
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
+        map_tileset_ids: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -681,8 +696,8 @@ mod collections {
         let c = &json["collections"][0];
         let links = c["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "self"));
-        assert!(links.iter().any(|l| l["rel"] == "map"));
-        assert!(links.iter().any(|l| l["rel"] == "styles"));
+        assert!(links.iter().any(|l| l["rel"] == api_common::rel::MAP));
+        assert!(links.iter().any(|l| l["rel"] == api_common::rel::STYLES));
     }
 
     #[tokio::test]
@@ -746,6 +761,49 @@ mod collections {
         let (_, json) = get("/collections/radar").await;
         let links = json["links"].as_array().unwrap();
         assert!(!links
+            .iter()
+            .any(|l| l["rel"] == "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map"));
+    }
+
+    #[tokio::test]
+    async fn collection_links_carry_registered_relations() {
+        // Maps Req 46 (collection → map), Req 53 (styled maps) and the legend
+        // recommendation name registered relations; the Maps test suite only
+        // finds maps through them. The unregistered short forms are gone.
+        let (_, json) = get("/collections/radar").await;
+        let href = |links: &Value, rel: &str| {
+            links
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["rel"] == rel)
+                .map(|l| l["href"].as_str().unwrap().to_owned())
+        };
+        let links = &json["links"];
+        assert!(href(links, api_common::rel::MAP).is_some());
+        assert!(href(links, api_common::rel::STYLES).is_some());
+        assert_eq!(href(links, "map"), None);
+        assert_eq!(href(links, "styles"), None);
+        let styles = json["styles"].as_array().unwrap();
+        assert!(!styles.is_empty());
+        for style in styles {
+            let links = &style["links"];
+            assert!(href(links, api_common::rel::MAP).is_some());
+            assert!(href(links, api_common::rel::LEGEND).is_some());
+            assert_eq!(href(links, "map"), None);
+            assert_eq!(href(links, "legend"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_omits_tilesets_map_link_when_tiles_did_not_register_it() {
+        // `apis` may list tiles for a collection the Tiles service does not
+        // render as map tiles; the link must follow the Tiles registry (#789).
+        let app = build_router_with_tilesets(vec!["maps".into(), "tiles".into()], false);
+        let (_, json) = get_on(app, "/collections/radar").await;
+        assert!(!json["links"]
+            .as_array()
+            .unwrap()
             .iter()
             .any(|l| l["rel"] == "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map"));
     }
@@ -823,7 +881,7 @@ mod styles_endpoint {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|l| l["rel"] == "legend")
+                .find(|l| l["rel"] == api_common::rel::LEGEND)
                 .unwrap_or_else(|| panic!("style {id} has no legend link"));
             assert_eq!(
                 legend["href"],
@@ -842,7 +900,7 @@ mod styles_endpoint {
             let id = style["id"].as_str().unwrap();
             assert!(
                 style["links"].as_array().unwrap().iter().any(|l| {
-                    l["rel"] == "legend"
+                    l["rel"] == api_common::rel::LEGEND
                         && l["href"] == format!("/maps/collections/radar/styles/{id}/legend")
                 }),
                 "style {id} in collection metadata has no legend link"
@@ -1454,6 +1512,7 @@ fn build_empty_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
+        map_tileset_ids: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -1583,6 +1642,7 @@ fn build_multi_param_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
+        map_tileset_ids: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -1716,8 +1776,14 @@ mod vertical_extent {
         // OGC API Common Part 2 additive form.
         assert_eq!(v["unit"], "deg");
         assert_eq!(v["grid"]["coordinates"], serde_json::json!([0.5, 1.5, 5.0]));
-        // vrs is intentionally omitted for radar elevation angle.
-        assert!(v.get("vrs").is_none());
+        // A Uniform Additional Dimension needs a reference system and a grid
+        // cell count (Common Part 2); radar elevation angle has no registered
+        // URI, so its vrs is the inline WKT2 EDR also advertises.
+        assert_eq!(
+            v["vrs"],
+            ds_core::vertical::VerticalKind::ElevationAngle.vrs()
+        );
+        assert_eq!(v["grid"]["cellsCount"], 3);
     }
 
     /// A `VerticalDimension` with no levels must not emit `"interval": null`
@@ -2010,6 +2076,7 @@ mod searchable {
             rendered_cache: Arc::new(RenderedCache::new(16)),
             base_url: String::new(),
             trust_proxy_headers: false,
+            map_tileset_ids: Default::default(),
         }));
         api_maps::router(state)
     }
@@ -2481,6 +2548,7 @@ fn build_router_with_styles(styles: HashMap<String, HashMap<String, StyleInfo>>)
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
+        map_tileset_ids: Default::default(),
     }));
     api_maps::router(state)
 }

@@ -1,13 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use axum::Extension;
 use axum::Json;
 use serde_json::json;
 
+use api_common::workbench::Surface;
+use api_common::{mounts, rel, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::map_engine::MapEngine;
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
@@ -29,13 +32,17 @@ pub struct MapsState {
     pub base_url: String,
     /// Honour reverse-proxy forwarding headers when generating self-links (#12).
     pub trust_proxy_headers: bool,
+    /// Collections the Tiles service renders as map tiles. The `tilesets-map`
+    /// link is advertised only for these, so it never names a tileset list
+    /// that does not exist (`apis` alone cannot tell, #789).
+    pub map_tileset_ids: HashSet<String>,
 }
 
 pub type AppState = Arc<ArcSwap<MapsState>>;
 
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
-fn request_base_url(state: &MapsState, headers: &HeaderMap) -> String {
+pub(crate) fn request_base_url(state: &MapsState, headers: &HeaderMap) -> String {
     ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
         headers.get(name).and_then(|v| v.to_str().ok())
     })
@@ -132,28 +139,34 @@ fn with_vary(mut resp: Response) -> Response {
 
 /// The link entries advertised for one style: the styled-map endpoint and the
 /// machine-readable legend. One builder so the `/collections/{id}` and
-/// `/collections/{id}/styles` representations can't drift.
-fn style_links(collection_id: &str, style_name: &str, base_url: &str) -> serde_json::Value {
+/// `/collections/{id}/styles` representations can't drift. `root` is the
+/// absolute API root (base URL + mount).
+///
+/// Relations are the registered OGC ones only (Maps Req 53 styled-map links,
+/// the legend recommendation): the short `map`/`legend` forms were dropped once
+/// no client depended on them (a bare unregistered relation type is not an
+/// RFC 8288 extension relation).
+fn style_links(collection_id: &str, style_name: &str, root: &str) -> serde_json::Value {
+    let map = format!("{root}/collections/{collection_id}/styles/{style_name}/map");
+    let legend = format!("{root}/collections/{collection_id}/styles/{style_name}/legend");
     json!([
-        {
-            "href": format!("{base_url}/maps/collections/{collection_id}/styles/{style_name}/map"),
-            "rel": "map",
-            "type": "image/png"
-        },
-        {
-            "href": format!("{base_url}/maps/collections/{collection_id}/styles/{style_name}/legend"),
-            "rel": "legend",
-            "type": "application/json"
-        }
+        {"href": map, "rel": rel::MAP, "type": "image/png"},
+        {"href": legend, "rel": rel::LEGEND, "type": "application/json"}
     ])
 }
 
-fn build_collection_metadata(
+/// Maps' description of a collection: its standard fields and data-access
+/// links (map, styles), without the `self` link. Shared by the per-API
+/// service and the shared OGC API root (#789).
+pub(crate) fn collection_parts(
     config: &CollectionConfig,
     info: &ds_core::map_engine::RasterInfo,
     styles: Option<&HashMap<String, StyleInfo>>,
-    base_url: &str,
-) -> serde_json::Value {
+    root: &str,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<serde_json::Value>,
+) {
     let mut crs_list: Vec<&str> = params::supported_crs_list().to_vec();
     // Deduplicate
     crs_list.dedup();
@@ -186,69 +199,77 @@ fn build_collection_metadata(
                 style_list.push(json!({
                     "id": s.name,
                     "title": s.title,
-                    "links": style_links(&config.id, &s.name, base_url)
+                    "links": style_links(&config.id, &s.name, root)
                 }));
             }
         }
     }
 
-    let mut links = vec![
+    let links = vec![
+        // The registered relation Maps Req 46 requires (and the Maps test
+        // suite looks for); `…/styles` is the Styles draft's.
         json!({
-            "href": format!("{base_url}/maps/collections/{}", config.id),
-            "rel": "self",
-            "type": "application/json",
-            "title": config.title
-        }),
-        json!({
-            "href": format!("{base_url}/maps/collections/{}/map", config.id),
-            "rel": "map",
+            "href": format!("{root}/collections/{}/map", config.id),
+            "rel": rel::MAP,
             "type": "image/png",
             "title": "Map"
         }),
         json!({
-            "href": format!("{base_url}/maps/collections/{}/styles", config.id),
-            "rel": "styles",
+            "href": format!("{root}/collections/{}/styles", config.id),
+            "rel": rel::STYLES,
             "type": "application/json",
             "title": "Styles"
         }),
     ];
 
-    // Map tilesets — rendered (raster) tiles are an OGC API Maps "map
-    // tileset", discoverable from the maps collection via the `tilesets-map`
-    // relation. Only advertise it when the operator exposed this collection
-    // through the Tiles API (the standalone `/tiles` router still serves it).
-    if config.apis.iter().any(|a| a == "tiles") {
-        links.push(json!({
-            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
-            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map",
-            "type": "application/json",
-            "title": "Map tilesets"
-        }));
-    }
-
-    let mut metadata = api_common::collection_metadata(
-        config,
-        json!({
-            "dataType": "map",
-            "crs": crs_uris,
-            "styles": style_list,
-        }),
-        links,
-    );
-
+    let mut fields = serde_json::Map::new();
+    fields.insert("dataType".into(), json!("map"));
+    fields.insert("crs".into(), json!(crs_uris));
+    fields.insert("styles".into(), json!(style_list));
     // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
     // Engines label projected/rotated grids with internal names ("TM",
     // "LAEA", "projected", "rotated_ll", …) that have no URI; emitting CRS84
     // for those would mislabel the storage grid, so omit it instead.
     if let Some(storage_crs) = ds_core::geo::native_crs_uri(&info.native_crs) {
-        metadata["storageCrs"] = json!(storage_crs);
+        fields.insert("storageCrs".into(), json!(storage_crs));
     }
-
     if let Some(extent) = build_extent(info) {
-        metadata["extent"] = extent;
+        fields.insert("extent".into(), extent);
+    }
+    (fields, links)
+}
+
+fn build_collection_metadata(
+    config: &CollectionConfig,
+    info: &ds_core::map_engine::RasterInfo,
+    styles: Option<&HashMap<String, StyleInfo>>,
+    map_tilesets: bool,
+    base_url: &str,
+    root: &str,
+) -> serde_json::Value {
+    let (fields, access) = collection_parts(config, info, styles, root);
+    let mut links = vec![json!({
+        "href": format!("{root}/collections/{}", config.id),
+        "rel": "self",
+        "type": "application/json",
+        "title": config.title
+    })];
+    links.extend(access);
+
+    // Map tilesets — rendered (raster) tiles are an OGC API Maps "map
+    // tileset", discoverable from the maps collection via the `tilesets-map`
+    // relation. Only advertise it when the Tiles service actually registered
+    // this collection for raster tiles (the per-API `/tiles` router serves it).
+    if map_tilesets {
+        links.push(json!({
+            "href": format!("{base_url}{}/collections/{}/tiles", mounts::TILES, config.id),
+            "rel": rel::TILESETS_MAP,
+            "type": "application/json",
+            "title": "Map tilesets"
+        }));
     }
 
-    metadata
+    api_common::collection_metadata(config, serde_json::Value::Object(fields), links)
 }
 
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
@@ -272,9 +293,10 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /maps/ — Landing page
+/// GET {mount}/ — Landing page
 pub async fn landing_page(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
@@ -282,37 +304,50 @@ pub async fn landing_page(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let title = "MeteoCore - Maps";
     let description = "Metocean Data Server — OGC API Maps";
     // (href, rel, type, title) — one source for both representations.
     let links = [
         (
-            format!("{base}/maps/"),
+            format!("{root}/"),
             "self",
             "application/json",
             "This document",
         ),
         (
-            format!("{base}/maps/api"),
+            format!("{root}/api"),
             "service-desc",
             "application/vnd.oai.openapi+json;version=3.0",
             "API definition",
         ),
         (
-            format!("{base}/maps/api/docs"),
+            format!("{root}/api/docs"),
             "service-doc",
             "text/html",
             "API documentation",
         ),
         (
-            format!("{base}/maps/conformance"),
+            format!("{root}/conformance"),
             "conformance",
             "application/json",
             "Conformance classes",
         ),
         (
-            format!("{base}/maps/collections"),
+            format!("{root}/conformance"),
+            rel::CONFORMANCE,
+            "application/json",
+            "Conformance classes",
+        ),
+        (
+            format!("{root}/collections"),
             "data",
+            "application/json",
+            "Collections",
+        ),
+        (
+            format!("{root}/collections"),
+            rel::DATA,
             "application/json",
             "Collections",
         ),
@@ -334,13 +369,16 @@ pub async fn landing_page(
             // rel="alternate" to the JSON representation (parity with the
             // collection-detail HTML page).
             views.push(LinkView::new(
-                format!("{base}/maps/?f=json"),
+                format!("{root}/?f=json"),
                 "alternate",
                 Some("This document as JSON"),
             ));
             Html(api_common::workbench::landing_html(
-                base,
-                "maps",
+                Surface {
+                    base,
+                    root,
+                    api: "maps",
+                },
                 title,
                 description,
                 &views,
@@ -357,15 +395,18 @@ fn format_parameter() -> serde_json::Value {
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
-/// GET /maps/api — OpenAPI 3.0.3 definition
-pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
-    let state = state.load_full();
+/// Per-collection OpenAPI paths (detail, map, styles, styled map, legend),
+/// keyed below the mount `m`.
+pub(crate) fn collection_openapi_paths(
+    state: &MapsState,
+    m: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
 
-        // GET /maps/collections/{id}
-        let detail_path = format!("/maps/collections/{id}");
+        // GET {mount}/collections/{id}
+        let detail_path = format!("{m}/collections/{id}");
         collection_paths[&detail_path] = json!({
             "get": {
                 "summary": format!("Get {} collection metadata", config.title),
@@ -379,8 +420,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/map
-        let map_path = format!("/maps/collections/{id}/map");
+        // GET {mount}/collections/{id}/map
+        let map_path = format!("{m}/collections/{id}/map");
         collection_paths[&map_path] = json!({
             "get": {
                 "summary": format!("Get map for {}", config.title),
@@ -419,8 +460,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/styles
-        let styles_path = format!("/maps/collections/{id}/styles");
+        // GET {mount}/collections/{id}/styles
+        let styles_path = format!("{m}/collections/{id}/styles");
         collection_paths[&styles_path] = json!({
             "get": {
                 "summary": format!("List styles for {}", config.title),
@@ -441,8 +482,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/styles/{styleId}/map
-        let styled_map_path = format!("/maps/collections/{id}/styles/{{styleId}}/map");
+        // GET {mount}/collections/{id}/styles/{styleId}/map
+        let styled_map_path = format!("{m}/collections/{id}/styles/{{styleId}}/map");
         collection_paths[&styled_map_path] = json!({
             "get": {
                 "summary": format!("Get styled map for {}", config.title),
@@ -488,8 +529,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // GET /maps/collections/{id}/styles/{styleId}/legend
-        let legend_path = format!("/maps/collections/{id}/styles/{{styleId}}/legend");
+        // GET {mount}/collections/{id}/styles/{styleId}/legend
+        let legend_path = format!("{m}/collections/{id}/styles/{{styleId}}/legend");
         collection_paths[&legend_path] = json!({
             "get": {
                 "summary": format!("Get style legend for {}", config.title),
@@ -538,28 +579,190 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         });
     }
 
+    match collection_paths {
+        serde_json::Value::Object(paths) => paths,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// OpenAPI components (parameters, schemas) referenced by the Maps paths.
+pub(crate) fn openapi_components() -> serde_json::Value {
+    json!({
+        "parameters": {
+            "bbox": {
+                "name": "bbox",
+                "in": "query",
+                "required": true,
+                "schema": {"type": "string"},
+                "description": "Bounding box: west,south,east,north"
+            },
+            "width": {
+                "name": "width",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8000,
+                    "default": 256
+                },
+                "description": "Image width in pixels"
+            },
+            "height": {
+                "name": "height",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8000,
+                    "default": 256
+                },
+                "description": "Image height in pixels"
+            },
+            "crs": {
+                "name": "crs",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "string",
+                    "default": "CRS:84",
+                    "enum": ["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"]
+                },
+                "description": "Coordinate reference system"
+            },
+            "datetime": {
+                "name": "datetime",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "ISO 8601 timestamp"
+            },
+            "transparent": {
+                "name": "transparent",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "Transparency support"
+            },
+            "f": {
+                "name": "f",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "string",
+                    "default": "image/png",
+                    "enum": ["image/png", "image/jpeg", "image/webp"]
+                },
+                "description": "Output format. `image/png` auto-emits an 8-bit indexed-palette PNG (~3–4× smaller) for colormap-rendered layers; falls back to 32-bit RGBA above 256 distinct colours."
+            },
+            "bbox-crs": {
+                "name": "bbox-crs",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "CRS for bbox coordinates. Only CRS:84 supported."
+            },
+            "elevation": {
+                "name": "elevation",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "number"},
+                "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
+            }
+        },
+        "schemas": {
+            "styleList": {
+                "type": "object",
+                "properties": {
+                    "styles": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/style"}
+                    },
+                    "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                }
+            },
+            "style": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                }
+            },
+            "legend": {
+                "type": "object",
+                "required": ["style", "title", "min", "max", "interpolation", "stops"],
+                "properties": {
+                    "style": {"type": "string", "description": "Style identifier"},
+                    "title": {"type": "string", "description": "Human-readable style title"},
+                    "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
+                    "unit": {"type": "string", "description": "Unit of the rendered values. Omitted when unknown."},
+                    "min": {"type": "number", "description": "Low end of the value range the colours span"},
+                    "max": {"type": "number", "description": "High end of the value range the colours span"},
+                    "interpolation": {"type": "string", "enum": ["linear", "step"],
+                                      "description": "How colours are produced between stops"},
+                    "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
+                    "stops": {
+                        "type": "array",
+                        "description": "Palette colour stops, ascending by value",
+                        "items": {
+                            "type": "object",
+                            "required": ["value", "color"],
+                            "properties": {
+                                "value": {"type": "number"},
+                                "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"}
+                            }
+                        }
+                    }
+                }
+            },
+            "link": {
+                "type": "object",
+                "required": ["href"],
+                "properties": {
+                    "href": {"type": "string"},
+                    "rel": {"type": "string"},
+                    "type": {"type": "string"},
+                    "title": {"type": "string"}
+                }
+            }
+        }
+    })
+}
+
+/// GET {mount}/api — OpenAPI 3.0.3 definition. Path keys include the mount.
+pub async fn api_definition(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+) -> impl IntoResponse {
+    let state = state.load_full();
+    let m = mount.0;
+    let collection_paths = serde_json::Value::Object(collection_openapi_paths(&state, m));
     let mut paths = json!({
-        "/maps/": {
+        format!("{m}/"): {
             "get": {
                 "summary": "Landing page",
                 "operationId": "getLandingPage",
+                "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Landing page"}
                 }
             }
         },
-        "/maps/conformance": {
+        format!("{m}/conformance"): {
             "get": {
                 "summary": "Conformance classes",
                 "operationId": "getConformance",
+                "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Conformance classes"}
                 }
             }
         },
-        "/maps/collections": {"get": api_common::collection_operation()}
+        format!("{m}/collections"): {"get": api_common::collection_operation()}
     });
 
     // Merge collection paths into main paths
@@ -578,157 +781,20 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "description": "OGC API - Maps implementation"
         },
         "paths": paths,
-        "components": {
-            "parameters": {
-                "bbox": {
-                    "name": "bbox",
-                    "in": "query",
-                    "required": true,
-                    "schema": {"type": "string"},
-                    "description": "Bounding box: west,south,east,north"
-                },
-                "width": {
-                    "name": "width",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 8000,
-                        "default": 256
-                    },
-                    "description": "Image width in pixels"
-                },
-                "height": {
-                    "name": "height",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 8000,
-                        "default": 256
-                    },
-                    "description": "Image height in pixels"
-                },
-                "crs": {
-                    "name": "crs",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "string",
-                        "default": "CRS:84",
-                        "enum": ["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"]
-                    },
-                    "description": "Coordinate reference system"
-                },
-                "datetime": {
-                    "name": "datetime",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "string"},
-                    "description": "ISO 8601 timestamp"
-                },
-                "transparent": {
-                    "name": "transparent",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "string"},
-                    "description": "Transparency support"
-                },
-                "f": {
-                    "name": "f",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "string",
-                        "default": "image/png",
-                        "enum": ["image/png", "image/jpeg", "image/webp"]
-                    },
-                    "description": "Output format. `image/png` auto-emits an 8-bit indexed-palette PNG (~3–4× smaller) for colormap-rendered layers; falls back to 32-bit RGBA above 256 distinct colours."
-                },
-                "bbox-crs": {
-                    "name": "bbox-crs",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "string"},
-                    "description": "CRS for bbox coordinates. Only CRS:84 supported."
-                },
-                "elevation": {
-                    "name": "elevation",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "number"},
-                    "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
-                }
-            },
-            "schemas": {
-                "styleList": {
-                    "type": "object",
-                    "properties": {
-                        "styles": {
-                            "type": "array",
-                            "items": {"$ref": "#/components/schemas/style"}
-                        },
-                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
-                    }
-                },
-                "style": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
-                    }
-                },
-                "legend": {
-                    "type": "object",
-                    "required": ["style", "title", "min", "max", "interpolation", "stops"],
-                    "properties": {
-                        "style": {"type": "string", "description": "Style identifier"},
-                        "title": {"type": "string", "description": "Human-readable style title"},
-                        "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
-                        "unit": {"type": "string", "description": "Unit of the rendered values. Omitted when unknown."},
-                        "min": {"type": "number", "description": "Low end of the value range the colours span"},
-                        "max": {"type": "number", "description": "High end of the value range the colours span"},
-                        "interpolation": {"type": "string", "enum": ["linear", "step"],
-                                          "description": "How colours are produced between stops"},
-                        "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
-                        "stops": {
-                            "type": "array",
-                            "description": "Palette colour stops, ascending by value",
-                            "items": {
-                                "type": "object",
-                                "required": ["value", "color"],
-                                "properties": {
-                                    "value": {"type": "number"},
-                                    "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"}
-                                }
-                            }
-                        }
-                    }
-                },
-                "link": {
-                    "type": "object",
-                    "required": ["href"],
-                    "properties": {
-                        "href": {"type": "string"},
-                        "rel": {"type": "string"},
-                        "type": {"type": "string"},
-                        "title": {"type": "string"}
-                    }
-                }
-            }
-        }
+        "components": openapi_components()
     });
 
     Json(openapi)
 }
 
-/// GET /maps/api/docs — Swagger UI
-pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// GET {mount}/api/docs — Swagger UI
+pub async fn api_docs(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/maps/api", request_base_url(&state, &headers));
+    let spec_url = format!("{}/api", mount.root(&request_base_url(&state, &headers)));
     (
         [
             (
@@ -760,9 +826,23 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
     }
 }
 
-/// GET /maps/conformance
+/// OGC API - Maps classes this implementation declares, on either surface.
+pub(crate) const CONFORMANCE: &[&str] = &[
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
+];
+
+/// GET {mount}/conformance
 pub async fn conformance(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
@@ -770,44 +850,43 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-    let classes = api_common::conformance_classes(&[
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
-    ]);
+    let root = &mount.root(base);
+    let classes = api_common::conformance_classes(CONFORMANCE);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {
             let nav = [
-                LinkView::new(format!("{base}/maps/"), "up", Some("Landing page")),
+                LinkView::new(format!("{root}/"), "up", Some("Landing page")),
                 LinkView::new(
-                    format!("{base}/maps/conformance?f=json"),
+                    format!("{root}/conformance?f=json"),
                     "alternate",
                     Some("This document as JSON"),
                 ),
             ];
             Html(api_common::workbench::conformance_html(
-                base, "maps", &classes, &nav,
+                Surface {
+                    base,
+                    root,
+                    api: "maps",
+                },
+                &classes,
+                &nav,
             ))
             .into_response()
         }
     }))
 }
 
-/// GET /maps/collections
+/// GET {mount}/collections
 pub async fn collections(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     request: api_common::CollectionRequest,
     headers: HeaderMap,
 ) -> Response {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let entries = state
         .collections
         .values()
@@ -820,8 +899,14 @@ pub async fn collections(
                 return None;
             };
             let info = engine.raster_info_shared();
-            let metadata =
-                build_collection_metadata(config, &info, state.styles.get(&config.id), base);
+            let metadata = build_collection_metadata(
+                config,
+                &info,
+                state.styles.get(&config.id),
+                state.map_tileset_ids.contains(&config.id),
+                base,
+                root,
+            );
             Some(api_common::CollectionEntry {
                 config,
                 metadata,
@@ -830,13 +915,22 @@ pub async fn collections(
             })
         })
         .collect();
-    api_common::collections_response(&format!("{base}/maps/collections"), request, entries)
+    api_common::collections_response(
+        Surface {
+            base,
+            root,
+            api: "maps",
+        },
+        request,
+        entries,
+    )
 }
 
-/// GET /maps/collections/{id} — Collection detail
+/// GET {mount}/collections/{id} — Collection detail
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
@@ -845,22 +939,37 @@ pub async fn collection(
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, &id)?;
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     Ok(with_vary(match wanted {
         Wanted::Json => {
             let info = engine.raster_info_shared();
             let styles = state.styles.get(&id);
-            Json(build_collection_metadata(config, &info, styles, base)).into_response()
+            let map_tilesets = state.map_tileset_ids.contains(&id);
+            Json(build_collection_metadata(
+                config,
+                &info,
+                styles,
+                map_tilesets,
+                base,
+                root,
+            ))
+            .into_response()
         }
         Wanted::Html => {
             let metadata = build_collection_metadata(
                 config,
                 &engine.raster_info_shared(),
                 state.styles.get(&id),
+                state.map_tileset_ids.contains(&id),
                 base,
+                root,
             );
             Html(api_common::workbench::collection_html(
-                base,
-                "maps",
+                Surface {
+                    base,
+                    root,
+                    api: "maps",
+                },
                 &metadata,
                 config.license.as_ref(),
             ))
@@ -869,15 +978,16 @@ pub async fn collection(
     }))
 }
 
-/// GET /maps/collections/{id}/styles
+/// GET {mount}/collections/{id}/styles
 pub async fn styles(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, MapsError> {
     let state = state.load_full();
     let (_engine, config) = lookup_engine(&state, &id)?;
-    let base = &request_base_url(&state, &headers);
+    let root = &mount.root(&request_base_url(&state, &headers));
 
     let mut style_list = Vec::new();
     if let Some(layer_styles) = state.styles.get(&id) {
@@ -896,7 +1006,7 @@ pub async fn styles(
                 style_list.push(json!({
                     "id": s.name,
                     "title": s.title,
-                    "links": style_links(&config.id, &s.name, base)
+                    "links": style_links(&config.id, &s.name, root)
                 }));
             }
         }
@@ -906,7 +1016,7 @@ pub async fn styles(
         "styles": style_list,
         "links": [
             {
-                "href": format!("{base}/maps/collections/{}/styles", id),
+                "href": format!("{root}/collections/{}/styles", id),
                 "rel": "self",
                 "type": "application/json"
             }
@@ -914,7 +1024,7 @@ pub async fn styles(
     })))
 }
 
-/// GET /maps/collections/{id}/styles/{styleId}/legend
+/// GET {mount}/collections/{id}/styles/{styleId}/legend
 ///
 /// `?f=json` (the default) returns the machine-readable legend — palette
 /// stops, value range, interpolation — so a client can draw its own legend;
@@ -1010,7 +1120,7 @@ pub async fn style_legend(
     }
 }
 
-/// GET /maps/collections/{id}/map — render map with default style
+/// GET {mount}/collections/{id}/map — render map with default style
 pub async fn get_map(
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -1020,7 +1130,7 @@ pub async fn get_map(
     render_map(&id, "default", params, headers, state).await
 }
 
-/// GET /maps/collections/{id}/styles/{styleId}/map — render map with named style
+/// GET {mount}/collections/{id}/styles/{styleId}/map — render map with named style
 pub async fn get_styled_map(
     headers: HeaderMap,
     Path((id, style_id)): Path<(String, String)>,

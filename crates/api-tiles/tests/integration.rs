@@ -112,6 +112,10 @@ impl MapEngine for InvalidParamEngine {
 // ---------------------------------------------------------------------------
 
 fn build_router() -> axum::Router {
+    api_tiles::router(build_state())
+}
+
+fn build_state() -> api_tiles::AppState {
     let engine: Arc<dyn MapEngine> = Arc::new(MockMapEngine::new());
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -179,7 +183,7 @@ fn build_router() -> axum::Router {
     );
     styles_map.insert("radar".to_string(), layer_styles);
 
-    let state = Arc::new(ArcSwap::from_pointee(TilesState {
+    Arc::new(ArcSwap::from_pointee(TilesState {
         map_engines: engines,
         collections,
         styles: styles_map,
@@ -190,8 +194,7 @@ fn build_router() -> axum::Router {
         vector_tile_cache: Arc::new(VectorTileCache::new(16)),
         base_url: String::new(),
         trust_proxy_headers: false,
-    }));
-    api_tiles::router(state)
+    }))
 }
 
 /// A Tiles router backed by a caller-supplied engine, for exercising
@@ -313,7 +316,10 @@ mod landing_page {
         assert!(links.iter().any(|l| l["rel"] == "service-doc"));
         assert!(links.iter().any(|l| l["rel"] == "conformance"));
         assert!(links.iter().any(|l| l["rel"] == "data"));
-        assert!(links.iter().any(|l| l["rel"] == "tiling-schemes"));
+        assert!(links
+            .iter()
+            .any(|l| l["rel"] == api_common::rel::TILING_SCHEMES));
+        assert!(!links.iter().any(|l| l["rel"] == "tiling-schemes"));
     }
 }
 
@@ -361,6 +367,17 @@ mod conformance {
         assert!(classes
             .iter()
             .any(|c| c.as_str().unwrap().contains("conf/tilesets-list")));
+    }
+
+    #[tokio::test]
+    async fn declares_geodata_tilesets() {
+        // Collections link their `…/tiles` list with a registered
+        // `tilesets-*` relation (Req 13) and the list resolves (Req 14).
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(classes
+            .iter()
+            .any(|c| c == "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets"));
     }
 
     #[tokio::test]
@@ -1390,7 +1407,7 @@ mod style_legend {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|l| l["rel"] == "legend")
+                .find(|l| l["rel"] == api_common::rel::LEGEND)
                 .unwrap_or_else(|| panic!("style {id} has no legend link"));
             assert_eq!(
                 legend["href"],
@@ -1499,6 +1516,10 @@ mod mvt {
     }
 
     fn build_mvt_router() -> axum::Router {
+        api_tiles::router(build_mvt_state())
+    }
+
+    fn build_mvt_state() -> api_tiles::AppState {
         let engine: Arc<dyn FeatureEngine> = Arc::new(PointFeatureEngine::three_points());
         let mut feature_engines = HashMap::new();
         let mut feature_collections = HashMap::new();
@@ -1528,7 +1549,7 @@ mod mvt {
             },
         );
 
-        let state = Arc::new(ArcSwap::from_pointee(TilesState {
+        Arc::new(ArcSwap::from_pointee(TilesState {
             map_engines: HashMap::new(),
             collections: HashMap::new(),
             styles: HashMap::new(),
@@ -1539,8 +1560,7 @@ mod mvt {
             vector_tile_cache: Arc::new(VectorTileCache::new(16)),
             base_url: String::new(),
             trust_proxy_headers: false,
-        }));
-        api_tiles::router(state)
+        }))
     }
 
     /// Mock engine that always returns at least one more feature than the
@@ -1647,6 +1667,66 @@ mod mvt {
             .to_bytes()
             .to_vec();
         (status, headers, body)
+    }
+
+    /// Shared-root vector tiles (`…/tiles`, no `?f=mvt`) are the per-API
+    /// service's MVT bytes; raster selectors are rejected, not ignored.
+    #[tokio::test]
+    async fn shared_root_vector_tiles_match_the_per_api_service() {
+        let state = build_mvt_state();
+        let (status, headers, body) = get_raw_on(
+            api_tiles::router(state.clone()),
+            "/collections/places/tiles/WebMercatorQuad/0/0/0?f=mvt",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let shared = shared_router(state);
+        let (shared_status, shared_headers, shared_body) = get_raw_on(
+            shared.clone(),
+            "/collections/places/tiles/WebMercatorQuad/0/0/0",
+        )
+        .await;
+        assert_eq!(shared_status, StatusCode::OK);
+        assert_eq!(body, shared_body);
+        assert_eq!(headers["etag"], shared_headers["etag"]);
+        assert_eq!(
+            shared_headers["content-type"],
+            "application/vnd.mapbox-vector-tile"
+        );
+        for query in [
+            "f=image/png",
+            "datetime=2024-01-01T00:00:00Z",
+            "elevation=0.5",
+            "parameter-name=x",
+        ] {
+            let (status, _, _) = get_raw_on(
+                shared.clone(),
+                &format!("/collections/places/tiles/WebMercatorQuad/0/0/0?{query}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
+        let (status, _, _) = get_raw_on(shared, "/collections/places/map/tiles").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a vector collection has no map tiles"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_collection_advertises_the_registered_vector_tilesets_relation() {
+        let (status, _, body) = fetch("/collections/places").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let rels: Vec<&str> = json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["rel"].as_str())
+            .collect();
+        assert!(rels.contains(&api_common::rel::TILESETS_VECTOR));
+        assert!(!rels.contains(&api_common::rel::TILESETS_MAP));
     }
 
     #[tokio::test]
@@ -2629,6 +2709,194 @@ async fn exhausted_memory_budget_rejects_uncached_tile() {
     );
     assert_eq!(ds_executor::budget::RENDER_MEMORY.available(), 0);
     assert_eq!(ds_executor::budget::RENDER_MEMORY.rejected(), 1);
+}
+
+/// The Tiles routes of the shared OGC API root (#789), mounted at the root.
+fn shared_router(state: api_tiles::AppState) -> axum::Router {
+    use api_common::shared::BuildingBlock;
+    api_tiles::TilesBlock::new(state)
+        .routes()
+        .layer(axum::Extension(api_common::Mount("")))
+}
+
+async fn get_raw_on(app: axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, headers, body)
+}
+
+/// Shared-root map tiles (Tiles Table 8 `…/map/tiles`) are the per-API
+/// service's tiles: same handler, renderer and cache, so the same bytes.
+#[tokio::test]
+async fn shared_root_map_tiles_match_the_per_api_service() {
+    let state = build_state();
+    for (per_api, shared) in [
+        (
+            "/collections/radar/tiles/WebMercatorQuad/1/0/1",
+            "/collections/radar/map/tiles/WebMercatorQuad/1/0/1",
+        ),
+        (
+            "/collections/radar/styles/grayscale/tiles/WebMercatorQuad/1/0/1",
+            "/collections/radar/styles/grayscale/map/tiles/WebMercatorQuad/1/0/1",
+        ),
+    ] {
+        let (status, headers, body) = get_raw_on(api_tiles::router(state.clone()), per_api).await;
+        assert_eq!(status, StatusCode::OK, "{per_api}");
+        let (shared_status, shared_headers, shared_body) =
+            get_raw_on(shared_router(state.clone()), shared).await;
+        assert_eq!(shared_status, StatusCode::OK, "{shared}");
+        assert_eq!(body, shared_body, "{shared}");
+        assert_eq!(headers["etag"], shared_headers["etag"]);
+        assert_eq!(headers["content-type"], shared_headers["content-type"]);
+    }
+    // Vector tiles have their own path at the shared root.
+    let (status, _, _) = get_raw_on(
+        shared_router(state.clone()),
+        "/collections/radar/map/tiles/WebMercatorQuad/0/0/0?f=mvt",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = get_raw_on(shared_router(state), "/collections/radar/tiles").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a raster collection has no vector tiles"
+    );
+}
+
+/// Styled map tilesets: one list per style, each tileset naming its style and
+/// linking to its own resource; an unknown style is 404.
+#[tokio::test]
+async fn shared_root_lists_styled_map_tilesets() {
+    let app = shared_router(build_state());
+    let (status, _, body) =
+        get_raw_on(app.clone(), "/collections/radar/styles/grayscale/map/tiles").await;
+    assert_eq!(status, StatusCode::OK);
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    for tileset in list["tilesets"].as_array().unwrap() {
+        assert_eq!(tileset["style"]["id"], "grayscale");
+        assert_eq!(tileset["dataType"], "map");
+        let links = tileset["links"].as_array().unwrap();
+        let own = links.iter().find(|l| l["rel"] == "self").unwrap()["href"]
+            .as_str()
+            .unwrap();
+        assert!(own.starts_with("/collections/radar/styles/grayscale/map/tiles/"));
+        let (status, _, _) = get_raw_on(app.clone(), own).await;
+        assert_eq!(status, StatusCode::OK, "{own}");
+        let item = links.iter().find(|l| l["rel"] == "item").unwrap()["href"]
+            .as_str()
+            .unwrap();
+        assert!(item.starts_with(own) && item.ends_with("/{tileMatrix}/{tileRow}/{tileCol}"));
+    }
+    let (status, _, _) = get_raw_on(app, "/collections/radar/styles/nope/map/tiles").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Tiles Req 10 B / abstract test A.9: each tileset list entry links to its
+/// full tileset resource at `…/tiles/{tileMatrixSetId}`, which resolves to
+/// Req 8 metadata (tiling scheme, templated tile links).
+#[tokio::test]
+async fn tileset_list_entries_link_to_resolvable_tileset_resources() {
+    let (status, list) = get("/collections/radar/tiles").await;
+    assert_eq!(status, StatusCode::OK);
+    let tilesets = list["tilesets"].as_array().unwrap();
+    assert_eq!(
+        tilesets.len(),
+        api_tiles::tilematrixset::SUPPORTED_TILE_MATRIX_SETS.len()
+    );
+    for entry in tilesets {
+        let tms_id = entry["tileMatrixSetURI"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let self_href = entry["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "self")
+            .expect("tileset list entries need a self link")["href"]
+            .as_str()
+            .unwrap();
+        // The fixture's base URL is empty and the router is not nested.
+        let path = self_href.strip_prefix("/tiles").unwrap();
+        assert_eq!(path, format!("/collections/radar/tiles/{tms_id}"));
+        assert!(entry["title"].as_str().is_some_and(|t| t.contains("Radar")));
+        let (status, tileset) = get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(tileset["dataType"], "map");
+        assert_eq!(tileset["crs"], entry["crs"]);
+        assert_eq!(tileset["tileMatrixSetURI"], entry["tileMatrixSetURI"]);
+        let links = tileset["links"].as_array().unwrap();
+        assert!(links
+            .iter()
+            .any(|l| l["rel"] == api_common::rel::TILING_SCHEME
+                && l["href"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/tileMatrixSets/{tms_id}"))));
+        // Req 8 E–G; NOTE 2 forbids a {tileMatrixSetId} template variable.
+        let item = links
+            .iter()
+            .find(|l| l["rel"] == "item")
+            .expect("tileset needs a templated tile link");
+        assert_eq!(item["templated"], true);
+        let template = item["href"].as_str().unwrap();
+        assert!(template.ends_with(&format!(
+            "/collections/radar/tiles/{tms_id}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+        )));
+    }
+    let (status, _) = get("/collections/radar/tiles/NotATileMatrixSet").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get("/collections/nonexistent/tiles/WebMercatorQuad").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, api) = get("/api").await;
+    let paths = api["paths"].as_object().unwrap();
+    assert!(paths.contains_key("/tiles/collections/radar/tiles/{tileMatrixSetId}"));
+    assert!(paths.contains_key(
+        "/tiles/collections/radar/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"
+    ));
+}
+
+/// Tiles Req 13 (geodata-tilesets): the collection names its tileset list
+/// with the registered relation for the kind of tiles it holds.
+#[tokio::test]
+async fn raster_collection_advertises_the_registered_map_tilesets_relation() {
+    let (_, json) = get("/collections/radar").await;
+    let links = json["links"].as_array().unwrap();
+    let map = links
+        .iter()
+        .find(|l| l["rel"] == api_common::rel::TILESETS_MAP)
+        .expect("raster collection must advertise tilesets-map");
+    assert!(map["href"]
+        .as_str()
+        .unwrap()
+        .ends_with("/tiles/collections/radar/tiles"));
+    assert!(!links
+        .iter()
+        .any(|l| l["rel"] == api_common::rel::TILESETS_VECTOR));
+    let (_, landing) = get("/").await;
+    let landing = landing["links"].as_array().unwrap();
+    let href = |rel: &str| {
+        landing
+            .iter()
+            .find(|l| l["rel"] == rel)
+            .map(|l| l["href"].clone())
+    };
+    assert!(href(api_common::rel::TILING_SCHEMES).is_some());
+    assert_eq!(href("tiling-schemes"), None, "only the registered relation");
 }
 
 #[tokio::test]

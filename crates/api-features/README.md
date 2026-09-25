@@ -12,15 +12,17 @@ Features work.
 `temporal_extent`) — must update the tables below in the same PR.** The
 `crates/api-features/CLAUDE.md` rule points here.
 
-Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Base route:
-`/features`.
+Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Served twice from
+the same handlers and state: the per-API service at `/features`, and as a
+building block of the shared OGC API root at `/` (see
+[Shared OGC API root](#shared-ogc-api-root)).
 
 ## Conformance classes
 
 | Class | Declared | Notes |
 |---|---|---|
 | Part 1 `core` | ✓ | landing, `/conformance`, `/collections`, `/collections/{id}`, `/items`, `/items/{featureId}`; optional Part 1 property equality filters implemented (#700) |
-| Part 1 `oas30` | ✓ | `/features/api` (hand-written `api_definition()`, validated against the bundled OpenAPI 3.0 meta-schema in tests), Swagger UI at `/features/api/docs` |
+| Part 1 `oas30` | ✓ | `/features/api` (hand-written `api_definition()`, validated against the bundled OpenAPI 3.0 meta-schema in tests), Swagger UI at `/features/api/docs`; `limit`, `bbox` and `datetime` are declared as Part 1 defines them, `style: form` and `explode: false` included (the test suite checks them) |
 | Part 1 `geojson` | ✓ | GeoJSON feature encoding (default) |
 | Part 1 `html` | ✓ | metadata, feature pages and individual features negotiate HTML; property tables, geometry details and a map using the preview’s vendored MapLibre assets |
 | Part 1 `gmlsf0` / `gmlsf2` | ✗ | no GML |
@@ -31,7 +33,10 @@ Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Base route:
 | Part 8 Sorting (draft) | partial | `sortby` implemented (#605 rule: validated against `FeatureEngine::sortables`, 400 naming the valid ones) but the class is not declared and no `/sortables` resource exists |
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
-Part 2 (collections, json, html). Collection discovery supports `bbox`,
+Part 2 (collections, json, html). The landing page links `/conformance` and
+`/collections` with both the short `conformance`/`data` relations this standard
+requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
+/ `…/data` relations Common Part 1 names. Collection discovery supports `bbox`,
 `bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `limit`, `offset` and `f` through
 [api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
 return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
@@ -61,10 +66,45 @@ imply a regular sampling grid.
 | `/features/api`, `/api/docs` | ✓ | OpenAPI 3.0 + Swagger UI |
 | `/features/conformance` | ✓ | JSON + HTML |
 | `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
-| `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the collection also lists `tiles` in `apis` |
+| `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the Tiles service registered the collection for vector tiles (listing `tiles` in `apis` is not enough: a nowcast renders only map tiles) |
 | `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
 | `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
+
+## Shared OGC API root
+
+Features is the third building block of the shared root
+([#789](https://github.com/mrauhala/meteocore/issues/789) Phase 2), after Maps
+and Tiles. The same handlers serve:
+
+| Route | Notes |
+|---|---|
+| `/collections/{id}/items` | as `/features/collections/{id}/items`, with every link on the shared root; conditional GET (ETag/304) as on `/features` |
+| `/collections/{id}/items/{featureId}` | as `/features/collections/{id}/items/{featureId}` |
+
+- **Feature collections only** get `itemType: "feature"` and two `items` links,
+  `application/geo+json` and `text/html` (Features Part 1 §7.1 scopes its
+  requirements to feature collections; the Features test suite skips entries
+  without a GeoJSON `items` link). A map-only collection has neither, and its
+  `/items` is 404.
+- **Field precedence** follows block order. A collection only Features serves
+  (CSV observations, BUFR stations, the PVOL site inventory) is
+  `dataType: vector` with CRS84 `crs` and `storageCrs`. Where Maps also serves
+  it (CAP, nowcast, lightning events), the extent, `crs` and `dataType` are
+  Maps', collection search follows that extent, and a projected raster's
+  unknown `storageCrs` stays unlabelled instead of becoming CRS84. Vector-tiled
+  GeoJSON takes `dataType` and `crs` from Tiles and `storageCrs` from Features.
+- **Links:** vector tilesets are Tiles' own shared-root link
+  (`/collections/{id}/tiles`); the per-API service's cross-link to
+  `/tiles/…` is not repeated.
+- **OpenAPI:** the items operations join the shared `/api`, with components
+  named `features-bbox`, `features-limit`, … because Maps already defines a
+  different `bbox`, `datetime` and `link`.
+- **Conformance:** `/conformance` adds Features `core`, `oas30`, `geojson` and
+  `html`.
+
+The per-API `/features` service is unchanged: the tutka.meteo.fi client and the
+MCP tool guide use it.
 
 Vector tiles: a collection with a `FeatureEngine` and `tiles` in its `apis`
 serves Mapbox Vector Tiles through `api-tiles` (`?f=mvt`), keyed on

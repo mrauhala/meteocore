@@ -16,6 +16,21 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
 - Adapters supply metadata and extents from their registry snapshot. Time bounds
   and advertised collection metadata must agree. Preserve EDR's distinct extent
   representation. Do not infer a sampling grid from feature interval endpoints.
+- Never hard-code an API path such as `/maps/…` in a Maps/Tiles/Features link, OpenAPI key
+  or HTML URL: build it from `Mount::root(base)` (the `Mount` extension added by
+  `router_at`). Cross-API links use `mounts::*`. Pass the workbench a `Surface`;
+  gate its data panels on advertised links, not on the API kind (#789).
+- Shared OGC API root (`shared.rs`, #789): blocks contribute routes, conformance,
+  OpenAPI fragments and per-collection `Contribution`s; the composer owns `/`,
+  `/api`, `/conformance`, `/collections`, `/collections/{id}`. Merge rules: links
+  concatenate in block order, the first block to describe a field wins unless an
+  earlier block `claims` it (raster blocks claim `storageCrs`), `styles` merge by
+  id. Block order (Maps, Tiles, Features in `server/src/main.rs`) is therefore
+  field precedence; discovery bounds follow the kept extent. Blocks must keep
+  overlapping OpenAPI components identical — or namespace them, as Features
+  does — and operation ids unique (tested); one route per path across blocks
+  (the legend belongs to Maps). Tag every block router with its API kind
+  (`tag_api_kind`).
 - Shared metadata owns keywords, license and representation links. API-specific
   fields may override id/title for instances; do not override shared links.
 - Conformance declarations are deliberate. Part 4 searchable-collections is absent

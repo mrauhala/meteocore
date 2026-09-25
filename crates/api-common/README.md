@@ -14,6 +14,49 @@ and API-specific fields.
 | `collection_operation` | OpenAPI discovery operation, supported parameters, JSON/HTML responses and structured 400 errors |
 | `CONFORMANCE_CLASSES` | One Common class inventory, combined with each API's own declarations |
 
+## Shared OGC API root
+
+`shared` composes OGC API standards as building blocks under one root
+([#789](https://github.com/mrauhala/meteocore/issues/789)), mounted by the server
+at `/`. A `BuildingBlock` contributes its conformance classes, landing links,
+OpenAPI paths/components, data-access routes and, per collection, a
+`Contribution` of standard fields and access links. The composer serves the
+Common resources — landing page, `/api` (one merged OpenAPI 3.0 document),
+`/conformance` (the union), `/collections` and `/collections/{id}` — and merges
+each collection's contributions: links concatenate in block order, the first
+block to describe a field wins, and `styles` merge by id so Tiles can add
+per-style map tilesets to Maps' entries. A block may *claim* a field it leaves
+out (`Contribution::claims`) so that no later block fills it: a raster block
+claims `storageCrs`, which it omits when the native CRS has no OGC URI, so a
+Features block's CRS84 cannot mislabel a projected radar grid. Common metadata routes get the
+conditional-GET middleware (`caching`); data routes keep their own ETags. Each
+block's responses carry an `ApiKind` for request logs and the `api` metrics
+label. Blocks reuse their per-API service's state, so reloads reach both.
+
+The blocks are Maps, Tiles and Features, in that order — the order is field
+precedence. Tiles uses the Tiles Table 8 layout at the shared root: map tiles
+under `…/map/tiles`, styled map tiles under `…/styles/{styleId}/map/tiles`,
+vector tiles (MVT) under `…/tiles`, each list with its own tileset resources.
+Features serves `…/items[/{featureId}]` (with the conditional-GET middleware),
+adds `itemType: "feature"` and one `items` link per encoding to feature
+collections only, and namespaces its OpenAPI components (`features-bbox`, …)
+because Maps already defines a different `bbox`, `datetime` and `link`. Where
+Maps and Features both describe a collection (CAP, nowcast, lightning events),
+the extent, `crs` and `dataType` are Maps', and discovery follows that extent.
+
+## Mounts and links
+
+`mounts` names where the server nests each per-API service (`/edr`, `/features`,
+`/maps`, `/tiles`). Maps, Tiles and Features are mount-agnostic: `router_at(state, mount)`
+adds a `Mount` request extension, and their handlers build every link, OpenAPI
+path key and HTML URL from base URL + mount (`Mount::root`). `router(state)`
+mounts at the per-API path. The HTML workbench receives a `Surface` (server base,
+API root, API kind) instead of deriving the root from `{base}/{api}`, and chooses
+data-access panels from the advertised links (for example the map preview),
+so one handler set serves both a per-API service and the shared OGC API root
+([#789](https://github.com/mrauhala/meteocore/issues/789)). EDR still builds
+its paths from its per-API mount.
+
 The supported parameter names come from `ds_core::collection_search::CollectionParameter`;
 the same inventory drives pair validation and OpenAPI generation.
 
@@ -98,7 +141,10 @@ cargo test -p ds-core -p api-edr -p api-features -p api-maps -p api-tiles
 The contract suite validates successful JSON landing/conformance/list/detail
 responses against the [pinned Common Part 2 and Part 4 bundles](../../schemas/README.md),
 offline. Resource schemas are selected by standard paths; API mount prefixes
-are fixture setup, ready to change with shared-root discovery. This does not
+are fixture setup, ready to change with shared-root discovery. A crawler test
+relocates Maps and Tiles to another mount and follows every advertised JSON link,
+which must resolve and stay on that mount (cross-API links target the per-API
+Tiles service). This does not
 establish full Part 4 or Uniform Additional Dimensions conformance. Regular
 temporal grids include their first timestamp; spatial grids emit a nullable
 `firstCoordinate` because engines expose bounds/counts without sample registration
@@ -111,6 +157,16 @@ lists and full collection metadata for EDR, Maps, Tiles and Features. EDR model
 runs and Features item pages use the same shell. The JSON link and copyable URL /
 cURL always represent the current resource with its applied filters and paging;
 unsubmitted edits appear separately in the request preview.
+
+A collection page's heading shows one chip per OGC API it is available
+through — Maps, Tiles, Features, EDR — derived from its advertised links, not
+from the API serving the page. Its map preview draws with whatever the
+collection advertises: Maps (one image per view), map tiles (the Web Mercator
+map tileset, per style) or vector tiles (the Web Mercator vector tileset, one
+layer named after the collection). With more than one, a "Draw with" switch
+picks among them; a collection advertising only tiles still gets a preview.
+Style, time and level apply to Maps and map tiles; vector tiles are unstyled,
+and a vector-only collection shows no legend panel.
 
 The collection builder derives its fields from `CollectionParameter::ALL`.
 Search and paging use ordinary GET requests. Optional advanced controls omit

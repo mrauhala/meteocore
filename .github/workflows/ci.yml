@@ -71,6 +71,26 @@ jobs:
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
 
+    # The Docker image builds the server with the Dockerfile's
+    # `CARGO_FEATURES` (icechunk), which the default-feature Clippy above
+    # never compiles. A feature's extra trait impls can change type
+    # inference: #791's mixed `&String`/`&str` label arrays passed here and
+    # failed with E0308 only in "Docker Build (PR)" ~8 minutes later (#795).
+    # Lint exactly the shipped set, read from the Dockerfile so the two
+    # cannot drift; a renamed or removed ARG fails loudly rather than
+    # silently skipping the check.
+    - name: Clippy server with the shipped feature set
+      run: |
+        line=$(grep -m1 '^ARG CARGO_FEATURES=' Dockerfile) \
+          || { echo "::error file=Dockerfile::no 'ARG CARGO_FEATURES=' default to lint"; exit 1; }
+        features=$(sed -e 's/^ARG CARGO_FEATURES=//' -e 's/^"\(.*\)"$/\1/' <<<"$line")
+        if [ -z "$features" ]; then
+          echo "Dockerfile ships default features; the Clippy step above covers them."
+          exit 0
+        fi
+        echo "Linting server with --features \"$features\""
+        cargo clippy -p server --features "$features" --all-targets -- -D warnings
+
     # `cargo test` builds everything `cargo build` does, plus test
     # binaries — a separate build step would just duplicate work.
     - name: Run tests
@@ -103,7 +123,7 @@ jobs:
       # Composite action (no Node runtime): fetches a prebuilt cargo-audit
       # binary in seconds rather than `cargo install`-ing it from source.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: cargo-audit
 
@@ -131,7 +151,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # `load: true` puts the image in the local daemon so the boot gate
       # can actually exec it — a build alone cannot catch runtime-stage
@@ -176,7 +196,7 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log into registry
         if: github.event_name != 'pull_request'

@@ -51,9 +51,10 @@ pub struct ParamInfo {
 /// Grid area definition.
 #[derive(Debug, Clone)]
 pub struct GridArea {
-    /// Bottom-left corner (lon, lat) in degrees.
+    /// First stored corner (lon, lat) in degrees — not necessarily the
+    /// bottom-left one (see [`GridInfo::new`]).
     pub bottom_left: (f64, f64),
-    /// Top-right corner (lon, lat) in degrees.
+    /// Second stored corner (lon, lat) in degrees.
     pub top_right: (f64, f64),
     /// CRS for coordinate transforms.
     pub crs: Crs,
@@ -68,33 +69,93 @@ pub struct GridInfo {
     pub ny: u32,
     /// Grid area (corner coordinates + CRS).
     pub area: GridArea,
+    /// Pixel ↔ world mapping, derived once from `area` by [`Self::new`].
+    transform: GeoTransform,
 }
 
 impl GridInfo {
-    /// Build a GeoTransform for pixel ↔ world coordinate mapping.
+    /// Derives the pixel ↔ world transform once, so per-pixel sampling never
+    /// re-projects the corners.
+    ///
+    /// QueryData's corners are the *centres* of the first and last grid
+    /// points (newbase maps grid index `0..n-1` onto the area), so the
+    /// spacing is `span / (n - 1)` and the affine origin sits half a cell
+    /// outside the corner. The span is measured in the CRS's own units: the
+    /// geographic corners of a projected area (LCC, stereographic) are
+    /// forward-projected first. Lat/lon and rotated lat/lon corners are
+    /// already in their CRS's coordinates and are used as stored.
+    ///
+    /// Which corner is grid index 0 differs between the two. A lat/lon area
+    /// starts at its first stored corner even when that is the north edge
+    /// (the ECMWF Kenya fixture: its cold cells fall on Mt Elgon, Mt Kenya
+    /// and Kilimanjaro only that way round). A projected area starts at the
+    /// south-west corner of its projected rectangle, whichever two corners
+    /// it stores: the MEPS fixture stores the north-west and south-east
+    /// ones (its world rect confirms it), yet its data runs south to north —
+    /// only that way does the Norwegian Sea and Bothnian coast line up with
+    /// its land/sea temperature contrast. So the projected rectangle is
+    /// normalised.
     ///
     /// QueryData grids have bottom-left origin (row 0 = south edge), but
-    /// GeoTransform expects top-left origin (row 0 = north edge). This
-    /// method constructs the transform with origin_y at the top (north)
-    /// edge so that `pixel_to_world(0, 0)` returns the northwest corner.
+    /// GeoTransform expects top-left origin (row 0 = north edge), so
+    /// `origin_y` is on the top-right corner's side.
+    pub fn new(nx: u32, ny: u32, area: GridArea) -> Self {
+        let (bl, tr) = (area.bottom_left, area.top_right);
+        let (x0, y0, x1, y1) = match area.crs {
+            Crs::Wgs84 | Crs::RotatedLatLon { .. } => (bl.0, bl.1, tr.0, tr.1),
+            _ => {
+                let (xa, ya) = area.crs.forward(bl.0, bl.1);
+                let (xb, yb) = area.crs.forward(tr.0, tr.1);
+                (xa.min(xb), ya.min(yb), xa.max(xb), ya.max(yb))
+            }
+        };
+        let pixel_width = (x1 - x0) / nx.saturating_sub(1).max(1) as f64;
+        let pixel_height = (y1 - y0) / ny.saturating_sub(1).max(1) as f64;
+        let transform = GeoTransform {
+            origin_x: x0 - pixel_width / 2.0,
+            origin_y: y1 + pixel_height / 2.0,
+            pixel_width,
+            pixel_height,
+            width: nx,
+            height: ny,
+            crs: area.crs.clone(),
+        };
+        Self {
+            nx,
+            ny,
+            area,
+            transform,
+        }
+    }
+
+    /// The GeoTransform for pixel ↔ world coordinate mapping (see
+    /// [`Self::new`]).
     ///
     /// Use `grid_lonlat()` on QueryData for direct grid-index-to-lonlat
     /// mapping that accounts for the bottom-left origin convention.
-    pub fn geo_transform(&self) -> GeoTransform {
-        let (lon0, _lat0) = self.area.bottom_left;
-        let (lon1, lat1) = self.area.top_right;
+    pub fn geo_transform(&self) -> &GeoTransform {
+        &self.transform
+    }
 
-        let pixel_width = (lon1 - lon0) / self.nx as f64;
-        let pixel_height = (lat1 - _lat0) / self.ny as f64;
-
-        GeoTransform {
-            origin_x: lon0,
-            origin_y: lat1, // top edge (north)
-            pixel_width,
-            pixel_height,
-            width: self.nx,
-            height: self.ny,
-            crs: self.area.crs.clone(),
+    /// The grid's WGS84 extent `[west, south, east, north]`.
+    ///
+    /// A lat/lon grid's is its corner points, normalised: `bottom_left` /
+    /// `top_right` are the corners as stored, and a north-to-south (or
+    /// cropped) grid stores the north one first. Any other grid's is its
+    /// projected rectangle's edges, which reach past the corners' lon/lat
+    /// box (an LCC rectangle's northern edge is wider than its corners).
+    pub fn lonlat_extent(&self) -> [f64; 4] {
+        match self.area.crs {
+            Crs::Wgs84 => {
+                let (bl, tr) = (self.area.bottom_left, self.area.top_right);
+                [
+                    bl.0.min(tr.0),
+                    bl.1.min(tr.1),
+                    bl.0.max(tr.0),
+                    bl.1.max(tr.1),
+                ]
+            }
+            _ => self.transform.bbox(),
         }
     }
 }
@@ -632,7 +693,7 @@ fn read_hplace_descriptor(r: &mut TextReader) -> Result<GridInfo, QueryDataError
         }
     }
 
-    Ok(GridInfo { nx, ny, area })
+    Ok(GridInfo::new(nx, ny, area))
 }
 
 /// Read the area definition inside an NFmiGrid.
@@ -794,8 +855,14 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
     let true_lat1 = true_lats.0;
     let true_lat2 = true_lats.1;
 
-    // radius (Earth radius, e.g. 6371220)
-    let _radius = r.read_line()?;
+    // Earth radius, e.g. 6371220: the grid is defined on this sphere. An
+    // unreadable value falls back to WGS84 rather than failing the file.
+    let radius = r
+        .read_line()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|r| r.is_finite() && *r > 0.0);
 
     // World rect (4 doubles as 2 points, precision 15)
     let _wr_p1 = r.read_line()?;
@@ -816,6 +883,7 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
             lon0: central_lon.to_radians(),
             false_e: 0.0,
             false_n: 0.0,
+            radius,
         },
     })
 }
@@ -1062,17 +1130,23 @@ mod tests {
 
         let qd = QueryData::open(&path).unwrap();
 
-        // First grid corner (index 0) is near (34, 4.75) — note this fixture's
-        // index 0 is the *north*west corner (lat 4.75), not a "bottom-left".
-        let (lon, lat) = qd.grid_lonlat(0);
-        assert!((lon - 34.0).abs() < 0.5, "corner0 lon={lon}");
-        assert!((lat - 4.75).abs() < 0.5, "corner0 lat={lat}");
-
-        // Opposite corner (last index) is near (41.5, -5.25).
+        // The stored corners are grid-point centres: index 0 is exactly
+        // (34, 4.75) — this fixture's *north*west corner, not a "bottom-left"
+        // — the last index exactly (41.5, -5.25), and the 0.5° spacing is
+        // span / (n - 1), not span / n.
         let last_idx = qd.grid_size() - 1;
-        let (lon, lat) = qd.grid_lonlat(last_idx);
-        assert!((lon - 41.5).abs() < 0.5, "cornerN lon={lon}");
-        assert!((lat - (-5.25)).abs() < 0.5, "cornerN lat={lat}");
+        for (idx, want) in [
+            (0, (34.0, 4.75)),
+            (1, (34.5, 4.75)),
+            (qd.grid.nx as usize, (34.0, 4.25)),
+            (last_idx, (41.5, -5.25)),
+        ] {
+            let got = qd.grid_lonlat(idx);
+            assert!(
+                (got.0 - want.0).abs() < 1e-9 && (got.1 - want.1).abs() < 1e-9,
+                "index {idx}: {got:?}, want {want:?}"
+            );
+        }
     }
 
     #[test]
@@ -1129,5 +1203,48 @@ mod tests {
         // can't pass with 0 params / 1 time.
         assert_eq!(qd.params.len(), 2, "meps fixture: expected 2 params");
         assert_eq!(qd.times.len(), 3, "meps fixture: expected 3 timesteps");
+
+        // Grid points, against PROJ on the area's own sphere (`cs2cs
+        // +proj=lcc +lat_1=63.3 +lat_2=63.3 +lat_0=63.3 +lon_0=15
+        // +R=6371220`, PROJ 9.x). The stored corners are the north-west and
+        // south-east grid points; index 0 is the south-west one (rows run
+        // south to north, see `GridInfo::new`).
+        assert!(matches!(
+            qd.grid.area.crs,
+            Crs::LambertConformalConic {
+                radius: Some(r),
+                ..
+            } if r == 6_371_220.0
+        ));
+        let (nx, ny) = (qd.grid.nx as usize, qd.grid.ny as usize);
+        for (col, qd_row, want) in [
+            (0, ny - 1, (9.04369, 64.9579)),
+            (nx - 1, 0, (19.134, 60.0194)),
+            (0, 0, (9.96756804, 59.98724574)),
+            (nx - 1, ny - 1, (19.89425131, 64.99599347)),
+            (50, 60, (14.40866301, 62.78083790)),
+        ] {
+            let got = qd.grid_lonlat(qd_row * nx + col);
+            assert!(
+                (got.0 - want.0).abs() < 1e-6 && (got.1 - want.1).abs() < 1e-6,
+                "col {col} row {qd_row}: {got:?}, PROJ {want:?}"
+            );
+        }
+
+        // Against the producer's own grid: the file's world rect, (-280072.24,
+        // -357576.50) + (509991.86 × 554975.39) m on the sphere, puts grid
+        // point (57, 57) at (15.09635294, 62.64719351). Anchoring on the
+        // stored corners, which carry only six significant digits, lands
+        // within a few metres; on WGS84 it was 69 m off (#800).
+        let (lon, lat) = qd.grid_lonlat(57 * nx + 57);
+        let (d_east, d_north) = (
+            (lon - 15.09635294) * 111_195.0 * lat.to_radians().cos(),
+            (lat - 62.64719351) * 111_195.0,
+        );
+        assert!(
+            d_east.hypot(d_north) < 10.0,
+            "grid point (57, 57) is {:.1} m from the producer's",
+            d_east.hypot(d_north)
+        );
     }
 }
