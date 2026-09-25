@@ -36,6 +36,16 @@ without reading code.
   update it in the same PR; copy standard parameter schemas verbatim,
   including `style`/`explode`.
 
+## Mount-agnostic, and a block of the shared root (#789)
+
+Build every link, OpenAPI path key and HTML URL from the router's `Mount`
+(`Mount::root(base)`; `router_at(state, mount)` adds it) — never a `/features`
+literal. `collection_parts` (with `Layout::PerApi` / `Layout::Shared`),
+`items_openapi_paths` and `openapi_components` are shared by the per-API
+service and `FeaturesBlock` (`shared.rs`); change them once. At the shared root
+the block's OpenAPI components are namespaced (`features-*`), and only
+collections with a feature engine get `itemType`/`items`.
+
 ## Shared Common discovery (#739)
 
 Use `api-common` for `/collections` validation, responses, links, Common metadata

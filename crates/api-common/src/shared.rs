@@ -2,13 +2,14 @@
 //! under one landing page, conformance declaration, OpenAPI document and
 //! collection catalog.
 //!
-//! Each [`BuildingBlock`] (Maps, Tiles, …) contributes its conformance
-//! classes, landing links, OpenAPI paths, data-access routes and — per
-//! collection — its access links and standard fields. The composer owns the
-//! Common resources and merges a collection's contributions into one
+//! Each [`BuildingBlock`] (Maps, Tiles, Features, …) contributes its
+//! conformance classes, landing links, OpenAPI paths, data-access routes and —
+//! per collection — its access links and standard fields. The composer owns
+//! the Common resources and merges a collection's contributions into one
 //! description: links are concatenated in block order, the first block to
-//! describe a field wins, and `styles` merge by style id so each block can add
-//! its per-style links. Common Part 2 §6.2: "the available data access
+//! describe a field wins (unless an earlier block [claims](Contribution::claims)
+//! it), and `styles` merge by style id so each block can add its per-style
+//! links. Common Part 2 §6.2: "the available data access
 //! mechanisms supported for a specific collection are typically advertised by
 //! including links … in the links array of the collection description."
 //!
@@ -46,6 +47,11 @@ pub struct Contribution {
     pub links: Vec<Value>,
     pub bbox: Option<[f64; 4]>,
     pub time: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Fields this block describes authoritatively even when it leaves them
+    /// out: no later block may fill them. A raster block claims `storageCrs`
+    /// because it omits a native CRS with no OGC URI rather than mislabel it,
+    /// and a later Features block's CRS84 must not stand in for it.
+    pub claims: &'static [&'static str],
 }
 
 /// OpenAPI paths and components a block adds to the shared definition.
@@ -189,8 +195,8 @@ async fn landing_page(
     let base = &api.base(&headers);
     let root = &Mount(api.mount).root(base);
     let title = "MeteoCore";
-    let description = "Metocean Data Server — OGC API building blocks (Maps, Tiles) \
-         over one collection catalog, alongside the per-API services";
+    let description = "Metocean Data Server — OGC API building blocks (Maps, Tiles, \
+         Features) over one collection catalog, alongside the per-API services";
     let json = "application/json";
     let mut links = vec![
         link(format!("{root}/"), "self", json, "This document"),
@@ -437,6 +443,7 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
         first.bbox,
         first.time,
     );
+    let mut claimed: Vec<&str> = first.claims.to_vec();
     // Discovery bounds follow the advertised extent: they come from the block
     // whose `extent` is kept, so search never matches bounds the description
     // does not show (api-common CLAUDE.md).
@@ -448,6 +455,9 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
             has_extent = true;
         }
         for (key, value) in contribution.fields {
+            if claimed.contains(&key.as_str()) {
+                continue;
+            }
             match fields.entry(key) {
                 Entry::Vacant(entry) => {
                     entry.insert(value);
@@ -460,6 +470,7 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
             }
         }
         links.extend(contribution.links);
+        claimed.extend(contribution.claims);
     }
     let mut all = vec![json!({
         "href": format!("{root}/collections/{}", config.id),
@@ -601,6 +612,7 @@ mod tests {
             links,
             bbox: None,
             time: None,
+            claims: &[],
         }
     }
 
@@ -620,6 +632,33 @@ mod tests {
         let mut second = contribution("c", json!({"extent": {"temporal": {}}}), vec![]);
         second.time = span;
         assert_eq!(merge(vec![first, second], "https://x").unwrap().time, span);
+    }
+
+    #[test]
+    fn a_claimed_field_is_never_filled_by_a_later_block() {
+        let crs84 = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+        let features = || {
+            contribution(
+                "c",
+                json!({"storageCrs": crs84, "itemType": "feature"}),
+                vec![],
+            )
+        };
+        // A raster whose native CRS has no URI: Maps omits and claims it.
+        let mut maps = contribution("c", json!({"dataType": "map"}), vec![]);
+        maps.claims = &["storageCrs"];
+        let merged = merge(vec![maps, features()], "https://x").unwrap().metadata;
+        assert!(merged.get("storageCrs").is_none(), "{merged}");
+        assert_eq!(
+            merged["itemType"], "feature",
+            "unclaimed fields still merge"
+        );
+        // Vector tiles claim nothing, so Features' CRS84 describes the storage.
+        let tiles = contribution("c", json!({"dataType": "vector"}), vec![]);
+        let merged = merge(vec![tiles, features()], "https://x")
+            .unwrap()
+            .metadata;
+        assert_eq!(merged["storageCrs"], crs84);
     }
 
     #[test]

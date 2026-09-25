@@ -307,18 +307,18 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
     out
 }
 
+/// `base` is the external base URL (shared assets); `root` the absolute URL
+/// of the API root serving the collection (#789).
 pub(crate) fn features_html(
     doc: &Value,
     title: &str,
     collection_id: &str,
     base: &str,
+    root: &str,
     controls: &FeatureControls,
 ) -> String {
     use api_common::workbench as ui;
-    let collection_url = format!(
-        "{base}/features/collections/{}",
-        path_segment(collection_id)
-    );
+    let collection_url = format!("{root}/collections/{}", path_segment(collection_id));
     let items_url = format!("{collection_url}/items");
     let is_list = doc["features"].is_array();
     let page_title = if is_list {
@@ -506,7 +506,7 @@ pub(crate) fn features_html(
     ui::Page {
         surface: ui::Surface {
             base,
-            root: &format!("{base}{}", api_common::mounts::FEATURES),
+            root,
             api: "features",
         },
         title: &page_title,
@@ -574,7 +574,14 @@ mod tests {
             {"id":"a","geometry":{"type":"Point","coordinates":[20,60]},"properties":{"label":"First","max_dbz":42,"nested":{"a":1},"null_value":null},"links":[{"rel":"self","href":"/items/a?f=html"}]},
             {"id":"b","geometry":null,"properties":{"nimi":"Second","last_report":"2026-09-18T09:00:00Z","evil</div>":"</script>"},"links":[{"rel":"self","href":"/items/b?f=html"}]}
         ],"numberMatched":1000,"numberReturned":2,"links":[{"rel":"self","href":"/features/collections/a/items?limit=2"},{"rel":"next","href":"/features/collections/a/items?limit=2&offset=2&f=html"}]});
-        let html = features_html(&doc, "Collection", "a", "", &FeatureControls::default());
+        let html = features_html(
+            &doc,
+            "Collection",
+            "a",
+            "",
+            "/features",
+            &FeatureControls::default(),
+        );
         assert!(html.contains("data-item-column value=\"last_report\""));
         assert!(html.contains("data-item-column value=\"nested\""));
         assert!(html.contains("evil&lt;/div&gt;"));
@@ -591,6 +598,7 @@ mod tests {
             "Collection",
             "a",
             "",
+            "/features",
             &FeatureControls::default(),
         );
         assert!(detail.contains("Geometry (Point)"));
@@ -601,16 +609,28 @@ mod tests {
     #[test]
     fn empty_offset_recovers_without_dropping_repeated_or_empty_predicates() {
         let doc = json!({"features":[],"numberMatched":308,"numberReturned":0,"links":[{"rel":"self","href":"/features/collections/a/items?limit=5&offset=1000&name=a%26b&name=&sortby=-name&f=html"}]});
-        let html = features_html(&doc, "Collection", "a", "", &FeatureControls::default());
+        let html = features_html(
+            &doc,
+            "Collection",
+            "a",
+            "",
+            "/features",
+            &FeatureControls::default(),
+        );
         assert!(html.contains("This page is outside the results."));
         assert!(!html.contains("No features match this query."));
         assert!(html.contains("href=\"/features/collections/a/items?limit=5&amp;name=a%26b&amp;name=&amp;sortby=-name&amp;f=html\">Go to first page"));
         let mut empty = doc.clone();
         empty["numberMatched"] = json!(0);
-        assert!(
-            features_html(&empty, "Collection", "a", "", &FeatureControls::default())
-                .contains("No features match this query.")
-        );
+        assert!(features_html(
+            &empty,
+            "Collection",
+            "a",
+            "",
+            "/features",
+            &FeatureControls::default()
+        )
+        .contains("No features match this query."));
     }
 
     #[test]
@@ -669,13 +689,14 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>()
             .into(),
         };
-        let mut doc = feature_to_geojson(&feature, "test", "https://example.com/prefix");
+        let mut doc = feature_to_geojson(&feature, "test", "https://example.com/prefix/features");
         representation_links(&mut doc, Wanted::Html);
         let html = features_html(
             &doc,
             attack,
             "test",
             "https://example.com/prefix",
+            "https://example.com/prefix/features",
             &FeatureControls::default(),
         );
         assert!(!html.contains(attack));
@@ -702,7 +723,14 @@ mod tests {
         let mut doc = json!({"type": "Feature", "id": "empty", "geometry": null,
             "properties": {}, "links": [{"rel": "self", "href": "/items/empty"}]});
         representation_links(&mut doc, Wanted::Html);
-        let html = features_html(&doc, "No geometry", "test", "", &FeatureControls::default());
+        let html = features_html(
+            &doc,
+            "No geometry",
+            "test",
+            "",
+            "/features",
+            &FeatureControls::default(),
+        );
         assert!(html.contains("No geometry available."));
         assert!(!html.contains("maplibre-gl.js"));
     }

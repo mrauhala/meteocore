@@ -772,13 +772,16 @@ async fn main() {
         }
     }
 
-    // The shared OGC API root (#789): Maps and Tiles as building blocks over
-    // the per-API services' own state, so reloads reach both surfaces.
+    // The shared OGC API root (#789): Maps, Tiles and Features as building
+    // blocks over the per-API services' own state, so reloads reach both
+    // surfaces. Block order is field precedence for a collection several
+    // blocks describe (api-common CLAUDE.md).
     let shared_api = api_common::shared::SharedApi::new(
         "",
         vec![
             Arc::new(api_maps::MapsBlock::new(maps_swap.clone())),
             Arc::new(api_tiles::TilesBlock::new(tiles_swap.clone())),
+            Arc::new(api_features::FeaturesBlock::new(features_swap.clone())),
         ],
         related_services(),
     );
@@ -787,7 +790,10 @@ async fn main() {
     let mut public = Router::new()
         .merge(api_common::shared::router(shared_api))
         .nest("/edr", api_edr::router(edr_swap.clone()))
-        .nest("/features", api_features::router(features_swap.clone()))
+        .nest(
+            api_common::mounts::FEATURES,
+            api_features::router(features_swap.clone()),
+        )
         .nest("/wms", api_wms::router(wms_swap.clone()))
         .nest(
             api_common::mounts::MAPS,
@@ -798,8 +804,8 @@ async fn main() {
             api_tiles::router(tiles_swap.clone()),
         )
         .nest("/3dtiles", api_3dtiles::router(tiles_3d_swap.clone()))
-        // Trailing-slash variants for /edr/, /features/ and /3dtiles/. Maps and
-        // Tiles need none: `NormalizePathLayer` below trims the slash before
+        // Trailing-slash variants for /edr/ and /3dtiles/. Maps, Tiles and
+        // Features need none: `NormalizePathLayer` below trims the slash before
         // routing, and their handlers require the router's `Mount` extension.
         .route(
             "/3dtiles/",
@@ -808,10 +814,6 @@ async fn main() {
         .route(
             "/edr/",
             get(api_edr::handlers::landing_page).with_state(edr_swap),
-        )
-        .route(
-            "/features/",
-            get(api_features::handlers::landing_page).with_state(features_swap),
         )
         .route(
             "/health",
@@ -985,7 +987,12 @@ fn related_services() -> Vec<api_common::shared::RelatedLink> {
     let json = "application/json";
     vec![
         link("/edr/", "child", json, "EDR API"),
-        link("/features/", "child", json, "Features API"),
+        link(
+            "/features/",
+            "child",
+            json,
+            "Features API (per-API service)",
+        ),
         link("/maps/", "child", json, "Maps API (per-API service)"),
         link("/tiles/", "child", json, "Tiles API (per-API service)"),
         link("/3dtiles/", "child", json, "3D Tiles API"),

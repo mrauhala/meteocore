@@ -25,28 +25,37 @@ Common resources — landing page, `/api` (one merged OpenAPI 3.0 document),
 `/conformance` (the union), `/collections` and `/collections/{id}` — and merges
 each collection's contributions: links concatenate in block order, the first
 block to describe a field wins, and `styles` merge by id so Tiles can add
-per-style map tilesets to Maps' entries. Common metadata routes get the
+per-style map tilesets to Maps' entries. A block may *claim* a field it leaves
+out (`Contribution::claims`) so that no later block fills it: a raster block
+claims `storageCrs`, which it omits when the native CRS has no OGC URI, so a
+Features block's CRS84 cannot mislabel a projected radar grid. Common metadata routes get the
 conditional-GET middleware (`caching`); data routes keep their own ETags. Each
 block's responses carry an `ApiKind` for request logs and the `api` metrics
 label. Blocks reuse their per-API service's state, so reloads reach both.
 
-Maps and Tiles are the blocks today. Tiles uses the Tiles Table 8 layout at the
-shared root: map tiles under `…/map/tiles`, styled map tiles under
-`…/styles/{styleId}/map/tiles`, vector tiles (MVT) under `…/tiles`, each list
-with its own tileset resources.
+The blocks are Maps, Tiles and Features, in that order — the order is field
+precedence. Tiles uses the Tiles Table 8 layout at the shared root: map tiles
+under `…/map/tiles`, styled map tiles under `…/styles/{styleId}/map/tiles`,
+vector tiles (MVT) under `…/tiles`, each list with its own tileset resources.
+Features serves `…/items[/{featureId}]` (with the conditional-GET middleware),
+adds `itemType: "feature"` and one `items` link per encoding to feature
+collections only, and namespaces its OpenAPI components (`features-bbox`, …)
+because Maps already defines a different `bbox`, `datetime` and `link`. Where
+Maps and Features both describe a collection (CAP, nowcast, lightning events),
+the extent, `crs` and `dataType` are Maps', and discovery follows that extent.
 
 ## Mounts and links
 
 `mounts` names where the server nests each per-API service (`/edr`, `/features`,
-`/maps`, `/tiles`). Maps and Tiles are mount-agnostic: `router_at(state, mount)`
+`/maps`, `/tiles`). Maps, Tiles and Features are mount-agnostic: `router_at(state, mount)`
 adds a `Mount` request extension, and their handlers build every link, OpenAPI
 path key and HTML URL from base URL + mount (`Mount::root`). `router(state)`
 mounts at the per-API path. The HTML workbench receives a `Surface` (server base,
 API root, API kind) instead of deriving the root from `{base}/{api}`, and chooses
 data-access panels from the advertised links (for example the map preview),
-so one handler set can later serve a shared OGC API root
-([#789](https://github.com/mrauhala/meteocore/issues/789)). EDR and Features
-still build their paths from their per-API mounts.
+so one handler set serves both a per-API service and the shared OGC API root
+([#789](https://github.com/mrauhala/meteocore/issues/789)). EDR still builds
+its paths from its per-API mount.
 
 The supported parameter names come from `ds_core::collection_search::CollectionParameter`;
 the same inventory drives pair validation and OpenAPI generation.
