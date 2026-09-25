@@ -182,11 +182,13 @@
             const item = tileset?.links?.find(l => l.rel === 'item');
             if (!item || !sameOrigin(item.href)) throw new Error('This collection advertises no Web Mercator tileset.');
             const zooms = (tileset.tileMatrixSetLimits || []).map(l => Number(l.tileMatrix)).filter(Number.isFinite);
+            // Every URL this page opens is validated like the tile template.
+            const self = tileset.links.find(l => l.rel === 'self')?.href;
             return {
               template: item.href.replace('{tileMatrix}','{z}').replace('{tileRow}','{y}').replace('{tileCol}','{x}'),
               minzoom: zooms.length ? Math.min(...zooms) : 0,
               maxzoom: zooms.length ? Math.max(...zooms) : 22,
-              self: tileset.links.find(l => l.rel === 'self')?.href || listHref
+              self: self && sameOrigin(self) ? self : listHref
             };
           })().catch(error => { tilesets.delete(key); throw error; }));
         }
