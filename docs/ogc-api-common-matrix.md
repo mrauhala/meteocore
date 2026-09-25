@@ -63,6 +63,11 @@ of the access standards (Maps `…/map`, `…/styles`, `…/legend`; Tiles
 `…/tilesets-map`/`…/tilesets-vector` by the registered tile kind). Cross-API
 tileset links now follow the Tiles registries rather than the `apis` list.
 Maps and Tiles build links from their router mount. No Common class changes.
+The short forms Phase 0 kept beside them (`map`, `styles`, `legend`,
+`tiling-schemes` and the per-API Tiles `tiles`) were removed on 2026-09-25 on
+every surface, the per-API `/maps` and `/tiles` included, as no client used
+them. The landing pages' short `conformance`/`data` stay: Features and EDR
+require them.
 
 Shared root update (2026-09-25, [#789](https://github.com/mrauhala/meteocore/issues/789)
 Phase 1): the server root is an OGC API composing Maps and Tiles as building

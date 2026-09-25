@@ -924,6 +924,7 @@ async fn relocated_apis_advertise_only_resolvable_links_on_their_mount() {
                 format!("{path}?{query}")
             };
             let doc = get_json(&app, &target).await;
+            assert_registered_relations_only(&url, &doc);
             let mut links = Vec::new();
             json_links(&doc, &mut links);
             queue.extend(links);
@@ -985,18 +986,19 @@ async fn crawl(app: &Router, start: &str) -> Vec<(String, Value)> {
 async fn shared_root_composes_maps_tiles_and_features_over_one_catalog() {
     let (app, prefix) = app("shared");
     let landing = get_json(&app, &prefix).await;
+    // Features and EDR require the short `conformance`/`data` next to the
+    // registered forms; every other relation is registered-only.
     for (short, registered, target) in [
         ("conformance", api_common::rel::CONFORMANCE, "/conformance"),
         ("data", api_common::rel::DATA, "/collections"),
-        (
-            "tiling-schemes",
-            api_common::rel::TILING_SCHEMES,
-            "/tileMatrixSets",
-        ),
     ] {
         assert_eq!(link(&landing, short), format!("{BASE}{target}"));
         assert_eq!(link(&landing, short), link(&landing, registered));
     }
+    assert_eq!(
+        link(&landing, api_common::rel::TILING_SCHEMES),
+        format!("{BASE}/tileMatrixSets")
+    );
     assert_eq!(link(&landing, "service-desc"), format!("{BASE}/api"));
     let classes = get_json(&app, &format!("{prefix}/conformance")).await["conformsTo"].clone();
     for class in [
@@ -1128,6 +1130,22 @@ async fn shared_root_links_resolve_and_tilesets_validate_against_tms_2() {
     );
     // Negative control: the validator is not vacuous.
     assert!(!tms::is_valid_tileset(&json!({"dataType": "map"})));
+    for (url, doc) in &visited {
+        assert_registered_relations_only(url, doc);
+    }
+}
+
+/// Maps and Tiles advertise their relations in the registered OGC form only;
+/// the pre-#789 short forms (`map`, `styles`, `legend`, `tiling-schemes`,
+/// `tiles`) are gone on every surface.
+fn assert_registered_relations_only(url: &str, doc: &Value) {
+    let text = doc.to_string();
+    for short in ["map", "styles", "legend", "tiling-schemes", "tiles"] {
+        assert!(
+            !text.contains(&format!("\"rel\":\"{short}\"")),
+            "{url} advertises the short `{short}` relation"
+        );
+    }
 }
 
 /// Per-API Tiles tilesets satisfy the same TMS 2.0 schema.

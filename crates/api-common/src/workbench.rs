@@ -378,7 +378,7 @@ pub fn document_links(doc: &Value) -> String {
                 escape(href),
                 escape(rel),
                 escape(link["type"].as_str().unwrap_or("Linked resource")),
-                if rel == "map" { " · requires bbox; use the map controls to build a request" } else { "" }
+                if rel == "map" || rel == rel::MAP { " · requires bbox; use the map controls to build a request" } else { "" }
             ));
         }
     }
@@ -614,7 +614,7 @@ pub fn collection_html(
             .filter(|href| safe_href(href) != "#")
             .map(|href| {
                 let legend = |style: &Value| style["links"].as_array()
-                    .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend"))
+                    .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend" || l["rel"] == rel::LEGEND))
                     .and_then(|l|l["href"].as_str()).filter(|href|safe_href(href) != "#")
                     .map(str::to_owned);
                 let default_legend = doc["styles"].as_array()

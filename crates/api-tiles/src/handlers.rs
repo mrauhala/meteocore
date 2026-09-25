@@ -200,7 +200,6 @@ pub(crate) fn collection_parts(
                 Layout::PerApi => {
                     let legend = format!("{root}/collections/{id}/styles/{}/legend", s.name);
                     json!([
-                        {"href": legend, "rel": "legend", "type": "application/json"},
                         {"href": legend, "rel": rel::LEGEND, "type": "application/json"}
                     ])
                 }
@@ -294,9 +293,9 @@ pub(crate) fn collection_parts(
     let tileset_link = |href: String, relation: &str, title: &str| json!({"href": href, "rel": relation, "type": "application/json", "title": title});
     match layout {
         Layout::PerApi => {
-            // One list may hold both kinds, as the standard allows.
+            // One list may hold both kinds, as the standard allows; each
+            // registered relation names a kind it holds.
             let tilesets = format!("{root}/collections/{id}/tiles");
-            links.push(tileset_link(tilesets.clone(), "tiles", "Tilesets"));
             if raster_info.is_some() {
                 links.push(tileset_link(
                     tilesets.clone(),
@@ -457,12 +456,6 @@ pub async fn landing_page(
             rel::DATA,
             "application/json",
             "Collections",
-        ),
-        (
-            format!("{root}/tileMatrixSets"),
-            "tiling-schemes",
-            "application/json",
-            "Tile matrix sets",
         ),
         (
             format!("{root}/tileMatrixSets"),

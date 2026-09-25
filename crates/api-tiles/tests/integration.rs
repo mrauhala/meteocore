@@ -316,7 +316,10 @@ mod landing_page {
         assert!(links.iter().any(|l| l["rel"] == "service-doc"));
         assert!(links.iter().any(|l| l["rel"] == "conformance"));
         assert!(links.iter().any(|l| l["rel"] == "data"));
-        assert!(links.iter().any(|l| l["rel"] == "tiling-schemes"));
+        assert!(links
+            .iter()
+            .any(|l| l["rel"] == api_common::rel::TILING_SCHEMES));
+        assert!(!links.iter().any(|l| l["rel"] == "tiling-schemes"));
     }
 }
 
@@ -1404,7 +1407,7 @@ mod style_legend {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|l| l["rel"] == "legend")
+                .find(|l| l["rel"] == api_common::rel::LEGEND)
                 .unwrap_or_else(|| panic!("style {id} has no legend link"));
             assert_eq!(
                 legend["href"],
@@ -2893,10 +2896,7 @@ async fn raster_collection_advertises_the_registered_map_tilesets_relation() {
             .map(|l| l["href"].clone())
     };
     assert!(href(api_common::rel::TILING_SCHEMES).is_some());
-    assert_eq!(
-        href(api_common::rel::TILING_SCHEMES),
-        href("tiling-schemes")
-    );
+    assert_eq!(href("tiling-schemes"), None, "only the registered relation");
 }
 
 #[tokio::test]
