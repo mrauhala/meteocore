@@ -186,6 +186,31 @@ pub enum Crs {
         south_pole_lat: f64, // latitude of the rotated south pole (radians)
         south_pole_lon: f64, // longitude of the rotated south pole (radians)
     },
+    /// Geostationary satellite view (PROJ `+proj=geos`, CF `geostationary`),
+    /// e.g. GOES-R ABI, Himawari AHI, MTG FCI.
+    ///
+    /// Projected coordinates are metres: the instrument's scan angle
+    /// (radians) times `height`. GOES-R publishes the angles themselves as
+    /// x/y (units `rad`), Himawari ISatSS in microradians. Only the Earth
+    /// disk the satellite sees has a projection: `forward` returns NaN for a
+    /// point on the far side of the Earth, and `inverse` returns `None` off
+    /// the disk.
+    Geostationary {
+        lon0: f64,       // sub-satellite longitude (radians)
+        height: f64,     // perspective point height above the ellipsoid (metres)
+        semi_major: f64, // ellipsoid semi-major axis (metres)
+        semi_minor: f64, // ellipsoid semi-minor axis (metres); equal for a sphere
+        sweep: SweepAxis,
+    },
+}
+
+/// The axis a geostationary imager sweeps, which fixes the order of its
+/// two scan angles (PROJ `+sweep`). GOES-R scans x (`sweep=x`); Himawari,
+/// Meteosat and GK2A scan y (`sweep=y`, the PROJ default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepAxis {
+    X,
+    Y,
 }
 
 /// Map an engine's internal native-CRS label (as stored in
@@ -380,8 +405,10 @@ pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> Option<[f64; 4]> {
 ///
 /// The inverse of [`wgs84_envelope`]: used by OGC API Maps, where the request
 /// `bbox` is in CRS:84 but the output `crs` is projected — the projected map
-/// frame must cover the requested geographic box. `Crs::forward` is total, so
-/// this always returns `Some`; the `unwrap_or` is a defensive identity fallback.
+/// frame must cover the requested geographic box. `Crs::forward` is total for
+/// every output CRS (Geostationary, the one partial variant, is never an
+/// output CRS), so this always returns `Some`; the `unwrap_or` is a defensive
+/// identity fallback.
 pub fn projected_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     edge_envelope(bbox, |lon, lat| Some(crs.forward(lon, lat))).unwrap_or(bbox)
 }
@@ -390,6 +417,9 @@ impl Crs {
     /// Forward-transform WGS84 (lon_deg, lat_deg) to projected (easting, northing).
     /// For Wgs84, returns (lon, lat) unchanged.
     /// For RotatedLatLon, returns rotated (lon, lat) in degrees.
+    /// For Geostationary, returns `(NaN, NaN)` for a point the satellite
+    /// cannot see; every other variant is total. Callers mapping many points
+    /// (`ProjectionGrid`, envelopes) must skip non-finite results.
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
         match self {
             Crs::Wgs84 => (lon_deg, lat_deg),
@@ -455,6 +485,11 @@ impl Crs {
                 *south_pole_lat,
                 *south_pole_lon,
             ),
+            Crs::Geostationary { .. } => {
+                let geos = Geos::from_crs(self).expect("Geostationary variant");
+                geos.forward(lat_deg.to_radians(), lon_deg.to_radians())
+                    .unwrap_or((f64::NAN, f64::NAN))
+            }
         }
     }
 
@@ -516,6 +551,11 @@ impl Crs {
                 *south_pole_lat,
                 *south_pole_lon,
             ),
+            Crs::Geostationary { .. } => {
+                let geos = Geos::from_crs(self).expect("Geostationary variant");
+                let (lat, lon) = geos.inverse(x, y)?;
+                (wrap_lon(lon.to_degrees()), lat.to_degrees())
+            }
         };
         if result.0.is_finite() && result.1.is_finite() {
             Some(result)
@@ -598,6 +638,45 @@ impl GeoTransform {
 }
 
 impl GeoTransform {
+    /// Create from the coordinates of the first pixel's **centre** and the
+    /// step between pixel centres — the form NetCDF coordinate variables
+    /// take (CF `x`/`y`). Rows must run north to south (`dy < 0`), as for
+    /// every other `GeoTransform`: a south-up source is flipped on read.
+    ///
+    /// For a geostationary source the coordinates are metres, i.e. the scan
+    /// angles in radians times the satellite height.
+    pub fn from_cell_centres(
+        x0: f64,
+        dx: f64,
+        y0: f64,
+        dy: f64,
+        width: u32,
+        height: u32,
+        crs: Crs,
+    ) -> Result<Self, String> {
+        if !(x0.is_finite() && dx.is_finite() && y0.is_finite() && dy.is_finite()) {
+            return Err("non-finite grid coordinates".to_string());
+        }
+        if dx <= 0.0 || dy >= 0.0 {
+            return Err(format!(
+                "grid must run west to east and north to south (dx > 0, dy < 0), \
+                 got dx={dx}, dy={dy}"
+            ));
+        }
+        if width == 0 || height == 0 {
+            return Err("empty grid".to_string());
+        }
+        Ok(GeoTransform {
+            origin_x: x0 - 0.5 * dx,
+            origin_y: y0 - 0.5 * dy,
+            pixel_width: dx,
+            pixel_height: -dy,
+            width,
+            height,
+            crs,
+        })
+    }
+
     /// Convert WGS84 (lon, lat) to *fractional, unclamped* pixel coordinates.
     ///
     /// Returns `(col, row)` as floats **before** flooring or bounds-checking;
@@ -633,7 +712,16 @@ impl GeoTransform {
     /// Compute the bounding box in WGS84 [west, south, east, north].
     /// For projected CRS, samples points along all edges (not just corners)
     /// to handle projection distortion. Skips points that fail to reproject.
+    ///
+    /// A geostationary raster's edges may lie wholly in space (a full disk),
+    /// so its box also covers where the edges meet the limb and the disk's
+    /// extreme points, and is `west > east` when it crosses the antimeridian.
+    /// Returns the `[MAX, MAX, MIN, MIN]` sentinel when nothing
+    /// reprojects; [`crs84_extent`] turns that into `None`.
     pub fn bbox(&self) -> [f64; 4] {
+        if let Some(geos) = Geos::from_crs(&self.crs) {
+            return self.geostationary_bbox(&geos);
+        }
         let x_min = self.origin_x;
         let x_max = self.origin_x + self.width as f64 * self.pixel_width;
         let y_max = self.origin_y;
@@ -673,8 +761,106 @@ impl GeoTransform {
         [min_lon, min_lat, max_lon, max_lat]
     }
 
+    /// [`bbox`](Self::bbox) of a geostationary raster.
+    ///
+    /// Longitude and latitude have no extremum inside the visible part of
+    /// the raster (the projection is a local diffeomorphism there), so the
+    /// extremes lie on its boundary: the raster edges where they are on the
+    /// disk, and the stretch of limb inside the raster. Along the limb,
+    /// latitude and longitude each have one maximum and one minimum — the
+    /// disk's four extreme points — so the extremes on a stretch of limb are
+    /// at its ends (where it meets a raster edge) or at one of those points.
+    fn geostationary_bbox(&self, geos: &Geos) -> [f64; 4] {
+        let x_min = self.origin_x;
+        let x_max = self.origin_x + self.width as f64 * self.pixel_width;
+        let y_max = self.origin_y;
+        let y_min = self.origin_y - self.height as f64 * self.pixel_height;
+        let mut extent = SeamExtent::new(geos.lon0.to_degrees());
+        let inverse = |x: f64, y: f64| self.crs.inverse(x, y);
+        let corners = [
+            (x_min, y_max),
+            (x_max, y_max),
+            (x_max, y_min),
+            (x_min, y_min),
+        ];
+        for k in 0..4 {
+            let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            visit_edge_with_boundaries(
+                64,
+                |t| (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)),
+                inverse,
+                |(lon, lat)| extent.add(lon, lat),
+            );
+        }
+        for (lat, lon) in geos.limb_extremes() {
+            if let Some((x, y)) = geos.forward(lat, lon) {
+                if (x_min..=x_max).contains(&x) && (y_min..=y_max).contains(&y) {
+                    extent.add(lon.to_degrees(), lat.to_degrees());
+                }
+            }
+        }
+        extent.finish()
+    }
+
+    /// [`bbox_to_pixels`](Self::bbox_to_pixels) of a geostationary raster:
+    /// the projected envelope of the part of the bbox the satellite sees.
+    ///
+    /// Its extremes lie on the bbox edges where visible, or on the stretch
+    /// of limb inside the bbox. Projected x and y are linear across the
+    /// disk, whose outline is convex, so a stretch of limb reaches its x/y
+    /// extremes at its ends or at one of the disk's four extreme points.
+    /// The bbox may cross the antimeridian (`west > east`).
+    fn geostationary_envelope(
+        &self,
+        geos: &Geos,
+        west: f64,
+        south: f64,
+        east: f64,
+        north: f64,
+    ) -> Option<[f64; 4]> {
+        let span = if east >= west {
+            east - west
+        } else {
+            east + 360.0 - west
+        };
+        let mut env = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        let mut add = |(x, y): (f64, f64)| {
+            env = [env[0].min(x), env[1].min(y), env[2].max(x), env[3].max(y)];
+        };
+        let forward = |lon: f64, lat: f64| {
+            let (x, y) = self.crs.forward(lon, lat);
+            (x.is_finite() && y.is_finite()).then_some((x, y))
+        };
+        let corners = [
+            (west, south),
+            (west + span, south),
+            (west + span, north),
+            (west, north),
+        ];
+        for k in 0..4 {
+            let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            visit_edge_with_boundaries(
+                64,
+                |t| (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)),
+                forward,
+                &mut add,
+            );
+        }
+        for (lat, lon) in geos.limb_extremes() {
+            let (lon, lat) = (lon.to_degrees(), lat.to_degrees());
+            let inside = (south..=north).contains(&lat) && (lon - west).rem_euclid(360.0) <= span;
+            if inside {
+                if let Some(xy) = geos.forward(lat.to_radians(), lon.to_radians()) {
+                    add(xy);
+                }
+            }
+        }
+        (env[0] <= env[2]).then_some(env)
+    }
+
     /// Convert pixel coordinate to WGS84 (lon, lat) at pixel center.
-    /// Returns (0, 0) if reprojection fails (degenerate edge case).
+    /// Returns (0, 0) if reprojection fails (degenerate edge case, or a
+    /// geostationary pixel in space).
     pub fn pixel_to_world(&self, col: u32, row: u32) -> (f64, f64) {
         let x = self.origin_x + (col as f64 + 0.5) * self.pixel_width;
         let y = self.origin_y - (row as f64 + 0.5) * self.pixel_height;
@@ -691,6 +877,11 @@ impl GeoTransform {
         east: f64,
         north: f64,
     ) -> Option<(u32, u32, u32, u32)> {
+        if let Some(geos) = Geos::from_crs(&self.crs) {
+            let [min_x, min_y, max_x, max_y] =
+                self.geostationary_envelope(&geos, west, south, east, north)?;
+            return self.envelope_to_pixels(min_x, min_y, max_x, max_y);
+        }
         // Transform bbox to source CRS by sampling points along all 4 edges
         // AND interior grid. For non-linear projections (TM, LAEA, LCC), bbox
         // edges project as curves — edge midpoints can extend beyond the
@@ -724,6 +915,18 @@ impl GeoTransform {
             }
         }
 
+        self.envelope_to_pixels(min_x, min_y, max_x, max_y)
+    }
+
+    /// Pixel window `(col_start, row_start, col_end, row_end)` covering a
+    /// source-CRS envelope, clamped to the raster; `None` when empty.
+    fn envelope_to_pixels(
+        &self,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    ) -> Option<(u32, u32, u32, u32)> {
         let col_start = ((min_x - self.origin_x) / self.pixel_width)
             .floor()
             .max(0.0) as u32;
@@ -1384,6 +1587,250 @@ fn rotlatlon_inverse(
     let lon_norm = ((lon_deg + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
 
     (lon_norm, lat.to_degrees())
+}
+
+// ============================================================================
+// Geostationary satellite view — GOES-R ABI, Himawari AHI, MTG FCI, GK2A AMI
+// A port of PROJ's `geos` (src/projections/geos.cpp): the ellipsoidal
+// formulas, which reduce to the spherical ones when semi_minor == semi_major.
+// ============================================================================
+
+/// Derived constants of a [`Crs::Geostationary`], in PROJ's notation.
+/// Lengths are in units of the semi-major axis.
+struct Geos {
+    lon0: f64,
+    semi_major: f64,
+    /// Satellite height above the ellipsoid, `h / a`.
+    radius_g_1: f64,
+    /// Satellite distance from the Earth's centre, `1 + h / a`.
+    radius_g: f64,
+    /// `radius_g² − 1`.
+    c: f64,
+    /// `b / a`, and its square and inverse square.
+    radius_p: f64,
+    radius_p2: f64,
+    radius_p_inv2: f64,
+    sweep: SweepAxis,
+}
+
+impl Geos {
+    fn from_crs(crs: &Crs) -> Option<Self> {
+        let Crs::Geostationary {
+            lon0,
+            height,
+            semi_major,
+            semi_minor,
+            sweep,
+        } = *crs
+        else {
+            return None;
+        };
+        let radius_g_1 = height / semi_major;
+        let radius_g = 1.0 + radius_g_1;
+        let radius_p = semi_minor / semi_major;
+        Some(Geos {
+            lon0,
+            semi_major,
+            radius_g_1,
+            radius_g,
+            c: radius_g * radius_g - 1.0,
+            radius_p,
+            radius_p2: radius_p * radius_p,
+            radius_p_inv2: 1.0 / (radius_p * radius_p),
+            sweep,
+        })
+    }
+
+    /// Satellite→surface vector for geodetic `(lat, lon)` (radians), and
+    /// whether the satellite sees that point (PROJ's visibility test).
+    fn view_vector(&self, lat: f64, lon: f64) -> ((f64, f64, f64), bool) {
+        let lam = lon - self.lon0;
+        // Geocentric latitude, then the point's distance from the centre.
+        let phi = (self.radius_p2 * lat.tan()).atan();
+        let r = self.radius_p / (self.radius_p * phi.cos()).hypot(phi.sin());
+        let vx = r * lam.cos() * phi.cos();
+        let vy = r * lam.sin() * phi.cos();
+        let vz = r * phi.sin();
+        let visible = (self.radius_g - vx) * vx - vy * vy - vz * vz * self.radius_p_inv2 >= 0.0;
+        ((vx, vy, vz), visible)
+    }
+
+    /// Geodetic `(lat, lon)` (radians) to projected metres, or `None` when
+    /// the point is on the far side of the Earth.
+    fn forward(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        let ((vx, vy, vz), visible) = self.view_vector(lat, lon);
+        if !visible {
+            return None;
+        }
+        let tmp = self.radius_g - vx;
+        let (x, y) = match self.sweep {
+            SweepAxis::X => ((vy / vz.hypot(tmp)).atan(), (vz / tmp).atan()),
+            SweepAxis::Y => ((vy / tmp).atan(), (vz / vy.hypot(tmp)).atan()),
+        };
+        let scale = self.radius_g_1 * self.semi_major;
+        Some((x * scale, y * scale))
+    }
+
+    /// Projected metres to geodetic `(lat, lon)` (radians, lon unwrapped),
+    /// or `None` off the Earth disk.
+    fn inverse(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let scale = self.radius_g_1 * self.semi_major;
+        let (ax, ay) = (x / scale, y / scale);
+        let vx = -1.0;
+        let (vy, vz) = match self.sweep {
+            SweepAxis::X => {
+                let vz = ay.tan();
+                (ax.tan() * 1.0_f64.hypot(vz), vz)
+            }
+            SweepAxis::Y => {
+                let vy = ax.tan();
+                (vy, ay.tan() * 1.0_f64.hypot(vy))
+            }
+        };
+        // Intersect the view ray with the ellipsoid: a quadratic in the ray
+        // length whose determinant is negative when the ray misses the Earth.
+        let vz_p = vz / self.radius_p;
+        let a = vy * vy + vz_p * vz_p + vx * vx;
+        let b = 2.0 * self.radius_g * vx;
+        let det = b * b - 4.0 * a * self.c;
+        if det.is_nan() || det < 0.0 {
+            return None;
+        }
+        let k = (-b - det.sqrt()) / (2.0 * a);
+        let (vx, vy, vz) = (self.radius_g + k * vx, vy * k, vz * k);
+        let lam = vy.atan2(vx);
+        let phi = (vz * lam.cos() / vx).atan();
+        let phi = (self.radius_p_inv2 * phi.tan()).atan();
+        Some((phi, lam + self.lon0))
+    }
+
+    /// The four extreme points of the visible disk, as geodetic `(lat, lon)`
+    /// radians just inside the limb: northernmost and southernmost (on the
+    /// sub-satellite meridian), easternmost and westernmost (on the
+    /// equator). The disk is symmetric about both planes, and each extreme
+    /// is found by bisecting the visibility test.
+    fn limb_extremes(&self) -> [(f64, f64); 4] {
+        let edge = |point: &dyn Fn(f64) -> (f64, f64)| {
+            let (mut inside, mut outside) = (0.0, std::f64::consts::FRAC_PI_2);
+            for _ in 0..60 {
+                let mid = 0.5 * (inside + outside);
+                let (lat, lon) = point(mid);
+                if self.view_vector(lat, lon).1 {
+                    inside = mid;
+                } else {
+                    outside = mid;
+                }
+            }
+            point(inside)
+        };
+        [
+            edge(&|t| (t, self.lon0)),
+            edge(&|t| (-t, self.lon0)),
+            edge(&|t| (0.0, self.lon0 + t)),
+            edge(&|t| (0.0, self.lon0 - t)),
+        ]
+    }
+}
+
+/// Longitude/latitude extent accumulated relative to a reference meridian,
+/// so a region straddling the antimeridian yields `west > east` rather than
+/// a spurious −180…180 box (the geostationary disks of GOES-West, Himawari
+/// and GK2A all cross it).
+struct SeamExtent {
+    lon_ref: f64,
+    min_rel: f64,
+    max_rel: f64,
+    min_lat: f64,
+    max_lat: f64,
+}
+
+impl SeamExtent {
+    fn new(lon_ref: f64) -> Self {
+        SeamExtent {
+            lon_ref,
+            min_rel: f64::MAX,
+            max_rel: f64::MIN,
+            min_lat: f64::MAX,
+            max_lat: f64::MIN,
+        }
+    }
+
+    fn add(&mut self, lon: f64, lat: f64) {
+        let rel = wrap_lon(lon - self.lon_ref);
+        self.min_rel = self.min_rel.min(rel);
+        self.max_rel = self.max_rel.max(rel);
+        self.min_lat = self.min_lat.min(lat);
+        self.max_lat = self.max_lat.max(lat);
+    }
+
+    /// `[west, south, east, north]`, or the `[MAX, MAX, MIN, MIN]` sentinel
+    /// when nothing was added (as [`GeoTransform::bbox`] documents).
+    fn finish(&self) -> [f64; 4] {
+        if self.min_rel > self.max_rel {
+            return [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        }
+        if self.max_rel - self.min_rel >= 360.0 {
+            return [-180.0, self.min_lat, 180.0, self.max_lat];
+        }
+        [
+            wrap_lon(self.lon_ref + self.min_rel),
+            self.min_lat,
+            wrap_lon(self.lon_ref + self.max_rel),
+            self.max_lat,
+        ]
+    }
+}
+
+/// Bisect the segment from `inside` (mapping to `Some`) to `outside`
+/// (mapping to `None`) and return the mapped value nearest the boundary on
+/// the inside. Used to find where a raster edge or bbox edge crosses the
+/// limb of a geostationary disk.
+fn bisect_boundary<T>(
+    inside: (f64, f64),
+    outside: (f64, f64),
+    map: impl Fn(f64, f64) -> Option<T>,
+) -> Option<T> {
+    let (mut a, mut b) = (inside, outside);
+    for _ in 0..40 {
+        let mid = (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+        if map(mid.0, mid.1).is_some() {
+            a = mid;
+        } else {
+            b = mid;
+        }
+    }
+    map(a.0, a.1)
+}
+
+/// Sample `n` segments along the path `edge(t)`, `t ∈ [0, 1]`,
+/// passing every point that maps to `Some` to `visit` — plus, where
+/// consecutive samples straddle a domain boundary, the boundary point found
+/// by bisection. The inverse and forward geostationary transforms are both
+/// partial, so edge sampling alone would miss where an edge meets the limb.
+fn visit_edge_with_boundaries<T>(
+    n: usize,
+    edge: impl Fn(f64) -> (f64, f64),
+    map: impl Fn(f64, f64) -> Option<T>,
+    mut visit: impl FnMut(T),
+) {
+    let mut prev: Option<((f64, f64), bool)> = None;
+    for i in 0..=n {
+        let p = edge(i as f64 / n as f64);
+        let mapped = map(p.0, p.1);
+        let ok = mapped.is_some();
+        if let Some(value) = mapped {
+            visit(value);
+        }
+        if let Some((q, q_ok)) = prev {
+            if q_ok != ok {
+                let (inside, outside) = if ok { (p, q) } else { (q, p) };
+                if let Some(value) = bisect_boundary(inside, outside, &map) {
+                    visit(value);
+                }
+            }
+        }
+        prev = Some((p, ok));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2436,5 +2883,284 @@ mod tests {
         let one_deg = great_circle_distance_m(25.0, 60.0, 25.0, 61.0);
         assert!((one_deg - 111_195.0).abs() < 200.0, "got {one_deg}");
         assert_eq!(great_circle_distance_m(25.0, 60.0, 25.0, 60.0), 0.0);
+    }
+
+    // --- Geostationary -----------------------------------------------------
+
+    /// GOES-East as the GOES-R L2 files describe it (`goes_imager_projection`).
+    fn goes_east() -> Crs {
+        Crs::Geostationary {
+            lon0: (-75.0_f64).to_radians(),
+            height: 35_786_023.0,
+            semi_major: 6_378_137.0,
+            semi_minor: 6_356_752.314_14,
+            sweep: SweepAxis::X,
+        }
+    }
+
+    fn goes_west() -> Crs {
+        Crs::Geostationary {
+            lon0: (-137.2_f64).to_radians(),
+            height: 35_786_023.0,
+            semi_major: 6_378_137.0,
+            semi_minor: 6_356_752.314_14,
+            sweep: SweepAxis::X,
+        }
+    }
+
+    /// The GOES-R ABI full disk: 5424² pixels of 56 µrad, first centre at
+    /// ±0.151844 rad (the packed x/y of an L2 file decoded).
+    fn goes_full_disk(crs: Crs) -> GeoTransform {
+        let h = 35_786_023.0;
+        GeoTransform::from_cell_centres(
+            -0.151844 * h,
+            5.6e-5 * h,
+            0.151844 * h,
+            -5.6e-5 * h,
+            5424,
+            5424,
+            crs,
+        )
+        .unwrap()
+    }
+
+    /// Pinned to `cs2cs +proj=longlat +a=6378137 +b=6356752.31414 +to
+    /// +proj=geos +h=35786023 +lon_0=-75 +sweep=x +a=6378137
+    /// +b=6356752.31414 +units=m` (PROJ 9.8.1), not only to itself.
+    #[test]
+    fn geostationary_sweep_x_matches_proj() {
+        assert_matches_proj(
+            &goes_east(),
+            &[
+                (-75.0, 0.0, 0.0, 0.0),
+                (-100.0, 30.0, -2239253.387825, 3046275.703528),
+                (-50.0, -40.0, 1947935.148980, -3852931.246132),
+                (-120.0, 60.0, -2006328.159192, 4902017.718814),
+                (-75.0, 80.0, 0.0, 5414758.281994),
+                (-10.0, 5.0, 5182984.148697, 500500.611319),
+            ],
+        );
+    }
+
+    /// The navigation example of the GOES-R Product User Guide (vol. 3,
+    /// §4.2.8): scan angles (−0.024052, 0.095340) rad from GOES-East are
+    /// 33.846162°N 84.690932°W. An absolute reference independent of PROJ.
+    #[test]
+    fn geostationary_matches_goes_r_pug_example() {
+        let h = 35_786_023.0;
+        let (lon, lat) = goes_east().inverse(-0.024052 * h, 0.095340 * h).unwrap();
+        assert!((lon + 84.690932).abs() < 1e-6, "lon={lon}");
+        assert!((lat - 33.846162).abs() < 1e-6, "lat={lat}");
+    }
+
+    /// GOES-West sees across the antimeridian: `cs2cs … +proj=geos
+    /// +h=35786023 +lon_0=-137.2 +sweep=x …` (PROJ 9.8.1).
+    #[test]
+    fn geostationary_across_the_antimeridian_matches_proj() {
+        assert_matches_proj(
+            &goes_west(),
+            &[
+                (170.0, 10.0, -4639119.965821, 1025975.668246),
+                (-170.0, 20.0, -3117676.383867, 2087186.829455),
+                (160.0, -30.0, -4402709.137024, -2856257.029850),
+                (-150.0, 45.0, -941726.684592, 4233040.952387),
+            ],
+        );
+    }
+
+    /// Himawari scans y: `cs2cs +proj=longlat +a=6378137 +b=6356752.3 +to
+    /// +proj=geos +h=35785831 +lon_0=140.7 +sweep=y +a=6378137 +b=6356752.3
+    /// +units=m`; and a sphere, `… +R=6371000 … +lon_0=0 +sweep=y`.
+    #[test]
+    fn geostationary_sweep_y_and_sphere_match_proj() {
+        let himawari = Crs::Geostationary {
+            lon0: 140.7_f64.to_radians(),
+            height: 35_785_831.0,
+            semi_major: 6_378_137.0,
+            semi_minor: 6_356_752.3,
+            sweep: SweepAxis::Y,
+        };
+        assert_matches_proj(
+            &himawari,
+            &[
+                (140.7, 0.0, 0.0, 0.0),
+                (139.7, 35.7, -87578.480720, 3569861.951564),
+                (-170.0, 10.0, 4453902.286646, 1026018.881534),
+                (100.0, -20.0, -3706108.055965, -2048812.510060),
+                (175.0, -40.0, 2583698.871098, -3803707.437491),
+            ],
+        );
+        let sphere = Crs::Geostationary {
+            lon0: 0.0,
+            height: 35_785_831.0,
+            semi_major: 6_371_000.0,
+            semi_minor: 6_371_000.0,
+            sweep: SweepAxis::Y,
+        };
+        assert_matches_proj(
+            &sphere,
+            &[
+                (10.0, 50.0, 667435.597628, 4555599.059598),
+                (-30.0, -20.0, -2891038.319347, -2099802.151926),
+            ],
+        );
+    }
+
+    /// PROJ rejects both (`*`): a point behind the Earth has no projection,
+    /// and a scan angle past the limb sees no Earth.
+    #[test]
+    fn geostationary_is_undefined_off_the_disk() {
+        let crs = goes_east();
+        for (lon, lat) in [(100.0, 0.0), (-75.0, 85.0), (105.0, 30.0)] {
+            let (x, y) = crs.forward(lon, lat);
+            assert!(
+                x.is_nan() && y.is_nan(),
+                "forward({lon}, {lat}) = ({x}, {y})"
+            );
+        }
+        assert_eq!(crs.inverse(0.0, 5_500_000.0), None);
+        assert_eq!(crs.inverse(5_500_000.0, 0.0), None);
+        assert_eq!(crs.inverse(f64::NAN, 0.0), None);
+    }
+
+    /// A full disk's edges are all space, so its extent comes from the limb:
+    /// the equator's edge is `acos(a / (a + h))` = 81.2995° from the
+    /// sub-satellite point, and the northern edge is at 81.3282°N (the
+    /// latitude where `cs2cs` stops projecting on the −75° meridian).
+    #[test]
+    fn geostationary_full_disk_extent_is_the_limb() {
+        let [w, s, e, n] = goes_full_disk(goes_east()).bbox();
+        assert!((w - (-75.0 - 81.2995)).abs() < 1e-3, "west={w}");
+        assert!((e - (-75.0 + 81.2995)).abs() < 1e-3, "east={e}");
+        assert!((n - 81.3282).abs() < 1e-3, "north={n}");
+        assert!((s + 81.3282).abs() < 1e-3, "south={s}");
+    }
+
+    /// GOES-West's disk crosses the antimeridian: its extent is `west > east`
+    /// (141.5°E to 55.9°W), which `crs84_extent` keeps as a crossing — not a
+    /// −180…180 box.
+    #[test]
+    fn geostationary_full_disk_extent_crosses_the_antimeridian() {
+        let bbox = goes_full_disk(goes_west()).bbox();
+        let [w, _, e, _] = crs84_extent(bbox).unwrap();
+        assert!((w - (-137.2 - 81.2995 + 360.0)).abs() < 1e-3, "west={w}");
+        assert!((e - (-137.2 + 81.2995)).abs() < 1e-3, "east={e}");
+        assert!(w > e);
+    }
+
+    /// A window cut across the limb (the NE edge of the disk, as in the
+    /// C13 fixture) has part of each edge in space. Its extent must contain
+    /// every on-disk pixel centre, and exceed their extremes only by about
+    /// a pixel, which near the limb covers a large ground distance.
+    #[test]
+    fn geostationary_window_across_the_limb_covers_its_pixels() {
+        let h = 35_786_023.0;
+        let (row0, col0, rows, cols) = (720, 4480, 240, 320);
+        let centre = |i: u32| -0.151844 + 5.6e-5 * i as f64;
+        let gt = GeoTransform::from_cell_centres(
+            centre(col0) * h,
+            5.6e-5 * h,
+            -centre(row0) * h,
+            -5.6e-5 * h,
+            cols,
+            rows,
+            goes_east(),
+        )
+        .unwrap();
+        let [w, s, e, n] = gt.bbox();
+        let mut seen = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        let mut on_disk = 0;
+        for r in 0..rows {
+            for c in 0..cols {
+                let x = gt.origin_x + (c as f64 + 0.5) * gt.pixel_width;
+                let y = gt.origin_y - (r as f64 + 0.5) * gt.pixel_height;
+                if let Some((lon, lat)) = gt.crs.inverse(x, y) {
+                    on_disk += 1;
+                    seen = [
+                        seen[0].min(lon),
+                        seen[1].min(lat),
+                        seen[2].max(lon),
+                        seen[3].max(lat),
+                    ];
+                }
+            }
+        }
+        assert!(
+            on_disk > 0 && on_disk < rows * cols,
+            "window must cross the limb"
+        );
+        assert!(w <= seen[0] && s <= seen[1] && e >= seen[2] && n >= seen[3]);
+        assert!(
+            seen[0] - w < 1.0 && seen[1] - s < 1.0,
+            "{:?} vs {seen:?}",
+            [w, s, e, n]
+        );
+        assert!(
+            e - seen[2] < 1.0 && n - seen[3] < 1.0,
+            "{:?} vs {seen:?}",
+            [w, s, e, n]
+        );
+    }
+
+    /// A whole-world request sees the whole disk even though every bbox
+    /// edge (the poles, the far meridian) is invisible; an area behind the
+    /// Earth reads nothing; and the canonical seam box reads from GOES-West,
+    /// which sees it, but not from GOES-East.
+    #[test]
+    fn geostationary_bbox_to_pixels_covers_the_visible_part() {
+        let east = goes_full_disk(goes_east());
+        // The disk is flattened: the equator's limb falls in the outermost
+        // columns, but the rows above the pole's limb are all space.
+        let on_disk_rows: Vec<u32> = (0..5424)
+            .filter(|&r| {
+                let y = east.origin_y - (r as f64 + 0.5) * east.pixel_height;
+                east.crs.inverse(0.0, y).is_some()
+            })
+            .collect();
+        let (first, last) = (on_disk_rows[0], *on_disk_rows.last().unwrap());
+        let (c0, r0, c1, r1) = east.bbox_to_pixels(-180.0, -90.0, 180.0, 90.0).unwrap();
+        assert_eq!((c0, c1), (0, 5424));
+        assert!(
+            r0 <= first && r0 + 1 >= first,
+            "r0={r0}, first on-disk row {first}"
+        );
+        assert!(
+            r1 > last && r1 <= last + 2,
+            "r1={r1}, last on-disk row {last}"
+        );
+        assert_eq!(east.bbox_to_pixels(100.0, -10.0, 120.0, 10.0), None);
+        assert_eq!(east.bbox_to_pixels(170.0, 10.0, -170.0, 20.0), None);
+
+        let west = goes_full_disk(goes_west());
+        let (c0, r0, c1, r1) = west.bbox_to_pixels(170.0, 10.0, -170.0, 20.0).unwrap();
+        // Every visible point of the box maps inside the window.
+        for (lon, lat) in [(170.0, 10.0), (-170.0, 20.0), (180.0, 15.0), (175.0, 19.0)] {
+            let (c, r) = west.world_to_pixel(lon, lat).unwrap();
+            assert!(
+                (c0..c1).contains(&c) && (r0..r1).contains(&r),
+                "({lon}, {lat})"
+            );
+        }
+    }
+
+    /// A box reaching past the limb gets a window up to the disk edge, not
+    /// only as far as its visible corners.
+    #[test]
+    fn geostationary_bbox_to_pixels_reaches_the_limb() {
+        let gt = goes_full_disk(goes_east());
+        // Up to 20°E: past the eastern limb (6.3°E) on the equator.
+        let (_, _, col_end, _) = gt.bbox_to_pixels(-20.0, -5.0, 20.0, 5.0).unwrap();
+        assert!(col_end >= 5423, "col_end={col_end}");
+    }
+
+    #[test]
+    fn from_cell_centres_places_the_origin_on_the_pixel_edge() {
+        let gt = GeoTransform::from_cell_centres(10.5, 1.0, 20.5, -1.0, 4, 3, Crs::Wgs84).unwrap();
+        assert_eq!((gt.origin_x, gt.origin_y), (10.0, 21.0));
+        assert_eq!(gt.world_to_pixel(10.5, 20.5), Some((0, 0)));
+        assert_eq!(gt.bbox(), [10.0, 18.0, 14.0, 21.0]);
+        // South-up and zero-step grids are rejected rather than mislocated.
+        assert!(GeoTransform::from_cell_centres(0.0, 1.0, 0.0, 1.0, 4, 3, Crs::Wgs84).is_err());
+        assert!(GeoTransform::from_cell_centres(0.0, 0.0, 0.0, -1.0, 4, 3, Crs::Wgs84).is_err());
     }
 }

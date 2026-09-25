@@ -1284,6 +1284,7 @@ fn crs_label(crs: &Crs) -> String {
         Crs::LambertConformalConic { .. } => "LCC".into(),
         Crs::Stereographic { .. } => "stere".into(),
         Crs::RotatedLatLon { .. } => "rotated_ll".into(),
+        Crs::Geostationary { .. } => "geos".into(),
     }
 }
 
