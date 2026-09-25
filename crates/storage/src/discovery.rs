@@ -214,21 +214,41 @@ pub fn prefix_step(pattern: &str) -> Result<PrefixStep, DataServerError> {
     Ok(step)
 }
 
+/// Longest `time_window` an hourly prefix template may run with. Each hour
+/// is one `list` per poll, issued sequentially (Critical Rule 9), so this
+/// caps a poll at 26 calls. A longer window belongs on a day-level
+/// template: listing a day prefix is recursive and covers all its hours.
+pub const MAX_HOURLY_PREFIX_WINDOW_HOURS: i64 = 24;
+
 /// Validate a prefix template against the discovery window it runs
 /// with, so a template discovery cannot expand fails at config load
 /// rather than on the first poll.
 ///
-/// An hourly template needs a `time_window`: without one, discovery
-/// falls back to whole days, 24 `list` calls per day on every poll.
+/// An hourly template needs a `time_window` of at most
+/// [`MAX_HOURLY_PREFIX_WINDOW_HOURS`]: without one, discovery falls back
+/// to whole days, and a long one multiplies the `list` calls per poll.
 pub fn validate_prefix_pattern(
     pattern: &str,
     time_window: Option<&TimeWindow>,
 ) -> Result<PrefixStep, DataServerError> {
     let step = prefix_step(pattern)?;
-    if step == PrefixStep::Hour && time_window.is_none() {
-        return Err(DataServerError::Config(format!(
-            "prefix_pattern '{pattern}' is partitioned by hour and needs a time_window"
-        )));
+    if step == PrefixStep::Hour {
+        match time_window {
+            None => {
+                return Err(DataServerError::Config(format!(
+                    "prefix_pattern '{pattern}' is partitioned by hour and needs a time_window"
+                )))
+            }
+            Some(tw) if tw.seconds.abs() > MAX_HOURLY_PREFIX_WINDOW_HOURS * 3_600 => {
+                return Err(DataServerError::Config(format!(
+                    "prefix_pattern '{pattern}' is partitioned by hour, which lists one \
+                     prefix per hour on every poll; its time_window may span at most \
+                     {MAX_HOURLY_PREFIX_WINDOW_HOURS} hours. Use a day-level prefix \
+                     (e.g. '%Y/%j/') for a longer window"
+                )))
+            }
+            Some(_) => {}
+        }
     }
     Ok(step)
 }
@@ -448,5 +468,17 @@ mod tests {
             validate_prefix_pattern("%Y/%m/%d/", None).unwrap(),
             PrefixStep::Day
         );
+    }
+
+    /// Each hour is a sequential `list` per poll: an hourly template's window
+    /// is capped, while a day-level template may run with a long one.
+    #[test]
+    fn hourly_prefix_window_is_bounded() {
+        let window = |s: &str| TimeWindow::parse(s).unwrap();
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("-PT24H"))).is_ok());
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("PT24H"))).is_ok());
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("-PT25H"))).is_err());
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("-P30D"))).is_err());
+        assert!(validate_prefix_pattern("%Y/%j/", Some(&window("-P30D"))).is_ok());
     }
 }

@@ -703,7 +703,7 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | `exclude_patterns` | no | `["*.tmp", "*.part"]` | Glob patterns for files to skip. |
 | `endpoint` | no | — | S3-compatible endpoint URL |
 | `bucket` | no | — | S3 bucket name. Required when `endpoint` is set. |
-| `prefix_pattern` | no | `""` | Object prefix, optionally with strftime date templates. An hour specifier (`%H`, e.g. `"ABI-L2-CMIPF/%Y/%j/%H/"`) lists one prefix per hour and requires `time_window`; minutes, seconds and unknown specifiers are rejected at load. |
+| `prefix_pattern` | no | `""` | Object prefix, optionally with strftime date templates. An hour specifier (`%H`, e.g. `"ABI-L2-CMIPF/%Y/%j/%H/"`) lists one prefix per hour and requires a `time_window` of at most 24 h (use a day-level template for longer windows); minutes, seconds and unknown specifiers are rejected at load. |
 | `time_window` | no | none | ISO 8601 duration for file selection, e.g., `"-PT2H"` |
 | `scan_days` | no | auto | Number of days to scan for date-based prefixes |
 | `stac_url` | no | — | STAC API items endpoint URL |
