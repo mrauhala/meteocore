@@ -33,6 +33,19 @@ pub const CONFORMANCE_CLASSES: &[&str] = &[
 
 /// Paths at which the per-API services are mounted below the external base URL.
 /// The server nests each router here; cross-API links target these services.
+/// OpenAPI tags. Swagger UI groups operations by tag, and an untagged
+/// operation lands in a catch-all "default" group. Data-access operations
+/// are tagged with their collection id; these name the rest.
+pub mod openapi_tags {
+    /// Landing page, conformance declaration and the collection catalog.
+    pub const DISCOVERY: &str = "Discovery";
+    pub const DISCOVERY_DESCRIPTION: &str =
+        "Landing page, conformance declaration and collection catalog (OGC API - Common)";
+    /// Tile matrix sets (Tiles `/tileMatrixSets`).
+    pub const TILING_SCHEMES: &str = "Tiling schemes";
+    pub const TILING_SCHEMES_DESCRIPTION: &str = "Tile matrix sets (OGC 2D TileMatrixSet 2.0)";
+}
+
 pub mod mounts {
     pub const EDR: &str = "/edr";
     pub const FEATURES: &str = "/features";
@@ -326,6 +339,7 @@ pub fn collection_operation() -> Value {
     json!({
         "summary": "List collections",
         "operationId": "getCollections",
+        "tags": [openapi_tags::DISCOVERY],
         "description": "Search and page the collections exposed by this API. Unsupported or duplicate query parameters return 400. Supports a subset of OGC API Common Part 4 draft 25-046 (2026-09-17); full Searchable Collections conformance is not claimed.",
         "parameters": collection_parameters(),
         "responses": {

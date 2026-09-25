@@ -319,7 +319,9 @@ Same pattern for api-edr, api-features, api-maps, api-tiles:
 1. Add the handler in `handlers.rs`, the route in `lib.rs`, new query params
    in `params.rs`, new response formats in `response.rs`.
 2. **Always update `api_definition()` in `handlers.rs`** so the OpenAPI spec
-   includes the new path.
+   includes the new path. Tag every operation — with its collection id, or an
+   `api_common::openapi_tags` group — or Swagger UI files it under "default"
+   (enforced by `common_discovery`).
 3. **An unknown query parameter must not be silently ignored.** serde drops
    unrecognized fields, so a parameter that is parsed but never validated
    returns 200 having done nothing — indistinguishable from success at the

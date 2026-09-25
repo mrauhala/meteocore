@@ -1448,3 +1448,55 @@ async fn items_parameters_follow_features_part_1_on_both_surfaces() {
             .is_some());
     }
 }
+
+/// Swagger UI groups operations by tag and puts untagged ones in a catch-all
+/// "default" group: every operation on every surface carries a tag, and the
+/// shared document declares its tags — discovery first, then each collection
+/// described by its title.
+#[tokio::test]
+async fn every_operation_is_tagged_and_shared_tags_are_declared() {
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let doc = get_json(&app, &format!("{prefix}/api")).await;
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for (method, operation) in item.as_object().unwrap() {
+                let tags = operation["tags"].as_array();
+                assert!(
+                    tags.is_some_and(|t| !t.is_empty()),
+                    "{surface}: {method} {path} has no tag"
+                );
+            }
+        }
+    }
+    let (app, prefix) = app("shared");
+    let doc = get_json(&app, &format!("{prefix}/api")).await;
+    let declared: Vec<&str> = doc["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(declared[0], api_common::openapi_tags::DISCOVERY);
+    for item in doc["paths"].as_object().unwrap().values() {
+        for operation in item.as_object().unwrap().values() {
+            for tag in operation["tags"].as_array().unwrap() {
+                assert!(
+                    declared.contains(&tag.as_str().unwrap()),
+                    "undeclared tag {tag}"
+                );
+            }
+        }
+    }
+    let wind = doc["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "f-wind")
+        .unwrap();
+    assert_eq!(wind["description"], "Wind");
+    // Shared tile operations join their collection's group.
+    assert_eq!(
+        doc["paths"]["/collections/c-match/map/tiles"]["get"]["tags"],
+        json!(["c-match"])
+    );
+}

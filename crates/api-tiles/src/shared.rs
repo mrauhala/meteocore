@@ -197,9 +197,12 @@ fn binary(media_types: &[&str]) -> Value {
     )
 }
 
-/// The list, tileset and tile operations below one `…/tiles` path.
+/// The list, tileset and tile operations below one `…/tiles` path, tagged
+/// with their collection so API docs group them under it.
+#[allow(clippy::too_many_arguments)] // path, naming, tag and three operation inputs
 fn tileset_paths(
     paths: &mut Map<String, Value>,
+    tag: &str,
     list: String,
     operation: &str,
     summary: &str,
@@ -212,6 +215,7 @@ fn tileset_paths(
         list.clone(),
         json!({"get": {"summary": format!("{summary} tilesets"),
             "operationId": format!("get{operation}Tilesets"),
+            "tags": [tag],
             "parameters": with(vec![]),
             "responses": {"200": {"description": "Tileset list"},
                           "404": {"description": "Not found"}}}}),
@@ -220,6 +224,7 @@ fn tileset_paths(
         format!("{list}/{{tileMatrixSetId}}"),
         json!({"get": {"summary": format!("{summary} tileset"),
             "operationId": format!("get{operation}Tileset"),
+            "tags": [tag],
             "parameters": with(vec![tile_matrix_set_parameter()]),
             "responses": {"200": {"description": "Tileset metadata"},
                           "404": {"description": "Not found"}}}}),
@@ -230,6 +235,7 @@ fn tileset_paths(
         format!("{list}/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"),
         json!({"get": {"summary": format!("{summary} tile"),
             "operationId": format!("get{operation}Tile"),
+            "tags": [tag],
             "parameters": parameters,
             "responses": {"200": {"description": "Tile", "content": tile_content},
                           "400": {"description": "Bad request"},
@@ -261,6 +267,7 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
         if sources.raster_info.is_some() {
             tileset_paths(
                 &mut paths,
+                id,
                 format!("{m}/collections/{id}/map/tiles"),
                 &format!("Map_{id}_"),
                 &format!("{} map", sources.config.title),
@@ -270,6 +277,7 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
             );
             tileset_paths(
                 &mut paths,
+                id,
                 format!("{m}/collections/{id}/styles/{{styleId}}/map/tiles"),
                 &format!("StyledMap_{id}_"),
                 &format!("{} styled map", sources.config.title),
@@ -281,6 +289,7 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
         if sources.has_vector {
             tileset_paths(
                 &mut paths,
+                id,
                 format!("{m}/collections/{id}/tiles"),
                 &format!("Vector_{id}_"),
                 &format!("{} vector", sources.config.title),
