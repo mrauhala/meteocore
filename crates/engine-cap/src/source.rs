@@ -466,7 +466,7 @@ pub fn extract_feed_links(xml: &str) -> Vec<String> {
         let mut typ: Option<String> = None;
         let mut rel: Option<String> = None;
         for attr in e.attributes().flatten() {
-            let key = String::from_utf8_lossy(attr.key.local_name().as_ref()).into_owned();
+            let key = attr.key.local_name().as_ref().to_owned();
             // Replaces the deprecated `unescape_value`; also applies XML
             // attribute-value normalization. `Implicit1_0` — the declaration is
             // not inspected and 1.0 is the assumed default (see `parser`).
@@ -512,11 +512,7 @@ pub fn extract_feed_links(xml: &str) -> Vec<String> {
                     pick_link(&e, &mut cap_typed, &mut fallback);
                 }
             }
-            Ok(Event::Text(e)) => {
-                if let Ok(t) = e.xml10_content() {
-                    text.push_str(&t);
-                }
-            }
+            Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
             // A `<link>https://host/a&amp;b</link>` arrives as three events
             // since quick-xml 0.38; without this the URL loses its `&`.
             Ok(Event::GeneralRef(r)) => crate::parser::push_general_ref(&mut text, &r),
@@ -547,8 +543,9 @@ pub fn extract_feed_links(xml: &str) -> Vec<String> {
     links
 }
 
-fn local(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+/// An element's local name; quick-xml >= 0.42 hands names over as `str`.
+fn local(name: &str) -> String {
+    name.to_owned()
 }
 
 fn looks_like_url(s: &str) -> bool {
