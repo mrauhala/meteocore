@@ -21,6 +21,9 @@ const APIS: &[(&str, &str, &str)] = &[
     ("maps", "Maps", mounts::MAPS),
     ("tiles", "Tiles", mounts::TILES),
 ];
+/// Per-API services the shared root supersedes (#789): still routed, but
+/// offered by the switcher only on their own pages.
+const SUPERSEDED: &[&str] = &["features", "maps", "tiles"];
 
 /// Where a page's API lives. `base` is the server's external base URL (for
 /// server-wide assets and the API switcher); `root` is the absolute root of the
@@ -193,8 +196,11 @@ impl Page<'_> {
                 format!("{base}{mount}/?f=html")
             }
         };
-        let api_nav = APIS
-            .iter()
+        let listed = || {
+            APIS.iter()
+                .filter(|(id, _, _)| id == api || !SUPERSEDED.contains(id))
+        };
+        let api_nav = listed()
             .map(|(id, name, mount)| {
                 anchor(
                     &api_home(id, mount),
@@ -204,8 +210,7 @@ impl Page<'_> {
             })
             .collect::<String>();
         let (workspace_api, workspace_root) = (*api, *root);
-        let options = APIS
-            .iter()
+        let options = listed()
             .map(|(id, name, mount)| {
                 format!(
                     "<option value=\"{}\" {}>{name}</option>",
@@ -473,7 +478,7 @@ pub fn landing_document(
         "edr" => "Open a collection to see its supported data queries and parameters. Choose a location, position or area query, then use the linked API reference to supply the required inputs.",
         "maps" => "Open a collection to see its map resources. Use the map preview to inspect the data, or the API reference to request an image for an area, time and style.",
         "tiles" => "Open a collection and follow its tileset links. Select a tile matrix set and tile coordinates to request map or vector tiles.",
-        crate::shared::WORKSPACE => "Open a collection to see every way to access it: map images, map tiles and vector tiles, as the collection offers them. The per-API services remain available below.",
+        crate::shared::WORKSPACE => "Open a collection to see every way to access it: map images, map tiles and vector tiles, as the collection offers them. Related services are linked below.",
         _ => "Choose an API and a collection first. Then request features, environmental values, map images or tiles using that collection's supported operations.",
     };
     body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
@@ -1690,9 +1695,33 @@ mod tests {
             None,
         );
         assert!(html.contains("value=\"https://example.test/relocated/features/?f=html\" selected"));
-        assert!(html.contains("value=\"https://example.test/maps/?f=html\""));
+        // Other superseded per-API services are not offered (#789).
+        assert!(html.contains("value=\"https://example.test/edr/?f=html\""));
+        assert!(!html.contains("value=\"https://example.test/maps/?f=html\""));
         // Map request parameters are documented by the API serving the map.
         assert!(html.contains("href=\"https://example.test/maps/api/docs\">Map request parameters"));
+    }
+
+    #[test]
+    fn shared_root_switcher_omits_superseded_per_api_services() {
+        let html = landing_html(
+            Surface {
+                base: "https://example.test",
+                root: "https://example.test",
+                api: crate::shared::WORKSPACE,
+            },
+            "MeteoCore",
+            "",
+            &[],
+        );
+        assert!(html.contains("value=\"https://example.test/?f=html\" selected"));
+        assert!(html.contains("value=\"https://example.test/edr/?f=html\""));
+        for mount in [mounts::FEATURES, mounts::MAPS, mounts::TILES] {
+            assert!(
+                !html.contains(&format!("https://example.test{mount}/")),
+                "{mount}"
+            );
+        }
     }
 
     #[test]

@@ -77,7 +77,8 @@ Common behaviour is that of the Maps and Tiles columns below, with two
 differences: Common metadata responses carry `Cache-Control`/ETag/304 (note [3]
 does not apply there), and collection fields shared by Maps and Tiles come from
 Maps (first block wins). The contract suite runs every cross-API check against
-it as a sixth surface. The per-API services are unchanged.
+it as a sixth surface. The per-API services are unchanged; the shared landing
+page no longer links the per-API Maps, Tiles and Features services.
 
 Features at the shared root (2026-09-25, [#789](https://github.com/mrauhala/meteocore/issues/789)
 Phase 2): Features is the third block. Feature collections carry

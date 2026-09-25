@@ -13,8 +13,9 @@
 //! mechanisms supported for a specific collection are typically advertised by
 //! including links … in the links array of the collection description."
 //!
-//! The per-API services (`/maps`, `/tiles`, …) remain; blocks reuse their
-//! engine registries, so a reload reaches both surfaces at once.
+//! The per-API services (`/maps`, `/tiles`, …) remain routed, though only
+//! EDR is advertised; blocks reuse their engine registries, so a reload
+//! reaches both surfaces at once.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -85,8 +86,8 @@ pub trait BuildingBlock: Send + Sync + 'static {
     fn routes(&self) -> Router;
 }
 
-/// A landing-page link to a service outside the shared API (legacy per-API
-/// services, WMS, health). Paths are relative to the external base URL.
+/// A landing-page link to a service outside the shared API (EDR, WMS,
+/// health). Paths are relative to the external base URL.
 pub struct RelatedLink {
     pub path: String,
     pub rel: &'static str,
@@ -196,7 +197,7 @@ async fn landing_page(
     let root = &Mount(api.mount).root(base);
     let title = "MeteoCore";
     let description = "Metocean Data Server — OGC API building blocks (Maps, Tiles, \
-         Features) over one collection catalog, alongside the per-API services";
+         Features) over one collection catalog";
     let json = "application/json";
     let mut links = vec![
         link(format!("{root}/"), "self", json, "This document"),

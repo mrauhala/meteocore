@@ -156,7 +156,9 @@ or axis direction.
 lists and full collection metadata for EDR, Maps, Tiles and Features. EDR model
 runs and Features item pages use the same shell. The JSON link and copyable URL /
 cURL always represent the current resource with its applied filters and paging;
-unsubmitted edits appear separately in the request preview.
+unsubmitted edits appear separately in the request preview. The API workspace
+switcher offers the shared OGC API root and EDR; the per-API Maps, Tiles and
+Features services the shared root supersedes appear only on their own pages.
 
 A collection page's heading shows one chip per OGC API it is available
 through — Maps, Tiles, Features, EDR — derived from its advertised links, not

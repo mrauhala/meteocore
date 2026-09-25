@@ -30,7 +30,9 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   overlapping OpenAPI components identical — or namespace them, as Features
   does — and operation ids unique (tested); one route per path across blocks
   (the legend belongs to Maps). Tag every block router with its API kind
-  (`tag_api_kind`).
+  (`tag_api_kind`). The per-API Maps/Tiles/Features services stay routed but
+  are not advertised: not in the landing links (`related_services()` in
+  `server/src/main.rs`) nor the workbench switcher (`SUPERSEDED`).
 - Shared metadata owns keywords, license and representation links. API-specific
   fields may override id/title for instances; do not override shared links.
 - Conformance declarations are deliberate. Part 4 searchable-collections is absent
