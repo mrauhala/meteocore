@@ -1020,13 +1020,14 @@ mod tests {
         // corner reaches 19.95°E, past the stored corners' 64.96°N / 19.13°E.
         // Reference: the half-cell-padded rectangle's edges inverse-projected
         // with `cs2cs +proj=lcc +lat_1=63.3 +lat_2=63.3 +lat_0=63.3 +lon_0=15
-        // +datum=WGS84 +to +proj=longlat` (PROJ 9.x).
+        // +R=6371220 +to +proj=longlat +R=6371220` (PROJ 9.x) — the area's
+        // own sphere.
         let bbox = meps_engine().get_spatial_extent().unwrap();
         for (got, want, edge) in [
-            (bbox[0], 8.985875, "west"),
-            (bbox[1], 59.96299, "south"),
-            (bbox[2], 19.950179, "east"),
-            (bbox[3], 65.09749, "north"),
+            (bbox[0], 8.985862, "west"),
+            (bbox[1], 59.963104, "south"),
+            (bbox[2], 19.951358, "east"),
+            (bbox[3], 65.097357, "north"),
         ] {
             assert!((got - want).abs() < 1e-3, "{edge} {got}, PROJ {want}");
         }

@@ -2820,6 +2820,7 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
                 lon0,
                 false_e,
                 false_n,
+                radius: None,
             })
         }
         // CT_LambertAzimEqualArea = 10
