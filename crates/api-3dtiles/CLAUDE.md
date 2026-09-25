@@ -73,7 +73,10 @@ deterministic.
 `GET /viewer` — a bundled CesiumJS page (`include_str!`-baked from
 `viewer/index.html`) with collection/quantity/representation/resolution
 pickers and a time scrubber (shown when >1 volume). Same-origin API base by
-default; `?base=` override.
+default; `?base=` selects another *path on the same origin* (a proxy-prefixed
+mount). Other origins are ignored, so a crafted link cannot make a served viewer
+render another server's data as ours (CodeQL `js/client-side-request-forgery`).
+Opened from disk, the viewer targets the public instance.
 
 - Point styling: `pointSize` by `${value}` (weak ~1 px → strong ~16 px);
   the `min dBZ` field restyles `show` client-side (instant while ≥ the

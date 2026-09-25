@@ -103,28 +103,35 @@
 "use strict";
 
 // API base, in priority order:
-//   1. ?base=…              explicit override (local dev / cross-origin)
+//   1. ?base=…              a path on THIS origin (e.g. a proxy-prefixed
+//                           mount). Another origin is ignored: a crafted link
+//                           must not make a served viewer fetch and render some
+//                           other server's "radar volumes" as ours (CodeQL
+//                           js/client-side-request-forgery). The host part is
+//                           always location.origin, never taken from the query.
 //   2. same origin          when served at /3dtiles/viewer (the normal path) —
 //                           so it works on any deployment with no config.
 //   3. the public instance  last resort, e.g. when this file is opened directly
-//                           from disk. Intentional (the page targets the public
-//                           API by default); note it's a third-party trust
-//                           boundary if this ever fires from a served page.
+//                           from disk (origin "null": no override applies).
+//                           Intentional (the page targets the public API by
+//                           default); it is a fixed constant, never user input.
 const params = new URLSearchParams(location.search);
 const here = location.pathname.replace(/\/+$/, "");
 const sameOrigin = here.endsWith("/viewer")
   ? location.origin + here.slice(0, -"/viewer".length)
   : null;
-// Only accept an http(s) ?base override (reject javascript:/data:/etc.); it's
-// fetched + parsed by CesiumJS, so keep it to a plain absolute URL.
 const rawBase = params.get("base");
 let override = null;
-if (rawBase) {
+if (rawBase && location.origin !== "null") {
   try {
-    // new URL() normalises (resolves any `..`) and throws on malformed input;
-    // only accept an http(s) absolute URL (it's fetched + parsed by CesiumJS).
-    const u = new URL(rawBase);
-    if (u.protocol === "http:" || u.protocol === "https:") override = u.href.replace(/\/+$/, "");
+    // Resolve against this origin (normalises `..`, throws on malformed
+    // input) and keep only its path.
+    const u = new URL(rawBase, location.origin);
+    if (u.origin === location.origin) {
+      override = location.origin + u.pathname.replace(/\/+$/, "");
+    } else {
+      console.warn(`ignoring ?base=${rawBase}: the viewer only reads its own origin`);
+    }
   } catch { /* ignore a malformed ?base override */ }
 }
 const BASE = override || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
