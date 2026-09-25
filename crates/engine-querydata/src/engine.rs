@@ -268,19 +268,7 @@ impl EdrEngine for QueryDataEngine {
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         let data = self.latest_data()?;
-        let bl = data.grid.area.bottom_left;
-        let tr = data.grid.area.top_right;
-        // Normalize to [west, south, east, north]. `bottom_left`/`top_right` are
-        // the grid's first/last corners as stored, which for a north-to-south
-        // (or cropped) grid can have bottom_left *north* of top_right — emitting
-        // those raw would produce an invalid south>north bbox to WMS
-        // `EX_GeographicBoundingBox`, EDR/Maps/Tiles extents.
-        Some([
-            bl.0.min(tr.0),
-            bl.1.min(tr.1),
-            bl.0.max(tr.0),
-            bl.1.max(tr.1),
-        ])
+        Some(data.grid.lonlat_extent())
     }
 
     fn supported_query_types(&self) -> Vec<String> {
@@ -331,15 +319,7 @@ impl EdrEngine for QueryDataEngine {
 
         // A polygon entirely outside the run's coverage is a 404, not an
         // all-null 200 (GRIB answers the same way).
-        let extent = {
-            let (bl, tr) = (data.grid.area.bottom_left, data.grid.area.top_right);
-            [
-                bl.0.min(tr.0),
-                bl.1.min(tr.1),
-                bl.0.max(tr.0),
-                bl.1.max(tr.1),
-            ]
-        };
+        let extent = data.grid.lonlat_extent();
         if !polygon.bbox.intersects_bbox(&extent) {
             return Err(DataServerError::LocationNotFound(
                 "The polygon lies outside the collection's spatial extent".into(),
@@ -365,7 +345,7 @@ impl EdrEngine for QueryDataEngine {
             .iter()
             .enumerate()
             .flat_map(|(iy, &y)| {
-                let (gt, axes, mask) = (&gt, &axes, &mask);
+                let (gt, axes, mask) = (gt, &axes, &mask);
                 axes.x.iter().enumerate().map(move |(ix, &x)| {
                     mask[axes.index(ix, iy)].then(|| world_to_grid_px(gt, x, y))
                 })
@@ -554,7 +534,7 @@ impl MapEngine for QueryDataEngine {
                     data.grid.nx,
                     data.grid.ny,
                     |fx, fy| output_crs.project_node(bbox, fx, fy),
-                    |lon, lat| world_to_grid_px(&gt, lon, lat),
+                    |lon, lat| world_to_grid_px(gt, lon, lat),
                 );
                 for oy in 0..height {
                     for ox in 0..width {
@@ -828,7 +808,7 @@ fn interpolate(
         return None;
     }
     let gt = data.grid.geo_transform();
-    let (col_f, row_f) = world_to_grid_px(&gt, lon, lat);
+    let (col_f, row_f) = world_to_grid_px(gt, lon, lat);
     sample_grid_bilinear(data, col_f, row_f, param_idx, level_idx, time_idx)
 }
 
@@ -1024,27 +1004,45 @@ mod tests {
         assert!((bbox[3] - 4.75).abs() < 0.01, "north {}", bbox[3]);
     }
 
-    #[test]
-    fn engine_spatial_extent_lcc() {
-        // Projected (LCC) fixture: confirms the get_spatial_extent min/max
-        // normalization holds for non-WGS84 grids too. FMI grids store
-        // north-to-south, so the raw bottom_left lat is north of top_right —
-        // the result must still be a valid [west, south, east, north].
+    fn meps_engine() -> QueryDataEngine {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/meps");
         assert!(
             dir.exists() && !list_sqd_files(&dir).is_empty(),
             "meps fixture missing"
         );
-        let engine = QueryDataEngine::new(&dir, "test", None, 30, 4).unwrap();
-        let bbox = engine.get_spatial_extent().unwrap();
-        assert!(bbox[0] < bbox[2], "west {} < east {}", bbox[0], bbox[2]);
-        assert!(bbox[1] < bbox[3], "south {} < north {}", bbox[1], bbox[3]);
-        // Pin all four to the cropped LCC corners (in degrees) — a parse
-        // regression returning projected metres would be ~10^5, not ~10-65.
-        assert!((bbox[0] - 9.04).abs() < 0.1, "west {}", bbox[0]);
-        assert!((bbox[1] - 60.02).abs() < 0.1, "south {}", bbox[1]);
-        assert!((bbox[2] - 19.13).abs() < 0.1, "east {}", bbox[2]);
-        assert!((bbox[3] - 64.96).abs() < 0.1, "north {}", bbox[3]);
+        QueryDataEngine::new(&dir, "test", None, 30, 4).unwrap()
+    }
+
+    #[test]
+    fn engine_spatial_extent_lcc() {
+        // The projected (LCC) rectangle's edges, not its stored corners'
+        // lon/lat box: the northern edge bows out to 65.1°N and the north-east
+        // corner reaches 19.95°E, past the stored corners' 64.96°N / 19.13°E.
+        // Reference: the half-cell-padded rectangle's edges inverse-projected
+        // with `cs2cs +proj=lcc +lat_1=63.3 +lat_2=63.3 +lat_0=63.3 +lon_0=15
+        // +datum=WGS84 +to +proj=longlat` (PROJ 9.x).
+        let bbox = meps_engine().get_spatial_extent().unwrap();
+        for (got, want, edge) in [
+            (bbox[0], 8.985875, "west"),
+            (bbox[1], 59.96299, "south"),
+            (bbox[2], 19.950179, "east"),
+            (bbox[3], 65.09749, "north"),
+        ] {
+            assert!((got - want).abs() < 1e-3, "{edge} {got}, PROJ {want}");
+        }
+    }
+
+    #[test]
+    fn meps_rows_run_south_to_north() {
+        // The fixture stores its north-west corner first, but its data starts
+        // in the south: read that way, the evening's mild Bothnian Sea lies
+        // east of the Swedish coast and the colder Västerbotten interior
+        // north of it. Read north-first, the two swap.
+        let engine = meps_engine();
+        let data = engine.latest_data().unwrap();
+        let at = |lon, lat| interpolate(&data, lon, lat, 0, 0, 0).unwrap();
+        let (sea, inland) = (at(18.8, 61.3), at(18.3, 64.3));
+        assert!(sea - inland > 2.0, "Bothnian Sea {sea} vs inland {inland}");
     }
 
     #[test]
