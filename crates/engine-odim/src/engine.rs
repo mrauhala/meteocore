@@ -41,7 +41,9 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 
-use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
+use ds_storage::discovery::{
+    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
+};
 
 use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, FilenameMatcher, Location};
 use crate::reader::{read_composite, OdimComposite};
@@ -208,12 +210,15 @@ fn scan_source(
         } => {
             let now = Utc::now();
             let (prefixes, time_filter) = match time_window {
-                Some(tw) => (
-                    expand_prefix_for_dates(prefix_pattern, &tw.scan_dates(now)),
-                    Some(tw.to_range(now)),
-                ),
+                Some(tw) => {
+                    let (start, end) = tw.to_range(now);
+                    (
+                        expand_prefix_for_range(prefix_pattern, start, end)?,
+                        Some((start, end)),
+                    )
+                }
                 None => (
-                    expand_prefix_pattern(prefix_pattern, DEFAULT_SCAN_DAYS),
+                    expand_prefix_pattern(prefix_pattern, DEFAULT_SCAN_DAYS)?,
                     None,
                 ),
             };
@@ -961,6 +966,7 @@ fn build_source(
                 Some(s) => Some(TimeWindow::parse(s)?),
                 None => None,
             };
+            validate_prefix_pattern(&prefix_pattern, time_window.as_ref())?;
             tracing::info!(
                 "[{}] ODIM S3 source: endpoint={endpoint} bucket={bucket} prefix='{prefix_pattern}'",
                 collection_id
@@ -1029,6 +1035,7 @@ fn build_source(
                     // Apache/nginx autoindex is *not* listable; use
                     // `discovery = "template"` for those.
                     DiscoveryMode::List => {
+                        validate_prefix_pattern(&base_prefix, time_window.as_ref())?;
                         tracing::info!(
                             "[{}] ODIM HTTP source: url={data_path} prefix='{base_prefix}'",
                             collection_id

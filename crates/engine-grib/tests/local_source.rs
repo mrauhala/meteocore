@@ -128,3 +128,25 @@ fn grib_area_query_masks_outside_the_polygon() {
         arr.values.len()
     );
 }
+
+/// Discovery settings the poll would reject are load errors: an invalid
+/// `time_window` (the poll used to skip its filter silently) and a
+/// `prefix_pattern` with an unknown or hour specifier (the run hour is `{run}`).
+#[test]
+fn invalid_discovery_settings_fail_at_load() {
+    let bad_window = GribConfig {
+        time_window: Some("PT2H5".to_string()),
+        ..local_config()
+    };
+    assert!(GribEngine::new("grib-local-test", &bad_window).is_err());
+
+    let s3 = |prefix: &str| GribConfig {
+        data_path: None,
+        endpoint: Some("https://s3.example.com".to_string()),
+        bucket: Some("models".to_string()),
+        prefix_pattern: Some(prefix.to_string()),
+        ..local_config()
+    };
+    assert!(GribEngine::new("grib-s3-test", &s3("%Y%m%d/%H/")).is_err());
+    assert!(GribEngine::new("grib-s3-test", &s3("%Y%m%d/%!/")).is_err());
+}
