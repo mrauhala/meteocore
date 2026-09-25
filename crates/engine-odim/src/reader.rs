@@ -14,7 +14,7 @@
 //! | Producer | ODIM version | Pixel type | Renders | Notes                                       |
 //! |----------|--------------|------------|---------|---------------------------------------------|
 //! | DMI      | v2.0         | u8         | yes     | No `/where/xsize`/`ysize`; gain/offset/nodata at root `/what`; quantity as attr on `/dataset1/data1` |
-//! | SMHI     | v2.2 (PVOL)  | i16        | yes     | **Signed** scaled integers (gain=0.01, sentinels nodata=-32768/undetect=-32767); 32-bit superblock + single DEFLATE chunks — needed both the `i16` storage variant and the patched `hdf5-reader` v1-B-tree chunk-key fix (see root `Cargo.toml`) |
+//! | SMHI     | v2.2 (PVOL)  | i16        | yes     | **Signed** scaled integers (gain=0.01, sentinels nodata=-32768/undetect=-32767); 32-bit superblock + single DEFLATE chunks — needed both the `i16` storage variant and the `hdf5-reader` v1-B-tree chunk-key fix (upstream since 0.6.1) |
 //! | DWD      | v2.3         | u16        | yes     | Canonical layout; polar stere (lat_0=90, lat_ts=60); 250m grid over Germany; fine gain=0.00293, offset=-64 |
 //! | OPERA    | v2.4         | f64        | yes     | Canonical layout; LAEA grid (EPSG:3035-style); already-decoded physical dBZ with `nodata=-9999000`, `undetect=-8888000` |
 //!
@@ -267,12 +267,12 @@ impl RawPixels {
 /// variant from the dataset's **actual** HDF5 datatype rather than probing
 /// reader types in fallback order.
 ///
-/// dtype inspection is load-bearing, not stylistic: `hdf5-reader` matches a
-/// typed `read_array::<T>()` on element **byte-size only**, not signedness. A
-/// signed `i16` moment (SMHI) therefore reads *successfully* — but with every
-/// value bit-reinterpreted — as `u16` (e.g. the `undetect` sentinel `-32767`
-/// becomes `32769`), so a u16-before-i16 probe order would silently return
-/// garbage. Branching on `Datatype` picks the one correct reader.
+/// dtype inspection is load-bearing, not stylistic: a signed `i16` moment
+/// (SMHI) read as `u16` has every value bit-reinterpreted (the `undetect`
+/// sentinel `-32767` becomes `32769`). `hdf5-reader` 0.9 rejects that read
+/// with a type mismatch — 0.6 matched on byte size alone and returned the
+/// garbage — but a probe-in-fallback-order reader would still depend on the
+/// crate's check. Branching on `Datatype` picks the one correct reader.
 ///
 /// Supported ODIM element types: `u8`/`u16`/`i16` scaled integers (physical =
 /// `raw * gain + offset`) and `f32`/`f64` pre-decoded physical values — both
