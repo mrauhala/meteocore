@@ -61,14 +61,10 @@ impl BuildingBlock for TilesBlock {
     }
 
     fn landing_links(&self, root: &str) -> Vec<Value> {
-        let href = format!("{root}/tileMatrixSets");
-        [("tiling-schemes"), (rel::TILING_SCHEMES)]
-            .into_iter()
-            .map(|relation| {
-                json!({"href": href, "rel": relation, "type": "application/json",
-                       "title": "Tile matrix sets"})
-            })
-            .collect()
+        vec![
+            json!({"href": format!("{root}/tileMatrixSets"), "rel": rel::TILING_SCHEMES,
+                    "type": "application/json", "title": "Tile matrix sets"}),
+        ]
     }
 
     fn base_url(&self, headers: &HeaderMap) -> String {

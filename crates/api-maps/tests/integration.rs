@@ -696,8 +696,8 @@ mod collections {
         let c = &json["collections"][0];
         let links = c["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "self"));
-        assert!(links.iter().any(|l| l["rel"] == "map"));
-        assert!(links.iter().any(|l| l["rel"] == "styles"));
+        assert!(links.iter().any(|l| l["rel"] == api_common::rel::MAP));
+        assert!(links.iter().any(|l| l["rel"] == api_common::rel::STYLES));
     }
 
     #[tokio::test]
@@ -769,7 +769,7 @@ mod collections {
     async fn collection_links_carry_registered_relations() {
         // Maps Req 46 (collection → map), Req 53 (styled maps) and the legend
         // recommendation name registered relations; the Maps test suite only
-        // finds maps through them. Short forms remain for existing clients.
+        // finds maps through them. The unregistered short forms are gone.
         let (_, json) = get("/collections/radar").await;
         let href = |links: &Value, rel: &str| {
             links
@@ -781,15 +781,17 @@ mod collections {
         };
         let links = &json["links"];
         assert!(href(links, api_common::rel::MAP).is_some());
-        assert_eq!(href(links, api_common::rel::MAP), href(links, "map"));
-        assert_eq!(href(links, api_common::rel::STYLES), href(links, "styles"));
+        assert!(href(links, api_common::rel::STYLES).is_some());
+        assert_eq!(href(links, "map"), None);
+        assert_eq!(href(links, "styles"), None);
         let styles = json["styles"].as_array().unwrap();
         assert!(!styles.is_empty());
         for style in styles {
             let links = &style["links"];
             assert!(href(links, api_common::rel::MAP).is_some());
-            assert_eq!(href(links, api_common::rel::MAP), href(links, "map"));
-            assert_eq!(href(links, api_common::rel::LEGEND), href(links, "legend"));
+            assert!(href(links, api_common::rel::LEGEND).is_some());
+            assert_eq!(href(links, "map"), None);
+            assert_eq!(href(links, "legend"), None);
         }
     }
 
@@ -879,7 +881,7 @@ mod styles_endpoint {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|l| l["rel"] == "legend")
+                .find(|l| l["rel"] == api_common::rel::LEGEND)
                 .unwrap_or_else(|| panic!("style {id} has no legend link"));
             assert_eq!(
                 legend["href"],
@@ -898,7 +900,7 @@ mod styles_endpoint {
             let id = style["id"].as_str().unwrap();
             assert!(
                 style["links"].as_array().unwrap().iter().any(|l| {
-                    l["rel"] == "legend"
+                    l["rel"] == api_common::rel::LEGEND
                         && l["href"] == format!("/maps/collections/radar/styles/{id}/legend")
                 }),
                 "style {id} in collection metadata has no legend link"
