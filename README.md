@@ -1217,7 +1217,7 @@ Each tileset includes a `times` manifest of all available volume timestamps (RFC
 | `GET /3dtiles/collections/{id}/content.pnts` | `quantity`, `datetime`, `min_value` |
 | `GET /3dtiles/collections/{id}/content.glb` | `representation`, `quantity`, `datetime`, `threshold`, `resolution` |
 | `GET /3dtiles/collections/{id}/voxel/tileset.json` | `quantity`, `datetime`, `resolution` |
-| `GET /3dtiles/viewer` | Built-in CesiumJS SPA; `?base=` overrides API origin |
+| `GET /3dtiles/viewer` | Built-in CesiumJS SPA; `?base=` selects another API path on the same origin (e.g. a proxy prefix) |
 
 `datetime` accepts any RFC 3339 instant and selects the nearest available volume; omitting it selects the latest. `?datetime=` values that exactly match an advertised volume time receive `Cache-Control: max-age=86400, immutable`; others receive `max-age=60`.
 
