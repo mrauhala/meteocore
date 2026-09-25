@@ -2414,6 +2414,7 @@ mod tests {
             lon0: 0.0,
             false_e: 0.0,
             false_n: 0.0,
+            radius: None,
         };
         let stere = ds_core::geo::Crs::Stereographic {
             lat0: 0.0,

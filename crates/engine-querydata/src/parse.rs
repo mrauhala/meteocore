@@ -855,8 +855,14 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
     let true_lat1 = true_lats.0;
     let true_lat2 = true_lats.1;
 
-    // radius (Earth radius, e.g. 6371220)
-    let _radius = r.read_line()?;
+    // Earth radius, e.g. 6371220: the grid is defined on this sphere. An
+    // unreadable value falls back to WGS84 rather than failing the file.
+    let radius = r
+        .read_line()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|r| r.is_finite() && *r > 0.0);
 
     // World rect (4 doubles as 2 points, precision 15)
     let _wr_p1 = r.read_line()?;
@@ -877,6 +883,7 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
             lon0: central_lon.to_radians(),
             false_e: 0.0,
             false_n: 0.0,
+            radius,
         },
     })
 }
@@ -1197,17 +1204,25 @@ mod tests {
         assert_eq!(qd.params.len(), 2, "meps fixture: expected 2 params");
         assert_eq!(qd.times.len(), 3, "meps fixture: expected 3 timesteps");
 
-        // Grid points, against PROJ (`cs2cs +proj=lcc +lat_1=63.3 +lat_2=63.3
-        // +lat_0=63.3 +lon_0=15 +datum=WGS84`, PROJ 9.x). The stored corners
-        // are the north-west and south-east grid points; index 0 is the
-        // south-west one (rows run south to north, see `GridInfo::new`).
+        // Grid points, against PROJ on the area's own sphere (`cs2cs
+        // +proj=lcc +lat_1=63.3 +lat_2=63.3 +lat_0=63.3 +lon_0=15
+        // +R=6371220`, PROJ 9.x). The stored corners are the north-west and
+        // south-east grid points; index 0 is the south-west one (rows run
+        // south to north, see `GridInfo::new`).
+        assert!(matches!(
+            qd.grid.area.crs,
+            Crs::LambertConformalConic {
+                radius: Some(r),
+                ..
+            } if r == 6_371_220.0
+        ));
         let (nx, ny) = (qd.grid.nx as usize, qd.grid.ny as usize);
         for (col, qd_row, want) in [
             (0, ny - 1, (9.04369, 64.9579)),
             (nx - 1, 0, (19.134, 60.0194)),
-            (0, 0, (9.96636858, 59.98714428)),
-            (nx - 1, ny - 1, (19.89308480, 64.99607711)),
-            (50, 60, (14.40806180, 62.78140623)),
+            (0, 0, (9.96756804, 59.98724574)),
+            (nx - 1, ny - 1, (19.89425131, 64.99599347)),
+            (50, 60, (14.40866301, 62.78083790)),
         ] {
             let got = qd.grid_lonlat(qd_row * nx + col);
             assert!(
@@ -1215,5 +1230,21 @@ mod tests {
                 "col {col} row {qd_row}: {got:?}, PROJ {want:?}"
             );
         }
+
+        // Against the producer's own grid: the file's world rect, (-280072.24,
+        // -357576.50) + (509991.86 × 554975.39) m on the sphere, puts grid
+        // point (57, 57) at (15.09635294, 62.64719351). Anchoring on the
+        // stored corners, which carry only six significant digits, lands
+        // within a few metres; on WGS84 it was 69 m off (#800).
+        let (lon, lat) = qd.grid_lonlat(57 * nx + 57);
+        let (d_east, d_north) = (
+            (lon - 15.09635294) * 111_195.0 * lat.to_radians().cos(),
+            (lat - 62.64719351) * 111_195.0,
+        );
+        assert!(
+            d_east.hypot(d_north) < 10.0,
+            "grid point (57, 57) is {:.1} m from the producer's",
+            d_east.hypot(d_north)
+        );
     }
 }

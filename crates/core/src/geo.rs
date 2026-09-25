@@ -160,6 +160,11 @@ pub enum Crs {
         lon0: f64,    // longitude of false origin (radians)
         false_e: f64, // false easting (meters)
         false_n: f64, // false northing (meters)
+        /// Earth model: `None` is the WGS84 ellipsoid, `Some(r)` a sphere of
+        /// radius `r` metres (PROJ `+R=r`), such as QueryData's 6371220 m.
+        /// Longitudes and latitudes go onto the sphere unchanged, as in PROJ
+        /// and in the producers that define grids this way.
+        radius: Option<f64>,
     },
     /// Polar Stereographic (e.g., FMI ODIM radar composites).
     ///
@@ -423,16 +428,9 @@ impl Crs {
                 lon0,
                 false_e,
                 false_n,
-            } => lcc_forward(
-                lat_deg.to_radians(),
-                lon_deg.to_radians(),
-                *lat1,
-                *lat2,
-                *lat0,
-                *lon0,
-                *false_e,
-                *false_n,
-            ),
+                radius,
+            } => Lcc::new(*lat1, *lat2, *lat0, *lon0, *false_e, *false_n, *radius)
+                .forward(lat_deg.to_radians(), lon_deg.to_radians()),
             Crs::Stereographic {
                 lat0,
                 lon0,
@@ -493,8 +491,10 @@ impl Crs {
                 lon0,
                 false_e,
                 false_n,
+                radius,
             } => {
-                let (lat, lon) = lcc_inverse(x, y, *lat1, *lat2, *lat0, *lon0, *false_e, *false_n);
+                let (lat, lon) =
+                    Lcc::new(*lat1, *lat2, *lat0, *lon0, *false_e, *false_n, *radius).inverse(x, y);
                 (lon.to_degrees(), lat.to_degrees())
             }
             Crs::Stereographic {
@@ -1013,86 +1013,99 @@ fn authalic_inverse(q: f64, e: f64) -> f64 {
 // Reference: Snyder, USGS PP 1395, p.107
 // ============================================================================
 
-#[allow(clippy::too_many_arguments)]
-fn lcc_forward(
-    lat: f64,
-    lon: f64,
-    lat1: f64,
-    lat2: f64,
-    lat0: f64,
+/// A Lambert Conformal Conic's constants on its Earth model, derived once
+/// per call and shared by forward and inverse.
+struct Lcc {
+    /// Semi-major axis, or the sphere's radius (metres).
+    a: f64,
+    /// Eccentricity; 0 on a sphere, where Snyder's ellipsoidal formulas
+    /// reduce to the spherical ones.
+    e: f64,
+    /// Cone constant.
+    n: f64,
+    f: f64,
+    rho0: f64,
     lon0: f64,
     false_e: f64,
     false_n: f64,
-) -> (f64, f64) {
-    let e = WGS84_E2.sqrt();
-    let (n, f_val, rho0) = lcc_cone(lat1, lat2, lat0);
-    let rho = WGS84_A * f_val * lcc_t(lat, e).powf(n);
-    let theta = n * (lon - lon0);
-
-    let x = false_e + rho * theta.sin();
-    let y = false_n + rho0 - rho * theta.cos();
-
-    (x, y)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn lcc_inverse(
-    x: f64,
-    y: f64,
-    lat1: f64,
-    lat2: f64,
-    lat0: f64,
-    lon0: f64,
-    false_e: f64,
-    false_n: f64,
-) -> (f64, f64) {
-    let e = WGS84_E2.sqrt();
-    let (n, f_val, rho0) = lcc_cone(lat1, lat2, lat0);
-
-    let xp = x - false_e;
-    let yp = rho0 - (y - false_n);
-
-    let rho = (xp * xp + yp * yp).sqrt().copysign(n);
-    let t = (rho / (WGS84_A * f_val)).powf(1.0 / n);
-    let theta = xp.atan2(yp);
-
-    let lon = theta / n + lon0;
-
-    // Iterative inverse
-    let mut lat = PI / 2.0 - 2.0 * t.atan();
-    for _ in 0..10 {
-        let e_sin = e * lat.sin();
-        let new_lat = PI / 2.0 - 2.0 * (t * ((1.0 - e_sin) / (1.0 + e_sin)).powf(e / 2.0)).atan();
-        if (new_lat - lat).abs() < 1e-12 {
-            break;
+impl Lcc {
+    /// The cone constant `n`, `F` and `ρ0` (Snyder eqs. 15-8 to 15-10).
+    ///
+    /// A tangent cone — one standard parallel, `lat1 == lat2`, as in the
+    /// MEPS/MetCoOp QueryData and GRIB grids — makes eq. 15-8 `0/0`, and the
+    /// NaN it produced projected every point to NaN. Its limit is
+    /// `n = sin φ1` (Snyder p. 108), which is also PROJ's choice below the
+    /// same `1e-10` rad threshold.
+    fn new(
+        lat1: f64,
+        lat2: f64,
+        lat0: f64,
+        lon0: f64,
+        false_e: f64,
+        false_n: f64,
+        radius: Option<f64>,
+    ) -> Self {
+        let (a, e2) = radius.map_or((WGS84_A, WGS84_E2), |r| (r, 0.0));
+        let e = e2.sqrt();
+        let m1 = lcc_m(lat1, e2);
+        let t1 = lcc_t(lat1, e);
+        let n = if (lat1 - lat2).abs() < 1e-10 {
+            lat1.sin()
+        } else {
+            (m1.ln() - lcc_m(lat2, e2).ln()) / (t1.ln() - lcc_t(lat2, e).ln())
+        };
+        let f = m1 / (n * t1.powf(n));
+        let rho0 = a * f * lcc_t(lat0, e).powf(n);
+        Self {
+            a,
+            e,
+            n,
+            f,
+            rho0,
+            lon0,
+            false_e,
+            false_n,
         }
-        lat = new_lat;
     }
 
-    (lat, lon)
-}
+    /// `(lat, lon)` in radians to `(x, y)` metres.
+    fn forward(&self, lat: f64, lon: f64) -> (f64, f64) {
+        let rho = self.a * self.f * lcc_t(lat, self.e).powf(self.n);
+        let theta = self.n * (lon - self.lon0);
+        (
+            self.false_e + rho * theta.sin(),
+            self.false_n + self.rho0 - rho * theta.cos(),
+        )
+    }
 
-/// The cone constant `n`, `F` and `ρ0` shared by forward and inverse
-/// (Snyder eqs. 15-8 to 15-10).
-///
-/// A tangent cone — one standard parallel, `lat1 == lat2`, as in the
-/// MEPS/MetCoOp QueryData and GRIB grids — makes eq. 15-8 `0/0`, and the
-/// NaN it produced projected every point to NaN. Its limit is
-/// `n = sin φ1` (Snyder p. 108), which is also PROJ's choice below the
-/// same `1e-10` rad threshold.
-fn lcc_cone(lat1: f64, lat2: f64, lat0: f64) -> (f64, f64, f64) {
-    let e2 = WGS84_E2;
-    let e = e2.sqrt();
-    let m1 = lcc_m(lat1, e2);
-    let t1 = lcc_t(lat1, e);
-    let n = if (lat1 - lat2).abs() < 1e-10 {
-        lat1.sin()
-    } else {
-        (m1.ln() - lcc_m(lat2, e2).ln()) / (t1.ln() - lcc_t(lat2, e).ln())
-    };
-    let f_val = m1 / (n * t1.powf(n));
-    let rho0 = WGS84_A * f_val * lcc_t(lat0, e).powf(n);
-    (n, f_val, rho0)
+    /// `(x, y)` metres to `(lat, lon)` in radians.
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let (n, e) = (self.n, self.e);
+        let xp = x - self.false_e;
+        let yp = self.rho0 - (y - self.false_n);
+
+        let rho = (xp * xp + yp * yp).sqrt().copysign(n);
+        let t = (rho / (self.a * self.f)).powf(1.0 / n);
+        let theta = xp.atan2(yp);
+
+        let lon = theta / n + self.lon0;
+
+        // Iterative inverse (exact after one step on a sphere, e = 0).
+        let mut lat = PI / 2.0 - 2.0 * t.atan();
+        for _ in 0..10 {
+            let e_sin = e * lat.sin();
+            let new_lat =
+                PI / 2.0 - 2.0 * (t * ((1.0 - e_sin) / (1.0 + e_sin)).powf(e / 2.0)).atan();
+            if (new_lat - lat).abs() < 1e-12 {
+                break;
+            }
+            lat = new_lat;
+        }
+
+        (lat, lon)
+    }
 }
 
 fn lcc_m(lat: f64, e2: f64) -> f64 {
@@ -1769,6 +1782,7 @@ mod tests {
             lon0: 0.0,
             false_e: 0.0,
             false_n: 0.0,
+            radius: None,
         };
         // Oslo roundtrip
         let (e, n) = crs.forward(10.75, 59.91);
@@ -1805,6 +1819,7 @@ mod tests {
             lon0: 0.0,
             false_e: 0.0,
             false_n: 0.0,
+            radius: None,
         };
         assert_matches_proj(&crs, &[(10.75, 59.91, 597771.1689, 8061381.0468)]);
     }
@@ -1823,6 +1838,7 @@ mod tests {
             lon0: 15.0_f64.to_radians(),
             false_e: 0.0,
             false_n: 0.0,
+            radius: None,
         };
         assert_matches_proj(
             &crs,
@@ -1833,6 +1849,49 @@ mod tests {
                 (40.0, 70.0, 937671.0198, 934085.7304),
             ],
         );
+    }
+
+    /// The tangent cone on QueryData's 6371220 m sphere, pinned to
+    /// `cs2cs +proj=longlat +R=6371220 +to +proj=lcc +lat_1=63.3
+    /// +lat_2=63.3 +lat_0=63.3 +lon_0=15 +R=6371220 +units=m` (PROJ 9.x).
+    /// (0.279, 50.32) is the full MEPS grid's first point, which its QueryData
+    /// world rect places at (-1060059.79, -1332533.27).
+    #[test]
+    fn lcc_tangent_sphere_matches_proj() {
+        let crs = Crs::LambertConformalConic {
+            lat1: 63.3_f64.to_radians(),
+            lat2: 63.3_f64.to_radians(),
+            lat0: 63.3_f64.to_radians(),
+            lon0: 15.0_f64.to_radians(),
+            false_e: 0.0,
+            false_n: 0.0,
+            radius: Some(6_371_220.0),
+        };
+        assert_matches_proj(
+            &crs,
+            &[
+                (15.0, 63.3, 0.0, 0.0),
+                (25.0, 60.17, 551690.9444, -305123.0314),
+                (0.279, 50.32, -1060059.7877, -1332533.2749),
+                (40.0, 70.0, 933888.3557, 931210.1301),
+            ],
+        );
+    }
+
+    /// Secant counterpart of `lcc_tangent_sphere_matches_proj`: `cs2cs
+    /// +proj=lcc +lat_1=58.964 +lat_2=69.987 +lat_0=0 +lon_0=0 +R=6371220`.
+    #[test]
+    fn lcc_secant_sphere_matches_proj() {
+        let crs = Crs::LambertConformalConic {
+            lat1: 58.964_f64.to_radians(),
+            lat2: 69.987_f64.to_radians(),
+            lat0: 0.0,
+            lon0: 0.0,
+            false_e: 0.0,
+            false_n: 0.0,
+            radius: Some(6_371_220.0),
+        };
+        assert_matches_proj(&crs, &[(10.75, 59.91, 595623.4605, 8092895.0783)]);
     }
 
     // FMI radar extreme corners — verified against GDAL gdaltransform

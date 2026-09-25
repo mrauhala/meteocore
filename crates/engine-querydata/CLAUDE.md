@@ -24,9 +24,12 @@ runtime).
   corners are min/max-normalised. Both orientations are pinned against the
   fixtures' geography (`grid_lonlat_corners`, `meps_rows_run_south_to_north`);
   a corner-coordinate test alone cannot catch a flipped row order.
-- The LCC `radius` line (a sphere, e.g. 6371220 m) is ignored: projection is
-  on WGS84 through the stored corners, so corners are exact and the interior
-  differs slightly from the producer's sphere grid.
+- The LCC `radius` line (e.g. 6371220 m) becomes `Crs::LambertConformalConic
+  { radius: Some(r) }`: the grid is defined on that sphere, and projecting it
+  on WGS84 misplaced the full MEPS interior by ~1.2 km mean (#800). The
+  stored corners have only six significant digits, so corner anchoring lands
+  within ~5 m of the file's world rect — pinned in `parse_meps_lcc`. The
+  stereographic record carries no radius line and still projects on WGS84.
 - EDR position queries and map rendering use bilinear interpolation. EDR area (and radius via the shared default) returns a
   CRS84 `Grid` over the polygon bbox at native resolution (≤ 256 cells per
   axis, 1M-value budget across time × cells × parameters), every cell
