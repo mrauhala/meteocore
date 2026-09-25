@@ -12,8 +12,10 @@ use crate::{mounts, rel};
 const CSS: &str = include_str!("workbench/style.css");
 const SCRIPT: &str = include_str!("workbench/app.js");
 const THEME: &str = include_str!("workbench/theme.js");
-/// API workspaces offered by the switcher: (kind, label, mount path).
+/// API workspaces offered by the switcher: (kind, label, mount path). The
+/// shared OGC API root (#789) is mounted at the server root.
 const APIS: &[(&str, &str, &str)] = &[
+    (crate::shared::WORKSPACE, "OGC API", ""),
     ("edr", "EDR", mounts::EDR),
     ("features", "Features", mounts::FEATURES),
     ("maps", "Maps", mounts::MAPS),
@@ -22,14 +24,17 @@ const APIS: &[(&str, &str, &str)] = &[
 
 /// Where a page's API lives. `base` is the server's external base URL (for
 /// server-wide assets and the API switcher); `root` is the absolute root of the
-/// API the page belongs to (base URL + mount); `api` is the API kind shown in
-/// navigation, empty for the server-wide service index (whose root is `base`).
+/// API the page belongs to (base URL + mount, `base` itself for the shared
+/// OGC API root); `api` is the API kind shown in navigation.
 #[derive(Clone, Copy, Debug)]
 pub struct Surface<'a> {
     pub base: &'a str,
     pub root: &'a str,
     pub api: &'a str,
 }
+
+/// Registered relations naming a list of tilesets (Tiles Req 13).
+const TILESETS_REL_PREFIX: &str = "http://www.opengis.net/def/rel/ogc/1.0/tilesets-";
 
 /// First link carrying the short or registered map relation (Maps Req 46).
 fn map_link(links: &[Value]) -> Option<&str> {
@@ -152,12 +157,7 @@ impl Page<'_> {
                 )
             })
             .collect::<String>();
-        // The service index has no API of its own; its sidebar opens Features.
-        let (workspace_api, workspace_root) = if api.is_empty() {
-            ("features", format!("{base}{}", mounts::FEATURES))
-        } else {
-            (*api, root.to_string())
-        };
+        let (workspace_api, workspace_root) = (*api, *root);
         let options = APIS
             .iter()
             .map(|(id, name, mount)| {
@@ -216,11 +216,14 @@ impl Page<'_> {
             }
         }
         let mut crumbs = anchor(&format!("{base}/?f=html"), "MeteoCore", "");
-        if !api.is_empty() {
-            crumbs.push_str(&format!(
-                "<span>/</span>{}",
-                anchor(&format!("{root}/?f=html"), api_title, "")
-            ));
+        {
+            // An API mounted at the server root is already the first crumb.
+            if root != base {
+                crumbs.push_str(&format!(
+                    "<span>/</span>{}",
+                    anchor(&format!("{root}/?f=html"), api_title, "")
+                ));
+            }
             let prefix = format!("{root}/");
             let mut path = prefix.trim_end_matches('/').to_string();
             if let Some(rest) = current_path.strip_prefix(&prefix) {
@@ -401,26 +404,13 @@ pub fn landing_document(
 ) -> String {
     let Surface { base, root, api } = surface;
     let url = format!("{root}/?f=json");
-    // The service index has no catalog of its own; its search opens Features.
-    let discovery = if api.is_empty() {
-        format!("{base}{}", mounts::FEATURES)
-    } else {
-        root.to_owned()
-    };
+    let discovery = root;
     let mut body = page_heading(title, description);
     body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resources</h2></div><div class=\"resource-table\">");
     for link in doc["links"].as_array().into_iter().flatten() {
         let rel = link["rel"].as_str().unwrap_or_default();
         let href = link["href"].as_str().unwrap_or_default();
-        let primary = if api.is_empty() {
-            rel == "child"
-                && APIS
-                    .iter()
-                    .any(|(_, _, mount)| href.trim_end_matches('/').ends_with(mount))
-        } else {
-            matches!(rel, "data" | "conformance" | "service-desc")
-        };
-        if !primary {
+        if !matches!(rel, "data" | "conformance" | "service-desc") {
             continue;
         }
         let target = if rel == "service-desc" {
@@ -437,9 +427,10 @@ pub fn landing_document(
         "edr" => "Open a collection to see its supported data queries and parameters. Choose a location, position or area query, then use the linked API reference to supply the required inputs.",
         "maps" => "Open a collection to see its map resources. Use the map preview to inspect the data, or the API reference to request an image for an area, time and style.",
         "tiles" => "Open a collection and follow its tileset links. Select a tile matrix set and tile coordinates to request map or vector tiles.",
+        crate::shared::WORKSPACE => "Open a collection to see every way to access it: map images, map tiles and vector tiles, as the collection offers them. The per-API services remain available below.",
         _ => "Choose an API and a collection first. Then request features, environmental values, map images or tiles using that collection's supported operations.",
     };
-    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(&discovery),arrow=icon("arrow")));
+    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
     body.push_str("<section class=\"section-space\"><div class=\"section-header\"><h2>API definitions &amp; resource links</h2></div>");
     body.push_str(&document_links(doc));
     body.push_str("</section>");
@@ -719,8 +710,20 @@ pub fn collection_html(
             "Map request parameters ↗",
             "btn",
         ));
-    } else if api == "tiles" {
-        body.push_str(&document_links(doc));
+    }
+    // Tilesets are listed whenever advertised, next to any map preview.
+    let tilesets: Vec<Value> = links
+        .into_iter()
+        .flatten()
+        .filter(|l| {
+            l["rel"]
+                .as_str()
+                .is_some_and(|r| r == "tiles" || r.starts_with(TILESETS_REL_PREFIX))
+        })
+        .cloned()
+        .collect();
+    if !tilesets.is_empty() {
+        body.push_str(&document_links(&json!({ "links": tilesets })));
     }
     body.push_str("</section></div><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Collection details</h2></div><div class=\"panel-body\"><dl class=\"definition\">");
     body.push_str(&format!(
@@ -1590,6 +1593,31 @@ mod tests {
         assert!(html.contains("value=\"https://example.test/maps/?f=html\""));
         // Map request parameters are documented by the API serving the map.
         assert!(html.contains("href=\"https://example.test/maps/api/docs\">Map request parameters"));
+    }
+
+    #[test]
+    fn request_section_lists_tilesets_next_to_the_map_preview() {
+        let doc = json!({"id":"a","links":[
+            {"rel":"self","href":"https://x/collections/a"},
+            {"rel":rel::MAP,"href":"https://x/collections/a/map"},
+            {"rel":rel::TILESETS_MAP,"href":"https://x/collections/a/map/tiles","type":"application/json","title":"Map tilesets"},
+            {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/a/tiles","type":"application/json","title":"Vector tilesets"}]});
+        let surface = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let html = collection_html(surface, &doc, None);
+        let request = html
+            .split("<h2>Request data from this collection</h2>")
+            .nth(1)
+            .unwrap()
+            .split("</section>")
+            .next()
+            .unwrap();
+        assert!(request.contains("Map request parameters"));
+        assert!(request.contains("https://x/collections/a/map/tiles"));
+        assert!(request.contains("https://x/collections/a/tiles"));
     }
 
     #[test]

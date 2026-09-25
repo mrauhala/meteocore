@@ -139,7 +139,7 @@ impl CacheMetricSet {
 static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new("http_requests_total", "Total HTTP requests"),
-        &["method", "path", "status"],
+        &["method", "path", "status", "api"],
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
@@ -160,7 +160,7 @@ static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
         .buckets(vec![
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0,
         ]),
-        &["method", "path"],
+        &["method", "path", "api"],
     )
     .unwrap();
     REGISTRY.register(Box::new(histogram.clone())).unwrap();
@@ -293,7 +293,7 @@ static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
             "http_response_bytes_total",
             "Total HTTP response body bytes sent",
         ),
-        &["method", "path"],
+        &["method", "path", "api"],
     )
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
@@ -5454,6 +5454,7 @@ pub async fn metrics_middleware(
 
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
+    let api = response_api(&response, &path);
 
     // Track response body size. Axum handlers like `Json`, `Bytes`, and
     // image responses return buffered bodies whose exact length is known
@@ -5467,28 +5468,53 @@ pub async fn metrics_middleware(
     // acceptable — no handler in this codebase streams.
     if let Some(len) = http_body::Body::size_hint(response.body()).exact() {
         HTTP_RESPONSE_BYTES
-            .with_label_values(&[&method, &path])
+            .with_label_values(&[method.as_str(), path.as_str(), api])
             .inc_by(len);
     }
 
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&[&method, &path, &status])
+        .with_label_values(&[method.as_str(), path.as_str(), status.as_str(), api])
         .inc();
     HTTP_REQUEST_DURATION
-        .with_label_values(&[&method, &path])
+        .with_label_values(&[method.as_str(), path.as_str(), api])
         .observe(duration);
 
     response
+}
+
+/// The API of a per-API service route, from its template's mount segment.
+fn template_api(template: &str) -> &str {
+    template
+        .trim_matches('/')
+        .split('/')
+        .next()
+        .filter(|s| {
+            matches!(
+                *s,
+                "edr" | "features" | "wms" | "maps" | "tiles" | "3dtiles"
+            )
+        })
+        .unwrap_or("")
+}
+
+/// The API a response belongs to: the kind a shared-root router tagged it
+/// with, else its per-API mount. A bounded label (a handful of APIs).
+fn response_api<'a>(response: &'a axum::response::Response, template: &'a str) -> &'a str {
+    response
+        .extensions()
+        .get::<api_common::ApiKind>()
+        .map(|kind| kind.0)
+        .unwrap_or_else(|| template_api(template))
 }
 
 /// Derive (api, collection_id, query_type) from a real URI path and the
 /// matched route template.
 ///
 /// The API comes from the template's per-API mount segment (`/edr/…`,
-/// `/maps/…`). The collection id is read from the URI at the position of
-/// `{id}` in the template, so it does not depend on the mount. Routes of the
-/// planned shared OGC API root (#789) have no mount segment and are left
-/// unattributed until that router can state each route's API.
+/// `/maps/…`); shared-root routes (#789) have none, so the logging
+/// middleware prefers the kind their router tagged the response with. The
+/// collection id is read from the URI at the position of `{id}` in the
+/// template, so it does not depend on the mount.
 ///
 /// Examples:
 ///   `/edr/collections/weather/position`, `/edr/collections/{id}/position`
@@ -5506,11 +5532,7 @@ fn classify_route<'a>(
     let template = matched.unwrap_or(uri_path);
     let template_segs: Vec<&str> = template.trim_matches('/').split('/').collect();
     let uri_segs: Vec<&str> = uri_path.trim_matches('/').split('/').collect();
-    let api = template_segs
-        .first()
-        .copied()
-        .filter(|s| matches!(*s, "edr" | "features" | "wms" | "maps" | "tiles"))
-        .unwrap_or("");
+    let api = template_api(template);
 
     // Unmatched requests have no template; take the segment after the first
     // `collections` of the path itself.
@@ -5625,6 +5647,10 @@ pub async fn request_logging_middleware(
         .and_then(|s| s.parse::<u64>().ok());
 
     let (api, collection_id, query_type) = classify_route(&uri_path, matched.as_deref());
+    let api = response
+        .extensions()
+        .get::<api_common::ApiKind>()
+        .map_or(api, |kind| kind.0);
 
     // For ≥400 responses, API error types attach a ds_core::error::ErrorReason
     // to the response extensions so the reason survives past IntoResponse (which
@@ -6898,6 +6924,40 @@ mod tests {
         assert_eq!(api, "edr");
         assert_eq!(coll, Some("weather"));
         assert_eq!(qt, "position");
+    }
+
+    /// Shared-root routes (#789) carry no API segment: metrics label them
+    /// with the API their router tagged the response with; per-API routes
+    /// keep their mount's API.
+    #[tokio::test]
+    async fn metrics_label_requests_with_the_serving_api() {
+        use tower::ServiceExt;
+        let handler = axum::routing::get(|| async { "ok" });
+        let app = api_common::tag_api_kind(
+            axum::Router::new().route("/collections/{id}/map", handler.clone()),
+            "maps",
+        )
+        .route("/tiles/collections/{id}/tiles", handler)
+        .layer(axum::middleware::from_fn(super::metrics_middleware));
+        for (uri, template, api) in [
+            ("/collections/radar/map", "/collections/{id}/map", "maps"),
+            (
+                "/tiles/collections/radar/tiles",
+                "/tiles/collections/{id}/tiles",
+                "tiles",
+            ),
+        ] {
+            let counter =
+                super::HTTP_REQUESTS_TOTAL.with_label_values(&["GET", template, "200", api]);
+            let before = counter.get();
+            let request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(counter.get(), before + 1, "{uri}");
+        }
     }
 
     #[test]

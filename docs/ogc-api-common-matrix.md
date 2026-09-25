@@ -64,7 +64,18 @@ of the access standards (Maps `…/map`, `…/styles`, `…/legend`; Tiles
 tileset links now follow the Tiles registries rather than the `apis` list.
 Maps and Tiles build links from their router mount. No Common class changes.
 
-Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively.
+Shared root update (2026-09-25, [#789](https://github.com/mrauhala/meteocore/issues/789)
+Phase 1): the server root is an OGC API composing Maps and Tiles as building
+blocks — one landing page, `/conformance` (the union), `/api` and one catalog in
+which each collection links every access mechanism (Common Part 2 §6.2). Its
+Common behaviour is that of the Maps and Tiles columns below, with two
+differences: Common metadata responses carry `Cache-Control`/ETag/304 (note [3]
+does not apply there), and collection fields shared by Maps and Tiles come from
+Maps (first block wins). The contract suite runs every cross-API check against
+it as a sixth surface. The per-API services are unchanged.
+
+Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
+the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a
 collection.
 

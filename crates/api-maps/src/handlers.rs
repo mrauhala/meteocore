@@ -42,7 +42,7 @@ pub type AppState = Arc<ArcSwap<MapsState>>;
 
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
-fn request_base_url(state: &MapsState, headers: &HeaderMap) -> String {
+pub(crate) fn request_base_url(state: &MapsState, headers: &HeaderMap) -> String {
     ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
         headers.get(name).and_then(|v| v.to_str().ok())
     })
@@ -155,14 +155,18 @@ fn style_links(collection_id: &str, style_name: &str, root: &str) -> serde_json:
     ])
 }
 
-fn build_collection_metadata(
+/// Maps' description of a collection: its standard fields and data-access
+/// links (map, styles), without the `self` link. Shared by the per-API
+/// service and the shared OGC API root (#789).
+pub(crate) fn collection_parts(
     config: &CollectionConfig,
     info: &ds_core::map_engine::RasterInfo,
     styles: Option<&HashMap<String, StyleInfo>>,
-    map_tilesets: bool,
-    base_url: &str,
     root: &str,
-) -> serde_json::Value {
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<serde_json::Value>,
+) {
     let mut crs_list: Vec<&str> = params::supported_crs_list().to_vec();
     // Deduplicate
     crs_list.dedup();
@@ -201,13 +205,7 @@ fn build_collection_metadata(
         }
     }
 
-    let mut links = vec![
-        json!({
-            "href": format!("{root}/collections/{}", config.id),
-            "rel": "self",
-            "type": "application/json",
-            "title": config.title
-        }),
+    let links = vec![
         json!({
             "href": format!("{root}/collections/{}/map", config.id),
             "rel": "map",
@@ -236,6 +234,40 @@ fn build_collection_metadata(
         }),
     ];
 
+    let mut fields = serde_json::Map::new();
+    fields.insert("dataType".into(), json!("map"));
+    fields.insert("crs".into(), json!(crs_uris));
+    fields.insert("styles".into(), json!(style_list));
+    // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
+    // Engines label projected/rotated grids with internal names ("TM",
+    // "LAEA", "projected", "rotated_ll", …) that have no URI; emitting CRS84
+    // for those would mislabel the storage grid, so omit it instead.
+    if let Some(storage_crs) = ds_core::geo::native_crs_uri(&info.native_crs) {
+        fields.insert("storageCrs".into(), json!(storage_crs));
+    }
+    if let Some(extent) = build_extent(info) {
+        fields.insert("extent".into(), extent);
+    }
+    (fields, links)
+}
+
+fn build_collection_metadata(
+    config: &CollectionConfig,
+    info: &ds_core::map_engine::RasterInfo,
+    styles: Option<&HashMap<String, StyleInfo>>,
+    map_tilesets: bool,
+    base_url: &str,
+    root: &str,
+) -> serde_json::Value {
+    let (fields, access) = collection_parts(config, info, styles, root);
+    let mut links = vec![json!({
+        "href": format!("{root}/collections/{}", config.id),
+        "rel": "self",
+        "type": "application/json",
+        "title": config.title
+    })];
+    links.extend(access);
+
     // Map tilesets — rendered (raster) tiles are an OGC API Maps "map
     // tileset", discoverable from the maps collection via the `tilesets-map`
     // relation. Only advertise it when the Tiles service actually registered
@@ -249,29 +281,7 @@ fn build_collection_metadata(
         }));
     }
 
-    let mut metadata = api_common::collection_metadata(
-        config,
-        json!({
-            "dataType": "map",
-            "crs": crs_uris,
-            "styles": style_list,
-        }),
-        links,
-    );
-
-    // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
-    // Engines label projected/rotated grids with internal names ("TM",
-    // "LAEA", "projected", "rotated_ll", …) that have no URI; emitting CRS84
-    // for those would mislabel the storage grid, so omit it instead.
-    if let Some(storage_crs) = ds_core::geo::native_crs_uri(&info.native_crs) {
-        metadata["storageCrs"] = json!(storage_crs);
-    }
-
-    if let Some(extent) = build_extent(info) {
-        metadata["extent"] = extent;
-    }
-
-    metadata
+    api_common::collection_metadata(config, serde_json::Value::Object(fields), links)
 }
 
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
@@ -397,13 +407,12 @@ fn format_parameter() -> serde_json::Value {
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
-/// GET {mount}/api — OpenAPI 3.0.3 definition. Path keys include the mount.
-pub async fn api_definition(
-    State(state): State<AppState>,
-    Extension(mount): Extension<Mount>,
-) -> impl IntoResponse {
-    let state = state.load_full();
-    let m = mount.0;
+/// Per-collection OpenAPI paths (detail, map, styles, styled map, legend),
+/// keyed below the mount `m`.
+pub(crate) fn collection_openapi_paths(
+    state: &MapsState,
+    m: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
@@ -582,6 +591,166 @@ pub async fn api_definition(
         });
     }
 
+    match collection_paths {
+        serde_json::Value::Object(paths) => paths,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// OpenAPI components (parameters, schemas) referenced by the Maps paths.
+pub(crate) fn openapi_components() -> serde_json::Value {
+    json!({
+        "parameters": {
+            "bbox": {
+                "name": "bbox",
+                "in": "query",
+                "required": true,
+                "schema": {"type": "string"},
+                "description": "Bounding box: west,south,east,north"
+            },
+            "width": {
+                "name": "width",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8000,
+                    "default": 256
+                },
+                "description": "Image width in pixels"
+            },
+            "height": {
+                "name": "height",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8000,
+                    "default": 256
+                },
+                "description": "Image height in pixels"
+            },
+            "crs": {
+                "name": "crs",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "string",
+                    "default": "CRS:84",
+                    "enum": ["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"]
+                },
+                "description": "Coordinate reference system"
+            },
+            "datetime": {
+                "name": "datetime",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "ISO 8601 timestamp"
+            },
+            "transparent": {
+                "name": "transparent",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "Transparency support"
+            },
+            "f": {
+                "name": "f",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "string",
+                    "default": "image/png",
+                    "enum": ["image/png", "image/jpeg", "image/webp"]
+                },
+                "description": "Output format. `image/png` auto-emits an 8-bit indexed-palette PNG (~3–4× smaller) for colormap-rendered layers; falls back to 32-bit RGBA above 256 distinct colours."
+            },
+            "bbox-crs": {
+                "name": "bbox-crs",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "CRS for bbox coordinates. Only CRS:84 supported."
+            },
+            "elevation": {
+                "name": "elevation",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "number"},
+                "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
+            }
+        },
+        "schemas": {
+            "styleList": {
+                "type": "object",
+                "properties": {
+                    "styles": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/style"}
+                    },
+                    "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                }
+            },
+            "style": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                }
+            },
+            "legend": {
+                "type": "object",
+                "required": ["style", "title", "min", "max", "interpolation", "stops"],
+                "properties": {
+                    "style": {"type": "string", "description": "Style identifier"},
+                    "title": {"type": "string", "description": "Human-readable style title"},
+                    "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
+                    "unit": {"type": "string", "description": "Unit of the rendered values. Omitted when unknown."},
+                    "min": {"type": "number", "description": "Low end of the value range the colours span"},
+                    "max": {"type": "number", "description": "High end of the value range the colours span"},
+                    "interpolation": {"type": "string", "enum": ["linear", "step"],
+                                      "description": "How colours are produced between stops"},
+                    "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
+                    "stops": {
+                        "type": "array",
+                        "description": "Palette colour stops, ascending by value",
+                        "items": {
+                            "type": "object",
+                            "required": ["value", "color"],
+                            "properties": {
+                                "value": {"type": "number"},
+                                "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"}
+                            }
+                        }
+                    }
+                }
+            },
+            "link": {
+                "type": "object",
+                "required": ["href"],
+                "properties": {
+                    "href": {"type": "string"},
+                    "rel": {"type": "string"},
+                    "type": {"type": "string"},
+                    "title": {"type": "string"}
+                }
+            }
+        }
+    })
+}
+
+/// GET {mount}/api — OpenAPI 3.0.3 definition. Path keys include the mount.
+pub async fn api_definition(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+) -> impl IntoResponse {
+    let state = state.load_full();
+    let m = mount.0;
+    let collection_paths = serde_json::Value::Object(collection_openapi_paths(&state, m));
     let mut paths = json!({
         format!("{m}/"): {
             "get": {
@@ -622,148 +791,7 @@ pub async fn api_definition(
             "description": "OGC API - Maps implementation"
         },
         "paths": paths,
-        "components": {
-            "parameters": {
-                "bbox": {
-                    "name": "bbox",
-                    "in": "query",
-                    "required": true,
-                    "schema": {"type": "string"},
-                    "description": "Bounding box: west,south,east,north"
-                },
-                "width": {
-                    "name": "width",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 8000,
-                        "default": 256
-                    },
-                    "description": "Image width in pixels"
-                },
-                "height": {
-                    "name": "height",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 8000,
-                        "default": 256
-                    },
-                    "description": "Image height in pixels"
-                },
-                "crs": {
-                    "name": "crs",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "string",
-                        "default": "CRS:84",
-                        "enum": ["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"]
-                    },
-                    "description": "Coordinate reference system"
-                },
-                "datetime": {
-                    "name": "datetime",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "string"},
-                    "description": "ISO 8601 timestamp"
-                },
-                "transparent": {
-                    "name": "transparent",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "string"},
-                    "description": "Transparency support"
-                },
-                "f": {
-                    "name": "f",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "string",
-                        "default": "image/png",
-                        "enum": ["image/png", "image/jpeg", "image/webp"]
-                    },
-                    "description": "Output format. `image/png` auto-emits an 8-bit indexed-palette PNG (~3–4× smaller) for colormap-rendered layers; falls back to 32-bit RGBA above 256 distinct colours."
-                },
-                "bbox-crs": {
-                    "name": "bbox-crs",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "string"},
-                    "description": "CRS for bbox coordinates. Only CRS:84 supported."
-                },
-                "elevation": {
-                    "name": "elevation",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "number"},
-                    "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
-                }
-            },
-            "schemas": {
-                "styleList": {
-                    "type": "object",
-                    "properties": {
-                        "styles": {
-                            "type": "array",
-                            "items": {"$ref": "#/components/schemas/style"}
-                        },
-                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
-                    }
-                },
-                "style": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
-                    }
-                },
-                "legend": {
-                    "type": "object",
-                    "required": ["style", "title", "min", "max", "interpolation", "stops"],
-                    "properties": {
-                        "style": {"type": "string", "description": "Style identifier"},
-                        "title": {"type": "string", "description": "Human-readable style title"},
-                        "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
-                        "unit": {"type": "string", "description": "Unit of the rendered values. Omitted when unknown."},
-                        "min": {"type": "number", "description": "Low end of the value range the colours span"},
-                        "max": {"type": "number", "description": "High end of the value range the colours span"},
-                        "interpolation": {"type": "string", "enum": ["linear", "step"],
-                                          "description": "How colours are produced between stops"},
-                        "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
-                        "stops": {
-                            "type": "array",
-                            "description": "Palette colour stops, ascending by value",
-                            "items": {
-                                "type": "object",
-                                "required": ["value", "color"],
-                                "properties": {
-                                    "value": {"type": "number"},
-                                    "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"}
-                                }
-                            }
-                        }
-                    }
-                },
-                "link": {
-                    "type": "object",
-                    "required": ["href"],
-                    "properties": {
-                        "href": {"type": "string"},
-                        "rel": {"type": "string"},
-                        "type": {"type": "string"},
-                        "title": {"type": "string"}
-                    }
-                }
-            }
-        }
+        "components": openapi_components()
     });
 
     Json(openapi)
@@ -808,6 +836,19 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
     }
 }
 
+/// OGC API - Maps classes this implementation declares, on either surface.
+pub(crate) const CONFORMANCE: &[&str] = &[
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
+    "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
+];
+
 /// GET {mount}/conformance
 pub async fn conformance(
     State(state): State<AppState>,
@@ -820,17 +861,7 @@ pub async fn conformance(
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);
-    let classes = api_common::conformance_classes(&[
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
-        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
-    ]);
+    let classes = api_common::conformance_classes(CONFORMANCE);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {

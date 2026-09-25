@@ -139,6 +139,7 @@ dependencies = [
  "ds-core",
  "form_urlencoded",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
