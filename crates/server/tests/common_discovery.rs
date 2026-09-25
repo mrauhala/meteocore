@@ -357,6 +357,7 @@ async fn common_metadata_validates_against_pinned_part_2_and_part_4() {
                 let url = format!("{prefix}/collections/{id}");
                 let detail = get_json(&app, &url).await;
                 schema::assert_valid("/collections/{collectionId}", &detail, &url);
+                schema::assert_dimensions_valid(&detail, &url);
             }
             for rel in ["next", "prev"] {
                 if doc["links"]
@@ -371,6 +372,25 @@ async fn common_metadata_validates_against_pinned_part_2_and_part_4() {
                 }
             }
         }
+    }
+}
+
+/// Negative controls for the strict dimension check: the dimension shape the
+/// Maps/Tiles extent builder emitted before (no reference system, no grid
+/// `cellsCount`) and an out-of-domain bbox must fail.
+#[test]
+fn uad_dimension_check_rejects_the_previous_vertical_shape() {
+    for broken in [
+        json!({"extent": {"vertical": {"interval": [[0.5, 15.0]], "unit": "deg",
+            "grid": {"coordinates": [0.5, 15.0]}}}}),
+        json!({"extent": {"vertical": {"interval": [[0.5, 15.0]], "vrs": "x",
+            "grid": {"coordinates": [0.5, 15.0]}}}}),
+        json!({"extent": {"spatial": {"bbox": [[-180.125, -90.125, 179.875, 90.125]]}}}),
+    ] {
+        let rejected = std::panic::catch_unwind(|| {
+            schema::assert_dimensions_valid(&broken, "negative control")
+        });
+        assert!(rejected.is_err(), "accepted {broken}");
     }
 }
 

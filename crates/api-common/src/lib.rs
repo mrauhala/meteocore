@@ -159,7 +159,9 @@ pub fn collections_response(
             title: &entry.config.title,
             description: &entry.config.description,
             keywords: &entry.config.keywords,
-            bbox: entry.bbox,
+            // Search the extent a description may advertise: CRS84-normalized,
+            // none for a box that describes no area.
+            bbox: entry.bbox.and_then(ds_core::geo::crs84_extent),
             time: entry.time,
         })
         .collect();

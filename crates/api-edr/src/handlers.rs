@@ -1806,7 +1806,11 @@ fn build_collection_metadata(
     instance: Option<&ds_core::instances::RunInfo>,
 ) -> serde_json::Value {
     let param_descs = engine.get_parameter_descriptions();
-    let spatial = engine.get_spatial_extent();
+    // Advertise a CRS84-domain extent: engine bounds can be grid cell edges
+    // past the domain, or an empty-accumulator sentinel.
+    let spatial = engine
+        .get_spatial_extent()
+        .and_then(ds_core::geo::crs84_extent);
 
     let coll_id = &config.id;
     // The self id and the base path every data-query href hangs off — scoped to

@@ -33,7 +33,9 @@ requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
 `bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `limit`, `offset` and `f` through
 [api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
 return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
-preserve filters and the negotiated format. Collection descriptions expose HTML
+preserve filters and the negotiated format. Advertised spatial extents are normalized to the CRS84
+domain (grid cell edges past ±180°/±90° are clamped; an extent describing no area
+is omitted), matching the other APIs and collection search. Collection descriptions expose HTML
 alternate links and configured keywords/license metadata through the shared helper.
 
 Text discovery supports whitespace-normalized whole-word phrases in `q`, and

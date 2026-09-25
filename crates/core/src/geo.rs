@@ -225,6 +225,37 @@ pub fn is_crs84_grid(label: &str) -> bool {
     label == "CRS:84"
 }
 
+/// Normalize an advertised WGS84 extent `[west, south, east, north]` to the
+/// CRS84 domain, or `None` when it describes no area.
+///
+/// Engines derive extents from grid cell edges or projected samples, which can
+/// fall just outside the domain: a global 0.25° grid's cell edges reach
+/// ±90.125° latitude and −180.125° longitude. An extent whose accumulation
+/// never saw a valid point is the inverted `[MAX, MAX, −MAX, −MAX]` sentinel.
+/// Extents and collection search must not advertise either.
+///
+/// - Non-finite values, or `south > north`: `None`.
+/// - Latitude is clamped to ±90 (a grid cell reaching past a pole).
+/// - A box spanning ≥ 360° of longitude becomes −180…180.
+/// - Other longitudes are clamped to ±180; a `west > east` box inside the
+///   domain is an antimeridian crossing and is kept as is.
+///
+/// Advertised extents only: request bboxes (WMS/Maps viewports) must never be
+/// clamped (Critical Rule 4).
+pub fn crs84_extent(bbox: [f64; 4]) -> Option<[f64; 4]> {
+    let [w, s, e, n] = bbox;
+    if !bbox.iter().all(|v| v.is_finite()) || s > n {
+        return None;
+    }
+    let (s, n) = (s.clamp(-90.0, 90.0), n.clamp(-90.0, 90.0));
+    let (w, e) = if w <= e && e - w >= 360.0 {
+        (-180.0, 180.0)
+    } else {
+        (w.clamp(-180.0, 180.0), e.clamp(-180.0, 180.0))
+    };
+    Some([w, s, e, n])
+}
+
 /// Positive longitude and latitude spans (degrees) of a CRS84 bbox
 /// `[west, south, east, north]`. Handles an anti-meridian crossing where
 /// `east < west` (e.g. a STAC bbox like `[170.0, …, -170.0, …]`, a 20°-wide
@@ -1431,6 +1462,32 @@ pub fn geometry_to_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crs84_extent_normalizes_advertised_bounds() {
+        // Global 0.25° grid cell edges reach past the domain.
+        assert_eq!(
+            crs84_extent([-180.125, -90.125, 179.875, 90.125]),
+            Some([-180.0, -90.0, 180.0, 90.0])
+        );
+        // The empty-accumulator sentinel and non-finite values describe no area.
+        assert_eq!(crs84_extent([f64::MAX, f64::MAX, f64::MIN, f64::MIN]), None);
+        assert_eq!(crs84_extent([f64::NAN, 0.0, 1.0, 1.0]), None);
+        // In-domain boxes pass through, including an antimeridian crossing.
+        assert_eq!(
+            crs84_extent([19.0, 59.0, 32.0, 70.0]),
+            Some([19.0, 59.0, 32.0, 70.0])
+        );
+        assert_eq!(
+            crs84_extent([170.0, 10.0, -170.0, 20.0]),
+            Some([170.0, 10.0, -170.0, 20.0])
+        );
+        // A partly overhanging box is clamped, not dropped.
+        assert_eq!(
+            crs84_extent([-180.5, -10.0, -170.0, 91.0]),
+            Some([-180.0, -10.0, -170.0, 90.0])
+        );
+    }
 
     #[test]
     fn projected_output_crs_pins_epsg_parameters() {
