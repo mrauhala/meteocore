@@ -56,7 +56,9 @@ fn geometry_to_json(g: &Geometry) -> Value {
     }
 }
 
-pub fn feature_to_geojson(feature: &Feature, collection_id: &str, base_url: &str) -> Value {
+/// `root` is the absolute URL of the API root serving the collection: the
+/// per-API `/features` service or the shared OGC API root (#789).
+pub fn feature_to_geojson(feature: &Feature, collection_id: &str, root: &str) -> Value {
     // Sorted iteration: serde_json's workspace-enabled `preserve_order` makes
     // insertion order the wire order, and engines build each feature's
     // property HashMap fresh per request — unsorted, byte-identical requests
@@ -76,12 +78,12 @@ pub fn feature_to_geojson(feature: &Feature, collection_id: &str, base_url: &str
         "properties": properties,
         "links": [
             {
-                "href": format!("{base_url}/features/collections/{}/items/{}", collection_id, crate::html::path_segment(&feature.id)),
+                "href": format!("{root}/collections/{}/items/{}", collection_id, crate::html::path_segment(&feature.id)),
                 "rel": "self",
                 "type": "application/geo+json"
             },
             {
-                "href": format!("{base_url}/features/collections/{}", collection_id),
+                "href": format!("{root}/collections/{}", collection_id),
                 "rel": "collection",
                 "type": "application/json"
             }
@@ -163,23 +165,23 @@ pub fn feature_page_to_geojson(
     // recommends — silently drops the caller's filters and ordering.
     filters: &str,
     timestamp: &str,
-    base_url: &str,
+    root: &str,
 ) -> Value {
     let features: Vec<Value> = page
         .features
         .iter()
-        .map(|f| feature_to_geojson(f, collection_id, base_url))
+        .map(|f| feature_to_geojson(f, collection_id, root))
         .collect();
 
     let mut links = vec![json!({
-        "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}{}", collection_id, offset, limit, filters),
+        "href": format!("{root}/collections/{}/items?offset={}&limit={}{}", collection_id, offset, limit, filters),
         "rel": "self",
         "type": "application/geo+json"
     })];
 
     if let Some(next) = page.next_offset {
         links.push(json!({
-            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}{}", collection_id, next, limit, filters),
+            "href": format!("{root}/collections/{}/items?offset={}&limit={}{}", collection_id, next, limit, filters),
             "rel": "next",
             "type": "application/geo+json"
         }));
@@ -188,7 +190,7 @@ pub fn feature_page_to_geojson(
     if offset > 0 {
         let prev_offset = offset.saturating_sub(limit);
         links.push(json!({
-            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}{}", collection_id, prev_offset, limit, filters),
+            "href": format!("{root}/collections/{}/items?offset={}&limit={}{}", collection_id, prev_offset, limit, filters),
             "rel": "prev",
             "type": "application/geo+json"
         }));

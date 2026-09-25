@@ -1,6 +1,6 @@
 # MeteoCore
 
-A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/), and [OGC 3D Tiles 1.1](https://www.ogc.org/standard/3dtiles/) over the same data sources. OGC API - Maps and Tiles are composed as building blocks of one shared OGC API at the server root — one landing page, conformance declaration, OpenAPI document and collection catalog, each collection linking every access mechanism it offers ([#789](https://github.com/mrauhala/meteocore/issues/789)). Each standard is also served as its own per-API service (`/edr`, `/features`, `/maps`, `/tiles`, `/wms`, `/3dtiles`). A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing; a bundled CesiumJS viewer serves volumetric 3D Tiles collections.
+A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/), and [OGC 3D Tiles 1.1](https://www.ogc.org/standard/3dtiles/) over the same data sources. OGC API - Maps, Tiles and Features are composed as building blocks of one shared OGC API at the server root — one landing page, conformance declaration, OpenAPI document and collection catalog, each collection linking every access mechanism it offers ([#789](https://github.com/mrauhala/meteocore/issues/789)). Each standard is also served as its own per-API service (`/edr`, `/features`, `/maps`, `/tiles`, `/wms`, `/3dtiles`). A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing; a bundled CesiumJS viewer serves volumetric 3D Tiles collections.
 
 ## Workspace Crates
 
@@ -252,15 +252,17 @@ The render semaphore (2× CPU cores, minimum 8) and rendered-image cache are sha
 
 ## Route Structure
 
-The shared OGC API root (Maps + Tiles building blocks; Tiles Table 8 layout):
+The shared OGC API root (Maps + Tiles + Features building blocks; Tiles Table 8 layout):
 
 ```
 /                                              OGC API landing page (also links every per-API service)
 /api                                           OpenAPI definition of the shared API (JSON)
 /api/docs                                      Swagger UI
-/conformance                                   Common + Maps + Tiles conformance classes
+/conformance                                   Common + Maps + Tiles + Features conformance classes
 /collections                                   Collection catalog (search/paging as per-API)
-/collections/{id}                              Collection: map, styles, map/vector tileset links
+/collections/{id}                              Collection: map, styles, map/vector tileset and items links
+/collections/{id}/items                        Features (GeoJSON or HTML; bbox, datetime, sortby, property filters)
+/collections/{id}/items/{featureId}            Feature
 /collections/{id}/map                          Map (default style)
 /collections/{id}/styles                       Styles
 /collections/{id}/styles/{styleId}/map         Styled map
@@ -1682,7 +1684,7 @@ Returns HTTP 503 only when all collections have failed.
 
 ### Prometheus Metrics
 
-`GET /metrics` returns Prometheus text format. Path labels are the matched route template (e.g. `/edr/collections/{id}/position`), not the raw URL, so cardinality stays bounded. The `api` label names the serving API: a per-API route's mount (`edr`, `features`, `maps`, `tiles`, `wms`, `3dtiles`), or for the shared OGC API root the building block that served it (`maps`, `tiles`) and `common` for its discovery resources; empty for operational routes.
+`GET /metrics` returns Prometheus text format. Path labels are the matched route template (e.g. `/edr/collections/{id}/position`), not the raw URL, so cardinality stays bounded. The `api` label names the serving API: a per-API route's mount (`edr`, `features`, `maps`, `tiles`, `wms`, `3dtiles`), or for the shared OGC API root the building block that served it (`maps`, `tiles`, `features`) and `common` for its discovery resources; empty for operational routes.
 
 **HTTP:**
 

@@ -5,9 +5,11 @@ use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{json, Map, Value};
+
+use api_common::Mount;
 
 use ds_core::config::CollectionConfig;
 use ds_core::feature::FeatureQuery;
@@ -36,9 +38,17 @@ pub struct FeaturesState {
 
 pub type AppState = Arc<ArcSwap<FeaturesState>>;
 
+/// Features Part 1 classes this crate implements, on every surface.
+pub const CONFORMANCE: &[&str] = &[
+    "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
+    "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
+    "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
+    "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/html",
+];
+
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
-fn request_base_url(state: &FeaturesState, headers: &HeaderMap) -> String {
+pub(crate) fn request_base_url(state: &FeaturesState, headers: &HeaderMap) -> String {
     ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
         headers.get(name).and_then(|v| v.to_str().ok())
     })
@@ -126,6 +136,7 @@ fn with_vary(mut resp: Response) -> Response {
 
 pub async fn landing_page(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
@@ -133,48 +144,49 @@ pub async fn landing_page(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let title = "MeteoCore - Features";
     let description = "Metocean Data Server — OGC API Features";
     // (href, rel, type, title) — one source for both representations.
     let links = [
         (
-            format!("{base}/features/"),
+            format!("{root}/"),
             "self",
             "application/json",
             "This document",
         ),
         (
-            format!("{base}/features/api"),
+            format!("{root}/api"),
             "service-desc",
             "application/vnd.oai.openapi+json;version=3.0",
             "API definition",
         ),
         (
-            format!("{base}/features/api/docs"),
+            format!("{root}/api/docs"),
             "service-doc",
             "text/html",
             "API documentation",
         ),
         (
-            format!("{base}/features/conformance"),
+            format!("{root}/conformance"),
             "conformance",
             "application/json",
             "Conformance classes",
         ),
         (
-            format!("{base}/features/conformance"),
+            format!("{root}/conformance"),
             api_common::rel::CONFORMANCE,
             "application/json",
             "Conformance classes",
         ),
         (
-            format!("{base}/features/collections"),
+            format!("{root}/collections"),
             "data",
             "application/json",
             "Collections",
         ),
         (
-            format!("{base}/features/collections"),
+            format!("{root}/collections"),
             api_common::rel::DATA,
             "application/json",
             "Collections",
@@ -197,14 +209,14 @@ pub async fn landing_page(
             // rel="alternate" to the JSON representation (parity with the
             // collection-detail HTML page).
             views.push(LinkView::new(
-                format!("{base}/features/?f=json"),
+                format!("{root}/?f=json"),
                 "alternate",
                 Some("This document as JSON"),
             ));
             Html(api_common::workbench::landing_html(
                 api_common::workbench::Surface {
                     base,
-                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    root,
                     api: "features",
                 },
                 title,
@@ -218,6 +230,7 @@ pub async fn landing_page(
 
 pub async fn conformance(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
@@ -225,19 +238,15 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-    let classes = api_common::conformance_classes(&[
-        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
-        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
-        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
-        "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/html",
-    ]);
+    let root = &mount.root(base);
+    let classes = api_common::conformance_classes(CONFORMANCE);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => {
             let nav = [
-                LinkView::new(format!("{base}/features/"), "up", Some("Landing page")),
+                LinkView::new(format!("{root}/"), "up", Some("Landing page")),
                 LinkView::new(
-                    format!("{base}/features/conformance?f=json"),
+                    format!("{root}/conformance?f=json"),
                     "alternate",
                     Some("This document as JSON"),
                 ),
@@ -245,7 +254,7 @@ pub async fn conformance(
             Html(api_common::workbench::conformance_html(
                 api_common::workbench::Surface {
                     base,
-                    root: &format!("{base}{}", api_common::mounts::FEATURES),
+                    root,
                     api: "features",
                 },
                 &classes,
@@ -269,77 +278,49 @@ fn feature_format_parameter() -> serde_json::Value {
         "description": "Output format, case-insensitive; overrides Accept. JSON aliases return GeoJSON. Encode the plus sign as %2B in application/geo+json."})
 }
 
-pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
-    let state = state.load_full();
-    let mut collection_paths = json!({});
-    for config in state.collections.values() {
+/// Names an OpenAPI component of this crate. The per-API definition uses the
+/// names as they are ([`plain_name`]); the shared root prefixes them, because
+/// Maps already defines a different `bbox`, `datetime` and `link` (#789).
+pub(crate) type ComponentName = fn(&str) -> String;
+
+pub(crate) fn plain_name(name: &str) -> String {
+    name.to_owned()
+}
+
+fn component_ref(section: &str, name: ComponentName, component: &str) -> Value {
+    json!({"$ref": format!("#/components/{section}/{}", name(component))})
+}
+
+/// The items and single-item operations of every feature collection, keyed
+/// below the mount `m`. Shared by the per-API definition and the shared root.
+pub(crate) fn items_openapi_paths(
+    state: &FeaturesState,
+    m: &str,
+    name: ComponentName,
+) -> Map<String, Value> {
+    let mut configs: Vec<&CollectionConfig> = state.collections.values().collect();
+    configs.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut paths = Map::new();
+    for config in configs {
         let id = &config.id;
-        let detail_path = format!("/features/collections/{id}");
-        let items_path = format!("/features/collections/{id}/items");
-        let item_path = format!("/features/collections/{id}/items/{{featureId}}");
-
-        // Collection detail. OGC API – Common – Part 2 `conf/json` requires the
-        // API definition to describe every collection resource, including
-        // GET /collections/{id} — Maps and Tiles already do; Features was the
-        // odd one out (review on #298).
-        collection_paths[&detail_path] = json!({
-            "get": {
-                "summary": format!("Get {} collection metadata", config.title),
-                "operationId": format!("getCollection_{id}"),
-                "tags": [id],
-                "parameters": [format_parameter()],
-                "responses": {
-                    "200": {
-                        "description": "Collection metadata",
-                        "content": {"application/json": {}}
-                    },
-                    "404": {"description": "Collection not found"}
-                }
-            }
-        });
-
-        collection_paths[&items_path] = json!({
-            "get": {
-                "summary": format!("Get features from {}", config.title),
-                "operationId": format!("getFeatures_{id}"),
-                "tags": [id],
-                "parameters": [
-                    {"$ref": "#/components/parameters/bbox"},
-                    {"$ref": "#/components/parameters/limit"},
-                    {"$ref": "#/components/parameters/offset"},
-                    {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/sortby"},
-                    feature_format_parameter()
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Features in GeoJSON or HTML format",
-                        "content": {
-                            "application/geo+json": {
-                                "schema": {"$ref": "#/components/schemas/featureCollectionGeoJSON"}
-                            },
-                            "text/html": {"schema": {"type": "string"}}
-                        }
-                    },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Collection not found"},
-                    "500": {"description": "Server error"}
-                }
-            }
-        });
+        let mut parameters = vec![
+            component_ref("parameters", name, "bbox"),
+            component_ref("parameters", name, "limit"),
+            component_ref("parameters", name, "offset"),
+            component_ref("parameters", name, "datetime"),
+            component_ref("parameters", name, "sortby"),
+            feature_format_parameter(),
+        ];
         // Part 1 §7.15.5–6 uses ordinary named query parameters, not CQL2.
         // The catalog is a cheap snapshot, including producer-defined names.
         if let Some(engine) = state.engines.get(id) {
-            let parameters = collection_paths[&items_path]["get"]["parameters"]
-                .as_array_mut()
-                .unwrap();
-            for name in engine
+            for filterable in engine
                 .filterables()
                 .iter()
                 .filter(|n| !crate::params::is_reserved_parameter(n))
             {
                 parameters.push(json!({
-                    "name": name,
+                    "name": filterable,
                     "in": "query",
                     "required": false,
                     "description": "Exact, case-sensitive property equality (OGC API Features Part 1 §7.15.5–6). Lists match any element; numbers and booleans use canonical string form. Numeric values also accept comma-separated alternatives (OR within that predicate, no spaces); commas in strings remain literal. Null/missing never match. All predicates, including repeated names, are ANDed before paging.",
@@ -349,71 +330,263 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }));
             }
         }
-        collection_paths[&item_path] = json!({
-            "get": {
-                "summary": format!("Get a single feature from {}", config.title),
-                "operationId": format!("getFeature_{id}"),
-                "tags": [id],
-                "parameters": [
-                    {
-                        "name": "featureId",
-                        "in": "path",
-                        "required": true,
-                        "schema": {"type": "string"}
-                    },
-                    feature_format_parameter()
-                ],
-                "responses": {
-                    "200": {
-                        "description": "A single feature in GeoJSON or HTML format",
-                        "content": {
-                            "application/geo+json": {
-                                "schema": {"$ref": "#/components/schemas/featureGeoJSON"}
-                            },
-                            "text/html": {"schema": {"type": "string"}}
-                        }
-                    },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Feature not found"},
-                    "500": {"description": "Server error"}
+        paths.insert(
+            format!("{m}/collections/{id}/items"),
+            json!({
+                "get": {
+                    "summary": format!("Get features from {}", config.title),
+                    "operationId": format!("getFeatures_{id}"),
+                    "tags": [id],
+                    "parameters": parameters,
+                    "responses": {
+                        "200": {
+                            "description": "Features in GeoJSON or HTML format",
+                            "content": {
+                                "application/geo+json": {
+                                    "schema": component_ref("schemas", name, "featureCollectionGeoJSON")
+                                },
+                                "text/html": {"schema": {"type": "string"}}
+                            }
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Collection not found"},
+                        "500": {"description": "Server error"}
+                    }
                 }
-            }
-        });
+            }),
+        );
+        paths.insert(
+            format!("{m}/collections/{id}/items/{{featureId}}"),
+            json!({
+                "get": {
+                    "summary": format!("Get a single feature from {}", config.title),
+                    "operationId": format!("getFeature_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {
+                            "name": "featureId",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "string"}
+                        },
+                        feature_format_parameter()
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "A single feature in GeoJSON or HTML format",
+                            "content": {
+                                "application/geo+json": {
+                                    "schema": component_ref("schemas", name, "featureGeoJSON")
+                                },
+                                "text/html": {"schema": {"type": "string"}}
+                            }
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Feature not found"},
+                        "500": {"description": "Server error"}
+                    }
+                }
+            }),
+        );
     }
+    paths
+}
 
-    let mut paths = json!({
-        "/features/": {
-            "get": {
-                "summary": "Landing page",
-                "operationId": "getLandingPage",
-                "parameters": [format_parameter()],
-                "responses": {
-                    "200": {"description": "Landing page"}
+/// This crate's OpenAPI components, named by `name`.
+pub(crate) fn openapi_components(name: ComponentName) -> Value {
+    let parameters: Map<String, Value> = [
+        (
+            "bbox",
+            json!({
+                "name": "bbox",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 6
+                },
+                "style": "form",
+                "explode": false
+            }),
+        ),
+        // `limit` and `datetime` follow OGC API - Features Part 1's own
+        // definitions (§7.15.3, §7.15.4), including `style: form` and
+        // `explode: false`, which its test suite checks.
+        (
+            "limit",
+            json!({
+                "name": "limit",
+                "in": "query",
+                "required": false,
+                "style": "form",
+                "explode": false,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "default": 100
                 }
-            }
-        },
-        "/features/conformance": {
-            "get": {
-                "summary": "Conformance classes",
-                "operationId": "getConformance",
-                "parameters": [format_parameter()],
-                "responses": {
-                    "200": {"description": "Conformance classes"}
+            }),
+        ),
+        (
+            "offset",
+            json!({
+                "name": "offset",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0
                 }
-            }
-        },
-        "/features/collections": {"get": api_common::collection_operation()}
-    });
+            }),
+        ),
+        (
+            "datetime",
+            json!({
+                "name": "datetime",
+                "in": "query",
+                "required": false,
+                "style": "form",
+                "explode": false,
+                "schema": {"type": "string"},
+                "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
+            }),
+        ),
+        // Schema reproduced verbatim from OGC API - Features Part 8:
+        // Sorting (draft 24-030). Do not "simplify" it to a plain
+        // string: `style: form` + `explode: false` is what makes the
+        // comma-separated form normative rather than incidental.
+        (
+            "sortby",
+            json!({
+                "name": "sortby",
+                "in": "query",
+                "required": false,
+                "schema": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "string",
+                        "pattern": "[+|-]?[A-Za-z_].*"
+                    }
+                },
+                "style": "form",
+                "explode": false,
+                "description": "Comma-separated sort properties, '-' for descending ('+' or no prefix for ascending). Valid properties are collection-specific; an unsupported one is rejected with 400."
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, definition)| (name(key), definition))
+    .collect();
+    let schemas: Map<String, Value> = [
+        (
+            "featureCollectionGeoJSON",
+            json!({
+                "type": "object",
+                "required": ["type", "features"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["FeatureCollection"]},
+                    "features": {"type": "array", "items": component_ref("schemas", name, "featureGeoJSON")},
+                    "numberMatched": {"type": "integer"},
+                    "numberReturned": {"type": "integer"},
+                    "timeStamp": {"type": "string", "format": "date-time"},
+                    "links": {"type": "array", "items": component_ref("schemas", name, "link")}
+                }
+            }),
+        ),
+        (
+            "featureGeoJSON",
+            json!({
+                "type": "object",
+                "required": ["type", "geometry", "properties"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["Feature"]},
+                    "id": {"oneOf": [{"type": "string"}, {"type": "number"}]},
+                    "geometry": {"nullable": true},
+                    "properties": {"type": "object", "nullable": true},
+                    "links": {"type": "array", "items": component_ref("schemas", name, "link")}
+                }
+            }),
+        ),
+        (
+            "link",
+            json!({
+                "type": "object",
+                "required": ["href"],
+                "properties": {
+                    "href": {"type": "string"},
+                    "rel": {"type": "string"},
+                    "type": {"type": "string"},
+                    "title": {"type": "string"}
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, definition)| (name(key), definition))
+    .collect();
+    json!({"parameters": parameters, "schemas": schemas})
+}
 
-    // Merge collection paths into main paths
-    if let (Some(main_obj), Some(coll_obj)) = (paths.as_object_mut(), collection_paths.as_object())
-    {
-        for (k, v) in coll_obj {
-            main_obj.insert(k.clone(), v.clone());
-        }
+pub async fn api_definition(
+    State(state): State<AppState>,
+    Extension(Mount(m)): Extension<Mount>,
+) -> impl IntoResponse {
+    let state = state.load_full();
+    let mut paths = Map::new();
+    for (path, summary, operation_id) in [
+        (format!("{m}/"), "Landing page", "getLandingPage"),
+        (
+            format!("{m}/conformance"),
+            "Conformance classes",
+            "getConformance",
+        ),
+    ] {
+        paths.insert(
+            path,
+            json!({"get": {"summary": summary, "operationId": operation_id,
+                "parameters": [format_parameter()],
+                "responses": {"200": {"description": summary}}}}),
+        );
     }
+    paths.insert(
+        format!("{m}/collections"),
+        json!({"get": api_common::collection_operation()}),
+    );
+    let mut configs: Vec<&CollectionConfig> = state.collections.values().collect();
+    configs.sort_by(|a, b| a.id.cmp(&b.id));
+    for config in configs {
+        let id = &config.id;
+        // Collection detail. OGC API – Common – Part 2 `conf/json` requires the
+        // API definition to describe every collection resource, including
+        // GET /collections/{id} — Maps and Tiles already do; Features was the
+        // odd one out (review on #298).
+        paths.insert(
+            format!("{m}/collections/{id}"),
+            json!({
+                "get": {
+                    "summary": format!("Get {} collection metadata", config.title),
+                    "operationId": format!("getCollection_{id}"),
+                    "tags": [id],
+                    "parameters": [format_parameter()],
+                    "responses": {
+                        "200": {
+                            "description": "Collection metadata",
+                            "content": {"application/json": {}}
+                        },
+                        "404": {"description": "Collection not found"}
+                    }
+                }
+            }),
+        );
+    }
+    paths.extend(items_openapi_paths(&state, m, plain_name));
 
-    let openapi = json!({
+    Json(json!({
         "openapi": "3.0.3",
         "info": {
             "title": "MeteoCore - OGC API Features",
@@ -421,114 +594,17 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "description": "OGC API - Features implementation"
         },
         "paths": paths,
-        "components": {
-            "parameters": {
-                "bbox": {
-                    "name": "bbox",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 6
-                    },
-                    "style": "form",
-                    "explode": false
-                },
-                "limit": {
-                    "name": "limit",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 1000,
-                        "default": 100
-                    }
-                },
-                "offset": {
-                    "name": "offset",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "default": 0
-                    }
-                },
-                "datetime": {
-                    "name": "datetime",
-                    "in": "query",
-                    "required": false,
-                    "schema": {"type": "string"},
-                    "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
-                },
-                // Schema reproduced verbatim from OGC API - Features Part 8:
-                // Sorting (draft 24-030). Do not "simplify" it to a plain
-                // string: `style: form` + `explode: false` is what makes the
-                // comma-separated form normative rather than incidental.
-                "sortby": {
-                    "name": "sortby",
-                    "in": "query",
-                    "required": false,
-                    "schema": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "string",
-                            "pattern": "[+|-]?[A-Za-z_].*"
-                        }
-                    },
-                    "style": "form",
-                    "explode": false,
-                    "description": "Comma-separated sort properties, '-' for descending ('+' or no prefix for ascending). Valid properties are collection-specific; an unsupported one is rejected with 400."
-                }
-            },
-            "schemas": {
-                "featureCollectionGeoJSON": {
-                    "type": "object",
-                    "required": ["type", "features"],
-                    "properties": {
-                        "type": {"type": "string", "enum": ["FeatureCollection"]},
-                        "features": {"type": "array", "items": {"$ref": "#/components/schemas/featureGeoJSON"}},
-                        "numberMatched": {"type": "integer"},
-                        "numberReturned": {"type": "integer"},
-                        "timeStamp": {"type": "string", "format": "date-time"},
-                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
-                    }
-                },
-                "featureGeoJSON": {
-                    "type": "object",
-                    "required": ["type", "geometry", "properties"],
-                    "properties": {
-                        "type": {"type": "string", "enum": ["Feature"]},
-                        "id": {"oneOf": [{"type": "string"}, {"type": "number"}]},
-                        "geometry": {"nullable": true},
-                        "properties": {"type": "object", "nullable": true},
-                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
-                    }
-                },
-                "link": {
-                    "type": "object",
-                    "required": ["href"],
-                    "properties": {
-                        "href": {"type": "string"},
-                        "rel": {"type": "string"},
-                        "type": {"type": "string"},
-                        "title": {"type": "string"}
-                    }
-                }
-            }
-        }
-    });
-
-    Json(openapi)
+        "components": openapi_components(plain_name)
+    }))
 }
 
-pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+pub async fn api_docs(
+    State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/features/api", request_base_url(&state, &headers));
+    let spec_url = format!("{}/api", mount.root(&request_base_url(&state, &headers)));
     (
         [
             (
@@ -562,11 +638,13 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
 
 pub async fn collections(
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     request: api_common::CollectionRequest,
     headers: HeaderMap,
 ) -> Response {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let entries = state
         .collections
         .values()
@@ -585,6 +663,7 @@ pub async fn collections(
                     config,
                     state.vector_tileset_ids.contains(&config.id),
                     base,
+                    root,
                 ),
                 bbox: engine.spatial_extent(),
                 time: engine.temporal_extent(),
@@ -594,7 +673,7 @@ pub async fn collections(
     api_common::collections_response(
         api_common::workbench::Surface {
             base,
-            root: &format!("{base}{}", api_common::mounts::FEATURES),
+            root,
             api: "features",
         },
         request,
@@ -602,10 +681,11 @@ pub async fn collections(
     )
 }
 
-/// GET /features/collections/{id} — Collection detail
+/// GET {mount}/collections/{id} — Collection detail
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
@@ -614,32 +694,26 @@ pub async fn collection(
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
+    let metadata = build_collection_metadata(
+        engine.as_ref(),
+        config,
+        state.vector_tileset_ids.contains(&id),
+        base,
+        root,
+    );
     Ok(with_vary(match wanted {
-        Wanted::Json => Json(build_collection_metadata(
-            engine.as_ref(),
-            config,
-            state.vector_tileset_ids.contains(&id),
-            base,
+        Wanted::Json => Json(metadata).into_response(),
+        Wanted::Html => Html(api_common::workbench::collection_html(
+            api_common::workbench::Surface {
+                base,
+                root,
+                api: "features",
+            },
+            &metadata,
+            config.license.as_ref(),
         ))
         .into_response(),
-        Wanted::Html => {
-            let metadata = build_collection_metadata(
-                engine.as_ref(),
-                config,
-                state.vector_tileset_ids.contains(&id),
-                base,
-            );
-            Html(api_common::workbench::collection_html(
-                api_common::workbench::Surface {
-                    base,
-                    root: &format!("{base}{}", api_common::mounts::FEATURES),
-                    api: "features",
-                },
-                &metadata,
-                config.license.as_ref(),
-            ))
-            .into_response()
-        }
     }))
 }
 
@@ -664,9 +738,12 @@ pub async fn items(
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
+    let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
     let (engine, config) = lookup_collection(&state, &id)?;
     let bad_request = |e: ds_core::error::DataServerError| {
         (
@@ -763,15 +840,7 @@ pub async fn items(
         &query.sortby,
         &query.property_filters,
     );
-    let mut doc = feature_page_to_geojson(
-        &page,
-        &id,
-        limit,
-        offset,
-        &filters,
-        "",
-        &request_base_url(&state, &headers),
-    );
+    let mut doc = feature_page_to_geojson(&page, &id, limit, offset, &filters, "", root);
     crate::html::representation_links(&mut doc, wanted);
     let render = |doc: &serde_json::Value| match wanted {
         ds_core::html::Wanted::Json => {
@@ -781,7 +850,8 @@ pub async fn items(
             doc,
             &config.title,
             &id,
-            &request_base_url(&state, &headers),
+            base,
+            root,
             &html_controls(engine.as_ref()),
         ),
     };
@@ -807,6 +877,7 @@ pub async fn item(
     Path((id, feature_id)): Path<(String, String)>,
     Query(fp): Query<ds_core::html::FormatParams>,
     State(state): State<AppState>,
+    Extension(mount): Extension<Mount>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
@@ -824,8 +895,9 @@ pub async fn item(
         ),
     })?;
 
-    let base = request_base_url(&state, &headers);
-    let mut doc = feature_to_geojson(&feature, &id, &base);
+    let base = &request_base_url(&state, &headers);
+    let root = &mount.root(base);
+    let mut doc = feature_to_geojson(&feature, &id, root);
     crate::html::representation_links(&mut doc, wanted);
     Ok(with_vary(match wanted {
         ds_core::html::Wanted::Json => GeoJsonResponse(doc).into_response(),
@@ -833,11 +905,84 @@ pub async fn item(
             &doc,
             &config.title,
             &id,
-            &base,
+            base,
+            root,
             &html_controls(engine.as_ref()),
         ))
         .into_response(),
     }))
+}
+
+/// Which surface a collection description is for: the per-API `/features`
+/// service keeps its historical shape; the shared OGC API root adds what a
+/// collection with several access mechanisms needs (#789).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layout {
+    PerApi,
+    Shared,
+}
+
+/// Features' description of a collection: its standard fields and `items`
+/// links, without `self`. Shared by the per-API service and the shared root.
+pub(crate) fn collection_parts(
+    engine: &dyn FeatureEngine,
+    config: &CollectionConfig,
+    root: &str,
+    layout: Layout,
+) -> (Map<String, Value>, Vec<Value>) {
+    let items = format!("{root}/collections/{}/items", config.id);
+    let mut links = vec![json!({
+        "href": items,
+        "rel": "items",
+        "type": "application/geo+json",
+        "title": "Items"
+    })];
+    let mut fields = Map::new();
+    fields.insert("itemType".into(), json!("feature"));
+    if layout == Layout::Shared {
+        // One `items` link per encoding (Common Part 2 §6.2); the Features
+        // test suite picks the GeoJSON one by type.
+        links.push(json!({
+            "href": format!("{items}?f=html"),
+            "rel": "items",
+            "type": "text/html",
+            "title": "Items as HTML"
+        }));
+        fields.insert("dataType".into(), json!("vector"));
+    }
+    fields.insert(
+        "crs".into(),
+        json!(["http://www.opengis.net/def/crs/OGC/1.3/CRS84"]),
+    );
+    fields.insert(
+        "storageCrs".into(),
+        json!("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
+    );
+    fields.insert("numberItems".into(), json!(engine.feature_count()));
+
+    // Add spatial + temporal extent if available. A Features collection
+    // contributes a bbox and (for time-aware engines like CAP) a temporal
+    // interval, but shares the one extent builder in `ds_core::ogc_extent` so the
+    // `/features` shape can't drift from `/maps` and `/tiles` (issue #263). The
+    // builder emits a temporal extent from the interval's endpoints, so pass them
+    // as the two-element `times` slice.
+    let times: Vec<chrono::DateTime<chrono::Utc>> = engine
+        .temporal_extent()
+        .map(|(start, end)| vec![start, end])
+        .unwrap_or_default();
+    if let Some(mut extent) =
+        ds_core::ogc_extent::build_extent(engine.spatial_extent(), None, "", &times, None)
+    {
+        // Extent endpoints describe bounds, not two regularly sampled observations.
+        if let Some(temporal) = &mut extent.temporal {
+            temporal.grid = None;
+        }
+        fields.insert(
+            "extent".into(),
+            serde_json::to_value(extent).expect("Extent serializes to JSON"),
+        );
+    }
+    (fields, links)
 }
 
 fn build_collection_metadata(
@@ -845,23 +990,16 @@ fn build_collection_metadata(
     config: &CollectionConfig,
     vector_tilesets: bool,
     base_url: &str,
-) -> serde_json::Value {
-    let total = engine.feature_count();
-
-    let mut links = vec![
-        json!({
-            "href": format!("{base_url}/features/collections/{}", config.id),
-            "rel": "self",
-            "type": "application/json",
-            "title": config.title
-        }),
-        json!({
-            "href": format!("{base_url}/features/collections/{}/items", config.id),
-            "rel": "items",
-            "type": "application/geo+json",
-            "title": "Items"
-        }),
-    ];
+    root: &str,
+) -> Value {
+    let (fields, parts) = collection_parts(engine, config, root, Layout::PerApi);
+    let mut links = vec![json!({
+        "href": format!("{root}/collections/{}", config.id),
+        "rel": "self",
+        "type": "application/json",
+        "title": config.title
+    })];
+    links.extend(parts);
 
     // If the Tiles service also encodes this collection as vector tiles,
     // advertise the tilesets list so clients can discover that representation
@@ -884,38 +1022,5 @@ fn build_collection_metadata(
         }));
     }
 
-    let mut metadata = api_common::collection_metadata(
-        config,
-        json!({
-            "itemType": "feature",
-            "crs": [
-                "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-            ],
-            "storageCrs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
-            "numberItems": total
-        }),
-        links,
-    );
-
-    // Add spatial + temporal extent if available. A Features collection
-    // contributes a bbox and (for time-aware engines like CAP) a temporal
-    // interval, but shares the one extent builder in `ds_core::ogc_extent` so the
-    // `/features` shape can't drift from `/maps` and `/tiles` (issue #263). The
-    // builder emits a temporal extent from the interval's endpoints, so pass them
-    // as the two-element `times` slice.
-    let times: Vec<chrono::DateTime<chrono::Utc>> = engine
-        .temporal_extent()
-        .map(|(start, end)| vec![start, end])
-        .unwrap_or_default();
-    if let Some(mut extent) =
-        ds_core::ogc_extent::build_extent(engine.spatial_extent(), None, "", &times, None)
-    {
-        // Extent endpoints describe bounds, not two regularly sampled observations.
-        if let Some(temporal) = &mut extent.temporal {
-            temporal.grid = None;
-        }
-        metadata["extent"] = serde_json::to_value(extent).expect("Extent serializes to JSON");
-    }
-
-    metadata
+    api_common::collection_metadata(config, Value::Object(fields), links)
 }

@@ -41,6 +41,13 @@ fn contribution(state: &TilesState, sources: &TileSources<'_>, root: &str) -> Co
         links,
         bbox: sources.spatial_extent(),
         time: sources.time(),
+        // A raster's storage is Tiles' to describe (omitted when its native CRS
+        // has no OGC URI); vector data leaves it to the Features block.
+        claims: if sources.raster_info.is_some() {
+            &["storageCrs"]
+        } else {
+            &[]
+        },
     }
 }
 

@@ -74,6 +74,16 @@ does not apply there), and collection fields shared by Maps and Tiles come from
 Maps (first block wins). The contract suite runs every cross-API check against
 it as a sixth surface. The per-API services are unchanged.
 
+Features at the shared root (2026-09-25, [#789](https://github.com/mrauhala/meteocore/issues/789)
+Phase 2): Features is the third block. Feature collections carry
+`itemType: "feature"` and a GeoJSON and an HTML `items` link; other collections
+carry neither, as Features Part 1 §7.1 scopes its requirements to feature
+collections. A collection only Features serves is `dataType: vector` with CRS84
+`crs`/`storageCrs`. Where Maps also serves it, Maps' extent, `crs` and
+`dataType` win, a raster block's claim keeps a projected grid's unknown
+`storageCrs` unlabelled, and discovery follows the advertised extent. No Common
+class changes; the shared root's Common behaviour is otherwise unchanged.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a

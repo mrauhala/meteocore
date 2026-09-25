@@ -242,12 +242,14 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   api-wms/api-maps, and api-edr for its `f=png` time-series plots — never on
   engine crates. API state is a registry of engines keyed by collection ID.
 - **The shared OGC API root at `/` (#789)** composes OGC API standards as
-  `api_common::shared::BuildingBlock`s — Maps and Tiles today — over one
+  `api_common::shared::BuildingBlock`s — Maps, Tiles and Features — over one
   landing page, conformance, OpenAPI document and collection catalog. Blocks
   reuse their per-API service's state (no second registry). Every standard is
   also its own per-API service with its own base route (`/edr/...`,
-  `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`); build Maps/Tiles
-  links from the router's `Mount`, never a hard-coded prefix. See
+  `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`); build Maps, Tiles
+  and Features links from the router's `Mount`, never a hard-coded prefix.
+  EDR stays at `/edr` only (EDR 1.1 requires every `/collections` entry to be
+  an EDR collection; #789 Phase 3). See
   `crates/api-common/CLAUDE.md` for the composition rules.
 - **Collection routing is dynamic.** Handlers look up engines from a
   `HashMap<String, Arc<dyn …Engine>>` by collection ID from the URL path.
