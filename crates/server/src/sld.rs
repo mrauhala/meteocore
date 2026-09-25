@@ -38,25 +38,25 @@ pub fn parse_sld_colormap(name: &str, xml: &str) -> Result<Palette, String> {
         match event {
             Event::Start(e) => match color_map.as_mut() {
                 Some(cm) => {
-                    if is_local(e.local_name().as_ref(), b"ColorMapEntry") {
+                    if is_local(e.local_name().as_ref(), "ColorMapEntry") {
                         cm.push_entry(&e)?;
                     }
                     cm.depth += 1;
                 }
                 None => {
-                    if is_local(e.local_name().as_ref(), b"ColorMap") {
+                    if is_local(e.local_name().as_ref(), "ColorMap") {
                         color_map = Some(ColorMap::open(&e)?);
                     }
                 }
             },
             Event::Empty(e) => match color_map.as_mut() {
                 Some(cm) => {
-                    if is_local(e.local_name().as_ref(), b"ColorMapEntry") {
+                    if is_local(e.local_name().as_ref(), "ColorMapEntry") {
                         cm.push_entry(&e)?;
                     }
                 }
                 None => {
-                    if is_local(e.local_name().as_ref(), b"ColorMap") {
+                    if is_local(e.local_name().as_ref(), "ColorMap") {
                         // Self-closing <ColorMap/>: opens and closes at once.
                         return ColorMap::open(&e)?.finish(name);
                     }
@@ -64,7 +64,7 @@ pub fn parse_sld_colormap(name: &str, xml: &str) -> Result<Palette, String> {
             },
             Event::End(e) => {
                 let closes_color_map = color_map.as_mut().is_some_and(|cm| {
-                    if cm.depth == 0 && is_local(e.local_name().as_ref(), b"ColorMap") {
+                    if cm.depth == 0 && is_local(e.local_name().as_ref(), "ColorMap") {
                         true
                     } else {
                         cm.depth = cm.depth.saturating_sub(1);
@@ -104,7 +104,7 @@ struct ColorMap {
 
 impl ColorMap {
     fn open(e: &BytesStart) -> Result<Self, String> {
-        let interpolation = match attribute(e, b"type")?.as_deref().map(str::trim) {
+        let interpolation = match attribute(e, "type")?.as_deref().map(str::trim) {
             // SLD 1.0 §11.4.3: "ramp" is the default.
             None | Some("ramp") => Interpolation::Linear,
             Some("intervals") | Some("values") => Interpolation::Step,
@@ -127,13 +127,13 @@ impl ColorMap {
         self.entry_index += 1;
         let at = |msg: String| format!("ColorMapEntry[{index}]: {msg}");
 
-        let color = attribute(e, b"color")
+        let color = attribute(e, "color")
             .map_err(at)?
             .ok_or_else(|| at("missing required attribute 'color'".to_string()))?;
         let mut color = parse_hex_color(color.trim())
             .map_err(|err| at(format!("invalid color '{color}': {err}")))?;
 
-        let quantity = attribute(e, b"quantity")
+        let quantity = attribute(e, "quantity")
             .map_err(at)?
             .ok_or_else(|| at("missing required attribute 'quantity'".to_string()))?;
         let value: f64 = quantity
@@ -144,7 +144,7 @@ impl ColorMap {
             return Err(at(format!("quantity '{quantity}' is not a finite number")));
         }
 
-        if let Some(opacity) = attribute(e, b"opacity").map_err(at)? {
+        if let Some(opacity) = attribute(e, "opacity").map_err(at)? {
             let factor: f64 = opacity
                 .trim()
                 .parse()
@@ -175,7 +175,7 @@ impl ColorMap {
 
 /// Compare an element's local name (namespace prefix already stripped by
 /// `local_name()`) against an expected name.
-fn is_local(local: &[u8], expected: &[u8]) -> bool {
+fn is_local(local: &str, expected: &str) -> bool {
     local == expected
 }
 
@@ -183,15 +183,15 @@ fn is_local(local: &[u8], expected: &[u8]) -> bool {
 ///
 /// `xmlns` declarations are skipped: `xmlns:color` would otherwise have the
 /// local name `color`.
-fn attribute(e: &BytesStart, want: &[u8]) -> Result<Option<String>, String> {
+fn attribute(e: &BytesStart, want: &str) -> Result<Option<String>, String> {
     for attr in e.attributes() {
         let attr = attr.map_err(|err| format!("malformed attribute: {err}"))?;
         let (local, prefix) = attr.key.decompose();
-        if attr.key.as_ref() == b"xmlns" || prefix.is_some_and(|p| p.as_ref() == b"xmlns") {
+        if attr.key.as_ref() == "xmlns" || prefix.is_some_and(|p| p.as_ref() == "xmlns") {
             continue;
         }
         if local.as_ref() == want {
-            let name = String::from_utf8_lossy(want);
+            let name = want;
             // `normalized_value` replaces the deprecated `unescape_value` and
             // additionally applies XML attribute-value normalization (§3.3.3:
             // tabs/newlines collapse to spaces). `Implicit1_0` — we never read

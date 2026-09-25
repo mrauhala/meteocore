@@ -215,16 +215,13 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
                 path.push(name);
                 text.clear();
             }
-            Ok(Event::Text(e)) => {
-                let chunk = e
-                    .xml10_content()
-                    .map_err(|err| DataServerError::Engine(format!("CAP XML text error: {err}")))?;
-                text.push_str(&chunk);
-            }
+            // Decoding happens in the reader (quick-xml >= 0.42), so text
+            // content is infallible here; malformed input fails `read_event`.
+            Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
             Ok(Event::GeneralRef(r)) => push_general_ref(&mut text, &r),
             Ok(Event::CData(e)) => {
                 // CAP `<description>`/`<instruction>` are sometimes CDATA-wrapped.
-                text.push_str(&String::from_utf8_lossy(e.as_ref()));
+                text.push_str(e.as_ref());
             }
             Ok(Event::End(e)) => {
                 let name = decode_name(e.local_name().as_ref());
@@ -342,10 +339,10 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
     Ok(alerts)
 }
 
-/// Lossily decode an already-namespace-stripped element name (`quick_xml`'s
-/// `local_name()` removes the prefix; this only turns the bytes into a `String`).
-fn decode_name(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+/// An already-namespace-stripped element name (`quick_xml`'s `local_name()`
+/// removes the prefix; since 0.42 it is already decoded `str`).
+fn decode_name(name: &str) -> String {
+    name.to_owned()
 }
 
 /// Append what a general entity reference stands for to the text buffer.
@@ -366,8 +363,9 @@ pub(crate) fn push_general_ref(text: &mut String, r: &BytesRef) {
         text.push(c);
         return;
     }
-    let Ok(name) = r.decode() else { return };
-    match name.as_ref() {
+    // Since quick-xml 0.42 the reference name is already decoded `str`.
+    let name: &str = r.as_ref();
+    match name {
         "amp" => text.push('&'),
         "lt" => text.push('<'),
         "gt" => text.push('>'),
