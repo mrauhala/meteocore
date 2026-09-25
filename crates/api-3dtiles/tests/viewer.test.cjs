@@ -261,3 +261,27 @@ test('pausing during a manifest fill is not undone when new content finishes', a
   await finishFrames(h, refresh);
   assert.equal(h.run('playing'), false);
 });
+
+// A crafted link must not make a served viewer fetch and render another
+// server's volumes as ours (CodeQL js/client-side-request-forgery): `?base`
+// selects a path on the viewer's own origin, nothing else.
+test('?base selects a path on the viewer origin only', () => {
+  const start = script.indexOf('const params = new URLSearchParams(location.search);');
+  const end = script.indexOf('\n', script.indexOf('const BASE ='));
+  assert.ok(start >= 0 && end > start, 'base resolution block not found');
+  const resolve = (search, origin = 'https://test', pathname = '/3dtiles/viewer') => {
+    const context = vm.createContext({ URLSearchParams, URL, location: { search, origin, pathname }, console: { warn() {} } });
+    return vm.runInContext(`${script.slice(start, end)}\nBASE`, context);
+  };
+  assert.equal(resolve(''), 'https://test/3dtiles');
+  assert.equal(resolve('?base=/proxy/3dtiles/'), 'https://test/proxy/3dtiles');
+  assert.equal(resolve('?base=https://test/other/3dtiles'), 'https://test/other/3dtiles');
+  for (const foreign of ['https://attacker.example/3dtiles', '//attacker.example/3dtiles', 'javascript:alert(1)']) {
+    assert.equal(resolve(`?base=${encodeURIComponent(foreign)}`), 'https://test/3dtiles', foreign);
+  }
+  // Opened from disk (opaque origin): the fixed public instance, no override.
+  assert.equal(
+    resolve('?base=https://attacker.example', 'null', '/Users/x/viewer/index.html'),
+    'https://meteocore.app.meteo.fi/3dtiles'
+  );
+});
