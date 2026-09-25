@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ErrorData, ServerCapabilities, ServerInfo};
+use rmcp::model::{ErrorData, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -563,8 +563,8 @@ impl MeteoCoreMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MeteoCoreMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "MeteoCore weather radar server. Tracked storm cells are segmented from radar \
                  composites every ~5 minutes and ranked by significance, which combines radar \
                  intensity, size, trend, lightning and impact on populated areas.\n\n\
