@@ -973,8 +973,10 @@ async fn shutdown_signal() {
     }
 }
 
-/// Services outside the shared OGC API, linked from its landing page: the
-/// per-API OGC API services, WMS, 3D Tiles and operational endpoints.
+/// Services outside the shared OGC API, linked from its landing page: EDR,
+/// 3D Tiles, WMS and operational endpoints. The per-API Maps, Tiles and
+/// Features services stay routed but are not advertised: the shared root
+/// serves all three (#789).
 fn related_services() -> Vec<api_common::shared::RelatedLink> {
     let link = |path: &str, rel: &'static str, media_type: &'static str, title: &str| {
         api_common::shared::RelatedLink {
@@ -987,14 +989,6 @@ fn related_services() -> Vec<api_common::shared::RelatedLink> {
     let json = "application/json";
     vec![
         link("/edr/", "child", json, "EDR API"),
-        link(
-            "/features/",
-            "child",
-            json,
-            "Features API (per-API service)",
-        ),
-        link("/maps/", "child", json, "Maps API (per-API service)"),
-        link("/tiles/", "child", json, "Tiles API (per-API service)"),
         link("/3dtiles/", "child", json, "3D Tiles API"),
         link(
             "/wms?SERVICE=WMS&REQUEST=GetCapabilities",
@@ -1015,6 +1009,24 @@ mod tests {
     fn parse_collection_list_trims_and_drops_empties() {
         assert_eq!(parse_collection_list("a, b ,,c"), vec!["a", "b", "c"]);
         assert!(parse_collection_list("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn related_services_omit_the_superseded_per_api_services() {
+        // The shared root serves Maps, Tiles and Features (#789); their
+        // per-API services stay routed but are not advertised.
+        let paths: Vec<_> = related_services().into_iter().map(|l| l.path).collect();
+        for mount in [
+            api_common::mounts::FEATURES,
+            api_common::mounts::MAPS,
+            api_common::mounts::TILES,
+        ] {
+            assert!(
+                !paths.iter().any(|p| p.starts_with(&format!("{mount}/"))),
+                "{mount} in {paths:?}"
+            );
+        }
+        assert!(paths.iter().any(|p| p == "/edr/"));
     }
 
     #[test]

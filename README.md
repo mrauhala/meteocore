@@ -255,7 +255,7 @@ The render semaphore (2× CPU cores, minimum 8) and rendered-image cache are sha
 The shared OGC API root (Maps + Tiles + Features building blocks; Tiles Table 8 layout):
 
 ```
-/                                              OGC API landing page (also links every per-API service)
+/                                              OGC API landing page (also links EDR, 3D Tiles, WMS)
 /api                                           OpenAPI definition of the shared API (JSON)
 /api/docs                                      Swagger UI
 /conformance                                   Common + Maps + Tiles + Features conformance classes
@@ -277,7 +277,9 @@ The shared OGC API root (Maps + Tiles + Features building blocks; Tiles Table 8 
 /tileMatrixSets[/{tileMatrixSetId}]            Tiling schemes
 ```
 
-Per-API services:
+Per-API services (the `/features`, `/maps` and `/tiles` services stay routed but
+are no longer advertised from the landing page or the HTML workspace switcher —
+the shared root serves all three):
 
 ```
 /edr/                                          EDR landing page

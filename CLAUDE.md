@@ -246,7 +246,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   landing page, conformance, OpenAPI document and collection catalog. Blocks
   reuse their per-API service's state (no second registry). Every standard is
   also its own per-API service with its own base route (`/edr/...`,
-  `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`); build Maps, Tiles
+  `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`) — the Maps, Tiles
+  and Features ones stay routed but are no longer advertised on the landing
+  page or workspace switcher; build Maps, Tiles
   and Features links from the router's `Mount`, never a hard-coded prefix.
   EDR stays at `/edr` only (EDR 1.1 requires every `/collections` entry to be
   an EDR collection; #789 Phase 3). See
