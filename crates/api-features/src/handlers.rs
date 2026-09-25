@@ -549,6 +549,7 @@ pub async fn api_definition(
         paths.insert(
             path,
             json!({"get": {"summary": summary, "operationId": operation_id,
+                "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {"200": {"description": summary}}}}),
         );

@@ -744,6 +744,7 @@ pub async fn api_definition(
             "get": {
                 "summary": "Landing page",
                 "operationId": "getLandingPage",
+                "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Landing page"}
@@ -754,6 +755,7 @@ pub async fn api_definition(
             "get": {
                 "summary": "Conformance classes",
                 "operationId": "getConformance",
+                "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Conformance classes"}

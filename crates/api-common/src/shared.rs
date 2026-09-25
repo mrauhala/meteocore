@@ -30,7 +30,7 @@ use ds_core::html::{FormatParams, LinkView, Wanted};
 use serde_json::{json, map::Entry, Map, Value};
 
 use crate::workbench::{self, Surface};
-use crate::{caching, rel, tag_api_kind, CollectionEntry, CollectionRequest, Mount};
+use crate::{caching, openapi_tags, rel, tag_api_kind, CollectionEntry, CollectionRequest, Mount};
 
 /// API kind of the shared root's own Common resources in logs and metrics.
 pub const COMMON: &str = "common";
@@ -332,6 +332,7 @@ pub fn openapi_document(api: &SharedApi) -> Value {
         paths.insert(
             path,
             json!({"get": {"summary": summary, "operationId": operation_id,
+                "tags": [openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {"200": {"description": summary}}}}),
         );
@@ -344,6 +345,7 @@ pub fn openapi_document(api: &SharedApi) -> Value {
         format!("{m}/collections/{{collectionId}}"),
         json!({"get": {"summary": "Describe a collection and its data access mechanisms",
             "operationId": "getCollection",
+            "tags": [openapi_tags::DISCOVERY],
             "parameters": [
                 {"name": "collectionId", "in": "path", "required": true, "schema": {"type": "string"},
                  "description": "Collection identifier"},
@@ -372,6 +374,15 @@ pub fn openapi_document(api: &SharedApi) -> Value {
             }
         }
     }
+    // Collection titles describe the per-collection tags. The contributions'
+    // links are unused here, so the mount stands in for the request root.
+    let titles: BTreeMap<String, String> = api
+        .blocks
+        .iter()
+        .flat_map(|block| block.collections(m))
+        .map(|c| (c.config.id, c.config.title))
+        .collect();
+    let tags = document_tags(&paths, &titles);
     json!({
         "openapi": "3.0.3",
         "info": {
@@ -379,9 +390,49 @@ pub fn openapi_document(api: &SharedApi) -> Value {
             "version": "1.0.0",
             "description": "OGC API building blocks over one collection catalog (#789)"
         },
+        "tags": tags,
         "paths": paths,
         "components": components
     })
+}
+
+/// The document's tag list, in the order API docs show them: discovery first,
+/// then other shared groups (tiling schemes) as they first appear, then one
+/// tag per collection by id, described by its title.
+fn document_tags(paths: &Map<String, Value>, titles: &BTreeMap<String, String>) -> Vec<Value> {
+    let mut used: Vec<&str> = Vec::new();
+    for operation in paths
+        .values()
+        .filter_map(Value::as_object)
+        .flat_map(|i| i.values())
+    {
+        for tag in operation["tags"].as_array().into_iter().flatten() {
+            if let Some(tag) = tag.as_str().filter(|t| !used.contains(t)) {
+                used.push(tag);
+            }
+        }
+    }
+    let (mut collections, mut groups): (Vec<&str>, Vec<&str>) =
+        used.into_iter().partition(|t| titles.contains_key(*t));
+    groups.sort_by_key(|t| *t != openapi_tags::DISCOVERY);
+    collections.sort_unstable();
+    let described = |name: &str| match name {
+        openapi_tags::DISCOVERY => Some(openapi_tags::DISCOVERY_DESCRIPTION),
+        openapi_tags::TILING_SCHEMES => Some(openapi_tags::TILING_SCHEMES_DESCRIPTION),
+        _ => None,
+    };
+    groups
+        .into_iter()
+        .map(|name| match described(name) {
+            Some(description) => json!({"name": name, "description": description}),
+            None => json!({"name": name}),
+        })
+        .chain(
+            collections
+                .into_iter()
+                .map(|id| json!({"name": id, "description": titles[id]})),
+        )
+        .collect()
 }
 
 /// GET {mount}/api — OpenAPI 3.0.3 definition

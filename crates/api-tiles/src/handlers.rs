@@ -782,6 +782,7 @@ pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, 
             "get": {
                 "summary": "List supported tile matrix sets",
                 "operationId": "getTileMatrixSets",
+                "tags": [api_common::openapi_tags::TILING_SCHEMES],
                 "responses": { "200": {"description": "List of tile matrix sets"} }
             }
         },
@@ -789,6 +790,7 @@ pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, 
             "get": {
                 "summary": "Get tile matrix set definition",
                 "operationId": "getTileMatrixSet",
+                "tags": [api_common::openapi_tags::TILING_SCHEMES],
                 "parameters": [{
                     "name": "tileMatrixSetId",
                     "in": "path",
@@ -892,6 +894,7 @@ pub async fn api_definition(
             "get": {
                 "summary": "Landing page",
                 "operationId": "getLandingPage",
+                "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": { "200": {"description": "Landing page"} }
             }
@@ -900,6 +903,7 @@ pub async fn api_definition(
             "get": {
                 "summary": "Conformance classes",
                 "operationId": "getConformance",
+                "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": { "200": {"description": "Conformance classes"} }
             }
