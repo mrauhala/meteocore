@@ -1,0 +1,22 @@
+id = "meps-northeurope"
+title = "MEPS Surface (Scandinavia sample)"
+description = "MetCoOp MEPS surface forecast on its native Lambert conformal conic (tangent cone) grid, from a cropped QueryData sample."
+data_path = "testdata/meps"
+engine_type = "querydata"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[querydata]
+wms_parameter = "Temperature"
+poll_interval_secs = 60
+
+# QueryData carries no units; MEPS surface temperature is in °C.
+[wms]
+colormap = "temperature"
+min = -20.0
+max = 20.0
+
+[[wms.parameters]]
+name = "Mean Sea Level Pressure"
+colormap = "viridis"
+min = 980.0
+max = 1040.0

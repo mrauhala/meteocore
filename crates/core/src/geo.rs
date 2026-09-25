@@ -151,7 +151,8 @@ pub enum Crs {
         false_e: f64, // false easting (meters)
         false_n: f64, // false northing (meters)
     },
-    /// Lambert Conformal Conic with 2 standard parallels.
+    /// Lambert Conformal Conic with 2 standard parallels; equal
+    /// parallels are the tangent (1SP, scale 1) cone.
     LambertConformalConic {
         lat1: f64,    // first standard parallel (radians)
         lat2: f64,    // second standard parallel (radians)
@@ -992,20 +993,9 @@ fn lcc_forward(
     false_e: f64,
     false_n: f64,
 ) -> (f64, f64) {
-    let e2 = WGS84_E2;
-    let e = e2.sqrt();
-
-    let m1 = lcc_m(lat1, e2);
-    let m2 = lcc_m(lat2, e2);
-    let t0 = lcc_t(lat0, e);
-    let t1 = lcc_t(lat1, e);
-    let t2 = lcc_t(lat2, e);
-    let t = lcc_t(lat, e);
-
-    let n = (m1.ln() - m2.ln()) / (t1.ln() - t2.ln());
-    let f_val = m1 / (n * t1.powf(n));
-    let rho0 = WGS84_A * f_val * t0.powf(n);
-    let rho = WGS84_A * f_val * t.powf(n);
+    let e = WGS84_E2.sqrt();
+    let (n, f_val, rho0) = lcc_cone(lat1, lat2, lat0);
+    let rho = WGS84_A * f_val * lcc_t(lat, e).powf(n);
     let theta = n * (lon - lon0);
 
     let x = false_e + rho * theta.sin();
@@ -1025,18 +1015,8 @@ fn lcc_inverse(
     false_e: f64,
     false_n: f64,
 ) -> (f64, f64) {
-    let e2 = WGS84_E2;
-    let e = e2.sqrt();
-
-    let m1 = lcc_m(lat1, e2);
-    let m2 = lcc_m(lat2, e2);
-    let t0 = lcc_t(lat0, e);
-    let t1 = lcc_t(lat1, e);
-    let t2 = lcc_t(lat2, e);
-
-    let n = (m1.ln() - m2.ln()) / (t1.ln() - t2.ln());
-    let f_val = m1 / (n * t1.powf(n));
-    let rho0 = WGS84_A * f_val * t0.powf(n);
+    let e = WGS84_E2.sqrt();
+    let (n, f_val, rho0) = lcc_cone(lat1, lat2, lat0);
 
     let xp = x - false_e;
     let yp = rho0 - (y - false_n);
@@ -1059,6 +1039,29 @@ fn lcc_inverse(
     }
 
     (lat, lon)
+}
+
+/// The cone constant `n`, `F` and `ρ0` shared by forward and inverse
+/// (Snyder eqs. 15-8 to 15-10).
+///
+/// A tangent cone — one standard parallel, `lat1 == lat2`, as in the
+/// MEPS/MetCoOp QueryData and GRIB grids — makes eq. 15-8 `0/0`, and the
+/// NaN it produced projected every point to NaN. Its limit is
+/// `n = sin φ1` (Snyder p. 108), which is also PROJ's choice below the
+/// same `1e-10` rad threshold.
+fn lcc_cone(lat1: f64, lat2: f64, lat0: f64) -> (f64, f64, f64) {
+    let e2 = WGS84_E2;
+    let e = e2.sqrt();
+    let m1 = lcc_m(lat1, e2);
+    let t1 = lcc_t(lat1, e);
+    let n = if (lat1 - lat2).abs() < 1e-10 {
+        lat1.sin()
+    } else {
+        (m1.ln() - lcc_m(lat2, e2).ln()) / (t1.ln() - lcc_t(lat2, e).ln())
+    };
+    let f_val = m1 / (n * t1.powf(n));
+    let rho0 = WGS84_A * f_val * lcc_t(lat0, e).powf(n);
+    (n, f_val, rho0)
 }
 
 fn lcc_m(lat: f64, e2: f64) -> f64 {
@@ -1715,6 +1718,64 @@ mod tests {
         let (lon, lat) = crs.inverse(e, n).unwrap();
         assert!((lon - 10.75).abs() < 0.001, "lon={lon}");
         assert!((lat - 59.91).abs() < 0.001, "lat={lat}");
+    }
+
+    /// Asserts `crs` maps each `(lon, lat)` to the PROJ `(x, y)` and back.
+    fn assert_matches_proj(crs: &Crs, cases: &[(f64, f64, f64, f64)]) {
+        for &(lon, lat, x_proj, y_proj) in cases {
+            let (x, y) = crs.forward(lon, lat);
+            assert!(
+                (x - x_proj).abs() < 0.01 && (y - y_proj).abs() < 0.01,
+                "forward({lon}, {lat}) = ({x}, {y}), PROJ ({x_proj}, {y_proj})"
+            );
+            let (lon_back, lat_back) = crs.inverse(x_proj, y_proj).unwrap();
+            assert!(
+                (lon_back - lon).abs() < 1e-7 && (lat_back - lat).abs() < 1e-7,
+                "inverse({x_proj}, {y_proj}) = ({lon_back}, {lat_back}), PROJ ({lon}, {lat})"
+            );
+        }
+    }
+
+    /// Secant LCC pinned to `cs2cs +proj=longlat +datum=WGS84 +to
+    /// +proj=lcc +lat_1=58.964 +lat_2=69.987 +lat_0=0 +lon_0=0
+    /// +datum=WGS84 +units=m` (PROJ 9.x), not only to itself.
+    #[test]
+    fn lcc_secant_matches_proj() {
+        let crs = Crs::LambertConformalConic {
+            lat1: 58.964_f64.to_radians(),
+            lat2: 69.987_f64.to_radians(),
+            lat0: 0.0,
+            lon0: 0.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        assert_matches_proj(&crs, &[(10.75, 59.91, 597771.1689, 8061381.0468)]);
+    }
+
+    /// Tangent LCC (one standard parallel, the MEPS/MetCoOp grid) pinned
+    /// to `cs2cs +proj=longlat +datum=WGS84 +to +proj=lcc +lat_1=63.3
+    /// +lat_2=63.3 +lat_0=63.3 +lon_0=15 +datum=WGS84 +units=m` (PROJ 9.x).
+    /// The secant cone constant is 0/0 here, and the NaN it produced
+    /// blanked every MEPS map and its advertised extent.
+    #[test]
+    fn lcc_tangent_matches_proj() {
+        let crs = Crs::LambertConformalConic {
+            lat1: 63.3_f64.to_radians(),
+            lat2: 63.3_f64.to_radians(),
+            lat0: 63.3_f64.to_radians(),
+            lon0: 15.0_f64.to_radians(),
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        assert_matches_proj(
+            &crs,
+            &[
+                (15.0, 63.3, 0.0, 0.0),
+                (25.0, 60.17, 553685.1338, -305725.8263),
+                (0.279, 50.32, -1063266.1496, -1334173.1109),
+                (40.0, 70.0, 937671.0198, 934085.7304),
+            ],
+        );
     }
 
     // FMI radar extreme corners — verified against GDAL gdaltransform
