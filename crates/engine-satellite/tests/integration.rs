@@ -148,6 +148,8 @@ fn discovers_products_with_their_own_time_axes() {
     );
     let extent = info.spatial_extent.unwrap();
     assert!(extent.iter().all(|v| v.is_finite()), "{extent:?}");
+    // Both fixture crops are 320 x 240, so the collection has one grid.
+    assert_eq!(info.grid_size, Some([320, 240]));
     assert_eq!(engine.status().0, 2);
 }
 

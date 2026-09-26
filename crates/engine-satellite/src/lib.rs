@@ -54,6 +54,8 @@ struct Catalog {
     times: Vec<Arc<[DateTime<Utc>]>>,
     /// Per product: the CRS84 extent of its grid, from its first scan.
     extents: Vec<Option<[f64; 4]>>,
+    /// Per product: its grid size, from its first scan.
+    grids: Vec<Option<[u32; 2]>>,
     info: Arc<RasterInfo>,
     /// When the last poll finished listing every product.
     polled_at: Option<DateTime<Utc>>,
@@ -114,7 +116,12 @@ impl SatelliteEngine {
             })
             .collect();
         let empty = vec![BTreeMap::new(); products.len()];
-        let catalog = Catalog::build(empty, &parameters, vec![None; products.len()], None);
+        let catalog = Catalog::build(
+            empty,
+            &parameters,
+            vec![None; products.len()],
+            vec![None; products.len()],
+        );
         Ok(Self {
             collection_id: collection_id.into(),
             source,
@@ -205,7 +212,7 @@ impl SatelliteEngine {
         let old = self.catalog.load();
         let mut frames = old.frames.clone();
         let mut extents = old.extents.clone();
-        let mut grid = old.info.grid_size;
+        let mut grids = old.grids.clone();
         let mut complete = true;
         for (index, product) in self.products.iter().enumerate() {
             let found = match self.source.list(&product.naming, window) {
@@ -236,7 +243,7 @@ impl SatelliteEngine {
                         if extents[index].is_none() {
                             extents[index] = ds_core::geo::crs84_extent(frame.gt.bbox());
                         }
-                        grid.get_or_insert([frame.gt.width, frame.gt.height]);
+                        grids[index].get_or_insert([frame.gt.width, frame.gt.height]);
                         frames[index].insert(scan.time, scan.path);
                     }
                     Err(e) => tracing::warn!(
@@ -266,7 +273,7 @@ impl SatelliteEngine {
                     .join(", ")
             );
         }
-        let catalog = Catalog::build(frames, &self.parameters, extents, grid);
+        let catalog = Catalog::build(frames, &self.parameters, extents, grids);
         self.catalog.store(Arc::new(Catalog {
             polled_at,
             ..catalog
@@ -358,8 +365,15 @@ impl Catalog {
         frames: Vec<BTreeMap<DateTime<Utc>, ObjectPath>>,
         parameters: &[ParameterInfo],
         extents: Vec<Option<[f64; 4]>>,
-        grid_size: Option<[u32; 2]>,
+        grids: Vec<Option<[u32; 2]>>,
     ) -> Catalog {
+        // A grid size is advertised only when every product with a scan
+        // shares it: a 0.5 km band next to 2 km products has no one grid.
+        let mut sizes = grids.iter().flatten();
+        let grid_size = sizes
+            .next()
+            .copied()
+            .filter(|first| sizes.all(|size| size == first));
         let spatial_extent = union_extent(extents.iter().flatten());
         let times: Vec<Arc<[DateTime<Utc>]>> = frames
             .iter()
@@ -384,6 +398,7 @@ impl Catalog {
             frames,
             times,
             extents,
+            grids,
             info: Arc::new(info),
             polled_at: None,
         }
@@ -569,7 +584,32 @@ impl std::fmt::Debug for SatelliteEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::union_extent;
+    use super::{union_extent, Catalog};
+    use ds_core::map_engine::ParameterInfo;
+    use std::collections::BTreeMap;
+
+    /// A grid size is advertised only when the products share it.
+    #[test]
+    fn grid_size_only_when_products_agree() {
+        let parameter = |name: &str| ParameterInfo {
+            name: name.into(),
+            title: name.into(),
+            unit: "K".into(),
+        };
+        let parameters = [parameter("ir"), parameter("vis")];
+        let build = |grids: Vec<Option<[u32; 2]>>| {
+            Catalog::build(vec![BTreeMap::new(); 2], &parameters, vec![None; 2], grids)
+                .info
+                .grid_size
+        };
+        assert_eq!(build(vec![Some([5424, 5424]), None]), Some([5424, 5424]));
+        assert_eq!(
+            build(vec![Some([5424, 5424]), Some([5424, 5424])]),
+            Some([5424, 5424])
+        );
+        assert_eq!(build(vec![Some([5424, 5424]), Some([21696, 21696])]), None);
+        assert_eq!(build(vec![None, None]), None);
+    }
 
     #[test]
     fn union_extent_is_seam_aware() {
