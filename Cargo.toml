@@ -13,6 +13,7 @@ members = [
     "crates/engine-cap",
     "crates/engine-bufr",
     "crates/engine-zarr",
+    "crates/engine-satellite",
     "crates/storage",
     "crates/render",
     "crates/ds-cache",

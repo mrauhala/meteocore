@@ -1,0 +1,588 @@
+//! Geostationary satellite imagery (#819): GOES-R ABI NetCDF-4 scans served
+//! through WMS, OGC API Maps and Tiles.
+//!
+//! One collection is one satellite and sector; each configured product (an
+//! ABI band, or an L2 field such as cloud top temperature) is a parameter
+//! with its own time axis. The poll loop lists the source, downloads each
+//! new scan whole and keeps it in memory ([`cache::FRAMES`]); renders
+//! decode only the strips they touch ([`cache::STRIPS`]) or, zoomed out,
+//! sample the overview built at ingest.
+
+mod cache;
+mod frame;
+mod naming;
+mod source;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
+use ds_core::config::SatelliteConfig;
+use ds_core::error::DataServerError;
+use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
+use ds_core::resample::ProjectionGrid;
+use ds_poll::{FirstTick, Shutdown};
+use ds_storage::discovery::{validate_prefix_pattern, TimeWindow};
+use ds_storage::object_store::path::Path as ObjectPath;
+
+pub use cache::{frame_metrics, strip_metrics};
+
+use cache::{FrameKey, StripKey, FRAMES, STRIPS};
+use frame::{Frame, OVERVIEW_FACTOR};
+use naming::Naming;
+use source::Source;
+
+/// New scans ingested per product per poll, newest first. Bootstrapping a
+/// window of many scans spreads over a few polls instead of one long
+/// sequential download (Critical Rule 9).
+const MAX_INGEST_PER_POLL: usize = 4;
+
+/// One configured product, served as one parameter.
+struct Product {
+    parameter: Arc<str>,
+    variable: String,
+    naming: Naming,
+}
+
+/// A consistent snapshot of what is served, swapped whole by each poll.
+struct Catalog {
+    /// Per product (config order): scan start → file.
+    frames: Vec<BTreeMap<DateTime<Utc>, ObjectPath>>,
+    /// Per product: its scan starts, for `parameter_times` (O(1)).
+    times: Vec<Arc<[DateTime<Utc>]>>,
+    /// Per product: the CRS84 extent of its grid, from its first scan.
+    extents: Vec<Option<[f64; 4]>>,
+    info: Arc<RasterInfo>,
+    /// When the last poll finished listing every product.
+    polled_at: Option<DateTime<Utc>>,
+}
+
+pub struct SatelliteEngine {
+    collection_id: Arc<str>,
+    source: Source,
+    products: Vec<Product>,
+    parameters: Vec<ParameterInfo>,
+    window: Option<TimeWindow>,
+    poll_interval: Duration,
+    catalog: ArcSwap<Catalog>,
+    shutdown: Shutdown,
+}
+
+impl SatelliteEngine {
+    /// Build the engine. No I/O: the poll loop's first, immediate tick lists
+    /// the source and ingests the newest scans.
+    pub fn new(collection_id: &str, config: &SatelliteConfig) -> Result<Self, DataServerError> {
+        ds_core::config::validate_satellite(collection_id, config)?;
+        let window = config
+            .time_window
+            .as_deref()
+            .map(TimeWindow::parse)
+            .transpose()?;
+        let products: Vec<Product> = config
+            .products
+            .iter()
+            .map(|p| Product {
+                parameter: p.parameter.as_str().into(),
+                variable: p.variable.clone(),
+                naming: Naming::goes_r(&p.product, p.band),
+            })
+            .collect();
+        let source = match (&config.data_path, &config.endpoint, &config.bucket) {
+            (Some(path), _, _) => {
+                let (store, base) = ds_storage::build_store(path)?;
+                Source::Directory { store, base }
+            }
+            (None, Some(endpoint), Some(bucket)) => {
+                for product in &products {
+                    validate_prefix_pattern(&product.naming.prefix, window.as_ref())?;
+                }
+                Source::Bucket {
+                    store: ds_storage::build_s3_store_from_parts(endpoint, bucket)?,
+                }
+            }
+            _ => unreachable!("validate_satellite requires a source"),
+        };
+        let parameters: Vec<ParameterInfo> = config
+            .products
+            .iter()
+            .map(|p| ParameterInfo {
+                name: p.parameter.clone(),
+                title: p.title.clone(),
+                unit: p.unit.clone(),
+            })
+            .collect();
+        let empty = vec![BTreeMap::new(); products.len()];
+        let catalog = Catalog::build(empty, &parameters, vec![None; products.len()], None);
+        Ok(Self {
+            collection_id: collection_id.into(),
+            source,
+            products,
+            parameters,
+            window,
+            poll_interval: Duration::from_secs(config.poll_interval_secs),
+            catalog: ArcSwap::from_pointee(catalog),
+            shutdown: Shutdown::new(),
+        })
+    }
+
+    /// Poll until [`Self::shutdown`]. Run on the background poll runtime
+    /// (Critical Rule 6): each tick does blocking listing and downloads.
+    pub async fn poll_loop(&self) {
+        let mut ticker = self
+            .shutdown
+            .ticker(self.poll_interval, FirstTick::Immediate);
+        while ticker.tick().await {
+            self.poll_once();
+        }
+        tracing::info!("[{}] satellite poll loop shutting down", self.collection_id);
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.shutdown();
+    }
+
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
+    /// Live `/health` status: ready while every product has a scan and the
+    /// source was listed recently.
+    pub fn live_health(&self) -> Option<ds_core::health::LiveStatus> {
+        use ds_core::health::LiveStatus;
+        let catalog = self.catalog.load();
+        let Some(polled_at) = catalog.polled_at else {
+            return Some(LiveStatus::Degraded {
+                reason: "waiting for the first poll",
+            });
+        };
+        let stale_after = chrono::Duration::from_std(self.poll_interval * 5)
+            .unwrap_or(chrono::Duration::MAX)
+            .max(chrono::Duration::minutes(10));
+        Some(if Utc::now() - polled_at > stale_after {
+            LiveStatus::Degraded {
+                reason: "polling the source has failed repeatedly",
+            }
+        } else if catalog.frames.iter().any(BTreeMap::is_empty) {
+            LiveStatus::Degraded {
+                reason: "a product has no scans in the time window",
+            }
+        } else {
+            LiveStatus::Ready
+        })
+    }
+
+    /// Age of the newest scan, for `/health`'s `data_age_secs`.
+    pub fn data_age(&self) -> Option<chrono::Duration> {
+        let newest = self.catalog.load().info.times.last().copied()?;
+        Some(Utc::now() - newest)
+    }
+
+    /// Every served scan start (the union over products), for `/health`.
+    pub fn times(&self) -> Vec<DateTime<Utc>> {
+        self.catalog.load().info.times.clone()
+    }
+
+    /// `(products with at least one scan, products, newest scan start, last
+    /// completed poll)`, for `/health`.
+    pub fn status(&self) -> (usize, usize, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+        let catalog = self.catalog.load();
+        let with_data = catalog.frames.iter().filter(|f| !f.is_empty()).count();
+        (
+            with_data,
+            self.products.len(),
+            catalog.info.times.last().copied(),
+            catalog.polled_at,
+        )
+    }
+
+    /// List every product, drop scans that left the window, and ingest up
+    /// to [`MAX_INGEST_PER_POLL`] new scans per product, newest first.
+    pub fn poll_once(&self) {
+        let now = Utc::now();
+        let window = self.window.as_ref().map(|w| w.to_range(now));
+        let old = self.catalog.load();
+        let mut frames = old.frames.clone();
+        let mut extents = old.extents.clone();
+        let mut grid = old.info.grid_size;
+        let mut complete = true;
+        for (index, product) in self.products.iter().enumerate() {
+            let found = match self.source.list(&product.naming, window) {
+                Ok(found) => found,
+                Err(e) => {
+                    complete = false;
+                    tracing::warn!(
+                        "[{}] listing '{}' failed (keeping its scans): {e}",
+                        self.collection_id,
+                        product.parameter
+                    );
+                    continue;
+                }
+            };
+            if let Some((start, _)) = window {
+                frames[index].retain(|time, _| *time >= start);
+            }
+            let known = &frames[index];
+            let mut new: Vec<_> = found
+                .into_iter()
+                .filter(|f| !known.contains_key(&f.time))
+                .collect();
+            new.reverse();
+            new.truncate(MAX_INGEST_PER_POLL);
+            for scan in new {
+                match self.ingest(index, scan.time, &scan.path) {
+                    Ok(frame) => {
+                        if extents[index].is_none() {
+                            extents[index] = ds_core::geo::crs84_extent(frame.gt.bbox());
+                        }
+                        grid.get_or_insert([frame.gt.width, frame.gt.height]);
+                        frames[index].insert(scan.time, scan.path);
+                    }
+                    Err(e) => tracing::warn!(
+                        "[{}] skipping {} scan {}: {e}",
+                        self.collection_id,
+                        product.parameter,
+                        scan.path
+                    ),
+                }
+            }
+        }
+        let polled_at = if complete { Some(now) } else { old.polled_at };
+        let added: usize = frames
+            .iter()
+            .zip(&old.frames)
+            .map(|(new, old)| new.keys().filter(|t| !old.contains_key(t)).count())
+            .sum();
+        if added > 0 {
+            tracing::info!(
+                "[{}] ingested {added} scan(s); serving {}",
+                self.collection_id,
+                self.products
+                    .iter()
+                    .zip(&frames)
+                    .map(|(p, f)| format!("{} ×{}", p.parameter, f.len()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let catalog = Catalog::build(frames, &self.parameters, extents, grid);
+        self.catalog.store(Arc::new(Catalog {
+            polled_at,
+            ..catalog
+        }));
+    }
+
+    /// Download one scan, parse it and cache it.
+    fn ingest(
+        &self,
+        index: usize,
+        time: DateTime<Utc>,
+        path: &ObjectPath,
+    ) -> Result<Arc<Frame>, DataServerError> {
+        let key = self.frame_key(index, time);
+        let bytes = self.source.fetch(path, None)?;
+        let frame = Arc::new(
+            Frame::open(bytes, &self.products[index].variable).map_err(DataServerError::Engine)?,
+        );
+        FRAMES.insert(key, frame.clone());
+        Ok(frame)
+    }
+
+    fn frame_key(&self, index: usize, time: DateTime<Utc>) -> FrameKey {
+        FrameKey {
+            collection: self.collection_id.clone(),
+            parameter: self.products[index].parameter.clone(),
+            time: time.timestamp(),
+        }
+    }
+
+    /// The product a request names; `None` is the first.
+    fn product_index(&self, parameter: Option<&str>) -> Result<usize, DataServerError> {
+        match parameter {
+            None => Ok(0),
+            Some(name) => self
+                .products
+                .iter()
+                .position(|p| &*p.parameter == name)
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "parameter '{name}' is not served by '{}'",
+                        self.collection_id
+                    ))
+                }),
+        }
+    }
+
+    /// The scan `get_raster_tile` renders for a product at `time`: the
+    /// latest at or before it, the first when `time` precedes every scan,
+    /// the newest when `time` is `None`. The one selection both rendering
+    /// and [`MapEngine::resolve_parameter_time`] use (#507).
+    fn select(
+        catalog: &Catalog,
+        index: usize,
+        time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let frames = &catalog.frames[index];
+        match time {
+            Some(time) => frames
+                .range(..=time)
+                .next_back()
+                .or_else(|| frames.iter().next())
+                .map(|(t, _)| *t),
+            None => frames.keys().next_back().copied(),
+        }
+    }
+
+    /// The scan, from the cache or fetched again after eviction.
+    fn frame(
+        &self,
+        index: usize,
+        time: DateTime<Utc>,
+        path: &ObjectPath,
+    ) -> Result<Arc<Frame>, DataServerError> {
+        FRAMES.get_or_insert_with(&self.frame_key(index, time), || {
+            // Renders run on blocking workers: fetch on their runtime
+            // explicitly (Critical Rule 7).
+            let handle = tokio::runtime::Handle::try_current().ok();
+            let bytes = self.source.fetch(path, handle.as_ref())?;
+            Frame::open(bytes, &self.products[index].variable)
+                .map(Arc::new)
+                .map_err(DataServerError::Engine)
+        })
+    }
+}
+
+impl Catalog {
+    fn build(
+        frames: Vec<BTreeMap<DateTime<Utc>, ObjectPath>>,
+        parameters: &[ParameterInfo],
+        extents: Vec<Option<[f64; 4]>>,
+        grid_size: Option<[u32; 2]>,
+    ) -> Catalog {
+        let spatial_extent = union_extent(extents.iter().flatten());
+        let times: Vec<Arc<[DateTime<Utc>]>> = frames
+            .iter()
+            .map(|f| f.keys().copied().collect::<Vec<_>>().into())
+            .collect();
+        let mut union: Vec<DateTime<Utc>> = times.iter().flat_map(|t| t.iter().copied()).collect();
+        union.sort_unstable();
+        union.dedup();
+        let info = RasterInfo {
+            native_crs: "geos".to_string(),
+            spatial_extent,
+            times: union,
+            parameter: parameters[0].name.clone(),
+            unit: parameters[0].unit.clone(),
+            parameters: parameters.to_vec(),
+            vertical: None,
+            grid_size,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        };
+        Catalog {
+            frames,
+            times,
+            extents,
+            info: Arc::new(info),
+            polled_at: None,
+        }
+    }
+}
+
+/// The CRS84 box covering every product's extent. Longitudes are measured
+/// from the first box's centre so disks crossing the antimeridian (GOES-West)
+/// union to a `west > east` box, not a −180…180 one.
+fn union_extent<'a>(mut extents: impl Iterator<Item = &'a [f64; 4]>) -> Option<[f64; 4]> {
+    let first = *extents.next()?;
+    let width = |[w, _, e, _]: [f64; 4]| if e >= w { e - w } else { e + 360.0 - w };
+    let reference = first[0] + width(first) / 2.0;
+    let relative = |lon: f64| ds_core::geo::wrap_lon(lon - reference);
+    let [mut w, mut s, mut e, mut n] = [
+        relative(first[0]),
+        first[1],
+        relative(first[0]) + width(first),
+        first[3],
+    ];
+    for extent in extents {
+        let west = relative(extent[0]);
+        w = w.min(west);
+        e = e.max(west + width(*extent));
+        s = s.min(extent[1]);
+        n = n.max(extent[3]);
+    }
+    if e - w >= 360.0 {
+        return Some([-180.0, s, 180.0, n]);
+    }
+    Some([
+        ds_core::geo::wrap_lon(reference + w),
+        s,
+        ds_core::geo::wrap_lon(reference + e),
+        n,
+    ])
+}
+
+impl MapEngine for SatelliteEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        let index = self.product_index(parameter)?;
+        let catalog = self.catalog.load();
+        let empty = || RasterTile {
+            width,
+            height,
+            values: vec![None; width as usize * height as usize].into(),
+        };
+        let Some(time) = Self::select(&catalog, index, time) else {
+            return Ok(empty());
+        };
+        let frame = self.frame(index, time, &catalog.frames[index][&time])?;
+
+        // The part of the disk the request sees decides the level: sample
+        // the overview when a full-resolution read would take several
+        // source pixels per output pixel.
+        let [west, south, east, north] = bbox;
+        let Some((c0, r0, c1, r1)) = frame.gt.bbox_to_pixels(west, south, east, north) else {
+            return Ok(empty());
+        };
+        let density = f64::max(
+            (c1 - c0) as f64 / width as f64,
+            (r1 - r0) as f64 / height as f64,
+        );
+        let overview = density >= OVERVIEW_FACTOR as f64;
+        let gt = if overview {
+            &frame.overview.gt
+        } else {
+            &frame.gt
+        };
+
+        // Output→source mapping on a coarse grid (Critical Rule 5). Points
+        // the satellite cannot see project to NaN; the grid refines cells on
+        // the limb, and no footprint guard is needed: there is no far side
+        // for a coarse cell to alias onto.
+        let grid = ProjectionGrid::build_2d(
+            width,
+            height,
+            gt.width,
+            gt.height,
+            |fx, fy| output_crs.project_node(bbox, fx, fy),
+            |lon, lat| gt.world_to_pixel_f64(lon, lat),
+        );
+
+        let key = self.frame_key(index, time);
+        let mut strips: Vec<Option<Arc<[u16]>>> = vec![None; frame.strip_count() as usize];
+        let mut values = Vec::with_capacity(width as usize * height as usize);
+        for oy in 0..height {
+            for ox in 0..width {
+                let (c, r) = grid.sample(ox, oy);
+                let inside = c.is_finite()
+                    && r.is_finite()
+                    && c >= 0.0
+                    && r >= 0.0
+                    && c < gt.width as f64
+                    && r < gt.height as f64;
+                if !inside {
+                    values.push(None);
+                    continue;
+                }
+                let (col, row) = (c as usize, r as u32);
+                let raw = if overview {
+                    frame.overview.raw[row as usize * gt.width as usize + col]
+                } else {
+                    let index = (row / frame.strip_rows) as usize;
+                    if strips[index].is_none() {
+                        let strip = STRIPS.get_or_insert_with(
+                            &StripKey {
+                                frame: key.clone(),
+                                strip: index as u32,
+                            },
+                            || {
+                                frame
+                                    .read_strip(index as u32)
+                                    .map_err(DataServerError::Engine)
+                            },
+                        )?;
+                        strips[index] = Some(strip);
+                    }
+                    let strip = strips[index].as_ref().expect("filled above");
+                    strip[(row % frame.strip_rows) as usize * gt.width as usize + col]
+                };
+                values.push(frame.packing.decode(raw));
+            }
+        }
+        Ok(RasterTile {
+            width,
+            height,
+            values: values.into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        (*self.catalog.load().info).clone()
+    }
+
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
+        self.catalog.load().info.clone()
+    }
+
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        self.resolve_parameter_time(None, time, reference_time)
+    }
+
+    fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+        let index = self.product_index(Some(parameter)).ok()?;
+        Some(self.catalog.load().times[index].clone())
+    }
+
+    fn resolve_parameter_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let Ok(index) = self.product_index(parameter) else {
+            return time;
+        };
+        Self::select(&self.catalog.load(), index, time).or(time)
+    }
+}
+
+impl std::fmt::Debug for SatelliteEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SatelliteEngine")
+            .field("collection_id", &self.collection_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::union_extent;
+
+    #[test]
+    fn union_extent_is_seam_aware() {
+        let a = [150.0, -10.0, 170.0, 10.0];
+        let b = [175.0, -20.0, -160.0, 5.0]; // crosses the antimeridian
+        assert_eq!(
+            union_extent([a, b].iter()),
+            Some([150.0, -20.0, -160.0, 10.0])
+        );
+        assert_eq!(
+            union_extent([[-10.0, 0.0, 10.0, 5.0], [20.0, 1.0, 30.0, 6.0]].iter()),
+            Some([-10.0, 0.0, 30.0, 6.0])
+        );
+        assert_eq!(union_extent(std::iter::empty()), None);
+    }
+}

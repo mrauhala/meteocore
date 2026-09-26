@@ -28,6 +28,7 @@ Each engine implements one or more of the core traits.
 | `engine-odim` | `EdrEngine` + `MapEngine` (composites); `EdrEngine` + `MapEngine` + `VolumeEngine` + `FeatureEngine` (polar volumes) | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
+| `engine-satellite` | `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
@@ -168,6 +169,8 @@ not re-scan the auto roots.
 | `MC_PVOL_PIXEL_CACHE_MB` | `1024` | PVOL per-moment decoded-pixel cache size in MB. `0` disables. |
 | `MC_ODIM_COMPOSITE_CACHE_MB` | `2048` | ODIM decoded-composite (COMP) cache size in MB. `0` disables. |
 | `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | GeoTIFF decoded-chunk cache for local sources, in MB. `0` disables. |
+| `MC_SATELLITE_FRAME_CACHE_MB` | `1024` | Satellite scans held in memory (the compressed NetCDF file plus its overview, ~30 MB per 2 km full disk), in MB. A scan evicted here is downloaded again when a render needs it. |
+| `MC_SATELLITE_STRIP_CACHE_MB` | `256` | Satellite decoded strips (24 full-width rows, ~260 KB each at 2 km), in MB. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool. Raise for high-latency object stores; value must be ≥ 1. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
 
@@ -425,7 +428,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `description` | yes | — | Collection description |
 | `data_path` | yes* | — | Path to data file (CSV, GeoJSON) or directory (GeoTIFF) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"`, `"3dtiles"` |
-| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"` |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"` |
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
 | `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name) and optional `url`. When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
@@ -1192,6 +1195,40 @@ max = 40.0
 
 Ready-to-use disabled examples ship in `collections.d/` (`ecmwf-aifs-single-icechunk.toml.disabled`, `noaa-gfs-icechunk.toml.disabled`, `dwd-icon-eu.toml.disabled`) — rename to drop `.disabled` and run with `--features icechunk`.
 
+### Satellite
+
+Geostationary satellite imagery (`engine_type = "satellite"`, epic #819). One collection is one satellite and sector; each `[[satellite.products]]` entry (an ABI band, or an L2 field such as cloud top temperature) is a parameter with **its own time axis**: WMS child layers advertise their own `time` dimension, and Maps/Tiles resolve `datetime` per `parameter-name`. The collection's temporal extent is the union.
+
+Today's provider is `goes-r`: NOAA GOES-R ABI NetCDF-4 files as published on AWS (`s3://noaa-goes19`, `s3://noaa-goes18`), `<product>/%Y/%j/%H/OR_<product>-M<mode>[C<band>]_G<sat>_s<start>_….nc`. The engine lists one hourly prefix per hour of `time_window` (at most 24 h), downloads each new scan whole (newest first, a few per poll), and keeps it compressed in memory. Renders decode only the 24-row strips they touch, or sample a 4× overview built at ingest when zoomed out. Scan times are keyed on the scan's start **minute** (a full-disk scan starts ~20 s past its ten-minute slot), and a request snaps to the latest scan at or before it.
+
+The projection is `Crs::Geostationary` (PROJ `geos`): points behind the Earth have no projection, so the rendered disk ends at the limb, and extents come from the limb (GOES-West's crosses the antimeridian, `west > east`).
+
+```toml
+[satellite]
+provider = "goes-r"
+endpoint = "https://s3.us-east-1.amazonaws.com"   # public bucket, unsigned
+bucket = "noaa-goes19"                            # or data_path = "<local mirror>"
+time_window = "-PT1H"                             # required for a bucket, ≤ 24 h
+poll_interval_secs = 60
+
+[[satellite.products]]
+parameter = "ir_10_3"                             # ^[a-z0-9_]+$
+title = "IR 10.3 µm brightness temperature"       # feeds parameter_defaults
+unit = "K"                                        # declared: styles resolve at load
+product = "ABI-L2-CMIPF"                          # full-disk cloud and moisture imagery
+band = 13                                         # ABI band for per-band products
+variable = "CMI"                                  # the NetCDF field
+
+[[satellite.products]]
+parameter = "cloud_top_temperature"
+title = "Cloud top temperature"
+unit = "K"
+product = "ABI-L2-ACHTF"
+variable = "TEMP"
+```
+
+Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` is a runnable example. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default. EDR queries come in a follow-up (#819 phase 2c).
+
 ## OGC 3D Tiles
 
 Volumetric weather data served as OGC 3D Tiles 1.1. Currently only the `odim-volume` (polar volume) engine implements `VolumeEngine`. Add `"3dtiles"` to a collection's `apis` to enable it.
@@ -1407,13 +1444,17 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | `cloud_cover` | White overlay with increasing opacity | 0–100 % |
 | `cap_severity` | CAP alert severity codes, grey/green/yellow/orange/red | 0–4 |
 | `lightning_age` | Lightning strike age, near-white → orange → dark violet | 0–60 min |
+| `ir_bt_grey` | Satellite IR brightness temperature, cold white → warm black | 180–330 K |
+| `ir_bt_enhanced` | IR grey with a colour ramp over cold cloud tops below 243 K | 180–330 K |
 
 **Per-parameter default styles** (#320) — parameters of multi-parameter
 collections (GRIB, QueryData, Zarr, radar volumes) with no explicit style
 are matched against a built-in defaults table by normalized name/title plus
 each parameter's unit: `t2m`/`2t`/`TMP` (unit K or C) → `temperature`,
 `msl`/`mslp` (Pa or hPa) → `pressure`, `DBZH`/`dbz` → `radar_dbz`,
-`VRADH` → `radial_velocity`, humidity/cloud/wind/precipitation likewise.
+`VRADH` → `radial_velocity`, satellite brightness temperature / cloud top
+temperature (unit K) → `ir_bt_enhanced`, humidity/cloud/wind/precipitation
+likewise.
 Unit-gated rules never guess (a temperature with no unit hint stays on the
 collection style). Defaults win over the collection-level colormap for
 those parameters; opt out per collection with

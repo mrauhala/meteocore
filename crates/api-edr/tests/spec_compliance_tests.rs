@@ -133,6 +133,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );

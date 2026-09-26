@@ -364,6 +364,29 @@ static TILE_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 // decoded (native) source tiles for LOCAL files, so the ~50–190 meta-tile
 // renders tiling one viewport don't re-decompress the same source tile ~6×
 // per frame.
+// Satellite scan and decoded-strip caches (#819) — process-global,
+// byte-bounded: whole compressed scans held for rendering, and the 24-row
+// strips renders decode from them.
+static SATELLITE_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "satellite_frame_cache",
+        "Satellite scan cache",
+        None,
+        Some("scan downloads"),
+        false,
+    )
+});
+
+static SATELLITE_STRIP_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "satellite_strip_cache",
+        "Satellite decoded-strip cache",
+        None,
+        Some("strip decodes"),
+        false,
+    )
+});
+
 static GEOTIFF_DECODED_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
     CacheMetricSet::new(
         "geotiff_decoded_chunk_cache",
@@ -1312,6 +1335,7 @@ pub struct ServerState {
     pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
     pub grib_engines: RwLock<Vec<Arc<engine_grib::GribEngine>>>,
     pub zarr_engines: RwLock<Vec<Arc<engine_zarr::ZarrEngine>>>,
+    pub satellite_engines: RwLock<Vec<Arc<engine_satellite::SatelliteEngine>>>,
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
     pub cap_engines: RwLock<Vec<Arc<engine_cap::CapEngine>>>,
@@ -1363,6 +1387,7 @@ pub struct LoadResult {
     pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
     pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
     pub zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>>,
+    pub satellite_engines: Vec<Arc<engine_satellite::SatelliteEngine>>,
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
     pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
@@ -1413,6 +1438,7 @@ pub enum EngineHandle {
     QueryData(Arc<engine_querydata::QueryDataEngine>),
     Grib(Arc<engine_grib::GribEngine>),
     Zarr(Arc<engine_zarr::ZarrEngine>),
+    Satellite(Arc<engine_satellite::SatelliteEngine>),
     Odim(Arc<engine_odim::OdimEngine>),
     OdimVolume(Arc<engine_odim::PolarVolumeEngine>),
     Cap(Arc<engine_cap::CapEngine>),
@@ -1451,6 +1477,7 @@ impl EngineReuse {
     reuse_take!(take_querydata, QueryData, engine_querydata::QueryDataEngine);
     reuse_take!(take_grib, Grib, engine_grib::GribEngine);
     reuse_take!(take_zarr, Zarr, engine_zarr::ZarrEngine);
+    reuse_take!(take_satellite, Satellite, engine_satellite::SatelliteEngine);
     reuse_take!(take_odim, Odim, engine_odim::OdimEngine);
     reuse_take!(take_odim_volume, OdimVolume, engine_odim::PolarVolumeEngine);
     reuse_take!(take_cap, Cap, engine_cap::CapEngine);
@@ -1578,6 +1605,7 @@ pub fn load_collections(
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
     let mut zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>> = Vec::new();
+    let mut satellite_engines: Vec<Arc<engine_satellite::SatelliteEngine>> = Vec::new();
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
     let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
@@ -1634,6 +1662,7 @@ pub fn load_collections(
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
             "zarr" => &["edr", "wms", "maps", "tiles"],
+            "satellite" => &["wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
@@ -2403,6 +2432,125 @@ pub fn load_collections(
                     } else {
                         Some("no Zarr data found yet (waiting for poll)".into())
                     },
+                });
+            }
+            "satellite" => {
+                let satellite_config = match collection.satellite.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'satellite' but missing [collections.satellite] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "satellite".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.satellite] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let engine = match engine_reuse.take_satellite(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
+                        );
+                        e
+                    }
+                    None => match engine_satellite::SatelliteEngine::new(
+                        &collection.id,
+                        satellite_config,
+                    ) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize satellite engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "satellite".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
+                };
+                engines_by_id.insert(
+                    collection.id.clone(),
+                    EngineHandle::Satellite(engine.clone()),
+                );
+                satellite_engines.push(engine.clone());
+
+                // One WMS/Maps/Tiles layer per product. The parameters come
+                // from config, so styles resolve before the first scan lands.
+                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                let raster_params = raster_info.parameters;
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    map_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    maps_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    tiles_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                // Live status comes from `/health` (`live_health`); at load the
+                // first poll has not run yet.
+                let (status, error) = match engine.live_health() {
+                    Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
+                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
+                        (CollectionStatus::Degraded, Some(reason.to_string()))
+                    }
+                    None => (CollectionStatus::Degraded, None),
+                };
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "satellite".into(),
+                    status,
+                    error,
                 });
             }
             "odim" => {
@@ -3678,6 +3826,7 @@ pub fn load_collections(
         querydata_engines,
         grib_engines,
         zarr_engines,
+        satellite_engines,
         odim_engines,
         odim_volume_engines,
         cap_engines,
@@ -4490,6 +4639,7 @@ fn apply_load(
     rotate_poll_loops!(querydata_engines);
     rotate_poll_loops!(grib_engines);
     rotate_poll_loops!(zarr_engines);
+    rotate_poll_loops!(satellite_engines);
     rotate_poll_loops!(odim_engines);
     rotate_poll_loops!(odim_volume_engines);
     rotate_poll_loops!(cap_engines);
@@ -4617,6 +4767,10 @@ fn apply_load(
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.zarr_engines;
     *state
+        .satellite_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.satellite_engines;
+    *state
         .odim_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.odim_engines;
@@ -4732,10 +4886,19 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
                 live.insert(e.collection_id().to_string(), s);
             }
         }
-        for h in health
-            .iter_mut()
-            .filter(|h| h.engine_type == "cap" || h.engine_type == "bufr")
+        for e in state
+            .satellite_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
         {
+            if let Some(s) = e.live_health() {
+                live.insert(e.collection_id().to_string(), s);
+            }
+        }
+        for h in health.iter_mut().filter(|h| {
+            h.engine_type == "cap" || h.engine_type == "bufr" || h.engine_type == "satellite"
+        }) {
             match live.get(h.id.as_str()) {
                 Some(ds_core::health::LiveStatus::Ready) => {
                     h.status = CollectionStatus::Ready;
@@ -4851,6 +5014,21 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
             if let Some(temporal) = build_temporal(engine.as_ref()) {
+                temporal_info.insert(id, temporal);
+            }
+        }
+    }
+    {
+        let engines = state
+            .satellite_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            if let Some(age) = engine.data_age() {
+                data_ages.insert(id.clone(), age.num_seconds());
+            }
+            if let Some(temporal) = temporal_from_times(&engine.times()) {
                 temporal_info.insert(id, temporal);
             }
         }
@@ -5042,6 +5220,15 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         GEOTIFF_DECODE_REJECTED.feed(rejected as u64);
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
+    }
+    if !state
+        .satellite_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
+        SATELLITE_FRAME_CACHE_METRICS.update(engine_satellite::frame_metrics(), None);
+        SATELLITE_STRIP_CACHE_METRICS.update(engine_satellite::strip_metrics(), None);
     }
 
     // Lightning strike-window cache (#504): only meaningful once a postgis
@@ -5746,6 +5933,7 @@ mod tests {
             cap: None,
             postgis: None,
             bufr: None,
+            satellite: None,
             nowcast: source.map(|s| ds_core::config::NowcastConfig {
                 source: s.to_string(),
                 horizon: "PT1H".to_string(),

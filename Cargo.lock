@@ -1556,6 +1556,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-satellite"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "ds-cache",
+ "ds-core",
+ "ds-poll",
+ "ds-storage",
+ "hdf5-reader",
+ "netcdf-reader",
+ "regex",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "engine-zarr"
 version = "0.1.0"
 dependencies = [
@@ -3177,6 +3196,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "netcdf-core"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25a7215ebd56ede9f76768a895593673ca072b67764f3abff7393be0de0dbaf4"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "netcdf-reader"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33e22b42b44c58a4fdb3c6969fdcf9bbcae71efad0ff94e2d63e21728a843f82"
+dependencies = [
+ "hdf5-reader",
+ "memmap2",
+ "ndarray",
+ "netcdf-core",
+ "thiserror",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4672,6 +4713,7 @@ dependencies = [
  "engine-odim",
  "engine-postgis",
  "engine-querydata",
+ "engine-satellite",
  "engine-zarr",
  "http-body",
  "http-body-util",

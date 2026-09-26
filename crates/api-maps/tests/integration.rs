@@ -142,6 +142,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -212,6 +213,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -329,6 +331,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -379,6 +382,7 @@ fn router_with(
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1480,6 +1484,7 @@ fn build_empty_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1610,6 +1615,7 @@ fn build_multi_param_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -2064,6 +2070,7 @@ mod searchable {
                     postgis: None,
                     nowcast: None,
                     bufr: None,
+                    satellite: None,
                     preview: None,
                 },
             );
@@ -2536,6 +2543,7 @@ fn build_router_with_styles(styles: HashMap<String, HashMap<String, StyleInfo>>)
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );

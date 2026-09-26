@@ -1,0 +1,23 @@
+[package]
+name = "engine-satellite"
+version = "0.1.0"
+edition = "2021"
+description = "Geostationary satellite imagery engine (GOES-R ABI NetCDF-4 -> WMS/Maps/Tiles)"
+
+[dependencies]
+ds-core = { path = "../core" }
+ds-cache = { path = "../ds-cache" }
+ds-poll = { path = "../ds-poll" }
+ds-storage = { path = "../storage" }
+arc-swap = "1"
+chrono = { version = "0.4", features = ["serde"] }
+hdf5-reader = { version = "0.9.1", default-features = false }
+netcdf-reader = { version = "0.9.1", default-features = false, features = ["netcdf4"] }
+regex = "1"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+toml = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -423,6 +423,7 @@ mod tests {
             querydata_engines: RwLock::new(result.querydata_engines),
             grib_engines: RwLock::new(result.grib_engines),
             zarr_engines: RwLock::new(result.zarr_engines),
+            satellite_engines: RwLock::new(result.satellite_engines),
             odim_engines: RwLock::new(result.odim_engines),
             odim_volume_engines: RwLock::new(result.odim_volume_engines),
             cap_engines: RwLock::new(result.cap_engines),

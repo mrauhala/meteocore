@@ -52,6 +52,18 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[],
         fallback_range: Some((-48.0, 48.0)),
     },
+    // Satellite IR window brightness temperature and cloud top
+    // temperature (#819): 180–330 K spans the coldest storm tops to the
+    // warmest land, far wider than air temperature's range. Before the
+    // temperature rule, which would otherwise claim both titles. The palette
+    // stops are in kelvin, so the rule requires a K unit.
+    DefaultRule {
+        names: &[],
+        contains: &["brightnesstemperature", "cloudtoptemperature"],
+        palette: "ir_bt_enhanced",
+        unit_ranges: &[(&["k", "kelvin"], 180.0, 330.0)],
+        fallback_range: None,
+    },
     // Temperature / dew point — unit-gated: NEVER guess K vs °C.
     DefaultRule {
         names: &["t", "2t", "t2m", "tmp", "tt", "td", "2d", "d2m", "skt"],
@@ -343,6 +355,31 @@ mod tests {
             .match_default("x", "Total cloud cover", Some("%"))
             .unwrap();
         assert_eq!(m.palette, "cloud_cover");
+    }
+
+    /// Satellite brightness temperature and cloud top temperature get the
+    /// IR palette over 180–330 K — not the air-temperature rule, whose
+    /// titles they also contain.
+    #[test]
+    fn satellite_ir_titles_get_the_ir_palette() {
+        let d = builtin();
+        for title in ["IR 10.3 µm brightness temperature", "Cloud top temperature"] {
+            let m = d.match_default("x", title, Some("K")).unwrap();
+            assert_eq!(m.palette, "ir_bt_enhanced", "{title}");
+            assert_eq!(m.range, Some((180.0, 330.0)), "{title}");
+        }
+        // The IR stops are kelvin: in °C the title falls through to the
+        // air-temperature rule, and with no unit nothing is guessed.
+        let celsius = d
+            .match_default("x", "Cloud top temperature", Some("°C"))
+            .unwrap();
+        assert_eq!(celsius.palette, "temperature");
+        assert_eq!(d.match_default("x", "Cloud top temperature", None), None);
+        // Air temperature is unchanged.
+        let air = d
+            .match_default("param42", "2 metre temperature", Some("K"))
+            .unwrap();
+        assert_eq!(air.palette, "temperature");
     }
 
     #[test]

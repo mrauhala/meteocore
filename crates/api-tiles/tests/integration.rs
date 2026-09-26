@@ -143,6 +143,7 @@ fn build_state() -> api_tiles::AppState {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -225,6 +226,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1062,6 +1064,7 @@ fn build_empty_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1194,6 +1197,7 @@ fn build_multi_param_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1545,6 +1549,7 @@ mod mvt {
                 postgis: None,
                 nowcast: None,
                 bufr: None,
+                satellite: None,
                 preview: None,
             },
         );
@@ -1634,6 +1639,7 @@ mod mvt {
                 postgis: None,
                 nowcast: None,
                 bufr: None,
+                satellite: None,
                 preview: None,
             },
         );
@@ -2010,6 +2016,7 @@ mod temporal_grid_jitter {
                 postgis: None,
                 nowcast: None,
                 bufr: None,
+                satellite: None,
                 preview: None,
             },
         );
@@ -2183,6 +2190,7 @@ mod metadata_extras {
                 postgis: None,
                 nowcast: None,
                 bufr: None,
+                satellite: None,
                 preview: None,
             },
         );
@@ -2491,6 +2499,7 @@ fn build_param_layer_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
