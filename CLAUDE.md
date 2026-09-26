@@ -391,10 +391,16 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 
 - **`ds_core::web_mercator`** — the ONLY EPSG:3857↔WGS84 implementation
   (Critical Rule 4).
-- **`ds_core::geo`** — CRS transforms (WGS84, TM, LAEA, LCC, Stereographic),
-  `GeoTransform`, `geometry_to_pixels`, `destination_point`,
+- **`ds_core::geo`** — CRS transforms (WGS84, TM, LAEA, LCC, Stereographic,
+  Geostationary), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
   `geodetic_to_ecef`, `OutputCrs::footprint_pixel_window` (low-zoom ghost
-  guard, #453).
+  guard, #453). `Crs::Geostationary` is the one **partial** transform:
+  `forward` is NaN on the far side of the Earth and `inverse` `None` off the
+  disk, so code mapping many points must skip non-finite results; its
+  `GeoTransform::bbox` comes from the limb and may be `west > east` (#819).
+- **`ds_core::cf`** — CF grid mapping → `Crs` and coordinate-unit scale,
+  shared by NetCDF readers. Unsupported mappings and missing earth figures
+  are errors, never a WGS84 guess.
 - **`ds_core::instances`** — model-run (forecast reference time) machinery
   shared by ALL forecast engines (#337), so run selection, instance lists and
   instance-id encoding are identical everywhere:

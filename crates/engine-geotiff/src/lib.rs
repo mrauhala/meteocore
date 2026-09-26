@@ -16,7 +16,7 @@ pub mod stac;
 #[doc(hidden)]
 pub mod fuzz_exports {
     pub use crate::reader::{DataSource, TiffMetadata};
-    pub use ds_core::geo::{Crs, GeoTransform};
+    pub use ds_core::geo::{Crs, GeoTransform, SweepAxis};
 }
 
 use std::collections::{BTreeMap, HashMap};
@@ -1383,6 +1383,7 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
         ds_core::geo::Crs::Stereographic { .. } => "stere".to_string(),
         // Rotated lat/lon is NOT EPSG:4326 — it has no standard EPSG code.
         ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
+        ds_core::geo::Crs::Geostationary { .. } => "geos".to_string(),
     }
 }
 

@@ -1,6 +1,6 @@
 #![no_main]
 
-use engine_geotiff::fuzz_exports::{Crs, GeoTransform};
+use engine_geotiff::fuzz_exports::{Crs, GeoTransform, SweepAxis};
 use libfuzzer_sys::fuzz_target;
 
 // Fuzz CRS forward/inverse transforms and GeoTransform methods
@@ -59,6 +59,18 @@ fuzz_target!(|data: &[u8]| {
             false_n: 0.0,
             radius: Some(6_371_220.0),
         },
+        // Partial: forward is NaN on the far side, inverse None off the disk.
+        Crs::Geostationary {
+            lon0: param1.clamp(-std::f64::consts::PI, std::f64::consts::PI),
+            height: 35_786_023.0,
+            semi_major: 6_378_137.0,
+            semi_minor: 6_356_752.314_14,
+            sweep: if param2 > 0.0 {
+                SweepAxis::X
+            } else {
+                SweepAxis::Y
+            },
+        },
     ];
 
     for crs in &crs_variants {
@@ -91,4 +103,13 @@ fuzz_target!(|data: &[u8]| {
     let _ = gt.bbox();
     let _ = gt.pixel_to_world(0, 0);
     let _ = gt.bbox_to_pixels(lon, lat, lon + 1.0, lat + 1.0);
+
+    // Nor on a geostationary raster, whose extent search bisects the limb.
+    let geos = GeoTransform {
+        crs: crs_variants.last().unwrap().clone(),
+        ..gt
+    };
+    let _ = geos.world_to_pixel(lon, lat);
+    let _ = geos.bbox();
+    let _ = geos.bbox_to_pixels(lon, lat, lon + 1.0, lat + 1.0);
 });
