@@ -42,6 +42,14 @@ const MIN_CELLS: u32 = 4;
 /// projection-call count — for extreme zoomed-out viewports.
 const MAX_CELLS: u32 = 256;
 
+/// Node spacing, in output pixels, inside a cell on a domain boundary —
+/// some of its corner nodes map to finite source pixels, some don't (the
+/// limb of a geostationary disk, the edge of a projected output CRS's
+/// domain). Such a cell cannot be interpolated as a whole, so it gets its
+/// own sub-grid at this spacing, which bounds the under-fill along the
+/// boundary to this many pixels.
+const BOUNDARY_STEP_PX: f64 = 2.0;
+
 /// Interpolation-error budget, in source pixels. Refinement stops once the
 /// estimated error over the on-raster region drops below this. Kept well under
 /// the 0.5 px resolution of nearest-neighbour resampling.
@@ -94,6 +102,37 @@ pub struct ProjectionGrid {
     /// Exact `(col, row)` source pixel coordinates at each node, row-major,
     /// `(cells_y + 1)` rows of `stride` nodes.
     nodes: Vec<(f64, f64)>,
+    /// Sub-grids of the cells on a domain boundary, keyed and sorted by the
+    /// index of the cell's top-left node.
+    boundary: Vec<(usize, SubGrid)>,
+}
+
+/// A boundary cell's nodes at [`BOUNDARY_STEP_PX`] spacing, row-major.
+struct SubGrid {
+    cells_x: usize,
+    cells_y: usize,
+    nodes: Vec<(f64, f64)>,
+}
+
+impl SubGrid {
+    /// Interpolated source `(col, row)` at fractional position `(tx, ty)`
+    /// within the cell; non-finite where the enclosing sub-cell touches
+    /// the boundary.
+    fn sample(&self, tx: f64, ty: f64) -> (f64, f64) {
+        let gx = tx * self.cells_x as f64;
+        let gy = ty * self.cells_y as f64;
+        let cx = (gx.floor() as usize).min(self.cells_x - 1);
+        let cy = (gy.floor() as usize).min(self.cells_y - 1);
+        let (tx, ty) = (gx - cx as f64, gy - cy as f64);
+        let stride = self.cells_x + 1;
+        let n = cy * stride + cx;
+        let (c00, c10) = (self.nodes[n], self.nodes[n + 1]);
+        let (c01, c11) = (self.nodes[n + stride], self.nodes[n + stride + 1]);
+        (
+            bilerp(c00.0, c10.0, c01.0, c11.0, tx, ty),
+            bilerp(c00.1, c10.1, c01.1, c11.1, tx, ty),
+        )
+    }
 }
 
 impl ProjectionGrid {
@@ -161,7 +200,7 @@ impl ProjectionGrid {
         let mut cells_y = out_height
             .div_ceil(GRID_STEP_PX)
             .clamp(MIN_CELLS, MAX_CELLS);
-        loop {
+        let mut grid = loop {
             let grid = Self::with_cells(
                 out_width,
                 out_height,
@@ -172,7 +211,7 @@ impl ProjectionGrid {
             );
             let error = grid.estimate_error(src_cols, src_rows, &out_to_world, &world_to_src_px);
             if error <= MAX_INTERP_ERROR_PX {
-                return grid;
+                break grid;
             }
             if cells_x >= MAX_CELLS && cells_y >= MAX_CELLS {
                 // Extreme viewport: even the densest grid cannot meet the
@@ -188,11 +227,75 @@ impl ProjectionGrid {
                      {MAX_INTERP_ERROR_PX} px; rendered output may be slightly \
                      misregistered for this viewport"
                 );
-                return grid;
+                break grid;
             }
             // Halving the cell size quarters the bilinear error.
             cells_x = (cells_x * 2).min(MAX_CELLS);
             cells_y = (cells_y * 2).min(MAX_CELLS);
+        };
+        grid.refine_boundary(out_width, out_height, &out_to_world, &world_to_src_px);
+        grid
+    }
+
+    /// Give every cell on a domain boundary — some corner nodes finite,
+    /// some not — a sub-grid at [`BOUNDARY_STEP_PX`] spacing, so the
+    /// boundary is resolved to that many pixels instead of blanking the
+    /// whole cell.
+    ///
+    /// This stays a coarse-grid mapping (Critical Rule 5): a boundary curve
+    /// crosses O(perimeter / cell) cells, each costing
+    /// `(cell / BOUNDARY_STEP_PX)²` projections, so a limb-sized curve costs
+    /// on the order of its perimeter in pixels times four. Total sub-grid
+    /// nodes are capped at a quarter of the per-pixel cost; a mapping with
+    /// scattered non-finite nodes stops refining there, and its remaining
+    /// boundary cells stay unfilled.
+    fn refine_boundary(
+        &mut self,
+        out_width: u32,
+        out_height: u32,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) {
+        let finite = |(c, r): (f64, f64)| c.is_finite() && r.is_finite();
+        let sub_x = (self.cell_w / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
+        let sub_y = (self.cell_h / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
+        let per_cell = (sub_x + 1) * (sub_y + 1);
+        let mut budget = (out_width as usize * out_height as usize / 4).max(4096);
+        for cy in 0..self.cells_y {
+            for cx in 0..self.cells_x {
+                let n = cy * self.stride + cx;
+                let corners = [
+                    self.nodes[n],
+                    self.nodes[n + 1],
+                    self.nodes[n + self.stride],
+                    self.nodes[n + self.stride + 1],
+                ];
+                let valid = corners.iter().filter(|&&c| finite(c)).count();
+                if valid == 0 || valid == 4 {
+                    continue;
+                }
+                if per_cell > budget {
+                    return;
+                }
+                budget -= per_cell;
+                let mut nodes = Vec::with_capacity(per_cell);
+                for j in 0..=sub_y {
+                    let fy = (cy as f64 + j as f64 / sub_y as f64) / self.cells_y as f64;
+                    for i in 0..=sub_x {
+                        let fx = (cx as f64 + i as f64 / sub_x as f64) / self.cells_x as f64;
+                        let (lon, lat) = out_to_world(fx, fy);
+                        nodes.push(world_to_src_px(lon, lat));
+                    }
+                }
+                self.boundary.push((
+                    n,
+                    SubGrid {
+                        cells_x: sub_x,
+                        cells_y: sub_y,
+                        nodes,
+                    },
+                ));
+            }
         }
     }
 
@@ -226,6 +329,7 @@ impl ProjectionGrid {
             cell_h: out_height as f64 / cells_y as f64,
             stride,
             nodes,
+            boundary: Vec::new(),
         }
     }
 
@@ -281,21 +385,16 @@ impl ProjectionGrid {
     /// `(ox, oy)`. Coordinates are fractional and unclamped — the caller floors
     /// and bounds-checks them, exactly as `GeoTransform::world_to_pixel` does.
     ///
-    /// If any of a cell's four nodes is non-finite the bilinear blend is
-    /// non-finite for *every* pixel in that cell; the caller must finite-check
-    /// before use (and a non-finite result resolves to nodata/transparent).
-    /// Non-finite nodes arise when `out_to_world` or `world_to_src_px` returns
-    /// NaN — i.e. a degenerate source mapping (zero pixel size) **or** a
-    /// projected output CRS whose inverse is undefined for an out-of-domain
-    /// node (`OutputCrs::Projected` past the projection's valid area). The
-    /// consequence is that the on-raster region can be under-filled by up to one
-    /// coarse cell (≤ `GRID_STEP_PX`, more at low zoom) right at that domain
-    /// boundary. This is accepted: it only bites thousands of km outside the
-    /// useful extent of EPSG:3067/3035 (whose Newton inverses return finite
-    /// values across all of Europe, so nodes there are finite), and resolving a
-    /// boundary that cuts through a cell exactly would defeat the coarse-grid
-    /// optimisation. Engines that must be pixel-exact at such a boundary should
-    /// fall back to per-pixel projection for cells `sample` reports as nodata.
+    /// The result is non-finite where the mapping is undefined; the caller
+    /// must finite-check before use (a non-finite result resolves to
+    /// nodata/transparent). Non-finite nodes arise when `out_to_world` or
+    /// `world_to_src_px` returns NaN: a degenerate source mapping (zero pixel
+    /// size), a source that is only partly defined (a geostationary disk,
+    /// whose far side has no projection), or a projected output CRS past its
+    /// valid area. A cell with some finite and some non-finite corners is on
+    /// such a domain boundary and is interpolated from its
+    /// [`BOUNDARY_STEP_PX`] sub-grid, so the defined region is under-filled
+    /// by at most that many pixels along the boundary.
     pub fn sample(&self, ox: u32, oy: u32) -> (f64, f64) {
         // Position of the pixel centre in grid-cell units.
         let gx = (ox as f64 + 0.5) / self.cell_w;
@@ -315,7 +414,13 @@ impl ProjectionGrid {
 
         let col = bilerp(c00.0, c10.0, c01.0, c11.0, tx, ty);
         let row = bilerp(c00.1, c10.1, c01.1, c11.1, tx, ty);
-        (col, row)
+        if col.is_finite() && row.is_finite() {
+            return (col, row);
+        }
+        match self.boundary.binary_search_by_key(&i00, |(cell, _)| *cell) {
+            Ok(k) => self.boundary[k].1.sample(tx, ty),
+            Err(_) => (col, row),
+        }
     }
 }
 
@@ -627,6 +732,72 @@ mod tests {
         );
         let (c, r) = grid.sample(10, 10);
         assert!(!c.is_finite() || !r.is_finite());
+    }
+
+    /// A source defined only inside a circle — the shape of a geostationary
+    /// disk. Cells the circle crosses are refined, so the defined region is
+    /// filled to within the sub-grid step of the boundary rather than a
+    /// whole cell short of it, and nothing outside the circle is sampled.
+    #[test]
+    fn boundary_cells_resolve_a_partial_domain() {
+        let radius = 0.7;
+        let map = |x: f64, y: f64| {
+            if x * x + y * y <= radius * radius {
+                (x * 100.0, y * 100.0)
+            } else {
+                (f64::NAN, f64::NAN)
+            }
+        };
+        let size = 256;
+        let grid = ProjectionGrid::build(
+            size,
+            size,
+            200,
+            200,
+            |fx| -1.0 + 2.0 * fx,
+            |fy| 1.0 - 2.0 * fy,
+            map,
+        );
+        assert!(!grid.boundary.is_empty());
+        let px = 2.0 / size as f64;
+        let margin = 2.0 * BOUNDARY_STEP_PX * px;
+        for oy in 0..size {
+            for ox in 0..size {
+                let x = -1.0 + (ox as f64 + 0.5) * px;
+                let y = 1.0 - (oy as f64 + 0.5) * px;
+                let d = x.hypot(y);
+                let (c, r) = grid.sample(ox, oy);
+                if d < radius - margin {
+                    assert!(
+                        (c - x * 100.0).abs() < 0.5 && (r - y * 100.0).abs() < 0.5,
+                        "({ox}, {oy}) inside the domain sampled ({c}, {r})"
+                    );
+                } else if d > radius {
+                    assert!(!c.is_finite() || !r.is_finite(), "({ox}, {oy}) outside");
+                }
+            }
+        }
+    }
+
+    /// Scattered non-finite nodes make every cell a boundary cell; the
+    /// refinement stops at its node budget instead of approaching a
+    /// per-pixel projection.
+    #[test]
+    fn boundary_refinement_is_budgeted() {
+        let map = |x: f64, y: f64| {
+            if ((x * 97.0).floor() + (y * 89.0).floor()) as i64 % 2 == 0 {
+                (x, y)
+            } else {
+                (f64::NAN, f64::NAN)
+            }
+        };
+        let size = 512;
+        let grid = ProjectionGrid::build(size, size, 100, 100, |fx| fx, |fy| fy, map);
+        let nodes: usize = grid.boundary.iter().map(|(_, sub)| sub.nodes.len()).sum();
+        assert!(
+            nodes <= (size * size / 4) as usize,
+            "{nodes} sub-grid nodes"
+        );
     }
 
     /// Web Mercator latitude for fractional y in `[0, 1]` over `[south, north]`.
