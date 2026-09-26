@@ -3313,3 +3313,247 @@ fn render_deadline_queue_shedding_and_cache_bypass() {
                 .unwrap();
     });
 }
+
+// ---------------------------------------------------------------------------
+// Per-parameter time axes (#819)
+// ---------------------------------------------------------------------------
+
+mod per_parameter_times {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    const T0: &str = "2026-09-25T19:00:00Z";
+    const T1: &str = "2026-09-25T19:10:00Z";
+    const T2: &str = "2026-09-25T19:20:00Z";
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// Two parameters on different time axes, as in a satellite collection:
+    /// `a` has three scans; `b`, a product that lands later, only the first
+    /// two. The collection's times are the union. Records every render's
+    /// `(parameter, time)`.
+    /// One render's `(parameter, time)`.
+    type Render = (Option<String>, Option<DateTime<Utc>>);
+
+    #[derive(Default)]
+    struct Engine {
+        renders: std::sync::Mutex<Vec<Render>>,
+    }
+
+    fn times(parameter: Option<&str>) -> Vec<DateTime<Utc>> {
+        match parameter {
+            Some("b") => vec![t(T0), t(T1)],
+            _ => vec![t(T0), t(T1), t(T2)],
+        }
+    }
+
+    impl MapEngine for Engine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.renders
+                .lock()
+                .unwrap()
+                .push((parameter.map(str::to_string), time));
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![Some(0.5); (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let parameter = |name: &str| ds_core::map_engine::ParameterInfo {
+                name: name.to_string(),
+                title: format!("Parameter {name}"),
+                unit: "K".into(),
+            };
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+                times: times(None),
+                parameter: "a".into(),
+                unit: "K".into(),
+                parameters: vec![parameter("a"), parameter("b")],
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+
+        fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+            Some(times(Some(parameter)).into())
+        }
+
+        fn resolve_parameter_time(
+            &self,
+            parameter: Option<&str>,
+            time: Option<DateTime<Utc>>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let times = times(parameter);
+            match time {
+                Some(time) => times.into_iter().rev().find(|&ts| ts <= time),
+                None => times.last().copied(),
+            }
+        }
+    }
+
+    fn router(engine: Arc<Engine>) -> axum::Router {
+        let engine: Arc<dyn MapEngine> = engine;
+        let config = CollectionConfig {
+            id: "sat".to_string(),
+            title: "Satellite".to_string(),
+            description: "Two parameters on different time axes".to_string(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "grib".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            nowcast: None,
+            bufr: None,
+            preview: None,
+        };
+        let style = StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
+            colormap: Arc::new(LutColorMap::from_builtin(
+                BuiltinColormap::Viridis,
+                0.0,
+                1.0,
+            )),
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        };
+        let state = Arc::new(ArcSwap::from_pointee(WmsState {
+            engines: HashMap::from([("sat".to_string(), engine)]),
+            collections: HashMap::from([("sat".to_string(), config)]),
+            styles: HashMap::from([(
+                "sat".to_string(),
+                HashMap::from([("default".to_string(), style)]),
+            )]),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            tile_cache: Arc::new(ds_render::TilePixelCache::new(64)),
+            base_url: String::new(),
+            trust_proxy_headers: false,
+        }));
+        api_wms::router(state)
+    }
+
+    async fn get(app: &axum::Router, query: &str) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/?SERVICE=WMS&VERSION=1.3.0&{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The `<Layer>` element named `name`, as text.
+    fn layer<'a>(caps: &'a str, name: &str) -> &'a str {
+        let start = caps.find(&format!("<Name>{name}</Name>")).unwrap();
+        let end = caps[start..].find("</Layer>").unwrap();
+        &caps[start..start + end]
+    }
+
+    /// The parent layer advertises the union; each child layer re-declares
+    /// the `time` dimension with its own values and default (WMS 1.3.0
+    /// "replace" inheritance).
+    #[tokio::test]
+    async fn child_layers_advertise_their_own_times() {
+        let app = router(Arc::default());
+        let (status, caps) = get(&app, "REQUEST=GetCapabilities").await;
+        assert_eq!(status, StatusCode::OK);
+        let parent_dim = caps.find("<Dimension name=\"time\"").unwrap();
+        assert!(caps[parent_dim..].starts_with(&format!(
+            "<Dimension name=\"time\" units=\"ISO8601\" default=\"{}\"",
+            t(T2).to_rfc3339()
+        )));
+        let b = layer(&caps, "sat/b");
+        assert!(
+            b.contains(&format!("default=\"{}\"", t(T1).to_rfc3339())),
+            "{b}"
+        );
+        assert!(b.contains(&format!("{},{}<", t(T0).to_rfc3339(), t(T1).to_rfc3339())));
+        assert!(!b.contains(&t(T2).to_rfc3339()));
+        let a = layer(&caps, "sat/a");
+        assert!(a.contains(&format!("default=\"{}\"", t(T2).to_rfc3339())));
+    }
+
+    /// An omitted TIME renders the requested parameter's latest time, and a
+    /// time it lacks snaps on its own axis — before any cache key is built.
+    #[tokio::test]
+    async fn getmap_resolves_time_per_parameter() {
+        let engine = Arc::new(Engine::default());
+        let app = router(engine.clone());
+        let map = |layer: &str, bbox: &str, time: Option<&str>| {
+            format!(
+                "REQUEST=GetMap&LAYERS={layer}&STYLES=&FORMAT=image/png&CRS=CRS:84\
+                 &BBOX={bbox}&WIDTH=64&HEIGHT=64{}",
+                time.map(|t| format!("&TIME={t}")).unwrap_or_default()
+            )
+        };
+        let renders = |engine: &Engine| engine.renders.lock().unwrap().clone();
+
+        assert_eq!(
+            get(&app, &map("sat/b", "0,40,10,50", None)).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&app, &map("sat/a", "0,40,10,50", None)).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            renders(&engine),
+            [
+                (Some("b".into()), Some(t(T1))),
+                (Some("a".into()), Some(t(T2)))
+            ]
+        );
+
+        // T2 exists for `a` only: `b` resolves to its T1 scan, which the
+        // omitted-TIME request above already cached under T1 — a hit.
+        assert_eq!(
+            get(&app, &map("sat/b", "0,40,10,50", Some(T2))).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(renders(&engine).len(), 2);
+        // Elsewhere, the same request renders `b` at T1.
+        assert_eq!(
+            get(&app, &map("sat/b", "10,40,20,50", Some(T2))).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(renders(&engine)[2], (Some("b".into()), Some(t(T1))));
+    }
+}

@@ -207,13 +207,23 @@ pub async fn wms_handler(
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
 
-            // Engine-owned default first (CAP: active now), then latest
-            // advertised time for engines using the forecast convention.
-            // Resolve before keying so an omitted TIME tracks catalog updates.
-            let time = params
-                .time
-                .or_else(|| engine.default_time())
-                .or_else(|| info.times.last().copied());
+            // WMS picks the parameter via `LAYERS=collection/param` (parsed
+            // into layer_parameter) and then `style_info.parameter`. Settle it
+            // first: a parameter can have its own time axis.
+            let parameter = layer_parameter
+                .clone()
+                .or_else(|| style_info.parameter.clone());
+
+            // Engine-owned default first (CAP: active now), then the
+            // parameter's (else the collection's) latest time. Resolve before
+            // keying so an omitted TIME tracks catalog updates.
+            let time = params.time.or_else(|| {
+                ds_core::map_engine::default_request_time(
+                    engine.as_ref(),
+                    &info,
+                    parameter.as_deref(),
+                )
+            });
 
             // Normalise an explicit pin of the *current* latest run to `None`
             // BEFORE resolution, so it gets the same fallback-tolerant run
@@ -251,8 +261,9 @@ pub async fn wms_handler(
             // seen under storm load). Resolving here also pins one timestep
             // for the whole request, so a catalog swap mid-render can no
             // longer mix timesteps within a single response. Exact-match
-            // engines keep the identity default.
-            let time = engine.resolve_time(time, reference_time);
+            // engines keep the identity default; a parameter with its own
+            // time axis snaps on that axis.
+            let time = engine.resolve_parameter_time(parameter.as_deref(), time, reference_time);
             // Content revised in place under the same instant (a push-fed
             // alert set) must not hit a stale entry: the engine's content
             // version is part of every rendered/meta-tile key.
@@ -280,13 +291,10 @@ pub async fn wms_handler(
                 width: params.width,
                 height: params.height,
                 time,
-                // WMS picks the parameter via `LAYERS=collection/param`
-                // (parsed into layer_parameter) and then `style_info.parameter`.
-                // Both are already folded into `style_parameter` below; mirror
-                // that here so the rendered-cache distinguishes parameters.
-                parameter: layer_parameter
-                    .clone()
-                    .or_else(|| style_info.parameter.clone()),
+                // The parameter settled above (also folded into
+                // `style_parameter` below), so the rendered cache
+                // distinguishes parameters.
+                parameter: parameter.clone(),
                 z: params.elevation.map(ds_render::quantize_z),
                 // The forecast run pinned via the `reference_time` dimension
                 // (None ⇒ latest), so runs don't collide in the rendered cache.

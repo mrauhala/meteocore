@@ -47,9 +47,18 @@ path can leave the WMS symptom unchanged (#448 vs #452).
 ## Dimensions
 
 - **TIME** — valid-time axis from `RasterInfo.times`. A TIME-less GetMap
-  resolves to `MapEngine::default_time()` when supplied, else `times.last()`.
-  GetCapabilities advertises the same default. CAP advertises future warnings
-  while keeping its snapshot's `as_of` as the "active now" default.
+  resolves through `ds_core::map_engine::default_request_time`: the engine's
+  `default_time()` when supplied, else the parameter's latest time, else
+  `times.last()`. GetCapabilities advertises the same default. CAP advertises
+  future warnings while keeping its snapshot's `as_of` as the "active now"
+  default.
+- **Per-parameter TIME (#819).** When `MapEngine::parameter_times(param)` is
+  `Some`, `RasterInfo.times` is the union over parameters and each child
+  layer (`coll/param`) re-declares `<Dimension name="time">` with its own
+  values and default — WMS 1.3.0 Table 7 makes Dimension inheritance
+  "replace". GetMap settles the parameter (`LAYERS=coll/param`, then the
+  style's) before defaulting TIME and snaps with `resolve_parameter_time`,
+  so the caches key the parameter's own timestep.
 - **ELEVATION** — advertised when the collection has a vertical extent
   (`RasterInfo.vertical`); rejected with 400 otherwise.
 - **`reference_time` (forecast model run, #337/#345):** forecast layers

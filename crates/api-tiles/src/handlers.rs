@@ -2090,21 +2090,6 @@ async fn render_tile(
     // parameter-name validation. Trait contract is O(1) but we still avoid
     // the redundant call.
     let raster_info = engine.raster_info_shared();
-    let time = validated
-        .time
-        .or_else(|| engine.default_time())
-        .or_else(|| raster_info.times.last().copied());
-    // #521: resolve the run axis to the CONCRETE run the engine will render
-    // before the cache key is built (see api-maps for the full rationale —
-    // the no-TTL rendered cache keyed on `None` would keep serving the
-    // first-rendered run's pixels after a newer run re-covers the same valid
-    // times; asking the engine preserves GRIB's cross-run fallback). Engines
-    // without runs keep the identity default (`None` stays `None`).
-    let reference_time = engine.resolve_reference_time(time, None);
-    // #507: snap to the exact timestep the engine will render before the
-    // cache key is built — a not-yet-ingested datetime must cache the
-    // previous timestep's pixels under the PREVIOUS timestep's key.
-    let time = engine.resolve_time(time, reference_time);
 
     let tile_size = params::TILE_SIZE;
 
@@ -2134,6 +2119,28 @@ async fn render_tile(
         .parameter_name
         .clone()
         .or_else(|| style_info.parameter.clone());
+
+    // Omitted `datetime`: the engine's default, else the parameter's (else
+    // the collection's) latest time.
+    let time = validated.time.or_else(|| {
+        ds_core::map_engine::default_request_time(
+            engine.as_ref(),
+            &raster_info,
+            effective_parameter.as_deref(),
+        )
+    });
+    // #521: resolve the run axis to the CONCRETE run the engine will render
+    // before the cache key is built (see api-maps for the full rationale —
+    // the no-TTL rendered cache keyed on `None` would keep serving the
+    // first-rendered run's pixels after a newer run re-covers the same valid
+    // times; asking the engine preserves GRIB's cross-run fallback). Engines
+    // without runs keep the identity default (`None` stays `None`).
+    let reference_time = engine.resolve_reference_time(time, None);
+    // #507: snap to the exact timestep the engine will render before the
+    // cache key is built — a not-yet-ingested datetime must cache the
+    // previous timestep's pixels under the PREVIOUS timestep's key. A
+    // parameter with its own time axis snaps on that axis.
+    let time = engine.resolve_parameter_time(effective_parameter.as_deref(), time, reference_time);
 
     // Reject an `elevation` against a collection with no vertical axis.
     if validated.z.is_some() && raster_info.vertical.is_none() {

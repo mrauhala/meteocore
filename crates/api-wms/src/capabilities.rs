@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ds_core::config::{CollectionConfig, LicenseConfig};
-use ds_core::map_engine::{MapEngine, RasterInfo};
+use ds_core::map_engine::{default_request_time, MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
@@ -64,7 +64,7 @@ pub fn get_capabilities_xml(
                     &info,
                     styles,
                     base_url,
-                    engine.default_time(),
+                    engine.as_ref(),
                 );
             } else {
                 // Single-parameter engine: one requestable layer
@@ -77,6 +77,7 @@ pub fn get_capabilities_xml(
                     base_url,
                     None,
                     engine.default_time(),
+                    None,
                 );
             }
         }
@@ -156,8 +157,9 @@ fn write_parent_layer(
     info: &RasterInfo,
     styles: &HashMap<String, HashMap<String, StyleInfo>>,
     base_url: &str,
-    default_time: Option<DateTime<Utc>>,
+    engine: &dyn MapEngine,
 ) {
+    let default_time = engine.default_time();
     let _ = writer.write_event(Event::Start(BytesStart::new("Layer")));
 
     // Parent has no Name element — makes it non-requestable per WMS spec
@@ -188,6 +190,13 @@ fn write_parent_layer(
         // parameter-scoped bundle extras); the collection's otherwise — which
         // is what GetMap resolves for this LAYER.
         let child_styles = styles.get(&child_layer_name).or_else(|| styles.get(id));
+        // A parameter with its own time axis re-declares the `time`
+        // dimension, replacing the parent's union of all parameters' times
+        // (WMS 1.3.0 Table 7: Dimension inheritance is "replace").
+        let own_times = engine.parameter_times(short_name).map(|times| {
+            let default = default_request_time(engine, info, Some(short_name));
+            (times, default)
+        });
         write_layer(
             writer,
             &child_layer_name,
@@ -197,15 +206,23 @@ fn write_parent_layer(
             base_url,
             Some(&child_title),
             default_time,
+            own_times
+                .as_ref()
+                .map(|(times, default)| (&times[..], *default)),
         );
     }
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
 }
 
+/// A child layer's own `time` axis: its values and default.
+type OwnTimes<'a> = (&'a [DateTime<Utc>], Option<DateTime<Utc>>);
+
 /// Write a single requestable layer.
 /// If `param_title` is Some, this is a child of a multi-param parent and we
-/// skip inherited metadata (CRS, bbox, time) since the parent already has it.
+/// skip inherited metadata (CRS, bbox, time) since the parent already has it —
+/// except a `time` dimension of the child's own, `own_times` (its values and
+/// default), which replaces the inherited one.
 #[allow(clippy::too_many_arguments)]
 fn write_layer(
     writer: &mut Writer<Vec<u8>>,
@@ -216,6 +233,7 @@ fn write_layer(
     base_url: &str,
     param_title: Option<&str>,
     default_time: Option<DateTime<Utc>>,
+    own_times: Option<OwnTimes<'_>>,
 ) {
     let mut layer = BytesStart::new("Layer");
     layer.push_attribute(("queryable", "0"));
@@ -240,12 +258,37 @@ fn write_layer(
         write_layer_metadata(writer, info, default_time);
         // Attribution (license) after Dimension, before Style.
         write_attribution(writer, config.license.as_ref());
+    } else if let Some((times, default)) = own_times {
+        write_time_dimension(writer, times, default);
     }
 
     // Styles
     write_layer_styles(writer, layer_name, layer_styles, base_url);
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
+}
+
+/// Write a `time` dimension listing `times` (nothing when empty), with
+/// `default` as its default value.
+fn write_time_dimension(
+    writer: &mut Writer<Vec<u8>>,
+    times: &[DateTime<Utc>],
+    default: Option<DateTime<Utc>>,
+) {
+    if times.is_empty() {
+        return;
+    }
+    let mut dim = BytesStart::new("Dimension");
+    dim.push_attribute(("name", "time"));
+    dim.push_attribute(("units", "ISO8601"));
+    if let Some(default) = default {
+        dim.push_attribute(("default", default.to_rfc3339().as_str()));
+    }
+    dim.push_attribute(("nearestValue", "1"));
+    let _ = writer.write_event(Event::Start(dim));
+    let time_values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+    let _ = writer.write_event(Event::Text(BytesText::new(&time_values.join(","))));
+    let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
 }
 
 /// Write CRS, bbox, and time dimension for a layer.
@@ -282,21 +325,11 @@ fn write_layer_metadata(
     }
 
     // Time dimension
-    if !info.times.is_empty() {
-        let mut dim = BytesStart::new("Dimension");
-        dim.push_attribute(("name", "time"));
-        dim.push_attribute(("units", "ISO8601"));
-        if let Some(latest) = default_time.or_else(|| info.times.last().copied()) {
-            dim.push_attribute(("default", latest.to_rfc3339().as_str()));
-        }
-        dim.push_attribute(("nearestValue", "1"));
-        let _ = writer.write_event(Event::Start(dim));
-
-        let time_values: Vec<String> = info.times.iter().map(|t| t.to_rfc3339()).collect();
-        let _ = writer.write_event(Event::Text(BytesText::new(&time_values.join(","))));
-
-        let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
-    }
+    write_time_dimension(
+        writer,
+        &info.times,
+        default_time.or_else(|| info.times.last().copied()),
+    );
 
     // Elevation dimension — advertised only for layers with a vertical axis.
     if let Some(vertical) = &info.vertical {

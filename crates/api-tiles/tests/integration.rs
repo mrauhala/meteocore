@@ -2962,3 +2962,140 @@ async fn swagger_docs_and_local_assets_obey_security_policy() {
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Per-parameter time axes (#819)
+// ---------------------------------------------------------------------------
+
+mod per_parameter_times {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    const T0: &str = "2026-09-25T19:00:00Z";
+    const T1: &str = "2026-09-25T19:10:00Z";
+    const T2: &str = "2026-09-25T19:20:00Z";
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// Two parameters on different time axes, as in a satellite collection:
+    /// `a` has three scans; `b`, a product that lands later, only the first
+    /// two. The collection's times are the union. Records every render's
+    /// `(parameter, time)`.
+    /// One render's `(parameter, time)`.
+    type Render = (Option<String>, Option<DateTime<Utc>>);
+
+    #[derive(Default)]
+    struct Engine {
+        renders: std::sync::Mutex<Vec<Render>>,
+    }
+
+    fn times(parameter: Option<&str>) -> Vec<DateTime<Utc>> {
+        match parameter {
+            Some("b") => vec![t(T0), t(T1)],
+            _ => vec![t(T0), t(T1), t(T2)],
+        }
+    }
+
+    impl MapEngine for Engine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.renders
+                .lock()
+                .unwrap()
+                .push((parameter.map(str::to_string), time));
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![Some(0.5); (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let parameter = |name: &str| ds_core::map_engine::ParameterInfo {
+                name: name.to_string(),
+                title: format!("Parameter {name}"),
+                unit: "K".into(),
+            };
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([-180.0, -90.0, 180.0, 90.0]),
+                times: times(None),
+                parameter: "a".into(),
+                unit: "K".into(),
+                parameters: vec![parameter("a"), parameter("b")],
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+
+        fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+            Some(times(Some(parameter)).into())
+        }
+
+        fn resolve_parameter_time(
+            &self,
+            parameter: Option<&str>,
+            time: Option<DateTime<Utc>>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let times = times(parameter);
+            match time {
+                Some(time) => times.into_iter().rev().find(|&ts| ts <= time),
+                None => times.last().copied(),
+            }
+        }
+    }
+
+    /// A map tile of parameter `p`, tile column `n` (0 or 1), at `time` if given.
+    #[allow(non_snake_case)]
+    fn URI(p: &str, n: u32, time: Option<&str>) -> String {
+        let time = time.map(|t| format!("&datetime={t}")).unwrap_or_default();
+        format!("/collections/radar/tiles/WebMercatorQuad/1/0/{n}?parameter-name={p}{time}")
+    }
+
+    async fn status(app: &axum::Router, uri: &str) -> StatusCode {
+        app.clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// An omitted `datetime` renders the requested parameter's latest time,
+    /// and a time it lacks snaps on its own axis before the cache key is
+    /// built — so the snapped request hits what the default one cached.
+    #[tokio::test]
+    async fn datetime_resolves_per_parameter() {
+        let engine = Arc::new(Engine::default());
+        let app = build_router_with_engine(engine.clone());
+        let renders = |engine: &Engine| engine.renders.lock().unwrap().clone();
+        let last = |engine: &Engine| renders(engine).last().cloned().unwrap();
+
+        assert_eq!(status(&app, &URI("b", 0, None)).await, StatusCode::OK);
+        assert_eq!(last(&engine), (Some("b".into()), Some(t(T1))));
+        assert_eq!(status(&app, &URI("a", 0, None)).await, StatusCode::OK);
+        assert_eq!(last(&engine), (Some("a".into()), Some(t(T2))));
+
+        // T2 exists for `a` only: `b` resolves to T1, already cached above.
+        let rendered = renders(&engine).len();
+        assert_eq!(status(&app, &URI("b", 0, Some(T2))).await, StatusCode::OK);
+        assert_eq!(renders(&engine).len(), rendered);
+        // Elsewhere, the same request renders `b` at T1.
+        assert_eq!(status(&app, &URI("b", 1, Some(T2))).await, StatusCode::OK);
+        assert!(renders(&engine).len() > rendered);
+        assert_eq!(last(&engine), (Some("b".into()), Some(t(T1))));
+    }
+}
