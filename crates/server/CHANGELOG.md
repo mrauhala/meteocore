@@ -1,5 +1,84 @@
 # Changelog
 
+## [0.10.0](https://github.com/mrauhala/meteocore/compare/v0.9.0...v0.10.0) (2026-09-26)
+
+
+### Features
+
+* **wis2:** ds-wis2 consumer client crate + Wis2Config ([#690](https://github.com/mrauhala/meteocore/issues/690)) ([fd24158](https://github.com/mrauhala/meteocore/commit/fd241588f390b27b101fd56a31ffed3c94ebd275))
+* **cap:** WIS2 push source — [cap.wis2] subscription, supersede/cancel, MeteoAlarm zone geometry ([#691](https://github.com/mrauhala/meteocore/issues/691)) ([7ebeb4d](https://github.com/mrauhala/meteocore/commit/7ebeb4d0769da6768e836c6121105f9728c20698))
+* **bufr:** engine-bufr — WMO BUFR surface observations as EDR + Features ([#692](https://github.com/mrauhala/meteocore/issues/692)) ([3bb4e73](https://github.com/mrauhala/meteocore/commit/3bb4e739674032720b273635fa36bd5858097519))
+* **bufr:** [bufr.wis2] — SYNOP observations pushed over WIS2 ([#698](https://github.com/mrauhala/meteocore/issues/698)) ([2b9fad1](https://github.com/mrauhala/meteocore/commit/2b9fad1c455582a745f8da40fc3e9d895a178734))
+* **cap:** expose <parameter> and <eventCode> pairs as feature properties ([#699](https://github.com/mrauhala/meteocore/issues/699)) ([d02dc8d](https://github.com/mrauhala/meteocore/commit/d02dc8ddda24873df22cecd6e262f1e7c770c804))
+* **bufr:** serve display units — K → °C, Pa → hPa, kg m-2 → mm ([#703](https://github.com/mrauhala/meteocore/issues/703)) ([c8f7427](https://github.com/mrauhala/meteocore/commit/c8f74278da4f9acdb1b8d9c39038f92f143ec499))
+* **features:** filter items by feature properties ([#710](https://github.com/mrauhala/meteocore/issues/710)) ([48a8ea8](https://github.com/mrauhala/meteocore/commit/48a8ea8ef57af57864cf8ad320eb75adaecc11ca))
+* **features:** add HTML representations for feature resources ([#711](https://github.com/mrauhala/meteocore/issues/711)) ([6c4fa2f](https://github.com/mrauhala/meteocore/commit/6c4fa2f3c83a9f4826ed35e8fd6945f2786ea562))
+* **grib:** split sources into vertical collections ([#750](https://github.com/mrauhala/meteocore/issues/750)) ([95b5ba6](https://github.com/mrauhala/meteocore/commit/95b5ba639681c8de706bf66bb940c8707dfd8a53))
+* **ogc:** shared OGC API root with Maps and Tiles building blocks, phase 1 of [#789](https://github.com/mrauhala/meteocore/issues/789) ([#791](https://github.com/mrauhala/meteocore/issues/791)) ([c784dfd](https://github.com/mrauhala/meteocore/commit/c784dfdd0b41d6856a756ed996dd800c3750fad4))
+* **ogc:** Features at the shared OGC API root, phase 2 of [#789](https://github.com/mrauhala/meteocore/issues/789) ([#803](https://github.com/mrauhala/meteocore/issues/803)) ([37186e7](https://github.com/mrauhala/meteocore/commit/37186e7c807f8a567af816101838d7e8d21d5e97))
+* **html:** API chips and a Maps / map tiles / vector tiles switch on collection pages ([#813](https://github.com/mrauhala/meteocore/issues/813)) ([3127011](https://github.com/mrauhala/meteocore/commit/31270112f7f4caaed6614d3851baa0e7efc5e60b))
+* **landing:** stop advertising the per-API Maps, Tiles and Features services ([#815](https://github.com/mrauhala/meteocore/issues/815)) ([2bfd85f](https://github.com/mrauhala/meteocore/commit/2bfd85f0b5d2d96b8438301995f08c9cc0442a87))
+* **geo:** geostationary projection and CF grid-mapping parser ([#820](https://github.com/mrauhala/meteocore/issues/820)) ([ecffaa3](https://github.com/mrauhala/meteocore/commit/ecffaa32b0b7034a4441a0e8b8a45968e5ec1999))
+* **resample:** refine ProjectionGrid cells on a domain boundary ([#821](https://github.com/mrauhala/meteocore/issues/821)) ([b432d93](https://github.com/mrauhala/meteocore/commit/b432d933ce6abe4d3758cdd5a2b5c8fb0c5f0872))
+* **map:** per-parameter time axes in WMS, Maps and Tiles ([#822](https://github.com/mrauhala/meteocore/issues/822)) ([99933ae](https://github.com/mrauhala/meteocore/commit/99933aef0ab06da69b35cd162a8903458bd4f2e4))
+
+
+### Bug Fixes
+
+* **server:** spawn CAP poll loops at boot and shut down cap/postgis/nowcast gracefully ([#688](https://github.com/mrauhala/meteocore/issues/688)) ([f0136cd](https://github.com/mrauhala/meteocore/commit/f0136cd54bf1e5b956505cbe7e237d2e43345830))
+* **render:** key rendered caches on the engine's content version (stale CAP tiles) ([#701](https://github.com/mrauhala/meteocore/issues/701)) ([9079e79](https://github.com/mrauhala/meteocore/commit/9079e79729850461d05c8b4f1f43fe73f9282ecc))
+* **cap:** union the per-geocode geometry hints of a multi-zone area ([#704](https://github.com/mrauhala/meteocore/issues/704)) ([e543b5c](https://github.com/mrauhala/meteocore/commit/e543b5c606d80f2ff48bf2ddc94f3f7e3eec1fb7))
+* **cap:** correct warning lifecycle and API consistency ([#708](https://github.com/mrauhala/meteocore/issues/708)) ([3bbf5b8](https://github.com/mrauhala/meteocore/commit/3bbf5b8748ce4b299551afc85fb1999022b83d15))
+* **cap:** expose future warning times while preserving the current default ([#714](https://github.com/mrauhala/meteocore/issues/714)) ([03b8c4f](https://github.com/mrauhala/meteocore/commit/03b8c4fc07f1642a3485e3550239fb6418dc621a))
+* **edr:** bound request work and isolate synchronous queries ([#712](https://github.com/mrauhala/meteocore/issues/712)) ([387c95a](https://github.com/mrauhala/meteocore/commit/387c95a9a1f7242ffb8d4d338e5f58a9ba536ded))
+* **render:** bound transient memory across raster APIs ([#713](https://github.com/mrauhala/meteocore/issues/713)) ([5391511](https://github.com/mrauhala/meteocore/commit/5391511ed38dab071d2e4b009708b8ad5c6b2184))
+* **nowcast:** retain serving history across compatible reloads ([#732](https://github.com/mrauhala/meteocore/issues/732)) ([5992f92](https://github.com/mrauhala/meteocore/commit/5992f9221820606f3cb0f976d2b3c8d27bfa4dcb))
+* **render:** use per-parameter units for styles and legends ([#733](https://github.com/mrauhala/meteocore/issues/733)) ([5652f85](https://github.com/mrauhala/meteocore/commit/5652f850255620718b7cce5519411f99b8655426))
+* **edr:** bound location response memory through delivery ([#735](https://github.com/mrauhala/meteocore/issues/735)) ([dbac94b](https://github.com/mrauhala/meteocore/commit/dbac94bd7b0bda3aa8cf5a4c8691db4fb5ac7f5e))
+* **grib:** correct field selection, sampling, and cache fills ([#749](https://github.com/mrauhala/meteocore/issues/749)) ([9007544](https://github.com/mrauhala/meteocore/commit/9007544a0b52f4a6cf83874760208a44660b151a))
+* **grib:** preserve wgrib2 level identities and summarize warnings ([#752](https://github.com/mrauhala/meteocore/issues/752)) ([135b4d2](https://github.com/mrauhala/meteocore/commit/135b4d2e99ee3c0fb510415e317f8ee5ba70c9a3))
+* **zarr:** bound gzip and zstd decode output ([#774](https://github.com/mrauhala/meteocore/issues/774)) ([8a663c4](https://github.com/mrauhala/meteocore/commit/8a663c4484b5fc376725daff2f288a272d4bf426))
+* **zarr:** bound Blosc frames and admit decode scratch ([#775](https://github.com/mrauhala/meteocore/issues/775)) ([61e87d4](https://github.com/mrauhala/meteocore/commit/61e87d465dc67733d227ed891ddcb97e5bd23fd7))
+* **zarr:** admit cache hits without cold decode workspace ([#776](https://github.com/mrauhala/meteocore/issues/776)) ([4122d9a](https://github.com/mrauhala/meteocore/commit/4122d9a2dd9e4613cf667b8670c262393dc00f29))
+* **zarr:** reserve encoded and codec headroom for cold reads ([#781](https://github.com/mrauhala/meteocore/issues/781)) ([61db8a0](https://github.com/mrauhala/meteocore/commit/61db8a0912c66de817ec378114dde0d4bb9a2422))
+* **zarr:** avoid duplicate decode reservations for coalesced reads ([#782](https://github.com/mrauhala/meteocore/issues/782)) ([34c04cd](https://github.com/mrauhala/meteocore/commit/34c04cddf66ea01adb519c176340ff2cb5d20cee))
+* **zarr:** release Blosc scratch admission after each decode ([#783](https://github.com/mrauhala/meteocore/issues/783)) ([dee3cc4](https://github.com/mrauhala/meteocore/commit/dee3cc477a98d193d9971ce263ebc5c9ef9a15a0))
+* **zarr:** release temporary admission between serial chunks ([#784](https://github.com/mrauhala/meteocore/issues/784)) ([331b9c1](https://github.com/mrauhala/meteocore/commit/331b9c157076fc25e6698e65e5a7784193aca799))
+* **zarr:** prepay peak scratch for stacked Blosc codecs ([#785](https://github.com/mrauhala/meteocore/issues/785)) ([6802aab](https://github.com/mrauhala/meteocore/commit/6802aab027ff76cfa9fafa29398a8be1c0daad65))
+* **preview:** avoid tile requests during initial zoom ([#786](https://github.com/mrauhala/meteocore/issues/786)) ([15ac33f](https://github.com/mrauhala/meteocore/commit/15ac33fe65a85024a0913412e5b0c285e2993632))
+* **ogc:** registered link relations, tileset resources and mount-agnostic Maps/Tiles, phase 0 of [#789](https://github.com/mrauhala/meteocore/issues/789) ([#790](https://github.com/mrauhala/meteocore/issues/790)) ([1faf071](https://github.com/mrauhala/meteocore/commit/1faf0711c2e265a47bfc5029da797e682f3861ef))
+* **ogc:** valid Common extents for vertical dimensions and CRS84 bounds ([#798](https://github.com/mrauhala/meteocore/issues/798)) ([7b4a80d](https://github.com/mrauhala/meteocore/commit/7b4a80d12df739a7ff97f0b45a271d152b320d90))
+* **querydata:** render projected grids such as MEPS ([#799](https://github.com/mrauhala/meteocore/issues/799)) ([15dd7e3](https://github.com/mrauhala/meteocore/commit/15dd7e3502010635fb6605ced1405ef67d9e04a8))
+* **querydata:** project LCC grids on the sphere their file declares ([#801](https://github.com/mrauhala/meteocore/issues/801)) ([ac83ca1](https://github.com/mrauhala/meteocore/commit/ac83ca1a1ae77d8d7cfe5e48c2842174cfb19755))
+* **ogc:** advertise Maps and Tiles relations in registered form only ([#806](https://github.com/mrauhala/meteocore/issues/806)) ([f12216e](https://github.com/mrauhala/meteocore/commit/f12216ea0b5a3bbac7c1b3befa452e5486e96c49))
+* **openapi:** tag every operation so API docs group them per collection ([#812](https://github.com/mrauhala/meteocore/issues/812)) ([017a7ea](https://github.com/mrauhala/meteocore/commit/017a7ea081e14eff10387fef567a27b76bae0054))
+* **3dtiles:** the viewer's ?base override selects a same-origin path only ([#814](https://github.com/mrauhala/meteocore/issues/814)) ([dff88f1](https://github.com/mrauhala/meteocore/commit/dff88f134a8e82ee2c7478c2ba4ff6887969aeaf))
+* **storage:** hourly prefix patterns, and no poll-time panic on a bad one ([#816](https://github.com/mrauhala/meteocore/issues/816)) ([042e405](https://github.com/mrauhala/meteocore/commit/042e40533e35d5ff830a1ccc387cfb12f6b09ac7))
+
+
+### Performance Improvements
+
+* **wms:** reuse tiles for EPSG:3067 and EPSG:3035 viewports ([#734](https://github.com/mrauhala/meteocore/issues/734)) ([ea2f528](https://github.com/mrauhala/meteocore/commit/ea2f5284aeb9935c769c46d5a33e1a61ab190a2e))
+* **geotiff:** add opt-in bounded COG range batching ([#736](https://github.com/mrauhala/meteocore/issues/736)) ([89fc5eb](https://github.com/mrauhala/meteocore/commit/89fc5eb101429c1c2143351e999959074fa29fa5))
+* **grib:** halve decoded grid buffers while preserving query precision ([#751](https://github.com/mrauhala/meteocore/issues/751)) ([0e1cd1d](https://github.com/mrauhala/meteocore/commit/0e1cd1d06457e2afad8c94a7300d1a70cd05adee))
+* **grib:** batch position sampling and parallelize field reads ([#753](https://github.com/mrauhala/meteocore/issues/753)) ([011eb3a](https://github.com/mrauhala/meteocore/commit/011eb3a1e265b4e9fc7bbca9b9ed4b00041cd769))
+* **grib:** download index sidecars concurrently ([#754](https://github.com/mrauhala/meteocore/issues/754)) ([363ad2b](https://github.com/mrauhala/meteocore/commit/363ad2bcfcdc51ad082526a79d8b48291a89c25b))
+* **grib:** batch metadata probes using header ranges ([#755](https://github.com/mrauhala/meteocore/issues/755)) ([0a501ad](https://github.com/mrauhala/meteocore/commit/0a501ad346b153a71650300d7b75174ad0d1d466))
+* **grib:** batch area and radius field reads ([#756](https://github.com/mrauhala/meteocore/issues/756)) ([2e4c363](https://github.com/mrauhala/meteocore/commit/2e4c3633321c93516d4e6c17eb68a454f8bad10a))
+* **grib:** cache compressed messages across grid evictions ([#757](https://github.com/mrauhala/meteocore/issues/757)) ([e03e3a3](https://github.com/mrauhala/meteocore/commit/e03e3a3a34f3676da3ee2eb123bf81d089d98fc2))
+* **grib:** cache discovery metadata and expose vertical axes in HTML ([#758](https://github.com/mrauhala/meteocore/issues/758)) ([4d23b3f](https://github.com/mrauhala/meteocore/commit/4d23b3f7e006e6f4a0b63b773e9fd7ebf2ea0bfb))
+
+
+### config
+
+* add ECMWF AIFS GRIB collection ([#761](https://github.com/mrauhala/meteocore/issues/761)) ([cc1b230](https://github.com/mrauhala/meteocore/commit/cc1b230e32db84b9898766a84efa797d0784d88e))
+* enable IFS pressure levels, gusts and most-unstable CAPE ([#762](https://github.com/mrauhala/meteocore/issues/762)) ([b469319](https://github.com/mrauhala/meteocore/commit/b469319824a6e55be4df744e1d2d0b91ab2509e1))
+
+
+### nowcast
+
+* verify the production motion estimator alongside the baseline ([#730](https://github.com/mrauhala/meteocore/issues/730)) ([aa0dc9b](https://github.com/mrauhala/meteocore/commit/aa0dc9b6657bc6327674dc7939a979baf877ad02))
+
 ## [0.9.0](https://github.com/mrauhala/meteocore/compare/v0.8.1...v0.9.0) (2026-09-11)
 
 
