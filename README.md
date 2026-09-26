@@ -617,7 +617,7 @@ Values are converted to `f64` internally. Physical values: `physical = raw * sca
 |------|--------|-------------|
 | Local directory | `data_path = "path/to/dir"` | Scans a local directory |
 | Fixed remote prefix | `data_path = "s3://bucket/prefix/"` | Scans a single S3/HTTP prefix |
-| Dynamic remote prefix | `endpoint` + `bucket` + `prefix_pattern` | Expands date-based prefixes on each poll cycle |
+| Dynamic remote prefix | `endpoint` + `bucket` + `prefix_pattern` | Expands date-based prefixes on each poll cycle (one per day, or per hour when the template has `%H`) |
 | STAC catalog | `stac_url` + `stac_asset_allowlist` | Discovers files via STAC API items endpoint |
 
 #### Polling and File Discovery
@@ -703,7 +703,7 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | `exclude_patterns` | no | `["*.tmp", "*.part"]` | Glob patterns for files to skip. |
 | `endpoint` | no | — | S3-compatible endpoint URL |
 | `bucket` | no | — | S3 bucket name. Required when `endpoint` is set. |
-| `prefix_pattern` | no | `""` | Object prefix, optionally with strftime templates |
+| `prefix_pattern` | no | `""` | Object prefix, optionally with strftime date templates. An hour specifier (`%H`, e.g. `"ABI-L2-CMIPF/%Y/%j/%H/"`) lists one prefix per hour and requires a `time_window` of at most 24 h (use a day-level template for longer windows); minutes, seconds and unknown specifiers are rejected at load. |
 | `time_window` | no | none | ISO 8601 duration for file selection, e.g., `"-PT2H"` |
 | `scan_days` | no | auto | Number of days to scan for date-based prefixes |
 | `stac_url` | no | — | STAC API items endpoint URL |
@@ -874,7 +874,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `data_path` | * | — | Local directory of `.grib2` + index files, or an `s3://`/`http(s)://` fixed-prefix URL. Mutually exclusive with `endpoint`+`bucket`. |
 | `endpoint` | * | — | S3-compatible endpoint URL. |
 | `bucket` | * | — | S3 bucket name. |
-| `prefix_pattern` | * | — | Object prefix with optional strftime date templates (e.g. `"%Y%m%d/00z/ifs/0p25/oper/"`). Required for S3; optional literal sub-prefix for `data_path`. |
+| `prefix_pattern` | * | — | Object prefix with optional strftime date templates (e.g. `"%Y%m%d/00z/ifs/0p25/oper/"`); the run hour goes in `{run}`, not `%H`. Unknown specifiers are rejected at load. Required for S3; optional literal sub-prefix for `data_path`. |
 | `index_format` | no | `"ecmwf-json"` | Index format: `"ecmwf-json"` (JSON-lines, ECMWF open data) or `"wgrib2"` (colon-separated text, NOAA GFS). |
 | `index_suffix` | no | `".index"` | Suffix for index sidecar files |
 | `data_suffix` | no | `".grib2"` | Suffix for GRIB data files |

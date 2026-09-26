@@ -13,7 +13,6 @@ mod runtime;
 mod scan_tests;
 #[cfg(test)]
 mod test_support;
-mod time_window;
 pub mod units;
 mod vertical;
 pub mod wgrib2_index;
@@ -35,8 +34,8 @@ use ds_core::model::*;
 
 use crate::cache::{DecodedGrid, GridCache};
 use crate::catalog::{Catalog, ForecastRun, ParameterKey, ParameterKeys, StepFile};
-use crate::time_window::TimeWindow;
 use crate::units::{DisplayConversion, SourceUnit};
+use ds_storage::discovery::TimeWindow;
 
 /// Resolved metadata for a parameter, populated by a successful header probe
 /// or decode of that parameter and level. Derived from the WMO triple
@@ -288,6 +287,11 @@ impl GribEngine {
 
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
+        // The poll re-parses `time_window` and skips the filter on an error,
+        // so an invalid window must fail here instead of silently widening.
+        if let Some(time_window) = &config.time_window {
+            TimeWindow::parse(time_window)?;
+        }
         // Data source: local `data_path` (a directory, or a fixed-prefix remote
         // URL) vs S3 `endpoint`+`bucket`. Mutual exclusivity is enforced at
         // config load (`GribConfig` validation); re-check the presence here so
@@ -319,6 +323,17 @@ impl GribEngine {
                     "Collection '{collection_id}': remote GRIB engine requires 'prefix_pattern'"
                 ))
             })?;
+            // Each day's prefix is formatted per poll; reject an unknown
+            // specifier now rather than panicking then. The run hour comes
+            // from `{run}`, so an hour specifier would only name the poll hour.
+            if ds_storage::discovery::prefix_step(&prefix_pattern)?
+                == ds_storage::discovery::PrefixStep::Hour
+            {
+                return Err(DataServerError::Config(format!(
+                    "Collection '{collection_id}': GRIB prefix_pattern names the run hour \
+                     with '{{run}}', not a strftime hour specifier"
+                )));
+            }
             // Construct URL from endpoint+bucket for S3 region detection.
             let store_url = format!("{endpoint}/{bucket}/");
             let (store, _prefix) = ds_storage::build_store(&store_url).map_err(|e| {

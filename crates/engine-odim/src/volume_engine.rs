@@ -75,7 +75,9 @@ use ds_core::volume::{
 };
 use ds_poll::{FirstTick, Shutdown};
 
-use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
+use ds_storage::discovery::{
+    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
+};
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
@@ -452,6 +454,7 @@ fn build_source(
                 Some(s) => Some(TimeWindow::parse(s)?),
                 None => None,
             };
+            validate_prefix_pattern(&prefix_pattern, time_window.as_ref())?;
             tracing::info!(
                 "[{collection_id}] PVOL S3 source: endpoint={endpoint} bucket={bucket} \
                  prefix='{prefix_pattern}'"
@@ -1073,12 +1076,15 @@ fn enumerate_remote(
 
     let now = Utc::now();
     let (prefixes, time_filter) = match time_window {
-        Some(tw) => (
-            expand_prefix_for_dates(prefix_pattern, &tw.scan_dates(now)),
-            Some(tw.to_range(now)),
-        ),
+        Some(tw) => {
+            let (start, end) = tw.to_range(now);
+            (
+                expand_prefix_for_range(prefix_pattern, start, end)?,
+                Some((start, end)),
+            )
+        }
         None => (
-            expand_prefix_pattern(prefix_pattern, DEFAULT_SCAN_DAYS),
+            expand_prefix_pattern(prefix_pattern, DEFAULT_SCAN_DAYS)?,
             None,
         ),
     };
@@ -6169,6 +6175,29 @@ mod tests {
         assert!(matches!(
             build_source("c", None, &config),
             Err(EngineError::MissingPrefixPattern)
+        ));
+    }
+
+    /// A `prefix_pattern` discovery cannot expand is a load error, not a
+    /// panic on the first poll: hourly templates need a `time_window`.
+    #[test]
+    fn build_source_validates_prefix_pattern() {
+        let s3 = |prefix: &str, time_window: Option<&str>| {
+            let mut config = empty_config();
+            config.endpoint = Some("https://s3-eu-west-1.amazonaws.com".into());
+            config.bucket = Some("fmi-opendata-radar-volume-hdf5".into());
+            config.prefix_pattern = Some(prefix.into());
+            config.time_window = time_window.map(Into::into);
+            build_source("c", None, &config)
+        };
+        assert!(s3("%Y/%m/%d/%H/fivih/", Some("-PT3H")).is_ok());
+        assert!(matches!(
+            s3("%Y/%m/%d/%H/fivih/", None),
+            Err(EngineError::Storage(_))
+        ));
+        assert!(matches!(
+            s3("%Y/%m/%d/%M/", Some("-PT3H")),
+            Err(EngineError::Storage(_))
         ));
     }
 

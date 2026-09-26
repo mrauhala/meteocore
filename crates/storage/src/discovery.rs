@@ -8,15 +8,20 @@
 //! 1. [`TimeWindow`] — parse an ISO 8601 duration (`-PT12H`, `-P2D`)
 //!    and turn "now" into the concrete `(start, end)` range and the
 //!    set of UTC dates that range touches.
-//! 2. [`expand_prefix_for_dates`] / [`expand_prefix_pattern`] —
-//!    substitute those dates into a strftime prefix template, yielding
-//!    one literal prefix per day to `list`.
+//! 2. [`expand_prefix_for_range`] / [`expand_prefix_pattern`] —
+//!    substitute the times a range touches into a strftime prefix
+//!    template, yielding one literal prefix per day (or per hour, for a
+//!    template naming the hour) to `list`. [`validate_prefix_pattern`]
+//!    rejects a template discovery cannot expand, at config load.
 //!
-//! This module is the shared home for both. `engine-odim` uses it
-//! today; `engine-geotiff` and `engine-grib` carry their own copies
-//! and are tracked for migration.
+//! This module is the shared home for both. `engine-odim` and
+//! `engine-geotiff` use it; `engine-grib` formats its run-hour
+//! prefixes itself.
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use std::fmt::Write as _;
+
+use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
+use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use ds_core::error::DataServerError;
 
 /// A signed ISO 8601 duration describing how far back (or forward)
@@ -120,6 +125,13 @@ impl TimeWindow {
         }
         dates
     }
+
+    /// Upper bound on the UTC days this window can span, for callers that
+    /// size a static day-count fallback from it.
+    pub fn max_scan_days(&self) -> u32 {
+        let days = (self.seconds.unsigned_abs() / 86_400) as u32;
+        days + 2
+    }
 }
 
 fn parse_component(s: &str, suffix: char, original: &str) -> Result<i64, DataServerError> {
@@ -137,37 +149,165 @@ fn parse_int(s: &str, field: &str, original: &str) -> Result<i64, DataServerErro
     })
 }
 
-/// Expand a strftime prefix template for a specific set of dates.
-///
-/// E.g. `"%Y/%m/%d/OPERA/COMP/"` with `[2026-05-15, 2026-05-14]`
-/// yields `["2026/05/15/OPERA/COMP", "2026/05/14/OPERA/COMP"]`.
-///
-/// A pattern with no `%` is a fixed prefix — returned as a single
-/// entry regardless of `dates`.
-pub fn expand_prefix_for_dates(pattern: &str, dates: &[NaiveDate]) -> Vec<String> {
-    if !pattern.contains('%') {
-        return vec![pattern.trim_end_matches('/').to_string()];
-    }
-    dates
-        .iter()
-        .map(|date| {
-            date.format(pattern)
-                .to_string()
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .collect()
+/// How finely a prefix template partitions time. Each step is one
+/// `list` per poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PrefixStep {
+    /// No time specifiers: one fixed prefix.
+    Fixed,
+    /// Date specifiers only (`%Y/%m/%d`, `%Y/%j`, …): one prefix per day.
+    Day,
+    /// An hour specifier (`%H`): one prefix per hour.
+    Hour,
 }
 
-/// Expand a prefix template over the most recent `scan_days` days,
-/// counting back from today (UTC). Fallback for callers without a
+/// The step of a strftime prefix template.
+///
+/// Every specifier must be one chrono can format from a UTC date-time,
+/// and none may be finer than an hour: a minute-partitioned prefix would
+/// need a `list` per minute of the window.
+pub fn prefix_step(pattern: &str) -> Result<PrefixStep, DataServerError> {
+    let invalid =
+        |why: &str| DataServerError::Config(format!("Invalid prefix_pattern '{pattern}': {why}"));
+    let mut step = PrefixStep::Fixed;
+    for item in StrftimeItems::new(pattern) {
+        let item_step = match item {
+            Item::Literal(_) | Item::OwnedLiteral(_) | Item::Space(_) | Item::OwnedSpace(_) => {
+                PrefixStep::Fixed
+            }
+            Item::Numeric(
+                Numeric::Year
+                | Numeric::YearDiv100
+                | Numeric::YearMod100
+                | Numeric::IsoYear
+                | Numeric::IsoYearDiv100
+                | Numeric::IsoYearMod100
+                | Numeric::Quarter
+                | Numeric::Month
+                | Numeric::Day
+                | Numeric::WeekFromSun
+                | Numeric::WeekFromMon
+                | Numeric::IsoWeek
+                | Numeric::NumDaysFromSun
+                | Numeric::WeekdayFromMon
+                | Numeric::Ordinal,
+                _,
+            )
+            | Item::Fixed(
+                Fixed::ShortMonthName
+                | Fixed::LongMonthName
+                | Fixed::ShortWeekdayName
+                | Fixed::LongWeekdayName,
+            ) => PrefixStep::Day,
+            Item::Numeric(Numeric::Hour | Numeric::Hour12, _)
+            | Item::Fixed(Fixed::LowerAmPm | Fixed::UpperAmPm) => PrefixStep::Hour,
+            Item::Error => return Err(invalid("unknown strftime specifier")),
+            _ => {
+                return Err(invalid(
+                    "only date and hour specifiers are supported (no minutes, seconds, \
+                     time zones or timestamps)",
+                ))
+            }
+        };
+        step = step.max(item_step);
+    }
+    Ok(step)
+}
+
+/// Longest `time_window` an hourly prefix template may run with. Each hour
+/// is one `list` per poll, issued sequentially (Critical Rule 9), so this
+/// caps a poll at 26 calls. A longer window belongs on a day-level
+/// template: listing a day prefix is recursive and covers all its hours.
+pub const MAX_HOURLY_PREFIX_WINDOW_HOURS: i64 = 24;
+
+/// Validate a prefix template against the discovery window it runs
+/// with, so a template discovery cannot expand fails at config load
+/// rather than on the first poll.
+///
+/// An hourly template needs a `time_window` of at most
+/// [`MAX_HOURLY_PREFIX_WINDOW_HOURS`]: without one, discovery falls back
+/// to whole days, and a long one multiplies the `list` calls per poll.
+pub fn validate_prefix_pattern(
+    pattern: &str,
+    time_window: Option<&TimeWindow>,
+) -> Result<PrefixStep, DataServerError> {
+    let step = prefix_step(pattern)?;
+    if step == PrefixStep::Hour {
+        match time_window {
+            None => {
+                return Err(DataServerError::Config(format!(
+                    "prefix_pattern '{pattern}' is partitioned by hour and needs a time_window"
+                )))
+            }
+            Some(tw) if tw.seconds.abs() > MAX_HOURLY_PREFIX_WINDOW_HOURS * 3_600 => {
+                return Err(DataServerError::Config(format!(
+                    "prefix_pattern '{pattern}' is partitioned by hour, which lists one \
+                     prefix per hour on every poll; its time_window may span at most \
+                     {MAX_HOURLY_PREFIX_WINDOW_HOURS} hours. Use a day-level prefix \
+                     (e.g. '%Y/%j/') for a longer window"
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(step)
+}
+
+/// Expand a strftime prefix template over every day (or hour, for a
+/// template naming the hour) that `[start, end]` touches, oldest first.
+/// A prefix repeated across steps (a `%Y/%m/` template over several
+/// days) is listed once.
+///
+/// E.g. `"%Y/%j/%H/"` from 22:30 to 00:10 the next day yields three
+/// prefixes: hours 22 and 23 of the first day and hour 00 of the next.
+/// A template with no time specifiers is a fixed prefix, returned as a
+/// single entry.
+pub fn expand_prefix_for_range(
+    pattern: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<String>, DataServerError> {
+    let step = prefix_step(pattern)?;
+    let (mut t, stride) = match step {
+        PrefixStep::Fixed | PrefixStep::Day => (
+            start.date_naive().and_time(Default::default()).and_utc(),
+            Duration::days(1),
+        ),
+        PrefixStep::Hour => (
+            start
+                .date_naive()
+                .and_hms_opt(start.hour(), 0, 0)
+                .unwrap_or_default()
+                .and_utc(),
+            Duration::hours(1),
+        ),
+    };
+    let mut prefixes: Vec<String> = Vec::new();
+    loop {
+        let mut prefix = String::new();
+        write!(prefix, "{}", t.format(pattern))
+            .map_err(|_| DataServerError::Config(format!("Invalid prefix_pattern '{pattern}'")))?;
+        let prefix = prefix.trim_end_matches('/').to_string();
+        if !prefixes.contains(&prefix) {
+            prefixes.push(prefix);
+        }
+        t += stride;
+        if step == PrefixStep::Fixed || t > end {
+            return Ok(prefixes);
+        }
+    }
+}
+
+/// Expand a prefix template over the most recent `scan_days` UTC days,
+/// counting back from today. Fallback for callers without a
 /// [`TimeWindow`]; `scan_days` is clamped to at least 1.
-pub fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
-    let today = Utc::now().date_naive();
-    let dates: Vec<_> = (0..scan_days.max(1))
-        .map(|offset| today - Duration::days(offset as i64))
-        .collect();
-    expand_prefix_for_dates(pattern, &dates)
+pub fn expand_prefix_pattern(
+    pattern: &str,
+    scan_days: u32,
+) -> Result<Vec<String>, DataServerError> {
+    let now = Utc::now();
+    let first = now.date_naive() - Duration::days(i64::from(scan_days.max(1)) - 1);
+    expand_prefix_for_range(pattern, first.and_time(Default::default()).and_utc(), now)
 }
 
 #[cfg(test)]
@@ -224,27 +364,121 @@ mod tests {
         assert_eq!(dates[1], NaiveDate::from_ymd_opt(2026, 5, 15).unwrap());
     }
 
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    #[test]
+    fn max_scan_days_covers_both_partial_days() {
+        assert_eq!(TimeWindow::parse("-PT2H").unwrap().max_scan_days(), 2);
+        assert_eq!(TimeWindow::parse("-P1D").unwrap().max_scan_days(), 3);
+        assert_eq!(TimeWindow::parse("PT36H").unwrap().max_scan_days(), 3);
+    }
+
     #[test]
     fn expand_static_prefix_is_single_entry() {
+        let now = at(2026, 5, 15, 12, 0);
         assert_eq!(
-            expand_prefix_for_dates("some/fixed/prefix/", &[]),
+            expand_prefix_for_range("some/fixed/prefix/", now - Duration::days(3), now).unwrap(),
             vec!["some/fixed/prefix"]
         );
         assert_eq!(
-            expand_prefix_pattern("some/fixed/prefix", 5),
+            expand_prefix_pattern("some/fixed/prefix", 5).unwrap(),
             vec!["some/fixed/prefix"]
+        );
+        assert_eq!(
+            expand_prefix_for_range("100%%/", now, now).unwrap(),
+            vec!["100%"]
         );
     }
 
     #[test]
-    fn expand_dated_prefix() {
-        let dates = [
-            NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 5, 14).unwrap(),
-        ];
+    fn expand_dated_prefix_per_day_oldest_first() {
         assert_eq!(
-            expand_prefix_for_dates("%Y/%m/%d/OPERA/COMP/", &dates),
-            vec!["2026/05/15/OPERA/COMP", "2026/05/14/OPERA/COMP"]
+            expand_prefix_for_range(
+                "%Y/%m/%d/OPERA/COMP/",
+                at(2026, 5, 14, 23, 30),
+                at(2026, 5, 15, 0, 10)
+            )
+            .unwrap(),
+            vec!["2026/05/14/OPERA/COMP", "2026/05/15/OPERA/COMP"]
         );
+        // A coarser template over several days is listed once.
+        assert_eq!(
+            expand_prefix_for_range("%Y/%m/", at(2026, 5, 13, 0, 0), at(2026, 5, 15, 0, 0))
+                .unwrap(),
+            vec!["2026/05"]
+        );
+    }
+
+    /// GOES-R layout: `<product>/YYYY/DOY/HH/` — the hour is a directory.
+    #[test]
+    fn expand_hourly_prefix_across_midnight() {
+        let tw = TimeWindow::parse("-PT2H").unwrap();
+        let (start, end) = tw.to_range(at(2026, 9, 26, 0, 10));
+        assert_eq!(
+            expand_prefix_for_range("ABI-L2-CMIPF/%Y/%j/%H/", start, end).unwrap(),
+            vec![
+                "ABI-L2-CMIPF/2026/268/22",
+                "ABI-L2-CMIPF/2026/268/23",
+                "ABI-L2-CMIPF/2026/269/00",
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_fallback_counts_back_whole_days() {
+        let prefixes = expand_prefix_pattern("%Y/%m/%d/", 2).unwrap();
+        let today = Utc::now().date_naive();
+        assert_eq!(
+            prefixes,
+            vec![
+                (today - Duration::days(1)).format("%Y/%m/%d").to_string(),
+                today.format("%Y/%m/%d").to_string(),
+            ]
+        );
+        assert_eq!(expand_prefix_pattern("%Y/%m/%d/", 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prefix_step_classifies_and_rejects() {
+        assert_eq!(prefix_step("radar/").unwrap(), PrefixStep::Fixed);
+        assert_eq!(prefix_step("%Y/%m/%d/").unwrap(), PrefixStep::Day);
+        assert_eq!(prefix_step("%F/%b/").unwrap(), PrefixStep::Day);
+        assert_eq!(prefix_step("%Y/%j/%H/").unwrap(), PrefixStep::Hour);
+        // Finer than an hour, or not a date-time field at all.
+        for pattern in ["%Y/%H%M/", "%T/", "%s/", "%Y/%z/", "%Y/%Q/", "%Y/%.3f/"] {
+            assert!(prefix_step(pattern).is_err(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn hourly_prefix_needs_a_time_window() {
+        let tw = TimeWindow::parse("-PT3H").unwrap();
+        assert_eq!(
+            validate_prefix_pattern("%Y/%j/%H/", Some(&tw)).unwrap(),
+            PrefixStep::Hour
+        );
+        assert!(validate_prefix_pattern("%Y/%j/%H/", None).is_err());
+        assert_eq!(
+            validate_prefix_pattern("%Y/%m/%d/", None).unwrap(),
+            PrefixStep::Day
+        );
+    }
+
+    /// Each hour is a sequential `list` per poll: an hourly template's window
+    /// is capped, while a day-level template may run with a long one.
+    #[test]
+    fn hourly_prefix_window_is_bounded() {
+        let window = |s: &str| TimeWindow::parse(s).unwrap();
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("-PT24H"))).is_ok());
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("PT24H"))).is_ok());
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("-PT25H"))).is_err());
+        assert!(validate_prefix_pattern("%Y/%j/%H/", Some(&window("-P30D"))).is_err());
+        assert!(validate_prefix_pattern("%Y/%j/", Some(&window("-P30D"))).is_ok());
     }
 }

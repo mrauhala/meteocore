@@ -10,7 +10,6 @@ mod reader;
 /// `(hits, misses, bytes, capacity_bytes)`.
 pub use decoded_cache::metrics as decoded_chunk_cache_metrics;
 pub mod stac;
-mod time_window;
 
 /// Re-exports for fuzz testing. Not part of the public API.
 #[cfg(feature = "fuzz")]
@@ -29,6 +28,9 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_poll::Shutdown;
+use ds_storage::discovery::{
+    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
+};
 use regex::Regex;
 use std::sync::Arc;
 
@@ -149,7 +151,7 @@ enum StoreMode {
         store: ds_storage::DataStore,
         prefix_pattern: String,
         scan_days: u32,
-        time_window: Option<time_window::TimeWindow>,
+        time_window: Option<TimeWindow>,
     },
     /// STAC API catalog: items discovered on-demand via STAC, assets fetched as remote COGs.
     RemoteStac { client: stac::StacClient },
@@ -383,7 +385,7 @@ impl GeoTiffEngine {
         let parsed_time_window = config
             .time_window
             .as_deref()
-            .map(time_window::TimeWindow::parse)
+            .map(TimeWindow::parse)
             .transpose()?;
 
         let (store_mode, display) = if let Some(stac_url) = &config.stac_url {
@@ -397,7 +399,7 @@ impl GeoTiffEngine {
             let display = format!("s3://{}/{}", bucket, prefix_pattern);
 
             // scan_days is only used as fallback when time_window is not set.
-            // When time_window is set, scan_dates() computes exact dates at scan time.
+            // When time_window is set, the prefixes follow its exact range.
             let scan_days = config
                 .scan_days
                 .or_else(|| parsed_time_window.as_ref().map(|tw| tw.max_scan_days()))
@@ -616,13 +618,13 @@ impl GeoTiffEngine {
             } => {
                 let now = Utc::now();
                 let (prefixes, time_filter) = if let Some(tw) = time_window {
-                    let dates = tw.scan_dates(now);
+                    let (start, end) = tw.to_range(now);
                     (
-                        expand_prefix_for_dates(prefix_pattern, &dates),
-                        Some(tw.to_range(now)),
+                        expand_prefix_for_range(prefix_pattern, start, end)?,
+                        Some((start, end)),
                     )
                 } else {
-                    (expand_prefix_pattern(prefix_pattern, *scan_days), None)
+                    (expand_prefix_pattern(prefix_pattern, *scan_days)?, None)
                 };
                 let mut merged = Catalog::empty();
                 let mut scan_errors: Vec<(String, DataServerError)> = Vec::new();
@@ -1937,6 +1939,19 @@ fn validate_config(
         );
     }
 
+    // A dynamic S3 prefix is expanded on every poll; reject a template
+    // discovery cannot expand now rather than on the first poll.
+    if config.endpoint.is_some() && config.stac_url.is_none() {
+        if let Some(pattern) = &config.prefix_pattern {
+            let time_window = config
+                .time_window
+                .as_deref()
+                .map(TimeWindow::parse)
+                .transpose()?;
+            validate_prefix_pattern(pattern, time_window.as_ref())?;
+        }
+    }
+
     if config.poll_interval_secs == 0 {
         return Err(DataServerError::Engine(format!(
             "[{collection_id}] poll_interval_secs must be > 0"
@@ -2108,37 +2123,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Expand a prefix pattern for specific dates.
-///
-/// E.g. `"%Y/%m/%d/OPERA/COMP/"` with dates [2026-03-25, 2026-03-24] produces:
-/// `["2026/03/25/OPERA/COMP", "2026/03/24/OPERA/COMP"]`
-///
-/// If the pattern contains no `%` characters, returns it as-is (single prefix).
-fn expand_prefix_for_dates(pattern: &str, dates: &[chrono::NaiveDate]) -> Vec<String> {
-    if !pattern.contains('%') {
-        return vec![pattern.trim_end_matches('/').to_string()];
-    }
-
-    dates
-        .iter()
-        .map(|date| {
-            date.format(pattern)
-                .to_string()
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .collect()
-}
-
-/// Expand a prefix pattern for the last `scan_days` days (fallback when no time_window).
-fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
-    let today = Utc::now().date_naive();
-    let dates: Vec<_> = (0..scan_days.max(1))
-        .map(|offset| today - chrono::Duration::days(offset as i64))
-        .collect();
-    expand_prefix_for_dates(pattern, &dates)
-}
-
 use parse::parse_coords;
 
 #[cfg(test)]
@@ -2244,9 +2228,21 @@ mod tests {
     }
 
     #[test]
-    fn expand_prefix_static() {
-        let result = expand_prefix_pattern("some/fixed/prefix", 2);
-        assert_eq!(result, vec!["some/fixed/prefix"]);
+    fn s3_prefix_pattern_is_validated_at_load() {
+        let s3 = |prefix: &str, time_window: Option<&str>| GeoTiffConfig {
+            endpoint: Some("https://s3.example.com".to_string()),
+            bucket: Some("radar".to_string()),
+            prefix_pattern: Some(prefix.to_string()),
+            time_window: time_window.map(str::to_string),
+            ..tm35fin_test_config()
+        };
+        assert!(validate_config("c", None, &s3("%Y/%m/%d/", None)).is_ok());
+        assert!(validate_config("c", None, &s3("%Y/%j/%H/", Some("-PT3H"))).is_ok());
+        // Hourly without a window, finer than an hour, or unknown: all
+        // load errors, never a panic on the first poll.
+        assert!(validate_config("c", None, &s3("%Y/%j/%H/", None)).is_err());
+        assert!(validate_config("c", None, &s3("%Y/%H%M/", Some("-PT3H"))).is_err());
+        assert!(validate_config("c", None, &s3("%Y/%!/", None)).is_err());
     }
 
     #[test]
@@ -2428,31 +2424,6 @@ mod tests {
         // Neither resolves to a storageCrs URI (no stable EPSG code).
         assert!(ds_core::geo::native_crs_uri("LCC").is_none());
         assert!(ds_core::geo::native_crs_uri("stere").is_none());
-    }
-
-    #[test]
-    fn expand_prefix_with_date() {
-        let result = expand_prefix_pattern("%Y/%m/%d/OPERA/COMP/", 2);
-        assert_eq!(result.len(), 2);
-        // Both should be date-formatted paths
-        for p in &result {
-            assert!(p.ends_with("/OPERA/COMP"), "unexpected prefix: {}", p);
-            assert_eq!(p.len(), "2026/03/25/OPERA/COMP".len());
-        }
-        // First should be today, second yesterday
-        assert_ne!(result[0], result[1]);
-    }
-
-    #[test]
-    fn expand_prefix_single_day() {
-        let result = expand_prefix_pattern("%Y/%m/%d/data/", 1);
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn expand_prefix_zero_days_defaults_to_one() {
-        let result = expand_prefix_pattern("%Y/%m/%d/data/", 0);
-        assert_eq!(result.len(), 1);
     }
 
     #[test]
