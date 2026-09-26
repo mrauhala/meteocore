@@ -1179,25 +1179,6 @@ async fn render_map(
     // Share one metadata snapshot across default-time resolution and
     // parameter-name validation.
     let raster_info = engine.raster_info_shared();
-    let time = validated
-        .time
-        .or_else(|| engine.default_time())
-        .or_else(|| raster_info.times.last().copied());
-    // #521: resolve the run axis to the CONCRETE run the engine will render
-    // before the cache key is built. The Maps `reference_time` query
-    // parameter is still a follow-up (#337 Phase 4) — the handler never pins
-    // a run — but the no-TTL rendered cache must key on the run actually
-    // rendered: keyed as `None`, the first-rendered run's pixels would keep
-    // serving after a newer run re-covers the same valid times (acute for
-    // nowcast generations, latent for NWP). Asking the engine (not
-    // `reference_times.last()`) preserves GRIB's cross-run fallback when the
-    // newest run doesn't cover the valid time yet. Engines without runs keep
-    // the identity default (`None` stays `None`).
-    let reference_time = engine.resolve_reference_time(time, None);
-    // #507: snap to the exact timestep the engine will render before the
-    // cache key is built — a not-yet-ingested datetime must cache the
-    // previous timestep's pixels under the PREVIOUS timestep's key.
-    let time = engine.resolve_time(time, reference_time);
 
     // Parameter selection precedence: ?parameter-name= wins over style.parameter.
     // Validate against the engine's advertised list when the query supplied one
@@ -1232,6 +1213,32 @@ async fn render_map(
         .parameter_name
         .clone()
         .or_else(|| style_info.parameter.clone());
+
+    // Omitted `datetime`: the engine's default, else the parameter's (else
+    // the collection's) latest time.
+    let time = validated.time.or_else(|| {
+        ds_core::map_engine::default_request_time(
+            engine.as_ref(),
+            &raster_info,
+            effective_parameter.as_deref(),
+        )
+    });
+    // #521: resolve the run axis to the CONCRETE run the engine will render
+    // before the cache key is built. The Maps `reference_time` query
+    // parameter is still a follow-up (#337 Phase 4) — the handler never pins
+    // a run — but the no-TTL rendered cache must key on the run actually
+    // rendered: keyed as `None`, the first-rendered run's pixels would keep
+    // serving after a newer run re-covers the same valid times (acute for
+    // nowcast generations, latent for NWP). Asking the engine (not
+    // `reference_times.last()`) preserves GRIB's cross-run fallback when the
+    // newest run doesn't cover the valid time yet. Engines without runs keep
+    // the identity default (`None` stays `None`).
+    let reference_time = engine.resolve_reference_time(time, None);
+    // #507: snap to the exact timestep the engine will render before the
+    // cache key is built — a not-yet-ingested datetime must cache the
+    // previous timestep's pixels under the PREVIOUS timestep's key. A
+    // parameter with its own time axis snaps on that axis.
+    let time = engine.resolve_parameter_time(effective_parameter.as_deref(), time, reference_time);
 
     // Reject an `elevation` against a collection with no vertical axis
     // rather than silently rendering the default layer.

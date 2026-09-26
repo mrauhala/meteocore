@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
@@ -538,11 +540,128 @@ pub trait MapEngine: Send + Sync {
     fn content_version(&self) -> u64 {
         0
     }
+
+    /// The timesteps of one parameter, when a multi-parameter collection's
+    /// parameters are not all available at the same times — a satellite
+    /// collection whose bands and derived products land minutes apart.
+    /// `RasterInfo::times` is then the union over the parameters (the
+    /// collection's temporal extent is an envelope); this is one parameter's
+    /// own axis, advertised per layer where a standard allows it (a WMS child
+    /// layer's `time` dimension).
+    ///
+    /// Default `None`: the parameter has every time in `RasterInfo::times`.
+    /// **O(1) from a snapshot** (Critical Rule 10): WMS GetCapabilities
+    /// calls this for every parameter layer.
+    fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+        let _ = parameter;
+        None
+    }
+
+    /// [`Self::resolve_time`] for one parameter: the exact timestep this
+    /// engine would render for `parameter` at `time`, the instant that must
+    /// key the rendered caches (#507). `None` parameter means the one
+    /// `get_raster_tile` renders by default.
+    ///
+    /// An engine with [`Self::parameter_times`] MUST override this with the
+    /// same per-parameter selection `get_raster_tile` uses, or a request for
+    /// a time the parameter lacks would cache another timestep's pixels
+    /// under that time's key. Default: [`Self::resolve_time`].
+    fn resolve_parameter_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let _ = parameter;
+        self.resolve_time(time, reference_time)
+    }
+}
+
+/// The instant a map request that omits `TIME`/`datetime` renders, before
+/// [`MapEngine::resolve_parameter_time`] snaps it: the engine's own default
+/// ([`MapEngine::default_time`]), else the requested parameter's latest
+/// time, else the collection's latest. WMS, Maps and Tiles all call this so
+/// an omitted time means the same thing on every API.
+pub fn default_request_time(
+    engine: &dyn MapEngine,
+    info: &RasterInfo,
+    parameter: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    engine.default_time().or_else(|| {
+        parameter
+            .and_then(|p| engine.parameter_times(p))
+            .map_or_else(|| info.times.last().copied(), |times| times.last().copied())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `default_request_time`: the engine's own default wins, then the
+    /// parameter's latest time, then the collection's.
+    #[test]
+    fn default_request_time_prefers_engine_then_parameter_then_collection() {
+        struct Engine(Option<DateTime<Utc>>);
+        impl MapEngine for Engine {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unreachable!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                unreachable!()
+            }
+            fn default_time(&self) -> Option<DateTime<Utc>> {
+                self.0
+            }
+            fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+                (parameter == "late").then(|| Arc::from(vec![at(1)]))
+            }
+        }
+        fn at(hour: u32) -> DateTime<Utc> {
+            format!("2026-09-26T{hour:02}:00:00Z").parse().unwrap()
+        }
+        let info = RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: None,
+            times: vec![at(1), at(2)],
+            parameter: String::new(),
+            unit: String::new(),
+            parameters: Vec::new(),
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        };
+        let plain = Engine(None);
+        assert_eq!(
+            default_request_time(&plain, &info, Some("late")),
+            Some(at(1))
+        );
+        assert_eq!(
+            default_request_time(&plain, &info, Some("other")),
+            Some(at(2))
+        );
+        assert_eq!(default_request_time(&plain, &info, None), Some(at(2)));
+        assert_eq!(
+            default_request_time(&Engine(Some(at(5))), &info, Some("late")),
+            Some(at(5))
+        );
+        // The default resolution is `resolve_time`'s identity.
+        assert_eq!(
+            plain.resolve_parameter_time(Some("late"), Some(at(2)), None),
+            Some(at(2))
+        );
+    }
     use crate::geo::projected_output_crs;
 
     const FINLAND_WGS84: [f64; 4] = [19.0, 59.0, 32.0, 70.0]; // [w, s, e, n]

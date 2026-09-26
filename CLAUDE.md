@@ -285,6 +285,13 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `get_raster_tile` uses (share one helper so they cannot drift) — the API
    layers key the no-TTL rendered/meta-tile caches on it. Skipping this
    reintroduces the #507 cache poisoning (stale animation frames).
+   **If the engine's parameters have different time axes** (a satellite
+   collection whose products land minutes apart), keep `RasterInfo.times`
+   the union and override `MapEngine::parameter_times` and
+   `resolve_parameter_time` with the SAME per-parameter selection
+   `get_raster_tile` uses. The API layers then advertise and default each
+   parameter's own axis (WMS child-layer `time` dimension, Maps/Tiles
+   `datetime`) and key the caches on its resolved timestep (#819).
    **If the engine retains model runs** (non-empty
    `RasterInfo.reference_times`), it MUST likewise override
    `MapEngine::resolve_reference_time` with the SAME run selection
