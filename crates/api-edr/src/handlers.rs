@@ -1795,12 +1795,6 @@ pub async fn trajectory_query(
     }
 }
 
-/// Build a collection (or instance) metadata document.
-///
-/// `instance = None` ⇒ the collection itself (un-pinned; latest run for forecast
-/// engines). `instance = Some(run)` ⇒ that forecast model run as an OGC EDR
-/// *instance*: `id`, temporal extent and data-query hrefs are scoped to the run
-/// (`/collections/{id}/instances/{instanceId}/…`). See [`ds_core::instances`].
 /// An EDR `extent.temporal` object: the interval, the Gregorian TRS and,
 /// when known, the individual timesteps.
 fn temporal_extent_json(
@@ -1824,6 +1818,12 @@ fn temporal_extent_json(
     serde_json::Value::Object(temporal)
 }
 
+/// Build a collection (or instance) metadata document.
+///
+/// `instance = None` ⇒ the collection itself (un-pinned; latest run for forecast
+/// engines). `instance = Some(run)` ⇒ that forecast model run as an OGC EDR
+/// *instance*: `id`, temporal extent and data-query hrefs are scoped to the run
+/// (`/collections/{id}/instances/{instanceId}/…`). See [`ds_core::instances`].
 fn build_collection_metadata(
     engine: &dyn EdrEngine,
     config: &CollectionConfig,
