@@ -20,7 +20,7 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
-`engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`), API layers (`api-common` shared HTTP plumbing, `api-edr`,
+`engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`, `engine-satellite`), API layers (`api-common` shared HTTP plumbing, `api-edr`,
 `api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`,
 `api-mcp` — Model Context Protocol tools over the storm-cell surface), and
 `server` (the binary).
@@ -59,7 +59,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
 - `crates/engine-geotiff/CLAUDE.md`, `crates/engine-grib/CLAUDE.md`,
   `crates/engine-querydata/CLAUDE.md`, `crates/engine-zarr/CLAUDE.md`,
   `crates/engine-cap/CLAUDE.md`, `crates/engine-postgis/CLAUDE.md`,
-  `crates/engine-nowcast/CLAUDE.md` — one file per engine.
+  `crates/engine-nowcast/CLAUDE.md`, `crates/engine-satellite/CLAUDE.md` —
+  one file per engine.
 
 This root file holds only workspace-wide rules.
 
@@ -489,6 +490,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
+| Satellite | `MapEngine` | WMS, Maps, Tiles — geostationary imagery (GOES-R ABI NetCDF-4 on AWS or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, #819). EDR = #819 phase 2c |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
 
 ## Config Format

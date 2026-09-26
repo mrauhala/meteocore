@@ -394,6 +394,7 @@ fn mk_collection(
         postgis: None,
         nowcast: None,
         bufr: None,
+        satellite: None,
         preview: None,
     }
 }

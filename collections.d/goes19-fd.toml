@@ -1,0 +1,50 @@
+id = "goes19-fd"
+title = "GOES-19 full disk"
+description = "NOAA GOES-19 (GOES-East, 75.2°W) ABI full-disk imagery every 10 minutes: clean-IR brightness temperature (band 13, 10.3 µm) and L2 cloud top temperature, from NOAA Open Data on AWS"
+engine_type = "satellite"
+apis = ["wms", "maps", "tiles"]
+keywords = ["satellite", "GOES-19", "GOES-East", "NOAA", "infrared", "cloud top temperature"]
+
+[license]
+title = "NOAA Open Data Dissemination (NODD)"
+url = "https://registry.opendata.aws/noaa-goes/"
+
+# Each new scan is downloaded whole: band 13 is ~24 MB and cloud top
+# temperature ~30 MB per 10 minutes (~330 MB/hour for both), and startup
+# ingests the whole time_window. Keep the window short on a metered link.
+[satellite]
+provider = "goes-r"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "noaa-goes19"
+time_window = "-PT1H"
+poll_interval_secs = 60
+
+[[satellite.products]]
+parameter = "ir_10_3"
+title = "IR 10.3 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 13
+variable = "CMI"
+
+# About 57% of pixels carry a value: clear sky has no cloud top.
+[[satellite.products]]
+parameter = "cloud_top_temperature"
+title = "Cloud top temperature"
+unit = "K"
+product = "ABI-L2-ACHTF"
+variable = "TEMP"
+
+# Both parameters take the enhanced-IR palette over 180–330 K from the
+# built-in parameter defaults; the classic grey IR is a named style.
+[wms]
+colormap = "ir_bt_enhanced"
+min = 180.0
+max = 330.0
+
+[[wms.styles]]
+name = "ir-grey"
+title = "IR brightness temperature · grey"
+colormap = "ir_bt_grey"
+min = 180.0
+max = 330.0

@@ -152,6 +152,7 @@ fn build_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -457,6 +458,7 @@ mod vector_tile_discovery {
                 postgis: None,
                 nowcast: None,
                 bufr: None,
+                satellite: None,
                 preview: None,
             },
         );
@@ -949,6 +951,7 @@ mod metadata_extras {
                 postgis: None,
                 nowcast: None,
                 bufr: None,
+                satellite: None,
                 preview: None,
             },
         );

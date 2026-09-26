@@ -219,6 +219,7 @@ fn config(id: &str, engine_type: &str) -> CollectionConfig {
         postgis: None,
         nowcast: None,
         bufr: None,
+        satellite: None,
         preview: None,
     }
 }

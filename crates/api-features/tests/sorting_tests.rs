@@ -162,6 +162,7 @@ fn collection(id: &str) -> CollectionConfig {
         postgis: None,
         nowcast: None,
         bufr: None,
+        satellite: None,
         preview: None,
     }
 }

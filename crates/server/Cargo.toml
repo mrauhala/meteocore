@@ -19,6 +19,7 @@ engine-geotiff = { path = "../engine-geotiff" }
 engine-querydata = { path = "../engine-querydata" }
 engine-grib = { path = "../engine-grib" }
 engine-zarr = { path = "../engine-zarr" }
+engine-satellite = { path = "../engine-satellite" }
 engine-odim = { path = "../engine-odim" }
 engine-cap = { path = "../engine-cap" }
 engine-bufr = { path = "../engine-bufr" }

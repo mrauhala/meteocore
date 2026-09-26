@@ -95,6 +95,7 @@ fn build_empty_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -274,6 +275,7 @@ fn build_failing_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -432,6 +434,7 @@ fn build_populated_state(engine: Arc<dyn MapEngine>) -> Arc<ArcSwap<WmsState>> {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -823,6 +826,7 @@ fn build_counting_router_versioned(
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1070,6 +1074,7 @@ fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1358,6 +1363,7 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         postgis: None,
         nowcast: None,
         bufr: None,
+        satellite: None,
         preview: None,
     }
 }
@@ -1571,6 +1577,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1724,6 +1731,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1800,6 +1808,7 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -1864,6 +1873,7 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -2188,6 +2198,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -2373,6 +2384,7 @@ fn build_advancing_router() -> AdvancingFixture {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );
@@ -3431,6 +3443,7 @@ mod per_parameter_times {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         };
         let style = StyleInfo {

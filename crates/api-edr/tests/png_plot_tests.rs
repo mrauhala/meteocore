@@ -172,6 +172,7 @@ fn router_with(engine: Arc<dyn EdrEngine>) -> axum::Router {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         },
     );

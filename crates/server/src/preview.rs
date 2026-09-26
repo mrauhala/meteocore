@@ -1019,6 +1019,7 @@ mod tests {
             querydata_engines: RwLock::new(Vec::new()),
             grib_engines: RwLock::new(Vec::new()),
             zarr_engines: RwLock::new(Vec::new()),
+            satellite_engines: RwLock::new(Vec::new()),
             odim_engines: RwLock::new(Vec::new()),
             odim_volume_engines: RwLock::new(Vec::new()),
             cap_engines: RwLock::new(Vec::new()),
@@ -1053,6 +1054,7 @@ mod tests {
             postgis: None,
             nowcast: None,
             bufr: None,
+            satellite: None,
             preview: None,
         }
     }

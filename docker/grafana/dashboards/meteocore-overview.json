@@ -1197,6 +1197,16 @@
           "expr": "rate(lightning_strike_cache_hits_total[$__rate_interval]) / clamp_min(rate(lightning_strike_cache_hits_total[$__rate_interval]) + rate(lightning_strike_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "C",
           "legendFormat": "Lightning strike windows (#504)"
+        },
+        {
+          "expr": "rate(satellite_frame_cache_hits_total[$__rate_interval]) / clamp_min(rate(satellite_frame_cache_hits_total[$__rate_interval]) + rate(satellite_frame_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "F",
+          "legendFormat": "Satellite scans (#819)"
+        },
+        {
+          "expr": "rate(satellite_strip_cache_hits_total[$__rate_interval]) / clamp_min(rate(satellite_strip_cache_hits_total[$__rate_interval]) + rate(satellite_strip_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "H",
+          "legendFormat": "Satellite decoded strips (#819)"
         }
       ]
     },
@@ -1300,6 +1310,16 @@
           "expr": "rate(lightning_strike_cache_misses_total[$__rate_interval])",
           "refId": "A",
           "legendFormat": "Lightning strike windows (#504)"
+        },
+        {
+          "expr": "rate(satellite_frame_cache_misses_total[$__rate_interval])",
+          "refId": "F",
+          "legendFormat": "Satellite scans (#819)"
+        },
+        {
+          "expr": "rate(satellite_strip_cache_misses_total[$__rate_interval])",
+          "refId": "G",
+          "legendFormat": "Satellite decoded strips (#819)"
         }
       ]
     },
@@ -1405,6 +1425,16 @@
           "expr": "lightning_strike_cache_bytes / clamp_min(lightning_strike_cache_capacity_bytes, 1)",
           "refId": "B",
           "legendFormat": "Lightning strike windows (#504)"
+        },
+        {
+          "expr": "satellite_frame_cache_bytes / clamp_min(satellite_frame_cache_capacity_bytes, 1)",
+          "refId": "G",
+          "legendFormat": "Satellite scans (#819)"
+        },
+        {
+          "expr": "satellite_strip_cache_bytes / clamp_min(satellite_strip_cache_capacity_bytes, 1)",
+          "refId": "H",
+          "legendFormat": "Satellite decoded strips (#819)"
         }
       ]
     },

@@ -239,6 +239,8 @@ pub struct CollectionConfig {
     pub nowcast: Option<NowcastConfig>,
     /// BUFR surface-observation engine (`engine_type = "bufr"`).
     pub bufr: Option<BufrConfig>,
+    /// Geostationary satellite imagery (`engine_type = "satellite"`).
+    pub satellite: Option<SatelliteConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
 }
@@ -1072,6 +1074,154 @@ pub fn validate_bufr(id: &str, cfg: &BufrConfig) -> Result<(), crate::error::Dat
         return Err(Config(format!(
             "Collection '{id}': [bufr] builtin_parameters = false requires at least one [[bufr.parameters]] entry"
         )));
+    }
+    Ok(())
+}
+
+/// Geostationary satellite imagery (`engine_type = "satellite"`, #819): one
+/// collection per satellite and sector, one parameter per product (a band,
+/// or a derived L2 field). Each product has its own time axis.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct SatelliteConfig {
+    /// File layout and naming convention. `"goes-r"`: NOAA GOES-R ABI
+    /// NetCDF-4 (L1b/L2) as published on AWS, `<product>/%Y/%j/%H/OR_…`.
+    #[serde(default = "default_satellite_provider")]
+    pub provider: String,
+    /// Local directory holding the files (listed recursively). Mutually
+    /// exclusive with `endpoint` + `bucket`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub data_path: Option<String>,
+    /// S3 endpoint of a public bucket, e.g.
+    /// `"https://s3.us-east-1.amazonaws.com"` (requests are unsigned).
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub endpoint: Option<String>,
+    /// S3 bucket, e.g. `"noaa-goes19"`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub bucket: Option<String>,
+    /// How far back scans are discovered and served (ISO 8601, e.g.
+    /// `"-PT2H"`). Required for a bucket, whose hourly prefixes it expands
+    /// (at most 24 h); optional for a local directory.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub time_window: Option<String>,
+    #[serde(default = "default_satellite_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    pub products: Vec<SatelliteProductConfig>,
+}
+
+/// One product of a satellite collection, served as one parameter.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct SatelliteProductConfig {
+    /// Parameter name (`^[a-z0-9_]+$`), e.g. `"ir_10_3"`.
+    pub parameter: String,
+    /// Human title, e.g. `"IR 10.3 µm brightness temperature"`. It feeds
+    /// the default style match (`parameter_defaults`), so name the quantity.
+    pub title: String,
+    /// Unit of the physical values, e.g. `"K"`. Declared here because
+    /// styles resolve at load, before the first file arrives.
+    pub unit: String,
+    /// GOES-R product, e.g. `"ABI-L2-CMIPF"` (full-disk cloud and moisture
+    /// imagery) or `"ABI-L2-ACHTF"` (full-disk cloud top temperature).
+    pub product: String,
+    /// ABI band (1–16) for per-band products such as CMIP.
+    #[serde(default)]
+    pub band: Option<u8>,
+    /// NetCDF variable holding the values, e.g. `"CMI"` or `"TEMP"`.
+    pub variable: String,
+}
+
+fn default_satellite_provider() -> String {
+    "goes-r".to_string()
+}
+
+fn default_satellite_poll_interval_secs() -> u64 {
+    60
+}
+
+/// Hard-fail validation for a [`SatelliteConfig`].
+pub fn validate_satellite(
+    id: &str,
+    cfg: &SatelliteConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    if cfg.provider != "goes-r" {
+        return Err(Config(format!(
+            "Collection '{id}': [satellite].provider '{}' is not supported (supported: goes-r)",
+            cfg.provider
+        )));
+    }
+    match (&cfg.data_path, &cfg.endpoint, &cfg.bucket) {
+        (Some(_), None, None) => {}
+        (None, Some(_), Some(_)) => {
+            if cfg.time_window.is_none() {
+                return Err(Config(format!(
+                    "Collection '{id}': [satellite] with a bucket needs a time_window"
+                )));
+            }
+        }
+        _ => {
+            return Err(Config(format!(
+                "Collection '{id}': [satellite] needs either 'data_path' or both \
+                 'endpoint' and 'bucket'"
+            )))
+        }
+    }
+    if cfg.poll_interval_secs == 0 {
+        return Err(Config(format!(
+            "Collection '{id}': [satellite].poll_interval_secs must be > 0"
+        )));
+    }
+    if cfg.products.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [satellite] needs at least one [[satellite.products]] entry"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for product in &cfg.products {
+        let name = &product.parameter;
+        let valid_name = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        if !valid_name {
+            return Err(Config(format!(
+                "Collection '{id}': satellite parameter '{name}' must match ^[a-z0-9_]+$"
+            )));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(Config(format!(
+                "Collection '{id}': satellite parameter '{name}' is listed twice"
+            )));
+        }
+        for (field, value) in [
+            ("title", &product.title),
+            ("unit", &product.unit),
+            ("product", &product.product),
+            ("variable", &product.variable),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Config(format!(
+                    "Collection '{id}': satellite parameter '{name}' needs a non-empty '{field}'"
+                )));
+            }
+        }
+        if !product
+            .product
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(Config(format!(
+                "Collection '{id}': satellite product '{}' may contain only letters, digits and '-'",
+                product.product
+            )));
+        }
+        if let Some(band) = product.band {
+            if !(1..=16).contains(&band) {
+                return Err(Config(format!(
+                    "Collection '{id}': satellite parameter '{name}' band {band} is not an ABI band (1-16)"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -3404,6 +3554,22 @@ impl ServerConfig {
             }
             if let Some(bufr) = &collection.bufr {
                 validate_bufr(id, bufr)?;
+            }
+
+            // Satellite engine requires its config section, and vice versa.
+            if collection.engine_type == "satellite" && collection.satellite.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'satellite' requires a [collections.satellite] config section"
+                )));
+            }
+            if collection.satellite.is_some() && collection.engine_type != "satellite" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.satellite] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(satellite) = &collection.satellite {
+                validate_satellite(id, satellite)?;
             }
 
             // style_bundle: reference must resolve. Inline [wms] fields are

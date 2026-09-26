@@ -448,6 +448,34 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (100.0, [200, 200, 205, 255]), // overcast — light gray
         ],
     },
+    // Satellite IR window brightness temperature (#819), in kelvin over
+    // 180–330 K: the coldest storm tops to the warmest land. Cold (high)
+    // cloud tops are bright, warm surfaces dark — the classic IR image.
+    BuiltinDef {
+        name: "ir_bt_grey",
+        title: "IR brightness temperature (grey, K)",
+        normalized: false,
+        stops: &[(180.0, [255, 255, 255, 255]), (330.0, [0, 0, 0, 255])],
+    },
+    // The same grey for warm scenes, with a colour ramp over cold cloud
+    // tops below 243 K (−30 °C), where convective storms show.
+    BuiltinDef {
+        name: "ir_bt_enhanced",
+        title: "IR brightness temperature (enhanced cold tops, K)",
+        normalized: false,
+        stops: &[
+            (180.0, [255, 255, 255, 255]), // overshooting tops
+            (185.0, [200, 0, 200, 255]),   // magenta
+            (193.0, [255, 0, 0, 255]),     // red
+            (198.0, [255, 140, 0, 255]),   // orange
+            (203.0, [255, 255, 0, 255]),   // yellow
+            (213.0, [0, 200, 0, 255]),     // green
+            (223.0, [0, 80, 255, 255]),    // blue
+            (233.0, [0, 200, 255, 255]),   // cyan
+            (243.0, [230, 230, 230, 255]), // light grey
+            (330.0, [0, 0, 0, 255]),       // black
+        ],
+    },
 ];
 
 fn materialize(def: &BuiltinDef) -> Palette {
@@ -603,6 +631,8 @@ mod tests {
             ("pressure", 8, 950.0, 1050.0),
             ("humidity", 6, 0.0, 100.0),
             ("cloud_cover", 6, 0.0, 100.0),
+            ("ir_bt_grey", 2, 180.0, 330.0),
+            ("ir_bt_enhanced", 10, 180.0, 330.0),
         ];
         assert_eq!(builtin_palettes().len(), expected.len());
         assert_eq!(builtin_names().len(), expected.len());
