@@ -46,6 +46,17 @@ use source::Source;
 /// sequential download (Critical Rule 9).
 const MAX_INGEST_PER_POLL: usize = 4;
 
+/// Scans one EDR query may download because the cache evicted them (a
+/// 2 km full disk is ~25 MB): checked before the first fetch, so an
+/// unfiltered query on a long catalog cannot chain sequential downloads
+/// (Critical Rule 9).
+const MAX_QUERY_FETCHES: usize = 8;
+
+/// Strips one EDR query may decode, over all its products and scans (~0.7 ms
+/// and ~260 KB each for a 2 km full-width strip). A position reads one strip
+/// per scan; an area the strips its polygon's rows cross, per product grid.
+const MAX_QUERY_STRIPS: usize = 1024;
+
 /// One configured product, served as one parameter.
 struct Product {
     parameter: Arc<str>,
@@ -403,6 +414,36 @@ impl SatelliteEngine {
         Ok((plan, times))
     }
 
+    /// Reject a query that would download more than [`MAX_QUERY_FETCHES`]
+    /// evicted scans, before it fetches any.
+    fn check_fetch_budget(
+        &self,
+        plan: &[(usize, Vec<DateTime<Utc>>)],
+    ) -> Result<(), DataServerError> {
+        let missing = plan
+            .iter()
+            .flat_map(|(index, own)| own.iter().map(move |time| (*index, *time)))
+            .filter(|(index, time)| !FRAMES.contains_key(&self.frame_key(*index, *time)))
+            .count();
+        if missing > MAX_QUERY_FETCHES {
+            return Err(DataServerError::QueryTooLarge(format!(
+                "The query addresses {missing} scans that are not held in memory; at most \
+                 {MAX_QUERY_FETCHES} per request — narrow the datetime window"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_strip_budget(strips: usize) -> Result<(), DataServerError> {
+        if strips > MAX_QUERY_STRIPS {
+            return Err(DataServerError::QueryTooLarge(format!(
+                "The query would decode {strips} image strips; at most {MAX_QUERY_STRIPS} per \
+                 request — narrow the datetime window, the polygon or the parameters"
+            )));
+        }
+        Ok(())
+    }
+
     fn description(&self, index: usize) -> ParameterDescription {
         let parameter = &self.parameters[index];
         ParameterDescription {
@@ -613,6 +654,8 @@ impl EdrEngine for SatelliteEngine {
         let (lat, lon) = parse_point_coords(coords)?;
         let catalog = self.catalog.load();
         let (plan, times) = self.query_plan(&catalog, parameters, datetime)?;
+        self.check_fetch_budget(&plan)?;
+        Self::check_strip_budget(plan.iter().map(|(_, own)| own.len()).sum())?;
         let mut on_disk = false;
         let mut descriptions = HashMap::new();
         let mut ranges = HashMap::new();
@@ -681,24 +724,31 @@ impl EdrEngine for SatelliteEngine {
             )));
         }
 
-        // The grid samples at the nadir pixel size, capped per axis.
-        let (first, first_time) = plan
-            .iter()
-            .find_map(|(index, own)| own.first().map(|t| (*index, *t)))
-            .expect("query_plan returns a non-empty time axis");
-        let probe = self.frame(first, first_time, &catalog.frames[first][&first_time])?;
-        let resolution = probe.gt.pixel_width / 111_320.0;
+        self.check_fetch_budget(&plan)?;
+        // Each product has its own grid (ABI bands are 0.5, 1 or 2 km): the
+        // decode budget sums the strips its polygon rows cross on each grid,
+        // and the output grid samples at the finest nadir pixel size.
+        let b = &polygon.bbox;
+        let mut resolution = f64::INFINITY;
+        let mut strips = 0usize;
+        for (index, own) in &plan {
+            let Some(&first) = own.first() else {
+                continue;
+            };
+            let probe = self.frame(*index, first, &catalog.frames[*index][&first])?;
+            resolution = resolution.min(probe.gt.pixel_width / 111_320.0);
+            if let Some((_, r0, _, r1)) = probe.gt.bbox_to_pixels(b.west, b.south, b.east, b.north)
+            {
+                let rows = r0 / probe.strip_rows..=(r1 - 1) / probe.strip_rows;
+                strips = strips.saturating_add(rows.count().saturating_mul(own.len()));
+            }
+        }
+        Self::check_strip_budget(strips)?;
         let axes = polygon.sample_grid(resolution, resolution, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
         check_area_budget(times.len(), ny, nx, plan.len())?;
         check_mask_budget(nx * ny, &polygon)?;
         let mask = polygon.cell_mask(&axes);
-        // A scan's read decodes the polygon's rows at full width.
-        let b = &polygon.bbox;
-        if let Some((_, r0, _, r1)) = probe.gt.bbox_to_pixels(b.west, b.south, b.east, b.north) {
-            let rows = (r1 - r0) as usize;
-            check_area_budget(times.len(), rows, probe.gt.width as usize, plan.len())?;
-        }
 
         let span = if b.crosses_antimeridian() {
             b.east + 360.0 - b.west
@@ -925,6 +975,15 @@ mod tests {
     use super::{union_extent, Catalog};
     use ds_core::map_engine::ParameterInfo;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn strip_budget_caps_decode_work() {
+        assert!(super::SatelliteEngine::check_strip_budget(super::MAX_QUERY_STRIPS).is_ok());
+        assert!(matches!(
+            super::SatelliteEngine::check_strip_budget(super::MAX_QUERY_STRIPS + 1),
+            Err(ds_core::error::DataServerError::QueryTooLarge(_))
+        ));
+    }
 
     /// A grid size is advertised only when the products share it.
     #[test]
