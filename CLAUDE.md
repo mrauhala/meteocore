@@ -107,6 +107,8 @@ Violating these has caused production incidents. Never break them.
      directly on a blocking worker, retaining that worker's runtime handle.
      Keep both async-worker progress and actual render-executor regressions
      in `crates/engine-zarr/src/store/coalescing_tests.rs` and `refresh_tests.rs`.
+     engine-satellite's evicted-scan fetch is the same exception (EDR on
+     async workers, renders on blocking ones): `tests/refetch.rs`.
    - Never from a non-Tokio thread such as a rayon pool — that hits a
      construct-a-new-`Runtime`-per-call fallback (#222). For parallel remote
      fetches, use async concurrency (`join_all`) on the runtime, or pass a
@@ -490,7 +492,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
-| Satellite | `MapEngine` | WMS, Maps, Tiles — geostationary imagery (GOES-R ABI NetCDF-4 on AWS or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, #819). EDR = #819 phase 2c |
+| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4 on AWS or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819) |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
 
 ## Config Format

@@ -24,9 +24,12 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   strip inflates each chunk once; the reader's own chunk cache is off
   because decoded strips are cached in `cache::STRIPS`.
 - **No request-time S3 in the steady state.** The poll loop downloads each
-  new scan whole and inserts it into `cache::FRAMES`. A render only fetches
-  a scan the cache evicted, on its blocking worker with
-  `Handle::try_current()` → `DataStore::get_on` (Critical Rule 7).
+  new scan whole and inserts it into `cache::FRAMES`. A scan the cache
+  evicted is fetched again by `Source::fetch` → `DataStore::get`, from a
+  render job (blocking worker) or an EDR query (async request worker). That
+  bridge serves both — the plain-Zarr exception to Critical Rule 7 — where
+  an explicit `get_on` handle panics on the async worker.
+  `tests/refetch.rs` runs both call sites with zero-size caches.
 - **Ingest is capped per poll** (`MAX_INGEST_PER_POLL`, newest first):
   bootstrapping a window spreads over polls (Critical Rule 9).
 - **No footprint guard.** `Crs::Geostationary::forward` is NaN behind the
@@ -60,8 +63,17 @@ disk interior) with the original packed integers, chunking and compression;
 the global `meteocore_fixture` attribute records each crop. Tests copy them
 into a nested temp directory (local discovery lists recursively).
 
+## EDR
+
+Position, area and radius (radius via area). A response's time axis is the
+union of the selected products' scans, null where a product has none; an
+instant snaps per product through `select`. `get_parameter_available_times`
+feeds each product's own `extent.temporal` in `parameter_names`. Area grids
+sample at the nadir pixel size through a `ProjectionGrid` (never a per-cell
+geostationary forward), with the native-read budget on the polygon's rows at
+full width. Update `crates/api-edr/README.md` with any change here.
+
 ## Not yet
 
-EDR (position/area, per-parameter `extent` in `parameter_names`) is phase
-2c. Other providers (Himawari ISatSS µrad tiles, GK2A CGMS navigation,
-MTG) are phases 3 and 5.
+Other providers (Himawari ISatSS µrad tiles, GK2A CGMS navigation, MTG) are
+phases 3 and 5.

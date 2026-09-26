@@ -13,15 +13,22 @@ mod frame;
 mod naming;
 mod source;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::config::SatelliteConfig;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::{
+    check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, MAX_AREA_DIM,
+};
 use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+};
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::{validate_prefix_pattern, TimeWindow};
@@ -288,7 +295,7 @@ impl SatelliteEngine {
         path: &ObjectPath,
     ) -> Result<Arc<Frame>, DataServerError> {
         let key = self.frame_key(index, time);
-        let bytes = self.source.fetch(path, None)?;
+        let bytes = self.source.fetch(path)?;
         let frame = Arc::new(
             Frame::open(bytes, &self.products[index].variable).map_err(DataServerError::Engine)?,
         );
@@ -341,6 +348,70 @@ impl SatelliteEngine {
         }
     }
 
+    /// The scans an EDR query addresses for one product: every scan for no
+    /// `datetime`, the scan [`Self::select`] renders for an instant, and the
+    /// scans inside an interval.
+    fn query_times(
+        catalog: &Catalog,
+        index: usize,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Vec<DateTime<Utc>> {
+        match datetime {
+            None => catalog.frames[index].keys().copied().collect(),
+            Some((start, end)) if start == end => Self::select(catalog, index, Some(start))
+                .into_iter()
+                .collect(),
+            Some((start, end)) => catalog.frames[index]
+                .range(start..=end)
+                .map(|(time, _)| *time)
+                .collect(),
+        }
+    }
+
+    /// The products an EDR query names (all for `None`), each with the scans
+    /// it addresses, and the query's time axis: the union of those scans. A
+    /// product without a scan at one of the union's times reads null there.
+    #[allow(clippy::type_complexity)]
+    fn query_plan(
+        &self,
+        catalog: &Catalog,
+        parameters: Option<&[String]>,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<(Vec<(usize, Vec<DateTime<Utc>>)>, Vec<DateTime<Utc>>), DataServerError> {
+        let mut indices: Vec<usize> = match parameters {
+            None => (0..self.products.len()).collect(),
+            Some(names) => names
+                .iter()
+                .map(|name| self.product_index(Some(name)))
+                .collect::<Result<_, _>>()?,
+        };
+        indices.sort_unstable();
+        indices.dedup();
+        let plan: Vec<(usize, Vec<DateTime<Utc>>)> = indices
+            .into_iter()
+            .map(|index| (index, Self::query_times(catalog, index, datetime)))
+            .collect();
+        let mut times: Vec<DateTime<Utc>> =
+            plan.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+        times.sort_unstable();
+        times.dedup();
+        if times.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "No scans available for the requested time range".into(),
+            ));
+        }
+        Ok((plan, times))
+    }
+
+    fn description(&self, index: usize) -> ParameterDescription {
+        let parameter = &self.parameters[index];
+        ParameterDescription {
+            label: parameter.title.clone(),
+            unit: parameter.unit.clone(),
+            observed_property: parameter.name.clone(),
+        }
+    }
+
     /// The scan, from the cache or fetched again after eviction.
     fn frame(
         &self,
@@ -349,10 +420,7 @@ impl SatelliteEngine {
         path: &ObjectPath,
     ) -> Result<Arc<Frame>, DataServerError> {
         FRAMES.get_or_insert_with(&self.frame_key(index, time), || {
-            // Renders run on blocking workers: fetch on their runtime
-            // explicitly (Critical Rule 7).
-            let handle = tokio::runtime::Handle::try_current().ok();
-            let bytes = self.source.fetch(path, handle.as_ref())?;
+            let bytes = self.source.fetch(path)?;
             Frame::open(bytes, &self.products[index].variable)
                 .map(Arc::new)
                 .map_err(DataServerError::Engine)
@@ -435,6 +503,276 @@ fn union_extent<'a>(mut extents: impl Iterator<Item = &'a [f64; 4]>) -> Option<[
         ds_core::geo::wrap_lon(reference + e),
         n,
     ])
+}
+
+/// Reads pixels of one scan through the strip cache, remembering the strips
+/// already fetched for this request.
+struct PixelReader<'a> {
+    key: FrameKey,
+    frame: &'a Frame,
+    strips: Vec<Option<Arc<[u16]>>>,
+}
+
+impl<'a> PixelReader<'a> {
+    fn new(key: FrameKey, frame: &'a Frame) -> Self {
+        PixelReader {
+            key,
+            frame,
+            strips: vec![None; frame.strip_count() as usize],
+        }
+    }
+
+    /// The physical value of full-resolution pixel `(row, col)`.
+    fn value(&mut self, row: u32, col: u32) -> Result<Option<f64>, DataServerError> {
+        let frame = self.frame;
+        let index = (row / frame.strip_rows) as usize;
+        if self.strips[index].is_none() {
+            let strip = STRIPS.get_or_insert_with(
+                &StripKey {
+                    frame: self.key.clone(),
+                    strip: index as u32,
+                },
+                || {
+                    frame
+                        .read_strip(index as u32)
+                        .map_err(DataServerError::Engine)
+                },
+            )?;
+            self.strips[index] = Some(strip);
+        }
+        let strip = self.strips[index].as_ref().expect("filled above");
+        let raw = strip[(row % frame.strip_rows) as usize * frame.gt.width as usize + col as usize];
+        Ok(frame.packing.decode(raw))
+    }
+}
+
+/// EDR over the scans: a position is a time series of the pixel under the
+/// point, an area a CRS84 grid sampled at the nadir resolution. Queries run
+/// on async request workers; a scan the cache evicted is fetched through
+/// `Source::fetch`, which is safe there.
+impl EdrEngine for SatelliteEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(Vec::new())
+    }
+
+    fn query_location(
+        &self,
+        location_id: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::LocationNotFound(format!(
+            "'{}' has no named locations (requested '{location_id}')",
+            self.collection_id
+        )))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        self.parameters.iter().map(|p| p.name.clone()).collect()
+    }
+
+    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+        (0..self.parameters.len())
+            .map(|index| (self.parameters[index].name.clone(), self.description(index)))
+            .collect()
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let info = self.catalog.load().info.clone();
+        Some((*info.times.first()?, *info.times.last()?))
+    }
+
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        Some(self.catalog.load().info.times.clone())
+    }
+
+    fn get_parameter_available_times(&self, parameter: &str) -> Option<Vec<DateTime<Utc>>> {
+        let index = self.product_index(Some(parameter)).ok()?;
+        Some(self.catalog.load().times[index].to_vec())
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        self.catalog.load().info.spatial_extent
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["position".into(), "area".into(), "radius".into()]
+    }
+
+    fn query_position(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        ds_core::deadline::check()?;
+        let (lat, lon) = parse_point_coords(coords)?;
+        let catalog = self.catalog.load();
+        let (plan, times) = self.query_plan(&catalog, parameters, datetime)?;
+        let mut on_disk = false;
+        let mut descriptions = HashMap::new();
+        let mut ranges = HashMap::new();
+        for (index, own) in plan {
+            let mut values = vec![None; times.len()];
+            for time in own {
+                ds_core::deadline::check()?;
+                let frame = self.frame(index, time, &catalog.frames[index][&time])?;
+                let Some((col, row)) = frame.gt.world_to_pixel(lon, lat) else {
+                    continue;
+                };
+                on_disk = true;
+                let slot = times.binary_search(&time).expect("time is in the union");
+                values[slot] =
+                    PixelReader::new(self.frame_key(index, time), &frame).value(row, col)?;
+            }
+            let name = self.parameters[index].name.clone();
+            descriptions.insert(name.clone(), self.description(index));
+            ranges.insert(
+                name,
+                NdArray {
+                    shape: vec![times.len()],
+                    axis_names: vec!["t".into()],
+                    values,
+                },
+            );
+        }
+        if !on_disk {
+            return Err(DataServerError::LocationNotFound(format!(
+                "POINT({lon} {lat}) is not on the Earth disk '{}' sees",
+                self.collection_id
+            )));
+        }
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::PointSeries {
+                x: lon,
+                y: lat,
+                t: times,
+                z: None,
+            },
+            parameters: descriptions,
+            ranges,
+        }))
+    }
+
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        ds_core::deadline::check()?;
+        let polygon = parse_area_coords(coords)?;
+        let catalog = self.catalog.load();
+        let (plan, times) = self.query_plan(&catalog, parameters, datetime)?;
+        let seen = catalog
+            .info
+            .spatial_extent
+            .is_some_and(|extent| polygon.bbox.intersects_bbox(&extent));
+        if !seen {
+            return Err(DataServerError::LocationNotFound(format!(
+                "The polygon lies outside the Earth disk '{}' sees",
+                self.collection_id
+            )));
+        }
+
+        // The grid samples at the nadir pixel size, capped per axis.
+        let (first, first_time) = plan
+            .iter()
+            .find_map(|(index, own)| own.first().map(|t| (*index, *t)))
+            .expect("query_plan returns a non-empty time axis");
+        let probe = self.frame(first, first_time, &catalog.frames[first][&first_time])?;
+        let resolution = probe.gt.pixel_width / 111_320.0;
+        let axes = polygon.sample_grid(resolution, resolution, MAX_AREA_DIM);
+        let (nx, ny) = axes.dims();
+        check_area_budget(times.len(), ny, nx, plan.len())?;
+        check_mask_budget(nx * ny, &polygon)?;
+        let mask = polygon.cell_mask(&axes);
+        // A scan's read decodes the polygon's rows at full width.
+        let b = &polygon.bbox;
+        if let Some((_, r0, _, r1)) = probe.gt.bbox_to_pixels(b.west, b.south, b.east, b.north) {
+            let rows = (r1 - r0) as usize;
+            check_area_budget(times.len(), rows, probe.gt.width as usize, plan.len())?;
+        }
+
+        let span = if b.crosses_antimeridian() {
+            b.east + 360.0 - b.west
+        } else {
+            b.east - b.west
+        };
+        let has_time = times.len() > 1;
+        let mut descriptions = HashMap::new();
+        let mut ranges = HashMap::new();
+        for (index, own) in plan {
+            let mut values = vec![None; times.len() * ny * nx];
+            for time in own {
+                ds_core::deadline::check()?;
+                let frame = self.frame(index, time, &catalog.frames[index][&time])?;
+                let gt = &frame.gt;
+                // Output cells → source pixels on a coarse grid (the
+                // geostationary forward transform is the expensive step).
+                let grid = ProjectionGrid::build_2d(
+                    nx as u32,
+                    ny as u32,
+                    gt.width,
+                    gt.height,
+                    |fx, fy| (b.west + fx * span, b.north - fy * (b.north - b.south)),
+                    |lon, lat| gt.world_to_pixel_f64(lon, lat),
+                );
+                let mut reader = PixelReader::new(self.frame_key(index, time), &frame);
+                let offset = times.binary_search(&time).expect("time is in the union") * ny * nx;
+                for iy in 0..ny {
+                    ds_core::deadline::check()?;
+                    for ix in 0..nx {
+                        let cell = axes.index(ix, iy);
+                        if !mask[cell] {
+                            continue;
+                        }
+                        let (c, r) = grid.sample(ix as u32, iy as u32);
+                        let inside = c.is_finite()
+                            && r.is_finite()
+                            && c >= 0.0
+                            && r >= 0.0
+                            && c < gt.width as f64
+                            && r < gt.height as f64;
+                        if inside {
+                            values[offset + cell] = reader.value(r as u32, c as u32)?;
+                        }
+                    }
+                }
+            }
+            let name = self.parameters[index].name.clone();
+            descriptions.insert(name.clone(), self.description(index));
+            let (shape, axis_names) = if has_time {
+                (vec![times.len(), ny, nx], vec!["t", "y", "x"])
+            } else {
+                (vec![ny, nx], vec!["y", "x"])
+            };
+            ranges.insert(
+                name,
+                NdArray {
+                    shape,
+                    axis_names: axis_names.into_iter().map(String::from).collect(),
+                    values,
+                },
+            );
+        }
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Grid {
+                x: axes.x,
+                y: axes.y,
+                t: has_time.then_some(times),
+                z: None,
+            },
+            parameters: descriptions,
+            ranges,
+        }))
+    }
 }
 
 impl MapEngine for SatelliteEngine {

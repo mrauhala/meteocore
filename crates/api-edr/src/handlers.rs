@@ -1801,6 +1801,29 @@ pub async fn trajectory_query(
 /// engines). `instance = Some(run)` ⇒ that forecast model run as an OGC EDR
 /// *instance*: `id`, temporal extent and data-query hrefs are scoped to the run
 /// (`/collections/{id}/instances/{instanceId}/…`). See [`ds_core::instances`].
+/// An EDR `extent.temporal` object: the interval, the Gregorian TRS and,
+/// when known, the individual timesteps.
+fn temporal_extent_json(
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    times: Option<&[chrono::DateTime<chrono::Utc>]>,
+) -> serde_json::Value {
+    let mut temporal = serde_json::Map::new();
+    temporal.insert(
+        "interval".to_string(),
+        json!([[start.to_rfc3339(), end.to_rfc3339()]]),
+    );
+    temporal.insert(
+        "trs".to_string(),
+        json!("http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"),
+    );
+    if let Some(times) = times {
+        let values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+        temporal.insert("values".to_string(), json!(values));
+    }
+    serde_json::Value::Object(temporal)
+}
+
 fn build_collection_metadata(
     engine: &dyn EdrEngine,
     config: &CollectionConfig,
@@ -1844,28 +1867,16 @@ fn build_collection_metadata(
         );
     }
     if let Some((start, end)) = temporal {
-        let mut temporal_obj = serde_json::Map::new();
-        temporal_obj.insert(
-            "interval".to_string(),
-            json!([[start.to_rfc3339(), end.to_rfc3339()]]),
-        );
-        temporal_obj.insert(
-            "trs".to_string(),
-            json!("http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"),
-        );
-
         // Include individual timesteps if available (the run's valid times for
         // an instance, the engine's for the collection).
         let times = match instance {
             Some(run) => (!run.valid_times.is_empty()).then(|| run.valid_times.clone()),
             None => engine.get_available_times(),
         };
-        if let Some(times) = times {
-            let values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
-            temporal_obj.insert("values".to_string(), json!(values));
-        }
-
-        extent.insert("temporal".to_string(), json!(temporal_obj));
+        extent.insert(
+            "temporal".to_string(),
+            temporal_extent_json(start, end, times.as_deref()),
+        );
     }
 
     // Vertical extent — advertise the available levels so a client knows
@@ -1916,6 +1927,19 @@ fn build_collection_metadata(
                         "type": "http://www.opengis.net/def/uom/UCUM/"
                     }
                 });
+            }
+            // A parameter on its own time axis (a satellite product) carries
+            // its own temporal extent; the collection's is the union (#819).
+            // Instances keep the run's axis.
+            let own_times = instance
+                .is_none()
+                .then(|| engine.get_parameter_available_times(name))
+                .flatten();
+            if let Some(times) = own_times {
+                if let (Some(&start), Some(&end)) = (times.first(), times.last()) {
+                    param["extent"] =
+                        json!({ "temporal": temporal_extent_json(start, end, Some(&times)) });
+                }
             }
             (name.clone(), param)
         })

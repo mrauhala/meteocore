@@ -102,6 +102,17 @@ pub trait EdrEngine: Send + Sync {
         None
     }
 
+    /// The timesteps of one parameter, when a collection's parameters are
+    /// not all available at the same times (a satellite collection whose
+    /// products land minutes apart). The collection's temporal extent stays
+    /// the union; this is advertised as the parameter's own
+    /// `extent.temporal` in `parameter_names` (EDR 1.1 allows a
+    /// per-parameter extent). Default `None`: every collection time.
+    fn get_parameter_available_times(&self, parameter: &str) -> Option<Vec<DateTime<Utc>>> {
+        let _ = parameter;
+        None
+    }
+
     fn get_spatial_extent(&self) -> Option<[f64; 4]>;
 
     /// Returns the collection's vertical axis, when it has one.

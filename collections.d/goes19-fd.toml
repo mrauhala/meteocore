@@ -2,7 +2,7 @@ id = "goes19-fd"
 title = "GOES-19 full disk"
 description = "NOAA GOES-19 (GOES-East, 75.2°W) ABI full-disk imagery every 10 minutes: clean-IR brightness temperature (band 13, 10.3 µm) and L2 cloud top temperature, from NOAA Open Data on AWS"
 engine_type = "satellite"
-apis = ["wms", "maps", "tiles"]
+apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["satellite", "GOES-19", "GOES-East", "NOAA", "infrared", "cloud top temperature"]
 
 [license]

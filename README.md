@@ -28,7 +28,7 @@ Each engine implements one or more of the core traits.
 | `engine-odim` | `EdrEngine` + `MapEngine` (composites); `EdrEngine` + `MapEngine` + `VolumeEngine` + `FeatureEngine` (polar volumes) | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
-| `engine-satellite` | `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
+| `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
@@ -1227,7 +1227,9 @@ product = "ABI-L2-ACHTF"
 variable = "TEMP"
 ```
 
-Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` is a runnable example. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default. EDR queries come in a follow-up (#819 phase 2c).
+EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
+
+Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` is a runnable example. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
 
 ## OGC 3D Tiles
 

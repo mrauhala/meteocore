@@ -1662,7 +1662,7 @@ pub fn load_collections(
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
             "zarr" => &["edr", "wms", "maps", "tiles"],
-            "satellite" => &["wms", "maps", "tiles"],
+            "satellite" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
@@ -2491,6 +2491,21 @@ pub fn load_collections(
                 // from config, so styles resolve before the first scan lands.
                 let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
                 let raster_params = raster_info.parameters;
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to EDR API", collection.id);
+                }
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
                         collection.id.clone(),

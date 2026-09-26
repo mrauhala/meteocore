@@ -614,6 +614,102 @@ mod collections {
         );
     }
 
+    /// A parameter on its own time axis (a satellite product, #819) carries
+    /// its own `extent.temporal` in `parameter_names`; the collection keeps
+    /// the union. Both documents still validate against EDR 1.1, whose
+    /// parameter schema allows an `extent`.
+    #[tokio::test]
+    async fn per_parameter_temporal_extent_validates() {
+        struct OwnTimesEngine(MockEngine);
+        impl EdrEngine for OwnTimesEngine {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                self.0.get_locations()
+            }
+            fn query_location(
+                &self,
+                location_id: &str,
+                dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                params: Option<&[String]>,
+                z: Option<&[f64]>,
+                rt: Option<DateTime<Utc>>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                self.0.query_location(location_id, dt, params, z, rt)
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                self.0.get_parameters()
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                self.0.get_temporal_extent()
+            }
+            fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+                Some(vec![
+                    "2024-01-01T00:00:00Z".parse().unwrap(),
+                    "2024-01-01T23:00:00Z".parse().unwrap(),
+                ])
+            }
+            fn get_parameter_available_times(&self, parameter: &str) -> Option<Vec<DateTime<Utc>>> {
+                (parameter == "humidity").then(|| vec!["2024-01-01T00:00:00Z".parse().unwrap()])
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                self.0.get_spatial_extent()
+            }
+            fn supported_query_types(&self) -> Vec<String> {
+                self.0.supported_query_types()
+            }
+        }
+
+        let engine: Arc<dyn EdrEngine> = Arc::new(OwnTimesEngine(MockEngine));
+        let schema: Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../schemas/ogcapi-edr-1.1-bundled.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        for (uri, path) in [
+            ("/collections", "/collections"),
+            ("/collections/weather", "/collections/{collectionId}"),
+        ] {
+            let router = api_edr::router(make_edr_state(engine.clone()));
+            let resp = router
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            let collection = match json.get("collections") {
+                Some(list) => &list[0],
+                None => &json,
+            };
+            let names = &collection["parameter_names"];
+            assert_eq!(
+                names["humidity"]["extent"]["temporal"]["values"],
+                serde_json::json!(["2024-01-01T00:00:00+00:00"]),
+                "{uri}"
+            );
+            assert!(names["temperature"].get("extent").is_none(), "{uri}");
+            assert_eq!(
+                collection["extent"]["temporal"]["values"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(2)
+            );
+            let validator = jsonschema::Validator::new(
+                &schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
+                    ["schema"],
+            )
+            .unwrap();
+            let errors: Vec<String> = validator
+                .iter_errors(&json)
+                .map(|e| format!("- {} (at {})", e, e.instance_path()))
+                .collect();
+            assert!(errors.is_empty(), "{uri}:\n{}", errors.join("\n"));
+        }
+    }
+
     // -- Single collection detail --
 
     #[tokio::test]

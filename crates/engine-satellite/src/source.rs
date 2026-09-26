@@ -78,20 +78,18 @@ impl Source {
         Ok(found)
     }
 
-    /// The whole file at `path`. On a render worker pass the runtime
-    /// `handle` (Critical Rule 7); the poll loop passes `None`.
-    pub fn fetch(
-        &self,
-        path: &ObjectPath,
-        handle: Option<&tokio::runtime::Handle>,
-    ) -> Result<Vec<u8>, DataServerError> {
+    /// The whole file at `path`.
+    ///
+    /// Called from the poll loop (background runtime), from render jobs
+    /// (blocking workers) and from EDR queries (async request workers) when
+    /// a scan was evicted. `DataStore::get` serves all three: its bridge
+    /// yields an async worker via `block_in_place` and runs directly on a
+    /// blocking one — the plain-Zarr exception to Critical Rule 7. An
+    /// explicit `get_on` handle would panic on the EDR path.
+    pub fn fetch(&self, path: &ObjectPath) -> Result<Vec<u8>, DataServerError> {
         let store = match self {
             Source::Bucket { store } | Source::Directory { store, .. } => store,
         };
-        let bytes = match handle {
-            Some(handle) => store.get_on(path, handle)?,
-            None => store.get(path)?,
-        };
-        Ok(bytes.to_vec())
+        Ok(store.get(path)?.to_vec())
     }
 }
