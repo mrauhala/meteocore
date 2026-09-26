@@ -69,9 +69,11 @@ Position, area and radius (radius via area). A response's time axis is the
 union of the selected products' scans, null where a product has none; an
 instant snaps per product through `select`. `get_parameter_available_times`
 feeds each product's own `extent.temporal` in `parameter_names`. Area grids
-sample at the nadir pixel size through a `ProjectionGrid` (never a per-cell
-geostationary forward), with the native-read budget on the polygon's rows at
-full width. Update `crates/api-edr/README.md` with any change here.
+sample at the finest selected product's nadir pixel size through a
+`ProjectionGrid` (never a per-cell geostationary forward). Update `crates/api-edr/README.md` with any change here.
+Budgets, checked before any work: at most `MAX_QUERY_FETCHES` (8) evicted
+scans to download and `MAX_QUERY_STRIPS` (1024) strips to decode per query,
+summed per product on its own grid (products may mix 0.5/1/2 km).
 
 ## Not yet
 
