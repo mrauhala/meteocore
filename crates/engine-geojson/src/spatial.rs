@@ -35,12 +35,28 @@ impl SpatialIndex {
         }
     }
 
-    /// Return indices of features whose bounding box intersects the query bbox.
+    /// Indices, in ascending (file) order, of features whose bounding box
+    /// intersects the query bbox: the candidates a geometry test refines.
+    /// A box crossing the antimeridian (west > east) is queried as its two
+    /// halves; as one AABB its corners would normalise into the complement.
     pub fn query(&self, bbox: &Bbox) -> Vec<usize> {
-        let query_aabb = AABB::from_corners([bbox.west, bbox.south], [bbox.east, bbox.north]);
-        self.tree
-            .locate_in_envelope_intersecting(&query_aabb)
-            .map(|entry| entry.index)
-            .collect()
+        let halves: &[(f64, f64)] = if bbox.crosses_antimeridian() {
+            &[(bbox.west, 180.0), (-180.0, bbox.east)]
+        } else {
+            &[(bbox.west, bbox.east)]
+        };
+        let mut indices: Vec<usize> = halves
+            .iter()
+            .flat_map(|&(west, east)| {
+                let query_aabb = AABB::from_corners([west, bbox.south], [east, bbox.north]);
+                self.tree
+                    .locate_in_envelope_intersecting(&query_aabb)
+                    .map(|entry| entry.index)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
     }
 }
