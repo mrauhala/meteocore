@@ -31,6 +31,11 @@ impl Server {
                     }
                     Err(e) => panic!("accept: {e}"),
                 };
+                // On macOS and the BSDs an accepted socket inherits the
+                // listener's O_NONBLOCK (Linux does not): a read could then
+                // return WouldBlock before the request arrives, and the read
+                // timeout would never apply (#797).
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();
