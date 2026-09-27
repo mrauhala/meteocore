@@ -18,6 +18,9 @@ pub struct CsvEngine {
     /// Immutable station inventory in first-observation order. Observation
     /// history must not be scanned or turned into Features on each page request.
     stations: Vec<Feature>,
+    /// First and last observation time, computed once: the Features
+    /// temporal extent is read per request (Critical Rule 10).
+    time_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
 impl CsvEngine {
@@ -32,7 +35,43 @@ impl CsvEngine {
             .into_iter()
             .map(|index| station_feature(&store.rows[index]))
             .collect();
-        Self { store, stations }
+        let time_extent = store
+            .rows
+            .iter()
+            .map(|row| row.time)
+            .min()
+            .zip(store.rows.iter().map(|row| row.time).max());
+        Self {
+            store,
+            stations,
+            time_extent,
+        }
+    }
+
+    /// Whether `location_id` has an observation row inside `interval`
+    /// (open bounds are unbounded).
+    fn has_rows_in(
+        &self,
+        location_id: &str,
+        interval: &ds_core::feature::DatetimeInterval,
+    ) -> bool {
+        let Some(times) = self.store.time_index.get(location_id) else {
+            return false;
+        };
+        // `BTreeMap::range` panics on an inverted range; the API layer
+        // rejects one, but an empty interval matches nothing either way.
+        if let (Some(start), Some(end)) = (interval.start, interval.end) {
+            if start > end {
+                return false;
+            }
+        }
+        let start = interval
+            .start
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
+        let end = interval
+            .end
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
+        times.range((start, end)).next().is_some()
     }
 
     /// Build a `PointSeries` coverage for one location. Shared by
@@ -312,6 +351,12 @@ impl EdrEngine for CsvEngine {
 }
 
 impl FeatureEngine for CsvEngine {
+    /// The observation times the stations' rows span; `datetime` filters
+    /// stations to those with a row inside it (#682).
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.time_extent
+    }
+
     fn filterables(&self) -> ds_core::feature::FilterableProperties {
         static NAMES: std::sync::LazyLock<ds_core::feature::FilterableProperties> =
             std::sync::LazyLock::new(|| {
@@ -326,7 +371,10 @@ impl FeatureEngine for CsvEngine {
     }
 
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
-        let (page, number_matched) = if query.bbox.is_none() && query.property_filters.is_empty() {
+        let (page, number_matched) = if query.bbox.is_none()
+            && query.property_filters.is_empty()
+            && query.datetime.is_none()
+        {
             let total = self.stations.len();
             let start = query.offset.min(total);
             let end = start.saturating_add(query.limit).min(total);
@@ -345,6 +393,14 @@ impl FeatureEngine for CsvEngine {
                 }
                 if !ds_core::feature::matches_property_filters(station, &query.property_filters) {
                     continue;
+                }
+                // `datetime`: stations with at least one observation row in
+                // the interval (#682), as the ODIM PVOL network does with
+                // volumes.
+                if let Some(interval) = &query.datetime {
+                    if !self.has_rows_in(&station.id, interval) {
+                        continue;
+                    }
                 }
                 if matched >= query.offset && page.len() < query.limit {
                     page.push(station.clone());
@@ -405,6 +461,56 @@ mod tests {
 
     fn test_store() -> CsvDataStore {
         CsvDataStore::load("../../testdata/weather.csv").unwrap()
+    }
+
+    /// `datetime` keeps the stations with an observation row inside the
+    /// interval, open bounds included (#682), and the Features temporal
+    /// extent spans the rows.
+    #[test]
+    fn datetime_filters_stations_by_their_observations() {
+        use ds_core::feature::DatetimeInterval;
+        use ds_core::feature_engine::FeatureEngine as _;
+        let engine = CsvEngine::new(
+            CsvDataStore::load(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/station_history.csv"
+            ))
+            .unwrap(),
+        );
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let ids = |start: Option<&str>, end: Option<&str>| {
+            let page = engine
+                .get_features(&FeatureQuery {
+                    datetime: Some(DatetimeInterval {
+                        start: start.map(at),
+                        end: end.map(at),
+                    }),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap();
+            let ids: Vec<String> = page.features.iter().map(|f| f.id.clone()).collect();
+            assert_eq!(page.number_matched, ids.len());
+            ids
+        };
+        // Rows: zeta and alpha at 00:00 and 01:00, beta at 00:00 only.
+        assert_eq!(
+            ids(Some("2026-01-01T00:30:00Z"), Some("2026-01-01T01:30:00Z")),
+            ["zeta", "alpha"]
+        );
+        assert_eq!(ids(Some("2026-01-01T00:30:00Z"), None), ["zeta", "alpha"]);
+        assert_eq!(
+            ids(None, Some("2026-01-01T00:00:00Z")),
+            ["zeta", "alpha", "beta"]
+        );
+        assert!(ids(Some("2026-01-02T00:00:00Z"), None).is_empty());
+        // An inverted interval matches nothing instead of panicking in
+        // `BTreeMap::range`.
+        assert!(ids(Some("2026-01-01T01:00:00Z"), Some("2026-01-01T00:00:00Z")).is_empty());
+        assert_eq!(
+            engine.temporal_extent(),
+            Some((at("2026-01-01T00:00:00Z"), at("2026-01-01T01:00:00Z")))
+        );
     }
 
     #[test]

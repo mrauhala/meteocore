@@ -63,6 +63,15 @@ pub trait FeatureEngine: Send + Sync {
         None
     }
 
+    /// Whether `FeatureQuery::datetime` filters this collection's features.
+    /// An engine whose features carry no time (a static GeoJSON file, a
+    /// station inventory) returns `false`, and the API answers `datetime`
+    /// with a 400 rather than an unfiltered 200 (#682; root CLAUDE.md:
+    /// an unsupported parameter must not be silently ignored).
+    fn has_time_dimension(&self) -> bool {
+        true
+    }
+
     /// Opaque token that changes when the underlying feature data changes.
     ///
     /// Used as a data-version component in vector-tile ETags so that an
