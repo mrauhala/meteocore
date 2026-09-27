@@ -9,8 +9,9 @@
 //! - **eviction** — an alert leaves the accumulator once every info's
 //!   validity end (`<expires>`, else onset + `default_ttl`, else receipt +
 //!   [`FALLBACK_LIFETIME`]) is more than `retention_grace` in the past, or when
-//!   a `rel=deletion` notification names its `data_id`; a hard `max_alerts`
-//!   cap evicts the oldest-received first;
+//!   a `rel=deletion` notification names its `data_id`; past a hard
+//!   `max_alerts` cap, not-yet-active alerts go first, then the lowest
+//!   severity, then the oldest received (#805);
 //! - **geometry** — MeteoAlarm's CAP documents are geocode-only, but its
 //!   notifications carry a `rel=geometry` link to the exact zone polygon
 //!   (one notification per alert × info × area, with 0-based `indexInfo` /
