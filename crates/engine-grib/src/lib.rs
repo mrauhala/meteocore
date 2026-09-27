@@ -180,6 +180,9 @@ pub struct GribEngine {
 /// One discovery/poll/cache owner, shared by all collection views.
 struct GribSource {
     config: GribConfig,
+    /// `config.time_window`, parsed once at load (#817) rather than on
+    /// every poll.
+    time_window: Option<TimeWindow>,
     catalog: ArcSwap<Catalog>,
     store: ds_storage::DataStore,
     scan_mode: ScanMode,
@@ -287,11 +290,13 @@ impl GribEngine {
 
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
-        // The poll re-parses `time_window` and skips the filter on an error,
-        // so an invalid window must fail here instead of silently widening.
-        if let Some(time_window) = &config.time_window {
-            TimeWindow::parse(time_window)?;
-        }
+        // Parsed once: an invalid window fails the load instead of silently
+        // widening, and the poll reuses the parsed value.
+        let time_window = config
+            .time_window
+            .as_deref()
+            .map(TimeWindow::parse)
+            .transpose()?;
         // Data source: local `data_path` (a directory, or a fixed-prefix remote
         // URL) vs S3 `endpoint`+`bucket`. Mutual exclusivity is enforced at
         // config load (`GribConfig` validation); re-check the presence here so
@@ -366,6 +371,7 @@ impl GribEngine {
                 message_cache,
                 shutdown: Shutdown::new(),
                 param_filter: config.parameters.clone(),
+                time_window,
                 known_indexes: Mutex::new(HashSet::new()),
                 settled_prefixes: Mutex::new(HashSet::new()),
                 last_full_scan: Mutex::new(None),
@@ -597,7 +603,7 @@ impl GribEngine {
             );
             // Metadata work is independent of discovery. With retention enabled,
             // continue below so existing steps can expire even during an outage.
-            if self.source.config.time_window.is_none() {
+            if self.source.time_window.is_none() {
                 self.probe_new_parameters();
                 return Ok(());
             }
@@ -726,18 +732,16 @@ impl GribEngine {
         ambiguities.emit(&self.collection_id);
 
         // Apply time_window filtering: remove steps whose valid times fall outside the window
-        if let Some(tw_str) = &self.source.config.time_window {
-            if let Ok(tw) = TimeWindow::parse(tw_str) {
-                let (tw_start, tw_end) = tw.to_range(now);
-                for run in new_catalog.runs.values_mut() {
-                    run.steps.retain(|&step, _| {
-                        let vt = run.reference_time + chrono::Duration::hours(i64::from(step));
-                        vt >= tw_start && vt <= tw_end
-                    });
-                }
-                // Remove runs that have no steps left
-                new_catalog.runs.retain(|_, run| !run.steps.is_empty());
+        if let Some(tw) = &self.source.time_window {
+            let (tw_start, tw_end) = tw.to_range(now);
+            for run in new_catalog.runs.values_mut() {
+                run.steps.retain(|&step, _| {
+                    let vt = run.reference_time + chrono::Duration::hours(i64::from(step));
+                    vt >= tw_start && vt <= tw_end
+                });
             }
+            // Remove runs that have no steps left
+            new_catalog.runs.retain(|_, run| !run.steps.is_empty());
         }
 
         // Apply max_runs eviction
@@ -1780,7 +1784,8 @@ mod tests {
                 0,
             );
             let mut engine = GribEngine::new("retention", &source.config()).unwrap();
-            Arc::get_mut(&mut engine.source).unwrap().config.time_window = Some("-PT2H".into());
+            Arc::get_mut(&mut engine.source).unwrap().time_window =
+                Some(TimeWindow::parse("-PT2H").unwrap());
             let version = engine.content_version();
             engine
                 .scan_at("2026-04-05T01:00:00Z".parse().unwrap())

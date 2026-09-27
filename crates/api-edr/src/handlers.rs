@@ -423,8 +423,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         // surfaces disagree (an OGC CITE crawl following /api would hit
         // the default `InvalidParameter → 400` arm on an unsupported
         // engine, while /collections/{id} omits the link entirely).
-        // The legacy /position and /area entries below stay unconditional
-        // for back-compat; trajectory ships gated from day one.
+        // Every data query is gated the same way, and its handler answers
+        // 404 when the engine does not support it (#668).
         let supported: std::collections::HashSet<String> = state
             .engines
             .get(id)
@@ -512,72 +512,76 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         });
 
         // Position query
-        let position_path = format!("/edr/collections/{id}/position");
-        collection_paths[&position_path] = json!({
-            "get": {
-                "summary": format!("Position query for {}", config.title),
-                "operationId": format!("getPosition_{id}"),
-                "tags": [id],
-                "parameters": [
-                    {"$ref": "#/components/parameters/coords-point"},
-                    {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/parameter-name"},
-                    {"$ref": "#/components/parameters/z"},
-                    {
-                        "name": "f",
-                        "in": "query",
-                        "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
-                        "required": false,
-                        "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Coverage data",
-                        "content": {
-                            "application/prs.coverage+json": {
-                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                            },
-                            "image/png": {
-                                "schema": {"type": "string", "format": "binary"}
-                            }
+        if supported.contains("position") {
+            let position_path = format!("/edr/collections/{id}/position");
+            collection_paths[&position_path] = json!({
+                "get": {
+                    "summary": format!("Position query for {}", config.title),
+                    "operationId": format!("getPosition_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/coords-point"},
+                        {"$ref": "#/components/parameters/datetime"},
+                        {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/z"},
+                        {
+                            "name": "f",
+                            "in": "query",
+                            "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
+                            "required": false,
+                            "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
                         }
-                    },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Not found"},
-                    "500": {"description": "Server error"}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Coverage data",
+                            "content": {
+                                "application/prs.coverage+json": {
+                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                },
+                                "image/png": {
+                                    "schema": {"type": "string", "format": "binary"}
+                                }
+                            }
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Not found"},
+                        "500": {"description": "Server error"}
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Area query
-        let area_path = format!("/edr/collections/{id}/area");
-        collection_paths[&area_path] = json!({
-            "get": {
-                "summary": format!("Area query for {}", config.title),
-                "operationId": format!("getArea_{id}"),
-                "tags": [id],
-                "parameters": [
-                    {"$ref": "#/components/parameters/coords-polygon"},
-                    {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/parameter-name"},
-                    {"$ref": "#/components/parameters/z"}
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Coverage data",
-                        "content": {
-                            "application/prs.coverage+json": {
-                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
+        if supported.contains("area") {
+            let area_path = format!("/edr/collections/{id}/area");
+            collection_paths[&area_path] = json!({
+                "get": {
+                    "summary": format!("Area query for {}", config.title),
+                    "operationId": format!("getArea_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/coords-polygon"},
+                        {"$ref": "#/components/parameters/datetime"},
+                        {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/z"}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Coverage data",
+                            "content": {
+                                "application/prs.coverage+json": {
+                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                }
                             }
-                        }
-                    },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Not found"},
-                    "500": {"description": "Server error"}
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Not found"},
+                        "500": {"description": "Server error"}
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Radius query. Gated like trajectory: only engines advertising
         // `radius` get the path, matching `data_queries` and the handler's
@@ -1379,6 +1383,28 @@ pub async fn location_query(
         .map(|r| with_data_cache_control(r, datetime))
 }
 
+/// The 404 for a data query the collection's engine does not support:
+/// the resource does not exist for that collection, the same answer for
+/// every query type, and consistent with `data_queries` and the OpenAPI
+/// document (#668).
+fn require_query_type(
+    engine: &Arc<dyn EdrEngine>,
+    id: &str,
+    query: &str,
+    label: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if engine.supported_query_types().iter().any(|q| q == query) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "code": "NotFound",
+            "description": format!("Collection '{id}' does not support {label} queries")
+        })),
+    ))
+}
+
 pub async fn position_query(
     Path(id): Path<String>,
     Query(params): Query<PositionQueryParams>,
@@ -1405,6 +1431,7 @@ async fn run_position_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
+    require_query_type(engine, &id, "position", "position")?;
     let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
     let datetime = params
@@ -1519,6 +1546,7 @@ async fn run_area_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
+    require_query_type(engine, &id, "area", "area")?;
 
     // Static request-level checks before engine/instance resolution, so the
     // instance variant rejects the same way as the non-instance `area_query`
@@ -1613,15 +1641,7 @@ async fn run_radius_query(
     // Same capability guard as trajectory: an engine that does not advertise
     // `radius` has no such resource (404), and the live route stays
     // consistent with `data_queries` and the OpenAPI gating.
-    if !engine.supported_query_types().iter().any(|q| q == "radius") {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "code": "NotFound",
-                "description": format!("Collection '{id}' does not support radius queries")
-            })),
-        ));
-    }
+    require_query_type(engine, &id, "radius", "radius")?;
 
     if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
         return Err(bad_request(&DataServerError::InvalidParameter(
@@ -1696,21 +1716,7 @@ pub async fn trajectory_query(
     // 400 (which wrongly implies the *request* was malformed). Keeps the
     // live route consistent with the `api_definition` OpenAPI gating and
     // the `data_queries` collection metadata. Flagged by claude-review.
-    if !engine
-        .supported_query_types()
-        .iter()
-        .any(|q| q == "trajectory")
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "code": "NotFound",
-                "description": format!(
-                    "Collection '{id}' does not support trajectory (cross-section) queries"
-                )
-            })),
-        ));
-    }
+    require_query_type(engine, &id, "trajectory", "trajectory (cross-section)")?;
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
 

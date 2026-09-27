@@ -1442,37 +1442,13 @@ fn normalize_area_wkt(coords: &str) -> Result<String, DataServerError> {
 
 // ─── coord parsing (WKT POINT or "lon,lat") ────────────────────────────────
 
+/// `(lon, lat)` of a WKT `POINT` or `lon,lat` pair: the shared ds-core
+/// parser, so a direct engine call gets the same finite and range checks
+/// as the HTTP boundary (#535). Note the order: ds-core returns
+/// `(lat, lon)`.
 fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
-    let coords = coords.trim();
-    if let Some(inner) = coords
-        .strip_prefix("POINT(")
-        .or_else(|| coords.strip_prefix("POINT ("))
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.split_whitespace().collect();
-        if parts.len() == 2 {
-            let lon: f64 = parts[0].parse().map_err(|_| {
-                DataServerError::InvalidParameter(format!("invalid longitude: {}", parts[0]))
-            })?;
-            let lat: f64 = parts[1].parse().map_err(|_| {
-                DataServerError::InvalidParameter(format!("invalid latitude: {}", parts[1]))
-            })?;
-            return Ok((lon, lat));
-        }
-    }
-    let parts: Vec<&str> = coords.split(',').collect();
-    if parts.len() == 2 {
-        let lon: f64 = parts[0].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("invalid latitude: {}", parts[1]))
-        })?;
-        return Ok((lon, lat));
-    }
-    Err(DataServerError::InvalidParameter(format!(
-        "cannot parse coordinates: {coords}"
-    )))
+    let (lat, lon) = ds_core::feature::parse_point_coords(coords)?;
+    Ok((lon, lat))
 }
 
 #[cfg(test)]
@@ -1495,6 +1471,21 @@ mod tests {
     fn parse_coords_garbage_rejected() {
         assert!(parse_coords("garbage").is_err());
         assert!(parse_coords("POINT(24.9)").is_err());
+    }
+
+    /// Direct engine calls get the HTTP boundary's checks too (#535).
+    #[test]
+    fn parse_coords_rejects_non_finite_and_out_of_range() {
+        for bad in [
+            "POINT(NaN 60)",
+            "POINT(24.9 inf)",
+            "POINT(181 60)",
+            "24.9,91",
+            "-180.5,0",
+        ] {
+            assert!(parse_coords(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_coords("POINT(-180 -90)").unwrap(), (-180.0, -90.0));
     }
 
     #[test]

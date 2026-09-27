@@ -119,6 +119,7 @@ impl EdrEngine for MockEngine {
     fn supported_query_types(&self) -> Vec<String> {
         vec![
             "locations".to_string(),
+            "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
         ]

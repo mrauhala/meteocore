@@ -259,6 +259,11 @@ impl FeatureEngine for GeoJsonEngine {
         self.spatial_extent
     }
 
+    /// A GeoJSON file has no time dimension: `datetime` is a 400 (#682).
+    fn has_time_dimension(&self) -> bool {
+        false
+    }
+
     fn data_version(&self) -> u64 {
         self.data_version
     }

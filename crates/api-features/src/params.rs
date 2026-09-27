@@ -91,6 +91,28 @@ impl ItemsQueryParams {
     }
 }
 
+/// The query of `/items/{featureId}`: at most one `f`, nothing else. Any
+/// other parameter is an `InvalidParameter` naming it (#681).
+pub fn item_format(pairs: Vec<(String, String)>) -> Result<Option<String>, DataServerError> {
+    let mut f = None;
+    for (name, value) in pairs {
+        match name.as_str() {
+            "f" if f.is_none() => f = Some(value),
+            "f" => {
+                return Err(DataServerError::InvalidParameter(
+                    "duplicate parameter 'f'".into(),
+                ))
+            }
+            _ => {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "unsupported parameter '{name}' on a single feature; only 'f' is accepted"
+                )))
+            }
+        }
+    }
+    Ok(f)
+}
+
 /// Parse an OGC API – Features Part 8 `sortby` value.
 ///
 /// Comma-separated `[+|-]?<property>`; `+` (or no prefix) is ascending, `-` is
@@ -219,7 +241,15 @@ pub fn parse_datetime(s: &str) -> Result<DatetimeInterval, DataServerError> {
                     .map_err(|e| DataServerError::InvalidDatetime(format!("{end_str}: {e}")))?,
             )
         };
-        Ok(DatetimeInterval { start, end })
+        let interval = DatetimeInterval { start, end };
+        if let (Some(start), Some(end)) = (interval.start, interval.end) {
+            if start > end {
+                return Err(DataServerError::InvalidDatetime(format!(
+                    "{s}: interval ends before it starts"
+                )));
+            }
+        }
+        Ok(interval)
     } else {
         let instant = s
             .parse()
@@ -297,6 +327,14 @@ mod tests {
         assert!(dt.start.is_some());
         assert!(dt.end.is_some());
         assert!(dt.start.unwrap() < dt.end.unwrap());
+    }
+
+    #[test]
+    fn parse_datetime_rejects_a_reversed_interval() {
+        assert!(matches!(
+            parse_datetime("2024-01-02T00:00:00Z/2024-01-01T00:00:00Z"),
+            Err(DataServerError::InvalidDatetime(_))
+        ));
     }
 
     #[test]

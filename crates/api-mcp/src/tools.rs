@@ -266,16 +266,17 @@ impl MeteoCoreMcp {
         let state = self.state.load();
         let engine = state.cells_engine(&collection)?;
         let limit = match limit {
+            Some(n) if (1..=MAX_CELLS).contains(&n) => n,
             // Coercing 0 to 1 would hand back a cell to a model that asked
-            // for none — this crate's whole error style is "say what was
-            // wrong so the next call is right".
-            Some(0) => {
+            // for none, and clamping 200 to 50 would hand back a page it did
+            // not ask for with nothing saying so (#652) — this crate's whole
+            // error style is "say what was wrong so the next call is right".
+            Some(_) => {
                 return Err(ErrorData::invalid_params(
                     format!("limit must be between 1 and {MAX_CELLS}"),
                     None,
                 ))
             }
-            Some(n) => n.min(MAX_CELLS),
             None => DEFAULT_CELLS,
         };
         // Validated against what the engine can actually order by, and the
@@ -434,13 +435,14 @@ impl MeteoCoreMcp {
         let state = self.state.load();
         let engine = state.cells_engine(&collection)?;
         let samples = match samples {
-            Some(0) => {
+            Some(n) if (1..=MAX_TRACK_SAMPLES).contains(&n) => n,
+            // Out of range either way is an error, never a silent clamp (#652).
+            Some(_) => {
                 return Err(ErrorData::invalid_params(
                     format!("samples must be between 1 and {MAX_TRACK_SAMPLES}"),
                     None,
                 ))
             }
-            Some(n) => n.min(MAX_TRACK_SAMPLES),
             None => DEFAULT_TRACK_SAMPLES,
         };
 
@@ -477,6 +479,11 @@ impl MeteoCoreMcp {
         let mut cursor = extent_end;
         let mut frames = 0;
         let mut empty_probes = 0;
+        // Frames that matched more cells than the per-frame cap returned,
+        // without the cell in the page: it may be there beyond the cap
+        // (#646). `number_matched` is the pre-paging total, so a frame of
+        // exactly the cap is not mistaken for a truncated one.
+        let mut frames_truncated = 0;
         // Option, so a reason set on the way out survives: `frames += 1`
         // happens before the boundary check, so a walk that reaches retention
         // start on its samples-th frame would otherwise be relabelled.
@@ -518,6 +525,8 @@ impl MeteoCoreMcp {
             frames += 1;
             if let Some(f) = page.features.iter().find(|f| f.id == cell_id) {
                 history.push(cell_json(f));
+            } else if page.number_matched > page.features.len() {
+                frames_truncated += 1;
             }
             if frame_time <= extent_start {
                 stopped = Some("reached_earliest_retained_frame");
@@ -549,16 +558,48 @@ impl MeteoCoreMcp {
             "retained_frames": engine
                 .temporal_extent()
                 .map(|(start, end)| json!({ "from": rfc3339(start), "to": rfc3339(end) })),
+            "frames_truncated": frames_truncated,
+            "note": track_note(history.is_empty(), stopped, frames, frames_truncated),
             "history": history,
-            "note": if history.is_empty() {
-                "This cell id is not present in any retained frame. Track ids restart when the \
-                 server reloads, so an id from an earlier session may no longer exist."
-            } else {
-                "Newest frame first. Analysis only — no forecast positions."
-            },
         })
         .to_string())
     }
+}
+
+/// What an empty or partial `get_cell_track` walk means, from how it ended
+/// (#646). Only a walk that reached the earliest retained frame, with no
+/// frame truncated, may say the id is not retained at all.
+fn track_note(empty: bool, stopped: &str, frames: usize, truncated: usize) -> String {
+    let truncation = if truncated > 0 {
+        format!(
+            " {truncated} of the frames walked held more than {MAX_CELLS_PER_PROBED_FRAME} cells \
+             and were read only in part, so the cell may be in them."
+        )
+    } else {
+        String::new()
+    };
+    if !empty {
+        return format!("Newest frame first. Analysis only — no forecast positions.{truncation}");
+    }
+    let why = match stopped {
+        "reached_earliest_retained_frame" if truncated == 0 => {
+            return "This cell id is not present in any retained frame. Track ids restart when \
+                    the server reloads, so an id from an earlier session may no longer exist."
+                .to_string()
+        }
+        "reached_earliest_retained_frame" => {
+            "The cell id was not found in the retained frames read.".to_string()
+        }
+        "samples_reached" => format!(
+            "The cell id is not in the newest {frames} frames walked; older retained frames \
+             were not read. Raise `samples` to look further back."
+        ),
+        "gave_up_in_empty_gap" => "The cell id was not found before a long stretch with no \
+                                   cells; older retained frames were not reached."
+            .to_string(),
+        _ => "The cell id was not found in the frames read; the walk stopped early.".to_string(),
+    };
+    format!("{why}{truncation}")
 }
 
 #[tool_handler(router = self.tool_router)]
