@@ -2008,7 +2008,7 @@ fn resolve_filename_config(config: &GeoTiffConfig) -> Result<(String, String), D
 /// Expand a filename template with strftime placeholders into a regex + timestamp format.
 ///
 /// E.g. `"OPERA@%Y%m%dT%H%M@0@ACRR.tiff"` produces:
-/// - regex: `OPERA@(?P<timestamp>\d{8}T\d{4})@0@ACRR\.tiff`
+/// - regex: `^OPERA@(?P<timestamp>\d{8}T\d{4})@0@ACRR\.tiff$`
 /// - format: `%Y%m%dT%H%M`
 fn expand_filename_template(template: &str) -> Result<(String, String), DataServerError> {
     // Known strftime codes and their regex equivalents
@@ -2108,7 +2108,10 @@ fn expand_filename_template(template: &str) -> Result<(String, String), DataServ
         )));
     }
 
-    Ok((regex, timestamp_format))
+    // Anchored: the whole basename must be the template, so a partial
+    // upload (`….tif.tmp`, `….tif.part`) or a longer name that merely
+    // contains a match is never read — engine-odim's rule (#817).
+    Ok((format!("^{regex}$"), timestamp_format))
 }
 
 /// Format byte count as human-readable string.
@@ -2468,6 +2471,22 @@ mod tests {
             caps.name("timestamp").unwrap().as_str(),
             "2026-03-25T19:30:00"
         );
+    }
+
+    /// Partial uploads and names that merely contain a match are not the
+    /// template (#817).
+    #[test]
+    fn template_matches_the_whole_name_only() {
+        let (regex, _) = expand_filename_template("radar_%Y%m%dT%H%MZ.tif").unwrap();
+        let re = Regex::new(&regex).unwrap();
+        assert!(re.is_match("radar_20260324T2315Z.tif"));
+        for partial in [
+            "radar_20260324T2315Z.tif.tmp",
+            "radar_20260324T2315Z.tif.part",
+            "old_radar_20260324T2315Z.tif",
+        ] {
+            assert!(!re.is_match(partial), "{partial}");
+        }
     }
 
     #[test]
