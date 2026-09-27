@@ -97,6 +97,13 @@ errors from all data-query handlers map through `map_query_error`.
   → 404 (an empty PointSeries would fail schema validation).
 - When adding endpoints or params, update `api_definition()` in
   `src/handlers.rs` (OpenAPI).
+- **Per-parameter time axes (#819).** When
+  `EdrEngine::get_parameter_available_times(name)` is `Some`, that
+  parameter's `parameter_names` entry carries its own `extent.temporal`
+  (EDR 1.1's parameter schema allows an `extent`); the collection extent
+  stays the union. Instances keep the run's axis. Built by
+  `temporal_extent_json`, the same builder as the collection extent;
+  `per_parameter_temporal_extent_validates` pins it against the schema.
 
 ## Caching headers (#499)
 

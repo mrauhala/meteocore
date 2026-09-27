@@ -291,3 +291,174 @@ fn example_collection_config_is_valid() {
         "nothing is fetched before the first poll"
     );
 }
+
+// --- EDR -----------------------------------------------------------------
+
+use ds_core::edr_engine::EdrEngine;
+use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
+
+fn single(response: CoverageResponse) -> QueryResult {
+    match response {
+        CoverageResponse::Single(result) => result,
+        other => panic!("expected one coverage, got {other:?}"),
+    }
+}
+
+/// A position is the time series of the pixel under it, on the union of
+/// the products' scans; a product without a scan there — or whose crop does
+/// not reach the point — reads null.
+#[test]
+fn edr_position_is_a_time_series_on_the_union_axis() {
+    let (engine, _dir) = engine(&[(C13, C13), (ACHT, ACHT), (C13, C13_LATER)]);
+    let (lon, lat, expected) = reference_pixel(C13, "CMI", 200, 40);
+    let expected = expected.expect("an on-disk reference pixel");
+    let point = format!("POINT({lon} {lat})");
+
+    let result = single(
+        engine
+            .query_position(&point, None, None, None, None)
+            .unwrap(),
+    );
+    let DomainDescription::PointSeries { t, .. } = &result.domain else {
+        panic!("expected a point series");
+    };
+    assert_eq!(t, &[at("2026-09-25T19:00:00Z"), at("2026-09-25T19:10:00Z")]);
+    let ir = &result.ranges["ir_10_3"];
+    assert_eq!(ir.shape, [2]);
+    for value in &ir.values {
+        assert!(
+            (value.unwrap() - expected).abs() < 1e-6,
+            "{value:?} vs {expected}"
+        );
+    }
+    // The cloud crop lies elsewhere on the disk: null, not an error.
+    assert!(result.ranges["cloud_top_temperature"]
+        .values
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(result.parameters["ir_10_3"].unit, "K");
+
+    // An instant snaps to its scan, per product.
+    let instant = at("2026-09-25T19:05:00Z");
+    let result = single(
+        engine
+            .query_position(
+                &point,
+                Some((instant, instant)),
+                Some(&["ir_10_3".to_string()]),
+                None,
+                None,
+            )
+            .unwrap(),
+    );
+    let DomainDescription::PointSeries { t, .. } = &result.domain else {
+        panic!("expected a point series");
+    };
+    assert_eq!(t, &[at("2026-09-25T19:00:00Z")]);
+    assert_eq!(result.ranges.len(), 1);
+
+    // Behind the Earth, and an unknown parameter.
+    assert!(matches!(
+        engine.query_position("POINT(100 0)", None, None, None, None),
+        Err(ds_core::error::DataServerError::LocationNotFound(_))
+    ));
+    assert!(engine
+        .query_position(&point, None, Some(&["nope".to_string()]), None, None)
+        .is_err());
+}
+
+/// An area is a CRS84 grid at the nadir resolution over the polygon,
+/// masked to it; with two scans it gains a time axis. A radius delegates to
+/// the area query.
+#[test]
+fn edr_area_and_radius_sample_the_scans() {
+    let (engine, _dir) = engine(&[(C13, C13), (C13, C13_LATER)]);
+    let (lon, lat, expected) = reference_pixel(C13, "CMI", 120, 60);
+    let expected = expected.expect("an on-disk reference pixel");
+    let d = 0.25;
+    let polygon = format!(
+        "POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))",
+        w = lon - d,
+        e = lon + d,
+        s = lat - d,
+        n = lat + d
+    );
+    let result = single(
+        engine
+            .query_area(&polygon, None, Some(&["ir_10_3".to_string()]), None, None)
+            .unwrap(),
+    );
+    let DomainDescription::Grid { x, y, t, .. } = &result.domain else {
+        panic!("expected a grid");
+    };
+    assert_eq!(t.as_ref().map(Vec::len), Some(2));
+    // ~2 km cells over half a degree.
+    assert!(x.len() >= 20 && y.len() >= 20, "{} × {}", x.len(), y.len());
+    let ir = &result.ranges["ir_10_3"];
+    assert_eq!(ir.shape, [2, y.len(), x.len()]);
+    let values: Vec<f64> = ir.values.iter().flatten().copied().collect();
+    assert!(values.len() > x.len() * y.len(), "both scans carry values");
+    assert!(values.iter().all(|v| (180.0..340.0).contains(v)));
+    // The cell nearest the reference pixel reads a value near it (the grid
+    // samples the nearest source pixel of each cell centre).
+    let (ix, iy) = (nearest(x, lon), nearest(y, lat));
+    let centre = ir.values[iy * x.len() + ix].unwrap();
+    assert!((centre - expected).abs() < 15.0, "{centre} vs {expected}");
+
+    let radius = single(
+        engine
+            .query_radius(
+                &format!("POINT({lon} {lat})"),
+                20_000.0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+    );
+    assert!(radius.ranges["ir_10_3"].values.iter().any(Option::is_some));
+    // Outside the disk entirely.
+    assert!(engine
+        .query_area(
+            "POLYGON((100 0,110 0,110 10,100 10,100 0))",
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err());
+}
+
+fn nearest(axis: &[f64], value: f64) -> usize {
+    (0..axis.len())
+        .min_by(|&a, &b| (axis[a] - value).abs().total_cmp(&(axis[b] - value).abs()))
+        .unwrap()
+}
+
+#[test]
+fn edr_metadata_advertises_per_parameter_times() {
+    let (engine, _dir) = engine(&[(C13, C13), (ACHT, ACHT), (C13, C13_LATER)]);
+    assert_eq!(
+        engine.get_parameter_available_times("cloud_top_temperature"),
+        Some(vec![at("2026-09-25T19:00:00Z")])
+    );
+    assert_eq!(
+        engine
+            .get_parameter_available_times("ir_10_3")
+            .map(|t| t.len()),
+        Some(2)
+    );
+    assert_eq!(
+        engine.get_temporal_extent(),
+        Some((at("2026-09-25T19:00:00Z"), at("2026-09-25T19:10:00Z")))
+    );
+    assert_eq!(
+        engine.supported_query_types(),
+        ["position", "area", "radius"]
+    );
+    assert_eq!(
+        engine.get_parameter_descriptions()["ir_10_3"].label,
+        "IR 10.3 µm brightness temperature"
+    );
+}
