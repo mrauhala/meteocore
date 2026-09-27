@@ -516,44 +516,44 @@ impl MapEngine for QueryDataEngine {
         // Each output pixel's WGS84 lon/lat comes from the shared
         // `OutputCrs::project_node` (linear lon/lat, Mercator-Y, or a projected
         // output CRS; #160), and the source grid — itself possibly projected
-        // (stereographic / rotated lat-lon) — is sampled by `world_to_grid_px`
-        // (`Crs::forward` + affine) then bilinear.
-        match output_crs {
-            OutputCrs::Projected { .. } => {
-                // Projected output runs `Crs::inverse` per node, and the source
-                // mapping runs `Crs::forward` per node; compose both into a
-                // coarse `ProjectionGrid` and bilinearly interpolate the
-                // output→source pixel map, rather than projecting per output
-                // pixel (CLAUDE.md "never project per output pixel"; #268). This
-                // also removes the per-pixel *source* forward projection on this
-                // path. Projected output is regional, so the grid stays accurate.
-                let gt = data.grid.geo_transform();
-                let grid = ds_core::resample::ProjectionGrid::build_2d(
-                    width,
-                    height,
-                    data.grid.nx,
-                    data.grid.ny,
-                    |fx, fy| output_crs.project_node(bbox, fx, fy),
-                    |lon, lat| world_to_grid_px(gt, lon, lat),
-                );
-                for oy in 0..height {
-                    for ox in 0..width {
-                        let (col_f, row_f) = grid.sample(ox, oy);
-                        values.push(sample_grid_bilinear(
-                            &data, col_f, row_f, param_idx, 0, time_idx,
-                        ));
-                    }
+        // (LCC, stereographic, rotated lat-lon) — is sampled by
+        // `world_to_grid_px` (`Crs::forward` + affine) then bilinear.
+        // A lat/lon source (`Crs::Wgs84`, forward = identity) under lat/lon
+        // or Web Mercator output needs no projection at all: sample per
+        // pixel. Every other pairing runs a projection per node — the
+        // output's inverse, the source's forward (LCC `powf`/`atan2` for
+        // MEPS), or both — so compose them into a coarse `ProjectionGrid` and
+        // bilinearly interpolate the output→source pixel map rather than
+        // projecting per output pixel (Critical Rule 5; #268, #807).
+        // Projected sources are regional, so the grid stays accurate and
+        // needs no antimeridian care.
+        let gt = data.grid.geo_transform();
+        let per_pixel = matches!(output_crs, OutputCrs::Wgs84 | OutputCrs::WebMercator)
+            && matches!(gt.crs, ds_core::geo::Crs::Wgs84);
+        if per_pixel {
+            for row in 0..height {
+                let fy = (row as f64 + 0.5) / height as f64;
+                for col in 0..width {
+                    let fx = (col as f64 + 0.5) / width as f64;
+                    let (lon, lat) = output_crs.project_node(bbox, fx, fy);
+                    values.push(interpolate(&data, lon, lat, param_idx, 0, time_idx));
                 }
             }
-            OutputCrs::Wgs84 | OutputCrs::WebMercator => {
-                // `project_node` is cheap here (no projection); sample per pixel.
-                for row in 0..height {
-                    let fy = (row as f64 + 0.5) / height as f64;
-                    for col in 0..width {
-                        let fx = (col as f64 + 0.5) / width as f64;
-                        let (lon, lat) = output_crs.project_node(bbox, fx, fy);
-                        values.push(interpolate(&data, lon, lat, param_idx, 0, time_idx));
-                    }
+        } else {
+            let grid = ds_core::resample::ProjectionGrid::build_2d(
+                width,
+                height,
+                data.grid.nx,
+                data.grid.ny,
+                |fx, fy| output_crs.project_node(bbox, fx, fy),
+                |lon, lat| world_to_grid_px(gt, lon, lat),
+            );
+            for oy in 0..height {
+                for ox in 0..width {
+                    let (col_f, row_f) = grid.sample(ox, oy);
+                    values.push(sample_grid_bilinear(
+                        &data, col_f, row_f, param_idx, 0, time_idx,
+                    ));
                 }
             }
         }
@@ -1030,6 +1030,95 @@ mod tests {
             (bbox[3], 65.097357, "north"),
         ] {
             assert!((got - want).abs() < 1e-3, "{edge} {got}, PROJ {want}");
+        }
+    }
+
+    /// The exact per-pixel render of `bbox` — the path lat/lon and Web
+    /// Mercator output of a projected source took before #807.
+    fn per_pixel_reference(
+        engine: &QueryDataEngine,
+        bbox: [f64; 4],
+        (width, height): (u32, u32),
+        crs: &OutputCrs,
+    ) -> Vec<Option<f64>> {
+        let data = engine.latest_data().unwrap();
+        let param = engine.resolve_map_param_idx(&data);
+        let time = find_time_idx(&data, None).unwrap();
+        let mut values = Vec::with_capacity((width * height) as usize);
+        for row in 0..height {
+            for col in 0..width {
+                let (fx, fy) = (
+                    (col as f64 + 0.5) / width as f64,
+                    (row as f64 + 0.5) / height as f64,
+                );
+                let (lon, lat) = crs.project_node(bbox, fx, fy);
+                values.push(interpolate(&data, lon, lat, param, 0, time));
+            }
+        }
+        values
+    }
+
+    /// A projected (MEPS LCC) source under lat/lon or Web Mercator output
+    /// renders through the coarse `ProjectionGrid`, not a source forward
+    /// projection per output pixel (#807), and agrees with the exact
+    /// per-pixel mapping within the grid's error budget.
+    #[test]
+    fn meps_grid_render_matches_the_per_pixel_mapping() {
+        let engine = meps_engine();
+        let bbox = [10.0, 60.5, 19.0, 64.5];
+        let size = (256, 256);
+        for crs in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
+            let tile = engine
+                .get_raster_tile(bbox, size.0, size.1, None, &crs, None, None, None)
+                .unwrap();
+            let reference = per_pixel_reference(&engine, bbox, size, &crs);
+            let (mut both, mut presence, mut max_diff) = (0, 0, 0.0_f64);
+            for (i, exact) in reference.iter().enumerate() {
+                match (tile.values.value_at(i), exact) {
+                    (Some(got), Some(want)) => {
+                        both += 1;
+                        max_diff = max_diff.max((got - want).abs());
+                    }
+                    (None, None) => {}
+                    _ => presence += 1,
+                }
+            }
+            // Coverage differs only along the grid's edge; values within a
+            // fraction of a source cell's gradient.
+            assert!(both > 50_000, "{crs:?}: {both} pixels with data");
+            assert!(
+                presence <= 2 * (size.0 + size.1) as usize,
+                "{crs:?}: {presence}"
+            );
+            assert!(max_diff < 0.25, "{crs:?}: max difference {max_diff}");
+        }
+    }
+
+    /// Timing of a 256² MEPS tile, grid path against the per-pixel
+    /// reference: `cargo test --release -p engine-querydata
+    /// meps_render_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn meps_render_timing() {
+        let engine = meps_engine();
+        let bbox = [10.0, 60.5, 19.0, 64.5];
+        for crs in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
+            let runs = 50;
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(per_pixel_reference(&engine, bbox, (256, 256), &crs));
+            }
+            let per_pixel = started.elapsed() / runs;
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(
+                    engine
+                        .get_raster_tile(bbox, 256, 256, None, &crs, None, None, None)
+                        .unwrap(),
+                );
+            }
+            let grid = started.elapsed() / runs;
+            println!("{crs:?}: per-pixel {per_pixel:?}, grid {grid:?}");
         }
     }
 
