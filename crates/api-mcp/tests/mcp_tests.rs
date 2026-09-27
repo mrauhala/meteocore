@@ -749,6 +749,97 @@ async fn the_track_walk_says_why_it_stopped() {
     assert_eq!(out["stopped_because"], "samples_reached");
 }
 
+/// An empty history's note follows how the walk ended (#646): only a walk
+/// that read every retained frame may say the id is not retained; one that
+/// stopped at `samples` says to look further back.
+#[tokio::test]
+async fn an_empty_track_note_follows_why_the_walk_stopped() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let track = |samples: u64| {
+        let (app, sid) = (&app, &sid);
+        async move {
+            call_tool(
+                app,
+                sid,
+                "get_cell_track",
+                json!({"collection": "cells", "cell_id": "no-such-cell", "samples": samples}),
+            )
+            .await
+        }
+    };
+    let short = track(1).await;
+    assert_eq!(short["stopped_because"], "samples_reached");
+    let note = short["note"].as_str().unwrap();
+    assert!(
+        !note.contains("not present in any retained frame"),
+        "{note}"
+    );
+    assert!(note.contains("Raise `samples`"), "{note}");
+    assert_eq!(short["frames_truncated"], 0);
+
+    let full = track(2).await;
+    assert_eq!(full["stopped_because"], "reached_earliest_retained_frame");
+    let note = full["note"].as_str().unwrap();
+    assert!(note.contains("not present in any retained frame"), "{note}");
+}
+
+/// One retained frame that matched more cells than a page holds.
+struct CrowdedEngine;
+
+impl FeatureEngine for CrowdedEngine {
+    fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        Ok(FeaturePage {
+            features: vec![CellEngine::cell("1", 0.5, 50.0, "2026-08-21T14:25:00Z")],
+            number_matched: 5_000,
+            number_returned: 1,
+            next_offset: None,
+        })
+    }
+    fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(id.into()))
+    }
+    fn temporal_extent(
+        &self,
+    ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+        let t = "2026-08-21T14:25:00Z".parse().unwrap();
+        Some((t, t))
+    }
+}
+
+/// A frame read only in part must not let the walk claim the id is absent.
+#[tokio::test]
+async fn a_truncated_frame_keeps_the_track_note_uncertain() {
+    let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
+    engines.insert("cells".into(), Arc::new(CrowdedEngine));
+    let mut collections = HashMap::new();
+    collections.insert("cells".to_string(), collection("cells", "nowcast"));
+    let app = api_mcp::router(
+        Arc::new(ArcSwap::from_pointee(McpState {
+            engines,
+            collections,
+        })),
+        Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+        api_mcp::allowed_hosts(BASE_URL, &[]),
+    );
+    let sid = handshake(&app).await;
+    let track = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "no-such-cell"}),
+    )
+    .await;
+    assert_eq!(track["stopped_because"], "reached_earliest_retained_frame");
+    assert_eq!(track["frames_truncated"], 1);
+    let note = track["note"].as_str().unwrap();
+    assert!(
+        !note.contains("not present in any retained frame"),
+        "{note}"
+    );
+    assert!(note.contains("read only in part"), "{note}");
+}
+
 /// An engine whose frames are retained but contain no cells — engine-nowcast
 /// pushes a snapshot every generation regardless of cell count.
 struct QuietEngine;
