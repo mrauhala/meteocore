@@ -928,44 +928,11 @@ fn find_time_range(
     }
 }
 
-/// Parse EDR position query coordinates.
+/// Parse EDR position query coordinates as `(lat, lon)`: the shared ds-core
+/// parser, so a direct engine call gets the same finite and range checks
+/// as the HTTP boundary (#534).
 fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
-    let trimmed = coords.trim();
-
-    if let Some(inner) = trimmed
-        .strip_prefix("POINT(")
-        .or_else(|| trimmed.strip_prefix("POINT ("))
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.split_whitespace().collect();
-        if parts.len() != 2 {
-            return Err(DataServerError::InvalidParameter(
-                "Expected POINT(lon lat) format".into(),
-            ));
-        }
-        let lon: f64 = parts[0].parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-        })?;
-        return Ok((lat, lon));
-    }
-
-    let parts: Vec<&str> = trimmed.split(',').collect();
-    if parts.len() == 2 {
-        let lon: f64 = parts[0].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-        })?;
-        return Ok((lat, lon));
-    }
-
-    Err(DataServerError::InvalidParameter(
-        "Expected POINT(lon lat) or lon,lat format".into(),
-    ))
+    ds_core::feature::parse_point_coords(coords)
 }
 
 #[cfg(test)]
@@ -1002,6 +969,28 @@ mod tests {
         assert!((bbox[1] - (-5.25)).abs() < 0.01, "south {}", bbox[1]);
         assert!((bbox[2] - 41.5).abs() < 0.01, "east {}", bbox[2]);
         assert!((bbox[3] - 4.75).abs() < 0.01, "north {}", bbox[3]);
+    }
+
+    /// A direct `query_position` gets the HTTP boundary's coordinate checks
+    /// (#534): non-finite and out-of-range points are a 400, never sampled.
+    #[test]
+    fn position_rejects_non_finite_and_out_of_range_coordinates() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        for bad in [
+            "POINT(NaN -1.3)",
+            "POINT(36.8 inf)",
+            "POINT(200 -1.3)",
+            "36.8,-95",
+        ] {
+            assert!(
+                matches!(
+                    engine.query_position(bad, None, None, None, None),
+                    Err(DataServerError::InvalidParameter(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     fn meps_engine() -> QueryDataEngine {
