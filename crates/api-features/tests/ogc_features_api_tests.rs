@@ -416,6 +416,22 @@ mod collections {
         let (status, _) = get("/collections/nonexistent").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// At the shared root a raster collection exists without feature
+    /// items; the items 404 must not claim the collection is missing
+    /// (#811).
+    #[tokio::test]
+    async fn items_404_says_no_feature_items() {
+        for uri in ["/collections/raster/items", "/collections/raster/items/1"] {
+            let (status, json) = get(uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            let description = json["description"].as_str().unwrap_or_default();
+            assert!(
+                description.contains("no feature items"),
+                "{uri}: {description}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +807,24 @@ mod errors {
         let (status, json) = get("/collections/cities/items?bbox=invalid").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["code"].is_string());
+    }
+
+    /// A single feature takes only `f` (#681): any other parameter would be
+    /// ignored with a 200, so it is a 400.
+    #[tokio::test]
+    async fn item_rejects_everything_but_f() {
+        let (status, _) = get("/collections/cities/items/helsinki?f=json").await;
+        assert_eq!(status, StatusCode::OK);
+        for query in [
+            "crs=EPSG%3A3067",
+            "properties=name",
+            "name=Helsinki",
+            "f=json&f=html",
+        ] {
+            let (status, json) = get(&format!("/collections/cities/items/helsinki?{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            assert!(json["description"].as_str().is_some(), "{query}");
+        }
     }
 
     #[tokio::test]

@@ -266,16 +266,17 @@ impl MeteoCoreMcp {
         let state = self.state.load();
         let engine = state.cells_engine(&collection)?;
         let limit = match limit {
+            Some(n) if (1..=MAX_CELLS).contains(&n) => n,
             // Coercing 0 to 1 would hand back a cell to a model that asked
-            // for none — this crate's whole error style is "say what was
-            // wrong so the next call is right".
-            Some(0) => {
+            // for none, and clamping 200 to 50 would hand back a page it did
+            // not ask for with nothing saying so (#652) — this crate's whole
+            // error style is "say what was wrong so the next call is right".
+            Some(_) => {
                 return Err(ErrorData::invalid_params(
                     format!("limit must be between 1 and {MAX_CELLS}"),
                     None,
                 ))
             }
-            Some(n) => n.min(MAX_CELLS),
             None => DEFAULT_CELLS,
         };
         // Validated against what the engine can actually order by, and the
@@ -434,13 +435,14 @@ impl MeteoCoreMcp {
         let state = self.state.load();
         let engine = state.cells_engine(&collection)?;
         let samples = match samples {
-            Some(0) => {
+            Some(n) if (1..=MAX_TRACK_SAMPLES).contains(&n) => n,
+            // Out of range either way is an error, never a silent clamp (#652).
+            Some(_) => {
                 return Err(ErrorData::invalid_params(
                     format!("samples must be between 1 and {MAX_TRACK_SAMPLES}"),
                     None,
                 ))
             }
-            Some(n) => n.min(MAX_TRACK_SAMPLES),
             None => DEFAULT_TRACK_SAMPLES,
         };
 

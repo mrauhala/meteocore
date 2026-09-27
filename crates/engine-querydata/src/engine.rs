@@ -302,20 +302,7 @@ impl EdrEngine for QueryDataEngine {
             ));
         }
 
-        let param_indices: Vec<(usize, &crate::parse::ParamInfo)> = data
-            .params
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                parameters
-                    .is_none_or(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(&p.name)))
-            })
-            .collect();
-        if param_indices.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No matching parameters found".into(),
-            ));
-        }
+        let param_indices = select_param_indices(&data, parameters)?;
 
         // A polygon entirely outside the run's coverage is a 404, not an
         // all-null 200 (GRIB answers the same way).
@@ -426,21 +413,7 @@ impl EdrEngine for QueryDataEngine {
 
         let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
 
-        let param_indices: Vec<(usize, &crate::parse::ParamInfo)> = data
-            .params
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                parameters
-                    .is_none_or(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(&p.name)))
-            })
-            .collect();
-
-        if param_indices.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No matching parameters found".into(),
-            ));
-        }
+        let param_indices = select_param_indices(&data, parameters)?;
 
         let domain = DomainDescription::PointSeries {
             x: lon,
@@ -810,6 +783,27 @@ fn interpolate(
     let gt = data.grid.geo_transform();
     let (col_f, row_f) = world_to_grid_px(gt, lon, lat);
     sample_grid_bilinear(data, col_f, row_f, param_idx, level_idx, time_idx)
+}
+
+/// The parameters an EDR query addresses, with their indices: every one
+/// when `parameters` is absent, else exactly the named ones
+/// (`select_parameters`: case-insensitive, an unknown name is a 400), in
+/// request order. Shared by position and area so the two cannot drift.
+fn select_param_indices<'a>(
+    data: &'a QueryData,
+    parameters: Option<&[String]>,
+) -> Result<Vec<(usize, &'a crate::parse::ParamInfo)>, DataServerError> {
+    let names: Vec<&str> = data.params.iter().map(|p| p.name.as_str()).collect();
+    let selected = ds_core::edr_engine::select_parameters(parameters, &names)?;
+    if selected.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "No parameters available".into(),
+        ));
+    }
+    Ok(selected
+        .into_iter()
+        .filter_map(|name| data.params.iter().enumerate().find(|(_, p)| p.name == name))
+        .collect())
 }
 
 /// Map WGS84 (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the

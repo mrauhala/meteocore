@@ -177,17 +177,11 @@ impl OdimEngine {
         }
     }
 
-    /// Reject a `parameters` filter that doesn't name this engine's
-    /// single quantity. A `None` filter (all parameters) is fine.
+    /// Reject a `parameters` filter that names anything but this engine's
+    /// single quantity (`select_parameters`). A `None` filter (all
+    /// parameters) is fine.
     fn check_parameter_filter(&self, parameters: Option<&[String]>) -> Result<(), DataServerError> {
-        if let Some(params) = parameters {
-            if !params.iter().any(|p| p == &self.parameter) {
-                return Err(DataServerError::InvalidParameter(format!(
-                    "Unknown parameter. Available: {}",
-                    self.parameter
-                )));
-            }
-        }
+        ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
         Ok(())
     }
 
