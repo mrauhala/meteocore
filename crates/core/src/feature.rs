@@ -49,6 +49,31 @@ impl Geometry {
         }
     }
 
+    /// Whether this geometry intersects `bbox` (OGC API - Features Part 1
+    /// §7.15.3: the bbox "must intersect the spatial geometry", not its
+    /// envelope). A point lies in the box; a polygon has a vertex in it, an
+    /// edge crossing it, or the box inside the polygon and outside its holes.
+    /// A box crossing the antimeridian (west > east) is its two halves.
+    /// A null geometry intersects nothing.
+    pub fn intersects_bbox(&self, bbox: &Bbox) -> bool {
+        let halves: &[[f64; 4]] = if bbox.crosses_antimeridian() {
+            &[
+                [bbox.west, bbox.south, 180.0, bbox.north],
+                [-180.0, bbox.south, bbox.east, bbox.north],
+            ]
+        } else {
+            &[[bbox.west, bbox.south, bbox.east, bbox.north]]
+        };
+        halves.iter().any(|b| match self {
+            Geometry::Point { x, y } => point_in_box(*x, *y, b),
+            Geometry::Polygon { exterior, holes } => polygon_intersects_box(exterior, holes, b),
+            Geometry::MultiPolygon { polygons } => polygons
+                .iter()
+                .any(|(exterior, holes)| polygon_intersects_box(exterior, holes, b)),
+            Geometry::Null => false,
+        })
+    }
+
     /// Compute the centroid (lon, lat) of this geometry.
     /// Returns None for null geometries.
     pub fn centroid(&self) -> Option<(f64, f64)> {
@@ -103,6 +128,62 @@ impl Geometry {
             Geometry::Point { .. } | Geometry::Null => false,
         }
     }
+}
+
+/// Whether `(x, y)` lies in the box `[west, south, east, north]`, edges
+/// included.
+fn point_in_box(x: f64, y: f64, b: &[f64; 4]) -> bool {
+    x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]
+}
+
+/// Whether the segment `p`–`q` meets the box `b` (Liang–Barsky clipping).
+fn segment_intersects_box(p: [f64; 2], q: [f64; 2], b: &[f64; 4]) -> bool {
+    let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (denom, dist) in [
+        (-dx, p[0] - b[0]),
+        (dx, b[2] - p[0]),
+        (-dy, p[1] - b[1]),
+        (dy, b[3] - p[1]),
+    ] {
+        if denom == 0.0 {
+            if dist < 0.0 {
+                return false;
+            }
+        } else {
+            let t = dist / denom;
+            if denom < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether a polygon (exterior + holes) meets the box `b`: a boundary
+/// vertex in the box, a boundary edge crossing it, or else the box lies
+/// wholly inside the polygon (its centre inside the exterior and outside
+/// every hole).
+fn polygon_intersects_box(exterior: &[[f64; 2]], holes: &[Vec<[f64; 2]>], b: &[f64; 4]) -> bool {
+    let rings = std::iter::once(exterior).chain(holes.iter().map(Vec::as_slice));
+    for ring in rings {
+        if ring.iter().any(|v| point_in_box(v[0], v[1], b)) {
+            return true;
+        }
+        // Every edge, including the closing one (zero-length when the ring
+        // repeats its first vertex, as GeoJSON rings do).
+        let n = ring.len();
+        if (0..n).any(|i| segment_intersects_box(ring[i], ring[(i + 1) % n], b)) {
+            return true;
+        }
+    }
+    let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+    point_in_ring(cx, cy, exterior) && !holes.iter().any(|hole| point_in_ring(cx, cy, hole))
 }
 
 fn ring_bbox(ring: &[[f64; 2]]) -> [f64; 4] {
@@ -1335,6 +1416,75 @@ mod tests {
         assert!(bbox.intersects_bbox(&[-179.0, -5.0, -175.0, 5.0]));
         // Feature bbox in the gap should not
         assert!(!bbox.intersects_bbox(&[0.0, -5.0, 10.0, 5.0]));
+    }
+
+    /// The geometry, not its envelope, decides (#687): a thin diagonal
+    /// polygon's envelope covers boxes its body never touches.
+    #[test]
+    fn geometry_intersects_bbox_by_shape_not_envelope() {
+        let ring = |pts: &[(f64, f64)]| pts.iter().map(|&(x, y)| [x, y]).collect::<Vec<_>>();
+        // A thin band along the diagonal from (0, 0) to (10, 10).
+        let diagonal = Geometry::Polygon {
+            exterior: ring(&[
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (10.0, 9.0),
+                (10.0, 10.0),
+                (9.0, 10.0),
+                (0.0, 1.0),
+                (0.0, 0.0),
+            ]),
+            holes: vec![],
+        };
+        let b = |w, s, e, n| Bbox::new(w, s, e, n).unwrap();
+        // Inside the envelope, off the band: no.
+        assert!(!diagonal.intersects_bbox(&b(7.0, 1.0, 9.0, 3.0)));
+        // Crossing the band with no vertex inside: yes (an edge crosses).
+        assert!(diagonal.intersects_bbox(&b(4.0, 4.5, 6.0, 5.5)));
+        // Wholly inside the band: yes (no vertex or edge in the box).
+        assert!(diagonal.intersects_bbox(&b(4.9, 4.9, 5.1, 5.1)));
+        // Containing the whole polygon: yes.
+        assert!(diagonal.intersects_bbox(&b(-1.0, -1.0, 11.0, 11.0)));
+
+        // A box inside a hole touches nothing; one straddling its edge does.
+        let donut = Geometry::Polygon {
+            exterior: ring(&[
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (10.0, 10.0),
+                (0.0, 10.0),
+                (0.0, 0.0),
+            ]),
+            holes: vec![ring(&[
+                (3.0, 3.0),
+                (7.0, 3.0),
+                (7.0, 7.0),
+                (3.0, 7.0),
+                (3.0, 3.0),
+            ])],
+        };
+        assert!(!donut.intersects_bbox(&b(4.0, 4.0, 6.0, 6.0)));
+        assert!(donut.intersects_bbox(&b(2.0, 4.0, 4.0, 6.0)));
+
+        // Points are in or out; a null geometry never matches.
+        assert!(Geometry::Point { x: 5.0, y: 5.0 }.intersects_bbox(&b(4.0, 4.0, 6.0, 6.0)));
+        assert!(!Geometry::Point { x: 7.0, y: 5.0 }.intersects_bbox(&b(4.0, 4.0, 6.0, 6.0)));
+        assert!(!Geometry::Null.intersects_bbox(&b(-180.0, -90.0, 180.0, 90.0)));
+    }
+
+    /// A box crossing the antimeridian is its two halves.
+    #[test]
+    fn geometry_intersects_an_antimeridian_bbox() {
+        let seam = Bbox::new(170.0, 10.0, -170.0, 20.0).unwrap();
+        let square = |w: f64, e: f64| Geometry::Polygon {
+            exterior: vec![[w, 12.0], [e, 12.0], [e, 18.0], [w, 18.0], [w, 12.0]],
+            holes: vec![],
+        };
+        assert!(square(172.0, 175.0).intersects_bbox(&seam));
+        assert!(square(-175.0, -172.0).intersects_bbox(&seam));
+        assert!(!square(0.0, 10.0).intersects_bbox(&seam));
+        assert!(Geometry::Point { x: 179.5, y: 15.0 }.intersects_bbox(&seam));
+        assert!(!Geometry::Point { x: 150.0, y: 15.0 }.intersects_bbox(&seam));
     }
 
     #[test]

@@ -177,10 +177,16 @@ impl FeatureEngine for GeoJsonEngine {
 
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         // When bbox is set, query the spatial index; otherwise iterate all features directly.
-        // R-tree results are already unique (each feature is indexed once).
+        // Spatial candidates come back unique and in file order.
         if query.bbox.is_some() || !query.property_filters.is_empty() {
+            // The R-tree's envelope hits are candidates; the geometry decides
+            // (Features Part 1 §7.15.3, #687).
             let mut indices = match &query.bbox {
-                Some(bbox) => self.spatial_index.query(bbox),
+                Some(bbox) => {
+                    let mut hits = self.spatial_index.query(bbox);
+                    hits.retain(|&i| self.features[i].geometry.intersects_bbox(bbox));
+                    hits
+                }
                 None => (0..self.features.len()).collect(),
             };
             indices.retain(|&i| {
@@ -537,6 +543,43 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("test_geojson_{n}.json"));
         std::fs::write(&tmp, json).unwrap();
         GeoJsonEngine::load(tmp.to_str().unwrap()).unwrap()
+    }
+
+    /// `bbox` matches geometries, not envelopes (#687): a query box inside
+    /// the envelope of a thin diagonal river but off its body finds only
+    /// the lake it does touch, and `numberMatched` counts only that. A box
+    /// across the antimeridian finds the island on each side.
+    #[test]
+    fn bbox_matches_geometry_not_envelope() {
+        let engine = load_from_string(
+            r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","id":"river","properties":{},"geometry":{"type":"Polygon",
+             "coordinates":[[[0,0],[1,0],[10,9],[10,10],[9,10],[0,1],[0,0]]]}},
+            {"type":"Feature","id":"lake","properties":{},"geometry":{"type":"Polygon",
+             "coordinates":[[[7.5,1.5],[8.5,1.5],[8.5,2.5],[7.5,2.5],[7.5,1.5]]]}},
+            {"type":"Feature","id":"east-isle","properties":{},"geometry":{"type":"Point",
+             "coordinates":[179.5,15]}},
+            {"type":"Feature","id":"west-isle","properties":{},"geometry":{"type":"Point",
+             "coordinates":[-179.5,15]}},
+            {"type":"Feature","id":"far","properties":{},"geometry":{"type":"Point",
+             "coordinates":[0,15]}}
+            ]}"#,
+        );
+        let ids = |w, s, e, n| {
+            let page = engine
+                .get_features(&FeatureQuery {
+                    bbox: Some(ds_core::feature::Bbox::new(w, s, e, n).unwrap()),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap();
+            let ids: Vec<String> = page.features.iter().map(|f| f.id.clone()).collect();
+            assert_eq!(page.number_matched, ids.len());
+            ids
+        };
+        assert_eq!(ids(7.0, 1.0, 9.0, 3.0), ["lake"]);
+        assert_eq!(ids(4.0, 4.5, 6.0, 5.5), ["river"]);
+        assert_eq!(ids(170.0, 10.0, -170.0, 20.0), ["east-isle", "west-isle"]);
     }
 
     #[test]
