@@ -2801,16 +2801,24 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
         8 => {
             let lat1 = get_double_key(&keys, 3078).unwrap_or(0.0).to_radians(); // StdParallel1
             let lat2 = get_double_key(&keys, 3079).unwrap_or(0.0).to_radians(); // StdParallel2
-            let lat0 = get_double_key(&keys, 3081).unwrap_or(0.0).to_radians(); // FalseOriginLat
-                                                                                // Try NatOriginLong (3080), fall back to FalseOriginLong (3084)
-            let lon0_nat = get_double_key(&keys, 3080);
-            let lon0_false = get_double_key(&keys, 3084);
-            let lon0 = lon0_nat.or(lon0_false).unwrap_or(0.0).to_radians();
-            let false_e = get_double_key(&keys, 3082)
-                .or_else(|| get_double_key(&keys, 3086))
+
+            // 2SP defines its origin by the false-origin keys (3084-3087);
+            // accept the natural-origin ones (3080-3083) from writers that
+            // use those instead. Reading only NatOriginLat (3081) left lat0
+            // at 0 for GDAL-written files, a shift of hundreds of km.
+            let lat0 = get_double_key(&keys, 3085) // FalseOriginLat
+                .or_else(|| get_double_key(&keys, 3081))
+                .unwrap_or(0.0)
+                .to_radians();
+            let lon0 = get_double_key(&keys, 3084) // FalseOriginLong
+                .or_else(|| get_double_key(&keys, 3080))
+                .unwrap_or(0.0)
+                .to_radians();
+            let false_e = get_double_key(&keys, 3086) // FalseOriginEasting
+                .or_else(|| get_double_key(&keys, 3082))
                 .unwrap_or(0.0);
-            let false_n = get_double_key(&keys, 3083)
-                .or_else(|| get_double_key(&keys, 3087))
+            let false_n = get_double_key(&keys, 3087) // FalseOriginNorthing
+                .or_else(|| get_double_key(&keys, 3083))
                 .unwrap_or(0.0);
 
             Ok(Crs::LambertConformalConic {

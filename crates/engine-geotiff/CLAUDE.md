@@ -13,7 +13,9 @@ apply here.
   `ds-core/src/geo.rs`). Earth model: an LCC whose geodetic GeoKeys
   describe a sphere (semi-minor = semi-major, inverse flattening 0, or an
   EPSG sphere ellipsoid) is projected on that sphere (`radius`, #810);
-  everything else on WGS84. TM and LAEA have no sphere form yet.
+  everything else on WGS84. TM and LAEA have no sphere form yet. LCC 2SP
+  takes its origin from the false-origin GeoKeys (3084-3087), the
+  natural-origin ones (3080-3083) only as a fallback.
 - **Reprojection:** `bbox_to_pixels()` samples 20 points per edge to capture
   projection curvature.
 - **Data sources (mutually exclusive):** local directory (`data_path`), S3
