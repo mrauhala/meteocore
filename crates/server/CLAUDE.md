@@ -190,6 +190,12 @@ and `render_deadline_exceeded_total` are exposed in /metrics and Grafana.
   `MapEngine::default_time()`. The slider selects it rather than the last
   value; preview time-window filtering must preserve that default (CAP's
   active-now view can precede future warning boundaries).
+- A parameter with its own time axis (`MapEngine::parameter_times`, e.g. a
+  lagging satellite product) carries `parameters[].temporal_extent`, windowed
+  the same way. The slider re-binds to it on a parameter switch, keeping the
+  viewed instant or the new axis's nearest — the collection axis is the
+  union, and scrubbing a lagging parameter across it would request instants
+  it doesn't have.
 - First enabling a preview collection fits its extent without animation,
   before setting its layers visible. Keep that order: a visible source during
   the initial flight requests intermediate zoom levels and can exhaust cold

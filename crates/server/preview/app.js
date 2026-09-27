@@ -139,8 +139,9 @@
             enabled: false,
             hasZoomed: false,
             timeIndex: null,
-            timeValues: temporalValues(collection),
-            defaultTime: collection.temporal_extent?.default || null,
+            // The time axis the slider scrubs: the selected parameter's own
+            // when it has one, else the collection's (see `timeAxisFor`).
+            timeValues: null,
             // Selected parameter name for multi-parameter raster collections.
             // null = use the server's default. The dropdown is only rendered
             // when `parameters.length > 1`, but state holds the first entry's
@@ -149,8 +150,11 @@
             parameter:
                 Array.isArray(collection.parameters) && collection.parameters.length > 0
                     ? collection.parameters[0].name
-                    : null
+                    : null,
+            // Set by the time slider: re-binds it to another parameter's axis.
+            rebindTimeAxis: null
         };
+        state.timeValues = timeAxisFor(collection, state.parameter).values;
 
         const li = document.createElement('li');
         li.className = 'collection';
@@ -272,8 +276,8 @@
                 if (state.enabled) {
                     layerHandles.forEach(function (h) { h.setVisible(true); });
                 }
-                if (hasTiles && state.timeValues && state.timeValues.length > 1) {
-                    attachTimeSlider(controlsHost, state, layerHandles);
+                if (hasTiles && longestTimeAxis(collection) > 1) {
+                    attachTimeSlider(collection, controlsHost, state, layerHandles);
                 }
             } catch (err) {
                 console.error(
@@ -375,11 +379,36 @@
         return d.toISOString().slice(0, 16).replace('T', ' ') + 'Z';
     }
 
-    function temporalValues(collection) {
-        const t = collection.temporal_extent;
-        if (!t) return null;
-        if (Array.isArray(t.values) && t.values.length > 0) return t.values;
+    function temporalValues(temporal) {
+        if (!temporal) return null;
+        if (Array.isArray(temporal.values) && temporal.values.length > 0) return temporal.values;
         return null;
+    }
+
+    // The time axis of one parameter: its own `temporal_extent` when the
+    // manifest carries one (a product that lags the others in the
+    // collection), else the collection's — the union, which would offer
+    // instants a lagging parameter doesn't have.
+    function timeAxisFor(collection, parameter) {
+        const own = Array.isArray(collection.parameters)
+            ? collection.parameters.find(p => p.name === parameter)
+            : undefined;
+        const temporal = own && own.temporal_extent ? own.temporal_extent : collection.temporal_extent;
+        return {
+            values: temporalValues(temporal),
+            defaultTime: temporal?.default || null
+        };
+    }
+
+    // Longest time axis over the collection and its parameters: the slider
+    // is built when any parameter can scrub, and hidden while the selected
+    // one can't.
+    function longestTimeAxis(collection) {
+        let longest = (temporalValues(collection.temporal_extent) || []).length;
+        (collection.parameters || []).forEach(function (p) {
+            longest = Math.max(longest, (temporalValues(p.temporal_extent) || []).length);
+        });
+        return longest;
     }
 
     // ------------------------------------------------------------------
@@ -435,6 +464,9 @@
             paramSelect.addEventListener('change', function () {
                 if (state.parameter === paramSelect.value) return;
                 state.parameter = paramSelect.value;
+                if (state.rebindTimeAxis) {
+                    state.rebindTimeAxis(timeAxisFor(collection, state.parameter));
+                }
                 refreshSource();
             });
             paramLabel.appendChild(paramSelect);
@@ -634,18 +666,13 @@
     // Time slider
     // ------------------------------------------------------------------
 
-    function attachTimeSlider(controlsHost, state, layerHandles) {
-        const values = state.timeValues;
-        // Use the engine-owned default (alerts: now), with latest as the
-        // fallback for forecast and older manifests.
-        const defaultIndex = state.defaultTime === null ? -1
-            : values.findIndex(t => Date.parse(t) === Date.parse(state.defaultTime));
-        state.timeIndex = defaultIndex >= 0 ? defaultIndex : values.length - 1;
+    function attachTimeSlider(collection, controlsHost, state, layerHandles) {
+        let values = [];
         // Track the index that's been pushed to the source so we can skip a
         // no-op refresh when the user scrubs and returns to the same step
         // (each setTiles call re-fetches the visible tiles even with the
         // same URL).
-        let appliedIndex = state.timeIndex;
+        let appliedIndex = null;
         // Debounce handle: rapid release events on the slider collapse to
         // one server-side render burst instead of N piled-up bursts.
         let pendingRefresh = null;
@@ -660,15 +687,12 @@
 
         const valueLabel = document.createElement('div');
         valueLabel.className = 'time-value';
-        valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
         row.appendChild(valueLabel);
 
         const input = document.createElement('input');
         input.type = 'range';
         input.min = '0';
-        input.max = String(values.length - 1);
         input.step = '1';
-        input.value = String(state.timeIndex);
         input.addEventListener('input', function () {
             state.timeIndex = parseInt(input.value, 10);
             valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
@@ -689,14 +713,64 @@
         const ticks = document.createElement('div');
         ticks.className = 'time-ticks';
         const firstTick = document.createElement('span');
-        firstTick.textContent = formatSliderTime(values[0]);
         const lastTick = document.createElement('span');
-        lastTick.textContent = formatSliderTime(values[values.length - 1]);
         ticks.appendChild(firstTick);
         ticks.appendChild(lastTick);
         row.appendChild(ticks);
 
+        // Bind the slider to a time axis. `keepTime` (a parameter switch)
+        // stays on the instant being viewed, or the axis's nearest to it, so
+        // two products compare at one moment. Otherwise the engine-owned
+        // default (alerts: now) is selected, with latest as the fallback for
+        // forecast and older manifests. An axis with a single instant hides
+        // the slider and leaves the time to the server's default.
+        function bind(axis, keepTime) {
+            if (pendingRefresh !== null) {
+                clearTimeout(pendingRefresh);
+                pendingRefresh = null;
+            }
+            values = axis.values || [];
+            state.timeValues = values;
+            if (values.length <= 1) {
+                state.timeIndex = null;
+                appliedIndex = null;
+                row.hidden = true;
+                return;
+            }
+            let index = keepTime ? nearestTimeIndex(values, keepTime) : -1;
+            if (index < 0 && axis.defaultTime !== null) {
+                index = values.findIndex(t => Date.parse(t) === Date.parse(axis.defaultTime));
+            }
+            state.timeIndex = index >= 0 ? index : values.length - 1;
+            appliedIndex = state.timeIndex;
+            input.max = String(values.length - 1);
+            input.value = String(state.timeIndex);
+            valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
+            firstTick.textContent = formatSliderTime(values[0]);
+            lastTick.textContent = formatSliderTime(values[values.length - 1]);
+            row.hidden = false;
+        }
+
+        bind(timeAxisFor(collection, state.parameter), null);
+        state.rebindTimeAxis = function (axis) {
+            bind(axis, currentTime(state));
+        };
         controlsHost.appendChild(row);
+    }
+
+    function nearestTimeIndex(values, iso) {
+        const target = Date.parse(iso);
+        if (Number.isNaN(target)) return -1;
+        let best = -1;
+        let bestDistance = Infinity;
+        values.forEach(function (t, i) {
+            const distance = Math.abs(Date.parse(t) - target);
+            if (distance < bestDistance) {
+                best = i;
+                bestDistance = distance;
+            }
+        });
+        return best;
     }
 
     function currentTime(state) {

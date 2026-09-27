@@ -439,7 +439,7 @@ fn build_entry(
     // and there's no rendering pathway today for switching parameters on a
     // pure-EDR collection from the SPA.
     if has_raster_tiles {
-        if let Some(params) = collection_parameters(id, edr, maps, tiles, wms) {
+        if let Some(params) = collection_parameters(id, config, edr, maps, tiles, wms) {
             entry["parameters"] = json!(params);
         }
     }
@@ -449,6 +449,14 @@ fn build_entry(
 
 /// Parameter list emitted as `parameters: [{name, title, unit}]` in the
 /// per-collection manifest entry. Sorted by name for stable ordering.
+///
+/// A parameter with its own time axis (`MapEngine::parameter_times`, e.g. a
+/// satellite product that lags the others) also carries `temporal_extent`,
+/// shaped like the collection's and filtered by the same
+/// `[collections.preview].time_window`: the collection axis is the union, so
+/// sliding a lagging parameter across it would request instants it doesn't
+/// have. Omitted when the engine reports no axis of the parameter's own
+/// (the default: every parameter has every collection time).
 ///
 /// **Caller invariant:** this is only invoked when the collection has
 /// raster tiles (see `build_entry`'s `if has_raster_tiles` guard), so a
@@ -465,17 +473,18 @@ fn build_entry(
 ///    the SPA can do. Suppress, even if EDR is multi-param.
 fn collection_parameters(
     id: &str,
+    config: Option<&CollectionConfig>,
     edr: &api_edr::handlers::EdrState,
     maps: &api_maps::handlers::MapsState,
     tiles: &api_tiles::handlers::TilesState,
     wms: &api_wms::handlers::WmsState,
 ) -> Option<Vec<Value>> {
-    let raster_params: Vec<ds_core::map_engine::ParameterInfo> = maps
+    let engine = maps
         .engines
         .get(id)
         .or_else(|| tiles.map_engines.get(id))
-        .or_else(|| wms.engines.get(id))
-        .map(|engine| engine.raster_info().parameters)?;
+        .or_else(|| wms.engines.get(id))?;
+    let raster_params = engine.raster_info().parameters;
 
     // Single-band engine → no meaningful per-request selection.
     if raster_params.is_empty() {
@@ -497,7 +506,12 @@ fn collection_parameters(
                 .get(&name)
                 .map(|d| (d.label.clone(), d.unit.clone()))
                 .unwrap_or((title, parameter.unit));
-            json!({ "name": name, "title": label, "unit": unit })
+            let mut entry = json!({ "name": name, "title": label, "unit": unit });
+            if let Some(times) = engine.parameter_times(&name) {
+                entry["temporal_extent"] =
+                    parameter_temporal_extent(id, config, engine.as_ref(), &times);
+            }
+            entry
         })
         .collect();
 
@@ -508,6 +522,24 @@ fn collection_parameters(
             .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
     });
     Some(out)
+}
+
+/// One parameter's own time axis in the manifest's `temporal_extent` shape.
+fn parameter_temporal_extent(
+    id: &str,
+    config: Option<&CollectionConfig>,
+    engine: &dyn ds_core::map_engine::MapEngine,
+    times: &[chrono::DateTime<chrono::Utc>],
+) -> Value {
+    let default_time = engine.default_time();
+    let mut values = times.to_vec();
+    apply_preview_window(id, config, &mut values, default_time);
+    let interval = values.first().zip(values.last()).map(|(a, b)| (*a, *b));
+    let mut temporal = serialize_temporal(interval, Some(&values));
+    if let Some(default) = default_time {
+        temporal["default"] = json!(default.to_rfc3339());
+    }
+    temporal
 }
 
 fn first_config<'a>(
@@ -634,25 +666,9 @@ fn resolve_temporal_extent(
     // start/end from the survivors. The engine sees its full range
     // unchanged; this only shrinks what the SPA slider exposes (useful for
     // STAC archives spanning years of 5-min radar items).
-    if let (Some(cfg), Some(vs)) = (config, values.as_mut()) {
-        if let Some(window_str) = cfg.preview.as_ref().and_then(|p| p.time_window.as_deref()) {
-            match ds_core::datetime::parse_iso8601_duration(window_str) {
-                Ok(duration) => {
-                    if let Some(latest) = vs.iter().max().copied() {
-                        let cutoff = latest - duration;
-                        vs.retain(|t| *t >= cutoff || Some(*t) == default_time);
-                        interval = vs.first().zip(vs.last()).map(|(a, b)| (*a, *b));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        collection = id,
-                        time_window = window_str,
-                        error = %e,
-                        "preview.time_window is invalid; ignoring"
-                    );
-                }
-            }
+    if let Some(vs) = values.as_mut() {
+        if apply_preview_window(id, config, vs, default_time) {
+            interval = vs.first().zip(vs.last()).map(|(a, b)| (*a, *b));
         }
     }
 
@@ -664,6 +680,44 @@ fn resolve_temporal_extent(
         return Some(temporal);
     }
     None
+}
+
+/// Apply `[collections.preview].time_window`: drop entries older than
+/// `max(values) - duration`, keeping `default_time` (an alert collection's
+/// active-now instant can precede its future boundaries). Returns whether
+/// the window applied, so the caller re-derives its interval from the
+/// survivors. An invalid window is a warning, not an error.
+fn apply_preview_window(
+    id: &str,
+    config: Option<&CollectionConfig>,
+    values: &mut Vec<chrono::DateTime<chrono::Utc>>,
+    default_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    let Some(window_str) = config
+        .and_then(|c| c.preview.as_ref())
+        .and_then(|p| p.time_window.as_deref())
+    else {
+        return false;
+    };
+    match ds_core::datetime::parse_iso8601_duration(window_str) {
+        Ok(duration) => {
+            let Some(latest) = values.iter().max().copied() else {
+                return false;
+            };
+            let cutoff = latest - duration;
+            values.retain(|t| *t >= cutoff || Some(*t) == default_time);
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                collection = id,
+                time_window = window_str,
+                error = %e,
+                "preview.time_window is invalid; ignoring"
+            );
+            false
+        }
+    }
 }
 
 fn serialize_temporal(
@@ -1966,6 +2020,103 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("msl", "hPa"), ("t2m", "°C"), ("ws", "m/s")]
         );
+    }
+
+    /// A parameter with its own time axis carries it as `temporal_extent`,
+    /// windowed like the collection's; one on the collection axis doesn't.
+    #[test]
+    fn manifest_emits_per_parameter_time_axes() {
+        struct Lagging {
+            inner: RasterMock,
+            lagging: Vec<DateTime<Utc>>,
+        }
+        impl MapEngine for Lagging {
+            #[allow(clippy::too_many_arguments)]
+            fn get_raster_tile(
+                &self,
+                _bbox: [f64; 4],
+                _w: u32,
+                _h: u32,
+                _t: Option<DateTime<Utc>>,
+                _crs: &OutputCrs,
+                _param: Option<&str>,
+                _z: Option<f64>,
+                _reference_time: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unimplemented!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                self.inner.raster_info()
+            }
+            fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+                (parameter == "cloud_top").then(|| Arc::from(self.lagging.clone()))
+            }
+        }
+
+        // IR every 10 minutes 00:00–03:00; cloud top lags by 20 minutes.
+        let start = t("2026-09-27T00:00:00Z");
+        let step = |i: i64| start + chrono::Duration::minutes(10 * i);
+        let union: Vec<DateTime<Utc>> = (0..=18).map(step).collect();
+        let lagging: Vec<DateTime<Utc>> = (0..=16).map(step).collect();
+        let parameters = ["cloud_top", "ir"]
+            .map(|name| ds_core::map_engine::ParameterInfo {
+                name: name.into(),
+                title: name.into(),
+                unit: "K".into(),
+            })
+            .into();
+        let mut tiles = empty_tiles();
+        tiles.map_engines.insert(
+            "sat".into(),
+            Arc::new(Lagging {
+                inner: RasterMock {
+                    times: union,
+                    parameters,
+                    ..RasterMock::default()
+                },
+                lagging,
+            }),
+        );
+        tiles
+            .collections
+            .insert("sat".into(), config_with_window("sat", &["tiles"], "PT1H"));
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let manifest = build_manifest(&state, 0, 100);
+        let collection = &manifest["collections"][0];
+        let params = collection["parameters"].as_array().unwrap();
+
+        // The collection axis is the windowed union: 02:00–03:00.
+        let collection_values = collection["temporal_extent"]["values"].as_array().unwrap();
+        assert_eq!(collection_values.len(), 7);
+        assert_eq!(collection_values[6], step(18).to_rfc3339());
+
+        // Cloud top: its own latest (02:40) anchors its own window.
+        let own = &params[0]["temporal_extent"];
+        assert_eq!(params[0]["name"], "cloud_top");
+        let values: Vec<&str> = own["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            (10..=16).map(|i| step(i).to_rfc3339()).collect::<Vec<_>>()
+        );
+        assert_eq!(own["start"], step(10).to_rfc3339());
+        assert_eq!(own["end"], step(16).to_rfc3339());
+        assert_eq!(own["total_values"], 7);
+        assert!(own.get("default").is_none());
+
+        // IR shares the collection axis: no per-parameter extent.
+        assert_eq!(params[1]["name"], "ir");
+        assert!(params[1].get("temporal_extent").is_none());
     }
 
     #[test]

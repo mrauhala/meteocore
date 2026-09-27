@@ -340,6 +340,12 @@ li.collection:last-child { margin-bottom: 4px; }
     margin-top: 2px;
 }
 
+/* A parameter with a single timestep hides the slider (`display: grid`
+   above would otherwise override the `hidden` attribute). */
+.time-slider[hidden] {
+    display: none;
+}
+
 .time-slider .control-label {
     grid-column: 1;
     grid-row: 1;
