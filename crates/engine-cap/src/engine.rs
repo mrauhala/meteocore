@@ -103,6 +103,7 @@ impl CapEngine {
         let (source, wis2) = match &config.wis2 {
             Some(w) => {
                 let src = Arc::new(Wis2CapSource::new(Wis2SourceConfig {
+                    label: collection_id.to_string(),
                     status_filter: config.status_filter.clone(),
                     retention_grace: parse_iso8601_duration(&config.retention_grace)?,
                     max_alerts: config.max_alerts.max(1),
@@ -253,6 +254,17 @@ impl CapEngine {
                 reason: "WIS2 subscription not acknowledged",
             });
         }
+        // Valid warnings are being evicted to stay under `max_alerts`
+        // (#805): the map and `/items` are missing some of them.
+        if self
+            .source
+            .wis2()
+            .is_some_and(|src| src.stats.over_capacity.load(Ordering::Relaxed))
+        {
+            return Some(LiveStatus::Degraded {
+                reason: "over max_alerts: valid warnings evicted",
+            });
+        }
         Some(if self.is_loaded() {
             LiveStatus::Ready
         } else {
@@ -272,8 +284,8 @@ impl CapEngine {
 
     /// WIS2 accumulator counters (`None` unless WIS2 mode). Values:
     /// `(documents_ingested, documents_rejected, deletions, hints_attached,
-    /// hints_rejected, evicted, alerts_held)`.
-    pub fn wis2_source_stats(&self) -> Option<[u64; 7]> {
+    /// hints_rejected, evicted, evicted_valid, alerts_held)`.
+    pub fn wis2_source_stats(&self) -> Option<[u64; 8]> {
         let src = self.source.wis2()?;
         let st = &src.stats;
         Some([
@@ -283,6 +295,7 @@ impl CapEngine {
             st.hints_attached.load(Ordering::Relaxed),
             st.hints_rejected.load(Ordering::Relaxed),
             st.evicted.load(Ordering::Relaxed),
+            st.evicted_valid.load(Ordering::Relaxed),
             src.len() as u64,
         ])
     }

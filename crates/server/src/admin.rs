@@ -630,6 +630,13 @@ static CAP_WIS2_EVICTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
 });
+static CAP_WIS2_EVICTED_VALID_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "cap_wis2_evicted_valid_total",
+        "Still-valid alerts evicted from the WIS2 accumulator by the max_alerts cap (#805)",
+        &["collection"],
+    )
+});
 
 // BUFR observation engine.
 static BUFR_STATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1036,8 +1043,9 @@ struct CacheCounterState {
     /// reconnects, downloads, download failures, integrity unverified).
     wis2: HashMap<String, [u64; 12]>,
     /// CAP engine counters per collection (superseded, wis2 ingested,
-    /// rejected, deletions, hints attached, hints rejected, evicted).
-    cap: HashMap<String, [u64; 7]>,
+    /// rejected, deletions, hints attached, hints rejected, evicted,
+    /// evicted valid).
+    cap: HashMap<String, [u64; 8]>,
     /// BUFR engine counters per collection (`Health::counters` order).
     bufr: HashMap<String, [u64; 9]>,
 }
@@ -5543,7 +5551,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             CAP_ALERTS_ACTIVE
                 .with_label_values(&[cid])
                 .set(engine.record_count() as i64);
-            let src = engine.wis2_source_stats().unwrap_or([0; 7]);
+            let src = engine.wis2_source_stats().unwrap_or([0; 8]);
             let cur = [
                 engine.superseded_total(),
                 src[0],
@@ -5552,13 +5560,14 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                 src[3],
                 src[4],
                 src[5],
+                src[6],
             ];
             let d = delta_counts(&mut counter_state.cap, cid, cur);
             CAP_ALERTS_SUPERSEDED_TOTAL
                 .with_label_values(&[cid])
                 .inc_by(d[0]);
             if engine.is_wis2() {
-                CAP_ALERTS_HELD.with_label_values(&[cid]).set(src[6] as i64);
+                CAP_ALERTS_HELD.with_label_values(&[cid]).set(src[7] as i64);
                 CAP_WIS2_DOCUMENTS_TOTAL
                     .with_label_values(&[cid, "ingested"])
                     .inc_by(d[1]);
@@ -5577,6 +5586,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                 CAP_WIS2_EVICTED_TOTAL
                     .with_label_values(&[cid])
                     .inc_by(d[6]);
+                CAP_WIS2_EVICTED_VALID_TOTAL
+                    .with_label_values(&[cid])
+                    .inc_by(d[7]);
             }
             if let Some(snap) = engine.wis2_status() {
                 scrape_wis2_status(&mut counter_state.wis2, cid, &snap);

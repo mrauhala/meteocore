@@ -54,6 +54,8 @@ const HINT_BBOX_TOLERANCE_DEG: f64 = 0.05;
 
 #[derive(Debug, Clone)]
 pub struct Wis2SourceConfig {
+    /// Collection id, for log lines.
+    pub label: String,
     pub status_filter: Vec<String>,
     pub retention_grace: Duration,
     pub max_alerts: usize,
@@ -161,6 +163,12 @@ pub struct Wis2SourceStats {
     pub hints_attached: AtomicU64,
     pub hints_rejected: AtomicU64,
     pub evicted: AtomicU64,
+    /// Of `evicted`, alerts still valid when the `max_alerts` cap removed
+    /// them (#805): each is a warning missing from the map and `/items`.
+    pub evicted_valid: AtomicU64,
+    /// Whether the last snapshot had to evict still-valid alerts; the
+    /// collection reports `degraded` meanwhile.
+    pub over_capacity: AtomicBool,
     /// Identifiers withdrawn at ingest by an Update/Cancel `<references>`.
     pub superseded: AtomicU64,
     /// Alerts held right now (kept in step with the accumulator so
@@ -569,23 +577,40 @@ impl Wis2CapSource {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        // Hard cap: oldest-received first.
+        // Hard cap (#805): what matters least goes first — alerts whose
+        // onset is still ahead, then the lowest severity, and only then the
+        // oldest received. An active Extreme or Severe warning never goes
+        // before a Minor one.
         let live = acc.alerts.len() - expired.len();
-        if live > self.cfg.max_alerts {
-            let mut by_age: Vec<(DateTime<Utc>, &AlertKey)> = acc
+        let over = live.saturating_sub(self.cfg.max_alerts);
+        if over > 0 {
+            let mut ranked: Vec<(bool, u8, DateTime<Utc>, &AlertKey)> = acc
                 .alerts
                 .iter()
                 .filter(|(id, _)| !expired.contains(*id))
-                .map(|(id, e)| (e.received, id))
+                .map(|(id, e)| {
+                    let (active, severity) = eviction_rank(&e.alert, default_ttl, now);
+                    (active, severity, e.received, id)
+                })
                 .collect();
-            by_age.sort();
-            let capped: Vec<AlertKey> = by_age
+            ranked.sort();
+            let capped: Vec<AlertKey> = ranked
                 .into_iter()
-                .take(live - self.cfg.max_alerts)
-                .map(|(_, id)| id.clone())
+                .take(over)
+                .map(|(_, _, _, id)| id.clone())
                 .collect();
             expired.extend(capped);
+            self.stats
+                .evicted_valid
+                .fetch_add(over as u64, Ordering::Relaxed);
+            tracing::warn!(
+                "[{}] cap/wis2: {live} valid alerts exceed max_alerts {}; evicted {over} \
+                 (not yet active and lowest severity first)",
+                self.cfg.label,
+                self.cfg.max_alerts
+            );
         }
+        self.stats.over_capacity.store(over > 0, Ordering::Relaxed);
         let evicted = expired.len();
         for id in &expired {
             acc.remove_alert(id);
@@ -687,6 +712,29 @@ fn merge_hints(into: &mut CapAlert, from: &CapAlert) {
 }
 
 /// Latest validity end over an alert's infos (`None` when no info has one).
+/// How much an alert matters to the `max_alerts` cap, ascending: whether
+/// any info is already in force at `now` (its window has started; an info
+/// with no start counts as started), and its highest severity code (0
+/// Unknown … 4 Extreme). Evictions take the smallest first.
+fn eviction_rank(
+    alert: &CapAlert,
+    default_ttl: Option<Duration>,
+    now: DateTime<Utc>,
+) -> (bool, u8) {
+    let active = alert.infos.iter().any(|info| {
+        build_window(alert, info, default_ttl)
+            .start
+            .is_none_or(|s| s <= now)
+    });
+    let severity = alert
+        .infos
+        .iter()
+        .map(|info| crate::catalog::severity_code(info.severity.as_deref()) as u8)
+        .max()
+        .unwrap_or(0);
+    (active, severity)
+}
+
 fn validity_end(alert: &CapAlert, default_ttl: Option<Duration>) -> Option<DateTime<Utc>> {
     alert
         .infos
@@ -758,6 +806,7 @@ mod tests {
 
     fn cfg() -> Wis2SourceConfig {
         Wis2SourceConfig {
+            label: "test".into(),
             status_filter: vec!["Actual".into()],
             retention_grace: Duration::hours(1),
             max_alerts: 100,
@@ -1306,6 +1355,81 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["A", "C"]);
+        src.assert_index_consistent();
+    }
+
+    /// One `<info>` with an explicit severity and onset.
+    fn cap_xml_rated(identifier: &str, severity: &str, onset: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+<identifier>{identifier}</identifier><sender>t@x</sender><sent>2026-09-12T07:00:00+00:00</sent>
+<status>Actual</status><msgType>Alert</msgType><scope>Public</scope>
+<info><language>en-GB</language><category>Met</category><event>Wind</event><urgency>Immediate</urgency>
+<severity>{severity}</severity><certainty>Likely</certainty><onset>{onset}</onset>
+<expires>2026-09-13T00:00:00+00:00</expires>
+<area><areaDesc>Zone</areaDesc><geocode><valueName>NUTS3</valueName><value>MK006</value></geocode></area></info></alert>"#
+        )
+    }
+
+    /// Over `max_alerts`, the cap takes what matters least (#805): a
+    /// warning whose onset is still ahead before an active one, then the
+    /// lowest severity, and only then the oldest received — never an
+    /// active Extreme warning before a Minor one. Each still-valid
+    /// eviction is counted, and the source reports over capacity until it
+    /// fits again.
+    #[tokio::test]
+    async fn max_alerts_evicts_future_then_least_severe_before_oldest() {
+        let mut c = cfg();
+        c.max_alerts = 2;
+        let src = Wis2CapSource::new(c);
+        let f = fetcher();
+        // `at(0)` is 2026-09-12T08:00Z; onsets before it are active.
+        let active = "2026-09-12T07:30:00+00:00";
+        let future = "2026-09-12T20:00:00+00:00";
+        for (i, (id, severity, onset)) in [
+            ("extreme-oldest", "Extreme", active),
+            ("minor", "Minor", active),
+            ("severe-upcoming", "Severe", future),
+        ]
+        .iter()
+        .enumerate()
+        {
+            src.apply_at(
+                resolved(
+                    &format!("d{i}"),
+                    i as i64,
+                    Some(cap_xml_rated(id, severity, onset)),
+                ),
+                &f,
+                "t",
+                at(i as i64),
+            )
+            .await;
+        }
+        let ids = |alerts: Vec<CapAlert>| {
+            let mut ids: Vec<String> = alerts.into_iter().map(|a| a.identifier).collect();
+            ids.sort();
+            ids
+        };
+        // The upcoming warning goes first, though it is the newest.
+        assert_eq!(ids(src.snapshot(at(100))), ["extreme-oldest", "minor"]);
+        assert_eq!(src.stats.evicted_valid.load(Ordering::Relaxed), 1);
+        assert!(src.stats.over_capacity.load(Ordering::Relaxed));
+
+        // Among active warnings the Minor one goes, not the oldest Extreme.
+        src.apply_at(
+            resolved("d3", 3, Some(cap_xml_rated("moderate", "Moderate", active))),
+            &f,
+            "t",
+            at(3),
+        )
+        .await;
+        assert_eq!(ids(src.snapshot(at(100))), ["extreme-oldest", "moderate"]);
+        assert_eq!(src.stats.evicted_valid.load(Ordering::Relaxed), 2);
+
+        // Within the cap again: no longer over capacity.
+        assert_eq!(src.snapshot(at(101)).len(), 2);
+        assert!(!src.stats.over_capacity.load(Ordering::Relaxed));
         src.assert_index_consistent();
     }
 
