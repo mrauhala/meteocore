@@ -40,6 +40,14 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   Earth, so no coarse projection cell can alias far-away output onto the
   disk; `ProjectionGrid` refines cells on the limb (#821). The collection
   extent is the seam-aware union of product extents (`union_extent`).
+- **Extents may cross the antimeridian** (GOES-West, Himawari, GK2A):
+  `spatial_extent` is `west > east` then. Requests reach the engine with
+  longitudes past ±180° (a WMS client wrapping the world): the
+  geostationary forward is periodic in longitude, so they need no
+  normalising. `tests/antimeridian.rs` pins renders and EDR positions
+  either side of the seam on a real GOES-18 crop. The API edges handle the
+  wrapped extent: WMS CRS:84 `BoundingBox` and Tiles limits span every
+  longitude. OGC API Maps rejects a west > east `bbox` (#828).
 - **A scan may be many files.** Himawari ISatSS (`provider = "isatss"`)
   publishes a full disk as 88 tiles of 550 × 550 in the scan's own
   ten-minute directory (`AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/`).
@@ -92,6 +100,8 @@ real GOES-19 scans cropped to 240×320 (C13 across the NE limb, ACHT from the
 disk interior) with the original packed integers, chunking and compression;
 the global `meteocore_fixture` attribute records each crop. Tests copy them
 into a nested temp directory (local discovery lists recursively).
+`testdata/goes18-abi/…_G18_s20262701850224_*.nc`: a GOES-18 C13 crop
+straddling 180° at 11–16°N (`lon_0` −137.0, read from the file).
 `testdata/himawari9-isatss/`: three real Himawari-9 band 13 tiles of one
 scan, cropped to 64 × 64 around a lattice corner on the NW limb whose fourth
 cell has no tile (its README has the layout).

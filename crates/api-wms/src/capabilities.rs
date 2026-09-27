@@ -315,11 +315,20 @@ fn write_layer_metadata(
         write_text_element(writer, "northBoundLatitude", &format!("{north:.6}"));
         let _ = writer.write_event(Event::End(BytesEnd::new("EX_GeographicBoundingBox")));
 
+        // `EX_GeographicBoundingBox` is an ISO 19115 box: west > east crosses
+        // the antimeridian (GOES-West, Himawari). A CRS `BoundingBox` is a
+        // min/max envelope with no wrap, so a crossing extent spans every
+        // longitude there.
+        let (min_x, max_x) = if west > east {
+            (-180.0, 180.0)
+        } else {
+            (west, east)
+        };
         let mut bb = BytesStart::new("BoundingBox");
         bb.push_attribute(("CRS", "CRS:84"));
-        bb.push_attribute(("minx", format!("{west:.6}").as_str()));
+        bb.push_attribute(("minx", format!("{min_x:.6}").as_str()));
         bb.push_attribute(("miny", format!("{south:.6}").as_str()));
-        bb.push_attribute(("maxx", format!("{east:.6}").as_str()));
+        bb.push_attribute(("maxx", format!("{max_x:.6}").as_str()));
         bb.push_attribute(("maxy", format!("{north:.6}").as_str()));
         let _ = writer.write_event(Event::Empty(bb));
     }
