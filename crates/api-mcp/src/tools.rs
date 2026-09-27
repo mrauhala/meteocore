@@ -477,8 +477,10 @@ impl MeteoCoreMcp {
         let mut cursor = extent_end;
         let mut frames = 0;
         let mut empty_probes = 0;
-        // Frames that filled the per-frame cap without the cell in the page:
-        // it may be there beyond the cap (#646).
+        // Frames that matched more cells than the per-frame cap returned,
+        // without the cell in the page: it may be there beyond the cap
+        // (#646). `number_matched` is the pre-paging total, so a frame of
+        // exactly the cap is not mistaken for a truncated one.
         let mut frames_truncated = 0;
         // Option, so a reason set on the way out survives: `frames += 1`
         // happens before the boundary check, so a walk that reaches retention
@@ -521,7 +523,7 @@ impl MeteoCoreMcp {
             frames += 1;
             if let Some(f) = page.features.iter().find(|f| f.id == cell_id) {
                 history.push(cell_json(f));
-            } else if page.features.len() >= MAX_CELLS_PER_PROBED_FRAME {
+            } else if page.number_matched > page.features.len() {
                 frames_truncated += 1;
             }
             if frame_time <= extent_start {
