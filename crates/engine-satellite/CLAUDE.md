@@ -15,14 +15,18 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   full-disk scan starts ~20 s past its ten-minute slot; keying on the
   second would make a nominal `TIME=…T19:00:00Z` snap to 18:50.
 - **Storage type ≠ value signedness.** GOES-R CMI is stored `short` with
-  `_Unsigned = "true"`. Read strips with the *storage* type (hdf5-reader 0.9
+  `_Unsigned = "true"`. Read blocks with the *storage* type (hdf5-reader 0.9
   rejects a signedness mismatch), carry values as `u16` bit patterns, and
   interpret them per `_Unsigned`. `_FillValue`/`valid_range` are in the
   storage type: a `short` fill of −1 is `0xFFFF` (`frame.rs` `as_raw`).
-- **Strips are the chunk rows** (`Dataset::chunks()`, via hdf5-reader on the
-  same in-memory storage as netcdf-reader, so no second copy). Reading a
-  strip inflates each chunk once; the reader's own chunk cache is off
-  because decoded strips are cached in `cache::STRIPS`.
+- **Reads go by blocks** (`Frame::{locate, read_block, blocks_in}`): a
+  rectangle of `block_rows` × `block_cols` pixels, row-major, clipped at
+  the grid's edges. A GOES-R block is a strip: the chunk rows
+  (`Dataset::chunks()`, via hdf5-reader on the same in-memory storage as
+  netcdf-reader, so no second copy) across the full width, so a block read
+  inflates each chunk once. The reader's own chunk cache is off because
+  decoded blocks are cached in `cache::STRIPS`, which keeps its phase-2
+  name, env var and metric family.
 - **No request-time S3 in the steady state.** The poll loop downloads each
   new scan whole and inserts it into `cache::FRAMES`. A scan the cache
   evicted is fetched again by `Source::fetch` → `DataStore::get`, from a
@@ -82,7 +86,7 @@ feeds each product's own `extent.temporal` in `parameter_names`. Area grids
 sample at the finest selected product's nadir pixel size through a
 `ProjectionGrid` (never a per-cell geostationary forward). Update `crates/api-edr/README.md` with any change here.
 Budgets, checked before any work: at most `MAX_QUERY_FETCHES` (8) evicted
-scans to download and `MAX_QUERY_STRIPS` (1024) strips to decode per query,
+scans to download and `MAX_QUERY_BLOCKS` (1024) blocks to decode per query,
 summed per product on its own grid (products may mix 0.5/1/2 km).
 
 ## Not yet
