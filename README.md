@@ -1201,7 +1201,7 @@ Geostationary satellite imagery (`engine_type = "satellite"`, epic #819). One co
 
 Today's provider is `goes-r`: NOAA GOES-R ABI NetCDF-4 files as published on AWS (`s3://noaa-goes19`, `s3://noaa-goes18`), `<product>/%Y/%j/%H/OR_<product>-M<mode>[C<band>]_G<sat>_s<start>_….nc`. The engine lists one hourly prefix per hour of `time_window` (at most 24 h), downloads each new scan whole (newest first, a few per poll), and keeps it compressed in memory. Renders decode only the 24-row strips they touch, or sample a 4× overview built at ingest when zoomed out. Scan times are keyed on the scan's start **minute** (a full-disk scan starts ~20 s past its ten-minute slot), and a request snaps to the latest scan at or before it.
 
-The projection is `Crs::Geostationary` (PROJ `geos`): points behind the Earth have no projection, so the rendered disk ends at the limb, and extents come from the limb (GOES-West's crosses the antimeridian, `west > east`).
+The projection is `Crs::Geostationary` (PROJ `geos`): points behind the Earth have no projection, so the rendered disk ends at the limb, and extents come from the limb. GOES-West's crosses the antimeridian and is advertised `west > east` (about 142°E → 56°W). WMS keeps that in `EX_GeographicBoundingBox`, and its CRS:84 `BoundingBox` spans every longitude. Tiles `tileMatrixSetLimits` take every column. OGC API Maps does not yet accept a `bbox` with west > east (#828); WMS and Tiles render across the seam.
 
 ```toml
 [satellite]
@@ -1229,7 +1229,7 @@ variable = "TEMP"
 
 EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
 
-Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` is a runnable example. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
+Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` (GOES-East) and `collections.d/goes18-fd.toml` (GOES-West) are runnable examples. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
 
 ## OGC 3D Tiles
 

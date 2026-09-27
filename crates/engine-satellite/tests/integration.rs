@@ -277,19 +277,24 @@ fn unknown_parameter_is_an_error_and_empty_catalog_renders_nothing() {
 /// The shipped example collection parses, validates and builds an engine
 /// (construction does no I/O; the first poll would download).
 #[test]
-fn example_collection_config_is_valid() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../collections.d/goes19-fd.toml");
-    let collection: ds_core::config::CollectionConfig =
-        toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(collection.engine_type, "satellite");
-    let satellite = collection.satellite.as_ref().unwrap();
-    let engine = SatelliteEngine::new(&collection.id, satellite).unwrap();
-    let info = engine.raster_info();
-    assert_eq!(info.parameters.len(), 2);
-    assert!(
-        info.times.is_empty(),
-        "nothing is fetched before the first poll"
-    );
+fn example_collection_configs_are_valid() {
+    for file in ["goes19-fd.toml", "goes18-fd.toml"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../collections.d")
+            .join(file);
+        let collection: ds_core::config::CollectionConfig =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(collection.engine_type, "satellite");
+        let satellite = collection.satellite.as_ref().unwrap();
+        ds_core::config::validate_satellite(&collection.id, satellite).unwrap();
+        let engine = SatelliteEngine::new(&collection.id, satellite).unwrap();
+        let info = engine.raster_info();
+        assert_eq!(info.parameters.len(), 2, "{file}");
+        assert!(
+            info.times.is_empty(),
+            "{file}: nothing is fetched before the first poll"
+        );
+    }
 }
 
 // --- EDR -----------------------------------------------------------------

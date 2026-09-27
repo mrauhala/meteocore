@@ -144,17 +144,24 @@ impl TileMatrixSetDef {
     }
 
     /// Compute TileMatrixSetLimits for a given spatial extent [west, south, east, north].
+    ///
+    /// An extent crossing the antimeridian (west > east) takes every column:
+    /// a limit is a min/max range and cannot wrap, and `minTileCol >
+    /// maxTileCol` would leave a client that honours the limits no tiles.
     pub fn limits_for_extent(&self, bbox: [f64; 4], max_zoom: u32) -> Vec<serde_json::Value> {
         let effective_max = max_zoom.min(self.max_zoom);
         let mut limits = Vec::new();
 
         for z in 0..=effective_max {
             if let Some(matrix) = self.matrix(z) {
-                let (min_col, min_row, max_col, max_row) = match self.id {
+                let (mut min_col, min_row, mut max_col, max_row) = match self.id {
                     "WebMercatorQuad" => web_mercator_extent_to_tile_range(z, bbox, &matrix),
                     "WorldCRS84Quad" => crs84_extent_to_tile_range(z, bbox, &matrix),
                     _ => continue,
                 };
+                if bbox[0] > bbox[2] {
+                    (min_col, max_col) = (0, matrix.matrix_width - 1);
+                }
 
                 limits.push(serde_json::json!({
                     "tileMatrix": z.to_string(),
@@ -515,5 +522,29 @@ mod tests {
         assert_eq!(z0["maxTileCol"], 0);
         assert_eq!(z0["minTileRow"], 0);
         assert_eq!(z0["maxTileRow"], 0);
+    }
+
+    /// An extent crossing the antimeridian takes every column; its rows
+    /// stay bounded.
+    #[test]
+    fn limits_for_an_antimeridian_extent_span_every_column() {
+        let seam = [170.0, 10.0, -170.0, 20.0];
+        for (tms, width, rows) in [
+            (&WEB_MERCATOR_QUAD, 32, (14, 15)),
+            (&WORLD_CRS84_QUAD, 64, (12, 14)),
+        ] {
+            let z5 = &tms.limits_for_extent(seam, 5)[5];
+            assert_eq!(z5["minTileCol"], 0, "{}", tms.id);
+            assert_eq!(z5["maxTileCol"], width - 1, "{}", tms.id);
+            assert_eq!(
+                (
+                    z5["minTileRow"].as_u64().unwrap(),
+                    z5["maxTileRow"].as_u64().unwrap()
+                ),
+                rows,
+                "{}",
+                tms.id
+            );
+        }
     }
 }

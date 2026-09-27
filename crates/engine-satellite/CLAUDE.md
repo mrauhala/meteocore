@@ -36,6 +36,14 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   Earth, so no coarse projection cell can alias far-away output onto the
   disk; `ProjectionGrid` refines cells on the limb (#821). The collection
   extent is the seam-aware union of product extents (`union_extent`).
+- **Extents may cross the antimeridian** (GOES-West, Himawari, GK2A):
+  `spatial_extent` is `west > east` then. Requests reach the engine with
+  longitudes past ±180° (a WMS client wrapping the world): the
+  geostationary forward is periodic in longitude, so they need no
+  normalising. `tests/antimeridian.rs` pins renders and EDR positions
+  either side of the seam on a real GOES-18 crop. The API edges handle the
+  wrapped extent: WMS CRS:84 `BoundingBox` and Tiles limits span every
+  longitude. OGC API Maps rejects a west > east `bbox` (#828).
 - **Overview**: a render whose source window spans ≥ `OVERVIEW_FACTOR`
   (4) source pixels per output pixel samples the ingest-time overview
   instead of decoding strips. A full-disk decode is ~160 ms.
@@ -62,6 +70,8 @@ real GOES-19 scans cropped to 240×320 (C13 across the NE limb, ACHT from the
 disk interior) with the original packed integers, chunking and compression;
 the global `meteocore_fixture` attribute records each crop. Tests copy them
 into a nested temp directory (local discovery lists recursively).
+`testdata/goes18-abi/…_G18_s20262701850224_*.nc`: a GOES-18 C13 crop
+straddling 180° at 11–16°N (`lon_0` −137.0, read from the file).
 
 ## EDR
 
@@ -77,5 +87,5 @@ summed per product on its own grid (products may mix 0.5/1/2 km).
 
 ## Not yet
 
-Other providers (Himawari ISatSS µrad tiles, GK2A CGMS navigation, MTG) are
-phases 3 and 5.
+Other providers (Himawari ISatSS µrad tiles, GMGSI lat/lon mosaics, GK2A
+CGMS navigation, MTG) are phases 3 and 5.
