@@ -3875,6 +3875,16 @@ fn fallback_default_styles(ctx: &ds_render::StyleContext) -> HashMap<String, ds_
     styles
 }
 
+/// Whether a resolved style palette is the generic normalized fallback
+/// (viridis, grayscale), for the #320 diagnostic. Resolution stretches a
+/// normalized palette onto the style's range, so the resolved copy is no
+/// longer flagged normalized (#823); ask the registry about its source.
+fn is_generic_fallback(ctx: &ds_render::StyleContext, palette: &ds_render::Palette) -> bool {
+    ctx.registry()
+        .get(&palette.name)
+        .is_some_and(|p| p.normalized)
+}
+
 /// Compute (once per collection) the full style-layer map: the collection
 /// key plus one "{id}/{param}" key per parameter, resolved through the
 /// shared StyleContext. Cached so the WMS, Maps and Tiles registries (and
@@ -3922,7 +3932,7 @@ fn collection_layer_styles(
                     .is_none_or(|w| w.colormap.is_none() && w.color_stops.is_empty());
             if unstyled {
                 if let Some(d) = styles.get("default") {
-                    if d.palette.normalized {
+                    if is_generic_fallback(ctx, &d.palette) {
                         tracing::warn!(
                             "Collection '{}': no colormap configured — collection layer \
                              renders generic {} {:.0}..{:.0} (parameter layers may still \
@@ -5904,10 +5914,32 @@ pub async fn request_logging_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_route, collection_layer_styles, is_safe_request_id};
+    use super::{classify_route, collection_layer_styles, is_generic_fallback, is_safe_request_id};
     use ds_core::config::{CollectionConfig, StyleBundle};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The #320 "no colormap configured" warning keys on the resolved
+    /// default being the generic normalized palette. Resolution stretches
+    /// that palette onto its range (#823), so the check asks the registry.
+    #[test]
+    fn generic_fallback_survives_the_normalized_stretch() {
+        let ctx = ds_render::StyleContext::with_builtins();
+        let resolve = |name| {
+            ctx.build_colormap(&ds_render::StyleSpec {
+                colormap: Some(name),
+                color_stops: &[],
+                min: Some(0.0),
+                max: Some(100.0),
+            })
+            .unwrap()
+            .palette
+        };
+        let viridis = resolve("viridis");
+        assert!(!viridis.normalized, "resolved stops are in data units");
+        assert!(is_generic_fallback(&ctx, &viridis));
+        assert!(!is_generic_fallback(&ctx, &resolve("temperature")));
+    }
 
     /// Resolve a collection's full style-layer map through a fresh
     /// [`ds_render::StyleContext`] + empty cache — the test-side stand-in for
