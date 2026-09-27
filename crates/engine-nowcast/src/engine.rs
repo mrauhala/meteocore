@@ -2303,30 +2303,12 @@ impl EdrEngine for NowcastEngine {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
         let bbox = polygon.bbox;
 
-        let wanted: Vec<&'static motion_grid::ParamSpec> = match parameters {
-            None => PARAM_SPECS.iter().collect(),
-            Some(list) => {
-                let mut out: Vec<&'static motion_grid::ParamSpec> = Vec::with_capacity(list.len());
-                for p in list {
-                    let Some(spec) = param_spec(p) else {
-                        let valid: Vec<&str> = PARAM_SPECS.iter().map(|p| p.name).collect();
-                        return Err(DataServerError::InvalidParameter(format!(
-                            "Unknown parameter '{p}'; valid: {}",
-                            valid.join(", ")
-                        )));
-                    };
-                    if !out.iter().any(|s| s.name == spec.name) {
-                        out.push(spec);
-                    }
-                }
-                if out.is_empty() {
-                    return Err(DataServerError::InvalidParameter(
-                        "No parameters specified for area query".into(),
-                    ));
-                }
-                out
-            }
-        };
+        let names: Vec<&'static str> = PARAM_SPECS.iter().map(|p| p.name).collect();
+        let wanted: Vec<&'static motion_grid::ParamSpec> =
+            ds_core::edr_engine::select_parameters(parameters, &names)?
+                .into_iter()
+                .filter_map(param_spec)
+                .collect();
 
         let state = self.state.load();
         let generation = Self::select_motion_generation(&state, datetime, reference_time)?;
