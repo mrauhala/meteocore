@@ -228,3 +228,65 @@ pub trait EdrEngine: Send + Sync {
         ))
     }
 }
+
+/// Resolve an EDR `parameter-name` selection against the parameters a
+/// collection serves, the one rule every engine applies (#666). `None`
+/// selects every available name, in their order. Otherwise each requested
+/// name must be available (matched case-insensitively), repeats collapse,
+/// and the canonical spellings come back in request order. An unknown name,
+/// or an empty list, is an `InvalidParameter` (400) listing the valid
+/// names — never silently narrowed to the names that do exist.
+pub fn select_parameters<'a>(
+    requested: Option<&[String]>,
+    available: &[&'a str],
+) -> Result<Vec<&'a str>, DataServerError> {
+    let Some(requested) = requested else {
+        return Ok(available.to_vec());
+    };
+    let valid = || available.join(", ");
+    if requested.is_empty() {
+        return Err(DataServerError::InvalidParameter(format!(
+            "No parameter requested; available: {}",
+            valid()
+        )));
+    }
+    let mut selected: Vec<&'a str> = Vec::with_capacity(requested.len());
+    for name in requested {
+        let Some(&found) = available.iter().find(|a| a.eq_ignore_ascii_case(name)) else {
+            return Err(DataServerError::InvalidParameter(format!(
+                "Unknown parameter '{name}'; available: {}",
+                valid()
+            )));
+        };
+        if !selected.contains(&found) {
+            selected.push(found);
+        }
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_parameters;
+
+    #[test]
+    fn select_parameters_is_all_or_exactly_the_known_names() {
+        let available = ["DBZH", "VRADH", "TH"];
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(select_parameters(None, &available).unwrap(), available);
+        // Request order, canonical spelling, repeats collapsed.
+        assert_eq!(
+            select_parameters(Some(&names(&["th", "DBZH", "TH"])), &available).unwrap(),
+            ["TH", "DBZH"]
+        );
+        // One unknown name fails the request, naming the valid ones.
+        let err = select_parameters(Some(&names(&["DBZH", "bogus"])), &available)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'bogus'") && err.contains("DBZH, VRADH, TH"),
+            "{err}"
+        );
+        assert!(select_parameters(Some(&[]), &available).is_err());
+    }
+}
