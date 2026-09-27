@@ -416,6 +416,22 @@ mod collections {
         let (status, _) = get("/collections/nonexistent").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// At the shared root a raster collection exists without feature
+    /// items; the items 404 must not claim the collection is missing
+    /// (#811).
+    #[tokio::test]
+    async fn items_404_says_no_feature_items() {
+        for uri in ["/collections/raster/items", "/collections/raster/items/1"] {
+            let (status, json) = get(uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            let description = json["description"].as_str().unwrap_or_default();
+            assert!(
+                description.contains("no feature items"),
+                "{uri}: {description}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
