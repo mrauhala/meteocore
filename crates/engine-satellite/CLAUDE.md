@@ -60,6 +60,11 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   - `tiled_scan_ready` holds a scan back while its tiles may still be
     arriving.
   - A bucket lists only the slots not yet ingested, and at most 6 h of them.
+    A slot directory holds every band, so one poll lists each prefix once
+    for all products (`source::Listings`).
+  - A tile with corrupt coordinates fails its scan: the lattice is capped
+    at `MAX_MOSAIC_PIXELS` per axis and `MAX_MOSAIC_CELLS` before anything
+    is allocated.
 - **ISatSS quirks.** The geostationary mapping writes `semi_major` and
   `semi_minor` (aliased in `Part::open`; `ds_core::cf` stays strictly CF).
   The field has no `_FillValue` or `valid_range`: far space is packed

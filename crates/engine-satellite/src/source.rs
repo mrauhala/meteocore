@@ -1,12 +1,13 @@
 //! Where scans come from: a public S3 bucket (GOES-R, Himawari on AWS), or a
 //! local directory mirroring it (tests, offline use).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_storage::object_store::path::Path as ObjectPath;
+use ds_storage::object_store::ObjectMeta;
 use ds_storage::DataStore;
 
 use crate::naming::Naming;
@@ -23,6 +24,11 @@ pub(crate) enum Source {
     Directory { store: DataStore, base: ObjectPath },
 }
 
+/// Listings made during one poll, by prefix. An ISatSS slot directory
+/// holds every band's tiles, so the products of one collection list it
+/// once, not once each (Critical Rule 9).
+pub(crate) type Listings = HashMap<String, Arc<[ObjectMeta]>>;
+
 /// One scan found by a listing: its file, or its tiles in tile order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Found {
@@ -35,7 +41,8 @@ impl Source {
     /// when `None`), oldest first. `known` names scans already ingested: a
     /// bucket skips the prefixes that hold nothing else.
     ///
-    /// Each prefix is one sequential `list` on the background runtime; a
+    /// Each prefix is one sequential `list` on the background runtime,
+    /// made once per poll whichever products need it (`listings`); a
     /// window's prefixes are capped by [`Naming::validate_window`]
     /// (Critical Rule 9).
     pub fn list(
@@ -43,20 +50,30 @@ impl Source {
         naming: &Naming,
         window: Option<(DateTime<Utc>, DateTime<Utc>)>,
         known: impl Fn(DateTime<Utc>) -> bool,
+        listings: &mut Listings,
     ) -> Result<Vec<Found>, DataServerError> {
-        let listed = match self {
+        let mut list = |store: &DataStore, prefix: String| -> Result<_, DataServerError> {
+            if let Some(listed) = listings.get(&prefix) {
+                return Ok(listed.clone());
+            }
+            let listed: Arc<[ObjectMeta]> = store.list(&ObjectPath::from(prefix.as_str()))?.into();
+            listings.insert(prefix, listed.clone());
+            Ok(listed)
+        };
+        let mut listed = Vec::new();
+        match self {
             Source::Bucket { store } => {
                 let (start, end) = window.ok_or_else(|| {
                     DataServerError::Config("a bucket source needs a time_window".into())
                 })?;
-                let mut listed = Vec::new();
                 for prefix in naming.prefixes(start, end, known)? {
-                    listed.extend(store.list(&ObjectPath::from(prefix))?);
+                    listed.extend(list(store, prefix)?.iter().cloned());
                 }
-                listed
             }
-            Source::Directory { store, base } => store.list(base)?,
-        };
+            Source::Directory { store, base } => {
+                listed.extend(list(store, base.to_string())?.iter().cloned());
+            }
+        }
         // Scan start → tile (0 for a single-file scan) → file. A file
         // re-published under a new creation stamp keeps its scan start and
         // tile; keep the lexicographically greatest name.
@@ -118,5 +135,64 @@ impl Source {
             .into_iter()
             .map(|file| file.map(|bytes| bytes.to_vec()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ds_storage::object_store::memory::InMemory;
+    use ds_storage::object_store::path::Path as ObjectPath;
+    use ds_storage::object_store::ObjectMeta;
+    use ds_storage::DataStore;
+
+    use super::{Listings, Source};
+    use crate::naming::Naming;
+
+    /// Two bands of one ISatSS collection share a slot directory: listed
+    /// once per poll, the second band reads the first band's listing. The
+    /// store here is empty, so each band finding its tiles proves nothing
+    /// was listed twice.
+    #[test]
+    fn products_share_a_slot_listing() {
+        let slot = "AHI-L2-FLDK-ISatSS/2026/09/27/1920";
+        let meta = |band: u8, tile: u32| {
+            ObjectMeta {
+            location: ObjectPath::from(format!(
+                "{slot}/OR_HFD-020-B12-M1C{band:02}-T{tile:03}_GH9_s20262701920000_c20262701928140.nc"
+            )),
+            last_modified: chrono::Utc::now(),
+            size: 1,
+            e_tag: None,
+            version: None,
+        }
+        };
+        let mut listings = Listings::new();
+        listings.insert(
+            slot.to_string(),
+            [meta(13, 1), meta(13, 2), meta(14, 1), meta(14, 2)].into(),
+        );
+        let source = Source::Bucket {
+            store: DataStore::new(Arc::new(InMemory::new())),
+        };
+        let at = "2026-09-27T19:20:00Z".parse().unwrap();
+        for band in [13, 14] {
+            let found = source
+                .list(
+                    &Naming::isatss("HFD", band),
+                    Some((at, at)),
+                    |_| false,
+                    &mut listings,
+                )
+                .unwrap();
+            assert_eq!(found.len(), 1, "band {band}");
+            assert_eq!(found[0].time, at);
+            assert_eq!(found[0].paths.len(), 2, "band {band}");
+            assert!(found[0].paths[0]
+                .as_ref()
+                .contains(&format!("C{band}-T001")));
+        }
+        assert_eq!(listings.len(), 1);
     }
 }

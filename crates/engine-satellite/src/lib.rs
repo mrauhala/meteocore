@@ -268,9 +268,13 @@ impl SatelliteEngine {
         let mut extents = old.extents.clone();
         let mut grids = old.grids.clone();
         let mut complete = true;
+        let mut listings = source::Listings::new();
         for (index, product) in self.products.iter().enumerate() {
             let known = |time| frames[index].contains_key(&time);
-            let found = match self.source.list(&product.naming, window, known) {
+            let found = match self
+                .source
+                .list(&product.naming, window, known, &mut listings)
+            {
                 Ok(found) => found,
                 Err(e) => {
                     complete = false;

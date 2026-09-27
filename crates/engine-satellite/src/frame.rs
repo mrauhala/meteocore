@@ -24,6 +24,13 @@ use netcdf_reader::{NcAttrValue, NcFile, NcOpenOptions, NcSliceInfo, NcSliceInfo
 /// the overview instead of decoding strips.
 pub(crate) const OVERVIEW_FACTOR: u32 = 4;
 
+/// Largest mosaic grid, per axis in pixels: a 0.5 km AHI or ABI full disk
+/// is ~22 000.
+const MAX_MOSAIC_PIXELS: u64 = 65_536;
+
+/// Most lattice cells in a mosaic: a Himawari full disk is 10 × 10.
+const MAX_MOSAIC_CELLS: u64 = 4_096;
+
 /// Block height when the variable is not chunked.
 const DEFAULT_BLOCK_ROWS: u32 = 24;
 
@@ -463,14 +470,25 @@ fn mosaic(parts: Vec<Part>) -> Result<(Files, GeoTransform, u32, u32), String> {
         .iter()
         .map(|p| p.gt.origin_y)
         .fold(f64::NEG_INFINITY, f64::max);
-    // A tile's lattice cell, from its offset in whole tiles.
+    // A tile's lattice cell: its offset must be a whole number of pixels
+    // (to 1e-3), that number a whole number of tiles, and the grid within
+    // `MAX_MOSAIC_PIXELS` — so a tile with corrupt coordinates fails its
+    // scan instead of sizing an enormous lattice.
     let cell = |offset: f64, size: f64, tile: u32| -> Result<u32, String> {
         let pixels = offset / size;
-        let tiles = pixels / tile as f64;
-        if (pixels - pixels.round()).abs() > 1e-3 || (tiles - tiles.round()).abs() > 1e-6 {
-            return Err("the tiles of a scan are not on one lattice".to_string());
+        let whole = pixels.round();
+        if !((pixels - whole).abs() <= 1e-3 && (0.0..=MAX_MOSAIC_PIXELS as f64).contains(&whole)) {
+            return Err(format!(
+                "the tiles of a scan are not on one lattice within {MAX_MOSAIC_PIXELS} pixels"
+            ));
         }
-        Ok(tiles.round() as u32)
+        let whole = whole as u64;
+        if !whole.is_multiple_of(tile as u64) || whole + tile as u64 > MAX_MOSAIC_PIXELS {
+            return Err(format!(
+                "the tiles of a scan are not on one lattice within {MAX_MOSAIC_PIXELS} pixels"
+            ));
+        }
+        Ok((whole / tile as u64) as u32)
     };
     let placed = parts
         .into_iter()
@@ -482,6 +500,11 @@ fn mosaic(parts: Vec<Part>) -> Result<(Files, GeoTransform, u32, u32), String> {
         .collect::<Result<Vec<_>, String>>()?;
     let across = placed.iter().map(|(_, col, _)| col + 1).max().unwrap_or(1);
     let down = placed.iter().map(|(row, _, _)| row + 1).max().unwrap_or(1);
+    if across as u64 * down as u64 > MAX_MOSAIC_CELLS {
+        return Err(format!(
+            "the tiles of a scan span a lattice of {across} × {down}; at most {MAX_MOSAIC_CELLS} cells"
+        ));
+    }
     let mut tiles: Vec<Option<NcFile>> = (0..across * down).map(|_| None).collect();
     for (row, col, nc) in placed {
         let slot = &mut tiles[(row * across + col) as usize];
@@ -617,7 +640,7 @@ fn to_u32(size: u64) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, FrameOptions, Packing, OVERVIEW_FACTOR};
+    use super::{mosaic, Frame, FrameOptions, Packing, Part, OVERVIEW_FACTOR};
 
     /// GOES-R CMI: stored `short`, `_Unsigned = "true"`, fill `-1s`,
     /// `valid_range = 0s, 4095s`, 12-bit brightness temperatures.
@@ -755,5 +778,47 @@ mod tests {
             }
         }
         assert!(kept > 0 && masked > 0, "kept {kept}, masked {masked}");
+    }
+
+    /// A tile with corrupt coordinates fails its scan: off the lattice, or
+    /// so far away that the lattice would be enormous, never an allocation
+    /// sized by the bad offset.
+    #[test]
+    fn mosaic_rejects_tiles_off_one_bounded_lattice() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/himawari9-isatss");
+        let options = FrameOptions {
+            variable: "Sectorized_CMI",
+            valid_fallback: Some((0, i16::MAX as i32)),
+        };
+        let parts = || -> Vec<Part> {
+            let mut names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|e| e == "nc"))
+                .collect();
+            names.sort();
+            names
+                .into_iter()
+                .map(|p| Part::open(std::fs::read(p).unwrap(), options).unwrap())
+                .collect()
+        };
+        assert!(mosaic(parts()).is_ok());
+        // (x, y) shifts of one tile, in pixels (tiles are 64 × 64).
+        for (dx, dy) in [
+            (10.0, 0.0),          // a fraction of a tile: off the lattice
+            (6400.0, 6400.0),     // 100 × 100 tiles: over MAX_MOSAIC_CELLS
+            (1100.0 * 64.0, 0.0), // 1100 tiles wide: over MAX_MOSAIC_PIXELS
+            (1.0e12, 0.0),        // far past any grid
+        ] {
+            let mut bad = parts();
+            let (pw, ph) = (bad[0].gt.pixel_width, bad[0].gt.pixel_height);
+            bad[0].gt.origin_x += dx * pw;
+            bad[0].gt.origin_y -= dy * ph;
+            let err = mosaic(bad)
+                .err()
+                .unwrap_or_else(|| panic!("shift ({dx}, {dy}) accepted"));
+            assert!(err.contains("lattice"), "shift ({dx}, {dy}): {err}");
+        }
     }
 }
