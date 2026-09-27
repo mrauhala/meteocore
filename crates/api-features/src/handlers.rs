@@ -781,6 +781,19 @@ pub async fn items(
                 Json(json!({ "code": "BadRequest", "description": e.to_string() })),
             )
         })?;
+    // A collection whose features carry no time cannot filter by it: a 400,
+    // not the full set with 200 (#682).
+    if datetime.is_some() && !engine.has_time_dimension() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BadRequest",
+                "description": format!(
+                    "Collection '{id}' has no time dimension; datetime is not supported"
+                )
+            })),
+        ));
+    }
 
     // Validated against what this engine can actually sort on, so an unknown
     // property is a 400 naming the valid ones rather than a parameter that

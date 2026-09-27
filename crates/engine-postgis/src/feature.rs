@@ -83,6 +83,12 @@ impl FeatureEngine for PostgisEngine {
         self.cache().load().spatial_extent
     }
 
+    /// The station inventory has no time dimension: `datetime` is a 400
+    /// (#682). Observations are EDR's.
+    fn has_time_dimension(&self) -> bool {
+        false
+    }
+
     fn data_version(&self) -> u64 {
         // The metadata cache bumps `version` on every successful refresh, so
         // station-set changes (and PR #110's planned background refresh) will
