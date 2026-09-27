@@ -68,7 +68,7 @@ imply a regular sampling grid.
 | `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
 | `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the Tiles service registered the collection for vector tiles (listing `tiles` in `apis` is not enough: a nowcast renders only map tiles) |
 | `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
-| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links |
+| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links; takes only `f` — any other parameter (`crs`, `properties`, a filter, a duplicate `f`) → 400 (#681) |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
 
 ## Shared OGC API root
@@ -118,7 +118,7 @@ tiles render the selected instant. Not part of this crate.
 | Parameter | Status | Notes |
 |---|---|---|
 | `bbox` | ✓ | 4 or 6 values (heights ignored); `west > east` is an antimeridian-crossing box (Features §7.15.3); 400 on malformed input |
-| `datetime` | partial | RFC 3339 instant, `start/end`, `../end`, `start/..`; parsed by the API layer but **silently ignored by engines with no time dimension** (CSV, GeoJSON, PostGIS stations — see matrix) |
+| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`; an interval that ends before it starts is 400. Engines with no time dimension (GeoJSON, PostGIS stations) answer 400 rather than ignoring it (#682); CSV filters stations to those with a report in the interval — see matrix |
 | `limit` | ✓ | default 100, clamped to `[1, 1000]` (out-of-range values are clamped, not rejected) |
 | `offset` | ✓ | offset pagination (non-standard extension; Part 1 only mandates `next`) |
 | `sortby` | ✓ | Part 8 syntax `[+\|-]property,…`; a decoded `+` (space) is accepted as ascending; 400 unless every property is in `FeatureEngine::sortables`; applied before paging (`ds_core::feature::sort_features`) |
@@ -208,10 +208,10 @@ layer but has no effect on this engine.
 
 | Engine | Feature = | `bbox` semantics | `datetime` semantics | `sortby` | Property filters | `spatial_extent` | `temporal_extent` | `data_version` |
 |---|---|---|---|---|---|---|---|---|
-| CSV | one station per distinct location (Point) | station point inside box | ignored | – (400) | ✓ name, latitude, longitude | – | – | 0 (static) |
-| GeoJSON file | file features as loaded | feature geometry intersects query box (R-tree candidates, then a point / polygon-edge / containment test; `west > east` split at the antimeridian) | ignored | – (400) | ✓ all loaded property names | ✓ | – | ✓ |
+| CSV | one station per distinct location (Point) | station point inside box | stations with at least one observation row in the interval | – (400) | ✓ name, latitude, longitude | – | ✓ (first/last observation) | 0 (static) |
+| GeoJSON file | file features as loaded | feature geometry intersects query box (R-tree candidates, then a point / polygon-edge / containment test; `west > east` split at the antimeridian) | – (400: no time dimension) | – (400) | ✓ all loaded property names | ✓ | – | ✓ |
 | CAP | one alert area (Polygon / MultiPolygon / null geometry); `properties.geometry_source` = `inline`/`geocode`/`notification`/`bbox`; producer `<parameter>`s as top-level properties under their valueName (MeteoAlarm `awareness_level`, `awareness_type`; repeats → list; `impacts`), `<eventCode>`s as `eventCode:<valueName>`. Identity is scoped to sender; canonical IDs include a length-prefixed sender, and old identifier-only URLs resolve only when unambiguous. Status filtering precedes exact sender/identifier/sent Update/Cancel resolution (at ingest for WIS2, on rebuild for directory/feed). Failed documents retain their last good data while successfully fetched documents update | area bbox intersects query box; crossing bboxes split at the antimeridian; null-geometry areas excluded when `bbox` is set | alert active window intersects the interval | – (400) | ✓ standard + producer property names (including lists) | ✓ | ✓ (union of active windows; `None` when fully open) | ✓ |
-| PostGIS stations | one station (Point) from the cached location set | station point inside box (in memory, not SQL) | ignored | – (400) | ✓ cached station property names | ✓ | – | ✓ |
+| PostGIS stations | one station (Point) from the cached location set | station point inside box (in memory, not SQL) | – (400: no time dimension) | – (400) | ✓ cached station property names | ✓ | – | ✓ |
 | PostGIS events | — no `FeatureEngine` (EDR area + WMS only; Features items = #503) — | | | | — | | | |
 | BUFR | one station (Point) from the observation store; properties `wigos_station_identifier`, `name`, `elevation`, `first_report`, `last_report`, `report_count` | station point inside box | station has ≥ 1 report inside the interval | ✓ last_report, first_report, report_count, name | ✓ name, wigos_station_identifier, elevation, first_report, last_report, report_count | ✓ | ✓ (oldest → newest report held) | ✓ (snapshot version) |
 | ODIM PVOL network | one radar site (Point) — site inventory | site point inside box | sites with a volume inside the interval | – (400) | ✓ all site inventory properties (including quantities/elevation_angles lists) | ✓ | – | ✓ (inventory-sensitive) |
@@ -227,9 +227,9 @@ responses are buffered rather than streamed.
 
 ## Known gaps, in suggested order
 
-1. Reject or honour query parameters on `/items/{featureId}` (#681);
-   `/items` now rejects unsupported/unknown names (#700). Honour or reject
-   `datetime` on engines without a time dimension (#682).
+1. Honour or reject `datetime` on engines without a time dimension (#682).
+   `/items` rejects unsupported/unknown names (#700), `/items/{featureId}`
+   everything but `f` (#681).
 2. Declare Part 8 sorting + serve `/sortables` (#683).
 3. PostGIS events shape as Features items with keyset pagination (#503).
 4. `Geometry::LineString` for storm tracks (#408); polygon cells.

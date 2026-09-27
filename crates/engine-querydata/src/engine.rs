@@ -302,20 +302,7 @@ impl EdrEngine for QueryDataEngine {
             ));
         }
 
-        let param_indices: Vec<(usize, &crate::parse::ParamInfo)> = data
-            .params
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                parameters
-                    .is_none_or(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(&p.name)))
-            })
-            .collect();
-        if param_indices.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No matching parameters found".into(),
-            ));
-        }
+        let param_indices = select_param_indices(&data, parameters)?;
 
         // A polygon entirely outside the run's coverage is a 404, not an
         // all-null 200 (GRIB answers the same way).
@@ -426,21 +413,7 @@ impl EdrEngine for QueryDataEngine {
 
         let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
 
-        let param_indices: Vec<(usize, &crate::parse::ParamInfo)> = data
-            .params
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                parameters
-                    .is_none_or(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(&p.name)))
-            })
-            .collect();
-
-        if param_indices.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No matching parameters found".into(),
-            ));
-        }
+        let param_indices = select_param_indices(&data, parameters)?;
 
         let domain = DomainDescription::PointSeries {
             x: lon,
@@ -812,6 +785,27 @@ fn interpolate(
     sample_grid_bilinear(data, col_f, row_f, param_idx, level_idx, time_idx)
 }
 
+/// The parameters an EDR query addresses, with their indices: every one
+/// when `parameters` is absent, else exactly the named ones
+/// (`select_parameters`: case-insensitive, an unknown name is a 400), in
+/// request order. Shared by position and area so the two cannot drift.
+fn select_param_indices<'a>(
+    data: &'a QueryData,
+    parameters: Option<&[String]>,
+) -> Result<Vec<(usize, &'a crate::parse::ParamInfo)>, DataServerError> {
+    let names: Vec<&str> = data.params.iter().map(|p| p.name.as_str()).collect();
+    let selected = ds_core::edr_engine::select_parameters(parameters, &names)?;
+    if selected.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "No parameters available".into(),
+        ));
+    }
+    Ok(selected
+        .into_iter()
+        .filter_map(|name| data.params.iter().enumerate().find(|(_, p)| p.name == name))
+        .collect())
+}
+
 /// Map WGS84 (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
 /// source `Crs::forward` plus the grid's affine, with the half-pixel centre
 /// offset. This is the (possibly projected) per-node mapping fed to
@@ -928,44 +922,11 @@ fn find_time_range(
     }
 }
 
-/// Parse EDR position query coordinates.
+/// Parse EDR position query coordinates as `(lat, lon)`: the shared ds-core
+/// parser, so a direct engine call gets the same finite and range checks
+/// as the HTTP boundary (#534).
 fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
-    let trimmed = coords.trim();
-
-    if let Some(inner) = trimmed
-        .strip_prefix("POINT(")
-        .or_else(|| trimmed.strip_prefix("POINT ("))
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.split_whitespace().collect();
-        if parts.len() != 2 {
-            return Err(DataServerError::InvalidParameter(
-                "Expected POINT(lon lat) format".into(),
-            ));
-        }
-        let lon: f64 = parts[0].parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-        })?;
-        return Ok((lat, lon));
-    }
-
-    let parts: Vec<&str> = trimmed.split(',').collect();
-    if parts.len() == 2 {
-        let lon: f64 = parts[0].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-        })?;
-        return Ok((lat, lon));
-    }
-
-    Err(DataServerError::InvalidParameter(
-        "Expected POINT(lon lat) or lon,lat format".into(),
-    ))
+    ds_core::feature::parse_point_coords(coords)
 }
 
 #[cfg(test)]
@@ -1002,6 +963,28 @@ mod tests {
         assert!((bbox[1] - (-5.25)).abs() < 0.01, "south {}", bbox[1]);
         assert!((bbox[2] - 41.5).abs() < 0.01, "east {}", bbox[2]);
         assert!((bbox[3] - 4.75).abs() < 0.01, "north {}", bbox[3]);
+    }
+
+    /// A direct `query_position` gets the HTTP boundary's coordinate checks
+    /// (#534): non-finite and out-of-range points are a 400, never sampled.
+    #[test]
+    fn position_rejects_non_finite_and_out_of_range_coordinates() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        for bad in [
+            "POINT(NaN -1.3)",
+            "POINT(36.8 inf)",
+            "POINT(200 -1.3)",
+            "36.8,-95",
+        ] {
+            assert!(
+                matches!(
+                    engine.query_position(bad, None, None, None, None),
+                    Err(DataServerError::InvalidParameter(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     fn meps_engine() -> QueryDataEngine {

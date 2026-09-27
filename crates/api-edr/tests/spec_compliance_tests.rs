@@ -485,16 +485,17 @@ async fn finding_10_collection_id_hardcoded() {
 //   is the most commonly expected query type.
 
 #[tokio::test]
-async fn finding_11_position_query_returns_400_for_unsupported_engine() {
+async fn finding_11_position_query_returns_404_for_unsupported_engine() {
     // URL-encode WKT parentheses: POINT(x y) -> POINT%2824.9384%2060.1699%29
-    let (status, _) =
+    let (status, json) =
         get_json("/collections/weather/position?coords=POINT%2824.9384%2060.1699%29").await;
-    // The CSV engine does not support position queries, so it returns 400
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "Position query should return 400 for engines that do not support it"
-    );
+    // The engine does not support position queries: the resource does not
+    // exist for this collection, 404 like radius and trajectory (#668), and
+    // the OpenAPI document does not list the path.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["code"], "NotFound");
+    let (_, api) = get_json("/api").await;
+    assert!(api["paths"]["/edr/collections/weather/position"].is_null());
 }
 
 #[tokio::test]
@@ -513,13 +514,12 @@ async fn finding_11b_radius_query_returns_404_for_unsupported_engine() {
 }
 
 #[tokio::test]
-async fn finding_11c_area_query_returns_400_for_unsupported_engine() {
-    let (status, _) = get_json("/collections/weather/area?coords=POLYGON%28%2820%2059%2C32%2059%2C32%2071%2C20%2071%2C20%2059%29%29").await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "Area query should return 400 for engines that do not support it"
-    );
+async fn finding_11c_area_query_returns_404_for_unsupported_engine() {
+    let (status, json) = get_json("/collections/weather/area?coords=POLYGON%28%2820%2059%2C32%2059%2C32%2071%2C20%2071%2C20%2059%29%29").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["code"], "NotFound");
+    let (_, api) = get_json("/api").await;
+    assert!(api["paths"]["/edr/collections/weather/area"].is_null());
 }
 
 // ===========================================================================
