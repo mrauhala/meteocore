@@ -50,9 +50,11 @@ pub struct FormatParams {
 /// wanting a specific format can always send `?f=`).
 pub fn negotiate(f: Option<&str>, accept: Option<&str>) -> Result<Wanted, NegotiationError> {
     if let Some(f) = f.map(str::trim).filter(|s| !s.is_empty()) {
+        // The short tokens, and the media types other OGC API servers
+        // accept in `f` too (#510).
         return match f.to_ascii_lowercase().as_str() {
-            "json" => Ok(Wanted::Json),
-            "html" => Ok(Wanted::Html),
+            "json" | "application/json" => Ok(Wanted::Json),
+            "html" | "text/html" => Ok(Wanted::Html),
             other => Err(NegotiationError(format!(
                 "unknown format '{other}'; expected 'json' or 'html'"
             ))),
@@ -214,5 +216,17 @@ mod tests {
     #[test]
     fn negotiate_unknown_f_is_error() {
         assert!(negotiate(Some("xml"), None).is_err());
+        assert!(negotiate(Some("application/xml"), None).is_err());
+    }
+
+    #[test]
+    fn negotiate_accepts_media_type_aliases_in_f() {
+        for f in ["application/json", "Application/JSON", " application/json "] {
+            assert_eq!(negotiate(Some(f), None).unwrap(), Wanted::Json, "{f}");
+        }
+        assert_eq!(
+            negotiate(Some("text/html"), Some("application/json")).unwrap(),
+            Wanted::Html
+        );
     }
 }
