@@ -1,11 +1,16 @@
-//! One scan of one product: a NetCDF-4 file held in memory, decoded strip
-//! by strip on demand.
+//! One scan of one product: a NetCDF-4 file held in memory, decoded block
+//! by block on demand.
 //!
 //! Keeping the compressed file (a 2 km full disk is ~25 MB, versus 59 MB
-//! decoded) and inflating only the strips a render touches measured cheaper
+//! decoded) and inflating only the blocks a render touches measured cheaper
 //! than decoding whole grids at ingest (#819 phase 0). A decimated overview
 //! is built once at ingest so a zoomed-out render never decodes the full
 //! disk.
+//!
+//! A block is a rectangle of the grid decoded at once: `block_rows` by
+//! `block_cols` pixels, row-major, the last row and column of blocks
+//! clipped to the grid. A GOES-R block is a strip of chunk rows across the
+//! full width.
 
 use std::sync::Arc;
 
@@ -19,9 +24,8 @@ use netcdf_reader::{NcAttrValue, NcFile, NcOpenOptions, NcSliceInfo, NcSliceInfo
 /// the overview instead of decoding strips.
 pub(crate) const OVERVIEW_FACTOR: u32 = 4;
 
-/// Strip height when the variable is not chunked (GOES-R chunks are 24
-/// full-width rows).
-const DEFAULT_STRIP_ROWS: u32 = 24;
+/// Block height when the variable is not chunked.
+const DEFAULT_BLOCK_ROWS: u32 = 24;
 
 pub(crate) struct Frame {
     nc: NcFile,
@@ -32,9 +36,11 @@ pub(crate) struct Frame {
     pub packing: Packing,
     /// Full-resolution grid.
     pub gt: GeoTransform,
-    /// Rows per decoded strip: the variable's chunk height, so a strip read
+    /// Rows per decoded block: the variable's chunk height, so a block read
     /// inflates each chunk once.
-    pub strip_rows: u32,
+    pub block_rows: u32,
+    /// Columns per decoded block: the full width, so a block is a strip.
+    pub block_cols: u32,
     pub overview: Overview,
     /// Bytes this frame holds (the file plus the overview), for the cache.
     pub weight: u64,
@@ -174,12 +180,12 @@ impl Frame {
             crs,
         )?;
 
-        let strip_rows = hdf5_reader::Hdf5File::from_storage(storage)
+        let block_rows = hdf5_reader::Hdf5File::from_storage(storage)
             .ok()
             .and_then(|h5| h5.dataset(variable).ok()?.chunks())
             .and_then(|chunks| chunks.first().copied())
             .filter(|&rows| rows > 0)
-            .unwrap_or(DEFAULT_STRIP_ROWS)
+            .unwrap_or(DEFAULT_BLOCK_ROWS)
             .min(ny);
 
         let placeholder = GeoTransform {
@@ -193,7 +199,8 @@ impl Frame {
             stored_signed,
             packing,
             gt,
-            strip_rows,
+            block_rows,
+            block_cols: nx,
             overview: Overview {
                 gt: placeholder,
                 raw: Vec::new(),
@@ -205,33 +212,58 @@ impl Frame {
         Ok(frame)
     }
 
-    pub fn strip_count(&self) -> u32 {
-        self.gt.height.div_ceil(self.strip_rows)
+    /// Blocks per row of blocks.
+    fn blocks_across(&self) -> u32 {
+        self.gt.width.div_ceil(self.block_cols)
     }
 
-    /// Decode strip `index`: rows `index * strip_rows ..`, all columns, as
-    /// stored integers.
-    pub fn read_strip(&self, index: u32) -> Result<Arc<[u16]>, String> {
-        let start = index * self.strip_rows;
-        if start >= self.gt.height {
-            return Err(format!("strip {index} is past the grid"));
+    pub fn block_count(&self) -> u32 {
+        self.gt.height.div_ceil(self.block_rows) * self.blocks_across()
+    }
+
+    /// Pixel rows and columns block `index` covers, clipped to the grid.
+    fn block_window(&self, index: u32) -> (std::ops::Range<u32>, std::ops::Range<u32>) {
+        let (row, col) = (index / self.blocks_across(), index % self.blocks_across());
+        let (r0, c0) = (row * self.block_rows, col * self.block_cols);
+        (
+            r0..(r0 + self.block_rows).min(self.gt.height),
+            c0..(c0 + self.block_cols).min(self.gt.width),
+        )
+    }
+
+    /// The block holding pixel `(row, col)`, and the pixel's offset in it.
+    pub fn locate(&self, row: u32, col: u32) -> (u32, usize) {
+        let index = (row / self.block_rows) * self.blocks_across() + col / self.block_cols;
+        let stride = self.block_window(index).1.len();
+        let offset = (row % self.block_rows) as usize * stride + (col % self.block_cols) as usize;
+        (index, offset)
+    }
+
+    /// Blocks a read of pixel columns `c0..c1`, rows `r0..r1` decodes.
+    pub fn blocks_in(&self, c0: u32, r0: u32, c1: u32, r1: u32) -> usize {
+        if c1 <= c0 || r1 <= r0 {
+            return 0;
         }
-        let end = (start + self.strip_rows).min(self.gt.height);
-        let selection = NcSliceInfo {
-            selections: vec![
-                NcSliceInfoElem::Slice {
-                    start: start as u64,
-                    end: end as u64,
-                    step: 1,
-                },
-                NcSliceInfoElem::Slice {
-                    start: 0,
-                    end: self.gt.width as u64,
-                    step: 1,
-                },
-            ],
+        let rows = (r1 - 1) / self.block_rows - r0 / self.block_rows + 1;
+        let cols = (c1 - 1) / self.block_cols - c0 / self.block_cols + 1;
+        rows as usize * cols as usize
+    }
+
+    /// Decode block `index` as stored integers, row-major.
+    pub fn read_block(&self, index: u32) -> Result<Arc<[u16]>, String> {
+        if index >= self.block_count() {
+            return Err(format!("block {index} is past the grid"));
+        }
+        let (rows, cols) = self.block_window(index);
+        let slice = |range: std::ops::Range<u32>| NcSliceInfoElem::Slice {
+            start: range.start as u64,
+            end: range.end as u64,
+            step: 1,
         };
-        let read = |e: netcdf_reader::Error| format!("strip {index} of '{}': {e}", self.variable);
+        let selection = NcSliceInfo {
+            selections: vec![slice(rows), slice(cols)],
+        };
+        let read = |e: netcdf_reader::Error| format!("block {index} of '{}': {e}", self.variable);
         let raw: Arc<[u16]> = if self.stored_signed {
             let values = self
                 .nc
@@ -248,25 +280,31 @@ impl Frame {
         Ok(raw)
     }
 
-    /// Every [`OVERVIEW_FACTOR`]-th pixel (the centre of each block), read
-    /// strip by strip so the full grid is never held decoded at once.
+    /// Every [`OVERVIEW_FACTOR`]-th pixel (the centre of each factor²
+    /// cell), read one row of blocks at a time so the full grid is never
+    /// held decoded at once.
     fn build_overview(&self) -> Result<Overview, String> {
         let factor = OVERVIEW_FACTOR;
         let (nx, ny) = (self.gt.width, self.gt.height);
         let (ox, oy) = (nx.div_ceil(factor), ny.div_ceil(factor));
         let mut raw = vec![0u16; ox as usize * oy as usize];
         let centre = |i: u32, n: u32| (i * factor + factor / 2).min(n - 1);
-        let mut strip: Option<(u32, Arc<[u16]>)> = None;
+        let mut blocks: Vec<Option<Arc<[u16]>>> = vec![None; self.block_count() as usize];
+        let mut block_row = None;
         for j in 0..oy {
             let row = centre(j, ny);
-            let index = row / self.strip_rows;
-            if strip.as_ref().map(|(i, _)| *i) != Some(index) {
-                strip = Some((index, self.read_strip(index)?));
+            // Blocks of rows already passed are never read again.
+            if block_row != Some(row / self.block_rows) {
+                block_row = Some(row / self.block_rows);
+                blocks.iter_mut().for_each(|b| *b = None);
             }
-            let data = &strip.as_ref().expect("just read").1;
-            let offset = (row % self.strip_rows) as usize * nx as usize;
             for i in 0..ox {
-                raw[j as usize * ox as usize + i as usize] = data[offset + centre(i, nx) as usize];
+                let (index, offset) = self.locate(row, centre(i, nx));
+                let block = match &mut blocks[index as usize] {
+                    Some(block) => block,
+                    slot => slot.insert(self.read_block(index)?),
+                };
+                raw[j as usize * ox as usize + i as usize] = block[offset];
             }
         }
         Ok(Overview {
@@ -332,7 +370,7 @@ fn to_u32(size: u64) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Packing;
+    use super::{Frame, Packing};
 
     /// GOES-R CMI: stored `short`, `_Unsigned = "true"`, fill `-1s`,
     /// `valid_range = 0s, 4095s`, 12-bit brightness temperatures.
@@ -357,5 +395,45 @@ mod tests {
             valid: None,
         };
         assert_eq!(signed.decode(0xFFFE), Some(-2.0));
+    }
+
+    /// Blocks narrower than the grid, clipped at its right and bottom
+    /// edges, read the same pixels and build the same overview as the
+    /// full-width strips of the real C13 crop (320 × 240, chunks 24 rows).
+    #[test]
+    fn blocks_of_any_shape_read_the_same_pixels() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../testdata/goes19-abi/\
+             OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc",
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let strips = Frame::open(bytes.clone(), "CMI").unwrap();
+        assert_eq!((strips.block_cols, strips.gt.width), (320, 320));
+        let mut blocks = Frame::open(bytes, "CMI").unwrap();
+        // 320 = 3 × 100 + 20 and 240 = 34 × 7 + 2: both edges clip.
+        (blocks.block_rows, blocks.block_cols) = (7, 100);
+        assert_eq!(blocks.block_count(), 35 * 4);
+        assert_eq!(blocks.blocks_in(0, 0, 320, 240), 35 * 4);
+        assert_eq!(blocks.blocks_in(99, 6, 101, 8), 4);
+        assert_eq!(blocks.blocks_in(300, 238, 320, 240), 1);
+
+        let mut decoded = std::collections::HashMap::new();
+        let mut read = |frame: &Frame, row: u32, col: u32| {
+            let (index, offset) = frame.locate(row, col);
+            let block = decoded
+                .entry((frame.block_cols, index))
+                .or_insert_with(|| frame.read_block(index).unwrap());
+            block[offset]
+        };
+        for row in (0..240).step_by(3).chain([239]) {
+            for col in (0..320).step_by(7).chain([99, 100, 299, 300, 319]) {
+                assert_eq!(
+                    read(&strips, row, col),
+                    read(&blocks, row, col),
+                    "pixel ({row}, {col})"
+                );
+            }
+        }
+        assert_eq!(blocks.build_overview().unwrap().raw, strips.overview.raw);
     }
 }
