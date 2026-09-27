@@ -333,7 +333,10 @@
     function fitMapToExtent(extent, animate = true) {
         const south = Math.max(extent[1], -85);
         const north = Math.min(extent[3], 85);
-        const bounds = new maplibregl.LngLatBounds([extent[0], south], [extent[2], north]);
+        // West > east crosses the antimeridian: unwrap the east edge so the
+        // fit spans the seam, not the rest of the globe.
+        const east = extent[2] < extent[0] ? extent[2] + 360 : extent[2];
+        const bounds = new maplibregl.LngLatBounds([extent[0], south], [east, north]);
         map.fitBounds(bounds, { padding: 80, maxZoom: 10, duration: 600, animate });
     }
 

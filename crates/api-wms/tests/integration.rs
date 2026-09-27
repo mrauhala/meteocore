@@ -1409,7 +1409,8 @@ impl MapEngine for ExtentMockMapEngine {
 /// The WMS 1.3.0 schema bounds `EX_GeographicBoundingBox` to ±180°/±90°. A
 /// global 0.25° grid's cell edges reach past both and become the whole globe;
 /// an extent that is still the empty-accumulator sentinel emits no box at all
-/// rather than ±1.8e308.
+/// rather than ±1.8e308. An antimeridian crossing keeps west > east in the
+/// ISO box only.
 #[test]
 fn capabilities_bbox_stays_in_the_crs84_domain() {
     let capabilities = |extent: [f64; 4]| {
@@ -1435,6 +1436,22 @@ fn capabilities_bbox_stays_in_the_crs84_domain() {
             r#"<BoundingBox CRS="CRS:84" minx="-180.000000" miny="-90.000000" maxx="180.000000" maxy="90.000000"/>"#
         ),
         "CRS:84 BoundingBox must match; got:\n{xml}"
+    );
+
+    // Across the antimeridian (GOES-West): the ISO box keeps west > east,
+    // the min/max envelope spans every longitude.
+    let xml = capabilities([173.5, 11.0, -174.5, 16.0]);
+    for element in [
+        "<westBoundLongitude>173.500000</westBoundLongitude>",
+        "<eastBoundLongitude>-174.500000</eastBoundLongitude>",
+    ] {
+        assert!(xml.contains(element), "missing {element}; got:\n{xml}");
+    }
+    assert!(
+        xml.contains(
+            r#"<BoundingBox CRS="CRS:84" minx="-180.000000" miny="11.000000" maxx="180.000000" maxy="16.000000"/>"#
+        ),
+        "a crossing extent's CRS:84 BoundingBox spans every longitude; got:\n{xml}"
     );
 
     let xml = capabilities([f64::MAX, f64::MAX, f64::MIN, f64::MIN]);
