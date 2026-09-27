@@ -5,7 +5,7 @@
 //! ABI band, or an L2 field such as cloud top temperature) is a parameter
 //! with its own time axis. The poll loop lists the source, downloads each
 //! new scan whole and keeps it in memory ([`cache::FRAMES`]); renders
-//! decode only the strips they touch ([`cache::STRIPS`]) or, zoomed out,
+//! decode only the blocks they touch ([`cache::STRIPS`]) or, zoomed out,
 //! sample the overview built at ingest.
 
 mod cache;
@@ -36,7 +36,7 @@ use ds_storage::object_store::path::Path as ObjectPath;
 
 pub use cache::{frame_metrics, strip_metrics};
 
-use cache::{FrameKey, StripKey, FRAMES, STRIPS};
+use cache::{BlockKey, FrameKey, FRAMES, STRIPS};
 use frame::{Frame, OVERVIEW_FACTOR};
 use naming::Naming;
 use source::Source;
@@ -52,10 +52,11 @@ const MAX_INGEST_PER_POLL: usize = 4;
 /// (Critical Rule 9).
 const MAX_QUERY_FETCHES: usize = 8;
 
-/// Strips one EDR query may decode, over all its products and scans (~0.7 ms
-/// and ~260 KB each for a 2 km full-width strip). A position reads one strip
-/// per scan; an area the strips its polygon's rows cross, per product grid.
-const MAX_QUERY_STRIPS: usize = 1024;
+/// Blocks one EDR query may decode, over all its products and scans (~0.7 ms
+/// and ~260 KB each for a 2 km full-width GOES-R strip). A position reads one
+/// block per scan; an area the blocks its polygon's bbox covers, per product
+/// grid.
+const MAX_QUERY_BLOCKS: usize = 1024;
 
 /// One configured product, served as one parameter.
 struct Product {
@@ -434,10 +435,10 @@ impl SatelliteEngine {
         Ok(())
     }
 
-    fn check_strip_budget(strips: usize) -> Result<(), DataServerError> {
-        if strips > MAX_QUERY_STRIPS {
+    fn check_block_budget(blocks: usize) -> Result<(), DataServerError> {
+        if blocks > MAX_QUERY_BLOCKS {
             return Err(DataServerError::QueryTooLarge(format!(
-                "The query would decode {strips} image strips; at most {MAX_QUERY_STRIPS} per \
+                "The query would decode {blocks} image blocks; at most {MAX_QUERY_BLOCKS} per \
                  request — narrow the datetime window, the polygon or the parameters"
             )));
         }
@@ -546,12 +547,12 @@ fn union_extent<'a>(mut extents: impl Iterator<Item = &'a [f64; 4]>) -> Option<[
     ])
 }
 
-/// Reads pixels of one scan through the strip cache, remembering the strips
-/// already fetched for this request.
+/// Reads full-resolution pixels of one scan through the block cache,
+/// remembering the blocks already fetched for this request.
 struct PixelReader<'a> {
     key: FrameKey,
     frame: &'a Frame,
-    strips: Vec<Option<Arc<[u16]>>>,
+    blocks: Vec<Option<Arc<[u16]>>>,
 }
 
 impl<'a> PixelReader<'a> {
@@ -559,31 +560,30 @@ impl<'a> PixelReader<'a> {
         PixelReader {
             key,
             frame,
-            strips: vec![None; frame.strip_count() as usize],
+            blocks: vec![None; frame.block_count() as usize],
         }
     }
 
-    /// The physical value of full-resolution pixel `(row, col)`.
-    fn value(&mut self, row: u32, col: u32) -> Result<Option<f64>, DataServerError> {
+    /// The stored integer of pixel `(row, col)`.
+    fn raw(&mut self, row: u32, col: u32) -> Result<u16, DataServerError> {
         let frame = self.frame;
-        let index = (row / frame.strip_rows) as usize;
-        if self.strips[index].is_none() {
-            let strip = STRIPS.get_or_insert_with(
-                &StripKey {
+        let (index, offset) = frame.locate(row, col);
+        let block = match &mut self.blocks[index as usize] {
+            Some(block) => block,
+            slot => slot.insert(STRIPS.get_or_insert_with(
+                &BlockKey {
                     frame: self.key.clone(),
-                    strip: index as u32,
+                    block: index,
                 },
-                || {
-                    frame
-                        .read_strip(index as u32)
-                        .map_err(DataServerError::Engine)
-                },
-            )?;
-            self.strips[index] = Some(strip);
-        }
-        let strip = self.strips[index].as_ref().expect("filled above");
-        let raw = strip[(row % frame.strip_rows) as usize * frame.gt.width as usize + col as usize];
-        Ok(frame.packing.decode(raw))
+                || frame.read_block(index).map_err(DataServerError::Engine),
+            )?),
+        };
+        Ok(block[offset])
+    }
+
+    /// The physical value of pixel `(row, col)`.
+    fn value(&mut self, row: u32, col: u32) -> Result<Option<f64>, DataServerError> {
+        Ok(self.frame.packing.decode(self.raw(row, col)?))
     }
 }
 
@@ -655,7 +655,7 @@ impl EdrEngine for SatelliteEngine {
         let catalog = self.catalog.load();
         let (plan, times) = self.query_plan(&catalog, parameters, datetime)?;
         self.check_fetch_budget(&plan)?;
-        Self::check_strip_budget(plan.iter().map(|(_, own)| own.len()).sum())?;
+        Self::check_block_budget(plan.iter().map(|(_, own)| own.len()).sum())?;
         let mut on_disk = false;
         let mut descriptions = HashMap::new();
         let mut ranges = HashMap::new();
@@ -726,24 +726,25 @@ impl EdrEngine for SatelliteEngine {
 
         self.check_fetch_budget(&plan)?;
         // Each product has its own grid (ABI bands are 0.5, 1 or 2 km): the
-        // decode budget sums the strips its polygon rows cross on each grid,
-        // and the output grid samples at the finest nadir pixel size.
+        // decode budget sums the blocks its polygon's bbox covers on each
+        // grid, and the output grid samples at the finest nadir pixel size.
         let b = &polygon.bbox;
         let mut resolution = f64::INFINITY;
-        let mut strips = 0usize;
+        let mut blocks = 0usize;
         for (index, own) in &plan {
             let Some(&first) = own.first() else {
                 continue;
             };
             let probe = self.frame(*index, first, &catalog.frames[*index][&first])?;
             resolution = resolution.min(probe.gt.pixel_width / 111_320.0);
-            if let Some((_, r0, _, r1)) = probe.gt.bbox_to_pixels(b.west, b.south, b.east, b.north)
+            if let Some((c0, r0, c1, r1)) =
+                probe.gt.bbox_to_pixels(b.west, b.south, b.east, b.north)
             {
-                let rows = r0 / probe.strip_rows..=(r1 - 1) / probe.strip_rows;
-                strips = strips.saturating_add(rows.count().saturating_mul(own.len()));
+                let per_scan = probe.blocks_in(c0, r0, c1, r1);
+                blocks = blocks.saturating_add(per_scan.saturating_mul(own.len()));
             }
         }
-        Self::check_strip_budget(strips)?;
+        Self::check_block_budget(blocks)?;
         let axes = polygon.sample_grid(resolution, resolution, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
         check_area_budget(times.len(), ny, nx, plan.len())?;
@@ -880,8 +881,7 @@ impl MapEngine for SatelliteEngine {
             |lon, lat| gt.world_to_pixel_f64(lon, lat),
         );
 
-        let key = self.frame_key(index, time);
-        let mut strips: Vec<Option<Arc<[u16]>>> = vec![None; frame.strip_count() as usize];
+        let mut reader = PixelReader::new(self.frame_key(index, time), &frame);
         let mut values = Vec::with_capacity(width as usize * height as usize);
         for oy in 0..height {
             for ox in 0..width {
@@ -900,23 +900,7 @@ impl MapEngine for SatelliteEngine {
                 let raw = if overview {
                     frame.overview.raw[row as usize * gt.width as usize + col]
                 } else {
-                    let index = (row / frame.strip_rows) as usize;
-                    if strips[index].is_none() {
-                        let strip = STRIPS.get_or_insert_with(
-                            &StripKey {
-                                frame: key.clone(),
-                                strip: index as u32,
-                            },
-                            || {
-                                frame
-                                    .read_strip(index as u32)
-                                    .map_err(DataServerError::Engine)
-                            },
-                        )?;
-                        strips[index] = Some(strip);
-                    }
-                    let strip = strips[index].as_ref().expect("filled above");
-                    strip[(row % frame.strip_rows) as usize * gt.width as usize + col]
+                    reader.raw(row, col as u32)?
                 };
                 values.push(frame.packing.decode(raw));
             }
@@ -977,10 +961,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn strip_budget_caps_decode_work() {
-        assert!(super::SatelliteEngine::check_strip_budget(super::MAX_QUERY_STRIPS).is_ok());
+    fn block_budget_caps_decode_work() {
+        assert!(super::SatelliteEngine::check_block_budget(super::MAX_QUERY_BLOCKS).is_ok());
         assert!(matches!(
-            super::SatelliteEngine::check_strip_budget(super::MAX_QUERY_STRIPS + 1),
+            super::SatelliteEngine::check_block_budget(super::MAX_QUERY_BLOCKS + 1),
             Err(ds_core::error::DataServerError::QueryTooLarge(_))
         ));
     }

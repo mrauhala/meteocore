@@ -1,5 +1,8 @@
-//! Process-wide caches of scans and decoded strips, shared by every
+//! Process-wide caches of scans and decoded blocks, shared by every
 //! satellite collection and bounded in bytes (`ds-cache`, #480).
+//!
+//! The block cache keeps its phase-2 name, `STRIPS`, and its env var and
+//! metric family: a GOES-R block is a strip.
 
 use std::sync::{Arc, LazyLock};
 
@@ -13,15 +16,15 @@ pub(crate) struct FrameKey {
     pub time: i64,
 }
 
-/// One decoded strip of a scan.
+/// One decoded block of a scan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct StripKey {
+pub(crate) struct BlockKey {
     pub frame: FrameKey,
-    pub strip: u32,
+    pub block: u32,
 }
 
 type FrameCache = ds_cache::ByteBoundedCache<FrameKey, Arc<Frame>>;
-type StripCache = ds_cache::ByteBoundedCache<StripKey, Arc<[u16]>>;
+type StripCache = ds_cache::ByteBoundedCache<BlockKey, Arc<[u16]>>;
 
 /// Scans held in memory: the compressed file plus its overview, ~30 MB for
 /// a 2 km full disk. The poll loop fills it with each new scan; a scan
@@ -32,7 +35,7 @@ pub(crate) static FRAMES: LazyLock<FrameCache> = LazyLock::new(|| {
     })
 });
 
-/// Decoded strips, ~260 KB each for a 24-row 2 km full-disk strip.
+/// Decoded blocks, ~260 KB each for a 24-row 2 km full-disk strip.
 pub(crate) static STRIPS: LazyLock<StripCache> = LazyLock::new(|| {
     StripCache::from_env("MC_SATELLITE_STRIP_CACHE_MB", 256, 256 << 10, |_, strip| {
         strip.len() as u64 * 2
@@ -44,7 +47,7 @@ pub fn frame_metrics() -> ds_cache::CacheMetrics {
     FRAMES.metrics()
 }
 
-/// Snapshot of the decoded-strip cache for `/metrics`.
+/// Snapshot of the decoded-block cache for `/metrics`.
 pub fn strip_metrics() -> ds_cache::CacheMetrics {
     STRIPS.metrics()
 }
