@@ -279,6 +279,22 @@ test('?base selects a path on the viewer origin only', () => {
   for (const foreign of ['https://attacker.example/3dtiles', '//attacker.example/3dtiles', 'javascript:alert(1)']) {
     assert.equal(resolve(`?base=${encodeURIComponent(foreign)}`), 'https://test/3dtiles', foreign);
   }
+  // #772: a query string or fragment in `base` cannot move the appended
+  // collection path out of the request path, credentials never survive,
+  // and dot segments normalise. Only origin + path are kept.
+  for (const [base, want] of [
+    ['/triage-probe?ignored=', 'https://test/triage-probe'],
+    ['/triage-probe#ignored', 'https://test/triage-probe'],
+    ['https://test/triage-probe?ignored=#x', 'https://test/triage-probe'],
+    ['https://user:secret@test/proxy/3dtiles', 'https://test/proxy/3dtiles'],
+    ['/a/b/../../proxy/./3dtiles/', 'https://test/proxy/3dtiles'],
+  ]) {
+    const got = resolve(`?base=${encodeURIComponent(base)}`);
+    assert.equal(got, want, base);
+    assert.equal(new URL(`${got}/collections`).pathname.endsWith('/collections'), true, base);
+  }
+  // Another port is another origin.
+  assert.equal(resolve(`?base=${encodeURIComponent('https://test:8443/3dtiles')}`), 'https://test/3dtiles');
   // Opened from disk (opaque origin): the fixed public instance, no override.
   assert.equal(
     resolve('?base=https://attacker.example', 'null', '/Users/x/viewer/index.html'),

@@ -91,6 +91,28 @@ impl ItemsQueryParams {
     }
 }
 
+/// The query of `/items/{featureId}`: at most one `f`, nothing else. Any
+/// other parameter is an `InvalidParameter` naming it (#681).
+pub fn item_format(pairs: Vec<(String, String)>) -> Result<Option<String>, DataServerError> {
+    let mut f = None;
+    for (name, value) in pairs {
+        match name.as_str() {
+            "f" if f.is_none() => f = Some(value),
+            "f" => {
+                return Err(DataServerError::InvalidParameter(
+                    "duplicate parameter 'f'".into(),
+                ))
+            }
+            _ => {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "unsupported parameter '{name}' on a single feature; only 'f' is accepted"
+                )))
+            }
+        }
+    }
+    Ok(f)
+}
+
 /// Parse an OGC API – Features Part 8 `sortby` value.
 ///
 /// Comma-separated `[+|-]?<property>`; `+` (or no prefix) is ascending, `-` is

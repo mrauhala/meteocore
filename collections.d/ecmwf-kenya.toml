@@ -9,8 +9,12 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "2t"
 poll_interval_secs = 60
 
+# QueryData carries no units; ECMWF surface temperature is in °C. The
+# default layer (2t) takes the temperature palette over a Kenyan range.
 [wms]
-colormap = "viridis"
+colormap = "temperature"
+min = 0.0
+max = 40.0
 
 [[wms.parameters]]
 name = "2t"
