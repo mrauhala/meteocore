@@ -1053,6 +1053,28 @@ async fn repeated_pnts_request_is_served_from_cache_without_recompute() {
     );
 }
 
+/// An unknown quantity is a 400 before the content cache, the render slot
+/// and the engine: distinct bogus names would otherwise each take a
+/// scarce slot only to be rejected by the engine (#536).
+#[tokio::test]
+async fn unknown_quantity_never_reaches_the_engine() {
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let app = router_with(
+        "radar-bogus-quantity",
+        Arc::new(CountingVolume {
+            reads: reads.clone(),
+        }),
+    );
+    for uri in [
+        "/collections/radar-bogus-quantity/content.pnts?quantity=BOGUS1",
+        "/collections/radar-bogus-quantity/content.pnts?quantity=BOGUS2",
+    ] {
+        let (status, _, _) = get_on(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn glb_revalidation_304_does_not_recompute() {
     let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
