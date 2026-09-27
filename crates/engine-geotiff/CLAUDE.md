@@ -10,7 +10,10 @@ apply here.
 - **Must be tiled COG.** Strip-based TIFFs are rejected. One parameter
   (band) per collection.
 - **CRS:** WGS84, TM, LAEA, LCC, Stereographic (math in
-  `ds-core/src/geo.rs`).
+  `ds-core/src/geo.rs`). Earth model: an LCC whose geodetic GeoKeys
+  describe a sphere (semi-minor = semi-major, inverse flattening 0, or an
+  EPSG sphere ellipsoid) is projected on that sphere (`radius`, #810);
+  everything else on WGS84. TM and LAEA have no sphere form yet.
 - **Reprojection:** `bbox_to_pixels()` samples 20 points per edge to capture
   projection curvature.
 - **Data sources (mutually exclusive):** local directory (`data_path`), S3

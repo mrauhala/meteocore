@@ -2820,7 +2820,7 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
                 lon0,
                 false_e,
                 false_n,
-                radius: None,
+                radius: sphere_radius(&keys),
             })
         }
         // CT_LambertAzimEqualArea = 10
@@ -2856,6 +2856,29 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
                  Convert with: gdalwarp -t_srs EPSG:4326 -of COG input.tif output.tif",
             proj_method
         ))),
+    }
+}
+
+/// The radius of the earth model the geodetic GeoKeys describe, when it is
+/// a sphere (#810): semi-minor equal to semi-major (2058 = 2057), an
+/// inverse flattening of 0 (2059), or an EPSG sphere ellipsoid code
+/// (2056). `None` is an ellipsoid, projected on WGS84 as before.
+fn sphere_radius(keys: &std::collections::HashMap<u16, GeoKeyValue>) -> Option<f64> {
+    if let Some(a) = get_double_key(keys, 2057).filter(|a| a.is_finite() && *a > 0.0) {
+        if let Some(b) = get_double_key(keys, 2058) {
+            return ((b - a).abs() <= 1e-6 * a).then_some(a);
+        }
+        if let Some(inv_f) = get_double_key(keys, 2059) {
+            return (inv_f == 0.0).then_some(a);
+        }
+    }
+    match keys.get(&2056) {
+        // EPSG ellipsoids 7035 "Sphere", 7047 and 7048 "GRS 1980 Authalic
+        // Sphere" (radii from `projinfo -k ellipsoid`).
+        Some(GeoKeyValue::Short(7035)) => Some(6_371_000.0),
+        Some(GeoKeyValue::Short(7047)) => Some(6_370_997.0),
+        Some(GeoKeyValue::Short(7048)) => Some(6_371_007.0),
+        _ => None,
     }
 }
 
@@ -4407,5 +4430,27 @@ mod tests {
         assert_eq!(first, second, "cached read must be value-identical");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A sphere-based LCC GeoTIFF (GDAL writes semi-minor = semi-major =
+    /// 6371220) is projected on that sphere, not on WGS84 (#810). Made with
+    /// `gdal_create -a_srs '+proj=lcc +lat_1=63.3 +lat_2=63.3 +lat_0=63.3
+    /// +lon_0=15 +R=6371220' -a_ullr -100000 100000 100000 -100000` (4 × 4).
+    /// Pixel (0, 0)'s centre (-75 000, 75 000) pinned against `cs2cs
+    /// +proj=lcc … +R=6371220 +to +proj=longlat +R=6371220`; WGS84 would put
+    /// it at 13.469138, 63.964772, ~290 m away.
+    #[test]
+    fn sphere_lcc_geotiff_uses_its_sphere() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lcc_sphere.tif");
+        let meta = TiffMetadata::from_source(&DataSource::from_path(&path)).unwrap();
+        let gt = &meta.geo_transform;
+        match gt.crs {
+            Crs::LambertConformalConic { radius, .. } => assert_eq!(radius, Some(6_371_220.0)),
+            ref other => panic!("expected LCC, got {other:?}"),
+        }
+        let (lon, lat) = gt.pixel_to_world(0, 0);
+        assert!((lon - 13.463229343).abs() < 1e-6, "lon {lon}");
+        assert!((lat - 63.966371701).abs() < 1e-6, "lat {lat}");
     }
 }
