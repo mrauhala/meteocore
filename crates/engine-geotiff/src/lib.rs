@@ -1061,14 +1061,7 @@ impl GeoTiffEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
     ) -> Result<QueryResult, DataServerError> {
-        if let Some(params) = parameters {
-            if !params.iter().any(|p| p == &self.parameter) {
-                return Err(DataServerError::InvalidParameter(format!(
-                    "Unknown parameter. Available: {}",
-                    self.parameter
-                )));
-            }
-        }
+        ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
         // Lazily load STAC stubs for the requested time range
         self.ensure_entries_loaded(datetime)?;
@@ -1171,14 +1164,7 @@ impl GeoTiffEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
     ) -> Result<QueryResult, DataServerError> {
-        if let Some(params) = parameters {
-            if !params.iter().any(|p| p == &self.parameter) {
-                return Err(DataServerError::InvalidParameter(format!(
-                    "Unknown parameter. Available: {}",
-                    self.parameter
-                )));
-            }
-        }
+        ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
         // Lazily load STAC stubs for the requested time range
         self.ensure_entries_loaded(datetime)?;

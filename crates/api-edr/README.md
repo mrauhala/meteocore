@@ -78,7 +78,7 @@ for the specification baselines and remaining gaps.
 |---|---|---|
 | `coords` | ✓ | WKT per query type (see above) |
 | `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..` |
-| `parameter-name` | partial | comma-separated; 400 only when *no* requested name matches — a mix of valid and unknown names silently drops the unknown ones (#666, the #605 rule) |
+| `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData and Nowcast (#666); GRIB keeps its own equivalent check |
 | `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent |
 | `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/prs.coverage+json`, `application/vnd.cov+json`, `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
 | `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
@@ -229,8 +229,8 @@ generations, not already-published instances.
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
 
 Related issues: #585 MULTIPOINT fan-out bound · #667
-antimeridian bboxes · #668 400-vs-404 on unsupported query types · #666
-shared parameter-name validation · #665 GRIB value rounding · #523 nowcast
+antimeridian bboxes · #668 400-vs-404 on unsupported query types · #665
+GRIB value rounding · #523 nowcast
 reflectivity via EDR · #673 shared area budget.
 
 GeoTIFF cold source decodes share a byte budget across APIs; exhausted decode

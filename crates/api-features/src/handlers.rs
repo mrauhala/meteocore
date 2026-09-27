@@ -889,7 +889,7 @@ pub async fn items(
 
 pub async fn item(
     Path((id, feature_id)): Path<(String, String)>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    Query(pairs): Query<Vec<(String, String)>>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
     headers: HeaderMap,
@@ -897,7 +897,16 @@ pub async fn item(
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
 
-    let wanted = negotiate_feature(fp.f.as_deref(), &headers)?;
+    // A single feature takes only `f`. Anything else (`crs`, `properties`,
+    // a filter, a typo) would be ignored with a 200, so it is a 400 naming
+    // it (#681; root CLAUDE.md: never silently ignore a parameter).
+    let f = crate::params::item_format(pairs).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    })?;
+    let wanted = negotiate_feature(f.as_deref(), &headers)?;
     let feature = engine.get_feature(&feature_id).map_err(|e| match &e {
         ds_core::error::DataServerError::FeatureNotFound(_) => (
             StatusCode::NOT_FOUND,

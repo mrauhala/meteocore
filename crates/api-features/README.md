@@ -68,7 +68,7 @@ imply a regular sampling grid.
 | `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
 | `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the Tiles service registered the collection for vector tiles (listing `tiles` in `apis` is not enough: a nowcast renders only map tiles) |
 | `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
-| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links |
+| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links; takes only `f` — any other parameter (`crs`, `properties`, a filter, a duplicate `f`) → 400 (#681) |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
 
 ## Shared OGC API root
@@ -227,9 +227,9 @@ responses are buffered rather than streamed.
 
 ## Known gaps, in suggested order
 
-1. Reject or honour query parameters on `/items/{featureId}` (#681);
-   `/items` now rejects unsupported/unknown names (#700). Honour or reject
-   `datetime` on engines without a time dimension (#682).
+1. Honour or reject `datetime` on engines without a time dimension (#682).
+   `/items` rejects unsupported/unknown names (#700), `/items/{featureId}`
+   everything but `f` (#681).
 2. Declare Part 8 sorting + serve `/sortables` (#683).
 3. PostGIS events shape as Features items with keyset pagination (#503).
 4. `Geometry::LineString` for storm tracks (#408); polygon cells.

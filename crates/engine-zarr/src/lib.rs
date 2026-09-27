@@ -182,23 +182,24 @@ impl ZarrEngine {
 }
 
 /// The variables an EDR query addresses: every one when `parameters` is
-/// absent, else the case-insensitive name matches; none → 400. Shared by
-/// position and area so the two cannot drift.
+/// absent, else exactly the named ones (case-insensitive; an unknown name
+/// is a 400, `select_parameters`), in request order. Shared by position
+/// and area so the two cannot drift.
 fn select_vars<'a>(
     cat: &'a Catalog,
     parameters: Option<&[String]>,
 ) -> Result<Vec<&'a catalog::Variable>, DataServerError> {
-    let selected: Vec<&catalog::Variable> = cat
-        .vars
-        .iter()
-        .filter(|v| parameters.is_none_or(|f| f.iter().any(|p| p.eq_ignore_ascii_case(&v.name))))
-        .collect();
+    let names: Vec<&str> = cat.vars.iter().map(|v| v.name.as_str()).collect();
+    let selected = ds_core::edr_engine::select_parameters(parameters, &names)?;
     if selected.is_empty() {
         return Err(DataServerError::InvalidParameter(
-            "No matching parameters found".into(),
+            "No parameters available".into(),
         ));
     }
-    Ok(selected)
+    Ok(selected
+        .into_iter()
+        .filter_map(|name| cat.vars.iter().find(|v| v.name == name))
+        .collect())
 }
 
 /// The time-axis indices an EDR query addresses: every step when
