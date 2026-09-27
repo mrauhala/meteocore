@@ -87,6 +87,28 @@ impl Palette {
         }
     }
 
+    /// A [`normalized`](Self::normalized) palette's stops stretched from
+    /// their 0..1 domain onto the physical range `[min, max]` (#823), so it
+    /// is sampled and legended in data units. A data-valued palette comes
+    /// back unchanged.
+    pub fn stretched(&self, min: f64, max: f64) -> Palette {
+        if !self.normalized {
+            return self.clone();
+        }
+        Palette {
+            stops: self
+                .stops
+                .iter()
+                .map(|s| ColorStop {
+                    value: min + s.value * (max - min),
+                    color: s.color,
+                })
+                .collect(),
+            normalized: false,
+            ..self.clone()
+        }
+    }
+
     /// Sample the palette color at a physical value (no range scaling).
     pub fn sample(&self, value: f64) -> [u8; 4] {
         sample_stops(&self.stops, value, self.interpolation)

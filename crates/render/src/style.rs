@@ -118,6 +118,15 @@ impl StyleContext {
             .get(name)
             .ok_or_else(|| format!("unknown colormap '{name}'"))?;
         let (min, max) = range_for(&palette, spec.min, spec.max);
+        // A normalized palette (viridis, grayscale: stops on 0..1) spans the
+        // style's range; sampled as physical values its stops would clamp
+        // every value of e.g. 0..100 to one end, one colour (#823). The
+        // stretched palette is also what the legend reads.
+        let palette = if palette.normalized {
+            Arc::new(palette.stretched(min, max))
+        } else {
+            palette
+        };
         let colormap: Arc<dyn ColorMap> = Arc::new(LutColorMap::from_palette(&palette, min, max));
         Ok(ResolvedColormap {
             colormap: maybe_wrap_integer_lut(colormap, min, max),
@@ -533,6 +542,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!((r.min, r.max), (200.0, 300.0));
+    }
+
+    /// A normalized palette spans an explicit range (#823): viridis over
+    /// 0..100 renders the colours viridis has at 0.1, 0.5 and 0.9, not
+    /// yellow three times, and its legend stops are in data units.
+    #[test]
+    fn normalized_palette_spans_an_explicit_range() {
+        let ctx = StyleContext::with_builtins();
+        let r = ctx
+            .build_colormap(&StyleSpec {
+                colormap: Some("viridis"),
+                color_stops: &[],
+                min: Some(0.0),
+                max: Some(100.0),
+            })
+            .unwrap();
+        let viridis = ctx.registry.get("viridis").unwrap();
+        for (value, t) in [(10.0, 0.1), (50.0, 0.5), (90.0, 0.9)] {
+            let got = r.colormap.color(Some(value));
+            let want = viridis.sample(t);
+            let close = got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 2);
+            assert!(close, "{value}: {got:?} vs viridis({t}) {want:?}");
+        }
+        assert_ne!(r.colormap.color(Some(10.0)), r.colormap.color(Some(90.0)));
+        let stops = &r.palette.stops;
+        assert_eq!(stops.first().unwrap().value, 0.0);
+        assert_eq!(stops.last().unwrap().value, 100.0);
+        assert!(!r.palette.normalized);
     }
 
     // CollectionConfig is deserialized from TOML in production (per-file
