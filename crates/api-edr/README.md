@@ -63,6 +63,8 @@ for the specification baselines and remaining gaps.
 | `corridor` | — | ✗ | not in the trait or the router (`corridor-width`/`-height` documented as follow-up on trajectory) |
 | `items` | — | ✗ | not in the trait or the router; the natural surface for CAP/GeoJSON/PostGIS-events, overlaps Features |
 
+A query type a collection's engine does not support (not in its `supported_query_types`, so not in `data_queries`) has no resource: position, area, radius and trajectory all answer 404 `NotFound`, and `/api` omits the path (#668).
+
 ### Instance-scoped routes
 
 | Route | Status |
