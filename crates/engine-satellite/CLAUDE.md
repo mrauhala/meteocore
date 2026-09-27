@@ -48,22 +48,53 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   either side of the seam on a real GOES-18 crop. The API edges handle the
   wrapped extent: WMS CRS:84 `BoundingBox` and Tiles limits span every
   longitude. OGC API Maps rejects a west > east `bbox` (#828).
+- **A scan may be many files.** Himawari ISatSS (`provider = "isatss"`)
+  publishes a full disk as 88 tiles of 550 × 550 in the scan's own
+  ten-minute directory (`AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/`).
+  - `Source::list` groups a scan's tiles, keeping the newest copy of each
+    tile. `Source::fetch` downloads them `get_many`-concurrently
+    (Critical Rule 9).
+  - `Frame::open` places the tiles on one lattice from their CF x/y
+    coordinates, which are absolute packed grid indices. Block = tile, and a
+    lattice cell without a tile reads as missing.
+  - `tiled_scan_ready` holds a scan back while its tiles may still be
+    arriving.
+  - A bucket lists only the slots not yet ingested, and at most 6 h of them.
+    A slot directory holds every band, so one poll lists each prefix once
+    for all products (`source::Listings`).
+  - A tile with corrupt coordinates fails its scan: the lattice is capped
+    at `MAX_MOSAIC_PIXELS` per axis and `MAX_MOSAIC_CELLS` before anything
+    is allocated.
+- **ISatSS quirks.** The geostationary mapping writes `semi_major` and
+  `semi_minor` (aliased in `Part::open`; `ds_core::cf` stays strictly CF).
+  The field has no `_FillValue` or `valid_range`: far space is packed
+  −1076 ≈ 0 K (`valid_fallback` = packed ≥ 0). Space next to the limb
+  carries an unmasked stray-light halo (~110–170 K).
+  - Map and EDR reads only land on the disk, but an overview cell
+    straddling the limb would keep an off-disk centre, so `mask_off_disk`
+    blanks those cells. It costs two bisections per row.
+  - A limb crop's warm values can lie wholly off the ellipsoid: that is the
+    atmosphere a grazing line of sight crosses.
 - **Overview**: a render whose source window spans ≥ `OVERVIEW_FACTOR`
   (4) source pixels per output pixel samples the ingest-time overview
   instead of decoding strips. A full-disk decode is ~160 ms.
 
 ## Config
 
-`[satellite]`: `provider = "goes-r"`, `data_path` XOR `endpoint`+`bucket`,
-`time_window` (required for a bucket, ≤ 24 h because prefixes are hourly),
+`[satellite]`: `provider = "goes-r" | "isatss"`, `data_path` XOR
+`endpoint`+`bucket`, `time_window` (required for a bucket: ≤ 24 h of GOES-R
+hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
+`Naming::validate_window`),
 `poll_interval_secs`, and `[[satellite.products]]` with `parameter`, `title`,
 `unit` (declared: styles resolve at load, before any scan), `product`,
-`band`, `variable`. Validation: `ds_core::config::validate_satellite`.
+`band` (required for ISatSS, whose `product` is the sector, `HFD`),
+`variable`. Validation: `ds_core::config::validate_satellite`.
 
 ## Bandwidth
 
 Each scan is downloaded whole: GOES-19 band 13 ~24 MB, cloud top temperature
-~30 MB per 10 minutes; startup ingests the whole window. The user is often
+~30 MB per 10 minutes, Himawari-9 band 13 ~26 MB in 88 tiles; startup
+ingests the whole window. The user is often
 on a metered connection — never run a bucket-backed collection for tests
 without asking; use the local fixtures.
 
@@ -76,6 +107,9 @@ the global `meteocore_fixture` attribute records each crop. Tests copy them
 into a nested temp directory (local discovery lists recursively).
 `testdata/goes18-abi/…_G18_s20262701850224_*.nc`: a GOES-18 C13 crop
 straddling 180° at 11–16°N (`lon_0` −137.0, read from the file).
+`testdata/himawari9-isatss/`: three real Himawari-9 band 13 tiles of one
+scan, cropped to 64 × 64 around a lattice corner on the NW limb whose fourth
+cell has no tile (its README has the layout).
 
 ## EDR
 
@@ -91,5 +125,5 @@ summed per product on its own grid (products may mix 0.5/1/2 km).
 
 ## Not yet
 
-Other providers (Himawari ISatSS µrad tiles, GMGSI lat/lon mosaics, GK2A
-CGMS navigation, MTG) are phases 3 and 5.
+Other providers (GMGSI lat/lon mosaics, GK2A CGMS navigation, MTG) are
+phases 3 and 5.

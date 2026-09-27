@@ -1,15 +1,43 @@
-//! GOES-R ABI file naming on the NOAA open-data buckets:
-//! `<product>/<year>/<day of year>/<hour>/OR_<product>-M<mode>[C<band>]_G<satellite>_s<start>_e<end>_c<created>.nc`,
-//! where each time stamp is `%Y%j%H%M%S` plus a tenths-of-a-second digit.
+//! File naming on the providers' open-data buckets.
+//!
+//! - GOES-R ABI (`goes-r`):
+//!   `<product>/<year>/<day of year>/<hour>/OR_<product>-M<mode>[C<band>]_G<satellite>_s<start>_e<end>_c<created>.nc`,
+//!   one file per scan, each time stamp `%Y%j%H%M%S` plus a tenths digit.
+//! - Himawari ISatSS (`isatss`), the AWIPS tiles NOAA republishes for
+//!   Himawari-9:
+//!   `AHI-L2-FLDK-ISatSS/<year>/<month>/<day>/<hour><minute>/OR_<sector>-<res>-B<bits>-M<mode>C<band>-T<tile>_G<satellite>_s<start>_c<created>.nc`,
+//!   one file per tile (88 for a full disk), `<start>` `%Y%j%H%M%S` plus a
+//!   tenths digit.
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, DurationRound, NaiveDateTime, Utc};
+use ds_core::error::DataServerError;
+use ds_storage::discovery::{expand_prefix_for_range, validate_prefix_pattern, TimeWindow};
 use regex::Regex;
 
-/// Where one product's files live and how their names encode the scan time.
-pub(crate) struct Naming {
+/// Full-disk cadence of the ISatSS scan directories: one `%H%M/` per
+/// ten-minute slot, the other minutes holding regional sectors.
+const ISATSS_SLOT_MINUTES: i64 = 10;
+
+/// Longest window over ISatSS slot directories: bootstrapping lists every
+/// slot of it once (36 sequential lists), later polls only the slots not
+/// yet ingested.
+const MAX_ISATSS_WINDOW_HOURS: i64 = 6;
+
+/// How a provider partitions its bucket.
+enum Layout {
     /// Hourly strftime prefix listing the product's files, e.g.
     /// `ABI-L2-CMIPF/%Y/%j/%H/`.
-    pub prefix: String,
+    Hourly(String),
+    /// One directory per ten-minute scan slot, holding every band's tiles.
+    IsatssSlots,
+}
+
+/// Where one product's files live and how their names encode the scan time
+/// (and, for a tiled product, the tile).
+pub(crate) struct Naming {
+    layout: Layout,
+    /// `start` captures the scan start stamp; `tile`, when present, the
+    /// tile number.
     file: Regex,
 }
 
@@ -19,29 +47,109 @@ impl Naming {
     pub fn goes_r(product: &str, band: Option<u8>) -> Self {
         let band = band.map(|b| format!("C{b:02}")).unwrap_or_default();
         let file = Regex::new(&format!(
-            r"^OR_{}-M\d+{band}_G\d+_s(\d{{13}})\d_e\d{{14}}_c\d{{14}}\.nc$",
+            r"^OR_{}-M\d+{band}_G\d+_s(?P<start>\d{{13}})\d_e\d{{14}}_c\d{{14}}\.nc$",
             regex::escape(product)
         ))
         .expect("config validation restricts the product to [A-Za-z0-9-]");
         Naming {
-            prefix: format!("{product}/%Y/%j/%H/"),
+            layout: Layout::Hourly(format!("{product}/%Y/%j/%H/")),
             file,
+        }
+    }
+
+    /// The Himawari ISatSS tiles of `sector` (`HFD`, the full disk) in one
+    /// AHI `band`.
+    pub fn isatss(sector: &str, band: u8) -> Self {
+        let file = Regex::new(&format!(
+            r"^OR_{}-\d{{3}}-B\d{{2}}-M\d+C{band:02}-T(?P<tile>\d{{3}})_G[A-Z0-9]+_s(?P<start>\d{{13}})\d_c\d{{14}}\.nc$",
+            regex::escape(sector)
+        ))
+        .expect("config validation restricts the product to [A-Za-z0-9-]");
+        Naming {
+            layout: Layout::IsatssSlots,
+            file,
+        }
+    }
+
+    /// Checks a bucket source's `window`: hourly prefixes are capped at
+    /// 24 h (`validate_prefix_pattern`), slot directories at
+    /// [`MAX_ISATSS_WINDOW_HOURS`].
+    pub fn validate_window(&self, window: Option<&TimeWindow>) -> Result<(), DataServerError> {
+        match &self.layout {
+            Layout::Hourly(pattern) => validate_prefix_pattern(pattern, window).map(|_| ()),
+            Layout::IsatssSlots => {
+                let (start, end) = window
+                    .ok_or_else(|| {
+                        DataServerError::Config("an ISatSS bucket needs a time_window".into())
+                    })?
+                    .to_range(Utc::now());
+                if end - start > Duration::hours(MAX_ISATSS_WINDOW_HOURS) {
+                    return Err(DataServerError::Config(format!(
+                        "an ISatSS bucket lists one directory per ten-minute scan; its \
+                         time_window may span at most {MAX_ISATSS_WINDOW_HOURS} hours"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether one scan is many files, one per tile.
+    pub fn tiled(&self) -> bool {
+        matches!(self.layout, Layout::IsatssSlots)
+    }
+
+    /// The listing prefixes holding scans that start in `start..=end`,
+    /// skipping the scan slots `known` says are already ingested (a slot
+    /// directory holds one scan, so there is nothing new to find there).
+    pub fn prefixes(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        known: impl Fn(DateTime<Utc>) -> bool,
+    ) -> Result<Vec<String>, DataServerError> {
+        match &self.layout {
+            Layout::Hourly(pattern) => expand_prefix_for_range(pattern, start, end),
+            Layout::IsatssSlots => {
+                let step = Duration::minutes(ISATSS_SLOT_MINUTES);
+                let mut slot = start
+                    .duration_trunc(step)
+                    .map_err(|e| DataServerError::Config(format!("scan slot: {e}")))?;
+                let mut prefixes = Vec::new();
+                while slot <= end {
+                    if !known(slot) {
+                        prefixes.push(slot.format("AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M").to_string());
+                    }
+                    slot += step;
+                }
+                Ok(prefixes)
+            }
         }
     }
 
     /// The scan start of `basename`, to the minute, when it is one of this
     /// product's files.
     ///
-    /// A full-disk scan starts about 20 s past its nominal ten-minute slot
-    /// (`s20262681900199` is 19:00:19.9). Keying frames on the minute lets
-    /// a request for the nominal 19:00 find that scan rather than snap back
-    /// to the one before it; every ABI scan mode starts at most one scan per
-    /// minute, so the minute still identifies the scan.
+    /// A GOES full-disk scan starts about 20 s past its nominal ten-minute
+    /// slot (`s20262681900199` is 19:00:19.9). Keying frames on the minute
+    /// lets a request for the nominal 19:00 find that scan rather than snap
+    /// back to the one before it; every ABI scan mode starts at most one
+    /// scan per minute, so the minute still identifies the scan.
     pub fn scan_start(&self, basename: &str) -> Option<DateTime<Utc>> {
-        let digits = self.file.captures(basename)?.get(1)?.as_str();
+        let digits = self.file.captures(basename)?.name("start")?.as_str();
         NaiveDateTime::parse_from_str(&format!("{}00", &digits[..11]), "%Y%j%H%M%S")
             .ok()
             .map(|t| t.and_utc())
+    }
+
+    /// The tile number of `basename`, for a tiled product's file.
+    pub fn tile(&self, basename: &str) -> Option<u32> {
+        self.file
+            .captures(basename)?
+            .name("tile")?
+            .as_str()
+            .parse()
+            .ok()
     }
 }
 
@@ -52,7 +160,17 @@ mod tests {
     #[test]
     fn goes_r_names_select_product_band_and_scan_minute() {
         let c13 = Naming::goes_r("ABI-L2-CMIPF", Some(13));
-        assert_eq!(c13.prefix, "ABI-L2-CMIPF/%Y/%j/%H/");
+        assert!(!c13.tiled());
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            c13.prefixes(
+                at("2026-09-25T18:30:00Z"),
+                at("2026-09-25T19:10:00Z"),
+                |_| true
+            )
+            .unwrap(),
+            ["ABI-L2-CMIPF/2026/268/18", "ABI-L2-CMIPF/2026/268/19"]
+        );
         let name = "OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc";
         assert_eq!(
             c13.scan_start(name),
@@ -73,6 +191,40 @@ mod tests {
                 "OR_ABI-L2-ACHTF-M6_G19_s20262681910199_e20262681919507_c20262681922250.nc"
             ),
             Some("2026-09-25T19:10:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn isatss_names_select_sector_band_tile_and_scan_minute() {
+        let c13 = Naming::isatss("HFD", 13);
+        assert!(c13.tiled());
+        let name = "OR_HFD-020-B12-M1C13-T007_GH9_s20262701920000_c20262701928130.nc";
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(c13.scan_start(name), Some(at("2026-09-27T19:20:00Z")));
+        assert_eq!(c13.tile(name), Some(7));
+        for other in [
+            // Another band, a regional sector, another resolution's band.
+            "OR_HFD-020-B12-M1C14-T007_GH9_s20262701920000_c20262701928130.nc",
+            "OR_HR3-020-B12-M1C13-T001_GH9_s20262701929000_c20262701931000.nc",
+            "OR_HFD-005-B11-M1C03-T001_GH9_s20262670000000_c20262670008450.nc",
+            "OR_HFD-020-B12-M1C13-T007_GH9_s20262701920000_c20262701928130.nc.tmp",
+        ] {
+            assert_eq!(c13.scan_start(other), None, "{other}");
+        }
+        // One directory per ten-minute slot, skipping slots already held.
+        let held = at("2026-09-27T19:10:00Z");
+        assert_eq!(
+            c13.prefixes(
+                at("2026-09-27T18:55:00Z"),
+                at("2026-09-27T19:20:00Z"),
+                |t| t == held
+            )
+            .unwrap(),
+            [
+                "AHI-L2-FLDK-ISatSS/2026/09/27/1850",
+                "AHI-L2-FLDK-ISatSS/2026/09/27/1900",
+                "AHI-L2-FLDK-ISatSS/2026/09/27/1920",
+            ]
         );
     }
 }
