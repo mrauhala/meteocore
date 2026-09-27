@@ -1644,8 +1644,8 @@ mod tests {
         let base = "https://example.test/prefix";
         let doc = json!({"id":"a","extent":{"spatial":{"bbox":[[20,60,0,30,70,100]]}},"links":[
             {"rel":"self","href":format!("{base}/maps/collections/a")},
-            {"rel":"map","href":format!("{base}/maps/collections/a/map")}
-        ],"styles":[{"title":"Rain & snow","links":[{"rel":"map","href":format!("{base}/maps/collections/a/styles/rain/map")}]},{"title":"Unsafe","links":[{"rel":"map","href":"javascript:alert(1)"}]}]});
+            {"rel":rel::MAP,"href":format!("{base}/maps/collections/a/map")}
+        ],"styles":[{"title":"Rain & snow","links":[{"rel":rel::MAP,"href":format!("{base}/maps/collections/a/styles/rain/map")}]},{"title":"Unsafe","links":[{"rel":rel::MAP,"href":"javascript:alert(1)"}]}]});
         let html = collection(base, "maps", &doc, None);
         let data = html
             .split("id=\"map-data\" hidden>")
@@ -1675,7 +1675,7 @@ mod tests {
         no_map["links"]
             .as_array_mut()
             .unwrap()
-            .retain(|l| l["rel"] != "map");
+            .retain(|l| l["rel"] != rel::MAP);
         assert!(!collection(base, "maps", &no_map, None).contains("id=\"map-controls\""));
     }
 
@@ -1865,8 +1865,8 @@ mod tests {
         let doc = json!({"links":[
             {"rel":"conformance","href":"https://x/maps/conformance","type":"application/json","title":"Conformance"},
             {"rel":rel::CONFORMANCE,"href":"https://x/maps/conformance","type":"application/json","title":"Conformance"},
-            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/png"},
-            {"rel":"map","href":"https://x/maps/collections/a/map","type":"image/jpeg"},
+            {"rel":rel::MAP,"href":"https://x/maps/collections/a/map","type":"image/png"},
+            {"rel":rel::MAP,"href":"https://x/maps/collections/a/map","type":"image/jpeg"},
             {"rel":"tiles","href":tiles,"type":"application/json","title":"Tilesets"},
             {"rel":rel::TILESETS_MAP,"href":tiles,"type":"application/json","title":"Map tilesets"},
             {"rel":rel::TILESETS_VECTOR,"href":tiles,"type":"application/json","title":"Vector tilesets"}
