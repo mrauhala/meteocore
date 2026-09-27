@@ -31,13 +31,13 @@ use ds_core::model::{
 };
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
-use ds_storage::discovery::{validate_prefix_pattern, TimeWindow};
+use ds_storage::discovery::TimeWindow;
 use ds_storage::object_store::path::Path as ObjectPath;
 
 pub use cache::{frame_metrics, strip_metrics};
 
 use cache::{BlockKey, FrameKey, FRAMES, STRIPS};
-use frame::{Frame, OVERVIEW_FACTOR};
+use frame::{Frame, FrameOptions, OVERVIEW_FACTOR};
 use naming::Naming;
 use source::Source;
 
@@ -58,17 +58,43 @@ const MAX_QUERY_FETCHES: usize = 8;
 /// grid.
 const MAX_QUERY_BLOCKS: usize = 1024;
 
+/// The files of one scan: one, or a mosaic's tiles.
+type Scan = Arc<[ObjectPath]>;
+
+/// How long after its start a tiled scan is ingested even if tiles are
+/// still missing: a Himawari full disk is published within ~9 minutes.
+const TILED_SCAN_SETTLE: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Whether a tiled scan starting at `time` with `tiles` files listed is
+/// complete enough to ingest: it has as many tiles as earlier scans had
+/// (`expected`), a newer scan has started publishing, or it has settled.
+/// Until then it may still be arriving, and a mosaic ingested early would
+/// keep its holes.
+fn tiled_scan_ready(
+    time: DateTime<Utc>,
+    tiles: usize,
+    expected: Option<usize>,
+    newest: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    expected.is_some_and(|n| tiles >= n)
+        || newest.is_some_and(|t| t > time)
+        || now - time >= TILED_SCAN_SETTLE
+}
+
 /// One configured product, served as one parameter.
 struct Product {
     parameter: Arc<str>,
     variable: String,
     naming: Naming,
+    /// Packed validity for files that declare none (ISatSS).
+    valid_fallback: Option<(i32, i32)>,
 }
 
 /// A consistent snapshot of what is served, swapped whole by each poll.
 struct Catalog {
     /// Per product (config order): scan start → file.
-    frames: Vec<BTreeMap<DateTime<Utc>, ObjectPath>>,
+    frames: Vec<BTreeMap<DateTime<Utc>, Scan>>,
     /// Per product: its scan starts, for `parameter_times` (O(1)).
     times: Vec<Arc<[DateTime<Utc>]>>,
     /// Per product: the CRS84 extent of its grid, from its first scan.
@@ -107,7 +133,16 @@ impl SatelliteEngine {
             .map(|p| Product {
                 parameter: p.parameter.as_str().into(),
                 variable: p.variable.clone(),
-                naming: Naming::goes_r(&p.product, p.band),
+                naming: match config.provider.as_str() {
+                    "isatss" => Naming::isatss(
+                        &p.product,
+                        p.band.expect("validate_satellite requires an ISatSS band"),
+                    ),
+                    _ => Naming::goes_r(&p.product, p.band),
+                },
+                // ISatSS writes space as ~0 K and declares no fill or range:
+                // below the packing offset is no measurement.
+                valid_fallback: (config.provider == "isatss").then_some((0, i16::MAX as i32)),
             })
             .collect();
         let source = match (&config.data_path, &config.endpoint, &config.bucket) {
@@ -117,7 +152,7 @@ impl SatelliteEngine {
             }
             (None, Some(endpoint), Some(bucket)) => {
                 for product in &products {
-                    validate_prefix_pattern(&product.naming.prefix, window.as_ref())?;
+                    product.naming.validate_window(window.as_ref())?;
                 }
                 Source::Bucket {
                     store: ds_storage::build_s3_store_from_parts(endpoint, bucket)?,
@@ -234,7 +269,8 @@ impl SatelliteEngine {
         let mut grids = old.grids.clone();
         let mut complete = true;
         for (index, product) in self.products.iter().enumerate() {
-            let found = match self.source.list(&product.naming, window) {
+            let known = |time| frames[index].contains_key(&time);
+            let found = match self.source.list(&product.naming, window, known) {
                 Ok(found) => found,
                 Err(e) => {
                     complete = false;
@@ -250,26 +286,40 @@ impl SatelliteEngine {
                 frames[index].retain(|time, _| *time >= start);
             }
             let known = &frames[index];
+            // Evidence of a complete scan's tile count: the scans held and
+            // those listed before the newest (which may still be arriving).
+            let expected = known
+                .values()
+                .map(|scan| scan.len())
+                .chain(found.iter().rev().skip(1).map(|f| f.paths.len()))
+                .max();
+            let newest = found.last().map(|f| f.time);
             let mut new: Vec<_> = found
                 .into_iter()
-                .filter(|f| !known.contains_key(&f.time))
+                .filter(|f| {
+                    !known.contains_key(&f.time)
+                        && (!product.naming.tiled()
+                            || tiled_scan_ready(f.time, f.paths.len(), expected, newest, now))
+                })
                 .collect();
             new.reverse();
             new.truncate(MAX_INGEST_PER_POLL);
             for scan in new {
-                match self.ingest(index, scan.time, &scan.path) {
+                match self.ingest(index, scan.time, &scan.paths) {
                     Ok(frame) => {
                         if extents[index].is_none() {
                             extents[index] = ds_core::geo::crs84_extent(frame.gt.bbox());
                         }
                         grids[index].get_or_insert([frame.gt.width, frame.gt.height]);
-                        frames[index].insert(scan.time, scan.path);
+                        frames[index].insert(scan.time, scan.paths);
                     }
                     Err(e) => tracing::warn!(
-                        "[{}] skipping {} scan {}: {e}",
+                        "[{}] skipping {} scan {} ({} file(s) from {}): {e}",
                         self.collection_id,
                         product.parameter,
-                        scan.path
+                        scan.time,
+                        scan.paths.len(),
+                        scan.paths[0]
                     ),
                 }
             }
@@ -304,15 +354,21 @@ impl SatelliteEngine {
         &self,
         index: usize,
         time: DateTime<Utc>,
-        path: &ObjectPath,
+        scan: &Scan,
     ) -> Result<Arc<Frame>, DataServerError> {
-        let key = self.frame_key(index, time);
-        let bytes = self.source.fetch(path)?;
-        let frame = Arc::new(
-            Frame::open(bytes, &self.products[index].variable).map_err(DataServerError::Engine)?,
-        );
-        FRAMES.insert(key, frame.clone());
+        let frame = Arc::new(self.open(index, scan)?);
+        FRAMES.insert(self.frame_key(index, time), frame.clone());
         Ok(frame)
+    }
+
+    /// Download a scan's files and parse them.
+    fn open(&self, index: usize, scan: &Scan) -> Result<Frame, DataServerError> {
+        let product = &self.products[index];
+        let options = FrameOptions {
+            variable: &product.variable,
+            valid_fallback: product.valid_fallback,
+        };
+        Frame::open(self.source.fetch(scan)?, options).map_err(DataServerError::Engine)
     }
 
     fn frame_key(&self, index: usize, time: DateTime<Utc>) -> FrameKey {
@@ -459,20 +515,17 @@ impl SatelliteEngine {
         &self,
         index: usize,
         time: DateTime<Utc>,
-        path: &ObjectPath,
+        scan: &Scan,
     ) -> Result<Arc<Frame>, DataServerError> {
         FRAMES.get_or_insert_with(&self.frame_key(index, time), || {
-            let bytes = self.source.fetch(path)?;
-            Frame::open(bytes, &self.products[index].variable)
-                .map(Arc::new)
-                .map_err(DataServerError::Engine)
+            self.open(index, scan).map(Arc::new)
         })
     }
 }
 
 impl Catalog {
     fn build(
-        frames: Vec<BTreeMap<DateTime<Utc>, ObjectPath>>,
+        frames: Vec<BTreeMap<DateTime<Utc>, Scan>>,
         parameters: &[ParameterInfo],
         extents: Vec<Option<[f64; 4]>>,
         grids: Vec<Option<[u32; 2]>>,
@@ -959,6 +1012,22 @@ mod tests {
     use super::{union_extent, Catalog};
     use ds_core::map_engine::ParameterInfo;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn tiled_scans_wait_for_their_tiles() {
+        let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let (scan, now) = (at("2026-09-27T19:20:00Z"), at("2026-09-27T19:28:00Z"));
+        let ready = |tiles, expected, newest, now| {
+            super::tiled_scan_ready(scan, tiles, expected, newest, now)
+        };
+        // Still arriving: fewer tiles than before, nothing newer, recent.
+        assert!(!ready(80, Some(88), Some(scan), now));
+        assert!(!ready(88, None, Some(scan), now));
+        // Complete, superseded, or settled.
+        assert!(ready(88, Some(88), Some(scan), now));
+        assert!(ready(80, Some(88), Some(at("2026-09-27T19:30:00Z")), now));
+        assert!(ready(80, Some(88), Some(scan), at("2026-09-27T19:35:00Z")));
+    }
 
     #[test]
     fn block_budget_caps_decode_work() {

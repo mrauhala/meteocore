@@ -1,0 +1,43 @@
+id = "himawari9-fd"
+title = "Himawari-9 full disk"
+description = "JMA Himawari-9 (140.7°E) AHI full-disk imagery every 10 minutes: clean-IR brightness temperature (band 13, 10.4 µm), from the ISatSS tiles NOAA publishes on AWS. Source: Japan Meteorological Agency. The disk crosses the antimeridian: its extent runs west > east, from about 60°E to 138°W"
+engine_type = "satellite"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["satellite", "Himawari-9", "JMA", "Asia", "Pacific", "infrared", "brightness temperature"]
+
+[license]
+title = "NOAA Open Data Dissemination (NODD); JMA Himawari data, attribution requested"
+url = "https://registry.opendata.aws/noaa-himawari/"
+
+# One scan is 88 tile files (~26 MB for band 13), each in the scan's own
+# ten-minute directory; a scan is ingested once all its tiles are there.
+# Startup ingests the whole time_window, at most 6 h. Keep it short on a
+# metered link.
+[satellite]
+provider = "isatss"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "noaa-himawari9"
+time_window = "-PT1H"
+poll_interval_secs = 60
+
+[[satellite.products]]
+parameter = "ir_10_4"
+title = "IR 10.4 µm brightness temperature"
+unit = "K"
+product = "HFD"
+band = 13
+variable = "Sectorized_CMI"
+
+# The enhanced-IR palette over 180–330 K from the built-in parameter
+# defaults; the classic grey IR is a named style.
+[wms]
+colormap = "ir_bt_enhanced"
+min = 180.0
+max = 330.0
+
+[[wms.styles]]
+name = "ir-grey"
+title = "IR brightness temperature · grey"
+colormap = "ir_bt_grey"
+min = 180.0
+max = 330.0

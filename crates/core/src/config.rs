@@ -1085,6 +1085,9 @@ pub fn validate_bufr(id: &str, cfg: &BufrConfig) -> Result<(), crate::error::Dat
 pub struct SatelliteConfig {
     /// File layout and naming convention. `"goes-r"`: NOAA GOES-R ABI
     /// NetCDF-4 (L1b/L2) as published on AWS, `<product>/%Y/%j/%H/OR_…`.
+    /// `"isatss"`: Himawari AHI ISatSS tiles as NOAA publishes them for
+    /// Himawari-9, `AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/OR_<sector>-…-T<tile>_…`,
+    /// one scan being 88 tile files.
     #[serde(default = "default_satellite_provider")]
     pub provider: String,
     /// Local directory holding the files (listed recursively). Mutually
@@ -1099,8 +1102,9 @@ pub struct SatelliteConfig {
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub bucket: Option<String>,
     /// How far back scans are discovered and served (ISO 8601, e.g.
-    /// `"-PT2H"`). Required for a bucket, whose hourly prefixes it expands
-    /// (at most 24 h); optional for a local directory.
+    /// `"-PT2H"`). Required for a bucket, whose prefixes it expands (at most
+    /// 24 h of GOES-R hours, 6 h of ISatSS ten-minute scans); optional for a
+    /// local directory.
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub time_window: Option<String>,
     #[serde(default = "default_satellite_poll_interval_secs")]
@@ -1120,9 +1124,11 @@ pub struct SatelliteProductConfig {
     /// styles resolve at load, before the first file arrives.
     pub unit: String,
     /// GOES-R product, e.g. `"ABI-L2-CMIPF"` (full-disk cloud and moisture
-    /// imagery) or `"ABI-L2-ACHTF"` (full-disk cloud top temperature).
+    /// imagery) or `"ABI-L2-ACHTF"` (full-disk cloud top temperature); for
+    /// ISatSS the sector, `"HFD"` (full disk).
     pub product: String,
-    /// ABI band (1–16) for per-band products such as CMIP.
+    /// ABI or AHI band (1–16), for per-band products such as CMIP; required
+    /// for ISatSS.
     #[serde(default)]
     pub band: Option<u8>,
     /// NetCDF variable holding the values, e.g. `"CMI"` or `"TEMP"`.
@@ -1144,9 +1150,10 @@ pub fn validate_satellite(
 ) -> Result<(), crate::error::DataServerError> {
     use crate::error::DataServerError::Config;
 
-    if cfg.provider != "goes-r" {
+    if !matches!(cfg.provider.as_str(), "goes-r" | "isatss") {
         return Err(Config(format!(
-            "Collection '{id}': [satellite].provider '{}' is not supported (supported: goes-r)",
+            "Collection '{id}': [satellite].provider '{}' is not supported \
+             (supported: goes-r, isatss)",
             cfg.provider
         )));
     }
@@ -1215,12 +1222,19 @@ pub fn validate_satellite(
                 product.product
             )));
         }
-        if let Some(band) = product.band {
-            if !(1..=16).contains(&band) {
+        match product.band {
+            Some(band) if !(1..=16).contains(&band) => {
                 return Err(Config(format!(
-                    "Collection '{id}': satellite parameter '{name}' band {band} is not an ABI band (1-16)"
+                    "Collection '{id}': satellite parameter '{name}' band {band} is not an \
+                     ABI/AHI band (1-16)"
                 )));
             }
+            None if cfg.provider == "isatss" => {
+                return Err(Config(format!(
+                    "Collection '{id}': ISatSS parameter '{name}' needs a 'band'"
+                )));
+            }
+            _ => {}
         }
     }
     Ok(())
