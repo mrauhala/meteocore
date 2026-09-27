@@ -730,6 +730,41 @@ async fn the_track_walk_says_why_it_stopped() {
     assert_eq!(out["stopped_because"], "samples_reached");
 }
 
+/// An empty history's note follows how the walk ended (#646): only a walk
+/// that read every retained frame may say the id is not retained; one that
+/// stopped at `samples` says to look further back.
+#[tokio::test]
+async fn an_empty_track_note_follows_why_the_walk_stopped() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let track = |samples: u64| {
+        let (app, sid) = (&app, &sid);
+        async move {
+            call_tool(
+                app,
+                sid,
+                "get_cell_track",
+                json!({"collection": "cells", "cell_id": "no-such-cell", "samples": samples}),
+            )
+            .await
+        }
+    };
+    let short = track(1).await;
+    assert_eq!(short["stopped_because"], "samples_reached");
+    let note = short["note"].as_str().unwrap();
+    assert!(
+        !note.contains("not present in any retained frame"),
+        "{note}"
+    );
+    assert!(note.contains("Raise `samples`"), "{note}");
+    assert_eq!(short["frames_truncated"], 0);
+
+    let full = track(2).await;
+    assert_eq!(full["stopped_because"], "reached_earliest_retained_frame");
+    let note = full["note"].as_str().unwrap();
+    assert!(note.contains("not present in any retained frame"), "{note}");
+}
+
 /// An engine whose frames are retained but contain no cells — engine-nowcast
 /// pushes a snapshot every generation regardless of cell count.
 struct QuietEngine;
