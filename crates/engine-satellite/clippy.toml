@@ -1,0 +1,11 @@
+# hdf5-reader compiles rayon in (netcdf-reader pulls it with default
+# features). Its rayon-backed readers would fan one request's decode out
+# over a global pool, which the server forbids on concurrent paths (root
+# CLAUDE.md, Performance & Concurrency Rules): read serially.
+# netcdf-reader's own `*_parallel` readers need its `rayon` feature, which
+# this crate leaves off, so they cannot be called at all.
+disallowed-methods = [
+    { path = "hdf5_reader::Dataset::read_array_parallel", reason = "rayon fan-out; use read_array" },
+    { path = "hdf5_reader::Dataset::read_array_in_pool", reason = "rayon fan-out; use read_array" },
+    { path = "hdf5_reader::Dataset::read_slice_parallel", reason = "rayon fan-out; use read_slice" },
+]
