@@ -527,17 +527,11 @@ pub async fn get_tileset(
     let resolution = Resolution::parse(params.resolution.as_deref())?;
 
     // Resolve + validate the quantity against what the collection advertises.
-    let quantity = match &params.quantity {
-        Some(q) => {
-            if !info.quantities.iter().any(|(qid, _)| qid == q) {
-                return Err(Tiles3dError::BadRequest(format!(
-                    "unknown quantity '{q}' for collection '{id}'"
-                )));
-            }
-            q.clone()
-        }
-        None => info.default_quantity.clone(),
-    };
+    check_quantity(&info, params.quantity.as_deref(), &id)?;
+    let quantity = params
+        .quantity
+        .clone()
+        .unwrap_or_else(|| info.default_quantity.clone());
     if quantity.is_empty() {
         return Err(Tiles3dError::NotFound(format!(
             "collection '{id}' has no quantities"
@@ -650,6 +644,22 @@ pub async fn get_tileset(
         .into_response())
 }
 
+/// A requested `quantity` must be one the collection advertises: a 400
+/// here, before any cache lookup, render slot or blocking read. `None`
+/// (the default quantity) always passes.
+fn check_quantity(
+    info: &ds_core::volume::VolumeInfo,
+    quantity: Option<&str>,
+    id: &str,
+) -> Result<(), Tiles3dError> {
+    match quantity {
+        Some(q) if !info.quantities.iter().any(|(qid, _)| qid == q) => Err(
+            Tiles3dError::BadRequest(format!("unknown quantity '{q}' for collection '{id}'")),
+        ),
+        _ => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Content (.pnts)
 // ---------------------------------------------------------------------------
@@ -673,6 +683,10 @@ pub async fn get_content(
     }
 
     let info = engine.volume_info();
+    // Before the cache key and the render semaphore: distinct bogus names
+    // would each miss the cache and hold a scarce render slot only for the
+    // engine to reject them (#536).
+    check_quantity(&info, quantity.as_deref(), &id)?;
     let exact = exact_volume_time(&info, time);
     let key = ContentKey {
         collection: id,
@@ -775,13 +789,7 @@ pub async fn get_content_glb(
     // Validate the quantity against the advertised set *before* the blocking
     // task, like the `.pnts` handler — an unknown name shouldn't trigger a full
     // `read_voxel_grid` (HDF5 open + polar scan) just to be rejected.
-    if let Some(q) = &params.quantity {
-        if !info.quantities.iter().any(|(qid, _)| qid == q) {
-            return Err(Tiles3dError::BadRequest(format!(
-                "unknown quantity '{q}' for collection '{id}'"
-            )));
-        }
-    }
+    check_quantity(&info, params.quantity.as_deref(), &id)?;
 
     let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let quantity = params.quantity.clone();
@@ -951,17 +959,11 @@ pub async fn get_voxel_tileset(
             "collection '{id}' has no voxel coverage yet"
         )));
     }
-    let quantity = match &params.quantity {
-        Some(q) => {
-            if !info.quantities.iter().any(|(qid, _)| qid == q) {
-                return Err(Tiles3dError::BadRequest(format!(
-                    "unknown quantity '{q}' for collection '{id}'"
-                )));
-            }
-            q.clone()
-        }
-        None => info.default_quantity.clone(),
-    };
+    check_quantity(&info, params.quantity.as_deref(), &id)?;
+    let quantity = params
+        .quantity
+        .clone()
+        .unwrap_or_else(|| info.default_quantity.clone());
     if quantity.is_empty() {
         return Err(Tiles3dError::NotFound(format!(
             "collection '{id}' has no quantities"
@@ -1103,13 +1105,7 @@ pub async fn get_voxel_content(
             "voxel content '{tile}' is out of range (single-tile set)"
         )));
     }
-    if let Some(q) = &params.quantity {
-        if !info.quantities.iter().any(|(qid, _)| qid == q) {
-            return Err(Tiles3dError::BadRequest(format!(
-                "unknown quantity '{q}' for collection '{id}'"
-            )));
-        }
-    }
+    check_quantity(&info, params.quantity.as_deref(), &id)?;
     let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let quantity = params.quantity.clone();
     let dims = Resolution::parse(params.resolution.as_deref())?.dims();
