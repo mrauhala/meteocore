@@ -38,12 +38,22 @@ pub enum EdrFormat {
 }
 
 /// Parse the `f` query parameter. Absent/blank → CoverageJSON. `coveragejson`
-/// and `png` are accepted case-insensitively; anything else is a 400.
+/// and `png` are accepted case-insensitively, and so are their media types
+/// (#510): `application/prs.coverage+json` (what the responses carry),
+/// `application/vnd.cov+json` (the registered CoverageJSON type) and
+/// `image/png`. A `+` sent unencoded arrives as a space, so a space inside
+/// a media type reads as `+`. Anything else is a 400.
 pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
-    match f.map(str::trim).filter(|s| !s.is_empty()) {
+    let f = f
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase().replace(' ', "+"));
+    match f.as_deref() {
         None => Ok(EdrFormat::CoverageJson),
-        Some(s) if s.eq_ignore_ascii_case("coveragejson") => Ok(EdrFormat::CoverageJson),
-        Some(s) if s.eq_ignore_ascii_case("png") => Ok(EdrFormat::Png),
+        Some("coveragejson" | "application/prs.coverage+json" | "application/vnd.cov+json") => {
+            Ok(EdrFormat::CoverageJson)
+        }
+        Some("png" | "image/png") => Ok(EdrFormat::Png),
         Some(other) => Err(DataServerError::InvalidParameter(format!(
             "Unsupported output format '{other}' — expected 'CoverageJSON' or 'PNG'"
         ))),
@@ -354,6 +364,30 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
 mod tests {
     use super::*;
     use ds_core::vertical::{VerticalDimension, VerticalKind};
+
+    #[test]
+    fn edr_format_accepts_tokens_and_media_types() {
+        for f in [
+            None,
+            Some(""),
+            Some("CoverageJSON"),
+            Some("application/prs.coverage+json"),
+            Some("application/prs.coverage json"),
+            Some("application/vnd.cov+json"),
+        ] {
+            assert_eq!(
+                parse_edr_format(f).unwrap(),
+                EdrFormat::CoverageJson,
+                "{f:?}"
+            );
+        }
+        for f in ["png", "PNG", "image/png"] {
+            assert_eq!(parse_edr_format(Some(f)).unwrap(), EdrFormat::Png, "{f}");
+        }
+        for f in ["json", "application/json", "image/jpeg"] {
+            assert!(parse_edr_format(Some(f)).is_err(), "{f}");
+        }
+    }
 
     #[test]
     fn parse_z_none_and_blank() {

@@ -322,6 +322,24 @@ async fn finding_06b_conformance_accepts_f_param() {
     );
 }
 
+/// `f` also takes the media types other OGC API servers accept (#510):
+/// production saw a client asking `/collections?f=application/json` get a
+/// 400. (Data queries' CoverageJSON media types: `parse_edr_format`'s
+/// unit test.)
+#[tokio::test]
+async fn f_accepts_media_type_aliases() {
+    for uri in [
+        "/collections?f=application%2Fjson",
+        "/conformance?f=application%2Fjson",
+        "/collections/weather?f=application%2Fjson",
+    ] {
+        let (status, _) = get_json(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+    let (status, _) = get_json("/collections?f=application%2Fxml").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 // ===========================================================================
 // FINDING 7: Content-Type header not explicitly set
 // ===========================================================================

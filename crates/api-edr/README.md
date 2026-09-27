@@ -80,7 +80,7 @@ for the specification baselines and remaining gaps.
 | `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..` |
 | `parameter-name` | partial | comma-separated; 400 only when *no* requested name matches — a mix of valid and unknown names silently drops the unknown ones (#666, the #605 rule) |
 | `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent |
-| `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only; media-type aliases such as `f=application/json` rejected (#510); no CSV/NetCDF/GeoJSON |
+| `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/prs.coverage+json`, `application/vnd.cov+json`, `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
 | `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
@@ -228,7 +228,7 @@ generations, not already-published instances.
 3. `crs` on data queries + `crs_details`; EDR GeoJSON output for point results (then declare `edr-geojson`).
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
 
-Related issues: #585 MULTIPOINT fan-out bound · #510 `f` aliases · #667
+Related issues: #585 MULTIPOINT fan-out bound · #667
 antimeridian bboxes · #668 400-vs-404 on unsupported query types · #666
 shared parameter-name validation · #665 GRIB value rounding · #523 nowcast
 reflectivity via EDR · #673 shared area budget.
