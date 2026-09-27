@@ -446,7 +446,7 @@ async fn storm_cells_come_back_ranked_and_bounded() {
         .unwrap_or_default()
         .contains("not an official warning"));
 
-    // limit is honoured and clamped.
+    // limit is honoured.
     let two = call_tool(
         &app,
         &sid,
@@ -655,9 +655,11 @@ async fn samples_counts_frames_walked_not_matches() {
 }
 
 #[tokio::test]
-async fn zero_limits_are_rejected_rather_than_coerced() {
+async fn out_of_range_limits_are_rejected_rather_than_coerced() {
     // A model asking for 0 means none; handing back 1 is a silently-wrong
-    // answer, which is the failure mode this crate is built to avoid.
+    // answer, which is the failure mode this crate is built to avoid. Above
+    // the maximum likewise: a silent clamp returns a page nobody asked for
+    // (#652).
     let app = app();
     let sid = handshake(&app).await;
     for (tool, args) in [
@@ -666,8 +668,16 @@ async fn zero_limits_are_rejected_rather_than_coerced() {
             json!({"collection": "cells", "limit": 0}),
         ),
         (
+            "get_storm_cells",
+            json!({"collection": "cells", "limit": 51}),
+        ),
+        (
             "get_cell_track",
             json!({"collection": "cells", "cell_id": "42", "samples": 0}),
+        ),
+        (
+            "get_cell_track",
+            json!({"collection": "cells", "cell_id": "42", "samples": 49}),
         ),
     ] {
         let (_, _, body) = call(
@@ -680,9 +690,18 @@ async fn zero_limits_are_rejected_rather_than_coerced() {
         .await;
         assert!(
             body.contains("must be between"),
-            "{tool} should reject 0 with a range: {body}"
+            "{tool} should reject {args} with a range: {body}"
         );
     }
+    // The maxima themselves are accepted.
+    let max = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "limit": 50}),
+    )
+    .await;
+    assert!(max["cells"].is_array(), "{max}");
 }
 
 #[tokio::test]
