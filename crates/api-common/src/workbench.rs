@@ -39,11 +39,12 @@ pub struct Surface<'a> {
 /// Registered relations naming a list of tilesets (Tiles Req 13).
 const TILESETS_REL_PREFIX: &str = "http://www.opengis.net/def/rel/ogc/1.0/tilesets-";
 
-/// First link carrying the short or registered map relation (Maps Req 46).
+/// First link carrying the registered map relation (Maps Req 46). No
+/// surface emits the short `map` relation since #806.
 fn map_link(links: &[Value]) -> Option<&str> {
     links
         .iter()
-        .find(|l| l["rel"] == "map" || l["rel"] == rel::MAP)
+        .find(|l| l["rel"] == rel::MAP)
         .and_then(|l| l["href"].as_str())
 }
 
@@ -429,7 +430,7 @@ pub fn document_links(doc: &Value) -> String {
                 escape(href),
                 escape(rel),
                 escape(link["type"].as_str().unwrap_or("Linked resource")),
-                if rel == "map" || rel == rel::MAP { " · requires bbox; use the map controls to build a request" } else { "" }
+                if rel == rel::MAP { " · requires bbox; use the map controls to build a request" } else { "" }
             ));
         }
     }
@@ -701,7 +702,7 @@ pub fn collection_html(
     let vector_href = links.and_then(|ls| vector_tilesets_link(ls)).filter(safe);
     let map_request = (map_href.is_some() || tiles_href.is_some() || vector_href.is_some()).then(|| {
         let legend = |style: &Value| style["links"].as_array()
-            .and_then(|ls|ls.iter().find(|l|l["rel"] == "legend" || l["rel"] == rel::LEGEND))
+            .and_then(|ls|ls.iter().find(|l|l["rel"] == rel::LEGEND))
             .and_then(|l|l["href"].as_str()).filter(safe)
             .map(str::to_owned);
         let default_style = doc["styles"].as_array()
@@ -1539,7 +1540,7 @@ mod tests {
         ] {
             let doc = json!({"id":"levels","extent":{"vertical":vertical},"links":[
                 {"rel":"self","href":"https://example.test/maps/collections/levels"},
-                {"rel":"map","href":"https://example.test/maps/collections/levels/map"}]});
+                {"rel":rel::MAP,"href":"https://example.test/maps/collections/levels/map"}]});
             assert!(collection_facts(&doc).contains("Vertical dimension"));
             for api in ["edr", "maps", "tiles"] {
                 let html = collection("https://example.test", api, &doc, None);
@@ -1558,7 +1559,7 @@ mod tests {
             }
         }
         let doc =
-            json!({"id":"single","links":[{"rel":"map","href":"/maps/collections/single/map"}]});
+            json!({"id":"single","links":[{"rel":rel::MAP,"href":"/maps/collections/single/map"}]});
         assert!(!collection_facts(&doc).contains("Vertical dimension"));
         // The script contains the selector name, so assert the actual element.
         assert!(!collection("", "maps", &doc, None).contains("id=\"map-level\""));
