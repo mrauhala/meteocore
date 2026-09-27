@@ -850,6 +850,10 @@ mod errors {
         let (status, json) = get("/collections/cities/items?datetime=not-a-date").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["code"].is_string());
+        let (status, _) =
+            get("/collections/cities/items?datetime=2026-01-02T00:00:00Z/2026-01-01T00:00:00Z")
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "reversed interval");
     }
 }
 

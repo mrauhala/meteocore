@@ -11,9 +11,10 @@
 //! `offset`; `number_matched` counts the full filtered set (pre-paging)
 //! so consumers can compute total pages.
 //!
-//! This file doesn't import `FeatureQuery.datetime` — `feature =
-//! station` is inherently time-agnostic in v1 (temporal features are an
-//! explicit non-goal per the plan doc). The field is silently ignored.
+//! `feature = station` is inherently time-agnostic in v1 (temporal
+//! features are an explicit non-goal per the plan doc), so
+//! `has_time_dimension` is false and the API layer answers a `datetime`
+//! filter with 400 rather than ignoring it.
 
 use std::sync::Arc;
 

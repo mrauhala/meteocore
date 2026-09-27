@@ -219,7 +219,15 @@ pub fn parse_datetime(s: &str) -> Result<DatetimeInterval, DataServerError> {
                     .map_err(|e| DataServerError::InvalidDatetime(format!("{end_str}: {e}")))?,
             )
         };
-        Ok(DatetimeInterval { start, end })
+        let interval = DatetimeInterval { start, end };
+        if let (Some(start), Some(end)) = (interval.start, interval.end) {
+            if start > end {
+                return Err(DataServerError::InvalidDatetime(format!(
+                    "{s}: interval ends before it starts"
+                )));
+            }
+        }
+        Ok(interval)
     } else {
         let instant = s
             .parse()
@@ -297,6 +305,14 @@ mod tests {
         assert!(dt.start.is_some());
         assert!(dt.end.is_some());
         assert!(dt.start.unwrap() < dt.end.unwrap());
+    }
+
+    #[test]
+    fn parse_datetime_rejects_a_reversed_interval() {
+        assert!(matches!(
+            parse_datetime("2024-01-02T00:00:00Z/2024-01-01T00:00:00Z"),
+            Err(DataServerError::InvalidDatetime(_))
+        ));
     }
 
     #[test]

@@ -58,6 +58,13 @@ impl CsvEngine {
         let Some(times) = self.store.time_index.get(location_id) else {
             return false;
         };
+        // `BTreeMap::range` panics on an inverted range; the API layer
+        // rejects one, but an empty interval matches nothing either way.
+        if let (Some(start), Some(end)) = (interval.start, interval.end) {
+            if start > end {
+                return false;
+            }
+        }
         let start = interval
             .start
             .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
@@ -497,6 +504,9 @@ mod tests {
             ["zeta", "alpha", "beta"]
         );
         assert!(ids(Some("2026-01-02T00:00:00Z"), None).is_empty());
+        // An inverted interval matches nothing instead of panicking in
+        // `BTreeMap::range`.
+        assert!(ids(Some("2026-01-01T01:00:00Z"), Some("2026-01-01T00:00:00Z")).is_empty());
         assert_eq!(
             engine.temporal_extent(),
             Some((at("2026-01-01T00:00:00Z"), at("2026-01-01T01:00:00Z")))

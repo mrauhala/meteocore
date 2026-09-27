@@ -118,7 +118,7 @@ tiles render the selected instant. Not part of this crate.
 | Parameter | Status | Notes |
 |---|---|---|
 | `bbox` | ✓ | 4 or 6 values (heights ignored); `west > east` is an antimeridian-crossing box (Features §7.15.3); 400 on malformed input |
-| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`. Engines with no time dimension (GeoJSON, PostGIS stations) answer 400 rather than ignoring it (#682); CSV filters stations to those with a report in the interval — see matrix |
+| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`; an interval that ends before it starts is 400. Engines with no time dimension (GeoJSON, PostGIS stations) answer 400 rather than ignoring it (#682); CSV filters stations to those with a report in the interval — see matrix |
 | `limit` | ✓ | default 100, clamped to `[1, 1000]` (out-of-range values are clamped, not rejected) |
 | `offset` | ✓ | offset pagination (non-standard extension; Part 1 only mandates `next`) |
 | `sortby` | ✓ | Part 8 syntax `[+\|-]property,…`; a decoded `+` (space) is accepted as ascending; 400 unless every property is in `FeatureEngine::sortables`; applied before paging (`ds_core::feature::sort_features`) |
