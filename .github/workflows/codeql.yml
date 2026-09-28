@@ -15,7 +15,12 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded PR runs only. A main or scheduled analysis cancelled
+  # mid-run is recorded as a failed analysis ("unsuccessful execution") and
+  # raises the code-scanning configuration-error banner; left to finish,
+  # back-to-back merges just queue, and GitHub drops all but the newest
+  # pending run, which covers them.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:
