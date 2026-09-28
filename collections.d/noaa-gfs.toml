@@ -72,14 +72,6 @@ min = 950.0
 max = 1050.0
 
 [[wms.parameters]]
-name = "UGRD"
-colormap = "wind_speed"
-
-[[wms.parameters]]
-name = "VGRD"
-colormap = "wind_speed"
-
-[[wms.parameters]]
 name = "GUST"
 colormap = "wind_speed"
 

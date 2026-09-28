@@ -21,14 +21,6 @@ parameters = [
 colormap = "temperature"
 
 [[wms.parameters]]
-name = "10u"
-colormap = "wind_speed"
-
-[[wms.parameters]]
-name = "10v"
-colormap = "wind_speed"
-
-[[wms.parameters]]
 name = "tcwv"
 colormap = "viridis"
 min = 0.0
