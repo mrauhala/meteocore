@@ -34,4 +34,15 @@ if [ $rc -ne 0 ] || [ -n "$diag" ]; then
   echo "${diag:-$(echo "$out" | tail -20)}"
   exit 1
 fi
+# The Docker image builds the server with --features icechunk, whose extra
+# trait impls can change type inference; a plain clippy run misses that.
+if (( ${@[(Ie)server]} )); then
+  out=$(cargo check -p server --features icechunk --all-targets 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "LINT FAILED $name (server --features icechunk, exit $rc)"
+    echo "$out" | grep -E "^(error|warning)" -A9 | head -40
+    exit 1
+  fi
+fi
 echo "LINT OK $name"

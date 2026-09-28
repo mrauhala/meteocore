@@ -47,7 +47,13 @@ the batch, and production deploys stay with the user.
   touches the tree's sources to prevent that, and before a local
   `cargo test` do the same: `git ls-files 'crates/*.rs' 'crates/**/*.rs' |
   xargs touch`. A build error naming code that isn't in your worktree is
-  this, not a bug to fix.
+  this, not a bug to fix. Touching only helps if no other worktree builds the
+  same crate meanwhile: while several agents run, treat a local result on a
+  crate another worktree also edits as provisional, re-lint once they finish,
+  and let CI decide.
+- Run the watchers from a checkout that stays put for the whole batch, e.g.
+  the main checkout or a dedicated worktree: a Monitor executes the script
+  file, so switching that checkout's branch mid-run changes or removes it.
 - Start the watchers as Monitors (max 30 min each; re-arm on expiry):
   `scripts/watch.sh <state>` (CI checks + comments for `<state>/prs`) and,
   unless `no-merge`, `scripts/merger.sh <state>` (the merge queue).
@@ -72,6 +78,18 @@ and the issue gets a progress comment (step 7).
 
 ## 4. Implement, one worktree per issue
 
+**Delegate the implementation, keep the judgment.** Create the worktrees, then
+launch one background general-purpose subagent per issue (all in one message
+so they run in parallel). Give each: its worktree path and branch, the issue
+number and the exact scope, the rules below, the lint and scoped-test
+commands, where to write the PR title and body, and "do not commit, stage,
+push or open a PR; stop and report if the issue is already done or needs a
+maintainer decision". When a report arrives, read the diff yourself, check
+anything it flags (public-type changes, deviations from the issue, "needs
+your call"), then ship. Main moves while agents work: if files an agent
+touched changed on main, `git stash -u`, merge `origin/main`, `git stash
+pop`, re-lint, then ship.
+
 - Read the root and the crate's `CLAUDE.md` and follow them (status-page
   READMEs for EDR/Features, Grafana for new metrics, OpenAPI for new
   parameters, CoverageJSON schema tests, geo/SQL/XML safety rules).
@@ -79,7 +97,9 @@ and the issue gets a progress comment (step 7).
 - Add tests that fail without the change. Before pushing a behaviour change,
   grep the crate's tests (and other crates' tests) for fixtures or mocks that
   relied on the old behaviour and update them.
-- `scripts/lint.sh <worktree> <crate> …` → must print `LINT OK`.
+- `scripts/lint.sh <worktree> <crate> …` → must print `LINT OK`. With
+  `server` in the list it also checks `server --features icechunk`, which
+  the Docker build uses and which a plain clippy run can miss.
 - Run locally any NEW test that pins values from an external reference
   (coordinates from `cs2cs`, expected colours, parsed fixtures). CI runs the
   rest; local first-runs are slow on macOS. A new pinned test once caught a

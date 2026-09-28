@@ -28,7 +28,10 @@ elif [ "$marker" = "$head" ]; then
 else
   echo "REVIEW STALE: summary covers ${marker:0:7}, head is ${head:0:7}"
 fi
-echo "$summary" | grep -v 'meteocore-review:'
+# The bot may put the marker on the same line as its text: strip the marker,
+# never the line.
+echo "$summary" | sed -E 's/<!-- *meteocore-review:[0-9a-f]+ *-->//'
+
 echo
 echo "--- open inline comments (not outdated):"
 $GH api "repos/$REPO/pulls/$pr/comments" --paginate \
