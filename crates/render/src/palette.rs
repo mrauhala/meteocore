@@ -87,6 +87,35 @@ impl Palette {
         }
     }
 
+    /// A [`normalized`](Self::normalized) palette's stops stretched from
+    /// their 0..1 domain onto the physical range `[min, max]` (#823), so it
+    /// is sampled and legended in data units. A data-valued palette comes
+    /// back unchanged.
+    pub fn stretched(&self, min: f64, max: f64) -> Palette {
+        if !self.normalized {
+            return self.clone();
+        }
+        let mut stops: Vec<ColorStop> = self
+            .stops
+            .iter()
+            .map(|s| ColorStop {
+                value: min + s.value * (max - min),
+                color: s.color,
+            })
+            .collect();
+        // An inverted range maps the stops descending; the samplers and the
+        // legend assume ascending, so flip them (a hard edge's paired stops
+        // flip with it, which keeps each colour on its side).
+        if max < min {
+            stops.reverse();
+        }
+        Palette {
+            stops,
+            normalized: false,
+            ..self.clone()
+        }
+    }
+
     /// Sample the palette color at a physical value (no range scaling).
     pub fn sample(&self, value: f64) -> [u8; 4] {
         sample_stops(&self.stops, value, self.interpolation)
@@ -609,6 +638,25 @@ impl PaletteRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An inverted range flips a normalized palette and keeps its stops
+    /// ascending, which the samplers assume.
+    #[test]
+    fn stretched_onto_an_inverted_range_stays_ascending() {
+        let viridis = builtin_palette("viridis").unwrap();
+        let flipped = viridis.stretched(100.0, 0.0);
+        assert!(flipped.stops.windows(2).all(|w| w[0].value <= w[1].value));
+        assert_eq!(flipped.stops.first().unwrap().value, 0.0);
+        assert_eq!(flipped.stops.last().unwrap().value, 100.0);
+        assert_eq!(
+            flipped.stops.first().unwrap().color,
+            viridis.stops.last().unwrap().color
+        );
+        assert_eq!(
+            flipped.stops.last().unwrap().color,
+            viridis.stops.first().unwrap().color
+        );
+    }
 
     /// Pin the table against accidental edits: every palette keeps its
     /// stop count and first/last stop values.
