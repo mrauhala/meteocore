@@ -158,11 +158,11 @@ pub fn router(api: SharedApi) -> Router {
 }
 
 fn error(status: StatusCode, code: &str, description: &str) -> Response {
-    (
+    crate::JsonError(
         status,
         Json(json!({"code": code, "description": description})),
     )
-        .into_response()
+    .into_response()
 }
 
 /// The requested representation, or the 400 to send for an unsupported one.

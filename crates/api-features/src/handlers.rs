@@ -9,7 +9,7 @@ use axum::{Extension, Json};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 
-use api_common::Mount;
+use api_common::{JsonError, Mount};
 
 use ds_core::config::CollectionConfig;
 use ds_core::feature::FeatureQuery;
@@ -75,13 +75,12 @@ impl IntoResponse for GeoJsonResponse {
 fn lookup_items_collection<'a>(
     state: &'a FeaturesState,
     id: &str,
-) -> Result<(&'a Arc<dyn FeatureEngine>, &'a CollectionConfig), (StatusCode, Json<serde_json::Value>)>
-{
-    lookup_collection(state, id).map_err(|(status, body)| {
+) -> Result<(&'a Arc<dyn FeatureEngine>, &'a CollectionConfig), HandlerError> {
+    lookup_collection(state, id).map_err(|JsonError(status, body)| {
         if status != StatusCode::NOT_FOUND {
-            return (status, body);
+            return JsonError(status, body);
         }
-        (
+        JsonError(
             status,
             Json(json!({
                 "code": "NotFound",
@@ -95,8 +94,7 @@ fn lookup_items_collection<'a>(
 fn lookup_collection<'a>(
     state: &'a FeaturesState,
     id: &str,
-) -> Result<(&'a Arc<dyn FeatureEngine>, &'a CollectionConfig), (StatusCode, Json<serde_json::Value>)>
-{
+) -> Result<(&'a Arc<dyn FeatureEngine>, &'a CollectionConfig), HandlerError> {
     let engine = state.engines.get(id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -112,11 +110,13 @@ fn lookup_collection<'a>(
     Ok((engine, config))
 }
 
-type HandlerError = (StatusCode, Json<serde_json::Value>);
+/// Converting through [`JsonError`] is what attaches the `ErrorReason` the
+/// request log reads (#119); a `(StatusCode, Json)` tuple converts via `?`.
+type HandlerError = JsonError;
 
 /// A 400 from a plain message (used for `?f=` content negotiation errors).
 fn bad_request_msg(msg: &str) -> HandlerError {
-    (
+    JsonError(
         StatusCode::BAD_REQUEST,
         Json(json!({ "code": "BadRequest", "description": msg })),
     )
@@ -764,7 +764,7 @@ pub async fn items(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);
@@ -807,7 +807,7 @@ pub async fn items(
     // A collection whose features carry no time cannot filter by it: a 400,
     // not the full set with 200 (#682).
     if datetime.is_some() && !engine.has_time_dimension() {
-        return Err((
+        return Err(JsonError(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": "BadRequest",
@@ -916,7 +916,7 @@ pub async fn item(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, config) = lookup_items_collection(&state, &id)?;
 
