@@ -236,7 +236,7 @@ fn is_read_only_event(kind: &EventKind) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use notify::Event;
 
@@ -387,7 +387,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     /// Build a live `AdminState` over `config_path`, mirroring `main.rs`.
-    fn build_state(config_path: &Path) -> AdminState {
+    pub(crate) fn build_state(config_path: &Path) -> AdminState {
         let (config, _) = ServerConfig::from_file(config_path.to_str().unwrap()).unwrap();
         let style_ctx = ds_render::StyleContext::new(
             crate::colormaps::build_palette_registry(&config, config_path.parent())

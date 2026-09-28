@@ -146,26 +146,80 @@ static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
+/// Latency buckets of the request and render histograms. They include
+/// 1.5/2/3/4 between 1s and 5s: without them, any request in (1, 5] is
+/// linearly interpolated by histogram_quantile across that wide bucket, so a
+/// handful of ~1.5s requests at low traffic read as a ~4-5s p99 in Grafana.
+/// 10s separates genuine >5s outliers from the merely-slow.
+const LATENCY_BUCKETS: [f64; 15] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0,
+];
+
 static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     let histogram = HistogramVec::new(
         HistogramOpts::new(
             "http_request_duration_seconds",
             "HTTP request duration in seconds",
         )
-        // Buckets include 1.5/2/3/4 between 1s and 5s: without them, any
-        // request in (1, 5] is linearly interpolated by histogram_quantile
-        // across that wide bucket, so a handful of ~1.5s requests at low
-        // traffic read as a ~4-5s p99 in Grafana. 10s separates genuine
-        // >5s outliers from the merely-slow.
-        .buckets(vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0,
-        ]),
+        .buckets(LATENCY_BUCKETS.to_vec()),
         &["method", "path", "api"],
     )
     .unwrap();
     REGISTRY.register(Box::new(histogram.clone())).unwrap();
     histogram
 });
+
+/// Raster render latency by API, collection and outcome (#466). One `/wms`
+/// request histogram hid which collection owned the tail, and its cache hits
+/// buried the cold renders past p99 (#248). Fed by the `RenderTiming`
+/// extension the WMS/Maps/Tiles handlers attach; `collection` is a registry
+/// id, and a reload drops the series of collections it removes
+/// ([`prune_render_duration`]).
+static RENDER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "render_duration_seconds",
+            "WMS GetMap, Maps map and Tiles map-tile render latency in seconds, from the \
+             rendered-cache lookup to the response. outcome: hit = rendered-cache hit, \
+             assembled = WMS view from cached meta-tiles, cold = engine read",
+        )
+        .buckets(LATENCY_BUCKETS.to_vec()),
+        &["api", "collection", "outcome"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// The `(api, collection)` pairs a raster API serves, keyed like the
+/// `render_duration_seconds` labels.
+fn render_label_sets(
+    wms: &WmsState,
+    maps: &MapsState,
+    tiles: &TilesState,
+) -> std::collections::HashSet<(&'static str, String)> {
+    let wms = wms.engines.keys().map(|id| ("wms", id.clone()));
+    let maps = maps.engines.keys().map(|id| ("maps", id.clone()));
+    let tiles = tiles.map_engines.keys().map(|id| ("tiles", id.clone()));
+    wms.chain(maps).chain(tiles).collect()
+}
+
+/// Drop the render-latency series of every `(api, collection)` served
+/// `before` a reload but not after it (#446): a removed collection must not
+/// keep reporting its last histogram forever. Outcomes are a fixed set, so
+/// no series enumeration is needed.
+fn prune_render_duration(
+    before: &std::collections::HashSet<(&'static str, String)>,
+    after: &std::collections::HashSet<(&'static str, String)>,
+) {
+    for (api, collection) in before.difference(after) {
+        for outcome in ds_executor::RenderOutcome::ALL {
+            // Err = no such series (never rendered with that outcome).
+            let _ =
+                RENDER_DURATION.remove_label_values(&[api, collection.as_str(), outcome.as_str()]);
+        }
+    }
+}
 
 static COLLECTIONS_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new("collections_total", "Total configured collections").unwrap();
@@ -4727,6 +4781,10 @@ fn apply_load(
     let rendered_cache = result.wms_state.rendered_cache.clone();
     let tile_cache = result.wms_state.tile_cache.clone();
     let vector_cache = result.tiles_state.vector_tile_cache.clone();
+    let rendered_before =
+        render_label_sets(&state.wms.load(), &state.maps.load(), &state.tiles.load());
+    let rendered_after =
+        render_label_sets(&result.wms_state, &result.maps_state, &result.tiles_state);
 
     // Atomically swap state
     state.edr.store(Arc::new(result.edr_state));
@@ -4794,6 +4852,11 @@ fn apply_load(
             stale.len()
         );
     }
+    // Metric-label hygiene (#446): only REMOVED collections lose their
+    // render-latency series; a rebuilt one keeps its history. (A render in
+    // flight on the old registry can re-create a series after this — the
+    // same narrow window as the cache sweep above.)
+    prune_render_duration(&rendered_before, &rendered_after);
 
     // Remember this load's config + engines as the diff basis and reuse pool
     // for the NEXT incremental reload.
@@ -5739,6 +5802,12 @@ pub async fn metrics_middleware(
     HTTP_REQUEST_DURATION
         .with_label_values(&[method.as_str(), path.as_str(), api])
         .observe(duration);
+
+    if let Some(timing) = response.extensions().get::<ds_executor::RenderTiming>() {
+        RENDER_DURATION
+            .with_label_values(&[api, timing.collection.as_str(), timing.outcome.as_str()])
+            .observe(timing.elapsed.as_secs_f64());
+    }
 
     response
 }
@@ -7261,6 +7330,87 @@ mod tests {
             assert_eq!(response.status(), axum::http::StatusCode::OK);
             assert_eq!(counter.get(), before + 1, "{uri}");
         }
+    }
+
+    /// `(api, outcome, sample count)` of each `render_duration_seconds`
+    /// series of `collection`, sorted. Reads the family without creating
+    /// series, so it can observe their removal.
+    fn render_series(collection: &str) -> Vec<(String, String, u64)> {
+        use prometheus::core::Collector;
+        let mut series = Vec::new();
+        for family in super::RENDER_DURATION.collect() {
+            for metric in family.get_metric() {
+                let label = |name: &str| {
+                    let pair = metric.get_label().iter().find(|l| l.name() == name);
+                    pair.map_or(String::new(), |l| l.value().to_string())
+                };
+                if label("collection") == collection {
+                    let count = metric.get_histogram().get_sample_count();
+                    series.push((label("api"), label("outcome"), count));
+                }
+            }
+        }
+        series.sort();
+        series
+    }
+
+    /// Render latency end to end (#466): the metrics middleware records the
+    /// WMS handler's timing under the collection's registry id, split into a
+    /// cold render and a hit, and a reload that removes a collection drops
+    /// its series while a kept collection's survive (#446).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn render_latency_is_labelled_per_collection_and_pruned_on_removal() {
+        use tower::ServiceExt;
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar-tm35fin");
+        let collection = |id: &str| {
+            format!(
+                "[[collections]]\nid = \"{id}\"\ntitle = \"{id}\"\ndescription = \"{id}\"\n\
+                 data_path = \"{fixture}\"\nengine_type = \"geotiff\"\napis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n"
+            )
+        };
+        let (kept, gone) = ("render-latency-kept", "render-latency-gone");
+        let server = "[server]\nhost = \"127.0.0.1\"\nport = 8000\n";
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let both = format!("{server}{}{}", collection(kept), collection(gone));
+        std::fs::write(&config_path, both).unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let app = axum::Router::new()
+            .nest("/wms", api_wms::router(state.wms.clone()))
+            .layer(axum::middleware::from_fn(super::metrics_middleware));
+
+        let series = |outcomes: &[(&str, u64)]| -> Vec<(String, String, u64)> {
+            outcomes
+                .iter()
+                .map(|&(outcome, n)| ("wms".into(), outcome.into(), n))
+                .collect()
+        };
+        for id in [kept, gone] {
+            for _ in 0..2 {
+                let uri = format!(
+                    "/wms?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS={id}&STYLES=\
+                     &FORMAT=image/png&CRS=CRS:84&BBOX=20,60,30,70&WIDTH=64&HEIGHT=64"
+                );
+                let request = axum::http::Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+            }
+            assert_eq!(
+                render_series(id),
+                series(&[("cold", 1), ("hit", 1)]),
+                "{id}"
+            );
+        }
+
+        std::fs::write(&config_path, format!("{server}{}", collection(kept))).unwrap();
+        super::do_reload(&state).unwrap();
+        assert_eq!(render_series(gone), series(&[]), "removed collection");
+        assert_eq!(render_series(kept), series(&[("cold", 1), ("hit", 1)]));
     }
 
     #[test]

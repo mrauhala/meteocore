@@ -90,3 +90,7 @@ one absolute deadline across admission/render/encoding. The worker retains
 CPU and memory permits after HTTP timeout/disconnect. Propagate
 `DeadlineExceeded` as 503 + Retry-After, never a successful transparent/error
 image. Meta-tile fan-out checks the same deadline between tiles.
+
+Every served GetMap carries a `ds_executor::RenderTiming` (timed from the
+rendered-cache lookup): `hit`, `assembled` (meta-tiles all cached) or `cold`.
+An error tile carries none. Maps and Tiles report `hit`/`cold` the same way.

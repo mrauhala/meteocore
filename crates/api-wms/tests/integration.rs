@@ -1288,6 +1288,78 @@ async fn zero_metatile_cache_disables_meta_tiling() {
     );
 }
 
+// --- Render latency by collection and outcome (#466) -------------------------
+
+/// GetMap on `layers`, returning the render timing the server's metrics
+/// middleware records as `render_duration_seconds`.
+async fn render_timing(
+    app: &axum::Router,
+    layers: &str,
+    crs: &str,
+    bbox: &str,
+    size: u32,
+) -> Option<(String, ds_executor::RenderOutcome)> {
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS={layers}&STYLES=\
+         &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH={size}&HEIGHT={size}"
+    );
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.extensions()
+        .get::<ds_executor::RenderTiming>()
+        .map(|t| (t.collection.clone(), t.outcome))
+}
+
+/// One `/wms` histogram hid which collection owned the tail and buried cold
+/// renders under cache hits. Each GetMap now reports its collection's
+/// registry id and the path that served it: a cold engine read, a
+/// rendered-cache hit, or a view assembled from cached meta-tiles only.
+#[tokio::test]
+async fn getmap_reports_render_outcome_per_collection() {
+    use ds_executor::RenderOutcome::{Assembled, Cold, Hit};
+    use std::sync::atomic::Ordering;
+    let (app, _tiles, calls) = build_counting_router(64);
+    let data = |outcome| Some(("data".to_string(), outcome));
+    let full = "2000000,8000000,3000000,9000000";
+
+    assert_eq!(
+        render_timing(&app, "data", "EPSG:3857", full, 512).await,
+        data(Cold)
+    );
+    assert_eq!(
+        render_timing(&app, "data", "EPSG:3857", full, 512).await,
+        data(Hit)
+    );
+    // A sub-view at the same resolution: a rendered-cache miss whose
+    // covering meta-tiles are all cached, so the engine is not called.
+    let before = calls.load(Ordering::Relaxed);
+    let quarter = "2000000,8000000,2500000,8500000";
+    assert_eq!(
+        render_timing(&app, "data", "EPSG:3857", quarter, 256).await,
+        data(Assembled)
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), before);
+    // Direct geographic render; a `collection/parameter` layer still labels
+    // the collection, never the raw layer name.
+    assert_eq!(
+        render_timing(&app, "data/any", "CRS:84", "10,55,30,70", 256).await,
+        data(Cold)
+    );
+}
+
+/// A failed render served as an error tile is not a render outcome: it must
+/// not dilute the cold-render latency.
+#[tokio::test]
+async fn error_tile_reports_no_render_timing() {
+    let app = build_failing_router();
+    let timing = render_timing(&app, "broken", "CRS:84", "10,55,30,70", 64).await;
+    assert_eq!(timing, None);
+}
+
 /// Multi-parameter mock standing in for a PVOL radar-site collection: two
 /// bare-quantity parameters with human labels, and a `layer_subtitle` carrying
 /// the site place name. Drives the flat-client disambiguation in

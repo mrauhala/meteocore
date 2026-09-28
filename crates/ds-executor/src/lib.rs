@@ -74,6 +74,56 @@ pub fn metrics() -> Metrics {
     }
 }
 
+/// Which path served a raster render response: the fixed `outcome` label of
+/// the server's `render_duration_seconds` histogram (#466). Kept apart so
+/// sub-millisecond hits no longer bury the cold-render tail (#248).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderOutcome {
+    /// Served from the rendered-output cache, without admission.
+    Hit,
+    /// A WMS view assembled from meta-tiles that were all cached: no engine read.
+    Assembled,
+    /// The engine read source data: a direct render, or a meta-tiled view
+    /// with at least one uncached tile.
+    Cold,
+}
+
+impl RenderOutcome {
+    pub const ALL: [Self; 3] = [Self::Hit, Self::Assembled, Self::Cold];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Assembled => "assembled",
+            Self::Cold => "cold",
+        }
+    }
+}
+
+/// Response extension carrying one render's latency, from the rendered-cache
+/// lookup to the response. The raster API handlers attach it and the
+/// server's metrics middleware records it, so engines and API crates stay
+/// metric-free. Only served renders carry one: shed, timed-out and failed
+/// renders have their own counters and error responses.
+#[derive(Clone, Debug)]
+pub struct RenderTiming {
+    /// The collection's registry id: config-bounded, never a raw layer name.
+    pub collection: String,
+    pub outcome: RenderOutcome,
+    pub elapsed: Duration,
+}
+
+impl RenderTiming {
+    /// The latency of a render block that began at `start`.
+    pub fn since(collection: &str, outcome: RenderOutcome, start: Instant) -> Self {
+        Self {
+            collection: collection.to_owned(),
+            outcome,
+            elapsed: start.elapsed(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error("Server busy, try again later")]
