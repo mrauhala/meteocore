@@ -160,6 +160,7 @@ fn style_links(collection_id: &str, style_name: &str, root: &str) -> serde_json:
 /// service and the shared OGC API root (#789).
 pub(crate) fn collection_parts(
     config: &CollectionConfig,
+    engine: &dyn MapEngine,
     info: &ds_core::map_engine::RasterInfo,
     styles: Option<&HashMap<String, StyleInfo>>,
     root: &str,
@@ -226,6 +227,10 @@ pub(crate) fn collection_parts(
     fields.insert("dataType".into(), json!("map"));
     fields.insert("crs".into(), json!(crs_uris));
     fields.insert("styles".into(), json!(style_list));
+    // The valid `parameter-name` values of the map routes (#279).
+    if let Some(parameters) = api_common::parameter_names(info, |p| engine.parameter_times(p)) {
+        fields.insert(api_common::PARAMETER_NAMES.into(), parameters);
+    }
     // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
     // Engines label projected/rotated grids with internal names ("TM",
     // "LAEA", "projected", "rotated_ll", …) that have no URI; emitting CRS84
@@ -241,13 +246,14 @@ pub(crate) fn collection_parts(
 
 fn build_collection_metadata(
     config: &CollectionConfig,
+    engine: &dyn MapEngine,
     info: &ds_core::map_engine::RasterInfo,
     styles: Option<&HashMap<String, StyleInfo>>,
     map_tilesets: bool,
     base_url: &str,
     root: &str,
 ) -> serde_json::Value {
-    let (fields, access) = collection_parts(config, info, styles, root);
+    let (fields, access) = collection_parts(config, engine, info, styles, root);
     let mut links = vec![json!({
         "href": format!("{root}/collections/{}", config.id),
         "rel": "self",
@@ -436,7 +442,8 @@ pub(crate) fn collection_openapi_paths(
                     {"$ref": "#/components/parameters/transparent"},
                     {"$ref": "#/components/parameters/f"},
                     {"$ref": "#/components/parameters/bbox-crs"},
-                    {"$ref": "#/components/parameters/elevation"}
+                    {"$ref": "#/components/parameters/elevation"},
+                    {"$ref": "#/components/parameters/parameter-name"}
                 ],
                 "responses": {
                     "200": {
@@ -505,7 +512,8 @@ pub(crate) fn collection_openapi_paths(
                     {"$ref": "#/components/parameters/transparent"},
                     {"$ref": "#/components/parameters/f"},
                     {"$ref": "#/components/parameters/bbox-crs"},
-                    {"$ref": "#/components/parameters/elevation"}
+                    {"$ref": "#/components/parameters/elevation"},
+                    {"$ref": "#/components/parameters/parameter-name"}
                 ],
                 "responses": {
                     "200": {
@@ -669,7 +677,8 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "required": false,
                 "schema": {"type": "number"},
                 "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
-            }
+            },
+            "parameter-name": api_common::parameter_name_parameter()
         },
         "schemas": {
             "styleList": {
@@ -901,6 +910,7 @@ pub async fn collections(
             let info = engine.raster_info_shared();
             let metadata = build_collection_metadata(
                 config,
+                engine.as_ref(),
                 &info,
                 state.styles.get(&config.id),
                 state.map_tileset_ids.contains(&config.id),
@@ -947,6 +957,7 @@ pub async fn collection(
             let map_tilesets = state.map_tileset_ids.contains(&id);
             Json(build_collection_metadata(
                 config,
+                engine.as_ref(),
                 &info,
                 styles,
                 map_tilesets,
@@ -958,6 +969,7 @@ pub async fn collection(
         Wanted::Html => {
             let metadata = build_collection_metadata(
                 config,
+                engine.as_ref(),
                 &engine.raster_info_shared(),
                 state.styles.get(&id),
                 state.map_tileset_ids.contains(&id),

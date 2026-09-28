@@ -1654,6 +1654,72 @@ fn build_multi_param_router() -> axum::Router {
 }
 
 // ---------------------------------------------------------------------------
+// Parameter discovery (#279)
+// ---------------------------------------------------------------------------
+
+mod parameter_discovery {
+    use super::*;
+
+    /// The collection advertises the valid `parameter-name` values, in EDR's
+    /// `parameter_names` shape, sorted by name.
+    #[tokio::test]
+    async fn multi_parameter_collection_lists_its_parameters() {
+        let (status, json) = get_on(build_multi_param_router(), "/collections/wx").await;
+        assert_eq!(status, StatusCode::OK);
+        let parameters = json["parameter_names"].as_object().unwrap();
+        assert_eq!(parameters.keys().collect::<Vec<_>>(), ["10u", "2t"]);
+        let t2 = &parameters["2t"];
+        assert_eq!(t2["type"], "Parameter");
+        assert_eq!(t2["observedProperty"]["label"]["en"], "Temperature");
+        assert_eq!(t2["unit"]["symbol"]["value"], "°C");
+        assert_eq!(
+            parameters["10u"]["observedProperty"]["label"]["en"],
+            "U Wind"
+        );
+        assert!(
+            parameters["10u"].get("unit").is_none(),
+            "unknown unit omitted"
+        );
+
+        let (_, list) = get_on(build_multi_param_router(), "/collections").await;
+        assert_eq!(
+            list["collections"][0]["parameter_names"],
+            json["parameter_names"]
+        );
+    }
+
+    /// A single-parameter collection ignores `parameter-name`: nothing to list.
+    #[tokio::test]
+    async fn single_parameter_collection_lists_no_parameters() {
+        let (status, json) = get("/collections/radar").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.get("parameter_names").is_none());
+    }
+
+    /// Both render routes declare the selector they accept.
+    #[tokio::test]
+    async fn render_routes_declare_parameter_name() {
+        let (_, api) = get_on(build_multi_param_router(), "/api").await;
+        assert_eq!(
+            api["components"]["parameters"]["parameter-name"]["name"],
+            "parameter-name"
+        );
+        for path in [
+            "/maps/collections/wx/map",
+            "/maps/collections/wx/styles/{styleId}/map",
+        ] {
+            let parameters = api["paths"][path]["get"]["parameters"].as_array().unwrap();
+            assert!(
+                parameters
+                    .iter()
+                    .any(|p| p["$ref"] == "#/components/parameters/parameter-name"),
+                "{path}: {parameters:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Styled map tests
 // ---------------------------------------------------------------------------
 
@@ -2939,5 +3005,29 @@ mod per_parameter_times {
         assert_eq!(status(&app, &URI("b", 1, Some(T2))).await, StatusCode::OK);
         assert!(renders(&engine).len() > rendered);
         assert_eq!(last(&engine), (Some("b".into()), Some(t(T1))));
+    }
+
+    /// Each parameter advertises its own time axis next to the collection's
+    /// union (#279), so a client knows `b` ends a timestep earlier.
+    #[tokio::test]
+    async fn parameters_advertise_their_own_time_axis() {
+        let app = build_router_with_engine(Arc::new(Engine::default()));
+        let (status, json) = get_on(app, "/collections/radar").await;
+        assert_eq!(status, StatusCode::OK);
+        let rfc3339 = |s: &str| t(s).to_rfc3339();
+        let interval =
+            |p: &str| json["parameter_names"][p]["extent"]["temporal"]["interval"].clone();
+        assert_eq!(
+            json["extent"]["temporal"]["interval"],
+            serde_json::json!([[rfc3339(T0), rfc3339(T2)]])
+        );
+        assert_eq!(
+            interval("a"),
+            serde_json::json!([[rfc3339(T0), rfc3339(T2)]])
+        );
+        assert_eq!(
+            interval("b"),
+            serde_json::json!([[rfc3339(T0), rfc3339(T1)]])
+        );
     }
 }

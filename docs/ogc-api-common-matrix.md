@@ -90,6 +90,16 @@ collections. A collection only Features serves is `dataType: vector` with CRS84
 `storageCrs` unlabelled, and discovery follows the advertised extent. No Common
 class changes; the shared root's Common behaviour is otherwise unchanged.
 
+Parameter discovery (2026-09-28, [#279](https://github.com/mrauhala/meteocore/issues/279)):
+a multi-parameter raster's Maps and Tiles collection descriptions, on the
+per-API services and the shared root alike, carry EDR's `parameter_names`
+member: `Parameter` objects keyed by the valid `parameter-name` values, with
+label and, when known, unit. A parameter on its own time axis adds its own
+`extent.temporal` in the Common shape of the collection's extent, which is the
+union. Every map and map-tile render route declares `parameter-name` in
+OpenAPI. The member is an extension borrowed from EDR, not a Maps, Tiles or
+Common requirement; no conformance classes change.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a

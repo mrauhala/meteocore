@@ -276,6 +276,12 @@ pub(crate) fn collection_parts(
         fields.insert("tileMatrixSetLinks".into(), json!(tms_links));
     }
     fields.insert("styles".into(), json!(style_list));
+    // The valid `parameter-name` values of the map tile routes (#279).
+    if let (Some(info), Some(engine)) = (raster_info, sources.map_engine) {
+        if let Some(parameters) = api_common::parameter_names(info, |p| engine.parameter_times(p)) {
+            fields.insert(api_common::PARAMETER_NAMES.into(), parameters);
+        }
+    }
     // No `itemType`: OGC API – Common – Part 2 §7.13 defines it as describing
     // the items reachable at /collections/{id}/items, which tiles are not.
     // Emitting it (even "feature" for vector collections) would be an
@@ -597,9 +603,10 @@ pub(crate) fn collection_openapi_paths(
             );
         }
 
-        collection_paths[format!(
+        let tile_path = format!(
             "{m}/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
-        )] = json!({
+        );
+        collection_paths[&tile_path] = json!({
             "get": {
                 "summary": format!("Get tile for {}", config.title),
                 "operationId": format!("getTile_{id}"),
@@ -649,6 +656,14 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
+        // Only map tiles render a selected parameter.
+        if has_raster {
+            if let Some(parameters) =
+                collection_paths[&tile_path]["get"]["parameters"].as_array_mut()
+            {
+                parameters.push(json!({"$ref": "#/components/parameters/parameter-name"}));
+            }
+        }
 
         // Legends describe a raster style's palette — vector-only collections
         // have no styles registry entry and the route would 404, so only
@@ -697,6 +712,7 @@ pub(crate) fn collection_openapi_paths(
                         },
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/elevation"},
+                        {"$ref": "#/components/parameters/parameter-name"},
                         {
                             "name": "f",
                             "in": "query",
@@ -844,7 +860,8 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "required": false,
                 "schema": {"type": "number"},
                 "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
-            }
+            },
+            "parameter-name": api_common::parameter_name_parameter()
         },
         "schemas": {
             "legend": {
@@ -1138,6 +1155,8 @@ pub async fn collection(
 pub(crate) struct TileSources<'a> {
     pub(crate) config: &'a CollectionConfig,
     pub(crate) raster_info: Option<Arc<ds_core::map_engine::RasterInfo>>,
+    /// The map engine `raster_info` is a snapshot of.
+    map_engine: Option<&'a dyn MapEngine>,
     pub(crate) has_vector: bool,
     feature_extent: Option<[f64; 4]>,
     feature_time: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
@@ -1187,11 +1206,9 @@ impl TileSources<'_> {
 }
 
 /// A configured collection's tile sources, or `None` when it serves no tiles.
-fn sources_for<'a>(state: &TilesState, config: &'a CollectionConfig) -> Option<TileSources<'a>> {
-    let raster_info = state
-        .map_engines
-        .get(&config.id)
-        .map(|e| e.raster_info_shared());
+fn sources_for<'a>(state: &'a TilesState, config: &'a CollectionConfig) -> Option<TileSources<'a>> {
+    let map_engine = state.map_engines.get(&config.id).map(|e| e.as_ref());
+    let raster_info = map_engine.map(|e| e.raster_info_shared());
     let feature = state.feature_engines.get(&config.id);
     if raster_info.is_none() && feature.is_none() {
         return None;
@@ -1199,6 +1216,7 @@ fn sources_for<'a>(state: &TilesState, config: &'a CollectionConfig) -> Option<T
     Some(TileSources {
         config,
         raster_info,
+        map_engine,
         has_vector: feature.is_some(),
         feature_extent: feature.and_then(|e| e.spatial_extent()),
         feature_time: feature.and_then(|e| e.temporal_extent()),
