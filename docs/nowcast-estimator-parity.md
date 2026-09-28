@@ -114,6 +114,29 @@ improves at one; centroid error is slightly worse. Few objects and a 20 km
 matching gate make class POD=1 uninformative as a general quality claim.
 A broader convective dataset is still required before estimator/model changes.
 
+### After the #651 estimator refinements
+
+Sub-pixel refinement, unsmoothed measured vectors and the local outlier gate
+change both arms, because they live in the shared block matcher. The tables
+above are the pre-#651 record. Production pixel CSI, before → after, same
+commands; `testdata/radar` is the committed five-frame float dBZ fixture,
+run with `--max-lead 3` and no decode overrides:
+
+```text
+fixture / lead      10 dBZ         20 dBZ         35 dBZ
+April +1            0.641→0.652    0.587→0.595    0.075→0.075
+July-8 +1           0.781→0.785    0.699→0.706    0.264→0.273
+July-8 +2           0.721→0.725    0.635→0.642    0.191→0.194
+July-8 +3           0.675→0.676    0.587→0.590    0.183→0.167
+radar +1            0.798→0.804    0.662→0.674    0.506→0.506
+radar +2            0.726→0.733    0.543→0.559    0.381→0.374
+radar +3            0.669→0.675    0.464→0.483    0.311→0.280
+```
+
+10 and 20 dBZ improve at every lead. 35 dBZ is mixed, and radar +3 is a
+single forecast. All 25 July frames, +1 to +6: 10/20 dBZ improve at every
+lead, 35 dBZ moves within ±0.01.
+
 ## Automated regression coverage
 
 - Irregular pair intervals preserve velocity in the last interval's units.
@@ -123,6 +146,9 @@ A broader convective dataset is still required before estimator/model changes.
 - Elongated working grids remain within the pixel budget.
 - Three successive live generations, including a skipped frame, expose the
   same EDR motion field as the harness helper, at the API's served precision.
+- A 3.3/−2.6 px shift of a smooth echo is recovered within 0.1 px (#651).
+- A measured block at an echo edge keeps its vector through fill/smoothing.
+- A minority region moving against the majority flow stays measured.
 
 ## Fixture SHA-256
 

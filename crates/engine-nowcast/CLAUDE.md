@@ -59,6 +59,20 @@ reason `MapEngine::resolve_reference_time` exists (#521).
      `EMA_ALPHA_FILLED = 0.4`; auto-skipped when the block grid changes).
   Weakening either brings the between-generation oscillation back —
   verify with an animation loop, not stills.
+- **Estimator refinements (#651)**, each gated on `skill_spike`:
+  - Per-axis 3-point parabolic fit on the SAD surface, clamped to ±0.5 px.
+    SAD is V-shaped, not parabolic, and per-axis fitting ignores the cross
+    term, so textured echo keeps ~0.2–0.3 px of bias; a 2-D quadratic fit
+    was measured and was no better.
+  - Measured vectors are never box-smoothed; smoothing touches filled
+    blocks only. That only pays together with the sub-pixel fit — without
+    it, unsmoothed integer vectors cost 35 dBZ skill on `testdata/radar`.
+  - The outlier gate is local: median/MAD of the 30 nearest measured blocks
+    (`outlier_neighbours`), 2 px floor. Near-neutral on the fixtures; it
+    exists so a differently steered region survives.
+  - Clamping sub-`min_echo` pixels before matching was measured and NOT
+    shipped: worse on every fixture, as weak echo carries motion too.
+    Clamping at 0 dBZ was mixed.
 
 ## Memory sizing (retention multiplies!)
 
