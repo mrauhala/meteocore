@@ -31,6 +31,13 @@ pub struct StyleSpec<'a> {
     pub max: Option<f64>,
 }
 
+/// A resolved named style with the parameter layers its `parameters` list
+/// limits it to (empty when it has no list).
+struct NamedStyle {
+    info: StyleInfo,
+    layers: Vec<String>,
+}
+
 /// A resolved colormap: the render-ready (possibly integer-LUT-wrapped)
 /// colormap, the palette it was built from (stops for legends), and the
 /// effective value range.
@@ -180,8 +187,9 @@ impl StyleContext {
     }
 
     /// All styles for a collection's base layer: `default` plus named
-    /// styles (bundle extras when a bundle is bound, else inline
-    /// `[[wms.styles]]`).
+    /// styles (bundle extras and inline `[[wms.styles]]`). A style limited
+    /// to parameter layers by a `parameters` list is not offered here: the
+    /// base layer has no single parameter to draw it on.
     pub fn collection_styles(
         &self,
         collection: &CollectionConfig,
@@ -203,9 +211,24 @@ impl StyleContext {
             },
         );
 
-        // Named styles: union of bundle extras and inline [[wms.styles]]
-        // (bundles v2) — inline wins on a name clash because it is inserted
-        // second into the same map.
+        for (name, named) in self.named_styles(collection, bundle)? {
+            if named.layers.is_empty() {
+                styles.insert(name, named.info);
+            }
+        }
+
+        Ok(styles)
+    }
+
+    /// Named styles: the union of bundle extras and inline `[[wms.styles]]`
+    /// (bundles v2), inline winning a name clash because it is inserted
+    /// second into the same map. Each keeps its `parameters` list.
+    fn named_styles(
+        &self,
+        collection: &CollectionConfig,
+        bundle: Option<&StyleBundle>,
+    ) -> Result<HashMap<String, NamedStyle>, String> {
+        let mut styles = HashMap::new();
         if let Some(bundle) = bundle {
             for extra in &bundle.extras {
                 // Name defaults to the colormap reference (validated to
@@ -227,14 +250,17 @@ impl StyleContext {
                     .unwrap_or_else(|| name.clone());
                 styles.insert(
                     name.clone(),
-                    StyleInfo {
-                        name,
-                        title,
-                        colormap: r.colormap,
-                        palette: r.palette,
-                        min: r.min,
-                        max: r.max,
-                        parameter: extra.parameter.clone(),
+                    NamedStyle {
+                        info: StyleInfo {
+                            name,
+                            title,
+                            colormap: r.colormap,
+                            palette: r.palette,
+                            min: r.min,
+                            max: r.max,
+                            parameter: extra.parameter.clone(),
+                        },
+                        layers: extra.parameters.clone(),
                     },
                 );
             }
@@ -257,14 +283,17 @@ impl StyleContext {
                     .unwrap_or_else(|| name.clone());
                 styles.insert(
                     name.clone(),
-                    StyleInfo {
-                        name,
-                        title,
-                        colormap: r.colormap,
-                        palette: r.palette,
-                        min: r.min,
-                        max: r.max,
-                        parameter: style_config.parameter.clone(),
+                    NamedStyle {
+                        info: StyleInfo {
+                            name,
+                            title,
+                            colormap: r.colormap,
+                            palette: r.palette,
+                            min: r.min,
+                            max: r.max,
+                            parameter: style_config.parameter.clone(),
+                        },
+                        layers: style_config.parameters.clone(),
                     },
                 );
             }
@@ -277,7 +306,8 @@ impl StyleContext {
     /// multi-parameter engines. Each parameter's default style uses its
     /// `[[wms.parameters]]` entry when configured, else the collection
     /// default; named styles are shared, except styles tagged with a
-    /// specific `parameter`, which are scoped to that layer only.
+    /// specific `parameter` or a `parameters` list, which are offered only
+    /// on the layers they name.
     ///
     /// `wrap` lets the caller decorate a parameter's colormaps (the server
     /// wraps the ODIM CELLS overlay sentinel there — engine-specific logic
@@ -293,7 +323,7 @@ impl StyleContext {
     ) -> Result<HashMap<String, HashMap<String, StyleInfo>>, String> {
         let mut out = HashMap::new();
 
-        let shared_named_styles = self.collection_styles(collection, bundle)?;
+        let shared_named_styles = self.named_styles(collection, bundle)?;
 
         // Per-parameter chain (bundles v2 + parameter defaults #320), each
         // slot resolved independently, first level that defines it wins:
@@ -382,19 +412,27 @@ impl StyleContext {
                 },
             );
 
-            for (name, style) in &shared_named_styles {
+            for (name, named) in &shared_named_styles {
                 if name == "default" {
-                    continue;
+                    continue; // rejected by validation; never replace the layer default
                 }
-                if let Some(p) = style.parameter.as_deref() {
-                    if p != short_name {
-                        continue;
-                    }
+                let style = &named.info;
+                let offered = if named.layers.is_empty() {
+                    style.parameter.as_deref().is_none_or(|p| p == short_name)
+                } else {
+                    named.layers.iter().any(|p| p == short_name)
+                };
+                if !offered {
+                    continue;
                 }
                 layer_styles.insert(
                     name.clone(),
                     StyleInfo {
                         colormap: wrap(short_name, style.colormap.clone()),
+                        parameter: style
+                            .parameter
+                            .clone()
+                            .or_else(|| (!named.layers.is_empty()).then(|| short_name.clone())),
                         ..style.clone()
                     },
                 );
@@ -1234,5 +1272,111 @@ mod tests {
         );
         assert!(wrapped_for.contains(&"DBZH".to_string()));
         assert!(wrapped_for.contains(&"VRADH".to_string()));
+    }
+
+    fn params(names: &[&str]) -> Vec<ds_core::map_engine::ParameterInfo> {
+        names
+            .iter()
+            .map(|n| ds_core::map_engine::ParameterInfo {
+                name: n.to_string(),
+                title: n.to_string(),
+                unit: String::new(),
+            })
+            .collect()
+    }
+
+    fn style_names(styles: &HashMap<String, StyleInfo>) -> Vec<&str> {
+        let mut names: Vec<&str> = styles.keys().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
+    /// A `parameters` list offers one named style on several parameter
+    /// layers (one temperature palette on `t` and `2t`) and on no other
+    /// layer. It stays off the base layer, which has no single parameter to
+    /// draw; a `parameter` tag and an untagged style keep their scopes.
+    #[test]
+    fn style_parameters_list_offers_one_style_on_several_layers() {
+        let ctx = StyleContext::with_builtins();
+        let c = coll(
+            r#"
+            colormap = "viridis"
+            [[wms.styles]]
+            name = "warm"
+            colormap = "temperature"
+            min = -40.0
+            max = 50.0
+            parameters = ["t", "2t"]
+            [[wms.styles]]
+            name = "gray-msl"
+            colormap = "grayscale"
+            parameter = "msl"
+            [[wms.styles]]
+            name = "shared"
+            colormap = "viridis"
+            "#,
+        );
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params(&["t", "2t", "msl"]), &|_, cm| cm)
+            .unwrap();
+        assert_eq!(style_names(&maps["c1/t"]), ["default", "shared", "warm"]);
+        assert_eq!(style_names(&maps["c1/2t"]), ["default", "shared", "warm"]);
+        assert_eq!(
+            style_names(&maps["c1/msl"]),
+            ["default", "gray-msl", "shared"]
+        );
+        let warm = &maps["c1/2t"]["warm"];
+        assert_eq!(warm.palette.name, "temperature");
+        assert_eq!((warm.min, warm.max), (-40.0, 50.0));
+        assert_eq!(warm.parameter.as_deref(), Some("2t"));
+        assert_eq!(maps["c1/t"]["warm"].parameter.as_deref(), Some("t"));
+
+        let base = ctx.collection_styles(&c, None).unwrap();
+        assert_eq!(style_names(&base), ["default", "gray-msl", "shared"]);
+    }
+
+    /// The point of the list: one bundle carries a style for every model's
+    /// temperature names, and a collection attaching it gets the style on
+    /// whichever of those layers it has. An inline style of the same name
+    /// replaces the extra, scope included.
+    #[test]
+    fn bundle_extra_parameters_list_reaches_each_named_layer() {
+        let ctx = StyleContext::with_builtins();
+        let b = bundle(
+            r#"
+            id = "temperature"
+            [default]
+            colormap = "temperature"
+            [[extras]]
+            name = "fmi"
+            colormap = "grayscale"
+            parameters = ["t", "2t", "TMP"]
+            "#,
+        );
+        let gfs = coll(r#"style_bundle = "temperature""#);
+        let maps = ctx
+            .parameter_layer_styles(&gfs, Some(&b), &params(&["TMP", "PRMSL"]), &|_, cm| cm)
+            .unwrap();
+        assert_eq!(style_names(&maps["c1/TMP"]), ["default", "fmi"]);
+        assert_eq!(style_names(&maps["c1/PRMSL"]), ["default"]);
+
+        let overridden = coll(
+            r#"
+            style_bundle = "temperature"
+            [[wms.styles]]
+            name = "fmi"
+            colormap = "viridis"
+            "#,
+        );
+        let maps = ctx
+            .parameter_layer_styles(
+                &overridden,
+                Some(&b),
+                &params(&["TMP", "PRMSL"]),
+                &|_, cm| cm,
+            )
+            .unwrap();
+        assert_eq!(maps["c1/PRMSL"]["fmi"].palette.name, "viridis");
+        assert_eq!(maps["c1/TMP"]["fmi"].palette.name, "viridis");
     }
 }

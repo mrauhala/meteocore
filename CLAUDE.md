@@ -805,7 +805,11 @@ Rules:
   (same fields as `[[wms.parameters]]`; names must be unique per bundle).
 - Inside a bundle, an `[[style_bundles.extras]]` entry with a `parameter`
   field is scoped to that parameter's layer only; untagged extras are shared
-  across every parameter layer.
+  across every parameter layer. A `parameters = [...]` list, in extras and
+  in `[[wms.styles]]`, scopes one style to several parameter layers and
+  keeps it off the base layer; `parameter` and `parameters` are mutually
+  exclusive. Style names are unique per collection, so the list is how one
+  shared bundle offers a style on every model's temperature layers.
 - Hot reload (`POST /admin/collections/reload`) picks up added/removed/changed
   files. The optional filesystem watcher and its trust model are documented in
   `crates/server/CLAUDE.md`.
