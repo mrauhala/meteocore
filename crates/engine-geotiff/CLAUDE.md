@@ -44,11 +44,12 @@ apply here.
 ## Decode admission
 
 `MC_GEOTIFF_DECODE_MEMORY_MB` (default 1024; 0 rejects cold decodes) bounds
-transient local/remote GeoTIFF decoding across collections and APIs. Local
-cache hits bypass it; cache retention has its own budget. Local misses reserve
-native output plus the decoder’s capped 64 MiB intermediate buffer. Remote
-reservations include bounded raw output and boxed samples and stay owned until
-parallel tile assembly releases them. Exhaustion propagates as HTTP 503, never
+transient local/remote GeoTIFF decoding across collections and APIs.
+Decoded-chunk cache hits bypass it; cache retention has its own budget. Local
+misses reserve native output plus the decoder’s capped 64 MiB intermediate
+buffer. Remote reservations include the encoded input, bounded raw output and
+the one-band native tile, and stay owned until parallel tile assembly releases
+them. Exhaustion propagates as HTTP 503, never
 as transparent pixels or an error image. This is separate from render output
 admission and does not cover other engines or the final source-window buffer.
 A full-resolution map window has its own source-pixel cap,
@@ -61,16 +62,23 @@ budget and its client-visible failure.
   sources only** — local files get compressed bytes free from the mmap/page
   cache.
 - **Rendered image cache** (default 512 MB) shared across WMS/Maps/Tiles.
-- **Decoded-chunk cache (#463):** process-global byte-bounded LRU of
-  *decoded* native source tiles for **local** files
-  (`MC_GEOTIFF_DECODED_CHUNK_CACHE_MB`, default 512, 0 disables). The WMS
-  meta-tile loop renders one viewport as ~50–190 independent
-  `get_raster_tile` calls whose covering source tiles overlap; without the
-  memo each source tile is LZW/DEFLATE-decoded ~6× per frame. Keyed
-  `(path, mtime, size, inode, ifd, chunk)` — inode included because
-  mtime+size alone miss a same-size same-second atomic rename (#253) — so a
-  replacement can't serve stale pixels. Band extraction + nodata +
-  scale/offset are applied at copy time for the intersecting window only.
+- **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of
+  *decoded* native source tiles for local files **and** remote COGs
+  (`MC_GEOTIFF_DECODED_CHUNK_CACHE_MB`, default 512, 0 disables; one shared
+  budget). The WMS meta-tile loop renders one viewport as ~50–190
+  independent `get_raster_tile` calls whose covering source tiles overlap;
+  without the memo each source tile is LZW/DEFLATE-decoded 4–8× per frame.
+  Local keys are `(path, mtime, size, inode, ifd, chunk)` — inode included
+  because mtime+size alone miss a same-size same-second atomic rename
+  (#253) — so a replacement can't serve stale pixels. Remote keys are
+  `(path, TileCache namespace, band, ifd, chunk)`: path-immutable like the
+  compressed cache, per engine, one band only (a 2-band OPERA Float32 tile
+  is 1 MB). Remote reads are deliberately NOT single-flight: a fill includes
+  the range fetch, and a fetch-pool worker must not wait on another
+  request's I/O. Nodata + scale/offset (and a local chunk's band
+  extraction) are applied at copy time for the intersecting window only.
+  Warm OPERA full-viewport renders fell from 124–235 ms to 53–82 ms
+  (`docs/performance/geotiff-remote-decode.md`).
 - Remote bbox reads can coalesce nearby compressed cache misses with
   `MC_COG_RANGE_BATCH_TILES` (default **1: disabled**, clamped 1–16). An
   opt-in batch is capped at 1 MiB, 4 KiB per gap and 10% total overfetch.

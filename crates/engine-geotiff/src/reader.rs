@@ -247,10 +247,11 @@ impl DataSource {
         }
     }
 
-    /// Scope for the process-global decoded-chunk cache (#463): local files
-    /// only — they have a stable path + content identity (captured at mmap
-    /// time). `InMemory` fallbacks decode uncached (no stable identity), and
-    /// the remote paths never reach the local decoder.
+    /// Scope for the process-global decoded-chunk cache (#463) on the local
+    /// decoder path: local files have a stable path + content identity
+    /// (captured at mmap time). `InMemory` fallbacks decode uncached (no
+    /// stable identity); remote reads key by their engine's tile-cache
+    /// namespace instead (`remote_scope`, #468).
     fn decoded_cache_scope(
         &self,
     ) -> Result<Option<crate::decoded_cache::FileScope>, DataServerError> {
@@ -274,20 +275,26 @@ fn decode_limits() -> tiff::decoder::Limits {
     limits
 }
 
-/// Keep remote decode reservations until parallel tile assembly drops the
-/// decoded values, not merely until decompression returns.
-struct DecodedTile {
-    values: Vec<Option<f64>>,
-    _permit: Permit,
+/// One remote source tile, ready for the window copy: the engine's band as
+/// native samples, padded to the full tile width, shared with the
+/// decoded-chunk cache (#468). `chunk` is `None` for an all-nodata tile (an
+/// empty tile, or a read that failed its retries). A decode keeps its
+/// reservation until parallel tile assembly drops the tile, not merely until
+/// decompression returns; a decoded-cache hit holds none, like a local hit.
+struct RemoteTile {
+    chunk: Option<Arc<DecodingResult>>,
+    _permit: Option<Permit>,
 }
 
-impl std::ops::Deref for DecodedTile {
-    type Target = [Option<f64>];
-    fn deref(&self) -> &Self::Target {
-        &self.values
-    }
+impl RemoteTile {
+    const NODATA: RemoteTile = RemoteTile {
+        chunk: None,
+        _permit: None,
+    };
 }
 
+/// `(raw, reservation)`: the decompressed size of one tile (all bands), and
+/// the decode reservation for that buffer plus the one-band native output.
 fn remote_decode_size(
     info: &RemoteTileInfo,
     samples_per_pixel: u32,
@@ -298,7 +305,7 @@ fn remote_decode_size(
         .and_then(|n| n.checked_mul(info.sample_type.bytes_per_sample()));
     let bytes = raw.filter(|&n| n <= MAX_DECODED_TILE_BYTES).and_then(|n| {
         pixels?
-            .checked_mul(std::mem::size_of::<Option<f64>>())?
+            .checked_mul(info.sample_type.bytes_per_sample())?
             .checked_add(n + 1)
     });
     match (raw, bytes) {
@@ -1069,17 +1076,17 @@ fn undo_horizontal_predictor(data: &mut [u8], tile_width: u32, bytes_per_sample:
     }
 }
 
-/// Decode a raw (decompressed) tile into Vec<Option<f64>> values.
-/// For multi-band files, `band_index` selects which band (0-based).
-fn decode_raw_tile_f64(
+/// Extract one band of a raw (decompressed, predictor-undone) little-endian
+/// tile into a native one-band chunk. Nodata mapping and scale/offset are
+/// left to the window copy, so the cached chunk serves any window (#468).
+fn decode_raw_band(
     raw: &[u8],
-    tile_info: &RemoteTileInfo,
-    metadata: &TiffMetadata,
+    sample_type: SampleType,
+    samples_per_pixel: usize,
     band_index: usize,
-) -> Result<Vec<Option<f64>>, DataServerError> {
-    let bps = tile_info.sample_type.bytes_per_sample();
-    let spp = metadata.samples_per_pixel as usize;
-    let sample_stride = bps * spp; // bytes per pixel (all bands)
+) -> Result<DecodingResult, DataServerError> {
+    let bps = sample_type.bytes_per_sample();
+    let sample_stride = bps * samples_per_pixel; // bytes per pixel (all bands)
     let band_byte_offset = band_index * bps;
 
     // Validate buffer is large enough for at least one pixel
@@ -1103,86 +1110,52 @@ fn decode_raw_tile_f64(
         }
     }
 
-    let mut values = Vec::with_capacity(pixel_count);
-
-    match tile_info.sample_type {
-        SampleType::U8 => {
-            for i in 0..pixel_count {
-                let v = raw[i * spp + band_index];
-                let fv = v as f64;
-                if metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
-            }
-        }
+    let samples = raw
+        .chunks_exact(sample_stride)
+        .map(|pixel| &pixel[band_byte_offset..band_byte_offset + bps]);
+    Ok(match sample_type {
+        SampleType::U8 => DecodingResult::U8(samples.map(|b| b[0]).collect()),
         SampleType::U16 => {
-            for i in 0..pixel_count {
-                let off = i * sample_stride + band_byte_offset;
-                let v = u16::from_le_bytes([raw[off], raw[off + 1]]);
-                let fv = v as f64;
-                if metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
-            }
+            DecodingResult::U16(samples.map(|b| u16::from_le_bytes([b[0], b[1]])).collect())
         }
         SampleType::I16 => {
-            for i in 0..pixel_count {
-                let off = i * sample_stride + band_byte_offset;
-                let v = i16::from_le_bytes([raw[off], raw[off + 1]]);
-                let fv = v as f64;
-                if metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
-            }
+            DecodingResult::I16(samples.map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
         }
-        SampleType::F32 => {
-            for i in 0..pixel_count {
-                let off = i * sample_stride + band_byte_offset;
-                let v = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
-                let fv = v as f64;
-                if v.is_nan() || metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
-            }
-        }
-        SampleType::F64 => {
-            for i in 0..pixel_count {
-                let off = i * sample_stride + band_byte_offset;
-                let v = f64::from_le_bytes([
-                    raw[off],
-                    raw[off + 1],
-                    raw[off + 2],
-                    raw[off + 3],
-                    raw[off + 4],
-                    raw[off + 5],
-                    raw[off + 6],
-                    raw[off + 7],
-                ]);
-                if v.is_nan() || metadata.is_nodata_raw(v) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(v)));
-                }
-            }
-        }
-    }
+        SampleType::F32 => DecodingResult::F32(
+            samples
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        ),
+        SampleType::F64 => DecodingResult::F64(
+            samples
+                .map(|b| f64::from_le_bytes(b.try_into().expect("8-byte sample")))
+                .collect(),
+        ),
+    })
+}
 
-    Ok(values)
+/// Decoded-chunk cache scope for a remote object read through `cache`'s
+/// engine (#468). `None` without a tile cache: nothing names the namespace.
+fn remote_scope(
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+) -> Option<crate::decoded_cache::FileScope> {
+    cache.map(|c| {
+        crate::decoded_cache::FileScope::remote(
+            file_path.to_string_lossy().as_ref(),
+            c.namespace(),
+            band_index,
+        )
+    })
 }
 
 /// Read and decode a tile from a remote source via byte-range read.
-/// If a tile cache is provided, checks it first and stores fetched tiles in it.
+/// If a tile cache is provided, the decoded chunk is looked up first, then the
+/// compressed bytes, and both store what they miss.
 /// `band_index` selects which band (0-based) for multi-band files.
 #[allow(clippy::too_many_arguments)]
-fn read_remote_chunk_f64(
+fn read_remote_chunk(
     store: &ds_storage::DataStore,
     obj_path: &ds_storage::object_store::path::Path,
     tile_info: &RemoteTileInfo,
@@ -1195,12 +1168,13 @@ fn read_remote_chunk_f64(
     // Runtime handle to drive the fetch on when called from a non-Tokio
     // (rayon) thread; `None` for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<DecodedTile, DataServerError> {
-    read_encoded_chunk_f64(
+) -> Result<RemoteTile, DataServerError> {
+    read_encoded_chunk(
         tile_info,
         metadata,
         chunk_index,
         cache,
+        remote_scope(cache, file_path, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -1215,21 +1189,23 @@ fn read_remote_chunk_f64(
 }
 
 /// Shared decoder/cache path for individual and coalesced remote ranges.
+/// `cache` is the compressed cache this function checks itself (`None` when
+/// the caller's `fetch_range` does); `decoded` is the decoded-chunk scope.
 #[allow(clippy::too_many_arguments)]
-fn read_encoded_chunk_f64(
+fn read_encoded_chunk(
     tile_info: &RemoteTileInfo,
     metadata: &TiffMetadata,
     chunk_index: u32,
     cache: Option<&crate::cache::TileCache>,
+    decoded: Option<&crate::decoded_cache::FileScope>,
     file_path: &Path,
     band_index: usize,
     ifd_index: u16,
     fetch_range: &impl Fn(std::ops::Range<usize>) -> Result<Bytes, DataServerError>,
-) -> Result<DecodedTile, DataServerError> {
+) -> Result<RemoteTile, DataServerError> {
     let idx = chunk_index as usize;
     let (raw_size, bytes, offset, byte_count) =
         remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
-    let permit = BUDGET.reserve(bytes)?;
 
     if byte_count == 0 {
         // Empty tile — return all nodata.
@@ -1240,12 +1216,19 @@ fn read_encoded_chunk_f64(
             idx,
             offset
         );
-        let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
-        return Ok(DecodedTile {
-            values: vec![None; pixel_count],
-            _permit: permit,
+        return Ok(RemoteTile::NODATA);
+    }
+
+    // The WMS meta-tile loop decodes each hot tile several times per frame:
+    // a decoded hit skips the compressed lookup, decompression and admission.
+    if let Some(chunk) = decoded.and_then(|d| crate::decoded_cache::get(d, ifd_index, chunk_index))
+    {
+        return Ok(RemoteTile {
+            chunk: Some(chunk),
+            _permit: None,
         });
     }
+    let permit = BUDGET.reserve(bytes)?;
 
     // Sanity check: offset 0 for a non-first tile is suspicious (likely truncated header)
     if offset == 0 && idx > 0 {
@@ -1304,9 +1287,18 @@ fn read_encoded_chunk_f64(
         );
     }
 
-    Ok(DecodedTile {
-        values: decode_raw_tile_f64(&raw, tile_info, metadata, band_index)?,
-        _permit: permit,
+    let chunk = Arc::new(decode_raw_band(
+        &raw,
+        tile_info.sample_type,
+        metadata.samples_per_pixel as usize,
+        band_index,
+    )?);
+    if let Some(decoded) = decoded {
+        crate::decoded_cache::insert(decoded, ifd_index, chunk_index, Arc::clone(&chunk));
+    }
+    Ok(RemoteTile {
+        chunk: Some(chunk),
+        _permit: Some(permit),
     })
 }
 
@@ -1373,9 +1365,9 @@ fn read_http_range(
 }
 
 /// Read and decode a tile from an HTTP source via byte-range read (reqwest).
-/// Mirrors `read_remote_chunk_f64` but uses `read_http_range` instead of object_store.
+/// Mirrors `read_remote_chunk` but uses `read_http_range` instead of object_store.
 #[allow(clippy::too_many_arguments)]
-fn read_http_chunk_f64(
+fn read_http_chunk(
     http: &reqwest::Client,
     url: &str,
     tile_info: &RemoteTileInfo,
@@ -1388,12 +1380,13 @@ fn read_http_chunk_f64(
     // Runtime handle for the fetch when on a non-Tokio (rayon) thread; `None`
     // for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<DecodedTile, DataServerError> {
-    read_encoded_chunk_f64(
+) -> Result<RemoteTile, DataServerError> {
+    read_encoded_chunk(
         tile_info,
         metadata,
         chunk_index,
         cache,
+        remote_scope(cache, file_path, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -1424,47 +1417,41 @@ pub fn read_pixel(
     // The row stride of the decoded tile depends on the source: the local
     // `tiff`-crate decode clips the rightmost tile column of its padding (stride
     // = clipped width), while the remote/HTTP path decodes the full padded raw
-    // tile (stride = tile_width). Indexing with the wrong stride reads a sheared
-    // pixel in the last tile column (#458).
-    let (values, tile_data_width) = match source {
+    // tile (stride = tile_width) of one band. Indexing with the wrong stride
+    // reads a sheared pixel in the last tile column (#458).
+    let tile = match source {
         DataSource::Remote {
             store,
             path,
             tile_info,
-        } => (
-            read_remote_chunk_f64(
-                store,
-                path,
-                tile_info,
-                metadata,
-                chunk_index,
-                cache,
-                file_path,
-                band_index,
-                0,    // full resolution IFD
-                None, // single-pixel read: caller is already on a runtime worker
-            )?,
-            metadata.tile_width as usize,
-        ),
+        } => read_remote_chunk(
+            store,
+            path,
+            tile_info,
+            metadata,
+            chunk_index,
+            cache,
+            file_path,
+            band_index,
+            0,    // full resolution IFD
+            None, // single-pixel read: caller is already on a runtime worker
+        )?,
         DataSource::HttpDirect {
             url,
             http,
             tile_info,
-        } => (
-            read_http_chunk_f64(
-                http,
-                url,
-                tile_info,
-                metadata,
-                chunk_index,
-                cache,
-                file_path,
-                band_index,
-                0,    // full resolution IFD
-                None, // single-pixel read: caller is already on a runtime worker
-            )?,
-            metadata.tile_width as usize,
-        ),
+        } => read_http_chunk(
+            http,
+            url,
+            tile_info,
+            metadata,
+            chunk_index,
+            cache,
+            file_path,
+            band_index,
+            0,    // full resolution IFD
+            None, // single-pixel read: caller is already on a runtime worker
+        )?,
         _ => {
             // Local/in-memory: read the decoded chunk (memoized for local
             // files, #463) and pull the single sample straight from the
@@ -1481,11 +1468,11 @@ pub fn read_pixel(
         }
     };
 
-    let local_idx = local_row as usize * tile_data_width + local_col as usize;
-    if local_idx >= values.len() {
+    let Some(chunk) = tile.chunk else {
         return Ok(None);
-    }
-    Ok(values[local_idx])
+    };
+    let sample_idx = local_row as usize * metadata.tile_width as usize + local_col as usize;
+    Ok(raw_sample_at(&chunk, sample_idx)?.and_then(|raw| raw_sample_to_value(raw, metadata)))
 }
 
 /// Default ceiling on concurrent remote-tile fetches when
@@ -1714,7 +1701,7 @@ pub fn read_bbox_overview(
                 row_end,
                 nx,
                 local_tile_data_width(&ov_metadata, tile_col),
-                band_index,
+                (ov_metadata.samples_per_pixel as usize, band_index),
             )?;
         }
     }
@@ -2087,7 +2074,7 @@ fn read_bbox_inner(
                 row_end,
                 nx,
                 local_tile_data_width(metadata, tile_col),
-                band_index,
+                (metadata.samples_per_pixel as usize, band_index),
             )?;
         }
     }
@@ -2100,7 +2087,7 @@ fn read_bbox_inner(
 /// failures and invalid tile-index arithmetic are fatal for the whole request.
 /// Other failed tile reads are replaced with all-nodata
 /// to allow partial rendering — a map with gaps is better than a 500 error.
-type TileFetchResult = (u32, u32, DecodedTile);
+type TileFetchResult = (u32, u32, RemoteTile);
 
 /// Retry a remote tile read up to 2 times with brief backoff.
 /// On final failure, logs at error level and returns all-nodata pixels.
@@ -2111,10 +2098,9 @@ fn read_remote_chunk_with_retry<F>(
     tile_row: u32,
     tile_col: u32,
     chunk_index: u32,
-    nodata_pixel_count: usize,
-) -> Result<DecodedTile, DataServerError>
+) -> Result<RemoteTile, DataServerError>
 where
-    F: Fn() -> Result<DecodedTile, DataServerError>,
+    F: Fn() -> Result<RemoteTile, DataServerError>,
 {
     ds_core::deadline::check()?;
     match read_fn() {
@@ -2160,26 +2146,20 @@ where
                 tile_col,
                 chunk_index
             );
-            let permit = BUDGET.reserve(
-                nodata_pixel_count
-                    .checked_mul(std::mem::size_of::<Option<f64>>())
-                    .ok_or(DataServerError::ResourceExhausted)?,
-            )?;
-            Ok(DecodedTile {
-                values: vec![None; nodata_pixel_count],
-                _permit: permit,
-            })
+            Ok(RemoteTile::NODATA)
         }
     }
 }
 
 /// Fetch cache misses in bounded nearby ranges for both remote transports.
+/// `decoded` is the decoded-chunk scope, checked before `cache`.
 #[allow(clippy::too_many_arguments)]
 fn read_bbox_tiles(
     coords: &[(u32, u32)],
     tile_info: &RemoteTileInfo,
     metadata: &TiffMetadata,
     cache: Option<&crate::cache::TileCache>,
+    decoded: Option<&crate::decoded_cache::FileScope>,
     file_path: &Path,
     band_index: usize,
     ifd_index: u16,
@@ -2207,7 +2187,8 @@ fn read_bbox_tiles(
         // Speculation must neither count a second hit/miss nor retain Bytes
         // across queueing (an evicted entry would then outlive its budget).
         let hit = batch_limit > 1
-            && cache.is_some_and(|c| c.contains_untracked(file_path, chunk, ifd_index));
+            && (decoded.is_some_and(|d| crate::decoded_cache::contains(d, ifd_index, chunk))
+                || cache.is_some_and(|c| c.contains_untracked(file_path, chunk, ifd_index)));
         if hit || count == 0 {
             jobs.push(Job::Single(i));
         } else {
@@ -2228,11 +2209,12 @@ fn read_bbox_tiles(
         let chunk = chunks[i];
         let data = read_remote_chunk_with_retry(
             || {
-                read_encoded_chunk_f64(
+                read_encoded_chunk(
                     tile_info,
                     metadata,
                     chunk,
                     None,
+                    decoded,
                     file_path,
                     band_index,
                     ifd_index,
@@ -2266,7 +2248,6 @@ fn read_bbox_tiles(
             row,
             col,
             chunk,
-            (metadata.tile_width * metadata.tile_height) as usize,
         )?;
         Ok((row, col, data))
     };
@@ -2354,6 +2335,7 @@ fn read_bbox_parallel(
         tile_info,
         metadata,
         cache,
+        remote_scope(cache, file_path, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -2368,30 +2350,49 @@ fn read_bbox_parallel(
         },
     )?;
 
-    // Assemble the result grid
-    let mut result = vec![None; total_pixels];
-    for (tile_row, tile_col, tile_data) in &tile_results {
-        copy_tile_to_result(
-            tile_data,
-            &mut result,
-            *tile_col,
-            *tile_row,
-            metadata,
-            col_start,
-            row_start,
-            col_end,
-            row_end,
-            nx,
-            // Remote path decodes the full padded raw tile → stride = tile_width.
-            metadata.tile_width as usize,
-        );
-    }
+    assemble_remote_tiles(
+        &tile_results,
+        metadata,
+        (col_start, row_start, col_end, row_end),
+        nx,
+        total_pixels,
+    )
+}
 
+/// Copy the fetched remote tiles into the source window. Each chunk is the
+/// full padded tile of one band (stride `tile_width`); an all-nodata tile
+/// leaves its pixels `None`.
+fn assemble_remote_tiles(
+    tiles: &[TileFetchResult],
+    metadata: &TiffMetadata,
+    (col_start, row_start, col_end, row_end): (u32, u32, u32, u32),
+    nx: usize,
+    total_pixels: usize,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let mut result = vec![None; total_pixels];
+    for (tile_row, tile_col, tile) in tiles {
+        if let Some(chunk) = &tile.chunk {
+            copy_raw_tile_to_result(
+                chunk,
+                &mut result,
+                *tile_col,
+                *tile_row,
+                metadata,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                nx,
+                metadata.tile_width as usize,
+                (1, 0),
+            )?;
+        }
+    }
     Ok(result)
 }
 
 /// Parallel tile fetching for HTTP direct data sources (reqwest).
-/// Mirrors `read_bbox_parallel` but uses `read_http_chunk_f64` instead of `read_remote_chunk_f64`.
+/// Mirrors `read_bbox_parallel` but fetches through `read_http_range` instead of object_store.
 #[allow(clippy::too_many_arguments)]
 fn read_bbox_parallel_http(
     http: &Arc<reqwest::Client>,
@@ -2424,6 +2425,7 @@ fn read_bbox_parallel_http(
         tile_info,
         metadata,
         cache,
+        remote_scope(cache, file_path, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -2432,25 +2434,13 @@ fn read_bbox_parallel_http(
         &|range| read_http_range(http, url, range, rt_handle.as_ref()),
     )?;
 
-    let mut result = vec![None; total_pixels];
-    for (tile_row, tile_col, tile_data) in &tile_results {
-        copy_tile_to_result(
-            tile_data,
-            &mut result,
-            *tile_col,
-            *tile_row,
-            metadata,
-            col_start,
-            row_start,
-            col_end,
-            row_end,
-            nx,
-            // HTTP path decodes the full padded raw tile → stride = tile_width.
-            metadata.tile_width as usize,
-        );
-    }
-
-    Ok(result)
+    assemble_remote_tiles(
+        &tile_results,
+        metadata,
+        (col_start, row_start, col_end, row_end),
+        nx,
+        total_pixels,
+    )
 }
 
 /// Row stride of a tile decoded by the local `tiff`-crate path
@@ -2468,61 +2458,11 @@ fn local_tile_data_width(metadata: &TiffMetadata, tile_col: u32) -> usize {
         .min(metadata.tile_width as u64) as usize
 }
 
-/// Copy pixels from a decoded tile into the output result grid.
-#[allow(clippy::too_many_arguments)]
-fn copy_tile_to_result(
-    tile_data: &[Option<f64>],
-    result: &mut [Option<f64>],
-    tile_col: u32,
-    tile_row: u32,
-    metadata: &TiffMetadata,
-    col_start: u32,
-    row_start: u32,
-    col_end: u32,
-    row_end: u32,
-    nx: usize,
-    // Row stride of `tile_data`. NOT always `tile_width`: the local `tiff`-crate
-    // decode path (`read_chunk`) returns edge tiles CLIPPED of their padding, so
-    // the rightmost tile column's rows are `min(tile_width, width - col0)` wide,
-    // not `tile_width`. Indexing such a buffer with a `tile_width` stride shears
-    // every row by the padding amount — invisible at full res (the data rarely
-    // lands in the last tile column) but a "venetian-blind" stripe block once an
-    // overview's edge tile carries real data (#458). The remote/HTTP path decodes
-    // the FULL padded raw tile, so it passes `tile_width`.
-    tile_data_width: usize,
-) {
-    let tile_pixel_col_start = tile_col * metadata.tile_width;
-    let tile_pixel_row_start = tile_row * metadata.tile_height;
-
-    let overlap_col_start = col_start.max(tile_pixel_col_start);
-    let overlap_col_end = col_end.min(tile_pixel_col_start + metadata.tile_width);
-    let overlap_row_start = row_start.max(tile_pixel_row_start);
-    let overlap_row_end = row_end.min(tile_pixel_row_start + metadata.tile_height);
-
-    for row in overlap_row_start..overlap_row_end {
-        for col in overlap_col_start..overlap_col_end {
-            let local_col = col - tile_pixel_col_start;
-            let local_row = row - tile_pixel_row_start;
-            let tile_idx = local_row as usize * tile_data_width + local_col as usize;
-
-            if tile_idx >= tile_data.len() {
-                continue;
-            }
-
-            let out_col = (col - col_start) as usize;
-            let out_row = (row - row_start) as usize;
-            let out_idx = out_row * nx + out_col;
-            result[out_idx] = tile_data[tile_idx];
-        }
-    }
-}
-
-/// Copy pixels from a decoded NATIVE chunk (all bands interleaved) into the
-/// output grid, applying band extraction, nodata mapping and scale/offset
-/// only for the intersecting window (#463) — the local path's replacement
-/// for boxing whole tiles to `Vec<Option<f64>>` up front. Same window/stride
-/// semantics as [`copy_tile_to_result`], including the clipped edge-tile
-/// stride (#458).
+/// Copy pixels from a decoded NATIVE chunk into the output grid, applying
+/// band extraction, nodata mapping and scale/offset only for the
+/// intersecting window (#463) — instead of boxing whole tiles to
+/// `Vec<Option<f64>>` up front. A local chunk interleaves every band; a
+/// remote chunk holds only the engine's band (#468).
 #[allow(clippy::too_many_arguments)]
 fn copy_raw_tile_to_result(
     chunk: &DecodingResult,
@@ -2535,11 +2475,17 @@ fn copy_raw_tile_to_result(
     col_end: u32,
     row_end: u32,
     nx: usize,
-    // Row stride of the decoded chunk — see `copy_tile_to_result`'s doc on
-    // clipped edge tiles (#458). Always `local_tile_data_width` here (this
-    // function is only reached by the local `tiff`-crate decode path).
+    // Row stride of the chunk. NOT always `tile_width`: the local `tiff`-crate
+    // decode path (`read_chunk`) returns edge tiles CLIPPED of their padding, so
+    // the rightmost tile column's rows are `min(tile_width, width - col0)` wide,
+    // not `tile_width`. Indexing such a buffer with a `tile_width` stride shears
+    // every row by the padding amount — invisible at full res (the data rarely
+    // lands in the last tile column) but a "venetian-blind" stripe block once an
+    // overview's edge tile carries real data (#458). The remote/HTTP path decodes
+    // the FULL padded raw tile, so it passes `tile_width`.
     tile_data_width: usize,
-    band_index: usize,
+    // `(samples per pixel in the chunk, band to read)`.
+    band_layout: (usize, usize),
 ) -> Result<(), DataServerError> {
     // One monomorphized copy loop per sample type; the macro keeps the long
     // shared argument list in one place.
@@ -2558,7 +2504,7 @@ fn copy_raw_tile_to_result(
                 row_end,
                 nx,
                 tile_data_width,
-                band_index,
+                band_layout,
             );
             Ok(())
         }};
@@ -2588,9 +2534,8 @@ fn copy_raw_samples<T>(
     row_end: u32,
     nx: usize,
     tile_data_width: usize,
-    band_index: usize,
+    (spp, band_index): (usize, usize),
 ) {
-    let spp = metadata.samples_per_pixel as usize;
     let tile_pixel_col_start = tile_col * metadata.tile_width;
     let tile_pixel_row_start = tile_row * metadata.tile_height;
 
@@ -2607,7 +2552,7 @@ fn copy_raw_samples<T>(
             let sample_idx = tile_idx * spp + band_index;
 
             // Out-of-buffer guard: clipped edge tiles are shorter than a full
-            // tile (same guard as `copy_tile_to_result`).
+            // tile.
             if sample_idx >= data.len() {
                 continue;
             }
@@ -3065,7 +3010,8 @@ mod tests {
             tile_width: 1,
             tile_height: 1,
         };
-        assert_eq!(remote_chunk_layout(&info, 1, 0).unwrap(), (1, 19, 0, 1));
+        // Encoded input + raw decode (+1 overrun probe) + one-band native output.
+        assert_eq!(remote_chunk_layout(&info, 1, 0).unwrap(), (1, 4, 0, 1));
         let store =
             ds_storage::DataStore::new(Arc::new(ds_storage::object_store::memory::InMemory::new()));
         let http = reqwest::Client::new();
@@ -3076,7 +3022,7 @@ mod tests {
             // Missing object / invalid URL would yield a different error if either
             // path reached I/O. Tiny pixel dimensions cannot hide giant encodings.
             for result in [
-                read_remote_chunk_f64(
+                read_remote_chunk(
                     &store,
                     &"missing".into(),
                     &info,
@@ -3088,7 +3034,7 @@ mod tests {
                     0,
                     None,
                 ),
-                read_http_chunk_f64(
+                read_http_chunk(
                     &http,
                     "invalid URL",
                     &info,
@@ -3149,7 +3095,6 @@ mod tests {
             0,
             0,
             0,
-            1024,
         );
         assert!(matches!(result, Err(DataServerError::ResourceExhausted)));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -3193,7 +3138,7 @@ mod tests {
         // Admission fails before fetching even a missing object, and the same
         // reservation path serves explicit HTTP sources.
         assert!(matches!(
-            read_remote_chunk_f64(
+            read_remote_chunk(
                 &store,
                 &ds_storage::object_store::path::Path::from("missing"),
                 &info,
@@ -3382,13 +3327,36 @@ mod tests {
         let (hits, misses) = cache.stats();
         assert_eq!(misses, 1);
         assert_eq!(hits, 0);
+        let fetched = store.bytes_read();
 
-        // Second read: cache hit, same value
+        // Second read: the decoded chunk answers before the compressed cache.
         let val2 = read_pixel(&remote_source, &meta, 0, 0, Some(&cache), &pseudo_path, 0).unwrap();
         assert_eq!(val1, val2);
-        let (hits, misses) = cache.stats();
-        assert_eq!(hits, 1);
-        assert_eq!(misses, 1);
+        assert_eq!(cache.stats(), (0, 1));
+        assert_eq!(store.bytes_read(), fetched);
+
+        // Without a decoded scope, the compressed bytes are reused.
+        let DataSource::Remote {
+            path, tile_info, ..
+        } = &remote_source
+        else {
+            unreachable!()
+        };
+        let tile = read_encoded_chunk(
+            tile_info,
+            &meta,
+            0,
+            Some(&cache),
+            None,
+            &pseudo_path,
+            0,
+            0,
+            &|range| Ok(store.get_range(path, range).unwrap()),
+        )
+        .unwrap();
+        assert!(tile.chunk.is_some());
+        assert_eq!(cache.stats(), (1, 1));
+        assert_eq!(store.bytes_read(), fetched);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3526,6 +3494,7 @@ mod tests {
                             &info,
                             &meta,
                             None,
+                            None,
                             Path::new("benchmark"),
                             0,
                             0,
@@ -3543,10 +3512,11 @@ mod tests {
                                     (
                                         r,
                                         c,
-                                        read_encoded_chunk_f64(
+                                        read_encoded_chunk(
                                             &info,
                                             &meta,
                                             chunk,
+                                            None,
                                             None,
                                             Path::new("benchmark"),
                                             0,
@@ -3561,7 +3531,7 @@ mod tests {
                     };
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
                     tiles.sort_by_key(|(r, c, _)| (*r, *c));
-                    let values: Vec<_> = tiles.iter().map(|(_, _, t)| t.values.clone()).collect();
+                    let values: Vec<_> = tiles.iter().map(|(_, _, t)| tile_samples(t)).collect();
                     if let Some(reference) = &reference {
                         assert_eq!(&values, reference);
                     } else {
@@ -3610,6 +3580,7 @@ mod tests {
             &info,
             &meta,
             Some(&cache),
+            None,
             file,
             0,
             0,
@@ -3619,7 +3590,7 @@ mod tests {
         )
         .unwrap();
         for (_, col, tile) in result {
-            assert_eq!(tile.values, vec![Some(col as f64 + 1.0); 64]);
+            assert_eq!(tile_samples(&tile), Some(vec![col as f64 + 1.0; 64]));
         }
         let mut ranges = calls.lock().unwrap().clone();
         ranges.sort_by_key(|r| r.start);
@@ -3640,6 +3611,7 @@ mod tests {
             &info,
             &meta,
             Some(&cache),
+            None,
             file,
             0,
             0,
@@ -3655,6 +3627,7 @@ mod tests {
             &info,
             &meta,
             Some(&cache),
+            None,
             file,
             0,
             0,
@@ -3672,6 +3645,7 @@ mod tests {
             &info,
             &meta,
             Some(&cache),
+            None,
             file,
             0,
             1,
@@ -3683,7 +3657,10 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 1, "another IFD is cold");
         assert_eq!(calls.lock().unwrap()[0], 0..268);
         calls.lock().unwrap().clear();
-        read_bbox_tiles(&coords, &info, &meta, None, file, 0, 0, None, 4, &fetch).unwrap();
+        read_bbox_tiles(
+            &coords, &info, &meta, None, None, file, 0, 0, None, 4, &fetch,
+        )
+        .unwrap();
         assert_eq!(
             calls.lock().unwrap().len(),
             1,
@@ -3729,6 +3706,7 @@ mod tests {
             &info,
             &meta,
             None,
+            None,
             Path::new("short"),
             0,
             0,
@@ -3740,7 +3718,7 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 5);
         assert!(result
             .iter()
-            .all(|(_, col, tile)| tile.values == vec![Some(*col as f64 + 1.0); 64]));
+            .all(|(_, col, tile)| tile_samples(tile) == Some(vec![*col as f64 + 1.0; 64])));
         for error in [
             DataServerError::DeadlineExceeded,
             DataServerError::ResourceExhausted,
@@ -3750,6 +3728,7 @@ mod tests {
                 &coords,
                 &info,
                 &meta,
+                None,
                 None,
                 Path::new("failed"),
                 0,
@@ -3774,6 +3753,7 @@ mod tests {
             &coords,
             &info,
             &meta,
+            None,
             None,
             Path::new("bad"),
             0,
@@ -4277,6 +4257,7 @@ mod tests {
         // so any shear would scramble the placement. (Mirrors what the `tiff`
         // crate's `read_chunk` returns for this edge tile.)
         let tile_data: Vec<Option<f64>> = (0..8).map(|v| Some(v as f64)).collect();
+        let chunk = DecodingResult::F64((0..8).map(|v| v as f64).collect());
         let stride = local_tile_data_width(&m, tile_col);
         assert_eq!(stride, 2);
 
@@ -4284,8 +4265,8 @@ mod tests {
         let (col_start, col_end, row_start, row_end) = (4u32, 6u32, 0u32, 4u32);
         let nx = (col_end - col_start) as usize;
         let mut result = vec![None; nx * (row_end - row_start) as usize];
-        copy_tile_to_result(
-            &tile_data,
+        copy_raw_tile_to_result(
+            &chunk,
             &mut result,
             tile_col,
             0,
@@ -4296,7 +4277,9 @@ mod tests {
             row_end,
             nx,
             stride,
-        );
+            (1, 0),
+        )
+        .unwrap();
         // The window IS the clipped tile, so result must equal tile_data verbatim.
         assert_eq!(result, tile_data);
 
@@ -4458,6 +4441,137 @@ mod tests {
         assert_eq!(first, second, "cached read must be value-identical");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A remote tile's samples as f64 (no nodata mapping); `None` = all nodata.
+    fn tile_samples(tile: &RemoteTile) -> Option<Vec<f64>> {
+        let chunk = tile.chunk.as_deref()?;
+        Some(
+            (0..crate::decoded_cache::sample_count(chunk))
+                .map(|i| raw_sample_at(chunk, i).unwrap().unwrap())
+                .collect(),
+        )
+    }
+
+    /// The fixture read back as a remote object: `(store, source, metadata,
+    /// cache path)`, all tiles fetched by byte range.
+    fn remote_fixture() -> (ds_storage::DataStore, DataSource, TiffMetadata, PathBuf) {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+        let (store, _prefix) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
+        let filename = tif_path.file_name().unwrap().to_str().unwrap();
+        let obj_path = ds_storage::object_store::path::Path::from(filename);
+        let file_size = std::fs::metadata(&tif_path).unwrap().len();
+        let (meta, tile_info) =
+            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let source = DataSource::Remote {
+            store: store.clone(),
+            path: obj_path,
+            tile_info,
+        };
+        (store, source, meta, PathBuf::from(filename))
+    }
+
+    /// #468: a remote tile decoded once is not decoded — or fetched — again.
+    /// The compressed cache is disabled, so only the decoded-chunk cache can
+    /// serve the second read; a second engine (another tile-cache namespace)
+    /// over the same object path must not share those chunks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_decoded_chunks_serve_repeat_reads_per_engine() {
+        let (store, source, meta, pseudo_path) = remote_fixture();
+        // Two tile columns and rows of the full-resolution grid.
+        let (col_end, row_end) = (
+            (meta.tile_width * 2).min(meta.width),
+            (meta.tile_height * 2).min(meta.height),
+        );
+        let read = |cache: &crate::cache::TileCache| {
+            read_bbox_map(
+                &source,
+                &meta,
+                0,
+                0,
+                col_end,
+                row_end,
+                Some(cache),
+                &pseudo_path,
+                0,
+            )
+            .unwrap()
+        };
+        let engine = crate::cache::TileCache::new(0);
+        let before = store.bytes_read();
+        let first = read(&engine);
+        let fetched = store.bytes_read();
+        assert!(fetched > before, "the first read fetches its tiles");
+
+        let second = read(&engine);
+        assert_eq!(
+            store.bytes_read(),
+            fetched,
+            "decoded chunks answer the repeat"
+        );
+        assert_eq!(first, second, "cached read must be value-identical");
+
+        let other_engine = crate::cache::TileCache::new(0);
+        assert_eq!(read(&other_engine), first);
+        assert!(
+            store.bytes_read() > fetched,
+            "another engine's namespace must decode its own chunks"
+        );
+    }
+
+    /// #468: remote chunks share `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB`; at 0
+    /// nothing is retained and every read decodes, as for local sources.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_decoded_chunks_obey_the_shared_budget() {
+        const CHILD: &str = "MC_TEST_REMOTE_DECODED_BUDGET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader::tests::remote_decoded_chunks_obey_the_shared_budget",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("MC_GEOTIFF_DECODED_CHUNK_CACHE_MB", "0")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let (store, source, meta, pseudo_path) = remote_fixture();
+        let cache = crate::cache::TileCache::new(0);
+        let mut reads = Vec::new();
+        for _ in 0..2 {
+            let value = read_pixel(&source, &meta, 0, 0, Some(&cache), &pseudo_path, 0).unwrap();
+            reads.push((value, store.bytes_read()));
+        }
+        assert_eq!(reads[0].0, reads[1].0);
+        assert!(reads[1].1 > reads[0].1, "a disabled budget retains nothing");
+        let metrics = crate::decoded_cache::metrics();
+        assert_eq!((metrics.hits, metrics.misses, metrics.bytes), (0, 2, 0));
+    }
+
+    /// #468: a cached remote chunk holds only the engine's band — a two-band
+    /// Float32 OPERA tile costs one band of the decoded-cache budget.
+    #[test]
+    fn decode_raw_band_keeps_only_the_requested_band() {
+        let raw: Vec<u8> = [1.5f32, -1.0, 2.5, -2.0, f32::NAN, -3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let band = |b| match decode_raw_band(&raw, SampleType::F32, 2, b).unwrap() {
+            DecodingResult::F32(v) => v,
+            _ => unreachable!(),
+        };
+        let first = band(0);
+        assert_eq!(&first[..2], [1.5, 2.5]);
+        assert!(
+            first[2].is_nan(),
+            "nodata mapping waits for the window copy"
+        );
+        assert_eq!(band(1), [-1.0, -2.0, -3.0]);
+        assert!(decode_raw_band(&raw, SampleType::F32, 2, 2).is_err());
     }
 
     /// A sphere-based LCC GeoTIFF (GDAL writes semi-minor = semi-major =

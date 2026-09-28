@@ -2,10 +2,13 @@
 //!
 //! Caches **compressed** tile bytes keyed by (file path, chunk index).
 //! Decompression is ~0.2ms vs 50-200ms for an S3 range read, so caching
-//! compressed bytes gives 58x better memory efficiency than decoded tiles
-//! with negligible CPU overhead on cache hits.
+//! compressed bytes gives 58x better memory efficiency than decoded tiles.
+//! The WMS meta-tile loop still decodes each hot tile several times per
+//! frame, so decoded tiles are also memoized in the process-global
+//! [`crate::decoded_cache`] under this cache's [`TileCache::namespace`] (#468).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -28,9 +31,13 @@ fn weigh_tile(_key: &TileCacheKey, val: &Bytes) -> u64 {
     val.len() as u64 + 32
 }
 
+/// Source of [`TileCache::namespace`] ids; never reused within a process.
+static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
 /// Thread-safe tile cache backed by the shared byte-bounded LRU (#480).
 pub struct TileCache {
     inner: ByteBoundedCache<TileCacheKey, Bytes>,
+    namespace: u64,
 }
 
 impl TileCache {
@@ -40,7 +47,16 @@ impl TileCache {
         // ~16 KB per compressed tile for initial hash map sizing.
         TileCache {
             inner: ByteBoundedCache::new(max_bytes, 16 * 1024, weigh_tile),
+            namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Process-unique id of this cache. Keys here are only an object path,
+    /// unique within one engine's store; the process-global decoded-chunk
+    /// cache adds this id so engines whose stores share an object path never
+    /// share decoded pixels, and a rebuilt engine starts a fresh namespace.
+    pub(crate) fn namespace(&self) -> u64 {
+        self.namespace
     }
 
     /// Look up a cached compressed tile.

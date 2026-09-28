@@ -1,27 +1,38 @@
-//! Process-global cache of **decoded** GeoTIFF chunks for local sources (#463).
+//! Process-global cache of **decoded** GeoTIFF chunks for local (#463) and
+//! remote (#468) sources.
 //!
 //! The WMS meta-tile loop renders a full viewport as ~50–190 independent
 //! `get_raster_tile` calls, and adjacent meta-tiles share covering source
 //! tiles — without a decode memo each 512×512 source tile is
-//! LZW/DEFLATE-decoded ~6× per frame. The compressed-byte [`crate::cache::TileCache`]
-//! deliberately doesn't help here: for a local mmap'd file the compressed
-//! bytes are already free from the page cache; the redundant cost is
-//! decompress + predictor. So this cache memoizes the *decoded* chunk —
-//! the native [`DecodingResult`] buffer (262 KB for a 512×512 Byte tile),
-//! with band extraction / nodata mapping / scale-offset deferred to the
-//! copy into the output window.
+//! LZW/DEFLATE-decoded ~6× per frame. For a local mmap'd file the compressed
+//! bytes are already free from the page cache; for a remote COG the
+//! compressed-byte [`crate::cache::TileCache`] saves the fetch but not the
+//! decode. Either way the redundant cost is decompress + predictor, so this
+//! cache memoizes the *decoded* chunk — the native [`DecodingResult`] buffer
+//! (262 KB for a 512×512 Byte tile), with nodata mapping / scale-offset
+//! deferred to the copy into the output window.
 //!
-//! Keying: `(path, mtime, size, inode, ifd, chunk)`. The identity is
+//! Local keys are `(path, mtime, size, inode, ifd, chunk)`. The identity is
 //! captured from the same file handle the mmap was created from, so a file
 //! replaced via atomic rename (new inode → new identity on the next catalog
 //! scan) can never serve stale pixels; stale-generation entries age out of
 //! the LRU. Same single-flight + byte-bounded LRU shape as `engine-odim`'s
-//! `COMPOSITE_CACHE` (#212).
+//! `COMPOSITE_CACHE` (#212). A local chunk keeps all bands interleaved.
 //!
-//! `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` sizes the cache (default 512 MB);
-//! `0` disables retention (`capacity.max(1)` keeps the cache valid but
-//! unable to hold anything, so every read decodes — same convention as the
-//! ODIM caches).
+//! Remote keys are `(path, namespace, band, ifd, chunk)`: an object is
+//! trusted to be path-immutable exactly as the compressed cache trusts it,
+//! and the namespace is that engine's [`crate::cache::TileCache::namespace`].
+//! A remote chunk holds only the engine's band, so a two-band OPERA Float32
+//! tile costs 1 MB rather than 2. Remote reads use plain [`get`] + [`insert`]
+//! instead of the single-flight: a miss's fill includes the fetch, and
+//! parking a `TILE_FETCH_POOL` worker behind another request's range read
+//! would tie its render to that request's deadline. Two concurrent misses
+//! for one chunk both decode, as every remote read did before #468.
+//!
+//! `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` sizes the one shared budget (default
+//! 512 MB); `0` disables retention (`capacity.max(1)` keeps the cache valid
+//! but unable to hold anything, so every read decodes — same convention as
+//! the ODIM caches).
 
 use std::sync::Arc;
 
@@ -70,19 +81,39 @@ impl FileIdentity {
     }
 }
 
-/// Cache scope for one local file: its path plus the content identity the
-/// mmap was captured under. Built once per `read_bbox*` call, cheap to clone.
+/// Which source a cached chunk was decoded from; see the module docs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Origin {
+    /// A local file's content identity; the chunk has every band.
+    Local(FileIdentity),
+    /// A remote object in one engine's compressed-cache namespace; the chunk
+    /// has only `band`.
+    Remote { namespace: u64, band: usize },
+}
+
+/// Cache scope for one source file: its path plus the origin its chunks are
+/// keyed under. Built once per `read_bbox*` call, cheap to clone.
 #[derive(Clone)]
 pub(crate) struct FileScope {
     file: Arc<str>,
-    identity: FileIdentity,
+    origin: Origin,
 }
 
 impl FileScope {
+    /// A local file, keyed by the content identity its mmap was captured under.
     pub(crate) fn new(file: impl Into<Arc<str>>, identity: FileIdentity) -> Self {
         FileScope {
             file: file.into(),
-            identity,
+            origin: Origin::Local(identity),
+        }
+    }
+
+    /// A remote object read through the engine whose compressed cache has
+    /// `namespace`; its chunks hold only `band`.
+    pub(crate) fn remote(file: impl Into<Arc<str>>, namespace: u64, band: usize) -> Self {
+        FileScope {
+            file: file.into(),
+            origin: Origin::Remote { namespace, band },
         }
     }
 }
@@ -90,10 +121,21 @@ impl FileScope {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ChunkKey {
     file: Arc<str>,
-    identity: FileIdentity,
+    origin: Origin,
     /// IFD index (0 = full resolution, 1+ = overview levels).
     ifd_index: u16,
     chunk_index: u32,
+}
+
+impl ChunkKey {
+    fn new(scope: &FileScope, ifd_index: u16, chunk_index: u32) -> Self {
+        ChunkKey {
+            file: Arc::clone(&scope.file),
+            origin: scope.origin,
+            ifd_index,
+            chunk_index,
+        }
+    }
 }
 
 /// Number of samples (all bands interleaved) in a decoded chunk.
@@ -165,13 +207,34 @@ pub(crate) fn get_or_decode(
     chunk_index: u32,
     decode: impl FnOnce() -> Result<DecodingResult, DataServerError>,
 ) -> Result<Arc<DecodingResult>, DataServerError> {
-    let key = ChunkKey {
-        file: Arc::clone(&scope.file),
-        identity: scope.identity,
-        ifd_index,
-        chunk_index,
-    };
+    let key = ChunkKey::new(scope, ifd_index, chunk_index);
     CACHE.get_or_insert_with(&key, || decode().map(Arc::new))
+}
+
+/// Look up a decoded chunk, counting a hit or a miss (the remote path's
+/// non-single-flight read; see the module docs).
+pub(crate) fn get(
+    scope: &FileScope,
+    ifd_index: u16,
+    chunk_index: u32,
+) -> Option<Arc<DecodingResult>> {
+    CACHE.get(&ChunkKey::new(scope, ifd_index, chunk_index))
+}
+
+/// Whether a chunk is resident, without touching counters or recency. For
+/// range-batch planning, which only predicts the later worker read.
+pub(crate) fn contains(scope: &FileScope, ifd_index: u16, chunk_index: u32) -> bool {
+    CACHE.contains_key(&ChunkKey::new(scope, ifd_index, chunk_index))
+}
+
+/// Retain a chunk decoded after a [`get`] miss.
+pub(crate) fn insert(
+    scope: &FileScope,
+    ifd_index: u16,
+    chunk_index: u32,
+    chunk: Arc<DecodingResult>,
+) {
+    CACHE.insert(ChunkKey::new(scope, ifd_index, chunk_index), chunk);
 }
 
 #[cfg(test)]
@@ -252,6 +315,39 @@ mod tests {
         let over = get_or_decode(&scope, 1, 0, || Ok(DecodingResult::U8(vec![20]))).unwrap();
         assert!(matches!(*full, DecodingResult::U8(ref v) if v == &[10]));
         assert!(matches!(*over, DecodingResult::U8(ref v) if v == &[20]));
+    }
+
+    /// #468: remote chunks are keyed by object path, engine namespace and
+    /// band, and never collide with a local file at the same path.
+    #[test]
+    fn remote_scope_keys_path_namespace_and_band() {
+        let file = "decoded_cache_test/remote.tif";
+        // `TileCache` namespaces count up from 1; stay clear of them.
+        let ns = u64::MAX - 1;
+        let scopes = [
+            FileScope::remote(file, ns, 0),
+            FileScope::remote(file, ns - 1, 0),
+            FileScope::remote(file, ns, 1),
+            FileScope::remote("decoded_cache_test/other.tif", ns, 0),
+            FileScope::new(
+                file,
+                FileIdentity {
+                    mtime_ns: 0,
+                    size: 0,
+                    inode: 0,
+                },
+            ),
+        ];
+        for (i, scope) in scopes.iter().enumerate() {
+            assert!(!contains(scope, 0, 5));
+            assert!(get(scope, 0, 5).is_none());
+            insert(scope, 0, 5, Arc::new(DecodingResult::U8(vec![i as u8])));
+        }
+        for (i, scope) in scopes.iter().enumerate() {
+            assert!(contains(scope, 0, 5));
+            let chunk = get(scope, 0, 5).expect("each scope keeps its own chunk");
+            assert!(matches!(*chunk, DecodingResult::U8(ref v) if v == &[i as u8]));
+        }
     }
 
     /// A decode error must not poison the key: the next attempt re-decodes.
