@@ -74,10 +74,18 @@ fi
 # grep is line-oriented and misses these; use perl in slurp mode.
 # Falls back silently if perl is unavailable (only macOS/Linux primary
 # CI jobs run this script, both have perl).
+# perl prints every hit as file:line on STDOUT and exits non-zero at the
+# end if there was any; only STDERR (xargs exit-status chatter) is dropped.
 if command -v perl >/dev/null 2>&1; then
     if find "$CRATE_DIR" -name '*.rs' -print0 | \
-        xargs -0 perl -0ne 'if (/(format!|concat!)\s*\([^)]*(SELECT|INSERT|UPDATE|DELETE|DROP)/) { print STDERR "$ARGV: multi-line format!/concat! with SQL verb\n"; exit 1 }' \
-        2>/dev/null; then
+        xargs -0 perl -0777 -ne '
+            while (/(format!|concat!)\s*\([^)]*(SELECT|INSERT|UPDATE|DELETE|DROP)/g) {
+                my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
+                print "$ARGV:$line: multi-line format!/concat! with SQL verb\n";
+                $bad = 1;
+            }
+            END { $? = 1 if $bad }
+        ' 2>/dev/null; then
         : # no matches
     else
         echo >&2
