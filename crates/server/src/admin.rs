@@ -445,7 +445,7 @@ static GEOTIFF_DECODED_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock:
     CacheMetricSet::new(
         "geotiff_decoded_chunk_cache",
         "GeoTIFF decoded-chunk cache",
-        Some("local sources"),
+        Some("local and remote sources"),
         Some("tile decompressions"),
         false,
     )
