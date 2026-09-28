@@ -2193,6 +2193,8 @@ async fn render_tile(
         // Content revised in place under the same instant (a push-fed alert
         // set) must not hit a stale entry.
         content_version: engine.content_version(),
+        // No opaque-background option on this API: output keeps its alpha.
+        background: None,
     };
 
     let cache_control = cache_control_value(has_explicit_time, cache_key.content_version);

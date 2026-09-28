@@ -15,7 +15,7 @@ pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
     LutColorMap, OverlayColorMap,
 };
-pub use encode::{encode_jpeg, encode_png, encode_webp};
+pub use encode::{encode_jpeg, encode_png, encode_webp, flatten_onto};
 pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
 pub use palette::{
     builtin_palette, builtin_palette_arc, builtin_palettes, Interpolation, Palette, PaletteInsert,
@@ -110,6 +110,12 @@ pub struct CacheKey {
     /// alert set) gets a fresh entry instead of serving the stale one
     /// forever. `0` for engines whose timesteps are immutable.
     pub content_version: u64,
+    /// Opaque background the encoded image was composited over (WMS
+    /// `TRANSPARENT=FALSE` / `BGCOLOR`, and JPEG's always-opaque output);
+    /// `None` keeps the alpha channel. Part of the key because it changes the
+    /// encoded bytes — the meta-tile pixel cache stays background-free, so
+    /// transparent and opaque views share its RGBA tiles.
+    pub background: Option<[u8; 3]>,
 }
 
 /// Quantize a vertical level for use in a [`CacheKey`] — millidegrees /
@@ -200,6 +206,11 @@ impl CacheKey {
         if self.content_version != 0 {
             fnv1a_mix(&mut h, b"|v");
             fnv1a_mix(&mut h, &self.content_version.to_le_bytes());
+        }
+        // Likewise only when set, so a transparent key keeps its old ETag.
+        if let Some(bg) = self.background {
+            fnv1a_mix(&mut h, b"|bg");
+            fnv1a_mix(&mut h, &bg);
         }
         format!("\"{h:016x}\"")
     }
@@ -292,25 +303,28 @@ impl CachedRendered {
     }
 }
 
-/// Max distinct `(width, height)` transparent tiles retained (see
-/// [`empty_tile`]). 64 covers any realistic mix of client viewport sizes;
+/// Max distinct `(width, height, background)` all-nodata tiles retained (see
+/// [`background_tile`]). 64 covers any realistic mix of client viewport sizes;
 /// beyond that the LRU recycles.
 const EMPTY_TILE_CACHE_ITEMS: usize = 64;
 
-/// Process-global cache of transparent (all-nodata) PNGs keyed by output
-/// dimensions, as ready-to-serve [`CachedRendered`] entries (bytes + their
-/// stable FNV-1a ETag).
+/// `(width, height, background)` of a memoized all-nodata tile.
+type EmptyTileKey = (u32, u32, Option<[u8; 3]>);
+
+/// Process-global cache of all-nodata PNGs keyed by output dimensions and
+/// background (`None` = transparent), as ready-to-serve [`CachedRendered`]
+/// entries (bytes + their stable FNV-1a ETag).
 ///
 /// WMS / Maps `GetMap` take an all-nodata fast path on off-coverage viewports;
-/// the encoded transparent PNG and its ETag are identical for a given
-/// `(width, height)`, so encoding once per distinct size and cloning the
-/// `Arc`-backed bytes is far cheaper than re-allocating `width·height·4` zero
+/// the encoded PNG and its ETag are identical for a given
+/// `(width, height, background)`, so encoding once per distinct key and cloning
+/// the `Arc`-backed bytes is far cheaper than re-allocating `width·height·4`
 /// bytes and re-encoding + re-hashing on every empty response (#171). The Tiles
 /// service (always 256×256) sources its single global from here too, so all
 /// three raster APIs share one mechanism. Bounded by item count so a
-/// `?WIDTH=…&HEIGHT=…` fan-out can't pin unbounded memory — an abuser just
-/// cycles the LRU; a real client uses a handful of viewport sizes.
-static EMPTY_TILE_CACHE: std::sync::LazyLock<Cache<(u32, u32), CachedRendered>> =
+/// `?WIDTH=…&HEIGHT=…&BGCOLOR=…` fan-out can't pin unbounded memory — an abuser
+/// just cycles the LRU; a real client uses a handful of viewport sizes.
+static EMPTY_TILE_CACHE: std::sync::LazyLock<Cache<EmptyTileKey, CachedRendered>> =
     std::sync::LazyLock::new(|| Cache::new(EMPTY_TILE_CACHE_ITEMS));
 
 /// A fully-transparent `width`×`height` PNG as a ready-to-serve
@@ -318,8 +332,23 @@ static EMPTY_TILE_CACHE: std::sync::LazyLock<Cache<(u32, u32), CachedRendered>> 
 /// (#171). Use this for the all-nodata fast path instead of allocating and
 /// encoding a fresh transparent image on every empty response.
 pub fn empty_tile(width: u32, height: u32) -> Result<CachedRendered, DataServerError> {
-    EMPTY_TILE_CACHE.get_or_insert_with(&(width, height), || {
-        let rgba = vec![0u8; width as usize * height as usize * 4];
+    background_tile(width, height, None)
+}
+
+/// [`empty_tile`] for a request that may ask for opaque output: `None` is the
+/// transparent tile, `Some(rgb)` a solid opaque PNG of that colour — what an
+/// all-nodata WMS `TRANSPARENT=FALSE` view renders to (every pixel is
+/// background). Memoized per `(width, height, background)` alike.
+pub fn background_tile(
+    width: u32,
+    height: u32,
+    background: Option<[u8; 3]>,
+) -> Result<CachedRendered, DataServerError> {
+    EMPTY_TILE_CACHE.get_or_insert_with(&(width, height, background), || {
+        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+        if let Some(bg) = background {
+            flatten_onto(&mut rgba, bg);
+        }
         Ok(CachedRendered::new(Bytes::from(encode_png(
             &rgba, width, height,
         )?)))
@@ -436,17 +465,45 @@ pub fn render_tile(
     colormap: &dyn ColorMap,
     format: ImageFormat,
 ) -> Result<Vec<u8>, DataServerError> {
+    render_tile_with_background(tile, colormap, format, None)
+}
+
+/// [`render_tile`] with an optional opaque `background`: `Some(rgb)` composites
+/// the colorized image over that colour before encoding (WMS
+/// `TRANSPARENT=FALSE` / `BGCOLOR`), `None` keeps the alpha channel.
+pub fn render_tile_with_background(
+    tile: &RasterTile,
+    colormap: &dyn ColorMap,
+    format: ImageFormat,
+    background: Option<[u8; 3]>,
+) -> Result<Vec<u8>, DataServerError> {
     ds_core::deadline::check()?;
     // Short-circuit for empty tiles: skip colorization, produce transparent RGBA directly.
-    let rgba = if tile.is_empty() {
+    let mut rgba = if tile.is_empty() {
         vec![0u8; (tile.width * tile.height * 4) as usize]
     } else {
         colorize(tile, colormap)
     };
+    encode_rgba(&mut rgba, tile.width, tile.height, format, background)
+}
+
+/// Encode a rendered RGBA image in `format`, first compositing it over
+/// `background` when one is given (opaque output). `None` keeps the alpha
+/// channel; JPEG, which has none, then flattens onto white itself.
+pub(crate) fn encode_rgba(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    format: ImageFormat,
+    background: Option<[u8; 3]>,
+) -> Result<Vec<u8>, DataServerError> {
+    if let Some(bg) = background {
+        flatten_onto(rgba, bg);
+    }
     match format {
-        ImageFormat::Png => encode::encode_png(&rgba, tile.width, tile.height),
-        ImageFormat::Jpeg => encode::encode_jpeg(&rgba, tile.width, tile.height),
-        ImageFormat::Webp => encode::encode_webp(&rgba, tile.width, tile.height),
+        ImageFormat::Png => encode::encode_png(rgba, width, height),
+        ImageFormat::Jpeg => encode::encode_jpeg(rgba, width, height),
+        ImageFormat::Webp => encode::encode_webp(rgba, width, height),
     }
 }
 
@@ -941,6 +998,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
+            background: None,
         };
         let cache = RenderedCache::new(1);
         cache.insert(
@@ -1162,6 +1220,43 @@ mod tests {
         let c = empty_tile(100, 100).expect("encode empty tile");
         assert_ne!(a.etag(), c.etag(), "different (w,h) must differ");
         assert!(!a.bytes().is_empty(), "an empty tile is still a real PNG");
+    }
+
+    #[test]
+    fn background_tile_is_opaque_and_keyed_by_colour() {
+        let transparent = background_tile(8, 4, None).expect("encode");
+        assert_eq!(
+            transparent.etag(),
+            empty_tile(8, 4).expect("encode").etag(),
+            "None is the transparent empty tile"
+        );
+        let bg = [0x33, 0x66, 0x99];
+        let opaque = background_tile(8, 4, Some(bg)).expect("encode");
+        assert_ne!(opaque.etag(), transparent.etag());
+        assert_eq!(
+            opaque.etag(),
+            background_tile(8, 4, Some(bg)).expect("encode").etag(),
+            "memoized per (w, h, background)"
+        );
+        assert_ne!(
+            opaque.etag(),
+            background_tile(8, 4, Some([255, 255, 255]))
+                .expect("encode")
+                .etag()
+        );
+        // Every pixel decodes to the opaque background.
+        let mut reader = png::Decoder::new(std::io::Cursor::new(opaque.bytes().to_vec()))
+            .read_info()
+            .unwrap();
+        let (plte, trns) = (
+            reader.info().palette.as_deref().map(<[u8]>::to_vec),
+            reader.info().trns.is_some(),
+        );
+        assert_eq!(plte.as_deref(), Some(&bg[..]), "one opaque palette entry");
+        assert!(!trns, "no transparency chunk");
+        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut buf).unwrap();
+        assert!(buf[..frame.buffer_size()].iter().all(|&i| i == 0));
     }
 
     /// The #206 correctness property: colorizing a `U8` tile through the
@@ -1603,6 +1698,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
+            background: None,
         };
         let mut later = base.clone();
         later.time = Some(
@@ -1628,6 +1724,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
+            background: None,
         };
         let mut other = base.clone();
         other.parameter = Some("10u".into());
@@ -1660,6 +1757,7 @@ mod tests {
                     .with_timezone(&chrono::Utc),
             ),
             content_version: 0,
+            background: None,
         };
         let mut other = base.clone();
         other.reference_time = Some(
@@ -1696,6 +1794,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 1,
+            background: None,
         };
         let mut revised = base.clone();
         revised.content_version = 2;
@@ -1718,6 +1817,43 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_distinguishes_background() {
+        // WMS TRANSPARENT=FALSE / BGCOLOR change the encoded bytes, so an
+        // opaque view must never be served a cached transparent one (or a
+        // different background's).
+        let base = CacheKey {
+            layer: "radar".into(),
+            style: "default".into(),
+            format: 0,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: None,
+            parameter: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+            background: None,
+        };
+        let mut opaque = base.clone();
+        opaque.background = Some([0x33, 0x66, 0x99]);
+        let mut white = base.clone();
+        white.background = Some([255, 255, 255]);
+        assert_ne!(base, opaque);
+        assert_ne!(opaque, white);
+        assert_ne!(base.etag(), opaque.etag());
+        assert_ne!(opaque.etag(), white.etag());
+        let cache = RenderedCache::new(1);
+        cache.insert(
+            base.clone(),
+            CachedRendered::new(Bytes::from_static(b"transparent")),
+        );
+        assert!(cache.get(&base).is_some());
+        assert!(cache.get(&opaque).is_none());
+    }
+
+    #[test]
     fn cache_key_etag_uses_stable_fnv1a_not_default_hasher() {
         // Pinned golden value — see the matching `VectorTileKey` test for
         // the rationale. If this changes you've either intentionally rotated
@@ -1736,6 +1872,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
+            background: None,
         };
         // Pinned after introducing the `reference_time` field (cache-bust event).
         assert_eq!(key.etag(), "\"92a1d2349689898e\"");

@@ -21,3 +21,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Decode GetMap PNGs to assert TRANSPARENT/BGCOLOR pixels (#163); already
+# in the graph via ds-render.
+png = "0.18"

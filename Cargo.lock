@@ -251,6 +251,7 @@ dependencies = [
  "ds-executor",
  "ds-render",
  "http-body-util",
+ "png",
  "quick-xml 0.42.0",
  "serde",
  "serde_json",

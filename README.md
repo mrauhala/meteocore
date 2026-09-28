@@ -1384,8 +1384,8 @@ For multi-parameter engines, GetCapabilities emits a non-requestable parent laye
 | `FORMAT` | yes | `image/png`, `image/jpeg`, or `image/webp` |
 | `STYLES` | no | Style name (empty or missing = `default`) |
 | `TIME` | no | ISO 8601 timestamp; defaults to the latest available |
-| `TRANSPARENT` | no | Accepted but currently a no-op — PNG/WebP output is always RGBA |
-| `BGCOLOR` | no | Accepted but ignored |
+| `TRANSPARENT` | no | `TRUE` (default) keeps nodata transparent; `FALSE` returns an opaque image with nodata painted in `BGCOLOR` |
+| `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output; default `0xFFFFFF` (white) |
 
 ### WMS 1.3.0 BBOX Axis Order
 

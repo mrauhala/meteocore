@@ -78,6 +78,25 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   instant is revised in place (engine-cap) bumps it, so an explicit
   `TIME=` render can't be served stale forever from the no-TTL caches.
 
+## TRANSPARENT / BGCOLOR (#163)
+
+- `TRANSPARENT` is `TRUE`/`FALSE` (case-insensitive) and defaults to `TRUE`
+  — deliberately not the spec's `FALSE`, which would turn every overlay
+  client that omits it opaque. Any other value is `InvalidParameterValue`.
+- `BGCOLOR` is strictly `0xRRGGBB` (lower-case `0x`, hex digits of either
+  case), default white; anything else is `InvalidParameterValue`.
+- `GetMapParams.background` is `Some(BGCOLOR)` for `TRANSPARENT=FALSE` and
+  for JPEG (no alpha, so its nodata is always background), else `None`.
+  The image is composited onto it at encode time (`ds_render::flatten_onto`):
+  every pixel opaque, PNG8 kept, no `tRNS`.
+- Caching: the background is part of the rendered-image `CacheKey` (the
+  encoded bytes differ) but NOT of the meta-tile key — cached tiles stay
+  RGBA, so opaque and transparent views share them. The all-nodata path uses
+  `ds_render::background_tile` (memoized per size + background); the error
+  tile is flattened too.
+- GetCapabilities advertises nothing for these; the layer `opaque` attribute
+  is unrelated and unchanged.
+
 ## Capabilities niceties
 
 - Collection `keywords` → `<KeywordList>` (after `<Abstract>`, WMS 1.3.0
