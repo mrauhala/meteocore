@@ -95,19 +95,50 @@ impl Palette {
         if !self.normalized {
             return self.clone();
         }
+        self.remapped(0.0, 1.0, min, max)
+    }
+
+    /// The palette to sample over a style range `[min, max]`, when that is
+    /// not this palette as it stands (#823). `None` means sample it as is.
+    ///
+    /// - A [`normalized`](Self::normalized) palette always spans the range.
+    /// - A data-valued palette keeps its physical values: a range that
+    ///   overlaps its stops clips, so 0 °C keeps its colour. Only a range
+    ///   lying entirely outside its stops is rescaled onto them, because
+    ///   clipping could then paint only one colour. That is a unit mismatch,
+    ///   such as the °C `temperature` palette given a kelvin range.
+    pub fn fitted_to(&self, min: f64, max: f64) -> Option<Palette> {
+        if self.normalized {
+            return Some(self.stretched(min, max));
+        }
+        let domain = self.domain_stops();
+        let (lo, hi) = (domain.first()?.value, domain.last()?.value);
+        let outside = min.max(max) < lo || min.min(max) > hi;
+        (outside && hi > lo && min.is_finite() && max.is_finite())
+            .then(|| self.remapped(lo, hi, min, max))
+    }
+
+    /// Every stop mapped linearly from `[from_lo, from_hi]` onto
+    /// `[min, max]`, as a data-valued palette.
+    fn remapped(&self, from_lo: f64, from_hi: f64, min: f64, max: f64) -> Palette {
+        let scale = (max - min) / (from_hi - from_lo);
         let mut stops: Vec<ColorStop> = self
             .stops
             .iter()
             .map(|s| ColorStop {
-                value: min + s.value * (max - min),
+                value: min + (s.value - from_lo) * scale,
                 color: s.color,
             })
             .collect();
-        // An inverted range maps the stops descending; the samplers and the
-        // legend assume ascending, so flip them (a hard edge's paired stops
-        // flip with it, which keeps each colour on its side).
         if max < min {
+            // An inverted range maps the stops descending; the samplers and
+            // the legend assume ascending, so flip them (a hard edge's paired
+            // stops flip with it, which keeps each colour on its side).
             stops.reverse();
+        } else if self.domain_stops().len() < self.stops.len() {
+            // Keep a display-threshold guard exactly one ULP below its stop,
+            // which is what makes it a guard ([`Self::domain_stops`]).
+            stops[0].value = stops[1].value.next_down();
         }
         Palette {
             stops,
@@ -638,6 +669,32 @@ impl PaletteRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rescaling onto a disjoint range keeps a display-threshold guard one
+    /// ULP below its stop, leaves an overlapping range alone, and keeps an
+    /// inverted range's stops ascending (#823).
+    #[test]
+    fn fitted_to_rescales_only_a_disjoint_range_and_keeps_the_guard() {
+        let stop = |value: f64, color: [u8; 4]| ColorStop { value, color };
+        let p = Palette::new(
+            "guarded",
+            vec![
+                stop(5f64.next_down(), [0, 0, 0, 0]),
+                stop(5.0, [1, 2, 3, 255]),
+                stop(60.0, [4, 5, 6, 255]),
+            ],
+            Interpolation::Linear,
+        );
+        let fitted = p.fitted_to(100.0, 200.0).unwrap();
+        assert_eq!(fitted.stops[1].value, 100.0);
+        assert_eq!(fitted.stops[2].value, 200.0);
+        assert_eq!(fitted.stops[0].value, fitted.stops[1].value.next_down());
+        assert_eq!(fitted.domain_stops().len(), 2);
+        assert!(p.fitted_to(0.0, 30.0).is_none(), "overlapping");
+        assert!(p.fitted_to(60.0, 90.0).is_none(), "touching");
+        let inverted = p.fitted_to(200.0, 100.0).unwrap();
+        assert!(inverted.stops.windows(2).all(|w| w[0].value <= w[1].value));
+    }
 
     /// An inverted range flips a normalized palette and keeps its stops
     /// ascending, which the samplers assume.
