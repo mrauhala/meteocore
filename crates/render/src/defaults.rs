@@ -64,14 +64,17 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(&["k", "kelvin"], 180.0, 330.0)],
         fallback_range: None,
     },
-    // Temperature / dew point — unit-gated: NEVER guess K vs °C.
+    // Temperature / dew point — unit-gated: NEVER guess K vs °C. One range
+    // for every level, −90…50 °C, so a colour means the same temperature
+    // from the surface to the stratosphere. The kelvin range is the same
+    // span, so the °C palette rescales onto it exactly.
     DefaultRule {
         names: &["t", "2t", "t2m", "tmp", "tt", "td", "2d", "d2m", "skt"],
         contains: &["temperature", "dewpoint"],
         palette: "temperature",
         unit_ranges: &[
-            (&["k", "kelvin"], 233.15, 323.15),
-            (&["c", "degc", "celsius", "cel"], -40.0, 50.0),
+            (&["k", "kelvin"], 183.15, 323.15),
+            (&["c", "degc", "celsius", "cel"], -90.0, 50.0),
         ],
         fallback_range: None,
     },
@@ -438,10 +441,10 @@ mod tests {
         let d = builtin();
         // Temperature with K → Kelvin range.
         let k = d.match_default("t2m", "", Some("K")).unwrap();
-        assert_eq!(k.range, Some((233.15, 323.15)));
+        assert_eq!(k.range, Some((183.15, 323.15)));
         // …with °C → Celsius range (degree sign normalized away).
         let c = d.match_default("t2m", "", Some("°C")).unwrap();
-        assert_eq!(c.range, Some((-40.0, 50.0)));
+        assert_eq!(c.range, Some((-90.0, 50.0)));
         // …with NO unit → rule refuses (never guess K vs C).
         assert_eq!(d.match_default("t2m", "", None), None);
         assert_eq!(d.match_default("t2m", "", Some("weird")), None);

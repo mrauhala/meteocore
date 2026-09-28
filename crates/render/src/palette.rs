@@ -355,9 +355,68 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (1.0, [253, 231, 37, 255]),
         ],
     },
+    // One fixed scale from the stratosphere to the hottest deserts, so a
+    // colour means the same temperature at every pressure level and in every
+    // collection. Colour changes fastest around surface temperatures, and
+    // 0 °C is a hard edge from ice white to green. The kelvin default
+    // (183.15–323.15 K) lies wholly outside these stops, so it is rescaled
+    // onto them exactly: 0 °C lands on 273.15 K.
     BuiltinDef {
         name: "temperature",
         title: "Temperature (°C)",
+        normalized: false,
+        stops: &[
+            // Stratosphere and tropopause: ink to deep purple.
+            (-90.0, [10, 10, 26, 255]),
+            (-80.0, [26, 18, 56, 255]),
+            (-70.0, [43, 22, 86, 255]),
+            // 300–200 hPa: purple through violet, so jets and troughs show.
+            (-60.0, [59, 31, 110, 255]),
+            (-55.0, [90, 38, 135, 255]),
+            (-50.0, [122, 51, 153, 255]),
+            (-45.0, [124, 79, 184, 255]),
+            (-40.0, [106, 102, 201, 255]),
+            // 500 hPa and cold surfaces: royal blue brightening to cyan.
+            (-35.0, [90, 114, 207, 255]),
+            (-30.0, [58, 116, 207, 255]),
+            (-25.0, [47, 138, 214, 255]),
+            (-20.0, [42, 160, 218, 255]),
+            (-15.0, [58, 182, 220, 255]),
+            (-10.0, [95, 202, 223, 255]),
+            (-6.0, [135, 217, 230, 255]),
+            (-3.0, [181, 233, 239, 255]),
+            // 0 °C: a hard edge from ice white to green.
+            (-0.05, [227, 247, 248, 255]),
+            (0.0, [79, 181, 138, 255]),
+            // Surface temperatures: a new hue every couple of degrees.
+            (2.0, [108, 192, 127, 255]),
+            (4.0, [141, 203, 116, 255]),
+            (6.0, [174, 213, 107, 255]),
+            (8.0, [203, 219, 102, 255]),
+            (10.0, [228, 220, 98, 255]),
+            (12.0, [242, 210, 91, 255]),
+            (14.0, [247, 195, 82, 255]),
+            (16.0, [247, 178, 75, 255]),
+            (18.0, [245, 156, 69, 255]),
+            (20.0, [241, 134, 63, 255]),
+            (22.0, [234, 112, 58, 255]),
+            (24.0, [224, 92, 54, 255]),
+            (26.0, [212, 74, 52, 255]),
+            (28.0, [198, 58, 51, 255]),
+            (30.0, [181, 45, 52, 255]),
+            // Heat extremes: crimson to wine, then plum and orchid.
+            (33.0, [156, 32, 55, 255]),
+            (36.0, [130, 22, 56, 255]),
+            (40.0, [100, 17, 54, 255]),
+            (45.0, [125, 43, 111, 255]),
+            (50.0, [179, 102, 169, 255]),
+        ],
+    },
+    // The `temperature` palette before it widened to −90…50 °C, kept for
+    // styles that name it.
+    BuiltinDef {
+        name: "temperature_classic",
+        title: "Temperature, classic (°C)",
         normalized: false,
         stops: &[
             (-40.0, [40, 0, 120, 255]),  // deep purple (extreme cold)
@@ -747,7 +806,8 @@ mod tests {
             ("radar_bookbinder", 21, -32.0, 94.5),
             ("grayscale", 2, 0.0, 1.0),
             ("viridis", 9, 0.0, 1.0),
-            ("temperature", 10, -40.0, 50.0),
+            ("temperature", 38, -90.0, 50.0),
+            ("temperature_classic", 10, -40.0, 50.0),
             ("precipitation", 9, 0.0, 50.0),
             ("precipitation_rate", 9, 0.0, 30.0),
             ("wind_speed", 9, 0.0, 50.0),
