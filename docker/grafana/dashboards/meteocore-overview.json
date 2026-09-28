@@ -2602,6 +2602,11 @@
           "expr": "rate(cap_wis2_evicted_total[1h]) * 3600",
           "refId": "D",
           "legendFormat": "{{collection}} evicted/h"
+        },
+        {
+          "expr": "rate(cap_wis2_evicted_valid_total[1h]) * 3600",
+          "refId": "E",
+          "legendFormat": "{{collection}} still-valid evicted/h (over max_alerts)"
         }
       ]
     },

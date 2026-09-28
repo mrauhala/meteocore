@@ -97,8 +97,12 @@ memory. Things that differ from the pull sources:
   validity of its own and would otherwise sit for the 7-day fallback
   suppressing a re-issued identifier. Eviction once every info's validity
   end (`<expires>`, else onset + `default_ttl`, else receipt + 7 d) is more
-  than `retention_grace` (PT1H) in the past; `max_alerts` (10 000) evicts
-  oldest-received first. `received` is refreshed by every in-place revision
+  than `retention_grace` (PT1H) in the past. Past `max_alerts` (10 000),
+  still-valid alerts are evicted least-important first (#805): onset still
+  ahead, then lowest severity, oldest-received only as the tie-break
+  (`eviction_rank`). Each is counted in `cap_wis2_evicted_valid_total`,
+  logged as a WARN, and the collection is `degraded` while over capacity.
+  `received` is refreshed by every in-place revision
   (same-or-newer pubtime), so both anchors follow the source's latest
   affirmation. **`data_id_index` invariant:** exactly the
   `(current_data_id, (sender, identifier))` pairs of the held alerts — an older
