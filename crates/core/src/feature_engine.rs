@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
-use crate::feature::{Feature, FeaturePage, FeatureQuery, FilterableProperties};
+use crate::feature::{DatetimeInterval, Feature, FeaturePage, FeatureQuery, FilterableProperties};
 
 pub trait FeatureEngine: Send + Sync {
     /// Get a page of features matching the query.
@@ -9,6 +9,26 @@ pub trait FeatureEngine: Send + Sync {
 
     /// Get a single feature by ID.
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError>;
+
+    /// One feature by ID as it stood in the time slice `get_features` selects
+    /// for `datetime` — the by-id counterpart of a `datetime` query, for an
+    /// engine that retains history (engine-nowcast's cell snapshots). Absent
+    /// from that slice, or no slice selected, is `FeatureNotFound`.
+    ///
+    /// Following one feature back through history otherwise means paging
+    /// every slice to find it (#646). The default refuses rather than doing
+    /// that scan: an engine without retained slices has no cheaper answer,
+    /// and a silent full scan is the cost this method exists to avoid.
+    fn get_feature_at(
+        &self,
+        feature_id: &str,
+        datetime: &DatetimeInterval,
+    ) -> Result<Feature, DataServerError> {
+        let _ = (feature_id, datetime);
+        Err(DataServerError::InvalidParameter(
+            "this collection does not serve a feature by id at a time".into(),
+        ))
+    }
 
     /// Total number of features in the collection. Used for collection metadata.
     fn feature_count(&self) -> usize {
@@ -61,6 +81,16 @@ pub trait FeatureEngine: Send + Sync {
     /// OGC API – Common – Part 2, the element is then simply omitted.
     fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         None
+    }
+
+    /// Instants of the retained time slices a `datetime` query selects
+    /// between, oldest first — for engine-nowcast one per cell snapshot,
+    /// including snapshots that hold no features. A caller walking history
+    /// steps from slice to slice instead of probing instants until one
+    /// resolves (#646). Empty (the default) means the engine has no discrete
+    /// slices to enumerate; `temporal_extent` still describes its span.
+    fn available_times(&self) -> Vec<DateTime<Utc>> {
+        Vec::new()
     }
 
     /// Whether `FeatureQuery::datetime` filters this collection's features.

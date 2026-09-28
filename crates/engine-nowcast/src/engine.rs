@@ -37,7 +37,9 @@ use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature::{
+    DatetimeInterval, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
+};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::instances::{build_instances, format_instance_id, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
@@ -2455,6 +2457,48 @@ impl EdrEngine for NowcastEngine {
     }
 }
 
+/// The retained snapshot a `datetime` selects: the NEWEST whose analysis
+/// instant falls inside the interval; none ⇒ the latest. Shared by
+/// `get_features` and `get_feature_at`, so a frame query and a by-id lookup
+/// for the same interval cannot resolve to different frames.
+fn select_snapshot<'a>(
+    history: &'a [CellSnapshot],
+    datetime: Option<&DatetimeInterval>,
+) -> Option<&'a CellSnapshot> {
+    match datetime {
+        None => history.last(),
+        Some(dt) => history.iter().rev().find(|s| {
+            dt.start.is_none_or(|st| s.anchor >= st) && dt.end.is_none_or(|e| s.anchor <= e)
+        }),
+    }
+}
+
+impl NowcastEngine {
+    /// One track of `snapshot` as a feature, without building the rest of
+    /// the frame. Shared by `get_feature` and `get_feature_at`.
+    fn snapshot_feature(
+        &self,
+        snapshot: Option<&CellSnapshot>,
+        feature_id: &str,
+    ) -> Result<Feature, DataServerError> {
+        let not_found = || DataServerError::FeatureNotFound(feature_id.to_string());
+        let snapshot = snapshot.ok_or_else(not_found)?;
+        let id: u64 = feature_id.parse().map_err(|_| not_found())?;
+        let track = snapshot
+            .cells
+            .iter()
+            .find(|t| t.facts.id == id)
+            .ok_or_else(not_found)?;
+        Ok(cell_feature(
+            track,
+            self.lightning_configured,
+            self.impact_configured,
+            self.radar_configured,
+        )
+        .2)
+    }
+}
+
 impl FeatureEngine for NowcastEngine {
     fn filterables(&self) -> ds_core::feature::FilterableProperties {
         self.filterables.clone()
@@ -2475,13 +2519,7 @@ impl FeatureEngine for NowcastEngine {
                 next_offset: None,
             })
         };
-        let snapshot = match &query.datetime {
-            None => state.cell_history.last(),
-            Some(dt) => state.cell_history.iter().rev().find(|s| {
-                dt.start.is_none_or(|st| s.anchor >= st) && dt.end.is_none_or(|e| s.anchor <= e)
-            }),
-        };
-        let Some(snapshot) = snapshot else {
+        let Some(snapshot) = select_snapshot(&state.cell_history, query.datetime.as_ref()) else {
             return empty();
         };
         let mut matched: Vec<Feature> = snapshot
@@ -2547,24 +2585,25 @@ impl FeatureEngine for NowcastEngine {
     }
 
     /// By-id lookup serves the LATEST snapshot's version of the track
-    /// (history is reachable via `get_features` + `datetime`).
+    /// (history is reachable via `get_feature_at`, or `get_features` +
+    /// `datetime`).
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        self.snapshot_feature(self.state.load().cell_history.last(), feature_id)
+    }
+
+    /// The track as it stood in the snapshot `datetime` selects (#646): one
+    /// scan of that snapshot's tracks, one feature built — a history walk no
+    /// longer materializes and pages whole frames to find one cell.
+    fn get_feature_at(
+        &self,
+        feature_id: &str,
+        datetime: &DatetimeInterval,
+    ) -> Result<Feature, DataServerError> {
         let state = self.state.load();
-        let not_found = || DataServerError::FeatureNotFound(feature_id.to_string());
-        let snapshot = state.cell_history.last().ok_or_else(not_found)?;
-        let id: u64 = feature_id.parse().map_err(|_| not_found())?;
-        let track = snapshot
-            .cells
-            .iter()
-            .find(|t| t.facts.id == id)
-            .ok_or_else(not_found)?;
-        Ok(cell_feature(
-            track,
-            self.lightning_configured,
-            self.impact_configured,
-            self.radar_configured,
+        self.snapshot_feature(
+            select_snapshot(&state.cell_history, Some(datetime)),
+            feature_id,
         )
-        .2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on
@@ -2588,6 +2627,18 @@ impl FeatureEngine for NowcastEngine {
             (Some(first), Some(last)) => Some((first.anchor, last.anchor)),
             _ => None,
         }
+    }
+
+    /// Every retained snapshot's analysis instant, oldest first — quiet
+    /// generations included, since a snapshot is pushed whatever its cell
+    /// count. At most `CELL_HISTORY_SNAPSHOTS` instants.
+    fn available_times(&self) -> Vec<DateTime<Utc>> {
+        self.state
+            .load()
+            .cell_history
+            .iter()
+            .map(|s| s.anchor)
+            .collect()
     }
 }
 

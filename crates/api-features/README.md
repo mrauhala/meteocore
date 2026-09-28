@@ -293,6 +293,13 @@ coverage of the labeled footprint and attribution radius. With a source wired,
 outside/unknown coverage and on failed or capped joins. An advertised source
 extent alone does not establish coverage.
 
+`FeatureEngine::available_times` and `get_feature_at` (#646) are not exposed
+over HTTP: `/items` does not list snapshot instants, and `/items/{featureId}`
+still serves the latest snapshot. They serve the MCP `get_cell_track` walk;
+only Nowcast implements them, one instant per retained cell snapshot, quiet
+ones included. Other engines return no instants, and the by-id-at-a-time
+lookup refuses rather than scanning pages.
+
 Compatible nowcast reloads preserve retained cell snapshots and track IDs (#604).
 Edited GeoJSON impact areas are used by the next generation; past snapshots
 keep their original facts. Replaced lightning sources restart the jump baseline

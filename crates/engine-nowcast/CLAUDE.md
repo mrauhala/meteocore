@@ -145,7 +145,11 @@ coasting, joins, or raw-byte forecast encoding. See
   before the retained range (or in the future — cells are analysis-only,
   never forecast) ⇒ 0 features. The collection's temporal extent
   advertises the retained span; by-id GET serves the latest snapshot's
-  version of a track.
+  version of a track. For the MCP track walk (#646), `available_times`
+  lists every retained snapshot's instant, quiet ones included, and
+  `get_feature_at` serves one track from the snapshot a `datetime` selects.
+  It shares `select_snapshot` with `get_features`, so the two cannot pick
+  different frames.
 - **Lightning join (#549, part 2):** `[collections.nowcast]
   lightning_source = "<id>"` names an events-shape engine-postgis
   collection in the same config (wired second-pass via the
