@@ -9,10 +9,14 @@ use zarrs::{
 mod asynchronous;
 
 pub(super) fn codec() -> BoundedCodec {
-    configured(BloscCompressor::LZ4, BloscShuffleMode::Shuffle)
+    configured(BloscCompressor::LZ4, BloscShuffleMode::Shuffle, 4)
 }
 
-fn configured(compressor: BloscCompressor, shuffle: BloscShuffleMode) -> BoundedCodec {
+pub(super) fn configured(
+    compressor: BloscCompressor,
+    shuffle: BloscShuffleMode,
+    typesize: usize,
+) -> BoundedCodec {
     BoundedCodec {
         inner: Arc::new(
             BloscCodec::new(
@@ -20,7 +24,7 @@ fn configured(compressor: BloscCompressor, shuffle: BloscShuffleMode) -> Bounded
                 1.try_into().unwrap(),
                 Some(64),
                 shuffle,
-                Some(4),
+                Some(typesize),
             )
             .unwrap(),
         ),
@@ -43,7 +47,7 @@ fn blosc_full_and_partial_reads_preserve_compressors_and_shuffle_modes() {
             BloscShuffleMode::Shuffle,
             BloscShuffleMode::BitShuffle,
         ] {
-            let codec = Arc::new(configured(compressor, shuffle));
+            let codec = Arc::new(configured(compressor, shuffle, 4));
             let encoded = codec
                 .encode(Cow::Borrowed(&raw), &options)
                 .unwrap()
@@ -83,6 +87,324 @@ fn blosc_full_and_partial_reads_preserve_compressors_and_shuffle_modes() {
             );
         }
     }
+}
+
+#[test]
+fn blosc_partial_reads_return_exact_unaligned_byte_ranges() {
+    let options = crate::catalog::single_threaded_opts();
+    // Lengths 519 and 517 leave a final partial element that getitem's element
+    // indices cannot address; every frame spans several 128-byte blocks.
+    for (typesize, length) in [(4, 512), (4, 519), (8, 517)] {
+        let raw: Vec<u8> = (0..length as u32 / 4 + 1)
+            .flat_map(|n| (n / 3).to_le_bytes())
+            .take(length)
+            .collect();
+        let size = length as u64;
+        let mut ranges: Vec<_> = (0..=size).map(ByteRange::Suffix).collect();
+        for start in 0..=size {
+            ranges.push(ByteRange::FromStart(start, None));
+            for len in [0, 1, 2, 3, 5, 7, 9, 17, 127, 128, 129] {
+                if start + len <= size {
+                    ranges.push(ByteRange::FromStart(start, Some(len)));
+                }
+            }
+        }
+        for shuffle in [
+            BloscShuffleMode::NoShuffle,
+            BloscShuffleMode::Shuffle,
+            BloscShuffleMode::BitShuffle,
+        ] {
+            let codec = Arc::new(configured(BloscCompressor::LZ4, shuffle, typesize));
+            let encoded = codec
+                .encode(Cow::Borrowed(&raw), &options)
+                .unwrap()
+                .into_owned();
+            assert_eq!(usize::from(encoded[3]), typesize);
+            for repr in [
+                BytesRepresentation::FixedSize(size),
+                BytesRepresentation::BoundedSize(size + 16),
+            ] {
+                let decoder = codec
+                    .clone()
+                    .partial_decoder(Arc::new(Cow::Owned(encoded.clone())), &repr, &options)
+                    .unwrap();
+                let values = decoder
+                    .partial_decode_many(Box::new(ranges.iter().copied()), &options)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(values.len(), ranges.len());
+                for (range, value) in ranges.iter().zip(values) {
+                    let bytes = range.to_range(size);
+                    assert_eq!(
+                        value.as_ref(),
+                        &raw[bytes.start as usize..bytes.end as usize],
+                        "{range:?} of {length} bytes, typesize {typesize}, {shuffle:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn blosc_unaligned_ranges_stay_block_level_except_the_final_partial_element() {
+    let options = crate::catalog::single_threaded_opts();
+    let codec = Arc::new(codec());
+    let raw: Vec<u8> = (0..130u32).flat_map(u32::to_le_bytes).take(519).collect();
+    let mut encoded = codec
+        .encode(Cow::Borrowed(&raw), &options)
+        .unwrap()
+        .into_owned();
+    let block = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+    let last = raw.len().div_ceil(block) - 1;
+    const MEMCPYED: u8 = 0x02;
+    assert!(last > 1 && encoded[2] & MEMCPYED == 0, "compressed blocks");
+    // Point the last block outside the frame. c-blosc rejects that offset, so
+    // a full decode fails while getitem over earlier blocks never reads it.
+    encoded[16 + 4 * last..20 + 4 * last].copy_from_slice(&u32::MAX.to_le_bytes());
+    let decoder = codec
+        .partial_decoder(
+            Arc::new(Cow::Owned(encoded)),
+            &BytesRepresentation::BoundedSize(1024),
+            &options,
+        )
+        .unwrap();
+    for (start, end) in [
+        (0, 4),
+        (1, 7),
+        (block - 3, block + 3),
+        (2, last * block - 1),
+    ] {
+        let range = ByteRange::FromStart(start as u64, Some((end - start) as u64));
+        let value = decoder.partial_decode(range, &options).unwrap().unwrap();
+        assert_eq!(value.as_ref(), &raw[start..end], "{range:?}");
+    }
+    // The final partial element (bytes 516..519) needs the corrupt block.
+    for range in [
+        ByteRange::FromStart(0, None),
+        ByteRange::Suffix(1),
+        ByteRange::FromStart(517, Some(1)),
+    ] {
+        assert!(
+            decoder.partial_decode(range, &options).is_err(),
+            "{range:?}"
+        );
+    }
+}
+
+/// Counts full decodes by the partial decoder's fallback.
+#[derive(Debug)]
+struct CountingDecodes {
+    inner: Arc<dyn BytesToBytesCodecTraits>,
+    decodes: std::sync::atomic::AtomicUsize,
+}
+
+impl ExtensionName for CountingDecodes {
+    fn name(&self, version: ZarrVersion) -> Option<Cow<'static, str>> {
+        self.inner.name(version)
+    }
+}
+
+impl CodecTraits for CountingDecodes {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn configuration(
+        &self,
+        version: ZarrVersion,
+        options: &CodecMetadataOptions,
+    ) -> Option<Configuration> {
+        self.inner.configuration(version, options)
+    }
+
+    fn partial_decoder_capability(&self) -> PartialDecoderCapability {
+        self.inner.partial_decoder_capability()
+    }
+
+    fn partial_encoder_capability(&self) -> PartialEncoderCapability {
+        self.inner.partial_encoder_capability()
+    }
+}
+
+impl BytesToBytesCodecTraits for CountingDecodes {
+    fn into_dyn(self: Arc<Self>) -> Arc<dyn BytesToBytesCodecTraits> {
+        self
+    }
+
+    fn recommended_concurrency(
+        &self,
+        representation: &BytesRepresentation,
+    ) -> Result<RecommendedConcurrency, CodecError> {
+        self.inner.recommended_concurrency(representation)
+    }
+
+    fn encoded_representation(&self, representation: &BytesRepresentation) -> BytesRepresentation {
+        self.inner.encoded_representation(representation)
+    }
+
+    fn encode<'a>(
+        &self,
+        bytes: ArrayBytesRaw<'a>,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytesRaw<'a>, CodecError> {
+        self.inner.encode(bytes, options)
+    }
+
+    fn decode<'a>(
+        &self,
+        bytes: ArrayBytesRaw<'a>,
+        representation: &BytesRepresentation,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytesRaw<'a>, CodecError> {
+        self.decodes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.decode(bytes, representation, options)
+    }
+}
+
+#[test]
+fn blosc_partial_batches_share_one_full_decode_for_the_final_partial_element() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let options = crate::catalog::single_threaded_opts();
+    let codec = Arc::new(CountingDecodes {
+        inner: codec().inner,
+        decodes: Default::default(),
+    });
+    let whole = ByteRange::FromStart(0, None);
+    let tail = ByteRange::Suffix(3);
+    let inner = ByteRange::FromStart(1, Some(6));
+    for (length, batches, decodes) in [
+        (
+            519,
+            vec![
+                vec![whole, tail],
+                vec![tail, whole],
+                vec![whole, whole],
+                vec![
+                    whole,
+                    inner,
+                    ByteRange::FromStart(510, Some(8)),
+                    whole,
+                    tail,
+                ],
+            ],
+            1,
+        ),
+        // Aligned frames and ranges before the partial element stay on getitem.
+        (512, vec![vec![whole, tail, whole]], 0),
+        (
+            519,
+            vec![vec![inner, ByteRange::FromStart(0, Some(516))]],
+            0,
+        ),
+    ] {
+        let raw: Vec<u8> = (0..130u32)
+            .flat_map(u32::to_le_bytes)
+            .take(length)
+            .collect();
+        let encoded = codec
+            .encode(Cow::Borrowed(&raw), &options)
+            .unwrap()
+            .into_owned();
+        let input: Arc<dyn BytesPartialDecoderTraits> = Arc::new(Cow::Owned(encoded));
+        let decoder = super::blosc::PartialDecoder::new(
+            input,
+            codec.clone(),
+            BytesRepresentation::BoundedSize(1024),
+        );
+        for ranges in batches {
+            let before = codec.decodes.load(SeqCst);
+            let values = decoder
+                .partial_decode_many(Box::new(ranges.clone().into_iter()), &options)
+                .unwrap()
+                .unwrap();
+            assert_eq!(codec.decodes.load(SeqCst) - before, decodes, "{ranges:?}");
+            assert_eq!(values.len(), ranges.len());
+            for (range, value) in ranges.iter().zip(values) {
+                let bytes = range.to_range(length as u64);
+                assert_eq!(
+                    value.as_ref(),
+                    &raw[bytes.start as usize..bytes.end as usize],
+                    "{range:?} in {ranges:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stacked_gzip_blosc_zstd_partial_reads_return_exact_intermediate_bytes() {
+    let options = crate::catalog::single_threaded_opts();
+    let [gzip, zstd] = super::tests::codecs().map(Arc::new);
+    // Blosc typesize 4 over an opaque gzip stream whose length is usually
+    // not a multiple of four (#780).
+    let blosc = Arc::new(configured(
+        BloscCompressor::LZ4,
+        BloscShuffleMode::Shuffle,
+        4,
+    ));
+    let mut unaligned = 0;
+    for count in 16..24u32 {
+        let raw: Vec<u8> = (0..count).flat_map(|n| (n as f32).to_le_bytes()).collect();
+        let fixed = BytesRepresentation::FixedSize(raw.len() as u64);
+        let gzip_repr = gzip.encoded_representation(&fixed);
+        let blosc_repr = blosc.encoded_representation(&gzip_repr);
+        let stream = gzip
+            .encode(Cow::Borrowed(&raw), &options)
+            .unwrap()
+            .into_owned();
+        let stored = zstd
+            .encode(
+                blosc.encode(Cow::Borrowed(&stream), &options).unwrap(),
+                &options,
+            )
+            .unwrap()
+            .into_owned();
+        unaligned += usize::from(stream.len() % 4 != 0);
+        let input = zstd
+            .clone()
+            .partial_decoder(Arc::new(Cow::Owned(stored)), &blosc_repr, &options)
+            .unwrap();
+        let intermediate = blosc
+            .clone()
+            .partial_decoder(input, &gzip_repr, &options)
+            .unwrap();
+        let size = stream.len() as u64;
+        let ranges = [
+            ByteRange::FromStart(0, None),
+            ByteRange::FromStart(1, Some(6)),
+            ByteRange::FromStart(size - 5, Some(3)),
+            ByteRange::Suffix(3),
+            ByteRange::FromStart(size, None),
+        ];
+        let values = intermediate
+            .partial_decode_many(Box::new(ranges.into_iter()), &options)
+            .unwrap()
+            .unwrap();
+        for (range, value) in ranges.iter().zip(values) {
+            let bytes = range.to_range(size);
+            assert_eq!(
+                value.as_ref(),
+                &stream[bytes.start as usize..bytes.end as usize],
+                "{range:?} of a {size}-byte gzip stream"
+            );
+        }
+        let decoded = gzip
+            .clone()
+            .partial_decoder(intermediate, &fixed, &options)
+            .unwrap();
+        assert_eq!(decoded.decode(&options).unwrap().unwrap(), raw);
+        assert_eq!(
+            decoded
+                .partial_decode(ByteRange::FromStart(4, Some(8)), &options)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &raw[4..12]
+        );
+    }
+    assert!(unaligned > 0, "some gzip stream leaves a partial element");
 }
 
 #[test]
@@ -438,5 +760,44 @@ async fn blosc_async_partial_reads_preserve_values_and_bounds() {
         }
         drop(scope);
         assert_eq!(budget.metrics().0, 0);
+    }
+}
+
+#[cfg(feature = "icechunk")]
+#[tokio::test]
+async fn blosc_async_partial_reads_return_exact_unaligned_ranges() {
+    let options = crate::catalog::single_threaded_opts();
+    let codec = Arc::new(codec());
+    let raw: Vec<u8> = (0..128u32).flat_map(u32::to_le_bytes).take(511).collect();
+    let encoded = codec
+        .encode(Cow::Borrowed(&raw), &options)
+        .unwrap()
+        .into_owned();
+    let partial = codec
+        .async_partial_decoder(
+            Arc::new(Cow::Owned(encoded)),
+            &BytesRepresentation::BoundedSize(512),
+            &options,
+        )
+        .await
+        .unwrap();
+    let ranges = [
+        ByteRange::FromStart(61, Some(7)),
+        ByteRange::FromStart(0, None),
+        ByteRange::Suffix(3),
+        ByteRange::FromStart(2, Some(0)),
+    ];
+    let values = partial
+        .partial_decode_many(Box::new(ranges.into_iter()), &options)
+        .await
+        .unwrap()
+        .unwrap();
+    for (range, value) in ranges.iter().zip(values) {
+        let bytes = range.to_range(511);
+        assert_eq!(
+            value.as_ref(),
+            &raw[bytes.start as usize..bytes.end as usize],
+            "{range:?}"
+        );
     }
 }
