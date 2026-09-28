@@ -712,7 +712,6 @@ fn merge_hints(into: &mut CapAlert, from: &CapAlert) {
     }
 }
 
-/// Latest validity end over an alert's infos (`None` when no info has one).
 /// How much an alert matters to the `max_alerts` cap, ascending: whether
 /// any info is already in force at `now` (its window has started; an info
 /// with no start counts as started), and its highest severity code (0
@@ -736,6 +735,7 @@ fn eviction_rank(
     (active, severity)
 }
 
+/// Latest validity end over an alert's infos (`None` when no info has one).
 fn validity_end(alert: &CapAlert, default_ttl: Option<Duration>) -> Option<DateTime<Utc>> {
     alert
         .infos
