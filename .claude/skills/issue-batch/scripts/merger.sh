@@ -42,6 +42,16 @@ while true; do
         fi
         drop "$n" ;;
       DIRTY) echo "#$n CONFLICTS with main; dropped, merge main in"; drop "$n" ;;
+      # BLOCKED = required checks still running, UNKNOWN = GitHub still
+      # computing: the normal waiting states. Say so once if it lasts.
+      BLOCKED|UNKNOWN)
+        since=$state/blocked.$n
+        [ -f "$since" ] || touch "$since"
+        if [ -z "$(find "$since" -mmin -30)" ] && [ ! -f "$since.told" ]; then
+          touch "$since.told"
+          echo "#$n still $ms after 30 min; check it (a required check stuck?)"
+        fi ;;
+      *) echo "#$n unhandled merge state $ms; dropped"; drop "$n" ;;
     esac
   done < "$q"
   sleep 60

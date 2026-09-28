@@ -10,7 +10,11 @@
 # Entries whose directory is gone are pruned; their branches get the same
 # merged-PR test before deletion. Everything else is listed as kept, with why.
 set -u
-apply=${1:-}
+case ${1:-} in
+  "") apply="" ;;
+  --apply) apply=1 ;;
+  *) echo "usage: cleanup.sh [--apply]" >&2; exit 2 ;;
+esac
 GH=$(command -v gh) || { echo "gh not found"; exit 1; }
 main=$(cd "$(git -C "${0:A:h}" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)
 cd "$main" || exit 1
