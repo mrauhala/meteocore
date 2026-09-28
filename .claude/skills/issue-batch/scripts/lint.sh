@@ -19,9 +19,14 @@ cd "$wt" || exit 1
 cargo fmt || { echo "FMT FAILED $name"; exit 1; }
 pkgs=()
 for crate in "$@"; do pkgs+=(-p "$crate"); done
-out=$(cargo clippy "${pkgs[@]}" --all-targets -- -D warnings 2>&1 \
-  | grep -E "^(error|warning)" -A9 | head -40)
-if [ -n "$out" ]; then
-  echo "LINT FAILED $name"; echo "$out"; exit 1
+out=$(cargo clippy "${pkgs[@]}" --all-targets -- -D warnings 2>&1)
+rc=$?
+diag=$(echo "$out" | grep -E "^(error|warning)" -A9 | head -40)
+# A clippy that never finished (toolchain, ICE, dependency fetch) exits
+# non-zero without an error/warning line: fail on the status too.
+if [ $rc -ne 0 ] || [ -n "$diag" ]; then
+  echo "LINT FAILED $name (clippy exit $rc)"
+  echo "${diag:-$(echo "$out" | tail -20)}"
+  exit 1
 fi
 echo "LINT OK $name"

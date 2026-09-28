@@ -32,10 +32,15 @@ title=$(cat "$title_f")
 body=$(sed '/^🤖 Generated with/,$d' "$body_f")
 printf '%s\n\n%s\n\n%s\n' "$title" "$body" "$(cat "$state/trailers")" > "$state/commitmsg.$name"
 git commit -q -F "$state/commitmsg.$name" || { echo "COMMIT FAILED $name"; exit 1; }
-git push -q -u origin "$branch" 2>&1 | grep -v '^remote:'
+if ! git push -q -u origin "$branch" 2> "$state/push.$name.err"; then
+  echo "PUSH FAILED $name"; grep -v '^remote:' "$state/push.$name.err"; exit 1
+fi
 
 url=$(cd /tmp && $GH pr create --repo "$repo" --base main --head "$branch" \
   --title "$title" --body-file "$body_f" 2>&1 | tail -1)
-echo "$name -> $url"
 n=${url##*/}
-[[ $n == <-> ]] && echo "$n" >> "$state/prs"
+if [[ $n != <-> ]]; then
+  echo "PR CREATE FAILED $name: $url"; exit 1
+fi
+echo "$name -> $url"
+echo "$n" >> "$state/prs"

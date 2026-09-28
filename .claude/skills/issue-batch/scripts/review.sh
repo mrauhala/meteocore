@@ -3,7 +3,9 @@
 #
 # What the automated reviewer said about the PR's CURRENT head:
 #   - whether the latest summary's `meteocore-review:<sha>` marker is the head
-#     (only then does "no issues" count; an older summary is stale);
+#     (only then does "no issues" count; an older summary is stale). Only
+#     comments by the review bot count: anyone can post a comment containing
+#     the marker, and the merge queue trusts this script;
 #   - the summary text;
 #   - every inline comment that is not outdated (line != null), with how many
 #     replies it has, so a finding you already answered is visible as such.
@@ -13,8 +15,11 @@ pr=$1
 GH=$(command -v gh) || { echo "gh not found"; exit 1; }
 REPO=$(cd "${0:A:h}" && $GH repo view --json nameWithOwner --jq .nameWithOwner) || exit 1
 head=$($GH pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid)
-summary=$($GH pr view "$pr" --repo "$REPO" --json comments \
-  --jq '[.comments[] | select(.body | contains("meteocore-review:"))] | last | .body // ""')
+BOT=github-actions[bot]
+summary=$($GH api "repos/$REPO/issues/$pr/comments" --paginate \
+  | jq -rs --arg bot "$BOT" '[add // [] | .[]
+      | select(.user.login == $bot and .user.type == "Bot")
+      | select(.body | contains("meteocore-review:"))] | last | .body // ""')
 marker=$(echo "$summary" | grep -oE 'meteocore-review:[0-9a-f]{40}' | cut -d: -f2)
 if [ -z "$summary" ]; then
   echo "NO REVIEW YET (head ${head:0:7})"
