@@ -168,10 +168,20 @@ be preempted: it retains its CPU/memory permits after timeout/disconnect until
 completion. Pending blocking jobs are aborted before they start.
 
 `render_queue_depth`, `render_queue_capacity`, `render_queue_rejected_total`,
-and `render_deadline_exceeded_total` are exposed in /metrics and Grafana.
+and `render_deadline_exceeded_total{stage}` are exposed in /metrics and
+Grafana. Immediate 503s are `render_queue_rejected_total` plus
+`render_budget_rejected_total{reason="oversize"}`; expiries are
+`render_deadline_exceeded_total`, `stage` `queue` (waiting for memory or a
+slot) or `render` (after admission), and an expired memory wait is also
+`render_budget_rejected_total{reason="deadline"}`.
 `render_duration_seconds{api,collection,outcome}` (#466) is fed by the
 `ds_executor::RenderTiming` extension in `metrics_middleware`; `apply_load`
-drops the series of `(api, collection)` pairs a reload removes (#446).
+drops the series of `(api, collection)` pairs a reload removes (#446). The
+same extension's phases feed `render_phase_seconds{api,phase}` (#147):
+queue, engine, assemble (WMS meta-tiles), encode, one sample per phase a
+served render ran. No `collection` label: queue wait belongs to the shared
+slots, the per-collection tail is `render_duration_seconds`, and fixed labels
+need no reload pruning.
 
 ## Operational notes
 

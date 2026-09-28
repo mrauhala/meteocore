@@ -809,6 +809,28 @@ mod get_tile {
         }
     }
 
+    /// A cold map tile reports its admission, engine read and encode phases
+    /// (#147); the cached repeat ran none of them.
+    #[tokio::test]
+    async fn tile_reports_render_phases() {
+        use ds_executor::RenderTiming;
+        let app = build_router();
+        let mut recorded = Vec::new();
+        for _ in 0..2 {
+            let req = Request::builder()
+                .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let timing = resp.extensions().get::<RenderTiming>().unwrap();
+            let phases: Vec<_> = timing.phases.iter().map(|(p, _)| p.as_str()).collect();
+            recorded.push(phases);
+        }
+        assert_eq!(recorded[0], ["queue", "engine", "encode"]);
+        assert!(recorded[1].is_empty(), "a hit runs no phase");
+    }
+
     /// Pin the post-render MISS → 304 branch. Use a fresh router (no
     /// cache-warm) so the first `If-None-Match`-bearing request must
     /// go through the full render path; assert the 304 carries

@@ -94,3 +94,8 @@ image. Meta-tile fan-out checks the same deadline between tiles.
 Every served GetMap carries a `ds_executor::RenderTiming` (timed from the
 rendered-cache lookup): `hit`, `assembled` (meta-tiles all cached) or `cold`.
 An error tile carries none. Maps and Tiles report `hit`/`cold` the same way.
+Its render phases (#147) reuse the slow-render log's measurements, never a
+second timer: `sem_wait` is `queue`; a meta-tiled view reports
+`MetaTileStats.engine` (uncached tiles only) as `engine`, `assemble`, and
+`colorize + encode` as `encode`, matching the direct path's `render_tile`.
+An all-nodata view skips assemble/encode; a hit reports no phase.

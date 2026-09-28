@@ -34,7 +34,10 @@ pub static RENDER_MEMORY: LazyLock<Arc<RenderBudget>> = LazyLock::new(|| {
 pub struct RenderBudget {
     capacity: u64,
     used: AtomicU64,
-    rejected: AtomicU64,
+    /// Requests larger than the whole budget, shed before queueing.
+    oversize: AtomicU64,
+    /// Requests whose deadline expired while waiting for memory.
+    expired: AtomicU64,
     released: Notify,
 }
 
@@ -43,7 +46,8 @@ impl RenderBudget {
         Self {
             capacity,
             used: AtomicU64::new(0),
-            rejected: AtomicU64::new(0),
+            oversize: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
             released: Notify::new(),
         }
     }
@@ -55,8 +59,19 @@ impl RenderBudget {
         self.capacity
             .saturating_sub(self.used.load(Ordering::Relaxed))
     }
+    /// Every rejection: [`Self::rejected_oversize`] plus [`Self::rejected_deadline`].
     pub fn rejected(&self) -> u64 {
-        self.rejected.load(Ordering::Relaxed)
+        self.rejected_oversize() + self.rejected_deadline()
+    }
+    /// Requests larger than the whole budget: an immediate 503 that retrying
+    /// cannot fix, never a wait.
+    pub fn rejected_oversize(&self) -> u64 {
+        self.oversize.load(Ordering::Relaxed)
+    }
+    /// Requests whose deadline expired while waiting for memory; each is also
+    /// a queue-stage render deadline expiry.
+    pub fn rejected_deadline(&self) -> u64 {
+        self.expired.load(Ordering::Relaxed)
     }
 
     pub(crate) fn fits(&self, width: u32, height: u32) -> bool {
@@ -66,8 +81,12 @@ impl RenderBudget {
             .is_some_and(|bytes| bytes <= self.capacity)
     }
 
-    pub(crate) fn reject(&self) {
-        self.rejected.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn reject_oversize(&self) {
+        self.oversize.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reject_deadline(&self) {
+        self.expired.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) async fn reserve(self: &Arc<Self>, width: u32, height: u32) -> RenderPermit {

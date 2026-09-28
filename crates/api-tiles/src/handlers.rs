@@ -15,7 +15,7 @@ use ds_core::config::CollectionConfig;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::MapEngine;
-use ds_executor::{RenderOutcome, RenderTiming};
+use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
 use ds_mvt::{
     encode_tile, properties_hash, CachedTile, PropertyAllowlist, TileEncodeOptions, TmsKind,
     VectorTileCache, VectorTileKey,
@@ -2253,6 +2253,7 @@ async fn render_tile(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
+    let queue_start = std::time::Instant::now();
     let (job, memory_permit) = ds_executor::RenderJob::acquire_raster(
         state.render_semaphore.clone(),
         tile_size,
@@ -2261,6 +2262,10 @@ async fn render_tile(
     .await
     .map_err(TilesError::from)?;
     let worker_memory = memory_permit.clone();
+    // Where the render's time goes (#147): admission here, the engine read
+    // and encode in the worker.
+    let mut phases = RenderPhases::default();
+    phases.add(RenderPhase::Queue, queue_start.elapsed());
 
     // Render on a blocking thread
     let engine = engine.clone();
@@ -2275,7 +2280,9 @@ async fn render_tile(
     let render_result = job
         .run(move || {
             let _memory_permit = worker_memory;
+            let mut phases = phases;
 
+            let engine_start = std::time::Instant::now();
             let tile = engine.get_raster_tile(
                 bbox,
                 tile_size,
@@ -2289,18 +2296,22 @@ async fn render_tile(
                 // run swap mid-render without mixing runs in one response.
                 reference_time,
             )?;
+            phases.add(RenderPhase::Engine, engine_start.elapsed());
 
             // If every pixel is nodata, skip colorization + encoding entirely.
             if tile.is_empty() {
-                return Ok(None);
+                return Ok((None, phases));
             }
 
-            ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
+            let encode_start = std::time::Instant::now();
+            let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
+            phases.add(RenderPhase::Encode, encode_start.elapsed());
+            Ok::<_, ds_core::error::DataServerError>((Some(bytes), phases))
         })
         .await
         .map_err(TilesError::from)?;
 
-    let maybe_bytes = render_result.map_err(|e| {
+    let (maybe_bytes, phases) = render_result.map_err(|e| {
         use ds_core::error::DataServerError as DSE;
         // A client mistake (multi-parameter collection rendered without a
         // parameter, bad bbox/datetime) is a 400 with the engine's message,
@@ -2376,11 +2387,10 @@ async fn render_tile(
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
                 .header(header::HeaderName::from_static("x-cache"), x_cache)
-                .extension(RenderTiming::since(
-                    collection_id,
-                    RenderOutcome::Cold,
-                    render_start,
-                ))
+                .extension(
+                    RenderTiming::since(collection_id, RenderOutcome::Cold, render_start)
+                        .with_phases(phases),
+                )
                 .body(axum::body::Body::empty())
                 .unwrap()
                 .into_response());
@@ -2397,11 +2407,10 @@ async fn render_tile(
             "nosniff",
         )
         .header(header::HeaderName::from_static("x-cache"), x_cache)
-        .extension(RenderTiming::since(
-            collection_id,
-            RenderOutcome::Cold,
-            render_start,
-        ))
+        .extension(
+            RenderTiming::since(collection_id, RenderOutcome::Cold, render_start)
+                .with_phases(phases),
+        )
         .body(axum::body::Body::from(cached.into_bytes()))
         .unwrap()
         .into_response())

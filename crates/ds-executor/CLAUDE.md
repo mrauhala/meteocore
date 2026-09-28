@@ -24,3 +24,10 @@ waiting. Global slots and queue survive reload. Metrics snapshot is exported
 through server and its Grafana dashboard. `RenderTiming` is the response
 extension raster handlers attach (registry collection id + fixed
 `RenderOutcome`); server records it as `render_duration_seconds` (#466).
+Its `RenderPhases` (fixed `RenderPhase`: queue, engine, assemble, encode)
+become `render_phase_seconds` (#147); a phase a render skipped stays unset
+and records nothing, so a hit carries none. Expired deadlines count by stage
+(`timed_out_queue` waiting for memory or a slot, `timed_out_render` after
+admission) and memory rejections by reason (`rejected_oversize` is an
+immediate 503, `rejected_deadline` an expired memory wait): the counters
+must keep immediate sheds and deadline expiries apart.

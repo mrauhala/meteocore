@@ -1177,6 +1177,98 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Render phases — p50 by API",
+      "description": "Where a typical served WMS/Maps/Tiles render spends its time (#147). queue = waiting for raster memory and a render slot; engine = the engine's get_raster_tile (source read, decode, reproject; summed over a WMS view's uncached meta-tiles); assemble = WMS meta-tile resample; encode = colorize + image encode. Hits run no phase and are not here, and the collection picker does not apply: phases are labelled by API only.",
+      "id": 74,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, api, phase) (rate(render_phase_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "{{api}} {{phase}} p50"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Render phases — p95 by API",
+      "description": "Where the slow renders spend their time (#147). A rising queue line over a flat engine line means too few render slots ([server] render_concurrency); a rising engine line means the source is slow (remote store, decode, overview choice). Renders that expired are not here: see the stage split in 'Render shedding and deadlines'. queue = waiting for raster memory and a render slot; engine = the engine's get_raster_tile (source read, decode, reproject; summed over a WMS view's uncached meta-tiles); assemble = WMS meta-tile resample; encode = colorize + image encode. Hits run no phase and are not here, and the collection picker does not apply: phases are labelled by API only.",
+      "id": 75,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, api, phase) (rate(render_phase_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "{{api}} {{phase}} p95"
+        }
+      ]
+    },
+    {
       "type": "logs",
       "title": "Slow renders (>0.5 s) — from logs",
       "description": "Every `slow WMS meta-tile render` line: which layer, how long, how many tiles, and whether time went to the semaphore (sem_wait) or the tile loop. This panel is how the #472 night spikes and the #476 eviction bursts were diagnosed.",
@@ -1185,7 +1277,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 64
+        "y": 72
       },
       "datasource": {
         "type": "loki",
@@ -1218,7 +1310,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 73
+        "y": 81
       },
       "panels": []
     },
@@ -1231,7 +1323,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 74
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -1346,7 +1438,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 74
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -1459,7 +1551,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 74
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -1574,7 +1666,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 82
+        "y": 90
       },
       "datasource": {
         "type": "prometheus",
@@ -1630,7 +1722,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 82
+        "y": 90
       },
       "datasource": {
         "type": "prometheus",
@@ -1703,7 +1795,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 98
+        "y": 106
       },
       "panels": []
     },
@@ -1716,7 +1808,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 99
+        "y": 107
       },
       "datasource": {
         "type": "prometheus",
@@ -1767,7 +1859,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 99
+        "y": 107
       },
       "datasource": {
         "type": "prometheus",
@@ -1813,7 +1905,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 107
+        "y": 115
       },
       "datasource": {
         "type": "prometheus",
@@ -1860,7 +1952,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 107
+        "y": 115
       },
       "datasource": {
         "type": "prometheus",
@@ -1907,7 +1999,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 111
+        "y": 119
       },
       "panels": []
     },
@@ -1920,7 +2012,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 112
+        "y": 120
       },
       "datasource": {
         "type": "prometheus",
@@ -1971,7 +2063,7 @@
         "h": 8,
         "w": 10,
         "x": 4,
-        "y": 112
+        "y": 120
       },
       "datasource": {
         "type": "prometheus",
@@ -2032,7 +2124,7 @@
         "h": 8,
         "w": 10,
         "x": 14,
-        "y": 112
+        "y": 120
       },
       "datasource": {
         "type": "prometheus",
@@ -2098,7 +2190,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 120
+        "y": 128
       },
       "panels": []
     },
@@ -2111,7 +2203,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 121
+        "y": 129
       },
       "datasource": {
         "type": "prometheus",
@@ -2164,7 +2256,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 121
+        "y": 129
       },
       "datasource": {
         "type": "prometheus",
@@ -2227,7 +2319,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 129
+        "y": 137
       },
       "datasource": {
         "type": "prometheus",
@@ -2278,7 +2370,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 129
+        "y": 137
       },
       "datasource": {
         "type": "prometheus",
@@ -2325,7 +2417,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 129
+        "y": 137
       },
       "datasource": {
         "type": "prometheus",
@@ -2376,7 +2468,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 137
+        "y": 145
       },
       "datasource": {
         "type": "prometheus",
@@ -2443,7 +2535,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 137
+        "y": 145
       },
       "datasource": {
         "type": "prometheus",
@@ -2491,7 +2583,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 145
+        "y": 153
       },
       "panels": []
     },
@@ -2504,7 +2596,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 146
+        "y": 154
       },
       "datasource": {
         "type": "prometheus",
@@ -2562,7 +2654,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 146
+        "y": 154
       },
       "datasource": {
         "type": "prometheus",
@@ -2615,7 +2707,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 146
+        "y": 154
       },
       "datasource": {
         "type": "prometheus",
@@ -2678,7 +2770,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 154
+        "y": 162
       },
       "datasource": {
         "type": "prometheus",
@@ -2746,7 +2838,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 154
+        "y": 162
       },
       "datasource": {
         "type": "prometheus",
@@ -2799,7 +2891,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 162
+        "y": 170
       },
       "datasource": {
         "type": "prometheus",
@@ -2852,7 +2944,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 162
+        "y": 170
       },
       "datasource": {
         "type": "prometheus",
@@ -2910,7 +3002,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 170
+        "y": 178
       },
       "panels": []
     },
@@ -2923,7 +3015,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 171
+        "y": 179
       },
       "datasource": {
         "type": "loki",
@@ -2956,7 +3048,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 180
+        "y": 188
       },
       "datasource": {
         "type": "loki",
@@ -2989,7 +3081,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 90
+        "y": 98
       },
       "datasource": {
         "type": "prometheus",
@@ -3072,7 +3164,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 190
+        "y": 198
       },
       "datasource": {
         "type": "prometheus",
@@ -3118,13 +3210,13 @@
     {
       "type": "timeseries",
       "title": "Raster memory rejections",
-      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Contention waits in the bounded render queue; oversized requests or expired memory waits are rejected. Separate from source decoding and resident caches.",
+      "description": "Transient output-buffer estimate, 32 bytes/pixel. MC_RENDER_MEMORY_MB controls capacity. Contention waits in the bounded render queue. By reason: oversize = larger than the whole budget, rejected at once; deadline = expired waiting for memory, also counted as a queue-stage deadline. Separate from source decoding and resident caches.",
       "id": 62,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 190
+        "y": 198
       },
       "datasource": {
         "type": "prometheus",
@@ -3156,9 +3248,9 @@
       },
       "targets": [
         {
-          "expr": "rate(render_budget_rejected_total[$__rate_interval])",
+          "expr": "sum by (reason) (rate(render_budget_rejected_total[$__rate_interval]))",
           "refId": "A",
-          "legendFormat": "rejected/s"
+          "legendFormat": "{{reason}} rejected/s"
         }
       ]
     },
@@ -3170,7 +3262,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 198
+        "y": 206
       },
       "datasource": {
         "type": "prometheus",
@@ -3209,7 +3301,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 198
+        "y": 206
       },
       "datasource": {
         "type": "prometheus",
@@ -3247,7 +3339,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 206
+        "y": 214
       },
       "targets": [
         {
@@ -3281,6 +3373,7 @@
       "id": 66,
       "type": "timeseries",
       "title": "Render shedding and deadlines",
+      "description": "Raster renders refused with 503 by the shared render executor. At once: queue full, or oversize (larger than the whole memory budget). Deadline by stage: queue = expired waiting for memory or a render slot, render = expired after admission, in dispatch, engine read or encode.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -3289,7 +3382,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 206
+        "y": 214
       },
       "targets": [
         {
@@ -3298,9 +3391,14 @@
           "refId": "A"
         },
         {
-          "expr": "rate(render_deadline_exceeded_total[5m])",
-          "legendFormat": "Deadline / s",
+          "expr": "sum by (stage) (rate(render_deadline_exceeded_total[5m]))",
+          "legendFormat": "Deadline ({{stage}}) / s",
           "refId": "B"
+        },
+        {
+          "expr": "rate(render_budget_rejected_total{reason=\"oversize\"}[5m])",
+          "legendFormat": "Oversize / s",
+          "refId": "C"
         }
       ],
       "fieldConfig": {
@@ -3328,7 +3426,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 214
+        "y": 222
       },
       "datasource": {
         "type": "prometheus",
@@ -3367,7 +3465,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 214
+        "y": 222
       },
       "datasource": {
         "type": "prometheus",
@@ -3411,7 +3509,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 214
+        "y": 222
       },
       "datasource": {
         "type": "prometheus",
@@ -3450,7 +3548,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 222
+        "y": 230
       },
       "datasource": {
         "type": "prometheus",
@@ -3494,7 +3592,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 222
+        "y": 230
       },
       "datasource": {
         "type": "prometheus",
