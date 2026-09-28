@@ -1451,6 +1451,17 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | `ir_bt_grey` | Satellite IR brightness temperature, cold white → warm black | 180–330 K |
 | `ir_bt_enhanced` | IR grey with a colour ramp over cold cloud tops below 243 K | 180–330 K |
 
+**Style range vs palette values** (#823): `min` and `max` set the value range
+a style renders. Normalized palettes (`viridis`, `grayscale`, range 0–1)
+always span it. Every other palette keeps its physical values: a range that
+overlaps its stops clips, so on `temperature` with `min = 0`, `max = 40`,
+0 °C keeps its own colour. Only a range lying entirely outside the palette's
+values is rescaled onto them, because clipping could then paint only one
+colour. That is usually a unit mismatch, such as the °C `temperature`
+palette given a kelvin range. Legends show the rescaled values; the
+palette's title keeps its original unit. The same rule applies to inline
+`color_stops`.
+
 **Per-parameter default styles** (#320) — parameters of multi-parameter
 collections (GRIB, QueryData, Zarr, radar volumes) with no explicit style
 are matched against a built-in defaults table by normalized name/title plus

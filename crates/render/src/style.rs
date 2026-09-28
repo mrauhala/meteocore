@@ -99,6 +99,11 @@ impl StyleContext {
                 // order), which would otherwise break the bracket lookup.
                 let palette = Arc::new(Palette::new("custom", stops, Interpolation::Linear));
                 let (min, max) = range_for(&palette, spec.min, spec.max);
+                // Inline stops follow the named-palette rule below (#823).
+                let palette = match palette.fitted_to(min, max) {
+                    Some(fitted) => Arc::new(fitted),
+                    None => palette,
+                };
                 let colormap: Arc<dyn ColorMap> =
                     Arc::new(LinearColorMap::new(palette.stops.clone()));
                 return Ok(ResolvedColormap {
@@ -118,14 +123,15 @@ impl StyleContext {
             .get(name)
             .ok_or_else(|| format!("unknown colormap '{name}'"))?;
         let (min, max) = range_for(&palette, spec.min, spec.max);
-        // A normalized palette (viridis, grayscale: stops on 0..1) spans the
-        // style's range; sampled as physical values its stops would clamp
-        // every value of e.g. 0..100 to one end, one colour (#823). The
-        // stretched palette is also what the legend reads.
-        let palette = if palette.normalized {
-            Arc::new(palette.stretched(min, max))
-        } else {
-            palette
+        // Sampled as physical values over a range its stops don't reach, a
+        // palette clamps every value to one end, one colour (#823): a
+        // normalized palette (viridis, grayscale: stops on 0..1) therefore
+        // always spans the style's range, and a data-valued one is rescaled
+        // only when the range lies entirely outside its stops. The fitted
+        // palette is also what the legend reads.
+        let palette = match palette.fitted_to(min, max) {
+            Some(fitted) => Arc::new(fitted),
+            None => palette,
         };
         let colormap: Arc<dyn ColorMap> = Arc::new(LutColorMap::from_palette(&palette, min, max));
         Ok(ResolvedColormap {
@@ -570,6 +576,97 @@ mod tests {
         assert_eq!(stops.first().unwrap().value, 0.0);
         assert_eq!(stops.last().unwrap().value, 100.0);
         assert!(!r.palette.normalized);
+    }
+
+    fn close(got: [u8; 4], want: [u8; 4]) -> bool {
+        got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 2)
+    }
+
+    /// A range entirely outside a data-valued palette's stops is rescaled
+    /// onto them (#823): the °C `temperature` palette over the #320 kelvin
+    /// range paints each temperature in its own colour, not all dark red.
+    #[test]
+    fn disjoint_range_rescales_a_data_valued_palette() {
+        let ctx = StyleContext::with_builtins();
+        let r = ctx
+            .build_colormap(&StyleSpec {
+                colormap: Some("temperature"),
+                color_stops: &[],
+                min: Some(233.15),
+                max: Some(323.15),
+            })
+            .unwrap();
+        let celsius = ctx.registry.get("temperature").unwrap();
+        // Whole kelvins: the integer LUT rounds to them.
+        for kelvin in [240.0, 273.0, 300.0] {
+            let (got, want) = (
+                r.colormap.color(Some(kelvin)),
+                celsius.sample(kelvin - 273.15),
+            );
+            assert!(close(got, want), "{kelvin} K: {got:?} vs {want:?}");
+        }
+        assert_ne!(r.colormap.color(Some(240.0)), r.colormap.color(Some(300.0)));
+        // The legend reads the rescaled stops, in the data's unit.
+        let stops = &r.palette.stops;
+        assert!((stops.first().unwrap().value - 233.15).abs() < 1e-9);
+        assert!((stops.last().unwrap().value - 323.15).abs() < 1e-9);
+    }
+
+    /// A range overlapping a data-valued palette keeps its physical colours:
+    /// 20 °C on `temperature` over 0..40 is the palette's own 20 °C, and a
+    /// range merely touching the stops still counts as overlapping.
+    #[test]
+    fn overlapping_range_keeps_physical_colours() {
+        let ctx = StyleContext::with_builtins();
+        let celsius = ctx.registry.get("temperature").unwrap();
+        for (min, max) in [(0.0, 40.0), (50.0, 100.0), (-60.0, -40.0)] {
+            let r = ctx
+                .build_colormap(&StyleSpec {
+                    colormap: Some("temperature"),
+                    color_stops: &[],
+                    min: Some(min),
+                    max: Some(max),
+                })
+                .unwrap();
+            assert_eq!(r.palette.stops, celsius.stops, "{min}..{max}");
+            let mid = (min + max) / 2.0;
+            let (got, want) = (r.colormap.color(Some(mid)), celsius.sample(mid));
+            assert!(close(got, want), "{mid}: {got:?} vs {want:?}");
+        }
+    }
+
+    /// Inline `color_stops` follow the same rule as named palettes.
+    #[test]
+    fn inline_stops_rescale_only_onto_a_disjoint_range() {
+        let ctx = StyleContext::with_builtins();
+        let stops = [
+            ds_core::config::ColorStop {
+                value: 0.0,
+                color: "#000000".into(),
+            },
+            ds_core::config::ColorStop {
+                value: 10.0,
+                color: "#FFFFFF".into(),
+            },
+        ];
+        let resolve = |min, max| {
+            ctx.build_colormap(&StyleSpec {
+                colormap: None,
+                color_stops: &stops,
+                min: Some(min),
+                max: Some(max),
+            })
+            .unwrap()
+        };
+        let disjoint = resolve(100.0, 200.0);
+        assert_eq!(disjoint.palette.stops.first().unwrap().value, 100.0);
+        assert_eq!(disjoint.palette.stops.last().unwrap().value, 200.0);
+        assert!(close(
+            disjoint.colormap.color(Some(150.0)),
+            [128, 128, 128, 255]
+        ));
+        let overlapping = resolve(5.0, 50.0);
+        assert_eq!(overlapping.palette.stops.last().unwrap().value, 10.0);
     }
 
     // CollectionConfig is deserialized from TOML in production (per-file
