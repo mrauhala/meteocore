@@ -1453,10 +1453,11 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | `lightning_age` | Lightning strike age, near-white → orange → dark violet | 0–60 min |
 | `ir_bt_grey` | Satellite IR brightness temperature, cold white → warm black | 180–330 K |
 | `ir_bt_enhanced` | IR grey with a colour ramp over cold cloud tops below 243 K | 180–330 K |
+| `diverging` | Blue → white → red for signed fields, zero on the midpoint of a symmetric range | 0–1 |
 
 **Style range vs palette values** (#823): `min` and `max` set the value range
-a style renders. Normalized palettes (`viridis`, `grayscale`, range 0–1)
-always span it. Every other palette keeps its physical values: a range that
+a style renders. Normalized palettes (`viridis`, `grayscale`, `diverging`,
+range 0–1) always span it. Every other palette keeps its physical values: a range that
 overlaps its stops clips, so on `temperature` with `min = 0`, `max = 40`,
 0 °C keeps its own colour. Only a range lying entirely outside the palette's
 values is rescaled onto them, because clipping could then paint only one
@@ -1471,8 +1472,15 @@ are matched against a built-in defaults table by normalized name/title plus
 each parameter's unit: `t2m`/`2t`/`TMP` (unit K or C) → `temperature`,
 `msl`/`mslp` (Pa or hPa) → `pressure`, `DBZH`/`dbz` → `radar_dbz`,
 `VRADH` → `radial_velocity`, satellite brightness temperature / cloud top
-temperature (unit K) → `ir_bt_enhanced`, humidity/cloud/wind/precipitation
-likewise.
+temperature (unit K) → `ir_bt_enhanced`, relative humidity/cloud/wind
+speed/precipitation likewise. Signed fields take `diverging` centred on
+zero: `u`/`v`/`10u`/`10v` wind components (±40 m/s, ±80 kt), vertical
+velocity `w` (±2 Pa/s; geometric ±1 m/s), vorticity `vo` (±2·10⁻⁴ s⁻¹) and
+divergence `d` (±1·10⁻⁴ s⁻¹). `viridis` covers geopotential `z`/`gh`
+(0–21 000 gpm, every pressure level up to 50 hPa), surface pressure `sp`
+(500–1050 hPa, apart from MSLP), specific humidity `q` (0–0.02 kg/kg or
+0–20 g/kg, never the relative-humidity percent range) and total column
+water vapour `tcwv` (0–70 mm); snowfall `sf` (mm) takes `precipitation`.
 Unit-gated rules never guess (a temperature with no unit hint stays on the
 collection style). Defaults win over the collection-level colormap for
 those parameters; opt out per collection with
@@ -1482,7 +1490,8 @@ top-level `[[parameter_defaults]]` blocks (`names`/`contains`, `colormap`,
 
 For multi-parameter rasters, defaults and legend labels use each selected
 parameter's own unit: GRIB display units, Zarr CF units, or ODIM quantity units.
-Temperature and pressure defaults require a known unit; unknown units (including
+Temperature, pressure and the signed, geopotential, specific-humidity,
+column-water and snowfall defaults above require a known unit; unknown units (including
 QueryData descriptors without unit metadata) stay unlabelled and use the
 configured fallback style. Explicit parameter styles still take precedence.
 

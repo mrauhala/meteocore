@@ -91,7 +91,36 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[],
         fallback_range: Some((0.0, 50.0)),
     },
-    // Wind speed / gust.
+    // Snowfall water equivalent (ECMWF `sf`) — the precipitation scale, but
+    // unit-gated: snowfall is also published in metres, which 0..50 would
+    // render as no snow at all.
+    DefaultRule {
+        names: &["sf"],
+        contains: &["snowfall"],
+        palette: "precipitation",
+        unit_ranges: &[(&["mm", "kgm2"], 0.0, 50.0)],
+        fallback_range: None,
+    },
+    // Signed wind components (u/v) — diverging about zero, on the wind-speed
+    // rule's scale. Before it, so a "u-component of wind gust" title stays
+    // signed.
+    DefaultRule {
+        names: &[
+            "u", "v", "10u", "10v", "100u", "100v", "u10", "v10", "u100", "v100", "ugrd", "vgrd",
+        ],
+        contains: &[
+            "componentofwind",
+            "windcomponent",
+            "eastwardwind",
+            "northwardwind",
+        ],
+        palette: "diverging",
+        unit_ranges: &[
+            (&["ms", "ms1", "mps"], -40.0, 40.0),
+            (&["kt", "kn", "knots"], -80.0, 80.0),
+        ],
+        fallback_range: None,
+    },
     DefaultRule {
         names: &["ws", "ff", "si10", "10si", "gust", "fg", "wgust"],
         contains: &["windspeed", "windgust"],
@@ -102,9 +131,71 @@ static RULES: &[DefaultRule] = &[
         ],
         fallback_range: Some((0.0, 40.0)),
     },
+    // Vertical velocity — diverging about zero. Pressure (omega, Pa s-1,
+    // negative = ascent) and geometric (m s-1) velocities differ in unit and
+    // scale, so the rule is unit-gated. Before the pressure rule, which would
+    // otherwise claim the "Vertical velocity (pressure)" title.
+    DefaultRule {
+        names: &["w", "omega", "vvel", "wz", "dzdt"],
+        contains: &["verticalvelocity"],
+        palette: "diverging",
+        unit_ranges: &[(&["pas1", "pas"], -2.0, 2.0), (&["ms", "ms1"], -1.0, 1.0)],
+        fallback_range: None,
+    },
+    // Vorticity (relative or absolute), s-1 — diverging about zero.
+    // Potential vorticity carries another unit and does not match.
+    DefaultRule {
+        names: &["vo", "relv", "absv"],
+        contains: &["vorticity"],
+        palette: "diverging",
+        unit_ranges: &[(&["s1", "1s"], -2e-4, 2e-4)],
+        fallback_range: None,
+    },
+    // Divergence, s-1 — diverging about zero; convergence is negative.
+    DefaultRule {
+        names: &["d", "reld"],
+        contains: &["divergence"],
+        palette: "diverging",
+        unit_ranges: &[(&["s1", "1s"], -1e-4, 1e-4)],
+        fallback_range: None,
+    },
+    // Geopotential / geopotential height. The matcher never sees the level,
+    // so one range serves every pressure level: 0–21 000 gpm spans 1000 hPa
+    // up to 50 hPa (~20.6 km), and 206 000 m2 s-2 is the same height as
+    // geopotential. Names only: a "Geopotential height anomaly" title is
+    // signed and must not match.
+    DefaultRule {
+        names: &[
+            "z",
+            "gh",
+            "hgt",
+            "fi",
+            "zg",
+            "geopotential",
+            "geopotentialheight",
+        ],
+        contains: &[],
+        palette: "viridis",
+        unit_ranges: &[(&["gpm", "m"], 0.0, 21_000.0), (&["m2s2"], 0.0, 206_000.0)],
+        fallback_range: None,
+    },
+    // Surface pressure: elevated terrain reaches ~500 hPa, so it needs a far
+    // wider range than MSLP, and a normalized palette — the MSLP palette's
+    // stops are 950–1050 hPa, which would paint every plateau one colour.
+    // Before the MSLP rule, which the "Pressure (surface)" title also matches.
+    DefaultRule {
+        names: &["sp"],
+        contains: &["surfacepressure", "pressuresurface", "surfaceairpressure"],
+        palette: "viridis",
+        unit_ranges: &[
+            (&["pa"], 50_000.0, 105_000.0),
+            (&["hpa", "mbar", "mb"], 500.0, 1050.0),
+        ],
+        fallback_range: None,
+    },
     // Pressure / MSLP — unit-gated: Pa vs hPa ranges differ 100×.
     DefaultRule {
-        names: &["msl", "mslp", "pres", "slp", "prmsl", "sp"],
+        names: &["msl", "mslp", "pres", "slp", "prmsl"],
         contains: &["pressure", "mslp"],
         palette: "pressure",
         unit_ranges: &[
@@ -113,10 +204,33 @@ static RULES: &[DefaultRule] = &[
         ],
         fallback_range: None,
     },
-    // Relative humidity.
+    // Specific humidity / humidity mixing ratio, a mass fraction — never the
+    // relative-humidity percent range. Unit-gated, and the RH rule below
+    // matches only relative humidity, so an unknown unit gets no default.
     DefaultRule {
-        names: &["rh", "r", "2r", "r2"],
-        contains: &["humidity"],
+        names: &["q", "spfh"],
+        contains: &["specifichumidity", "humiditymixingratio"],
+        palette: "viridis",
+        unit_ranges: &[
+            (&["kgkg1", "kgkg", "1"], 0.0, 0.02),
+            (&["gkg1", "gkg"], 0.0, 20.0),
+        ],
+        fallback_range: None,
+    },
+    // Total column water (vapour), mm = kg m-2.
+    DefaultRule {
+        names: &["tcwv", "tcw"],
+        contains: &["totalcolumnwater", "columnintegratedwatervapour"],
+        palette: "viridis",
+        unit_ranges: &[(&["mm", "kgm2"], 0.0, 70.0)],
+        fallback_range: None,
+    },
+    // Relative humidity. `contains` names relative humidity explicitly:
+    // "Specific humidity" must not reach the percent range. A bare
+    // `Humidity` short name (FMI QueryData, no unit metadata) still matches.
+    DefaultRule {
+        names: &["rh", "r", "2r", "r2", "humidity"],
+        contains: &["relativehumidity"],
         palette: "humidity",
         unit_ranges: &[(&["", "percent", "pct"], 0.0, 100.0), (&["1"], 0.0, 1.0)],
         fallback_range: Some((0.0, 100.0)),
@@ -402,6 +516,201 @@ mod tests {
             None
         );
         assert_eq!(d.match_default("unknown", "", Some("K")), None);
+    }
+
+    /// #763: GRIB fields that had no rule or the wrong one, with the names,
+    /// titles and display units engine-grib publishes (plus the wgrib2 and
+    /// CF spellings of the same fields).
+    #[test]
+    fn grib_fields_get_field_specific_defaults() {
+        let d = builtin();
+        let wind = ("diverging", (-40.0, 40.0));
+        let height = ("viridis", (0.0, 21_000.0));
+        for (name, title, unit, (palette, range)) in [
+            ("u", "u-component of wind", "m s-1", wind),
+            ("v", "v-component of wind", "m s-1", wind),
+            (
+                "10u",
+                "u-component of wind (10 m above ground)",
+                "m s-1",
+                wind,
+            ),
+            (
+                "10v",
+                "v-component of wind (10 m above ground)",
+                "m s-1",
+                wind,
+            ),
+            (
+                "UGRD",
+                "u-component of wind (10 m above ground)",
+                "m/s",
+                wind,
+            ),
+            ("u10", "10 metre U wind component", "m s**-1", wind),
+            ("10u", "", "kt", ("diverging", (-80.0, 80.0))),
+            (
+                "w",
+                "Vertical velocity (pressure)",
+                "Pa s-1",
+                ("diverging", (-2.0, 2.0)),
+            ),
+            (
+                "DZDT",
+                "Vertical velocity (geometric)",
+                "m s-1",
+                ("diverging", (-1.0, 1.0)),
+            ),
+            ("z", "Geopotential", "gpm", height),
+            ("gh", "Geopotential height", "gpm", height),
+            ("HGT", "Geopotential height (500 hPa)", "gpm", height),
+            (
+                "z",
+                "Geopotential",
+                "m**2 s**-2",
+                ("viridis", (0.0, 206_000.0)),
+            ),
+            (
+                "q",
+                "Specific humidity",
+                "kg kg-1",
+                ("viridis", (0.0, 0.02)),
+            ),
+            (
+                "SPFH",
+                "Specific humidity",
+                "kg/kg",
+                ("viridis", (0.0, 0.02)),
+            ),
+            ("q", "Specific humidity", "g kg-1", ("viridis", (0.0, 20.0))),
+            (
+                "sp",
+                "Pressure (surface)",
+                "hPa",
+                ("viridis", (500.0, 1050.0)),
+            ),
+            (
+                "PRES",
+                "Pressure (surface)",
+                "Pa",
+                ("viridis", (50_000.0, 105_000.0)),
+            ),
+            (
+                "vo",
+                "Relative vorticity",
+                "s-1",
+                ("diverging", (-2e-4, 2e-4)),
+            ),
+            (
+                "d",
+                "Relative divergence",
+                "s-1",
+                ("diverging", (-1e-4, 1e-4)),
+            ),
+            (
+                "tcwv",
+                "Total column integrated water vapour (surface)",
+                "mm",
+                ("viridis", (0.0, 70.0)),
+            ),
+            (
+                "sf",
+                "Snowfall (water equivalent) (surface)",
+                "mm",
+                ("precipitation", (0.0, 50.0)),
+            ),
+        ] {
+            let m = d
+                .match_default(name, title, Some(unit))
+                .unwrap_or_else(|| panic!("no default for {name} / {title} / {unit}"));
+            assert_eq!(m.palette, palette, "{name} / {title} / {unit}");
+            assert_eq!(m.range, Some(range), "{name} / {title} / {unit}");
+        }
+    }
+
+    /// The #763 rules never guess a unit: with none, or one they do not
+    /// know, they do not apply — and nothing falls through to a neighbour
+    /// with another meaning (specific humidity to the RH percent range,
+    /// surface pressure or omega to the MSLP range).
+    #[test]
+    fn grib_rules_are_unit_gated_without_fall_through() {
+        let d = builtin();
+        for (name, title) in [
+            ("u", "u-component of wind"),
+            ("w", "Vertical velocity (pressure)"),
+            ("gh", "Geopotential height"),
+            ("q", "Specific humidity"),
+            ("x", "Humidity mixing ratio"),
+            ("sp", "Pressure (surface)"),
+            ("vo", "Relative vorticity"),
+            ("d", "Relative divergence"),
+            ("tcwv", "Total column integrated water vapour"),
+            ("sf", "Snowfall (water equivalent)"),
+            // engine-grib's label and unit before its metadata is known.
+            ("tcw", "tcw"),
+        ] {
+            assert_eq!(d.match_default(name, title, None), None, "{name}");
+            assert_eq!(
+                d.match_default(name, title, Some("furlong")),
+                None,
+                "{name}"
+            );
+        }
+        // Snowfall in metres is not millimetres.
+        assert_eq!(d.match_default("sf", "Snowfall", Some("m")), None);
+        // Potential vorticity has its own unit; an anomaly is signed.
+        assert_eq!(
+            d.match_default("pv", "Potential vorticity", Some("K m2 kg-1 s-1")),
+            None
+        );
+        assert_eq!(
+            d.match_default("5WAVA", "Geopotential height anomaly", Some("gpm")),
+            None
+        );
+    }
+
+    /// Relative humidity keeps its percent and fraction ranges, and the
+    /// unit-less FMI QueryData `Humidity` its percent fallback; MSLP keeps
+    /// 950–1050 hPa.
+    #[test]
+    fn relative_humidity_and_mslp_keep_their_defaults() {
+        let d = builtin();
+        let hit = |name, title, unit| d.match_default(name, title, unit).unwrap();
+        for (name, title, unit, palette, range) in [
+            (
+                "r",
+                "Relative humidity",
+                Some("%"),
+                "humidity",
+                (0.0, 100.0),
+            ),
+            (
+                "2r",
+                "2 metre relative humidity",
+                Some("1"),
+                "humidity",
+                (0.0, 1.0),
+            ),
+            ("Humidity", "Humidity", None, "humidity", (0.0, 100.0)),
+            (
+                "msl",
+                "Pressure (mean sea level)",
+                Some("hPa"),
+                "pressure",
+                (950.0, 1050.0),
+            ),
+            (
+                "PRMSL",
+                "Pressure reduced to MSL",
+                Some("Pa"),
+                "pressure",
+                (95_000.0, 105_000.0),
+            ),
+        ] {
+            let m = hit(name, title, unit);
+            assert_eq!(m.palette, palette, "{name}");
+            assert_eq!(m.range, Some(range), "{name}");
+        }
     }
 
     #[test]

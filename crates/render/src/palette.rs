@@ -536,6 +536,27 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (330.0, [0, 0, 0, 255]),       // black
         ],
     },
+    // Signed fields — wind components, vertical velocity, vorticity (#763).
+    // Normalized, so it spans any style range; a range symmetric about zero
+    // puts zero on the white midpoint. ColorBrewer RdBu, blue end low.
+    BuiltinDef {
+        name: "diverging",
+        title: "Diverging (blue–white–red)",
+        normalized: true,
+        stops: &[
+            (0.0, [5, 48, 97, 255]),     // strong negative — dark blue
+            (0.1, [33, 102, 172, 255]),  // blue
+            (0.2, [67, 147, 195, 255]),  // mid blue
+            (0.3, [146, 197, 222, 255]), // light blue
+            (0.4, [209, 229, 240, 255]), // pale blue
+            (0.5, [247, 247, 247, 255]), // zero — near-white
+            (0.6, [253, 219, 199, 255]), // pale red
+            (0.7, [244, 165, 130, 255]), // light red
+            (0.8, [214, 96, 77, 255]),   // mid red
+            (0.9, [178, 24, 43, 255]),   // red
+            (1.0, [103, 0, 31, 255]),    // strong positive — dark red
+        ],
+    },
 ];
 
 fn materialize(def: &BuiltinDef) -> Palette {
@@ -738,6 +759,7 @@ mod tests {
             ("cloud_cover", 6, 0.0, 100.0),
             ("ir_bt_grey", 2, 180.0, 330.0),
             ("ir_bt_enhanced", 10, 180.0, 330.0),
+            ("diverging", 11, 0.0, 1.0),
         ];
         assert_eq!(builtin_palettes().len(), expected.len());
         assert_eq!(builtin_names().len(), expected.len());
@@ -773,6 +795,7 @@ mod tests {
     fn normalized_flags_and_default_range() {
         assert!(builtin_palette("viridis").unwrap().normalized);
         assert!(builtin_palette("grayscale").unwrap().normalized);
+        assert!(builtin_palette("diverging").unwrap().normalized);
         assert_eq!(builtin_palette("viridis").unwrap().default_range(), None);
         assert_eq!(
             builtin_palette("radar_dbz").unwrap().default_range(),

@@ -1034,6 +1034,102 @@ mod tests {
         }
     }
 
+    /// #763 through the shared resolver whose per-parameter maps the server
+    /// hands to WMS, Maps and Tiles alike: over a temperature collection
+    /// colormap (the ECMWF collections' fallback), each GRIB field gets its
+    /// own palette and range, representative values render distinct colours
+    /// and the legend spans the range in data units. A clipped or uniform
+    /// layer would still be a 200, so the colours are what is checked.
+    #[test]
+    fn grib_parameter_defaults_render_representative_values() {
+        let ctx = StyleContext::with_builtins();
+        let c = coll("colormap = \"temperature\"\n[[wms.parameters]]\nname = \"10u\"\ncolormap = \"wind_speed\"\n");
+        let params = [
+            ("u", "u-component of wind", "m s-1"),
+            ("10u", "u-component of wind (10 m above ground)", "m s-1"),
+            ("10v", "v-component of wind (10 m above ground)", "m s-1"),
+            ("w", "Vertical velocity (pressure)", "Pa s-1"),
+            ("gh", "Geopotential height", "gpm"),
+            ("q", "Specific humidity", "kg kg-1"),
+            ("sp", "Pressure (surface)", "hPa"),
+            ("msl", "Pressure (mean sea level)", "hPa"),
+            ("r", "Relative humidity", "%"),
+        ]
+        .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
+            name: name.into(),
+            title: title.into(),
+            unit: unit.into(),
+        });
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
+            .unwrap();
+        let style = |name: &str| &maps[&format!("c1/{name}")]["default"];
+
+        // (parameter, palette, range, representative values)
+        type Case = (&'static str, &'static str, (f64, f64), &'static [f64]);
+        let cases: [Case; 8] = [
+            (
+                "u",
+                "diverging",
+                (-40.0, 40.0),
+                &[-25.0, -8.0, 0.0, 8.0, 25.0],
+            ),
+            ("10v", "diverging", (-40.0, 40.0), &[-8.0, -2.0, 2.0, 8.0]),
+            ("w", "diverging", (-2.0, 2.0), &[-1.0, -0.2, 0.0, 0.2, 1.0]),
+            (
+                "gh",
+                "viridis",
+                (0.0, 21_000.0),
+                &[1_500.0, 5_500.0, 10_500.0, 20_500.0],
+            ),
+            ("q", "viridis", (0.0, 0.02), &[0.001, 0.005, 0.01, 0.015]),
+            (
+                "sp",
+                "viridis",
+                (500.0, 1050.0),
+                &[550.0, 700.0, 850.0, 1000.0],
+            ),
+            ("msl", "pressure", (950.0, 1050.0), &[970.0, 1013.0, 1040.0]),
+            ("r", "humidity", (0.0, 100.0), &[10.0, 50.0, 90.0]),
+        ];
+        for (name, palette, (min, max), values) in cases {
+            let s = style(name);
+            assert_eq!(s.palette.name, palette, "{name}");
+            assert_eq!((s.min, s.max), (min, max), "{name}");
+            let colors: Vec<[u8; 4]> = values.iter().map(|v| s.colormap.color(Some(*v))).collect();
+            for (i, a) in colors.iter().enumerate() {
+                for b in &colors[i + 1..] {
+                    assert_ne!(a, b, "{name}: {values:?} rendered {colors:?}");
+                }
+            }
+            let legend = crate::legend_json(s, Some(name), None);
+            assert_eq!(legend["min"].as_f64(), Some(min), "{name} legend min");
+            assert_eq!(legend["max"].as_f64(), Some(max), "{name} legend max");
+            let stops = legend["stops"].as_array().unwrap();
+            assert_eq!(stops[0]["value"].as_f64(), Some(min), "{name} first stop");
+            assert_eq!(
+                stops[stops.len() - 1]["value"].as_f64(),
+                Some(max),
+                "{name} last stop"
+            );
+        }
+
+        // Signed fields: zero on the near-white midpoint, negatives blue,
+        // positives red.
+        for name in ["u", "w"] {
+            let s = style(name);
+            let zero = s.colormap.color(Some(0.0));
+            assert!(zero[..3].iter().all(|&c| c >= 240), "{name} zero {zero:?}");
+            let neg = s.colormap.color(Some(s.min / 2.0));
+            let pos = s.colormap.color(Some(s.max / 2.0));
+            assert!(neg[2] > neg[0], "{name} negative {neg:?}");
+            assert!(pos[0] > pos[2], "{name} positive {pos:?}");
+        }
+
+        // An explicit [[wms.parameters]] entry still wins over the default.
+        assert_eq!(style("10u").palette.name, "wind_speed");
+    }
+
     #[test]
     fn parameter_defaults_opt_out_and_inline_override() {
         let ctx = StyleContext::with_builtins();
