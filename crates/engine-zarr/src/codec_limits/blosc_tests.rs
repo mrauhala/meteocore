@@ -192,6 +192,147 @@ fn blosc_unaligned_ranges_stay_block_level_except_the_final_partial_element() {
     }
 }
 
+/// Counts full decodes by the partial decoder's fallback.
+#[derive(Debug)]
+struct CountingDecodes {
+    inner: Arc<dyn BytesToBytesCodecTraits>,
+    decodes: std::sync::atomic::AtomicUsize,
+}
+
+impl ExtensionName for CountingDecodes {
+    fn name(&self, version: ZarrVersion) -> Option<Cow<'static, str>> {
+        self.inner.name(version)
+    }
+}
+
+impl CodecTraits for CountingDecodes {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn configuration(
+        &self,
+        version: ZarrVersion,
+        options: &CodecMetadataOptions,
+    ) -> Option<Configuration> {
+        self.inner.configuration(version, options)
+    }
+
+    fn partial_decoder_capability(&self) -> PartialDecoderCapability {
+        self.inner.partial_decoder_capability()
+    }
+
+    fn partial_encoder_capability(&self) -> PartialEncoderCapability {
+        self.inner.partial_encoder_capability()
+    }
+}
+
+impl BytesToBytesCodecTraits for CountingDecodes {
+    fn into_dyn(self: Arc<Self>) -> Arc<dyn BytesToBytesCodecTraits> {
+        self
+    }
+
+    fn recommended_concurrency(
+        &self,
+        representation: &BytesRepresentation,
+    ) -> Result<RecommendedConcurrency, CodecError> {
+        self.inner.recommended_concurrency(representation)
+    }
+
+    fn encoded_representation(&self, representation: &BytesRepresentation) -> BytesRepresentation {
+        self.inner.encoded_representation(representation)
+    }
+
+    fn encode<'a>(
+        &self,
+        bytes: ArrayBytesRaw<'a>,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytesRaw<'a>, CodecError> {
+        self.inner.encode(bytes, options)
+    }
+
+    fn decode<'a>(
+        &self,
+        bytes: ArrayBytesRaw<'a>,
+        representation: &BytesRepresentation,
+        options: &CodecOptions,
+    ) -> Result<ArrayBytesRaw<'a>, CodecError> {
+        self.decodes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.decode(bytes, representation, options)
+    }
+}
+
+#[test]
+fn blosc_partial_batches_share_one_full_decode_for_the_final_partial_element() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let options = crate::catalog::single_threaded_opts();
+    let codec = Arc::new(CountingDecodes {
+        inner: codec().inner,
+        decodes: Default::default(),
+    });
+    let whole = ByteRange::FromStart(0, None);
+    let tail = ByteRange::Suffix(3);
+    let inner = ByteRange::FromStart(1, Some(6));
+    for (length, batches, decodes) in [
+        (
+            519,
+            vec![
+                vec![whole, tail],
+                vec![tail, whole],
+                vec![whole, whole],
+                vec![
+                    whole,
+                    inner,
+                    ByteRange::FromStart(510, Some(8)),
+                    whole,
+                    tail,
+                ],
+            ],
+            1,
+        ),
+        // Aligned frames and ranges before the partial element stay on getitem.
+        (512, vec![vec![whole, tail, whole]], 0),
+        (
+            519,
+            vec![vec![inner, ByteRange::FromStart(0, Some(516))]],
+            0,
+        ),
+    ] {
+        let raw: Vec<u8> = (0..130u32)
+            .flat_map(u32::to_le_bytes)
+            .take(length)
+            .collect();
+        let encoded = codec
+            .encode(Cow::Borrowed(&raw), &options)
+            .unwrap()
+            .into_owned();
+        let input: Arc<dyn BytesPartialDecoderTraits> = Arc::new(Cow::Owned(encoded));
+        let decoder = super::blosc::PartialDecoder::new(
+            input,
+            codec.clone(),
+            BytesRepresentation::BoundedSize(1024),
+        );
+        for ranges in batches {
+            let before = codec.decodes.load(SeqCst);
+            let values = decoder
+                .partial_decode_many(Box::new(ranges.clone().into_iter()), &options)
+                .unwrap()
+                .unwrap();
+            assert_eq!(codec.decodes.load(SeqCst) - before, decodes, "{ranges:?}");
+            assert_eq!(values.len(), ranges.len());
+            for (range, value) in ranges.iter().zip(values) {
+                let bytes = range.to_range(length as u64);
+                assert_eq!(
+                    value.as_ref(),
+                    &raw[bytes.start as usize..bytes.end as usize],
+                    "{range:?} in {ranges:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn stacked_gzip_blosc_zstd_partial_reads_return_exact_intermediate_bytes() {
     let options = crate::catalog::single_threaded_opts();

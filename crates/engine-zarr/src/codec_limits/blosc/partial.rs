@@ -34,9 +34,11 @@ impl<T: ?Sized> PartialDecoder<T> {
     // make the same getitem call as upstream; rounding adds under two elements
     // of output capacity and never passes the admitted frame length. A frame
     // whose length is not a multiple of typesize ends in a partial element
-    // getitem cannot index. Ranges reaching it slice one full decode of the
-    // admitted output; its serial scratch fits the admitted getitem allowance.
-    // Stop on the first invalid range, discarding prior outputs.
+    // getitem cannot index. Ranges reaching it slice a single full decode of
+    // the admitted output per call, and the last exact whole-frame request
+    // takes that buffer after every other slice is copied, so a batch holds no
+    // extra frame-sized copy. Its serial scratch fits the admitted getitem
+    // allowance. Every range is validated before any native call.
     fn decode_ranges(
         &self,
         encoded: &[u8],
@@ -46,51 +48,60 @@ impl<T: ?Sized> PartialDecoder<T> {
     ) -> Result<Option<Vec<ArrayBytesRaw<'static>>>, CodecError> {
         let typesize = frame.typesize as usize;
         let length = frame.length as usize;
-        let mut full: Option<Vec<u8>> = None;
-        let mut values = Vec::new();
-        for range in regions {
-            let (start, end) = frame.bounds(range).ok_or_else(|| {
-                CodecError::Other("Blosc decoded byte range is outside the frame".into())
-            })?;
+        let ranges = regions
+            .map(|range| {
+                frame.bounds(range).ok_or_else(|| {
+                    CodecError::Other("Blosc decoded byte range is outside the frame".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let reaches_tail = |&(start, end): &(usize, usize)| {
+            start < end && end.div_ceil(typesize) * typesize > length
+        };
+        let mut full = None;
+        if ranges.iter().any(reaches_tail) {
+            let decoded = self
+                .codec
+                .decode(Cow::Borrowed(encoded), &self.representation, options)?
+                .into_owned();
+            if decoded.len() != length {
+                return Err(CodecError::Other(
+                    "Blosc output does not match its frame".into(),
+                ));
+            }
+            full = Some(decoded);
+        }
+        let owner = full
+            .as_ref()
+            .and_then(|_| ranges.iter().rposition(|&range| range == (0, length)));
+        let mut values = Vec::with_capacity(ranges.len());
+        for (index, &(start, end)) in ranges.iter().enumerate() {
             let (first, last) = (
                 start / typesize * typesize,
                 end.div_ceil(typesize) * typesize,
             );
-            let value = if start == end {
-                // getitem reports zero items as a failure.
-                Vec::new()
-            } else if last <= length {
-                let mut value =
-                    blosc_decompress_bytes_partial(encoded, first, last - first, typesize)
-                        .map_err(|error| CodecError::Other(error.to_string()))?;
-                value.truncate(end - first);
-                value.drain(..start - first);
-                value
-            } else {
-                let decoded = match full.take() {
-                    Some(decoded) => decoded,
-                    None => self
-                        .codec
-                        .decode(Cow::Borrowed(encoded), &self.representation, options)?
-                        .into_owned(),
-                };
-                if decoded.len() != length {
-                    return Err(CodecError::Other(
-                        "Blosc output does not match its frame".into(),
-                    ));
-                }
-                if (start, end) == (0, length) {
-                    decoded
-                } else {
-                    let value = decoded[start..end].to_vec();
-                    full = Some(decoded);
+            let value = match &full {
+                // getitem reports zero items as a failure; the owner's
+                // placeholder receives the decoded buffer below.
+                _ if start == end || Some(index) == owner => Vec::new(),
+                _ if last <= length => {
+                    let mut value =
+                        blosc_decompress_bytes_partial(encoded, first, last - first, typesize)
+                            .map_err(|error| CodecError::Other(error.to_string()))?;
+                    value.truncate(end - first);
+                    value.drain(..start - first);
                     value
                 }
+                Some(decoded) => decoded[start..end].to_vec(),
+                None => unreachable!("ranges reaching the partial element decode the frame"),
             };
-            values.push(Cow::Owned(value));
+            values.push(value);
+        }
+        if let (Some(index), Some(decoded)) = (owner, full) {
+            values[index] = decoded;
         }
         check_deadline()?;
-        Ok(Some(values))
+        Ok(Some(values.into_iter().map(Cow::Owned).collect()))
     }
 }
 
