@@ -511,6 +511,7 @@ impl SatelliteEngine {
             label: parameter.title.clone(),
             unit: parameter.unit.clone(),
             observed_property: parameter.name.clone(),
+            standard_name: None,
         }
     }
 

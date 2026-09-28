@@ -150,6 +150,7 @@ impl CsvEngine {
                     label: name.replace('_', " "),
                     unit: unit.clone(),
                     observed_property: name.clone(),
+                    standard_name: None,
                 },
             );
         }
@@ -246,6 +247,7 @@ impl EdrEngine for CsvEngine {
                         label: name.replace('_', " "),
                         unit,
                         observed_property: name.clone(),
+                        standard_name: None,
                     },
                 )
             })

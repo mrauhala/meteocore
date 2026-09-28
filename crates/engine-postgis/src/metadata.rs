@@ -206,6 +206,7 @@ fn build_parameter_descriptions(
                     },
                     unit: p.unit.clone(),
                     observed_property: p.observed_property.clone(),
+                    standard_name: None,
                 },
             )
         })

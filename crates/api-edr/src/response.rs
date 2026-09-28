@@ -1,6 +1,10 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
-use ds_core::model::{CoverageResponse, DomainDescription, Location, QueryResult, VerticalCoord};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, Location, ParameterDescription, QueryResult, VerticalCoord,
+};
+use ds_core::units::qudt_unit;
 use serde_json::{json, Map, Number, Value};
 
 /// Pre-built reference system objects (shared across all responses).
@@ -44,59 +48,132 @@ fn vertical_ref(z: &VerticalCoord) -> Value {
     })
 }
 
-fn build_parameter(label: &str, unit: &str, observed_property: &str) -> Value {
-    let mut param = Map::with_capacity(4);
+/// Longest parameter `label` the OGC API - EDR Metocean Profile allows
+/// (Requirement 7C).
+pub const MAX_PARAMETER_LABEL_CHARS: usize = 50;
+
+/// NERC Vocabulary Server namespace of the CF standard names: the
+/// `observedProperty.id` form of Metocean Profile Requirement 7F.
+pub const CF_STANDARD_NAME_BASE: &str = "https://vocab.nerc.ac.uk/standard_name/";
+
+/// `unit.symbol.type` of a unit QUDT has no entry for (`dBZ`): the engine's
+/// unit string stays the symbol value, typed as UCUM.
+const UCUM_SYMBOL_TYPE: &str = "http://www.opengis.net/def/uom/UCUM/";
+
+/// The parameter `label`: the engine's label, cut to at most
+/// [`MAX_PARAMETER_LABEL_CHARS`] characters (ellipsis included). The full
+/// text stays in the description and `observedProperty.label`.
+fn parameter_label(desc: &ParameterDescription) -> Cow<'_, str> {
+    let label = desc.label.trim();
+    if label.chars().count() <= MAX_PARAMETER_LABEL_CHARS {
+        return Cow::Borrowed(label);
+    }
+    let head: String = label.chars().take(MAX_PARAMETER_LABEL_CHARS - 1).collect();
+    Cow::Owned(format!("{}…", head.trim_end()))
+}
+
+/// The parameter `description`: the engine's full label plus the unit it is
+/// served in, so it says more than `label` (Metocean Requirement 7B).
+fn parameter_description(desc: &ParameterDescription) -> String {
+    let label = desc.label.trim();
+    let unit = desc.unit.trim();
+    if unit.is_empty() {
+        return format!("{label} (unit not specified)");
+    }
+    let symbol = qudt_unit(unit).map_or(unit, |q| q.symbol);
+    format!("{label}, in {symbol}")
+}
+
+/// `observedProperty.id` of a parameter whose engine knows its CF standard
+/// name. A value that is not a bare CF name (a CF modifier such as
+/// `… standard_error`, anything needing URL escaping) is not published.
+fn cf_standard_name_uri(desc: &ParameterDescription) -> Option<String> {
+    let name = desc.standard_name.as_deref()?.trim();
+    let bare = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    bare.then(|| format!("{CF_STANDARD_NAME_BASE}{name}"))
+}
+
+/// The `unit` object, or `None` when the engine knows no unit. A unit QUDT
+/// has an entry for carries its QUDT identifier and `qudt:symbol`
+/// (Metocean Requirement 7E); any other keeps the engine's string as a
+/// UCUM symbol. Valid in both EDR 1.1 and CoverageJSON.
+fn build_unit(unit: &str) -> Option<Value> {
+    let unit = unit.trim();
+    if unit.is_empty() {
+        return None;
+    }
+    let (value, kind) = match qudt_unit(unit) {
+        Some(q) => (q.symbol.to_string(), q.uri()),
+        None => (unit.to_string(), UCUM_SYMBOL_TYPE.to_string()),
+    };
+    let mut symbol = Map::with_capacity(2);
+    symbol.insert("value".into(), Value::String(value));
+    symbol.insert("type".into(), Value::String(kind));
+    let mut m = Map::with_capacity(2);
+    m.insert("label".into(), i18n(unit));
+    m.insert("symbol".into(), Value::Object(symbol));
+    Some(Value::Object(m))
+}
+
+fn i18n(text: &str) -> Value {
+    let mut m = Map::with_capacity(1);
+    m.insert("en".into(), Value::String(text.into()));
+    Value::Object(m)
+}
+
+/// `observedProperty`: identified by the CF standard name URI when the
+/// engine knows one, else by `fallback_id` (if any) and described by
+/// `description` (Metocean Requirement 7F).
+fn build_observed_property(
+    desc: &ParameterDescription,
+    fallback_id: Option<&str>,
+    description: Value,
+) -> Value {
+    let mut m = Map::with_capacity(3);
+    let cf_id = cf_standard_name_uri(desc);
+    if let Some(id) = cf_id.as_deref().or(fallback_id) {
+        m.insert("id".into(), Value::String(id.into()));
+    }
+    m.insert("label".into(), i18n(&desc.label));
+    if cf_id.is_none() {
+        m.insert("description".into(), description);
+    }
+    Value::Object(m)
+}
+
+/// One entry of a collection's `parameter_names` (an EDR 1.1 parameter
+/// object: plain-string `label` and `description`). The coverage
+/// `parameters` of a data query say the same things (#273).
+pub fn collection_parameter_json(desc: &ParameterDescription) -> Value {
+    let description = parameter_description(desc);
+    let observed = build_observed_property(desc, None, Value::String(description.clone()));
+    let mut param = Map::with_capacity(6);
     param.insert("type".into(), Value::String("Parameter".into()));
     param.insert(
-        "description".into(),
-        Value::Object({
-            let mut m = Map::with_capacity(1);
-            m.insert("en".into(), Value::String(label.into()));
-            m
-        }),
+        "label".into(),
+        Value::String(parameter_label(desc).into_owned()),
     );
-    param.insert(
-        "unit".into(),
-        Value::Object({
-            let mut m = Map::with_capacity(2);
-            m.insert(
-                "label".into(),
-                Value::Object({
-                    let mut lm = Map::with_capacity(1);
-                    lm.insert("en".into(), Value::String(unit.into()));
-                    lm
-                }),
-            );
-            m.insert(
-                "symbol".into(),
-                Value::Object({
-                    let mut sm = Map::with_capacity(2);
-                    sm.insert("value".into(), Value::String(unit.into()));
-                    sm.insert(
-                        "type".into(),
-                        Value::String("http://www.opengis.net/def/uom/UCUM/".into()),
-                    );
-                    sm
-                }),
-            );
-            m
-        }),
-    );
+    param.insert("description".into(), Value::String(description));
+    if let Some(unit) = build_unit(&desc.unit) {
+        param.insert("unit".into(), unit);
+    }
+    param.insert("observedProperty".into(), observed);
+    Value::Object(param)
+}
+
+/// A CoverageJSON parameter. Its short name is `observedProperty.label`:
+/// CoverageJSON asks to leave out a parameter `label` identical to it.
+fn build_parameter(desc: &ParameterDescription) -> Value {
+    let description = parameter_description(desc);
+    let mut param = Map::with_capacity(4);
+    param.insert("type".into(), Value::String("Parameter".into()));
+    param.insert("description".into(), i18n(&description));
+    if let Some(unit) = build_unit(&desc.unit) {
+        param.insert("unit".into(), unit);
+    }
     param.insert(
         "observedProperty".into(),
-        Value::Object({
-            let mut m = Map::with_capacity(2);
-            m.insert("id".into(), Value::String(observed_property.into()));
-            m.insert(
-                "label".into(),
-                Value::Object({
-                    let mut lm = Map::with_capacity(1);
-                    lm.insert("en".into(), Value::String(label.into()));
-                    lm
-                }),
-            );
-            m
-        }),
+        build_observed_property(desc, Some(&desc.observed_property), i18n(&description)),
     );
     Value::Object(param)
 }
@@ -146,10 +223,7 @@ fn sorted<V>(map: &HashMap<String, V>) -> Vec<(&String, &V)> {
 fn build_parameters(result: &QueryResult) -> Map<String, Value> {
     let mut parameters = Map::with_capacity(result.parameters.len());
     for (name, desc) in sorted(&result.parameters) {
-        parameters.insert(
-            name.clone(),
-            build_parameter(&desc.label, &desc.unit, &desc.observed_property),
-        );
+        parameters.insert(name.clone(), build_parameter(desc));
     }
     parameters
 }

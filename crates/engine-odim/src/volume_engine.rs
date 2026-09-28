@@ -2379,6 +2379,7 @@ fn quantity_description(quantity: &str) -> ParameterDescription {
         label: quantities::quantity_label(quantity),
         unit: quantities::quantity_unit(quantity).to_string(),
         observed_property: quantity.to_string(),
+        standard_name: None,
     }
 }
 
@@ -4442,6 +4443,18 @@ impl EdrEngine for PolarVolumeSiteView {
             .get(&self.nod)
             .map(|m| m.quantities.clone())
             .unwrap_or_default()
+    }
+
+    /// The same label and unit the query results carry, so the collection's
+    /// `parameter_names` is not left with the bare code and no unit (#273).
+    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+        self.get_parameters()
+            .into_iter()
+            .map(|q| {
+                let desc = quantity_description(&q);
+                (q, desc)
+            })
+            .collect()
     }
 
     fn get_vertical_extent(&self) -> Option<VerticalDimension> {

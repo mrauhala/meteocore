@@ -1437,6 +1437,25 @@ fn pvol_edr_get_locations_lists_sites() {
     assert!(!fivih.label.is_empty(), "a location carries a label");
 }
 
+/// Collection metadata describes each quantity the way the query results
+/// do — the ODIM table's label and unit, not the bare code without a unit
+/// that the trait default would give (#273).
+#[test]
+fn pvol_edr_parameter_descriptions_use_the_quantity_table() {
+    let Some(view) = pvol_fixture_view() else {
+        eprintln!(
+            "skipping pvol_edr_parameter_descriptions_use_the_quantity_table: fixture absent"
+        );
+        return;
+    };
+    let descs = EdrEngine::get_parameter_descriptions(&view);
+    assert_eq!(descs.len(), EdrEngine::get_parameters(&view).len());
+    let dbzh = descs.get("DBZH").expect("the fixture carries DBZH");
+    assert_eq!(dbzh.label, "DBZH — Reflectivity (horizontal)");
+    assert_eq!(dbzh.unit, "dBZ");
+    assert_eq!(dbzh.observed_property, "DBZH");
+}
+
 /// A position query with no `z` returns a `CoverageCollection` of
 /// A position query for a point far outside the real radar's coverage
 /// (Kansas vs a Finnish radar) is `LocationNotFound` (404), not HTTP 200

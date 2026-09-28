@@ -108,6 +108,7 @@ impl EdrEngine for ScalableEngine {
                     label: format!("Parameter {p}"),
                     unit: "unit".to_string(),
                     observed_property: name.clone(),
+                    standard_name: None,
                 },
             );
             ranges.insert(

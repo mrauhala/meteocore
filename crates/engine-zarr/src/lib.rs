@@ -288,6 +288,7 @@ impl EdrEngine for ZarrEngine {
                         label: v.label.clone(),
                         unit: v.units.clone(),
                         observed_property: v.name.clone(),
+                        standard_name: v.standard_name.clone(),
                     },
                 )
             })
@@ -457,6 +458,7 @@ impl EdrEngine for ZarrEngine {
                     label: v.label.clone(),
                     unit: v.units.clone(),
                     observed_property: v.name.clone(),
+                    standard_name: v.standard_name.clone(),
                 },
             );
             let (shape, axis_names) = if has_time {
@@ -520,6 +522,7 @@ impl EdrEngine for ZarrEngine {
                     label: v.label.clone(),
                     unit: v.units.clone(),
                     observed_property: v.name.clone(),
+                    standard_name: v.standard_name.clone(),
                 },
             );
             ranges.insert(

@@ -51,6 +51,7 @@ impl MockEngine {
                     label: name.into(),
                     unit: "degC".into(),
                     observed_property: name.into(),
+                    standard_name: None,
                 },
             );
             ranges.insert(

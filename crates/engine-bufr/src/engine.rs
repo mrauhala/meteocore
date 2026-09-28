@@ -448,6 +448,7 @@ impl BufrEngine {
                     label: p.label.clone(),
                     unit: p.unit.clone(),
                     observed_property: p.observed_property.clone(),
+                    standard_name: None,
                 },
             );
         }

@@ -105,6 +105,7 @@ impl EdrEngine for ForecastMock {
                 label: "temperature".to_string(),
                 unit: "degC".to_string(),
                 observed_property: "temperature".to_string(),
+                standard_name: None,
             },
         );
         let mut ranges = HashMap::new();
@@ -175,6 +176,7 @@ impl EdrEngine for NonForecastMock {
                 label: "temperature".to_string(),
                 unit: "degC".to_string(),
                 observed_property: "temperature".to_string(),
+                standard_name: None,
             },
         );
         let mut ranges = HashMap::new();

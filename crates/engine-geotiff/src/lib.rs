@@ -1293,6 +1293,7 @@ impl GeoTiffEngine {
                 label: self.parameter.replace('_', " "),
                 unit: self.unit.clone(),
                 observed_property: self.parameter.clone(),
+                standard_name: None,
             },
         );
 
@@ -1442,6 +1443,7 @@ impl GeoTiffEngine {
                 label: self.parameter.replace('_', " "),
                 unit: self.unit.clone(),
                 observed_property: self.parameter.clone(),
+                standard_name: None,
             },
         );
 
@@ -2028,6 +2030,7 @@ impl EdrEngine for GeoTiffEngine {
                 label: self.parameter.replace('_', " "),
                 unit: self.unit.clone(),
                 observed_property: self.parameter.clone(),
+                standard_name: None,
             },
         );
         map

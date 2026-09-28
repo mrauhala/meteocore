@@ -253,6 +253,7 @@ impl EdrEngine for QueryDataEngine {
                         label: p.name.clone(),
                         unit: String::new(),
                         observed_property: p.name.clone(),
+                        standard_name: None,
                     },
                 )
             })
@@ -359,6 +360,7 @@ impl EdrEngine for QueryDataEngine {
                     label: param.name.clone(),
                     unit: String::new(),
                     observed_property: param.name.clone(),
+                    standard_name: None,
                 },
             );
             let (shape, axis_names) = if has_time {
@@ -437,6 +439,7 @@ impl EdrEngine for QueryDataEngine {
                     label: param.name.clone(),
                     unit: String::new(),
                     observed_property: param.name.clone(),
+                    standard_name: None,
                 },
             );
 

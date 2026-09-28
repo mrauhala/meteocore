@@ -15,6 +15,9 @@
 //! | `kg m-2` | `mm` | identity (1 kg m⁻² of water ≈ 1 mm) |
 //! | `m2 s-2` | `gpm` | ÷ 9.80665 |
 //! | anything else | unchanged | identity |
+//!
+//! [`qudt_unit`] names the served unit in the QUDT vocabulary, which the
+//! OGC API - EDR Metocean Profile requires for parameter metadata.
 
 /// `display = source * scale + offset`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,9 +71,116 @@ pub fn display_conversion(source_unit: &str) -> Option<DisplayConversion> {
     Some(c)
 }
 
+/// Namespace of QUDT unit identifiers, in the form the OGC API - EDR
+/// Metocean Profile names for `unit.symbol.type` (Requirement 7E).
+pub const QUDT_UNIT_BASE: &str = "https://qudt.org/vocab/unit/";
+
+/// A unit in the QUDT vocabulary: its identifier under [`QUDT_UNIT_BASE`]
+/// and its `qudt:symbol`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QudtUnit {
+    /// Local name of the identifier, e.g. `"M-PER-SEC"`.
+    pub id: &'static str,
+    /// The unit's `qudt:symbol`, e.g. `"m/s"`.
+    pub symbol: &'static str,
+}
+
+impl QudtUnit {
+    /// The full identifier, e.g. `https://qudt.org/vocab/unit/M-PER-SEC`.
+    pub fn uri(&self) -> String {
+        format!("{QUDT_UNIT_BASE}{}", self.id)
+    }
+}
+
+/// The QUDT unit for a unit string as the engines emit it: display units
+/// and the UCUM, CF/udunits and WMO spellings of the same unit map to one
+/// entry (identifiers and symbols as published in QUDT 3.5.2). `None` when
+/// QUDT has no faithful entry; callers then keep the unit string as it is.
+///
+/// Deliberately absent: `dBZ` (QUDT's `DeciB_Z` is the acoustic Z-weighted
+/// sound level, not radar reflectivity), `gpm`, `deg/km`, the CF
+/// dimensionless `1` and BUFR code-table "units".
+pub fn qudt_unit(unit: &str) -> Option<QudtUnit> {
+    let (id, symbol) = match unit.trim() {
+        "K" => ("K", "K"),
+        "°C" | "degC" | "Cel" | "℃" => ("DEG_C", "°C"),
+        "Pa" => ("PA", "Pa"),
+        "hPa" => ("HectoPA", "hPa"),
+        "Pa s-1" | "Pa/s" | "Pa.s-1" => ("PA-PER-SEC", "Pa/s"),
+        "m s-1" | "m/s" | "m.s-1" | "m s**-1" => ("M-PER-SEC", "m/s"),
+        "km/h" | "km h-1" | "km.h-1" => ("KiloM-PER-HR", "km/h"),
+        "m" => ("M", "m"),
+        "km" => ("KiloM", "km"),
+        "cm" => ("CentiM", "cm"),
+        "mm" => ("MilliM", "mm"),
+        "mm/h" | "mm h-1" | "mm.h-1" => ("MilliM-PER-HR", "mm/h"),
+        "%" => ("PERCENT", "%"),
+        "dB" => ("DeciB", "dB"),
+        "deg" | "degree" | "degrees" | "°" => ("DEG", "°"),
+        "kg m-2" | "kg m**-2" | "kg.m-2" | "kg/m2" | "kg/m²" => ("KiloGM-PER-M2", "kg/m²"),
+        "kg m-2 s-1" | "kg m**-2 s**-1" | "kg.m-2.s-1" | "kg/(m2 s)" => {
+            ("KiloGM-PER-M2-SEC", "kg/(m²·s)")
+        }
+        "kg m-3" | "kg.m-3" | "kg/m3" | "kg/m³" => ("KiloGM-PER-M3", "kg/m³"),
+        "kg kg-1" | "kg.kg-1" | "kg/kg" => ("KiloGM-PER-KiloGM", "kg/kg"),
+        "J kg-1" | "J.kg-1" | "J/kg" => ("J-PER-KiloGM", "J/kg"),
+        "J m-2" | "J.m-2" | "J/m2" | "J/m²" => ("J-PER-M2", "J/m²"),
+        "W m-2" | "W.m-2" | "W/m2" | "W/m²" => ("W-PER-M2", "W/m²"),
+        "m2 s-2" | "m**2 s**-2" | "m2.s-2" => ("M2-PER-SEC2", "m²/s²"),
+        "m3 m-3" | "m3.m-3" | "m3/m3" | "m³/m³" => ("M3-PER-M3", "m³/m³"),
+        "s-1" | "/s" | "1/s" => ("PER-SEC", "/s"),
+        "s" => ("SEC", "s"),
+        "min" => ("MIN", "min"),
+        "h" => ("HR", "h"),
+        "DU" => ("DU", "DU"),
+        "kA" => ("KiloA", "kA"),
+        _ => return None,
+    };
+    Some(QudtUnit { id, symbol })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_spellings_share_one_qudt_entry() {
+        for (spellings, id, symbol) in [
+            (
+                &["m s-1", "m/s", "m.s-1", " m s-1 "][..],
+                "M-PER-SEC",
+                "m/s",
+            ),
+            (&["°C", "degC", "Cel"][..], "DEG_C", "°C"),
+            (&["kg m-2", "kg/m²", "kg.m-2"][..], "KiloGM-PER-M2", "kg/m²"),
+            (&["deg", "degree", "°"][..], "DEG", "°"),
+        ] {
+            for unit in spellings {
+                assert_eq!(qudt_unit(unit), Some(QudtUnit { id, symbol }), "{unit}");
+            }
+        }
+        assert_eq!(
+            qudt_unit("hPa").unwrap().uri(),
+            "https://qudt.org/vocab/unit/HectoPA"
+        );
+    }
+
+    #[test]
+    fn units_without_a_faithful_qudt_entry_are_not_mapped() {
+        // `C` is the coulomb in UCUM; the rest have no QUDT entry that means
+        // what the engines serve.
+        for unit in ["dBZ", "gpm", "deg/km", "1", "C", "", "code table 0 20 003"] {
+            assert_eq!(qudt_unit(unit), None, "{unit}");
+        }
+    }
+
+    #[test]
+    fn every_mechanical_display_unit_but_gpm_has_a_qudt_entry() {
+        for source in ["K", "Pa", "kg m-2"] {
+            let display = display_conversion(source).unwrap().unit;
+            assert!(qudt_unit(display).is_some(), "{display}");
+        }
+    }
 
     #[test]
     fn mechanical_rules() {

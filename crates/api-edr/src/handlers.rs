@@ -23,7 +23,9 @@ use crate::params::{
     RadiusQueryParams, TrajectoryQueryParams, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
-use crate::response::{coverage_response_to_json, locations_to_writer, LocationsContext};
+use crate::response::{
+    collection_parameter_json, coverage_response_to_json, locations_to_writer, LocationsContext,
+};
 
 /// Converting through [`JsonError`] is what attaches the `ErrorReason` the
 /// request log reads (#119); a `(StatusCode, Json)` tuple converts via `?`.
@@ -1922,21 +1924,7 @@ fn build_collection_metadata(
     let parameter_names: serde_json::Map<String, serde_json::Value> = sorted_descs
         .into_iter()
         .map(|(name, desc)| {
-            let mut param = json!({
-                "type": "Parameter",
-                "observedProperty": {
-                    "label": { "en": desc.label }
-                }
-            });
-            if !desc.unit.is_empty() {
-                param["unit"] = json!({
-                    "label": { "en": desc.unit },
-                    "symbol": {
-                        "value": desc.unit,
-                        "type": "http://www.opengis.net/def/uom/UCUM/"
-                    }
-                });
-            }
+            let mut param = collection_parameter_json(desc);
             // A parameter on its own time axis (a satellite product) carries
             // its own temporal extent; the collection's is the union (#819).
             // Instances keep the run's axis.

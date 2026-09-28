@@ -95,6 +95,7 @@ impl GribEngine {
                         label: meta.label(),
                         unit: meta.display.display_unit.into(),
                         observed_property: name.clone(),
+                        standard_name: None,
                     },
                 )
             })
