@@ -503,6 +503,8 @@ location,latitude,longitude,time,temperature,humidity,wind_speed
 Helsinki,60.1699,24.9384,2024-01-01T00:00:00Z,-2.5,85.0,3.2
 ```
 
+`time` is RFC 3339 with a mandatory UTC offset (`Z`, `UTC`, `+02:00` or `+0200`; a space may replace the `T`) and is stored as UTC. A timestamp without an offset fails the load: it is never assumed to be UTC. A file whose rows carry more than one distinct offset, say `Z` and `+02:00`, still loads with every row converted correctly, but logs one WARN per load naming the file, the number of distinct offsets and the row count per offset — a mix usually means concatenated exports or local time across a DST switch. `Z`, `UTC` and `+00:00` count as one offset.
+
 ### GeoJSON
 
 Standard GeoJSON FeatureCollection files (RFC 7946). Requirements:
