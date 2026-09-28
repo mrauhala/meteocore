@@ -238,8 +238,16 @@ memory. Things that differ from the pull sources:
   **no TIME ⇒ active now** (the snapshot's `as_of`, advanced each poll so
   expired alerts drop out).
 - **WMS TIME shape:** `RasterInfo.times` advertises window boundaries through
-  `as_of + 7 days`, plus `as_of`, capped to 256 nearest boundaries. The sorted
-  axis always retains `as_of`. `MapEngine::default_time()` returns `as_of`:
+  `as_of + 7 days`, plus `as_of`, capped at 256 (`build_times`, computed once
+  per catalog). The sorted axis always retains `as_of`. Over the cap, every
+  window reaching the axis first gets one instant inside it — its onset,
+  latest-uncovered-onset first so overlapping windows share one — and only
+  then do the boundaries nearest now fill the rest (#805): a client that
+  steps through the list (WMS TIME, the preview slider) must not skip a short
+  warning whose own boundaries were trimmed. When even those onsets exceed
+  the cap: upcoming before ended, then higher severity, then nearer now.
+  Rendering never reads the list (explicit TIME renders exactly), so it is
+  metadata only — no cache key depends on it. `MapEngine::default_time()` returns `as_of`:
   WMS/Maps/Tiles and the preview use that default independently of the latest
   advertised time. Never restore the old "last advertised time means now" rule.
 - `data_version()` (Feature ETags) hashes record ids + severity + window +

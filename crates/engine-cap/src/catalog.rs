@@ -3,7 +3,7 @@
 //! fills). Built once per poll/refresh and swapped atomically; both trait
 //! surfaces read from the same immutable snapshot.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -742,8 +742,12 @@ fn union_extent(records: &[AreaRecord]) -> Option<[f64; 4]> {
 }
 
 /// Advertise warning boundaries through the next seven days, retaining the
-/// default "now" even under the cardinality cap. Prefer nearby boundaries
-/// when trimming; neither a long archive nor distant forecasts can evict now.
+/// default "now" even under the cardinality cap. Over the cap, every warning
+/// window first gets one instant inside it ([`cover_windows`]): a client that
+/// only steps through the list (WMS TIME, the preview slider) would otherwise
+/// skip a short warning whose own boundaries were trimmed (#805). The rest of
+/// the budget goes to the boundaries nearest now, so neither a long archive
+/// nor distant forecasts can evict now.
 fn build_times(records: &[AreaRecord], as_of: DateTime<Utc>) -> Vec<DateTime<Utc>> {
     let horizon = as_of
         .checked_add_signed(Duration::days(7))
@@ -759,17 +763,109 @@ fn build_times(records: &[AreaRecord], as_of: DateTime<Utc>) -> Vec<DateTime<Utc
     }
     times.sort_unstable();
     times.dedup();
-    if times.len() > MAX_TIME_VALUES {
-        times.sort_unstable_by_key(|t| {
-            (
-                t.signed_duration_since(as_of).num_seconds().unsigned_abs(),
-                *t,
-            )
-        });
-        times.truncate(MAX_TIME_VALUES);
-        times.sort_unstable();
+    if times.len() <= MAX_TIME_VALUES {
+        return times;
     }
-    times
+    let mut kept = BTreeSet::from([as_of]);
+    cover_windows(records, as_of, horizon, &mut kept);
+    times.sort_unstable_by_key(|&t| nearness(t, as_of));
+    for t in times {
+        if kept.len() >= MAX_TIME_VALUES {
+            break;
+        }
+        kept.insert(t);
+    }
+    kept.into_iter().collect()
+}
+
+/// Sort key putting instants nearer `as_of` first (the earlier on a tie).
+fn nearness(t: DateTime<Utc>, as_of: DateTime<Utc>) -> (u64, DateTime<Utc>) {
+    (
+        t.signed_duration_since(as_of).num_seconds().unsigned_abs(),
+        t,
+    )
+}
+
+/// A warning window with no advertised instant inside it yet.
+struct Uncovered {
+    window: ActiveWindow,
+    /// The instant that would represent it: its onset, or its end for an
+    /// open-start window.
+    anchor: DateTime<Utc>,
+    /// Closed before `as_of`; otherwise it opens after it.
+    ended: bool,
+    severity: f64,
+}
+
+/// Add to `kept` (holding `as_of`) an instant inside every warning window that
+/// reaches the advertised range, without exceeding [`MAX_TIME_VALUES`]. Each
+/// added instant is an onset, picked by [`stab`] so the fewest are used. When
+/// even those exceed the cap, upcoming warnings go before ended ones, then the
+/// most severe, then the onsets nearest now.
+fn cover_windows(
+    records: &[AreaRecord],
+    as_of: DateTime<Utc>,
+    horizon: DateTime<Utc>,
+    kept: &mut BTreeSet<DateTime<Utc>>,
+) {
+    let mut uncovered: Vec<Uncovered> = records
+        .iter()
+        .filter_map(|r| {
+            let w = r.window;
+            let anchor = w.start.or(w.end)?;
+            // A window closing before it opens is active at no instant.
+            let reachable = anchor <= horizon && w.start.zip(w.end).is_none_or(|(s, e)| s <= e);
+            (reachable && !w.active_at(as_of)).then_some(Uncovered {
+                window: w,
+                anchor,
+                ended: w.end.is_some_and(|e| e < as_of),
+                severity: r.severity_code,
+            })
+        })
+        .collect();
+    uncovered.sort_unstable_by_key(|u| std::cmp::Reverse(u.anchor));
+    let all = stab(&uncovered, kept);
+    if kept.len() + all.len() <= MAX_TIME_VALUES {
+        kept.extend(all);
+        return;
+    }
+    uncovered.sort_by(|a, b| {
+        a.ended
+            .cmp(&b.ended)
+            .then(b.severity.total_cmp(&a.severity))
+            .then(b.anchor.cmp(&a.anchor))
+    });
+    let same_tier = |a: &Uncovered, b: &Uncovered| {
+        a.ended == b.ended && a.severity.total_cmp(&b.severity).is_eq()
+    };
+    for tier in uncovered.chunk_by(same_tier) {
+        let mut onsets = stab(tier, kept);
+        onsets.sort_unstable_by_key(|&t| nearness(t, as_of));
+        for t in onsets {
+            if kept.len() >= MAX_TIME_VALUES {
+                return;
+            }
+            kept.insert(t);
+        }
+    }
+}
+
+/// The anchors to add so every window of `uncovered` (latest anchor first)
+/// holds an instant of `kept` or of the result. An onset also lies inside
+/// every window that opened earlier and is still active then, so taking the
+/// latest uncovered onset each time needs the fewest instants (interval
+/// stabbing).
+fn stab(uncovered: &[Uncovered], kept: &BTreeSet<DateTime<Utc>>) -> Vec<DateTime<Utc>> {
+    let mut chosen = BTreeSet::new();
+    for u in uncovered {
+        let lo = u.window.start.unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let hi = u.window.end.unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let visible = |set: &BTreeSet<DateTime<Utc>>| set.range(lo..=hi).next().is_some();
+        if !visible(kept) && !visible(&chosen) {
+            chosen.insert(u.anchor);
+        }
+    }
+    chosen.into_iter().collect()
 }
 
 /// FNV-1a (64-bit) — a **fixed, documented** algorithm, unlike `DefaultHasher`
@@ -1207,7 +1303,7 @@ mod tests {
             "severity",
             as_of,
         );
-        let records: Vec<_> = (-600..600)
+        let mut records: Vec<_> = (-600..600)
             .map(|minute| {
                 let mut record = cat.records[0].clone();
                 record.window.start = Some(as_of + Duration::minutes(minute));
@@ -1215,11 +1311,144 @@ mod tests {
                 record
             })
             .collect();
+        // Expires before its onset: active at no instant, so nothing can
+        // cover it — it must not trip the coverage pass either.
+        let mut inverted = cat.records[0].clone();
+        inverted.window = window(as_of + Duration::hours(2), as_of + Duration::hours(1));
+        records.push(inverted);
         let times = build_times(&records, as_of);
         assert_eq!(times.len(), MAX_TIME_VALUES);
         assert!(times.contains(&as_of));
         assert!(times.iter().any(|&t| t > as_of));
         assert!(times.iter().all(|&t| t <= as_of + Duration::days(7)));
         assert!(times.windows(2).all(|w| w[0] < w[1]));
+        // One late onset covers every window opening after now; the rest of
+        // the budget still goes to the boundaries nearest now.
+        assert_eq!(unreachable(&records[..1200], &times), Vec::<usize>::new());
+        assert!(times.contains(&(as_of - Duration::minutes(100))));
+        assert!(times.contains(&(as_of + Duration::minutes(100))));
+    }
+
+    fn window(start: DateTime<Utc>, end: DateTime<Utc>) -> ActiveWindow {
+        ActiveWindow {
+            start: Some(start),
+            end: Some(end),
+        }
+    }
+
+    /// `n` disjoint ten-minute warnings, one every half hour from an hour
+    /// after `as_of`, all well inside the seven-day horizon for `n <= 300`.
+    fn short_warnings(
+        as_of: DateTime<Utc>,
+        n: i64,
+        severity: impl Fn(i64) -> f64,
+    ) -> Vec<AreaRecord> {
+        let alerts = parse_document(DOC).unwrap();
+        let template = Catalog::build(&alerts, &cfg(), "cap", "severity", as_of).records[0].clone();
+        (0..n)
+            .map(|k| {
+                let start = as_of + Duration::hours(1) + Duration::minutes(30 * k);
+                let mut r = template.clone();
+                r.window = window(start, start + Duration::minutes(10));
+                r.severity_code = severity(k);
+                r
+            })
+            .collect()
+    }
+
+    /// Indices of the records active at no advertised instant: a client
+    /// stepping through `times` never shows them.
+    fn unreachable(records: &[AreaRecord], times: &[DateTime<Utc>]) -> Vec<usize> {
+        (0..records.len())
+            .filter(|&i| !times.iter().any(|&t| records[i].window.active_at(t)))
+            .collect()
+    }
+
+    fn assert_axis(times: &[DateTime<Utc>], as_of: DateTime<Utc>) {
+        assert_eq!(times.len(), MAX_TIME_VALUES);
+        assert!(times.contains(&as_of));
+        assert!(
+            times.windows(2).all(|w| w[0] < w[1]),
+            "sorted, no duplicates"
+        );
+    }
+
+    #[test]
+    fn small_timeline_is_every_boundary_up_to_the_horizon_plus_now() {
+        let as_of = at(2026, 6, 15, 12);
+        let mut records = short_warnings(as_of, 4, |_| 3.0);
+        let h = Duration::hours;
+        records[0].window = window(as_of - h(3), as_of - h(1));
+        records[1].window = window(as_of + h(1), as_of + h(2));
+        records[2].window = window(as_of + Duration::days(6), as_of + Duration::days(8));
+        records[3].window = window(as_of + Duration::days(8), as_of + Duration::days(9));
+        assert_eq!(
+            build_times(&records, as_of),
+            vec![
+                as_of - h(3),
+                as_of - h(1),
+                as_of,
+                as_of + h(1),
+                as_of + h(2),
+                as_of + Duration::days(6),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_short_warning_keeps_an_instant_when_boundaries_overflow() {
+        // 250 disjoint warnings: 500 boundaries, but 250 onsets fit the cap.
+        let as_of = at(2026, 6, 15, 12);
+        let records = short_warnings(as_of, 250, |_| 3.0);
+        let times = build_times(&records, as_of);
+        assert_axis(&times, as_of);
+        assert_eq!(unreachable(&records, &times), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn three_hundred_short_warnings_keep_the_nearest_onsets() {
+        // 300 disjoint windows need 300 instants; the cap holds now + 255.
+        // Every kept instant shows its own warning, the nearest first.
+        let as_of = at(2026, 6, 15, 12);
+        let records = short_warnings(as_of, 300, |_| 3.0);
+        let times = build_times(&records, as_of);
+        assert_axis(&times, as_of);
+        assert_eq!(
+            unreachable(&records, &times),
+            (255..300).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn over_the_cap_more_severe_warnings_keep_their_instants_first() {
+        // Every tenth warning is Extreme, including the farthest one; the
+        // Minor ones take what is left of the budget, nearest first.
+        let as_of = at(2026, 6, 15, 12);
+        let records = short_warnings(as_of, 300, |k| if k % 10 == 9 { 4.0 } else { 1.0 });
+        let times = build_times(&records, as_of);
+        assert_axis(&times, as_of);
+        assert_eq!(
+            unreachable(&records, &times),
+            (250..300).filter(|k| k % 10 != 9).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn over_the_cap_upcoming_warnings_go_before_ended_ones() {
+        // 250 upcoming Minor + 20 ended Extreme = 270 disjoint windows. The
+        // upcoming ones are all kept; the five ended ones nearest now fill
+        // the rest of the cap.
+        let as_of = at(2026, 6, 15, 12);
+        let mut records = short_warnings(as_of, 270, |k| if k < 250 { 1.0 } else { 4.0 });
+        for (k, r) in records[250..].iter_mut().enumerate() {
+            let end = as_of - Duration::hours(1) - Duration::minutes(30 * k as i64);
+            r.window = window(end - Duration::minutes(10), end);
+        }
+        let times = build_times(&records, as_of);
+        assert_axis(&times, as_of);
+        assert_eq!(
+            unreachable(&records, &times),
+            (255..270).collect::<Vec<_>>()
+        );
     }
 }
