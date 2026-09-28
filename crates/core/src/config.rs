@@ -570,6 +570,13 @@ pub struct WmsStyle {
     /// (e.g., querydata), selects which parameter's data is returned.
     /// If not set, the engine's default parameter is used.
     pub parameter: Option<String>,
+    /// Parameter layers this style is offered on, for one style shared by
+    /// several parameters (e.g. a temperature palette on `t`, `2t` and
+    /// `TMP`). Each listed layer renders its own parameter. The style is not
+    /// offered on the collection's base layer, which has no single parameter
+    /// to draw. Mutually exclusive with `parameter`.
+    #[serde(default)]
+    pub parameters: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -637,6 +644,10 @@ pub struct StyleBundleExtra {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub parameter: Option<String>,
+    /// Parameter layers this extra is offered on; see
+    /// [`WmsStyle::parameters`]. Mutually exclusive with `parameter`.
+    #[serde(default)]
+    pub parameters: Vec<String>,
 }
 
 /// A named, reusable colormap (`[[colormaps]]` in the top-level config, or
@@ -735,6 +746,40 @@ impl WmsStyle {
     pub fn effective_name(&self) -> Option<&str> {
         self.name.as_deref().or(self.colormap.as_deref())
     }
+}
+
+/// Validate a named style's layer scope: `parameter` and `parameters` are
+/// mutually exclusive, and a `parameters` list names each layer once.
+fn validate_style_scope(
+    owner: &str,
+    name: &str,
+    parameter: Option<&str>,
+    parameters: &[String],
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+    if parameters.is_empty() {
+        return Ok(());
+    }
+    if parameter.is_some() {
+        return Err(Config(format!(
+            "{owner}: style '{name}' sets both 'parameter' and 'parameters'; \
+             use 'parameters' alone to offer it on several parameter layers"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for p in parameters {
+        if p.trim().is_empty() {
+            return Err(Config(format!(
+                "{owner}: style '{name}' has an empty entry in 'parameters'"
+            )));
+        }
+        if !seen.insert(p.as_str()) {
+            return Err(Config(format!(
+                "{owner}: style '{name}' lists parameter '{p}' twice in 'parameters'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -3094,6 +3139,12 @@ impl ServerConfig {
                         bundle.id
                     )));
                 }
+                validate_style_scope(
+                    &format!("Style bundle '{}'", bundle.id),
+                    name,
+                    extra.parameter.as_deref(),
+                    &extra.parameters,
+                )?;
             }
             // Bundle per-parameter defaults (bundles v2): non-empty, unique
             // names — duplicates would silently overwrite each other.
@@ -3647,6 +3698,12 @@ impl ServerConfig {
                              (set an explicit 'name' when reusing a colormap)"
                         )));
                     }
+                    validate_style_scope(
+                        &format!("Collection '{id}'"),
+                        name,
+                        style.parameter.as_deref(),
+                        &style.parameters,
+                    )?;
                 }
                 if let Some(bundle_ref) = &wms.style_bundle {
                     if !bundle_ids.contains(bundle_ref.as_str()) {
@@ -5166,6 +5223,82 @@ colormap = "radar_fmi"
             .to_string();
         assert!(
             err.contains("Style bundle 'radar_multi': extra has an empty 'name' field"),
+            "got: {err}"
+        );
+    }
+
+    /// A `parameters` list may not be combined with `parameter`, repeat a
+    /// name or hold an empty entry, in `[[wms.styles]]` and bundle extras.
+    #[test]
+    fn style_parameters_list_rules() {
+        let tmp = TempDir::new().unwrap();
+        let load = |style: &str, extra: &str| {
+            let toml = format!(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "temperature"
+[style_bundles.default]
+colormap = "temperature"
+
+[[style_bundles.extras]]
+name = "wide"
+colormap = "viridis"
+{extra}
+
+[[collections]]
+id = "c"
+title = "t"
+description = "d"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "x_%Y.tif"
+parameter = "p"
+unit = "u"
+data_path = "/tmp"
+
+[[collections.wms.styles]]
+name = "fmi"
+colormap = "viridis"
+{style}
+"#
+            );
+            let path = write_config(tmp.path(), "config.toml", &toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map_err(|e| e.to_string())
+        };
+
+        let ok = r#"parameters = ["t", "2t", "TMP"]"#;
+        let config = load(ok, ok).expect("a parameters list loads").0;
+        let wms = config.collections[0].wms.as_ref().unwrap();
+        assert_eq!(wms.styles[0].parameters, ["t", "2t", "TMP"]);
+        assert_eq!(
+            config.style_bundles[0].extras[0].parameters,
+            ["t", "2t", "TMP"]
+        );
+
+        let both = "parameter = \"t\"\nparameters = [\"2t\"]";
+        let err = load(both, "").unwrap_err();
+        assert!(
+            err.contains("Collection 'c': style 'fmi' sets both 'parameter' and 'parameters'"),
+            "got: {err}"
+        );
+        let err = load("", both).unwrap_err();
+        assert!(
+            err.contains(
+                "Style bundle 'temperature': style 'wide' sets both 'parameter' and 'parameters'"
+            ),
+            "got: {err}"
+        );
+
+        let err = load(r#"parameters = ["t", "t"]"#, "").unwrap_err();
+        assert!(err.contains("lists parameter 't' twice"), "got: {err}");
+        let err = load("", r#"parameters = ["t", " "]"#).unwrap_err();
+        assert!(
+            err.contains("has an empty entry in 'parameters'"),
             "got: {err}"
         );
     }

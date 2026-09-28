@@ -1543,6 +1543,26 @@ min = 0.0
 max = 70.0
 ```
 
+In a multi-parameter collection each parameter has its own layer, and an
+untagged named style is offered on every one of them. Limit a style to
+the layers it suits with `parameter` (one layer) or `parameters` (several;
+not both). A style with a `parameters` list is not offered on the
+collection's base layer, which has no single parameter to draw:
+
+```toml
+[[collections.wms.styles]]
+name = "fmi-hires"
+colormap = "fmi_hires_temperature"
+min = -50.0
+max = 50.0
+parameters = ["t", "2t", "TMP", "temperature_2m"]   # names that don't exist are ignored
+```
+
+Style names are unique per collection, so the list is also how one style
+reaches several layers. It works in `[[style_bundles.extras]]` too: one
+shared bundle can list every model's temperature names, and each
+collection attaching it gets the style on whichever of those layers it has.
+
 Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml` via `style_bundle = "..."` — see the [Configuration](#configuration) section.
 
 **`[wms]` config fields:**
