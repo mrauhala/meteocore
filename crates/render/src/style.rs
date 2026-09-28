@@ -665,8 +665,8 @@ mod tests {
             })
             .unwrap();
         let celsius = ctx.registry.get("temperature").unwrap();
-        // Whole kelvins: the integer LUT rounds to them. None near the hard
-        // 0 °C edge, where a 0.15 K rounding would straddle it.
+        // The 0 °C hard edge keeps this palette on the float LUT, so kelvin
+        // and °C sample the same stops; `close` absorbs one LUT step.
         for kelvin in [200.0, 240.0, 283.0, 300.0] {
             let (got, want) = (
                 r.colormap.color(Some(kelvin)),
