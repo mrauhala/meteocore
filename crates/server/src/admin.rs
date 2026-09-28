@@ -7667,10 +7667,14 @@ colormap = "no_such_map"
             super::EngineReuse::default(),
         );
         assert_eq!(result.wms_state.render_semaphore.available_permits(), 3);
-        assert!(Arc::ptr_eq(
-            &result.wms_state.render_semaphore,
-            &result.tiles_3d_state.render_semaphore
-        ));
+        // Every raster API shares the slots; 3D Tiles content has its own
+        // pool (#380), pinned by `tiles_3d_content_pool_is_not_the_raster_render_pool`.
+        for other in [
+            &result.maps_state.render_semaphore,
+            &result.tiles_state.render_semaphore,
+        ] {
+            assert!(Arc::ptr_eq(&result.wms_state.render_semaphore, other));
+        }
         use super::Encoder as _;
         let mut text = Vec::new();
         super::TextEncoder::new()
