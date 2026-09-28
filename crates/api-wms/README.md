@@ -99,7 +99,8 @@ GetFeatureInfo is not supported.
 | `WIDTH` | yes | Output image width in pixels (1–8000) |
 | `HEIGHT` | yes | Output image height in pixels (1–8000) |
 | `FORMAT` | yes | Must be `image/png` |
-| `TRANSPARENT` | no | `TRUE` (default) or `FALSE` |
+| `TRANSPARENT` | no | `TRUE` (default) or `FALSE`. `FALSE` returns an opaque image with nodata painted in `BGCOLOR` |
+| `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output (default `0xFFFFFF`) |
 | `TIME` | no | ISO 8601 timestamp. Defaults to latest available. |
 | `STYLES` | no | Ignored (only default style is supported) |
 

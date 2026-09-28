@@ -207,9 +207,47 @@ fn encode_png_indexed(
     Ok(Some(buf))
 }
 
+/// Straight-alpha "over" of one RGBA pixel onto an opaque background colour.
+/// The one compositing formula for opaque output: [`flatten_onto`] (WMS
+/// `TRANSPARENT=FALSE` / `BGCOLOR`) and [`encode_jpeg`]'s implicit white both
+/// use it, so the two cannot drift.
+#[inline]
+fn over(pixel: [u8; 4], background: [u8; 3]) -> [u8; 3] {
+    let a = pixel[3] as u32;
+    match a {
+        255 => [pixel[0], pixel[1], pixel[2]],
+        0 => background,
+        _ => {
+            let blend = |ch: u8, bg: u8| ((ch as u32 * a + bg as u32 * (255 - a)) / 255) as u8;
+            [
+                blend(pixel[0], background[0]),
+                blend(pixel[1], background[1]),
+                blend(pixel[2], background[2]),
+            ]
+        }
+    }
+}
+
+/// Composite an RGBA buffer in place over an opaque `background` colour,
+/// leaving every pixel fully opaque (alpha 255).
+///
+/// The WMS 1.3.0 `TRANSPARENT=FALSE` contract: nodata pixels take the
+/// `BGCOLOR` value and semi-transparent colormap entries blend onto it. The
+/// mapping is per colour, so the distinct-colour count never grows and a
+/// ≤256-colour image still encodes as PNG8, now without a `tRNS` chunk.
+pub fn flatten_onto(rgba: &mut [u8], background: [u8; 3]) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        let [r, g, b] = over(*pixel, background);
+        *pixel = [r, g, b, 255];
+    }
+}
+
 /// Encode an RGBA buffer to JPEG bytes.
 ///
-/// Drops the alpha channel (JPEG doesn't support transparency).
+/// Drops the alpha channel (JPEG doesn't support transparency), compositing
+/// non-opaque pixels over white. A caller wanting another background (WMS
+/// `BGCOLOR`) flattens with [`flatten_onto`] first — an opaque buffer passes
+/// through unchanged.
 /// Quality 85 gives a good size/quality tradeoff.
 pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
     let expected_len = (width * height * 4) as usize;
@@ -226,12 +264,8 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
     // Convert RGBA to RGB (drop alpha)
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     for pixel in rgba.as_chunks::<4>().0 {
-        // Premultiply alpha onto white background for non-opaque pixels
-        let a = pixel[3] as f32 / 255.0;
-        let r = (pixel[0] as f32 * a + 255.0 * (1.0 - a)) as u8;
-        let g = (pixel[1] as f32 * a + 255.0 * (1.0 - a)) as u8;
-        let b = (pixel[2] as f32 * a + 255.0 * (1.0 - a)) as u8;
-        rgb.extend_from_slice(&[r, g, b]);
+        // Composite non-opaque pixels over a white background.
+        rgb.extend_from_slice(&over(*pixel, [255, 255, 255]));
     }
 
     let mut buf = Vec::with_capacity((width * height * 3) as usize);
@@ -388,6 +422,63 @@ mod tests {
         let rgba = vec![0, 0, 0, 0, 255, 0, 0, 255]; // 2x1: transparent, red
         let result = encode_jpeg(&rgba, 2, 1);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn flatten_onto_composites_over_the_background() {
+        let bg = [0x33, 0x66, 0x99];
+        let mut rgba = vec![
+            0, 0, 0, 0, // nodata → the background itself
+            200, 100, 50, 0, // transparent with stray RGB → still the background
+            10, 20, 30, 255, // opaque → unchanged
+            255, 0, 0, 100, // semi-transparent → blended
+        ];
+        flatten_onto(&mut rgba, bg);
+        assert_eq!(
+            rgba,
+            vec![
+                0x33, 0x66, 0x99, 255, //
+                0x33, 0x66, 0x99, 255, //
+                10, 20, 30, 255, //
+                131, 62, 93, 255, // (c·100 + bg·155) / 255 per channel
+            ]
+        );
+    }
+
+    #[test]
+    fn jpeg_white_matches_explicit_white_flatten() {
+        // `encode_jpeg`'s implicit white and `flatten_onto(white)` share one
+        // formula, so pre-flattening onto white changes no byte.
+        let rgba = rgba_from(8, 8, |x, y| {
+            [x as u8 * 30, y as u8 * 30, 90, (x * y * 4) as u8]
+        });
+        let mut flat = rgba.clone();
+        flatten_onto(&mut flat, [255, 255, 255]);
+        assert_eq!(
+            encode_jpeg(&rgba, 8, 8).unwrap(),
+            encode_jpeg(&flat, 8, 8).unwrap()
+        );
+    }
+
+    #[test]
+    fn flattened_png8_stays_indexed_without_trns() {
+        // Opaque output of a ≤256-colour image: still PNG8, but every palette
+        // entry is opaque, so no tRNS chunk and nodata decodes to the background.
+        let rgba = rgba_from(4, 4, |x, _| {
+            if x < 2 {
+                [0, 0, 0, 0]
+            } else {
+                [255, 0, 0, 255]
+            }
+        });
+        let mut flat = rgba.clone();
+        flatten_onto(&mut flat, [0x33, 0x66, 0x99]);
+        let bytes = encode_png(&flat, 4, 4).unwrap();
+        assert!(!png_has_trns(&bytes), "opaque output must not carry tRNS");
+        let (_, _, ct, decoded) = decode_png_to_rgba(&bytes);
+        assert_eq!(ct, png::ColorType::Indexed);
+        assert_eq!(&decoded[..4], &[0x33, 0x66, 0x99, 255]);
+        assert_eq!(&decoded[8..12], &[255, 0, 0, 255]);
     }
 
     // --- Auto-PNG8 (indexed-palette) --------------------------------------

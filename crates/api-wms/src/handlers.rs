@@ -100,12 +100,20 @@ fn request_base_url(state: &WmsState, headers: &HeaderMap) -> String {
     })
 }
 
-/// Render a semi-transparent red error tile to make failed areas visible.
-fn render_error_tile(width: u32, height: u32) -> Result<Vec<u8>, WmsError> {
+/// Render a semi-transparent red error tile to make failed areas visible,
+/// composited over `background` when the request asked for opaque output.
+fn render_error_tile(
+    width: u32,
+    height: u32,
+    background: Option<[u8; 3]>,
+) -> Result<Vec<u8>, WmsError> {
     let pixel_count = (width * height) as usize;
     let mut rgba = Vec::with_capacity(pixel_count * 4);
     for _ in 0..pixel_count {
         rgba.extend_from_slice(&[255, 0, 0, 100]);
+    }
+    if let Some(bg) = background {
+        ds_render::flatten_onto(&mut rgba, bg);
     }
     ds_render::encode_png(&rgba, width, height)
         .map_err(|e| WmsError::Internal(format!("Failed to encode error tile: {e}")))
@@ -337,6 +345,10 @@ pub async fn wms_handler(
                 // (None ⇒ latest), so runs don't collide in the rendered cache.
                 reference_time,
                 content_version,
+                // TRANSPARENT=FALSE / BGCOLOR (and JPEG) change the encoded
+                // bytes; the meta-tile key below stays background-free, so
+                // opaque and transparent views share cached RGBA tiles.
+                background: params.background,
             };
 
             let cache_control = cache_control_value(has_explicit_time, content_version);
@@ -422,6 +434,7 @@ pub async fn wms_handler(
             // direct and meta-tile render closures below.
             let output_crs = params.output_crs.clone();
             let format = params.format;
+            let background = params.background;
             let elevation = params.elevation;
             // `reference_time` (resolved to a concrete run above, #521) is
             // `Copy`; it flows into both the direct and meta-tile render
@@ -469,7 +482,12 @@ pub async fn wms_handler(
                                 return Ok((None, phases));
                             }
                             let encode_start = std::time::Instant::now();
-                            let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
+                            let bytes = ds_render::render_tile_with_background(
+                                &tile,
+                                colormap.as_ref(),
+                                format,
+                                background,
+                            )?;
                             phases.add(RenderPhase::Encode, encode_start.elapsed());
                             Ok::<_, DataServerError>((Some(bytes), phases))
                         };
@@ -502,6 +520,7 @@ pub async fn wms_handler(
                                 &prefix,
                                 colormap.as_ref(),
                                 format,
+                                background,
                                 tile_cache.as_ref(),
                                 |tbbox, tw, th, tile_output| {
                                     engine.get_raster_tile(
@@ -627,14 +646,16 @@ pub async fn wms_handler(
                     (cached, "MISS", content_type)
                 }
                 Ok(None) => {
-                    // Empty tile: a transparent PNG, encoded once per (w,h) and
-                    // shared across WMS/Maps/Tiles (#171). Not inserted into the
-                    // rendered cache — the shared empty-tile cache already serves
-                    // the deterministic empty response.
+                    // Empty tile: a transparent PNG — or, for opaque output, a
+                    // solid background one — encoded once per (w,h,background)
+                    // and shared across WMS/Maps/Tiles (#171). Not inserted into
+                    // the rendered cache — the shared empty-tile cache already
+                    // serves the deterministic empty response.
                     let cached =
-                        ds_render::empty_tile(params.width, params.height).map_err(|e| {
-                            WmsError::Internal(format!("Failed to encode empty tile: {e}"))
-                        })?;
+                        ds_render::background_tile(params.width, params.height, params.background)
+                            .map_err(|e| {
+                                WmsError::Internal(format!("Failed to encode empty tile: {e}"))
+                            })?;
                     (cached, "EMPTY", "image/png")
                 }
                 Err(
@@ -644,7 +665,7 @@ pub async fn wms_handler(
                 }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
-                    let png = render_error_tile(params.width, params.height)?;
+                    let png = render_error_tile(params.width, params.height, params.background)?;
                     let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
                     (cached, "ERROR", "image/png")
                 }

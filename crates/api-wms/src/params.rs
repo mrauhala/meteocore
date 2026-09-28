@@ -134,7 +134,11 @@ pub struct GetMapParams {
     pub bbox: [f64; 4],
     pub width: u32,
     pub height: u32,
-    pub transparent: bool,
+    /// Opaque background to composite the image over, from `TRANSPARENT` /
+    /// `BGCOLOR` and the format: `None` keeps the alpha channel
+    /// (`TRANSPARENT=TRUE`, the default, for PNG/WebP); `Some(rgb)` for
+    /// `TRANSPARENT=FALSE` and for JPEG, which cannot carry alpha.
+    pub background: Option<[u8; 3]>,
     pub time: Option<DateTime<Utc>>,
     /// Output CRS for pixel-to-coordinate mapping.
     pub output_crs: OutputCrs,
@@ -241,12 +245,15 @@ impl WmsQuery {
         // FORMAT
         let image_format = parse_image_format(self.format.as_deref())?;
 
-        // TRANSPARENT
-        let transparent = self
-            .transparent
-            .as_deref()
-            .map(|s| s.eq_ignore_ascii_case("true"))
-            .unwrap_or(true);
+        // TRANSPARENT + BGCOLOR (WMS 1.3.0 §7.3.3.9–10). With TRANSPARENT=FALSE,
+        // or a format without alpha (JPEG), nodata pixels take the BGCOLOR
+        // value (default white) and the image is opaque. TRANSPARENT defaults
+        // to TRUE here — the spec's FALSE would turn every overlay client that
+        // omits it opaque.
+        let transparent = parse_transparent(self.transparent.as_deref())?;
+        let bgcolor = parse_bgcolor(self.bgcolor.as_deref())?;
+        let background =
+            (!transparent || image_format == ds_render::ImageFormat::Jpeg).then_some(bgcolor);
 
         // TIME
         let time = self.time.as_deref().map(parse_time).transpose()?;
@@ -308,7 +315,7 @@ impl WmsQuery {
             bbox,
             width,
             height,
-            transparent,
+            background,
             time,
             output_crs,
             format: image_format,
@@ -429,6 +436,41 @@ fn epsg3857_to_wgs84(x: f64, y: f64) -> (f64, f64) {
         ds_core::web_mercator::x_to_lon(x),
         ds_core::web_mercator::y_to_lat(y),
     )
+}
+
+/// `BGCOLOR` default: white (WMS 1.3.0 §7.3.3.10).
+const DEFAULT_BGCOLOR: [u8; 3] = [0xFF, 0xFF, 0xFF];
+
+/// Parse `TRANSPARENT`: `TRUE` or `FALSE`, case-insensitive; omitted or empty
+/// ⇒ `TRUE`. Anything else is rejected rather than read as `FALSE`, since
+/// that would silently turn the image opaque.
+fn parse_transparent(raw: Option<&str>) -> Result<bool, WmsError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(true),
+        Some(s) if s.eq_ignore_ascii_case("true") => Ok(true),
+        Some(s) if s.eq_ignore_ascii_case("false") => Ok(false),
+        Some(s) => Err(WmsError::invalid_parameter(&format!(
+            "TRANSPARENT '{s}' must be TRUE or FALSE"
+        ))),
+    }
+}
+
+/// Parse `BGCOLOR` strictly as `0xRRGGBB` — a lower-case `0x` prefix and six
+/// hex digits of either case (WMS 1.3.0 §7.3.3.10); omitted or empty ⇒ white.
+fn parse_bgcolor(raw: Option<&str>) -> Result<[u8; 3], WmsError> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_BGCOLOR);
+    };
+    s.strip_prefix("0x")
+        .filter(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .map(|rgb| {
+            let [_, r, g, b] = rgb.to_be_bytes();
+            [r, g, b]
+        })
+        .ok_or_else(|| {
+            WmsError::invalid_parameter(&format!("BGCOLOR '{s}' must be of the form 0xRRGGBB"))
+        })
 }
 
 /// Parse an ISO 8601 timestamp for the TIME parameter.
@@ -574,6 +616,52 @@ mod tests {
         assert!(parse_time("2024-01-01T00:00:00+00:00").is_ok());
         assert!(parse_time("2024-01-01T00:00").is_ok());
         assert!(parse_time("not-a-time").is_err());
+    }
+
+    #[test]
+    fn parse_bgcolor_accepts_0xrrggbb_in_either_hex_case() {
+        assert_eq!(parse_bgcolor(Some("0x336699")).unwrap(), [0x33, 0x66, 0x99]);
+        assert_eq!(parse_bgcolor(Some("0xAbCdEf")).unwrap(), [0xAB, 0xCD, 0xEF]);
+        assert_eq!(parse_bgcolor(Some("0x000000")).unwrap(), [0, 0, 0]);
+        // Omitted or empty ⇒ the spec default, white.
+        assert_eq!(parse_bgcolor(None).unwrap(), [0xFF, 0xFF, 0xFF]);
+        assert_eq!(parse_bgcolor(Some("")).unwrap(), [0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn parse_bgcolor_rejects_malformed_values() {
+        for bogus in [
+            "#336699",
+            "336699",
+            "0X336699",
+            "0x3366",
+            "0x33669",
+            "0x3366990",
+            "0x33669G",
+            "0x+33669",
+            "0x",
+            "white",
+        ] {
+            let err = parse_bgcolor(Some(bogus)).expect_err(bogus);
+            assert!(
+                matches!(err, WmsError::InvalidParameterValue(_)),
+                "expected InvalidParameterValue for {bogus:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_transparent_is_true_false_case_insensitive() {
+        assert!(parse_transparent(None).unwrap());
+        assert!(parse_transparent(Some("")).unwrap());
+        assert!(parse_transparent(Some("TRUE")).unwrap());
+        assert!(parse_transparent(Some("true")).unwrap());
+        assert!(!parse_transparent(Some("FALSE")).unwrap());
+        assert!(!parse_transparent(Some("False")).unwrap());
+        for bogus in ["1", "0", "yes", "no", "t"] {
+            let err = parse_transparent(Some(bogus)).expect_err(bogus);
+            assert!(matches!(err, WmsError::InvalidParameterValue(_)));
+        }
     }
 
     #[test]

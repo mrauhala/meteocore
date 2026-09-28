@@ -306,8 +306,9 @@ pub enum MetaTile {
         stats: MetaTileStats,
     },
     /// Every covered pixel is nodata — the caller should emit its own
-    /// transparent tile (matching the existing all-nodata fast path). `stats`
-    /// still carries the tile-loop timing (assemble/encode are skipped, so 0).
+    /// all-nodata tile, transparent or its opaque background (matching the
+    /// existing all-nodata fast path). `stats` still carries the tile-loop
+    /// timing (assemble/encode are skipped, so 0).
     Empty { stats: MetaTileStats },
     /// Meta-tiling declined (degenerate bbox, over-zoom past the ladder, or a
     /// covering tile count above [`tile_budget`]); the caller should fall back
@@ -321,6 +322,10 @@ pub enum MetaTile {
 /// `bbox_deg` is the WGS84 source-read envelope; projected viewport metres
 /// come from `output_crs`. Each closure call receives its OWN projected tile
 /// bounds plus their WGS84 envelope, never the original viewport's bounds.
+///
+/// `background` (`Some` = opaque output, WMS `TRANSPARENT=FALSE`) is applied
+/// only when encoding the assembled view: the cached tiles stay RGBA, so
+/// transparent and opaque views of one area share them.
 #[allow(clippy::too_many_arguments)]
 pub fn render_metatiled<F>(
     bbox_deg: [f64; 4],
@@ -330,6 +335,7 @@ pub fn render_metatiled<F>(
     prefix: &TileKeyPrefix,
     colormap: &dyn ColorMap,
     format: ImageFormat,
+    background: Option<[u8; 3]>,
     cache: &TilePixelCache,
     render_tile: F,
 ) -> Result<MetaTile, DataServerError>
@@ -546,11 +552,7 @@ where
     let assemble = t_assemble.elapsed();
 
     let t_encode = Instant::now();
-    let bytes = match format {
-        ImageFormat::Png => crate::encode_png(&out, width, height)?,
-        ImageFormat::Jpeg => crate::encode_jpeg(&out, width, height)?,
-        ImageFormat::Webp => crate::encode_webp(&out, width, height)?,
-    };
+    let bytes = crate::encode_rgba(&mut out, width, height, format, background)?;
     let encode = t_encode.elapsed();
     Ok(MetaTile::Image {
         bytes,
@@ -823,6 +825,7 @@ mod tests {
             &prefix,
             &SolidRed,
             ImageFormat::Png,
+            None,
             &cache,
             solid_tile,
         )
@@ -862,6 +865,7 @@ mod tests {
             &prefix,
             &SolidRed,
             ImageFormat::Png,
+            None,
             &cache,
             solid_tile,
         )
@@ -897,6 +901,7 @@ mod tests {
             &prefix,
             &SolidRed,
             ImageFormat::Png,
+            None,
             &cache,
             empty_tile,
         )
@@ -932,6 +937,7 @@ mod tests {
                 &prefix,
                 &SolidRed,
                 ImageFormat::Png,
+                None,
                 &cache,
                 slow_tile,
             );
@@ -990,6 +996,7 @@ mod tests {
             &prefix,
             &SolidRed,
             ImageFormat::Png,
+            None,
             &cache,
             solid_tile,
         )
@@ -1035,6 +1042,7 @@ mod tests {
             &prefix,
             &SolidRed,
             ImageFormat::Png,
+            None,
             &cache,
             solid_tile,
         )
@@ -1090,6 +1098,7 @@ mod tests {
             &prefix,
             &SolidRed,
             ImageFormat::Png,
+            None,
             &cache,
             solid_tile,
         )
@@ -1165,6 +1174,77 @@ mod tests {
         }
     }
 
+    /// `background` is an encode-time composite: an opaque view paints nodata
+    /// with the background, and the transparent view of the same area is then
+    /// served from the very same cached RGBA tiles (no second engine call).
+    #[test]
+    fn background_composites_at_encode_and_shares_cached_tiles() {
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        // Data in the left half of every tile, nodata in the right half.
+        let calls = AtomicU64::new(0);
+        let half_tile = |_b: [f64; 4], w: u32, h: u32, _: &OutputCrs| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let values = (0..w * h)
+                .map(|i| (i % w < w / 2).then_some(1.0))
+                .collect::<Vec<_>>();
+            Ok(RasterTile {
+                width: w,
+                height: h,
+                values: values.into(),
+            })
+        };
+        let bg = [0x33, 0x66, 0x99];
+        let bbox = [20.0, 58.0, 30.0, 64.0];
+        let render = |background| match render_metatiled(
+            bbox,
+            &OutputCrs::WebMercator,
+            256,
+            256,
+            &prefix,
+            &SolidRed,
+            ImageFormat::Png,
+            background,
+            &cache,
+            half_tile,
+        )
+        .unwrap()
+        {
+            MetaTile::Image { bytes, .. } => decode_rgba(&bytes).2,
+            _ => panic!("expected an image"),
+        };
+
+        let opaque = render(Some(bg));
+        let first_calls = calls.load(Ordering::Relaxed);
+        assert!(first_calls > 0);
+        let pixels = opaque.as_chunks::<4>().0;
+        assert!(pixels.iter().all(|p| p[3] == 255), "opaque output");
+        assert!(
+            pixels.contains(&[0x33, 0x66, 0x99, 255]),
+            "nodata → background"
+        );
+        assert!(pixels.contains(&[255, 0, 0, 255]), "data keeps its colour");
+
+        let transparent = render(None);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            first_calls,
+            "the transparent view reuses the cached RGBA tiles"
+        );
+        assert!(
+            transparent.as_chunks::<4>().0.contains(&[0, 0, 0, 0]),
+            "without a background nodata stays transparent"
+        );
+    }
+
     /// The strongest fidelity guard: assemble a field whose value at every pixel
     /// is that pixel's own Web Mercator X (longitude axis), encoded into red.
     /// The decoded output's red at pixel `px` must match the colormap of that
@@ -1221,6 +1301,7 @@ mod tests {
             &prefix,
             &cmap,
             ImageFormat::Png,
+            None,
             &cache,
             x_render,
         )
@@ -1276,6 +1357,7 @@ mod tests {
             &prefix,
             &cmap_y,
             ImageFormat::Png,
+            None,
             &cache_y,
             y_render,
         )
@@ -1353,6 +1435,7 @@ mod tests {
             &prefix,
             &SolidRed,
             ImageFormat::Png,
+            None,
             &cache,
             stripe_tile,
         )
@@ -1504,6 +1587,7 @@ mod tests {
                     &projected_prefix(),
                     &cmap,
                     ImageFormat::Png,
+                    None,
                     &cache,
                     projected_field,
                 )
@@ -1548,6 +1632,7 @@ mod tests {
                         &prefix,
                         &SolidRed,
                         ImageFormat::Png,
+                        None,
                         &cache,
                         solid_tile,
                     )
@@ -1594,6 +1679,7 @@ mod tests {
                     &projected_prefix(),
                     &SolidRed,
                     ImageFormat::Png,
+                    None,
                     &cache,
                     |_, _, _, _| panic!("declined requests must not render tiles"),
                 )

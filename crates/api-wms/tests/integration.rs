@@ -3705,3 +3705,348 @@ mod per_parameter_times {
         assert_eq!(renders(&engine)[2], (Some("b".into()), Some(t(T1))));
     }
 }
+
+// --- TRANSPARENT / BGCOLOR (#163) ------------------------------------------
+
+/// Data west of 20°E, nodata east of it, counting engine calls. Geographic,
+/// not tile-local, so the direct and the meta-tiled path agree: a lon 10–30
+/// view is half data, half nodata either way.
+struct HalfDataMockMapEngine {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MapEngine for HalfDataMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let [west, _, east, _] = bbox;
+        let values: Vec<Option<f64>> = (0..width * height)
+            .map(|i| {
+                let lon = west + ((i % width) as f64 + 0.5) / width as f64 * (east - west);
+                (lon < 20.0).then_some(0.5)
+            })
+            .collect();
+        Ok(RasterTile {
+            width,
+            height,
+            values: values.into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:4326".into(),
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: vec![chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)],
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        }
+    }
+}
+
+fn build_half_data_router() -> (axum::Router, Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let engine = Arc::new(HalfDataMockMapEngine {
+        calls: calls.clone(),
+    });
+    (build_populated_router_with_engine(engine), calls)
+}
+
+/// The same lon 10–30 / lat 55–70 view on the direct (CRS:84) and the
+/// meta-tiled (EPSG:3857) render path.
+const HALF_VIEWS: [(&str, &str); 2] = [
+    ("CRS:84", "10,55,30,70"),
+    ("EPSG:3857", "1113194,7361866,3339584,11068715"),
+];
+
+const BG: [u8; 4] = [0x33, 0x66, 0x99, 255];
+
+/// GET a 64×64 GetMap of `layer` with `extra` query parameters appended.
+async fn get_map_with(
+    app: &axum::Router,
+    layer: &str,
+    crs: &str,
+    bbox: &str,
+    extra: &str,
+) -> (StatusCode, String, bytes::Bytes) {
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS={layer}&STYLES=\
+         &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64{extra}"
+    );
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let x_cache = resp
+        .headers()
+        .get("x-cache")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, x_cache, body)
+}
+
+/// Decode a PNG (indexed or truecolour, with or without alpha) to RGBA pixels.
+fn png_pixels(bytes: &[u8]) -> Vec<[u8; 4]> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("png buffer size")];
+    let frame = reader.next_frame(&mut buf).unwrap();
+    let data = &buf[..frame.buffer_size()];
+    match frame.color_type {
+        png::ColorType::Rgba => data.as_chunks::<4>().0.to_vec(),
+        png::ColorType::Rgb => data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[r, g, b]| [r, g, b, 255])
+            .collect(),
+        other => panic!("unexpected decoded PNG colour type: {other:?}"),
+    }
+}
+
+/// TRANSPARENT=FALSE paints nodata with BGCOLOR and returns an opaque image;
+/// the default keeps nodata transparent — on both render paths.
+#[tokio::test]
+async fn transparent_false_composites_nodata_over_bgcolor() {
+    for (crs, bbox) in HALF_VIEWS {
+        let (app, _) = build_half_data_router();
+
+        let (status, _, body) = get_map_with(&app, "radar", crs, bbox, "&FORMAT=image/png").await;
+        assert_eq!(status, StatusCode::OK);
+        let default = png_pixels(&body);
+        assert!(
+            default.iter().any(|p| p[3] == 0),
+            "{crs}: default output keeps nodata transparent"
+        );
+        assert!(default.iter().any(|p| p[3] == 255), "{crs}: data is drawn");
+
+        let (status, _, body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let opaque = png_pixels(&body);
+        assert!(
+            opaque.iter().all(|p| p[3] == 255),
+            "{crs}: TRANSPARENT=FALSE output must be opaque"
+        );
+        assert!(opaque.contains(&BG), "{crs}: nodata takes BGCOLOR");
+        assert!(
+            opaque.iter().any(|&p| p != BG),
+            "{crs}: data pixels keep their colour"
+        );
+        // Pixel for pixel: data unchanged, nodata → BGCOLOR.
+        for (d, o) in default.iter().zip(&opaque) {
+            let expected = if d[3] == 0 { BG } else { *d };
+            assert_eq!(*o, expected, "{crs}");
+        }
+
+        // Without BGCOLOR the background is the spec default, white.
+        let (_, _, body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&transparent=false",
+        )
+        .await;
+        let white = png_pixels(&body);
+        assert!(white.iter().all(|p| p[3] == 255));
+        assert!(white.contains(&[255, 255, 255, 255]), "{crs}");
+    }
+}
+
+/// The rendered-image cache must never serve a transparent image to an opaque
+/// request (or vice versa), while the meta-tile cache — plain RGBA — is shared
+/// by both.
+#[tokio::test]
+async fn opaque_request_is_not_served_a_cached_transparent_image() {
+    use std::sync::atomic::Ordering;
+    for (crs, bbox) in HALF_VIEWS {
+        let (app, calls) = build_half_data_router();
+        let png = "&FORMAT=image/png";
+        let opaque = "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699";
+
+        let (_, x, transparent_body) = get_map_with(&app, "radar", crs, bbox, png).await;
+        assert_eq!(x, "MISS");
+        let after_transparent = calls.load(Ordering::Relaxed);
+
+        let (_, x, opaque_body) = get_map_with(&app, "radar", crs, bbox, opaque).await;
+        assert_eq!(
+            x, "MISS",
+            "{crs}: opaque must not hit the transparent entry"
+        );
+        assert!(png_pixels(&opaque_body).iter().all(|p| p[3] == 255));
+        if crs == "EPSG:3857" {
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                after_transparent,
+                "meta-tiled: the opaque view composites the cached RGBA tiles"
+            );
+        }
+
+        let (_, x, body) = get_map_with(&app, "radar", crs, bbox, opaque).await;
+        assert_eq!(x, "HIT", "{crs}");
+        assert_eq!(body, opaque_body);
+        let (_, x, body) = get_map_with(&app, "radar", crs, bbox, png).await;
+        assert_eq!(x, "HIT", "{crs}");
+        assert_eq!(body, transparent_body);
+        // A different background is a different image.
+        let (_, x, body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x000000",
+        )
+        .await;
+        assert_eq!(x, "MISS", "{crs}");
+        assert_ne!(body, opaque_body);
+    }
+}
+
+/// An all-nodata view with TRANSPARENT=FALSE is a solid BGCOLOR image, on the
+/// direct and the meta-tiled empty path; the default stays transparent.
+#[tokio::test]
+async fn all_nodata_opaque_view_is_solid_bgcolor() {
+    let app = build_empty_router();
+    for (crs, bbox) in HALF_VIEWS {
+        let (status, x, body) = get_map_with(
+            &app,
+            "empty",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(x, "EMPTY", "{crs}");
+        let pixels = png_pixels(&body);
+        assert_eq!(pixels.len(), 64 * 64);
+        assert!(pixels.iter().all(|&p| p == BG), "{crs}: solid BGCOLOR");
+
+        let (_, x, body) = get_map_with(&app, "empty", crs, bbox, "&FORMAT=image/png").await;
+        assert_eq!(x, "EMPTY", "{crs}");
+        assert!(png_pixels(&body).iter().all(|&p| p == [0, 0, 0, 0]));
+    }
+}
+
+/// The semi-transparent red error tile is composited over BGCOLOR too.
+#[tokio::test]
+async fn error_tile_honours_transparent_false() {
+    let app = build_failing_router();
+    let (_, x, body) = get_map_with(
+        &app,
+        "broken",
+        "CRS:84",
+        "10,55,30,70",
+        "&FORMAT=image/png&TRANSPARENT=FALSE",
+    )
+    .await;
+    assert_eq!(x, "ERROR");
+    // [255, 0, 0, 100] over white.
+    assert!(png_pixels(&body).iter().all(|&p| p == [255, 155, 155, 255]));
+
+    let (_, x, body) =
+        get_map_with(&app, "broken", "CRS:84", "10,55,30,70", "&FORMAT=image/png").await;
+    assert_eq!(x, "ERROR");
+    assert!(png_pixels(&body).iter().all(|&p| p == [255, 0, 0, 100]));
+}
+
+/// JPEG has no alpha, so it is always composited over BGCOLOR (default
+/// white): TRANSPARENT is moot, and BGCOLOR changes the image.
+#[tokio::test]
+async fn jpeg_is_composited_over_bgcolor() {
+    let (app, _) = build_half_data_router();
+    let (crs, bbox) = HALF_VIEWS[0];
+    let (status, x, default) = get_map_with(&app, "radar", crs, bbox, "&FORMAT=image/jpeg").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(x, "MISS");
+    assert_eq!(&default[..2], &[0xFF, 0xD8], "a JPEG");
+
+    // Same white background, so the same cached image.
+    let (_, x, body) = get_map_with(
+        &app,
+        "radar",
+        crs,
+        bbox,
+        "&FORMAT=image/jpeg&TRANSPARENT=FALSE&BGCOLOR=0xFFFFFF",
+    )
+    .await;
+    assert_eq!(x, "HIT");
+    assert_eq!(body, default);
+
+    let (_, x, body) = get_map_with(
+        &app,
+        "radar",
+        crs,
+        bbox,
+        "&FORMAT=image/jpeg&BGCOLOR=0x336699",
+    )
+    .await;
+    assert_eq!(x, "MISS");
+    assert_eq!(&body[..2], &[0xFF, 0xD8]);
+    assert_ne!(body, default, "BGCOLOR must replace the white background");
+}
+
+/// A malformed BGCOLOR or TRANSPARENT is an InvalidParameterValue
+/// ServiceException, not a silently ignored parameter.
+#[tokio::test]
+async fn malformed_bgcolor_or_transparent_is_invalid_parameter_value() {
+    let (app, calls) = build_half_data_router();
+    for extra in [
+        "&BGCOLOR=%23336699",
+        "&BGCOLOR=336699",
+        "&BGCOLOR=0x3366",
+        "&BGCOLOR=0x33669G",
+        "&BGCOLOR=0X336699",
+        "&TRANSPARENT=FALSE&BGCOLOR=white",
+        "&TRANSPARENT=maybe",
+    ] {
+        let (status, _, body) = get_map_with(
+            &app,
+            "radar",
+            "CRS:84",
+            "10,55,30,70",
+            &format!("&FORMAT=image/png{extra}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}");
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("<ServiceExceptionReport"), "{extra}: {xml}");
+        assert!(
+            xml.contains("code=\"InvalidParameterValue\""),
+            "{extra}: {xml}"
+        );
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rejected before rendering"
+    );
+}
