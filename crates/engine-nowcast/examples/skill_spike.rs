@@ -235,6 +235,10 @@ fn tile_to_grid(values: RasterValues, width: usize, height: usize) -> Grid {
                 }
             })
             .collect(),
+        RasterValues::F32 { data, nodata } => data
+            .into_iter()
+            .map(|raw| RasterValues::decode_f32(raw, nodata).map_or(f32::NAN, |_| raw))
+            .collect(),
     };
     Grid::new(width, height, data)
 }

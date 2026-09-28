@@ -845,6 +845,9 @@ fn draw_rect_border(
 /// index it by the raw byte — no per-pixel float decode, boxing, or dyn
 /// dispatch. The LUT entry is *defined* as `colormap.color(value_at(i))`,
 /// so the output is byte-identical to boxing the same samples to `F64`.
+/// `F32` (#475) evaluates the colormap per pixel on
+/// [`RasterValues::decode_f32`](ds_core::map_engine::RasterValues::decode_f32)
+/// — the boxed view by definition — reading 4 bytes per pixel instead of 16.
 pub(crate) fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
     use ds_core::map_engine::RasterValues;
     let mut rgba = Vec::with_capacity((tile.width * tile.height * 4) as usize);
@@ -872,6 +875,20 @@ pub(crate) fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
             }
             for &raw in data {
                 rgba.extend_from_slice(&lut[raw as usize]);
+            }
+        }
+        // The common no-sentinel case gets its own loop so the per-pixel
+        // sentinel compare folds away (measured ~8% of this loop).
+        RasterValues::F32 { data, nodata: None } => {
+            for &raw in data {
+                let color = colormap.color(RasterValues::decode_f32(raw, None));
+                rgba.extend_from_slice(&color);
+            }
+        }
+        RasterValues::F32 { data, nodata } => {
+            for &raw in data {
+                let color = colormap.color(RasterValues::decode_f32(raw, *nodata));
+                rgba.extend_from_slice(&color);
             }
         }
     }
@@ -1192,6 +1209,85 @@ mod tests {
             colorize(&f64_tile, &cmap),
             "U8 LUT colorize must be byte-identical to the boxed F64 path"
         );
+    }
+
+    /// The #475 counterpart for `F32`: colorizing the compact float form
+    /// must be byte-identical to boxing the same samples to `F64` — the
+    /// sentinel and NaN/±∞ transparent, every other sample widened exactly,
+    /// including values straddling LUT bin edges and outside the range.
+    #[test]
+    fn f32_colorize_matches_boxed_f64_exactly() {
+        use ds_core::map_engine::RasterValues;
+        let (min, max) = (-40.0f64, 40.0f64);
+        let bin = (max - min) / 4095.0;
+        let mut data: Vec<f32> = vec![
+            -9999.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            f32::MIN_POSITIVE / 2.0,
+            -1000.0,
+            1000.0,
+            min as f32,
+            max as f32,
+        ];
+        // Dense sweep across the range, plus both neighbours of every
+        // LUT rounding edge in a stretch of it.
+        data.extend((0..4000).map(|i| (min + i as f64 * 0.0213) as f32));
+        for k in 1800..1900 {
+            let edge = (min + (k as f64 + 0.5) * bin) as f32;
+            data.extend([edge.next_down(), edge, edge.next_up()]);
+        }
+        let lut = LutColorMap::from_builtin(BuiltinColormap::Temperature, min, max);
+        let linear = LinearColorMap::new(
+            builtin_palette("temperature")
+                .expect("builtin palette")
+                .stops
+                .clone(),
+        );
+        // Tells a boxed `None` from a non-finite `Some`, which the builtin
+        // colormaps render alike: pins that NaN/±∞ decode to `None`.
+        struct NonFiniteProbe;
+        impl ColorMap for NonFiniteProbe {
+            fn color(&self, value: Option<f64>) -> [u8; 4] {
+                match value {
+                    None => [0, 0, 0, 0],
+                    Some(v) if !v.is_finite() => [255, 0, 0, 255],
+                    Some(v) => [0, 0, v.clamp(0.0, 255.0) as u8, 255],
+                }
+            }
+        }
+        // Both colorize arms: with a sentinel, and without one (where
+        // -9999 is a real, below-range value).
+        for nodata in [Some(-9999.0f32), None] {
+            let boxed: Vec<Option<f64>> = data
+                .iter()
+                .map(|&raw| (raw.is_finite() && Some(raw) != nodata).then_some(raw as f64))
+                .collect();
+            let w = data.len() as u32;
+            let f32_tile = RasterTile {
+                width: w,
+                height: 1,
+                values: RasterValues::F32 {
+                    data: data.clone(),
+                    nodata,
+                },
+            };
+            let f64_tile = RasterTile {
+                width: w,
+                height: 1,
+                values: boxed.into(),
+            };
+            for cmap in [&lut as &dyn ColorMap, &linear, &NonFiniteProbe] {
+                assert_eq!(
+                    colorize(&f32_tile, cmap),
+                    colorize(&f64_tile, cmap),
+                    "F32 colorize must be byte-identical to the boxed F64 path \
+                     (nodata {nodata:?})"
+                );
+            }
+        }
     }
 
     #[test]

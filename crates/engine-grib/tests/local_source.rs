@@ -150,3 +150,61 @@ fn invalid_discovery_settings_fail_at_load() {
     assert!(GribEngine::new("grib-s3-test", &s3("%Y%m%d/%H/")).is_err());
     assert!(GribEngine::new("grib-s3-test", &s3("%Y%m%d/%!/")).is_err());
 }
+
+/// #475: the map path emits the compact `F32` form, and every sample is
+/// exactly the pre-#475 boxed value — f64 bilinear resample plus display
+/// conversion — narrowed to f32, with nodata in the same pixels. Storage
+/// width is the only change; checked for all three output-CRS paths.
+#[test]
+fn map_tiles_are_f32_narrowings_of_the_f64_resample() {
+    use ds_core::map_engine::RasterValues;
+    use engine_grib::{reader::decode_message, units};
+
+    let engine = GribEngine::new("grib-local-test", &local_config()).expect("engine builds");
+    let bytes = std::fs::read("../../testdata/grib-local/sample-message.grib2").expect("fixture");
+    let grid = decode_message(&bytes, "fixture").expect("decode fixture");
+    let (discipline, category, number) = grid.triple;
+    let display = units::lookup(grid.centre, discipline, category, number)
+        .map(|info| units::default_display(info.source_unit))
+        .filter(units::DisplayConversion::has_conversion);
+    let time = engine.get_temporal_extent().expect("extent").0;
+    let param = engine.raster_info().parameter;
+
+    // Europe, straddling Greenwich; the projected view is the same area in
+    // EPSG:3035 (the `ProjectionGrid` path).
+    let bbox = [-20.0, 35.0, 40.0, 72.0];
+    let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
+    let projected = ds_core::geo::projected_envelope(&crs, bbox);
+    let read = ds_core::geo::wgs84_envelope(&crs, projected).unwrap();
+    for (bbox, output) in [
+        (bbox, OutputCrs::Wgs84),
+        (bbox, OutputCrs::WebMercator),
+        (
+            read,
+            OutputCrs::Projected {
+                crs,
+                bbox: projected,
+            },
+        ),
+    ] {
+        let (w, h) = (128, 96);
+        let tile = engine
+            .get_raster_tile(bbox, w, h, Some(time), &output, Some(&param), None, None)
+            .expect("render");
+        assert!(
+            matches!(tile.values, RasterValues::F32 { nodata: None, .. }),
+            "GRIB map tiles must use the compact F32 form"
+        );
+        let reference = grid.resample(bbox, w, h, &output);
+        assert_eq!(tile.values.len(), reference.len());
+        assert!(reference.iter().any(Option::is_some), "view must hit data");
+        for (i, value) in reference.into_iter().enumerate() {
+            let converted = value.map(|v| display.map_or(v, |d| d.convert(v)));
+            assert_eq!(
+                tile.values.value_at(i),
+                converted.map(|v| f64::from(v as f32)),
+                "pixel {i}"
+            );
+        }
+    }
+}

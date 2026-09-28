@@ -43,6 +43,8 @@ reason `MapEngine::resolve_reference_time` exists (#521).
 - A `RasterValues::U8` source with a nodata byte stays raw bytes end to end
   (1 B/px; `advect_u8` moves bytes); anything else falls back to f32
   (4 B/px — the FMI S3 COG path lands here until #475-style typed paths).
+  A `RasterValues::F32` source (GRIB) is taken over in place, its sentinel
+  rewritten to NaN; output frames are still boxed to `F64` (follow-up).
 - Motion is estimated on a coarsened grid sized so the physical search
   window (40 m/s × source interval) fits `TARGET_SEARCH_PX` (48 — keeps
   typical kilometre-scale working grids uncoarsened), then the field is scaled back —

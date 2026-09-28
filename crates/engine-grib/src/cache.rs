@@ -45,7 +45,8 @@ pub struct DecodedGrid {
     /// Latitude increment (positive northward, but stored negative for N→S grids).
     pub lat_inc: f64,
     /// Decoder-native values in row-major order (north to south, west to east).
-    /// Widen only sampled values; interpolation and public outputs stay f64.
+    /// Widen only sampled values; interpolation and EDR outputs stay f64, map
+    /// tiles store the f64 result narrowed back to f32 (#475).
     pub values: Arc<Vec<f32>>,
     /// WMO GRIB2 parameter identification triple `(discipline, category, number)`
     /// extracted from the decoded message. Used for unit resolution.
@@ -367,9 +368,44 @@ impl DecodedGrid {
         height: u32,
         output_crs: &OutputCrs,
     ) -> Vec<Option<f64>> {
+        let mut out = Vec::with_capacity(width as usize * height as usize);
+        self.resample_each(bbox, width, height, output_crs, |v| out.push(v));
+        out
+    }
+
+    /// The map-tile form of [`Self::resample`] (#475): the same f64 samples,
+    /// passed through `convert` (the display-unit conversion) and narrowed
+    /// to `f32`, nodata as NaN — the `RasterValues::F32` layout, 4 bytes per
+    /// pixel instead of the 16 of a boxed `Option<f64>`. Each value is
+    /// exactly `convert(sample) as f32`: interpolation and conversion stay
+    /// f64, only the stored result is narrowed.
+    pub fn resample_f32(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        output_crs: &OutputCrs,
+        convert: impl Fn(f64) -> f64,
+    ) -> Vec<f32> {
+        let mut out = Vec::with_capacity(width as usize * height as usize);
+        self.resample_each(bbox, width, height, output_crs, |v| {
+            out.push(v.map_or(f32::NAN, |raw| convert(raw) as f32));
+        });
+        out
+    }
+
+    /// Walk the output pixels in row-major order, emitting each resampled
+    /// value — the one sampling implementation behind both collectors.
+    fn resample_each(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        output_crs: &OutputCrs,
+        mut emit: impl FnMut(Option<f64>),
+    ) {
         let w = width as usize;
         let h = height as usize;
-        let mut out = Vec::with_capacity(w * h);
 
         match output_crs {
             OutputCrs::Projected { .. } => {
@@ -384,7 +420,7 @@ impl DecodedGrid {
                 for oy in 0..height {
                     for ox in 0..width {
                         let (col_f, row_f) = grid.sample(ox, oy);
-                        out.push(self.bilinear_at(col_f, row_f));
+                        emit(self.bilinear_at(col_f, row_f));
                     }
                 }
             }
@@ -394,13 +430,11 @@ impl DecodedGrid {
                     for col in 0..w {
                         let fx = (col as f64 + 0.5) / w as f64;
                         let (lon, lat) = output_crs.project_node(bbox, fx, fy);
-                        out.push(self.bilinear_value(lon, lat));
+                        emit(self.bilinear_value(lon, lat));
                     }
                 }
             }
         }
-
-        out
     }
 }
 

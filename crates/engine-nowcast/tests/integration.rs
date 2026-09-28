@@ -642,7 +642,92 @@ fn render_raw(engine: &NowcastEngine, time: DateTime<Utc>) -> Vec<u8> {
             assert_eq!(nodata, Some(NODATA), "nodata byte must survive end to end");
             data
         }
-        RasterValues::F64(_) => panic!("U8 source must stay on the raw-byte path"),
+        RasterValues::F64(_) | RasterValues::F32 { .. } => {
+            panic!("U8 source must stay on the raw-byte path")
+        }
+    }
+}
+
+/// #475: an `F32` source (e.g. a GRIB collection) enters the f32 frame path
+/// directly — its sentinel and NaN stay transparent and the echo value
+/// survives exactly.
+#[test]
+fn f32_source_keeps_nodata_and_values() {
+    const SENTINEL: f32 = -9999.0;
+    struct F32Source(Vec<DateTime<Utc>>);
+    impl MapEngine for F32Source {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let t = time.ok_or_else(|| DataServerError::Engine("mock needs a time".into()))?;
+            // Echo at 40 dBZ; background alternates sentinel and NaN.
+            let data = truth_frame(t)
+                .into_iter()
+                .enumerate()
+                .map(|(i, raw)| match (raw == ECHO_RAW, i % 2) {
+                    (true, _) => 40.0,
+                    (false, 0) => SENTINEL,
+                    (false, _) => f32::NAN,
+                })
+                .collect();
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::F32 {
+                    data,
+                    nodata: Some(SENTINEL),
+                },
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.0.clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    let anchor = t0() + Duration::minutes(5);
+    let source = Arc::new(F32Source(vec![t0(), anchor]));
+    let engine =
+        NowcastEngine::new("f32-nowcast", "mock", source, &base_config()).expect("engine builds");
+    engine.poll_once();
+    assert!(engine.has_data(), "an F32 source must produce a generation");
+
+    let tile = engine
+        .get_raster_tile(
+            EXTENT,
+            W,
+            H,
+            Some(anchor),
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
+        .expect("render succeeds");
+    let truth = truth_frame(anchor);
+    assert_eq!(tile.values.len(), truth.len());
+    for (i, raw) in truth.iter().enumerate() {
+        let expected = (*raw == ECHO_RAW).then_some(40.0);
+        assert_eq!(tile.values.value_at(i), expected, "pixel {i}");
     }
 }
 
