@@ -1190,8 +1190,8 @@ async fn a_significance_floor_reports_what_it_removed() {
     )
     .await;
     assert!(
-        out["below_min_significance"].is_null(),
-        "absent unless a floor was set, so it cannot read as 'nothing filtered'"
+        out["below_min_significance"].is_null() && out["matching_min_significance"].is_null(),
+        "null unless a floor was set, so it cannot read as 'nothing filtered'"
     );
 
     // The mock's cells are 0.88 / 0.55 / 0.31.
@@ -1203,6 +1203,7 @@ async fn a_significance_floor_reports_what_it_removed() {
     )
     .await;
     assert_eq!(out["returned"], 2);
+    assert_eq!(out["matching_min_significance"], 2);
     assert_eq!(out["below_min_significance"], 1);
     assert_eq!(
         out["total_tracked"], 3,
@@ -1285,4 +1286,208 @@ async fn the_storm_cells_schema_declares_every_parameter_it_accepts() {
         mentions_number,
         "min_significance must advertise a numeric type: {ty}"
     );
+}
+
+/// An app whose only collection, "cells", is served by `engine`.
+fn cells_app(engine: Arc<dyn FeatureEngine>) -> axum::Router {
+    let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
+    engines.insert("cells".into(), engine);
+    let mut collections = HashMap::new();
+    collections.insert("cells".to_string(), collection("cells", "nowcast"));
+    api_mcp::router(
+        Arc::new(ArcSwap::from_pointee(McpState {
+            engines,
+            collections,
+        })),
+        Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+        api_mcp::allowed_hosts(BASE_URL, &[]),
+    )
+}
+
+/// #652: an `at` after the newest frame resolved to that frame with nothing
+/// saying so, so a model asking for 09:00 could present 08:25 as 09:00.
+#[tokio::test]
+async fn a_future_at_is_flagged_and_names_the_frame_served() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let at = |t: &'static str| json!({"collection": "cells", "at": t});
+
+    let future = call_tool(&app, &sid, "get_storm_cells", at("2026-08-21T15:00:00Z")).await;
+    assert_eq!(
+        future["requested_time_after_newest_frame"], true,
+        "{future}"
+    );
+    assert_eq!(future["observed"], "2026-08-21T14:25:00Z", "{future}");
+    assert_eq!(
+        future["no_frame_for_requested_time"], false,
+        "a frame WAS served — the newest one"
+    );
+    let note = future["note"].as_str().unwrap();
+    assert!(note.contains("after the newest analysis frame"), "{note}");
+    assert!(note.contains("2026-08-21T14:25:00Z"), "{note}");
+    assert!(
+        note.contains("not an official warning"),
+        "the disclaimer survives: {note}"
+    );
+
+    // Exactly the newest frame, an older one, and no `at`: nothing to flag.
+    for args in [
+        at("2026-08-21T14:25:00Z"),
+        at("2026-08-21T14:22:00Z"),
+        json!({"collection": "cells"}),
+    ] {
+        let out = call_tool(&app, &sid, "get_storm_cells", args.clone()).await;
+        assert_eq!(
+            out["requested_time_after_newest_frame"], false,
+            "{args}: {out}"
+        );
+        assert!(
+            !out["note"]
+                .as_str()
+                .unwrap()
+                .contains("after the newest analysis frame"),
+            "{args}: {out}"
+        );
+    }
+
+    // A quiet newest frame has no cell to carry `observed`; the frame served
+    // is still named, or the flag would point at nothing.
+    let app = cells_app(Arc::new(QuietEngine));
+    let sid = handshake(&app).await;
+    let quiet = call_tool(&app, &sid, "get_storm_cells", at("2026-08-21T15:00:00Z")).await;
+    assert_eq!(quiet["returned"], 0);
+    assert_eq!(quiet["requested_time_after_newest_frame"], true, "{quiet}");
+    assert_eq!(quiet["observed"], "2026-08-21T14:25:00Z", "{quiet}");
+}
+
+/// `n` cells in one frame, significance rising with the index and `max_dbz`
+/// with it, so ascending `max_dbz` is ascending significance.
+struct ManyCellEngine(usize);
+
+impl FeatureEngine for ManyCellEngine {
+    fn sortables(&self) -> &[&'static str] {
+        &["significance", "max_dbz"]
+    }
+
+    fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        let n = self.0;
+        let mut all: Vec<Feature> = (0..n)
+            .map(|i| {
+                CellEngine::cell(
+                    &format!("c{i:04}"),
+                    (i as f64 + 0.5) / n as f64,
+                    30.0 + i as f64 / 100.0,
+                    "2026-08-21T14:25:00Z",
+                )
+            })
+            .collect();
+        sort_features(&mut all, &query.sortby);
+        let page: Vec<Feature> = all
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .collect();
+        Ok(FeaturePage {
+            number_returned: page.len(),
+            features: page,
+            number_matched: n,
+            next_offset: None,
+        })
+    }
+
+    fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(id.into()))
+    }
+
+    fn temporal_extent(
+        &self,
+    ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+        let t = "2026-08-21T14:25:00Z".parse().unwrap();
+        Some((t, t))
+    }
+}
+
+/// #652: the floor filtered the page AFTER it was cut to `limit`, so "every
+/// cell at or above 0.3" was unanswerable once more than `limit` qualified —
+/// and under `sort_by` the page could hold few or none of the qualifying
+/// cells at all.
+#[tokio::test]
+async fn min_significance_filters_the_frame_before_limit() {
+    let app = cells_app(Arc::new(ManyCellEngine(90)));
+    let sid = handshake(&app).await;
+    // (i + 0.5) / 90 >= 0.3 for i >= 27: 63 of 90 cells qualify, more than
+    // the largest page.
+    let significances = |out: &Value| -> Vec<f64> {
+        out["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["significance"].as_f64().unwrap())
+            .collect()
+    };
+
+    for args in [
+        json!({"collection": "cells", "limit": 50, "min_significance": 0.3}),
+        // Ascending: the first 50 cells in this order hold only 23 that
+        // qualify, so filtering the page returned 23, not 50.
+        json!({"collection": "cells", "limit": 50, "min_significance": 0.3,
+               "sort_by": "max_dbz", "order": "asc"}),
+    ] {
+        let out = call_tool(&app, &sid, "get_storm_cells", args.clone()).await;
+        let sig = significances(&out);
+        assert_eq!(out["returned"], 50, "{args}");
+        assert_eq!(sig.len(), 50, "{args}");
+        assert!(sig.iter().all(|&s| s >= 0.3), "{args}: {sig:?}");
+        assert_eq!(out["matching_min_significance"], 63, "{args}");
+        assert_eq!(out["below_min_significance"], 27, "{args}");
+        assert_eq!(out["total_tracked"], 90, "{args}");
+    }
+
+    // The requested order still holds within the qualifying set.
+    let asc = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "limit": 3, "min_significance": 0.3,
+               "sort_by": "max_dbz", "order": "asc"}),
+    )
+    .await;
+    let ids: Vec<&str> = asc["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["c0027", "c0028", "c0029"]);
+}
+
+/// Past the read cap the counts are partial, and the note says so rather
+/// than leaving a model to notice they do not add up to `total_tracked`.
+#[tokio::test]
+async fn a_floor_over_an_oversized_frame_says_its_counts_are_partial() {
+    let app = cells_app(Arc::new(ManyCellEngine(1_005)));
+    let sid = handshake(&app).await;
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "min_significance": 0.5}),
+    )
+    .await;
+    assert_eq!(out["total_tracked"], 1_005);
+    let counted = out["matching_min_significance"].as_u64().unwrap()
+        + out["below_min_significance"].as_u64().unwrap();
+    assert_eq!(counted, 1_000, "{out}");
+    let note = out["note"].as_str().unwrap();
+    assert!(note.contains("first 1000 of 1005 cells"), "{note}");
+
+    // Without a floor nothing is checked, so nothing is partial.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert!(!out["note"].as_str().unwrap().contains("checked"), "{out}");
 }

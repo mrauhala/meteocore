@@ -84,11 +84,25 @@ postgis engine issues a COUNT against the database.
   field: on its own it has nothing to apply to, so accepting it would return
   significance-descending to a caller who asked for ascending — the same
   silent no-op in a smaller box.
-- **`min_significance` filters the bounded page, it does not reach deeper into
-  the ranking.** Asking for 10 with a floor can return 3. The response carries
-  `below_min_significance` so a model can tell "only 3 cells exist" from
-  "7 were below your floor" — and that key is ABSENT when no floor was set,
-  so its absence never reads as "nothing was filtered".
+- **`min_significance` filters the frame BEFORE `limit` cuts it** (#652).
+  Filtering the page instead made "every cell at or above 0.3" unanswerable
+  once more than `limit` qualified, and under `sort_by` a page could hold
+  none of the qualifying cells. The engine's property filters are
+  exact-match only, so the floor cannot ride in the `FeatureQuery`: a floor
+  reads the whole frame in the requested order, capped at
+  `MAX_CELLS_CHECKED_FOR_FLOOR` (1000; a convective day is ~170), and past
+  the cap the note says the counts are partial. `matching_min_significance`
+  and `below_min_significance` count the frame, not the page, and both are
+  null when no floor was set, so they never read as "nothing was filtered".
+- **An `at` after the newest frame is flagged, not an error** (#652). The
+  engine serves the newest frame at or before `at`, so a future `at` gets
+  the newest frame. `requested_time_after_newest_frame` says so and the note
+  names that frame, since otherwise `observed` < `at` was the only hint and
+  a model could present 08:25 as the 09:00 situation. It is the counterpart
+  of `no_frame_for_requested_time` for an `at` before retention.
+  `observed` names the frame served; a quiet frame has no cell to carry it,
+  so when the request resolved to the newest frame it comes from the
+  retained window's end.
 - The default is unchanged and should stay: no `sort_by` means most
   significant first, which is what a caller almost always wants.
 - `get_cell_track` walks snapshots backward by asking for "newest frame at or
