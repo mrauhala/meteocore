@@ -10,8 +10,8 @@
 //!   default, or `echotop` columns). The mesh products take a `resolution`
 //!   (`low`/`med`/`high`) detail tier; the point cloud is native-resolution.
 //!
-//! All content types are sampled on a blocking thread (bounded by the shared
-//! render semaphore) and encoded by `ds-3dtiles`.
+//! All content types are sampled on a blocking thread (bounded by the 3D Tiles
+//! content pool, not the raster render slots) and encoded by `ds-3dtiles`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -222,18 +222,21 @@ static POINT_LEGEND: LazyLock<serde_json::Value> = LazyLock::new(|| {
     })
 });
 
-/// Dedicated concurrency limiter for **voxel** content encodes — separate from
-/// the shared `render_semaphore`. A `high`-resolution voxel (11.8 M cells, 4
-/// blur passes) is ~12 s of single-threaded CPU; running it on the shared raster
-/// pool would let one voxel request hold a WMS/Maps/Tiles render slot for that
-/// whole window. On its own small pool, slow voxel encodes serialise among
-/// themselves and never touch raster capacity. Sized to ¼ of the cores (≥1) so a
-/// couple can overlap without oversubscribing the box. Process-global (one
-/// server, one limit) → a `LazyLock` static, not per-collection state.
-static VOXEL_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+/// The 3D Tiles **content pool**: bounds every cold content compute (`.pnts`,
+/// the `.glb` meshes and voxels) — separate from the raster render slots
+/// (`ds_executor::RENDER_SLOTS`) that WMS/Maps/Tiles share (#380). A mesh or
+/// voxel is seconds of single-threaded CPU (`high` ≈ 12 s), and a viewer
+/// preload asks for many frames; on the raster pool each would hold a
+/// WMS/Maps/Tiles render slot for that whole window. On this small pool, 3D
+/// loads serialise among themselves and never touch raster capacity. One pool
+/// for all three products bounds total 3D CPU whatever the product mix. Sized
+/// to ¼ of the cores, min 2 so one slow encode can't stall every other 3D
+/// load. Process lifetime (like `RENDER_SLOTS`) so a reload can't double it;
+/// the server passes it in as [`TilesState3d::content_semaphore`].
+pub static CONTENT_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
     let n = std::thread::available_parallelism()
-        .map(|c| (c.get() / 4).max(1))
-        .unwrap_or(1);
+        .map(|c| (c.get() / 4).max(2))
+        .unwrap_or(2);
     Arc::new(tokio::sync::Semaphore::new(n))
 });
 
@@ -266,8 +269,9 @@ pub struct TilesState3d {
     /// one shared ramp (reflectivity); per-collection/per-quantity colormaps
     /// from config are a follow-up.
     pub colormap: Arc<dyn ColorMap>,
-    /// Bounds concurrent sampling/encoding, shared with the raster render path.
-    pub render_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent content sampling/encoding. The server passes
+    /// [`CONTENT_SLOTS`] — never the raster render slots (#380).
+    pub content_semaphore: Arc<tokio::sync::Semaphore>,
     /// Static fallback base URL for absolute links. Used as-is unless
     /// `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
@@ -683,9 +687,9 @@ pub async fn get_content(
     }
 
     let info = engine.volume_info();
-    // Before the cache key and the render semaphore: distinct bogus names
-    // would each miss the cache and hold a scarce render slot only for the
-    // engine to reject them (#536).
+    // Before the cache key and the content pool: distinct bogus names would
+    // each miss the cache and hold a scarce content slot only for the engine
+    // to reject them (#536).
     check_quantity(&info, quantity.as_deref(), &id)?;
     let exact = exact_volume_time(&info, time);
     let key = ContentKey {
@@ -704,16 +708,16 @@ pub async fn get_content(
     let pinned = exact;
 
     let engine = engine.clone();
-    let semaphore = state.render_semaphore.clone();
+    let semaphore = state.content_semaphore.clone();
     let colormap = state.colormap.clone();
     let content = CONTENT_CACHE
         .get_or_compute(key, move || async move {
             // Sample + encode off the request worker: `read_point_cloud` does
             // blocking HDF5 I/O and a long CPU loop (CLAUDE.md concurrency
-            // rules), so bound it with the shared render semaphore and run it
-            // on a blocking thread. Only the computing (cache-missing)
-            // request pays this — hits and coalesced waiters never queue on
-            // the semaphore.
+            // rules), so bound it with the 3D content pool (never a raster
+            // render slot, #380) and run it on a blocking thread. Only the
+            // computing (cache-missing) request pays this — hits and
+            // coalesced waiters never queue on the pool.
             let job = ds_executor::RenderJob::acquire_volume(semaphore)
                 .await
                 .map_err(Tiles3dError::from)?;
@@ -749,8 +753,8 @@ pub async fn get_content(
 /// `GET /collections/{id}/content.glb` — a glTF `.glb` mesh of the volume:
 /// `representation=isosurface` (default) is a reflectivity shell (marching
 /// tetrahedra); `representation=echotop` is extruded echo-top columns. Resampled
-/// to a voxel grid and meshed on a blocking thread (bounded by the shared render
-/// semaphore), encoded by `ds-3dtiles`.
+/// to a voxel grid and meshed on a blocking thread (bounded by the 3D content
+/// pool), encoded by `ds-3dtiles`.
 pub async fn get_content_glb(
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -848,15 +852,15 @@ pub async fn get_content_glb(
     let pinned = exact;
 
     let engine = engine.clone();
-    let semaphore = state.render_semaphore.clone();
+    let semaphore = state.content_semaphore.clone();
     let colormap = state.colormap.clone(); // reflectivity ramp (isosurface)
     let id_for_err = key.collection.clone();
     let content = CONTENT_CACHE
         .get_or_compute(key, move || async move {
             // read_voxel_grid + meshing do blocking HDF5 I/O + a long CPU
-            // loop, so bound them with the shared render semaphore and run on
-            // a blocking thread (same rule as the `.pnts` path / the raster
-            // `get_raster_tile`). Only the computing request pays this.
+            // loop, so bound them with the 3D content pool and run on a
+            // blocking thread (same rule as the `.pnts` path). Only the
+            // computing request pays this.
             let job = ds_executor::RenderJob::acquire_volume(semaphore)
                 .await
                 .map_err(Tiles3dError::from)?;
@@ -1077,8 +1081,8 @@ fn is_root_voxel_tile(tile: &str) -> bool {
 }
 
 /// `GET /collections/{id}/voxel/content/{*tile}` — the `EXT_primitive_voxels`
-/// glTF `.glb`. Samples the grid (blocking) under the shared render semaphore,
-/// same as the mesh content path; content-derived ETag.
+/// glTF `.glb`. Samples the grid (blocking) under the 3D content pool, same as
+/// the mesh content path; content-derived ETag.
 pub async fn get_voxel_content(
     headers: HeaderMap,
     Path((id, tile)): Path<(String, String)>,
@@ -1090,7 +1094,7 @@ pub async fn get_voxel_content(
     let info = engine.volume_info();
     // Same support/coverage gate as `get_voxel_tileset`/`get_voxel_subtree` (no
     // grid → 400, no coverage yet → 404). Crucially this 404s a no-coverage site
-    // CHEAPLY — before acquiring a render-semaphore slot and a `spawn_blocking`
+    // CHEAPLY — before acquiring a content-pool slot and a `spawn_blocking`
     // task that would otherwise sample, encode, and only then 404 via `Empty`.
     let caps = info.voxel_grid.as_ref().ok_or_else(|| {
         Tiles3dError::BadRequest(format!("collection '{id}' does not support voxels"))
@@ -1125,17 +1129,17 @@ pub async fn get_voxel_content(
     let pinned = exact;
 
     let engine = engine.clone();
+    let semaphore = state.content_semaphore.clone();
     let id_for_err = key.collection.clone();
     let content = CONTENT_CACHE
         .get_or_compute(key, move || async move {
-            // Dedicated voxel pool (NOT the shared raster `render_semaphore`)
-            // so a slow `high`-res encode can't hold a WMS/Maps/Tiles render
-            // slot — see `VOXEL_SEMAPHORE`. Only the computing request pays.
-            let _permit = VOXEL_SEMAPHORE
-                .clone()
+            // The 3D content pool (NOT the raster render slots) so a slow
+            // `high`-res encode can't hold a WMS/Maps/Tiles render slot — see
+            // `CONTENT_SLOTS`. Only the computing request pays.
+            let _permit = semaphore
                 .acquire_owned()
                 .await
-                .map_err(|_| Tiles3dError::Internal("voxel semaphore closed".into()))?;
+                .map_err(|_| Tiles3dError::Internal("content semaphore closed".into()))?;
             tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
                 let _permit = _permit;
                 let grid = engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;

@@ -18,7 +18,7 @@ pub mod handlers;
 
 pub use cache::content_cache_metrics;
 pub use error::Tiles3dError;
-pub use handlers::{default_point_colormap, AppState, TilesState3d};
+pub use handlers::{default_point_colormap, AppState, TilesState3d, CONTENT_SLOTS};
 
 use axum::routing::get;
 use axum::Router;

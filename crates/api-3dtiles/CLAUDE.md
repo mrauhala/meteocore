@@ -89,9 +89,13 @@ Opened from disk, the viewer targets the public instance.
 ## Concurrency & caching
 
 - `read_point_cloud`/`read_voxel_grid` are sync (blocking I/O + long CPU).
-  Both content handlers bound them with the shared render semaphore and run
-  via `spawn_blocking` — never inline on a request worker (same pattern as
-  the raster APIs).
+  Every content handler (points, meshes, voxels) bounds them with the **3D
+  Tiles content pool** — `TilesState3d.content_semaphore`, which the server
+  fills with the process-lifetime `CONTENT_SLOTS` (¼ cores, min 2) — and runs
+  via `spawn_blocking`, never inline on a request worker. Never hand it the
+  raster render slots: a cold multi-frame preload would hold WMS/Maps/Tiles
+  slots for seconds per frame (#380). One pool for all three products bounds
+  total 3D CPU whatever the mix.
 - **Content cache** (`src/cache.rs`): process-global byte-bounded LRU of
   encoded content bytes + ETag, keyed (collection, product, quantity,
   datetime, params, dims) **plus a data-version hashed from
@@ -122,8 +126,11 @@ Viewer regression tests: `node --test crates/api-3dtiles/tests/viewer.test.cjs`
 (delay metadata/content and check scheduling, failure, cancellation, refresh).
 These run in CI; WebGL/render verification remains a separate check.
 
-Point/mesh computations now use `ds-executor` admission: the shared bounded
-render queue and a 30 s queue/compute deadline. The raster 3 s default does not
-apply to these larger products. Their workers (and the separate voxel worker)
-retain CPU permits on client disconnection. Admission/deadline failures are
-503 + Retry-After. Coalesced cache waiters share the cache-owned result flight.
+Point/mesh computations use `ds-executor` admission
+(`RenderJob::acquire_volume`) over the content pool: slots come from that pool,
+waiters still count against the process-wide bounded render queue, and a 30 s
+queue/compute deadline applies. The raster 3 s default does not apply to these
+larger products. Voxels take a plain content-pool permit, with no queue bound
+or deadline. All three workers retain CPU permits on client disconnection.
+Admission/deadline failures are 503 + Retry-After. Coalesced cache waiters
+share the cache-owned result flight.

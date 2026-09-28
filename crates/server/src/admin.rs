@@ -3840,7 +3840,9 @@ pub fn load_collections(
             // legend the API advertises samples this same source). Per-collection
             // /per-quantity colormaps from config are a follow-up (#350).
             colormap: api_3dtiles::default_point_colormap(),
-            render_semaphore: render_semaphore.clone(),
+            // Its own process-lifetime pool, NOT `render_semaphore`: a cold
+            // 3D preload must not occupy WMS/Maps/Tiles render slots (#380).
+            content_semaphore: api_3dtiles::CONTENT_SLOTS.clone(),
             base_url: base_url.to_string(),
             trust_proxy_headers,
         },
@@ -5951,6 +5953,25 @@ mod tests {
         assert!(!viridis.normalized, "resolved stops are in data units");
         assert!(is_generic_fallback(&ctx, &viridis));
         assert!(!is_generic_fallback(&ctx, &resolve("temperature")));
+    }
+
+    /// #380: 3D Tiles content computes get their own process-lifetime pool; a
+    /// cold 3D preload must never occupy WMS/Maps/Tiles render slots.
+    #[test]
+    fn tiles_3d_content_pool_is_not_the_raster_render_pool() {
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let pool = &result.tiles_3d_state.content_semaphore;
+        assert!(Arc::ptr_eq(pool, &api_3dtiles::CONTENT_SLOTS));
+        assert!(!Arc::ptr_eq(pool, &result.wms_state.render_semaphore));
     }
 
     /// Resolve a collection's full style-layer map through a fresh
