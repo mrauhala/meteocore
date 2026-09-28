@@ -1,11 +1,14 @@
 //! Block-matching motion estimation between two consecutive frames.
 //!
 //! pySTEPS-style Lucas–Kanade-lite: cross-correlate coarse blocks (sum of
-//! absolute differences), keep only vectors measured where the target frame
-//! actually has echo (which also stops stationary ground clutter and empty
-//! sky from anchoring the field), reject outliers against the robust global
-//! median, then fill unmeasured blocks from their neighbours and smooth into
-//! a continuous field. The result samples bilinearly at any pixel position.
+//! absolute differences), refine the integer minimum to sub-pixel precision,
+//! keep only vectors measured where the target frame actually has echo
+//! (which also stops stationary ground clutter and empty sky from anchoring
+//! the field), reject outliers against the robust median of each vector's
+//! nearest measured neighbours, then fill unmeasured blocks from their
+//! neighbours and smooth the filled ones into a continuous field. Measured
+//! vectors are never smoothed. The result samples bilinearly at any pixel
+//! position.
 
 use crate::Grid;
 
@@ -28,9 +31,12 @@ pub struct MotionOptions {
     /// a candidate displacement to be scored.
     pub min_overlap_frac: f32,
     /// Robust outlier gate: vectors farther than
-    /// `max(outlier_sigmas * 1.4826 * MAD, 2 px)` from the median are dropped.
+    /// `max(outlier_sigmas * 1.4826 * MAD, 2 px)` from the median of their
+    /// `outlier_neighbours` nearest measured blocks are dropped.
     pub outlier_sigmas: f32,
-    /// 3×3 box-smoothing passes applied after fill.
+    /// Neighbourhood size of the local outlier gate (pySTEPS' `k_outlier`).
+    pub outlier_neighbours: usize,
+    /// 3×3 box-smoothing passes applied after fill, to filled blocks only.
     pub smooth_passes: usize,
 }
 
@@ -44,6 +50,7 @@ impl Default for MotionOptions {
             min_echo_frac: 0.02,
             min_overlap_frac: 0.5,
             outlier_sigmas: 3.0,
+            outlier_neighbours: 30,
             smooth_passes: 2,
         }
     }
@@ -293,10 +300,14 @@ fn measure_pair(prev: &Grid, next: &Grid, opts: &MotionOptions) -> MotionField {
                 }
             }
 
-            if let Some((_, dx, dy)) = best {
+            if let Some((c0, dx, dy)) = best {
+                // Integer displacements alone quantise speed to ±0.5 px per
+                // interval — ±12 px after 24 leads (#651).
+                let fx = subpixel_offset(cost_of(dx - 1, dy), c0, cost_of(dx + 1, dy));
+                let fy = subpixel_offset(cost_of(dx, dy - 1), c0, cost_of(dx, dy + 1));
                 let i = by * bw + bx;
-                field.u[i] = dx as f32;
-                field.v[i] = dy as f32;
+                field.u[i] = dx as f32 + fx;
+                field.v[i] = dy as f32 + fy;
                 field.measured[i] = true;
             }
         }
@@ -306,13 +317,28 @@ fn measure_pair(prev: &Grid, next: &Grid, opts: &MotionOptions) -> MotionField {
 }
 
 /// The shared post-measurement pipeline: robust outlier rejection, fill,
-/// smoothing.
+/// smoothing of the filled blocks.
 fn postprocess(field: &mut MotionField, opts: &MotionOptions) {
     reject_outliers(field, opts);
     fill_unmeasured(field);
     for _ in 0..opts.smooth_passes {
         box_smooth(field);
     }
+}
+
+/// Sub-pixel offset of the cost minimum along one axis: the vertex of the
+/// parabola through the costs one pixel either side of the integer minimum
+/// `c0`, clamped to ±0.5 px. Zero when a neighbour has too little overlap to
+/// score or the surface is not convex there.
+fn subpixel_offset(minus: Option<f32>, c0: f32, plus: Option<f32>) -> f32 {
+    let (Some(m), Some(p)) = (minus, plus) else {
+        return 0.0;
+    };
+    let curvature = m - 2.0 * c0 + p;
+    if !curvature.is_finite() || curvature <= 0.0 {
+        return 0.0;
+    }
+    (0.5 * (m - p) / curvature).clamp(-0.5, 0.5)
 }
 
 /// Keep `(cost, dx, dy)` in `best` if it beats the current candidate.
@@ -324,7 +350,11 @@ fn keep_better(best: &mut Option<(f32, i32, i32)>, cost: Option<f32>, dx: i32, d
     }
 }
 
-/// Drop measured vectors far from the robust (median/MAD) global consensus.
+/// Drop measured vectors far from the robust (median/MAD) consensus of their
+/// `outlier_neighbours` nearest measured blocks (itself excluded). A local
+/// gate, as in pySTEPS: one global median over a composite-wide domain is a
+/// rigid-body prior that clips genuine differential flow — a front steered
+/// differently north and south, a right-mover (#651).
 fn reject_outliers(field: &mut MotionField, opts: &MotionOptions) {
     let measured: Vec<usize> = (0..field.measured.len())
         .filter(|&i| field.measured[i])
@@ -332,24 +362,46 @@ fn reject_outliers(field: &mut MotionField, opts: &MotionOptions) {
     if measured.len() < 4 {
         return;
     }
-    let median_of = |vals: &mut Vec<f32>| -> f32 {
+    let k = opts.outlier_neighbours.clamp(1, measured.len() - 1);
+    let bw = field.bw;
+    let median_of = |vals: &mut [f32]| -> f32 {
         vals.sort_by(|a, b| a.total_cmp(b));
         vals[vals.len() / 2]
     };
-    let mut us: Vec<f32> = measured.iter().map(|&i| field.u[i]).collect();
-    let mut vs: Vec<f32> = measured.iter().map(|&i| field.v[i]).collect();
-    let (mu, mv) = (median_of(&mut us), median_of(&mut vs));
-    let mut du: Vec<f32> = measured.iter().map(|&i| (field.u[i] - mu).abs()).collect();
-    let mut dv: Vec<f32> = measured.iter().map(|&i| (field.v[i] - mv).abs()).collect();
-    let (mad_u, mad_v) = (median_of(&mut du), median_of(&mut dv));
-    let gate_u = (opts.outlier_sigmas * 1.4826 * mad_u).max(2.0);
-    let gate_v = (opts.outlier_sigmas * 1.4826 * mad_v).max(2.0);
+    // Brute-force k-NN: O(measured²) block pairs, a few million at most on
+    // the pixel-budgeted working grid.
+    let mut near: Vec<(usize, usize)> = Vec::with_capacity(measured.len());
+    let (mut us, mut vs) = (Vec::with_capacity(k), Vec::with_capacity(k));
+    let mut rejected = Vec::new();
     for &i in &measured {
+        let (xi, yi) = (i % bw, i / bw);
+        near.clear();
+        near.extend(measured.iter().filter(|&&j| j != i).map(|&j| {
+            let (dx, dy) = ((j % bw).abs_diff(xi), (j / bw).abs_diff(yi));
+            (dx * dx + dy * dy, j)
+        }));
+        // Ties break on block index, so the neighbourhood is deterministic.
+        near.select_nth_unstable(k - 1);
+        us.clear();
+        vs.clear();
+        us.extend(near[..k].iter().map(|&(_, j)| field.u[j]));
+        vs.extend(near[..k].iter().map(|&(_, j)| field.v[j]));
+        let (mu, mv) = (median_of(&mut us), median_of(&mut vs));
+        us.iter_mut().for_each(|u| *u = (*u - mu).abs());
+        vs.iter_mut().for_each(|v| *v = (*v - mv).abs());
+        let (mad_u, mad_v) = (median_of(&mut us), median_of(&mut vs));
+        let gate_u = (opts.outlier_sigmas * 1.4826 * mad_u).max(2.0);
+        let gate_v = (opts.outlier_sigmas * 1.4826 * mad_v).max(2.0);
         if (field.u[i] - mu).abs() > gate_u || (field.v[i] - mv).abs() > gate_v {
-            field.measured[i] = false;
-            field.u[i] = 0.0;
-            field.v[i] = 0.0;
+            rejected.push(i);
         }
+    }
+    // Gate against the unfiltered neighbourhoods, then drop all at once, so
+    // the verdict does not depend on block order.
+    for i in rejected {
+        field.measured[i] = false;
+        field.u[i] = 0.0;
+        field.v[i] = 0.0;
     }
 }
 
@@ -397,13 +449,19 @@ fn fill_unmeasured(field: &mut MotionField) {
     }
 }
 
-/// One 3×3 box-smoothing pass over the block field.
+/// One 3×3 box-smoothing pass over the FILLED blocks. A measured vector is
+/// kept as matched: averaging it with filled neighbours would dilute exactly
+/// the isolated edge cell whose motion differs from the ambient flow (#651).
 fn box_smooth(field: &mut MotionField) {
     let (bw, bh) = (field.bw, field.bh);
     let mut nu = field.u.clone();
     let mut nv = field.v.clone();
     for by in 0..bh {
         for bx in 0..bw {
+            let i = by * bw + bx;
+            if field.measured[i] {
+                continue;
+            }
             let mut su = 0.0f32;
             let mut sv = 0.0f32;
             let mut n = 0u32;
@@ -415,7 +473,6 @@ fn box_smooth(field: &mut MotionField) {
                     n += 1;
                 }
             }
-            let i = by * bw + bx;
             nu[i] = su / n as f32;
             nv[i] = sv / n as f32;
         }
@@ -542,5 +599,128 @@ mod tests {
         let field = estimate_motion(&a, &b, &MotionOptions::default());
         assert!(field.measured.iter().all(|&m| !m));
         assert!(field.u.iter().chain(&field.v).all(|&c| c == 0.0));
+    }
+
+    /// Frame sampled from `f` at pixel centres, so a synthetic displacement
+    /// can be any real number of pixels.
+    fn frame_of(w: usize, h: usize, f: impl Fn(f32, f32) -> f32) -> Grid {
+        let data = (0..w * h)
+            .map(|i| f((i % w) as f32 + 0.5, (i / w) as f32 + 0.5))
+            .collect();
+        Grid::new(w, h, data)
+    }
+
+    /// Smooth isotropic echo: a Gaussian of `peak` dBZ, sigma `s` px.
+    fn gaussian(x: f32, y: f32, cx: f32, cy: f32, s: f32, peak: f32) -> f32 {
+        peak * (-((x - cx).powi(2) + (y - cy).powi(2)) / (2.0 * s * s)).exp()
+    }
+
+    /// Textured echo, every pixel above `min_echo`, so every block it covers
+    /// yields a vector.
+    fn texture(x: f32, y: f32) -> f32 {
+        30.0 + 8.0 * (0.31 * x + 0.17 * y).sin()
+            + 7.0 * (0.13 * x - 0.29 * y + 1.3).sin()
+            + 5.0 * (0.47 * x + 0.41 * y + 0.7).sin()
+    }
+
+    #[test]
+    fn recovers_sub_pixel_translation() {
+        // Integer matching alone lands 0.3 / 0.4 px off this shift — about
+        // 7 / 10 px of drift after 24 leads. Asserted where the echo is well
+        // resolved: faint-tail blocks carry the SAD fit's own bias.
+        let (su, sv) = (3.3f32, -2.6f32);
+        // Centred in block (2, 2) of a 5×5-block frame.
+        let blob = |x: f32, y: f32| gaussian(x, y, 80.0, 80.0, 10.0, 50.0);
+        let prev = frame_of(160, 160, blob);
+        let next = frame_of(160, 160, |x, y| blob(x - su, y - sv));
+        let opts = MotionOptions {
+            search_radius: 8,
+            ..MotionOptions::default()
+        };
+        let field = estimate_motion(&prev, &next, &opts);
+        let centre = 2 * field.bw + 2;
+        assert!(field.measured[centre]);
+        let (u, v) = (field.u[centre], field.v[centre]);
+        assert!(
+            (u - su).abs() < 0.1 && (v - sv).abs() < 0.1,
+            "({u}, {v}) vs true ({su}, {sv})"
+        );
+        let (u, v) = field.sample(80.0, 80.0);
+        assert!(
+            (u - su).abs() < 0.1 && (v - sv).abs() < 0.1,
+            "sampled ({u}, {v})"
+        );
+    }
+
+    #[test]
+    fn subpixel_offset_is_the_parabola_vertex_and_clamped() {
+        // Symmetric → no offset; costs of (x - 0.25)² at -1, 0, 1 → +0.25.
+        assert_eq!(subpixel_offset(Some(2.0), 1.0, Some(2.0)), 0.0);
+        let c = |x: f32| (x - 0.25).powi(2);
+        assert!((subpixel_offset(Some(c(-1.0)), c(0.0), Some(c(1.0))) - 0.25).abs() < 1e-6);
+        // A neighbour below the "minimum" (search-window edge) clamps.
+        assert_eq!(subpixel_offset(Some(5.0), 1.0, Some(0.5)), 0.5);
+        // Unscorable neighbour or a non-convex surface: stay on the integer.
+        assert_eq!(subpixel_offset(None, 1.0, Some(2.0)), 0.0);
+        assert_eq!(subpixel_offset(Some(1.0), 1.0, Some(1.0)), 0.0);
+    }
+
+    #[test]
+    fn measured_edge_block_keeps_its_vector() {
+        // Ambient echo on the left moves (+4, 0); an isolated cell at the
+        // echo edge moves (+5, +1) — inside the outlier gate, so it stays
+        // measured. Smoothing used to average it with the ambient flow.
+        let ambient = |x: f32, y: f32| if x < 96.0 { texture(x, y) } else { 0.0 };
+        let cell = |x: f32, y: f32| gaussian(x, y, 144.0, 48.0, 4.0, 50.0);
+        let prev = frame_of(256, 128, |x, y| ambient(x, y).max(cell(x, y)));
+        let next = frame_of(256, 128, |x, y| {
+            ambient(x - 4.0, y).max(cell(x - 5.0, y - 1.0))
+        });
+        let opts = MotionOptions {
+            search_radius: 8,
+            ..MotionOptions::default()
+        };
+        let field = estimate_motion(&prev, &next, &opts);
+        let edge = field.bw + 4; // block (4, 1) holds the cell
+        assert!(field.measured[edge], "the cell's block must be measured");
+        assert!(
+            field.measured[field.bw + 2],
+            "precondition: ambient echo is measured next door"
+        );
+        assert!(
+            (field.u[edge] - 5.0).abs() < 0.1 && (field.v[edge] - 1.0).abs() < 0.1,
+            "edge vector diluted to ({}, {})",
+            field.u[edge],
+            field.v[edge]
+        );
+    }
+
+    #[test]
+    fn local_gate_keeps_differential_flow() {
+        // Most of the domain moves (+6, 0); the lower-right blocks move
+        // (-2, 0). One global median/MAD saw MAD 0 and a 2 px gate, and
+        // rejected the whole minority flow as outliers.
+        let minority = |x: f32, y: f32| x >= 224.0 && y >= 128.0;
+        let prev = frame_of(384, 256, texture);
+        let next = frame_of(384, 256, |x, y| {
+            let u = if minority(x, y) { -2.0 } else { 6.0 };
+            texture(x - u, y)
+        });
+        let opts = MotionOptions {
+            search_radius: 8,
+            ..MotionOptions::default()
+        };
+        let field = estimate_motion(&prev, &next, &opts);
+        // Block (9, 6): the middle of the minority blocks (7..12 × 4..8).
+        let centre = 6 * field.bw + 9;
+        assert!(field.measured[centre], "minority flow rejected as outlier");
+        assert!(
+            (field.u[centre] + 2.0).abs() < 0.1,
+            "u = {}",
+            field.u[centre]
+        );
+        // The majority keeps its own vector.
+        let far = field.bw + 1;
+        assert!(field.measured[far] && (field.u[far] - 6.0).abs() < 0.1);
     }
 }
