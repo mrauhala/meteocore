@@ -24,6 +24,23 @@ apply here.
 - **STAC security:** `stac_asset_allowlist` is mandatory (SSRF protection).
   HTTP redirects disabled. Pagination origin-checked.
 
+## STAC metadata loading (#90)
+
+- Startup reads only the collection extent. Each `poll_cycle` adds items
+  newer than the newest entry as stubs (the first poll: the last hour), then
+  `preload_stac_metadata` fetches the header/IFD of the ones it just
+  discovered, on the poll runtime: newest `STAC_PRELOAD_MAX_ITEMS` only,
+  `STAC_PRELOAD_CONCURRENCY` in flight, async reqwest end to end. Never loop
+  the sync `load_stac_entry_metadata` there: that is N sequential blocking
+  round trips (root Critical Rule 9).
+- The lazy request path (`ensure_metadata` / `ensure_entries_loaded`) stays
+  the fallback for older items (on-demand `fetch_stac_range`), items past the
+  cap and failed preloads. Both paths share `fetch_stac_entry_metadata` and
+  the `loading_in_flight` single-flight set: the preload `try_claim`s without
+  parking and skips an item a request is loading; a request for an item being
+  preloaded waits for it. Install through `install_stac_metadata`, whose
+  `rcu` keeps concurrent loaders from dropping each other's update.
+
 ## Decode admission
 
 `MC_GEOTIFF_DECODE_MEMORY_MB` (default 1024; 0 rejects cold decodes) bounds

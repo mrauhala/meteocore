@@ -22,7 +22,8 @@ pub struct StacStub {
 ///
 /// Non-STAC entries (local/remote) are always `Loaded` since metadata is parsed
 /// during the scan. STAC entries start as `Stub` and transition to `Loaded` when
-/// GeoTIFF metadata is fetched on demand.
+/// the poll cycle preloads their GeoTIFF metadata (#90) or a request fetches it
+/// on demand.
 #[derive(Debug, Clone)]
 pub enum FileState {
     /// STAC stub: only STAC metadata available, GeoTIFF not yet loaded.
