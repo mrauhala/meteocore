@@ -25,8 +25,10 @@ OpenAPI paths/components, data-access routes and, per collection, a
 Common resources — landing page, `/api` (one merged OpenAPI 3.0 document),
 `/conformance` (the union), `/collections` and `/collections/{id}` — and merges
 each collection's contributions: links concatenate in block order, the first
-block to describe a field wins, and `styles` merge by id so Tiles can add
-per-style map tilesets to Maps' entries. A block may *claim* a field it leaves
+block to describe a field wins, `styles` merge by id so Tiles can add
+per-style map tilesets to Maps' entries, and `crs` lists union in block order
+(the earlier block's first entry stays the default) because Features Part 2
+requires `/items` to accept exactly its collection's list. A block may *claim* a field it leaves
 out (`Contribution::claims`) so that no later block fills it: a raster block
 claims `storageCrs`, which it omits when the native CRS has no OGC URI, so a
 Features block's CRS84 cannot mislabel a projected radar grid. Common metadata routes get the
@@ -43,7 +45,7 @@ adds `itemType: "feature"` and one `items` link per encoding to feature
 collections only, and namespaces its OpenAPI components (`features-bbox`, …)
 because Maps already defines a different `bbox`, `datetime` and `link`. Where
 Maps and Features both describe a collection (CAP, nowcast, lightning events),
-the extent, `crs` and `dataType` are Maps', and discovery follows that extent.
+the extent and `dataType` are Maps', and discovery follows that extent.
 
 ## Mounts and links
 

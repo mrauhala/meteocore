@@ -15,8 +15,10 @@ use ds_core::config::CollectionConfig;
 use ds_core::feature::FeatureQuery;
 use ds_core::feature_engine::FeatureEngine;
 
+use crate::crs::{FeatureCrs, ResponseCrs};
 use crate::params::{
-    parse_bbox, parse_datetime, parse_sortby, ItemsQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
+    parse_bbox_values, parse_datetime, parse_sortby, ItemQueryParams, ItemsQueryParams,
+    DEFAULT_LIMIT, MAX_LIMIT,
 };
 use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
 
@@ -38,12 +40,14 @@ pub struct FeaturesState {
 
 pub type AppState = Arc<ArcSwap<FeaturesState>>;
 
-/// Features Part 1 classes this crate implements, on every surface.
+/// Features classes this crate implements, on every surface: Part 1, and
+/// Part 2 CRS by reference (`crs`, `bbox-crs`; [`crate::crs`]).
 pub const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/html",
+    "http://www.opengis.net/spec/ogcapi-features-2/1.0/conf/crs",
 ];
 
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
@@ -154,6 +158,34 @@ fn with_vary(mut resp: Response) -> Response {
     // `Vary: Accept-Encoding`) isn't clobbered.
     resp.headers_mut()
         .append(header::VARY, HeaderValue::from_static("accept"));
+    resp
+}
+
+/// The response CRS from `crs` (Part 2). The HTML view draws its map and
+/// labels coordinates in longitude/latitude, so another CRS is a 400 there
+/// rather than a page that ignores it; the GeoJSON representation takes any.
+fn response_crs(
+    crs: Option<&str>,
+    wanted: ds_core::html::Wanted,
+) -> Result<ResponseCrs, HandlerError> {
+    let requested = crs
+        .map(|value| FeatureCrs::parse(value, "crs"))
+        .transpose()
+        .map_err(|e| bad_request_msg(&e.to_string()))?;
+    if wanted == ds_core::html::Wanted::Html && requested.is_some_and(|c| c != FeatureCrs::Crs84) {
+        return Err(bad_request_msg(
+            "the HTML representation is CRS84 only; request another crs as GeoJSON (f=json)",
+        ));
+    }
+    Ok(ResponseCrs::new(requested))
+}
+
+/// `Content-Crs` on every items and item response, CRS84 included (Part 2).
+fn with_content_crs(mut resp: Response, crs: &ResponseCrs) -> Response {
+    resp.headers_mut().insert(
+        header::HeaderName::from_static("content-crs"),
+        HeaderValue::from_str(&crs.content_crs()).expect("a CRS URI is a valid header value"),
+    );
     resp
 }
 
@@ -328,6 +360,8 @@ pub(crate) fn items_openapi_paths(
         let id = &config.id;
         let mut parameters = vec![
             component_ref("parameters", name, "bbox"),
+            component_ref("parameters", name, "bbox-crs"),
+            component_ref("parameters", name, "crs"),
             component_ref("parameters", name, "limit"),
             component_ref("parameters", name, "offset"),
             component_ref("parameters", name, "datetime"),
@@ -392,6 +426,7 @@ pub(crate) fn items_openapi_paths(
                             "required": true,
                             "schema": {"type": "string"}
                         },
+                        component_ref("parameters", name, "crs"),
                         feature_format_parameter()
                     ],
                     "responses": {
@@ -476,6 +511,36 @@ pub(crate) fn openapi_components(name: ComponentName) -> Value {
                 "explode": false,
                 "schema": {"type": "string"},
                 "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
+            }),
+        ),
+        // `crs` and `bbox-crs` reproduced verbatim from OGC API - Features
+        // Part 2 (OGC 18-058): a URI, `style: form`, `explode: false`. The
+        // valid values are each collection's `crs`.
+        (
+            "crs",
+            json!({
+                "name": "crs",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string", "format": "uri"},
+                "style": "form",
+                "explode": false,
+                "description": format!(
+                    "CRS of the response geometry, in that CRS's axis order (EPSG:4326 is latitude, longitude; EPSG:3035 northing, easting). One of the collection's `crs` values: {}. Default CRS84. The HTML representation is CRS84 only.",
+                    crate::crs::supported_uris().join(", ")
+                )
+            }),
+        ),
+        (
+            "bbox-crs",
+            json!({
+                "name": "bbox-crs",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string", "format": "uri"},
+                "style": "form",
+                "explode": false,
+                "description": "CRS of `bbox`, whose corners follow that CRS's axis order. One of the collection's `crs` values. Default CRS84."
             }),
         ),
         // Schema reproduced verbatim from OGC API - Features Part 8:
@@ -780,18 +845,23 @@ pub async fn items(
     params
         .validate_filters(&engine.filterables())
         .map_err(bad_request)?;
+    let crs = response_crs(params.crs.as_deref(), wanted)?;
 
+    // `bbox-crs` is validated even without a `bbox`; the engine always gets a
+    // CRS84 box, which the pagination links then carry.
+    let bbox_crs = params
+        .bbox_crs
+        .as_deref()
+        .map(|value| FeatureCrs::parse(value, "bbox-crs"))
+        .transpose()
+        .map_err(bad_request)?
+        .unwrap_or(FeatureCrs::Crs84);
     let bbox = params
         .bbox
         .as_deref()
-        .map(parse_bbox)
+        .map(|value| bbox_crs.bbox_to_crs84(parse_bbox_values(value)?))
         .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?;
+        .map_err(bad_request)?;
 
     let datetime = params
         .datetime
@@ -877,7 +947,7 @@ pub async fn items(
         &query.sortby,
         &query.property_filters,
     );
-    let mut doc = feature_page_to_geojson(&page, &id, limit, offset, &filters, "", root);
+    let mut doc = feature_page_to_geojson(&page, &id, limit, offset, &filters, "", root, &crs);
     crate::html::representation_links(&mut doc, wanted);
     let render = |doc: &serde_json::Value| match wanted {
         ds_core::html::Wanted::Json => {
@@ -907,7 +977,7 @@ pub async fn items(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),
     );
-    Ok(with_vary(resp))
+    Ok(with_vary(with_content_crs(resp, &crs)))
 }
 
 pub async fn item(
@@ -920,16 +990,18 @@ pub async fn item(
     let state = state.load_full();
     let (engine, config) = lookup_items_collection(&state, &id)?;
 
-    // A single feature takes only `f`. Anything else (`crs`, `properties`,
-    // a filter, a typo) would be ignored with a 200, so it is a 400 naming
-    // it (#681; root CLAUDE.md: never silently ignore a parameter).
-    let f = crate::params::item_format(pairs).map_err(|e| {
+    // A single feature takes only `f` and `crs`. Anything else
+    // (`properties`, a filter, a typo) would be ignored with a 200, so it is
+    // a 400 naming it (#681; root CLAUDE.md: never silently ignore a
+    // parameter).
+    let params = ItemQueryParams::from_pairs(pairs).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "code": "BadRequest", "description": e.to_string() })),
         )
     })?;
-    let wanted = negotiate_feature(f.as_deref(), &headers)?;
+    let wanted = negotiate_feature(params.f.as_deref(), &headers)?;
+    let crs = response_crs(params.crs.as_deref(), wanted)?;
     let feature = engine.get_feature(&feature_id).map_err(|e| match &e {
         ds_core::error::DataServerError::FeatureNotFound(_) => (
             StatusCode::NOT_FOUND,
@@ -943,9 +1015,9 @@ pub async fn item(
 
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);
-    let mut doc = feature_to_geojson(&feature, &id, root);
+    let mut doc = feature_to_geojson(&feature, &id, root, &crs);
     crate::html::representation_links(&mut doc, wanted);
-    Ok(with_vary(match wanted {
+    let resp = match wanted {
         ds_core::html::Wanted::Json => GeoJsonResponse(doc).into_response(),
         ds_core::html::Wanted::Html => Html(crate::html::features_html(
             &doc,
@@ -956,7 +1028,8 @@ pub async fn item(
             &html_controls(engine.as_ref()),
         ))
         .into_response(),
-    }))
+    };
+    Ok(with_vary(with_content_crs(resp, &crs)))
 }
 
 /// Which surface a collection description is for: the per-API `/features`
@@ -996,14 +1069,9 @@ pub(crate) fn collection_parts(
         }));
         fields.insert("dataType".into(), json!("vector"));
     }
-    fields.insert(
-        "crs".into(),
-        json!(["http://www.opengis.net/def/crs/OGC/1.3/CRS84"]),
-    );
-    fields.insert(
-        "storageCrs".into(),
-        json!("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
-    );
+    // Part 2: exactly the CRSs `/items` accepts in `crs` and `bbox-crs`.
+    fields.insert("crs".into(), json!(crate::crs::supported_uris()));
+    fields.insert("storageCrs".into(), json!(FeatureCrs::Crs84.uri()));
     fields.insert("numberItems".into(), json!(engine.feature_count()));
 
     // Add spatial + temporal extent if available. A Features collection

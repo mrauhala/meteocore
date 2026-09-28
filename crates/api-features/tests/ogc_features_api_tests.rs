@@ -831,14 +831,18 @@ mod errors {
         assert!(json["code"].is_string());
     }
 
-    /// A single feature takes only `f` (#681): any other parameter would be
-    /// ignored with a 200, so it is a 400.
+    /// A single feature takes only `f` and `crs` (#681, #685): any other
+    /// parameter would be ignored with a 200, so it is a 400.
     #[tokio::test]
-    async fn item_rejects_everything_but_f() {
-        let (status, _) = get("/collections/cities/items/helsinki?f=json").await;
-        assert_eq!(status, StatusCode::OK);
+    async fn item_rejects_everything_but_f_and_crs() {
+        for query in ["f=json", "crs=EPSG%3A3067", "f=json&crs=EPSG%3A4326"] {
+            let (status, _) = get(&format!("/collections/cities/items/helsinki?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+        }
         for query in [
-            "crs=EPSG%3A3067",
+            "bbox-crs=EPSG%3A3067",
+            "crs=EPSG%3A32635",
+            "crs=EPSG%3A3067&crs=EPSG%3A3067",
             "properties=name",
             "name=Helsinki",
             "f=json&f=html",
@@ -920,7 +924,7 @@ mod errors {
             "/collections/nonexistent",
             "/collections/nonexistent/items",
             "/collections/cities/items/nope",
-            "/collections/cities/items/helsinki?crs=EPSG%3A3067",
+            "/collections/cities/items/helsinki?crs=EPSG%3A2393",
             "/collections/cities/items?sortby=bogus",
             "/collections/cities/items?f=xml",
             "/collections?unknown=1",

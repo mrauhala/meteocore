@@ -14,6 +14,24 @@ fn with_format(href: &str, format: &str) -> String {
     format!("{href}{separator}f={format}")
 }
 
+/// `href` without its `crs` parameter: the HTML view is CRS84 only, so its
+/// alternate link from a GeoJSON response in another CRS drops it. Other
+/// parameters keep their exact encoding.
+fn without_crs(href: &str) -> String {
+    let Some((path, query)) = href.split_once('?') else {
+        return href.to_owned();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| pair.split('=').next() != Some("crs"))
+        .collect();
+    if kept.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    }
+}
+
 /// Explicit formats keep pagination and alternate links usable even when a
 /// browser follows them with a different Accept header from the first request.
 pub(crate) fn representation_links(doc: &mut Value, wanted: Wanted) {
@@ -26,8 +44,12 @@ pub(crate) fn representation_links(doc: &mut Value, wanted: Wanted) {
         for link in links.iter_mut() {
             let href = link["href"].as_str().unwrap_or_default().to_owned();
             if link["rel"] == "self" {
+                let alternate_href = match wanted {
+                    Wanted::Json => without_crs(&href),
+                    Wanted::Html => href.clone(),
+                };
                 alternate_link = Some(json!({
-                    "href": with_format(&href, alternate),
+                    "href": with_format(&alternate_href, alternate),
                     "rel": "alternate", "type": alternate_media
                 }));
             }
@@ -689,7 +711,12 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>()
             .into(),
         };
-        let mut doc = feature_to_geojson(&feature, "test", "https://example.com/prefix/features");
+        let mut doc = feature_to_geojson(
+            &feature,
+            "test",
+            "https://example.com/prefix/features",
+            &crate::crs::ResponseCrs::default(),
+        );
         representation_links(&mut doc, Wanted::Html);
         let html = features_html(
             &doc,
@@ -752,7 +779,16 @@ mod tests {
             number_matched: 5,
             next_offset: Some(2),
         };
-        let mut doc = feature_page_to_geojson(&page, "test", 1, 1, &filters, "", "");
+        let mut doc = feature_page_to_geojson(
+            &page,
+            "test",
+            1,
+            1,
+            &filters,
+            "",
+            "",
+            &crate::crs::ResponseCrs::default(),
+        );
         representation_links(&mut doc, Wanted::Html);
         for link in doc["links"].as_array().unwrap() {
             let href = link["href"].as_str().unwrap();

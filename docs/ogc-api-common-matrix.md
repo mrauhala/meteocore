@@ -84,11 +84,14 @@ Features at the shared root (2026-09-25, [#789](https://github.com/mrauhala/mete
 Phase 2): Features is the third block. Feature collections carry
 `itemType: "feature"` and a GeoJSON and an HTML `items` link; other collections
 carry neither, as Features Part 1 §7.1 scopes its requirements to feature
-collections. A collection only Features serves is `dataType: vector` with CRS84
-`crs`/`storageCrs`. Where Maps also serves it, Maps' extent, `crs` and
-`dataType` win, a raster block's claim keeps a projected grid's unknown
-`storageCrs` unlabelled, and discovery follows the advertised extent. No Common
-class changes; the shared root's Common behaviour is otherwise unchanged.
+collections. A collection only Features serves is `dataType: vector` with
+Features' `crs` list and CRS84 `storageCrs`. Where Maps also serves it, Maps'
+extent and `dataType` win, a raster block's claim keeps a projected grid's
+unknown `storageCrs` unlabelled, and discovery follows the advertised extent.
+`crs` lists union in block order (2026-09-28, [#685](https://github.com/mrauhala/meteocore/issues/685)):
+Features Part 2 makes a feature collection's list exactly the CRSs `/items`
+accepts, and Maps' and Tiles' lists hold none Features lacks. No Common class
+changes; the shared root's Common behaviour is otherwise unchanged.
 
 Parameter discovery (2026-09-28, [#279](https://github.com/mrauhala/meteocore/issues/279)):
 a multi-parameter raster's Maps and Tiles collection descriptions, on the
@@ -135,7 +138,7 @@ collection.
 | Spatial extent in CRS84 | Yes — engine-dependent | Yes — engine-dependent | Yes — raster or feature extent | Yes — engine-dependent |
 | Temporal extent metadata | Yes — engine-dependent | Yes — raster times | Yes — raster or feature extent [5] | Yes — time-aware engines [5] |
 | Multiple spatial boxes / temporal intervals for sparse data | No — one overall extent | No — one overall extent | No — one overall extent | No — one overall extent |
-| Supported output CRS metadata (`crs`) | Yes — CRS84 | Yes — supported map CRSs | Yes — tile matrix set CRSs and native CRS where known | Yes — CRS84 |
+| Supported output CRS metadata (`crs`) | Yes — CRS84 | Yes — supported map CRSs | Yes — tile matrix set CRSs and native CRS where known | Yes — CRS84, EPSG:4326, 3857, 3067, 3035 (Features Part 2 `crs`/`bbox-crs`) |
 | Native CRS metadata (`storageCrs`) | No | Partial — known CRS URI only | Partial — known raster CRS URI only | Yes — CRS84 |
 | Native spatial bounds (`storageCrsBbox`) | No | No [6] | No [6] | N/A — storage and extent both CRS84 |
 | Scale/cell-size suitability metadata (`minScaleDenominator`, `maxScaleDenominator`, `minCellSize`, `maxCellSize`) | No | No | No | No |
