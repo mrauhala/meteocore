@@ -114,7 +114,7 @@ impl StyleContext {
                 let colormap: Arc<dyn ColorMap> =
                     Arc::new(LinearColorMap::new(palette.stops.clone()));
                 return Ok(ResolvedColormap {
-                    colormap: maybe_wrap_integer_lut(colormap, min, max),
+                    colormap: wrap_if_integer_lut_keeps(colormap, &palette, min, max),
                     palette,
                     min,
                     max,
@@ -142,7 +142,7 @@ impl StyleContext {
         };
         let colormap: Arc<dyn ColorMap> = Arc::new(LutColorMap::from_palette(&palette, min, max));
         Ok(ResolvedColormap {
-            colormap: maybe_wrap_integer_lut(colormap, min, max),
+            colormap: wrap_if_integer_lut_keeps(colormap, &palette, min, max),
             palette,
             min,
             max,
@@ -483,6 +483,35 @@ fn range_for(
     (min, max)
 }
 
+/// [`maybe_wrap_integer_lut`], for a palette whose structure a whole-unit
+/// LUT keeps.
+fn wrap_if_integer_lut_keeps(
+    cmap: Arc<dyn ColorMap>,
+    palette: &Palette,
+    min: f64,
+    max: f64,
+) -> Arc<dyn ColorMap> {
+    if integer_lut_keeps(palette) {
+        maybe_wrap_integer_lut(cmap, min, max)
+    } else {
+        cmap
+    }
+}
+
+/// Whether a whole-unit LUT keeps a palette's structure. The LUT rounds
+/// every value to the nearest unit, which is harmless on a smooth ramp but
+/// moves finer structure: a step palette's class boundaries shift by half a
+/// class, and a hard edge between stops less than one unit apart, such as
+/// `temperature`'s 0 °C, shifts by up to half a unit. Those palettes keep
+/// the float LUT, which resolves 1/4096 of the range.
+fn integer_lut_keeps(palette: &Palette) -> bool {
+    palette.interpolation != Interpolation::Step
+        && palette
+            .stops
+            .windows(2)
+            .all(|w| w[1].value - w[0].value >= 1.0)
+}
+
 /// Wrap `cmap` in [`IntegerLutColorMap`] when the value range fits a small
 /// precomputed LUT (#207). Skipped for non-finite/inverted bounds, spans
 /// below 16 integer steps (≥1-unit-per-stop is too coarse for sub-unit
@@ -622,7 +651,8 @@ mod tests {
 
     /// A range entirely outside a data-valued palette's stops is rescaled
     /// onto them (#823): the °C `temperature` palette over the #320 kelvin
-    /// range paints each temperature in its own colour, not all dark red.
+    /// range, the same −90…50 span, paints each temperature in its own
+    /// colour, not all one colour.
     #[test]
     fn disjoint_range_rescales_a_data_valued_palette() {
         let ctx = StyleContext::with_builtins();
@@ -630,13 +660,14 @@ mod tests {
             .build_colormap(&StyleSpec {
                 colormap: Some("temperature"),
                 color_stops: &[],
-                min: Some(233.15),
+                min: Some(183.15),
                 max: Some(323.15),
             })
             .unwrap();
         let celsius = ctx.registry.get("temperature").unwrap();
-        // Whole kelvins: the integer LUT rounds to them.
-        for kelvin in [240.0, 273.0, 300.0] {
+        // The 0 °C hard edge keeps this palette on the float LUT, so kelvin
+        // and °C sample the same stops; `close` absorbs one LUT step.
+        for kelvin in [200.0, 240.0, 283.0, 300.0] {
             let (got, want) = (
                 r.colormap.color(Some(kelvin)),
                 celsius.sample(kelvin - 273.15),
@@ -646,7 +677,7 @@ mod tests {
         assert_ne!(r.colormap.color(Some(240.0)), r.colormap.color(Some(300.0)));
         // The legend reads the rescaled stops, in the data's unit.
         let stops = &r.palette.stops;
-        assert!((stops.first().unwrap().value - 233.15).abs() < 1e-9);
+        assert!((stops.first().unwrap().value - 183.15).abs() < 1e-9);
         assert!((stops.last().unwrap().value - 323.15).abs() < 1e-9);
     }
 
@@ -818,6 +849,67 @@ mod tests {
             &src,
             &maybe_wrap_integer_lut(src.clone(), 0.0, f64::INFINITY)
         ));
+    }
+
+    /// Smooth ramps keep the whole-unit LUT; step classes and hard edges,
+    /// which it would move by up to half a unit, do not. `radar_dbz`'s
+    /// 5.0 → 5.1 dBZ display threshold is such an edge: rounding put it at
+    /// 5.5 dBZ.
+    #[test]
+    fn integer_lut_only_for_palettes_it_keeps() {
+        let reg = PaletteRegistry::with_builtins();
+        assert!(integer_lut_keeps(&reg.get("temperature_classic").unwrap()));
+        assert!(integer_lut_keeps(&reg.get("wind_speed").unwrap()));
+        assert!(!integer_lut_keeps(&reg.get("temperature").unwrap()));
+        assert!(!integer_lut_keeps(&reg.get("radar_dbz").unwrap()));
+        let step = Palette::new(
+            "classes",
+            vec![
+                ColorStop {
+                    value: -1.0,
+                    color: [0, 0, 255, 255],
+                },
+                ColorStop {
+                    value: 0.0,
+                    color: [0, 255, 0, 255],
+                },
+                ColorStop {
+                    value: 1.0,
+                    color: [255, 0, 0, 255],
+                },
+            ],
+            Interpolation::Step,
+        );
+        assert!(!integer_lut_keeps(&step));
+    }
+
+    /// A step palette's classes are `[lo, hi)` for float data too: 0.6 is in
+    /// the 0…1 class and −0.4 in the −1…0 class, where whole-unit rounding
+    /// would put them one class up.
+    #[test]
+    fn step_classes_hold_their_boundaries_through_build_colormap() {
+        let mut reg = PaletteRegistry::with_builtins();
+        let classes: Vec<ColorStop> = (-20..=20)
+            .map(|v| ColorStop {
+                value: v as f64,
+                color: [(v + 100) as u8, 0, 0, 255],
+            })
+            .collect();
+        reg.insert(Palette::new("classes", classes, Interpolation::Step))
+            .unwrap();
+        let ctx = StyleContext::new(reg);
+        let r = ctx
+            .build_colormap(&StyleSpec {
+                colormap: Some("classes"),
+                color_stops: &[],
+                min: Some(-20.0),
+                max: Some(20.0),
+            })
+            .unwrap();
+        for (value, class) in [(0.6, 0), (-0.4, -1), (5.9, 5), (-7.5, -8)] {
+            let got = r.colormap.color(Some(value))[0];
+            assert_eq!(got, (class + 100) as u8, "{value} is in class {class}");
+        }
     }
 
     fn bundle(toml_src: &str) -> StyleBundle {
@@ -1050,10 +1142,10 @@ mod tests {
             .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
             .unwrap();
         for (name, palette, range) in [
-            ("t2m", "temperature", (-40.0, 50.0)),
+            ("t2m", "temperature", (-90.0, 50.0)),
             ("msl", "pressure", (950.0, 1050.0)),
             ("ws", "wind_speed", (0.0, 40.0)),
-            ("tmp", "temperature", (233.15, 323.15)),
+            ("tmp", "temperature", (183.15, 323.15)),
             ("pres", "pressure", (95000.0, 105000.0)),
         ] {
             let style = &maps[&format!("c1/{name}")]["default"];
@@ -1070,6 +1162,43 @@ mod tests {
                 (fallback["default"].min, fallback["default"].max)
             );
         }
+    }
+
+    /// The default temperature style is one scale for every level and unit:
+    /// a kelvin layer and a °C layer paint the same temperature in the same
+    /// colour, from the stratosphere to the desert, and 0 °C is a hard edge
+    /// from ice white to green.
+    #[test]
+    fn default_temperature_colours_agree_across_units_and_levels() {
+        let ctx = StyleContext::with_builtins();
+        let c = coll("colormap = \"viridis\"\n");
+        let params = [("t", "Temperature", "K"), ("2t", "2 m temperature", "°C")].map(
+            |(name, title, unit)| ds_core::map_engine::ParameterInfo {
+                name: name.into(),
+                title: title.into(),
+                unit: unit.into(),
+            },
+        );
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
+            .unwrap();
+        let kelvin = &maps["c1/t"]["default"].colormap;
+        let celsius = &maps["c1/2t"]["default"].colormap;
+        // Within one LUT step: the +273.15 offset can round to the
+        // neighbouring entry.
+        for c in [-85.0, -55.0, -20.0, -1.0, 1.0, 15.0, 35.0] {
+            let (k, c_) = (kelvin.color(Some(c + 273.15)), celsius.color(Some(c)));
+            assert!(close(k, c_), "{c} °C: {k:?} vs {c_:?}");
+        }
+        let [r, g, b, _] = celsius.color(Some(-0.2));
+        assert!(
+            r > 200 && g > 200 && b > 200,
+            "just below 0 °C is ice white"
+        );
+        let [r, g, b, _] = celsius.color(Some(0.2));
+        assert!(g > r + 60 && g > b, "just above 0 °C is green");
+        // Upper-air levels are no longer clamped to one colour.
+        assert_ne!(celsius.color(Some(-60.0)), celsius.color(Some(-45.0)));
     }
 
     /// #763 through the shared resolver whose per-parameter maps the server

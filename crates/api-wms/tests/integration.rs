@@ -3042,7 +3042,7 @@ fn param_layer_styles() -> HashMap<String, HashMap<String, StyleInfo>> {
             ),
             (
                 "vradh_only".to_string(),
-                param_palette_style("vradh_only", "temperature", Some("VRADH")),
+                param_palette_style("vradh_only", "temperature_classic", Some("VRADH")),
             ),
         ]),
     );

@@ -1442,7 +1442,8 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | `radial_velocity` | Doppler radial velocity, diverging blue → white → red | ±48 m/s |
 | `grayscale` | Linear black → white | 0–1 |
 | `viridis` | Perceptually uniform (good default) | 0–1 |
-| `temperature` | Purple → blue → cyan → green → yellow → red | -40 to 50 °C |
+| `temperature` | One scale for every level: ink → purple → blue → ice white, a hard edge at 0 °C to green → yellow → orange → red → wine | -90 to 50 °C |
+| `temperature_classic` | The pre-widening `temperature`: purple → blue → cyan → green → yellow → red | -40 to 50 °C |
 | `precipitation` | Transparent → blue → purple → white | 0–50 mm |
 | `precipitation_rate` | Precipitation-rate ramp | 0–30 mm/h |
 | `wind_speed` | Green → yellow → orange → red → purple | 0–50 m/s |
@@ -1469,7 +1470,10 @@ palette's title keeps its original unit. The same rule applies to inline
 **Per-parameter default styles** (#320) — parameters of multi-parameter
 collections (GRIB, QueryData, Zarr, radar volumes) with no explicit style
 are matched against a built-in defaults table by normalized name/title plus
-each parameter's unit: `t2m`/`2t`/`TMP` (unit K or C) → `temperature`,
+each parameter's unit: temperature and dew point such as `t`/`t2m`/`2t`/`TMP`/`2d`
+(unit K or C) → `temperature` over one range for every level, −90…50 °C or
+183.15…323.15 K, so a colour means the same temperature from the surface to
+the stratosphere,
 `msl`/`mslp` (Pa or hPa) → `pressure`, `DBZH`/`dbz` → `radar_dbz`,
 `VRADH` → `radial_velocity`, satellite brightness temperature / cloud top
 temperature (unit K) → `ir_bt_enhanced`, relative humidity/cloud/wind
