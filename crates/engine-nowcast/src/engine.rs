@@ -1369,6 +1369,13 @@ impl NowcastEngine {
                     .map(|v| v.map(|x| x as f32).unwrap_or(f32::NAN))
                     .collect(),
             ),
+            // Already the frame's representation: only the sentinel (and
+            // ±∞) need rewriting to NaN — in place, no boxing.
+            RasterValues::F32 { data, nodata } => FrameData::F32(
+                data.into_iter()
+                    .map(|raw| RasterValues::decode_f32(raw, nodata).map_or(f32::NAN, |_| raw))
+                    .collect(),
+            ),
         })
     }
 

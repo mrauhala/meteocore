@@ -162,7 +162,13 @@ on the request path. Single-level and legacy views require exact metadata.
 
 - The GRIB decoder produces `f32`; retain those values in `DecodedGrid` to
   avoid doubling every cached buffer. Widen samples to `f64` before interpolation
-  or display conversion. Coordinates and EDR/Maps outputs remain `f64`.
+  or display conversion. Coordinates and EDR outputs remain `f64`.
+- Map tiles are `RasterValues::F32` (#475): `DecodedGrid::resample_f32` runs
+  the same f64 sampling as `resample` (one walk, `resample_each`), fuses the
+  display conversion, and narrows each result to f32 with NaN as nodata —
+  4 B/px instead of a boxed 16. Values are exactly the old f64 ones `as f32`
+  (`tests/local_source.rs` pins this on the fixture for all three CRS paths);
+  keep `resample` returning f64 for the bench fingerprint.
 - Cache weights include allocated value capacity and key/structure overhead.
   Keep the entry-size estimate aligned with the 4 MiB typical global field.
 - Run `cargo run --release -p engine-grib --example bench_grid_cache` for a

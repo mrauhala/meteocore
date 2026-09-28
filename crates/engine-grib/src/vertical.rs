@@ -244,6 +244,7 @@ mod tests {
                 .find(|view| view.family == Some(GribLevelType::Single))
                 .unwrap();
             let reference = "2026-04-05T00:00:00Z".parse().unwrap();
+            // Map tiles store f32 (#475): compare at f32 precision.
             let render = |z| {
                 view.get_raster_tile(
                     [0.0, 0.0, 1.0, 1.0],
@@ -265,7 +266,7 @@ mod tests {
             let version = view.content_version();
             let single_version = single.content_version();
             assert_ne!(version, 0, "explicit-TIME responses must revalidate");
-            assert!((render(None) + 23.15).abs() < 1e-9);
+            assert_eq!(render(None) as f32, -23.15);
 
             source.write(
                 "later",
@@ -287,13 +288,13 @@ mod tests {
                 view.resolve_reference_time(Some(reference), Some(reference)),
                 Some(reference)
             );
-            assert!((render(None) + 3.15).abs() < 1e-9);
+            assert_eq!(render(None) as f32, -3.15);
             let first_level = if family == GribLevelType::Pressure {
                 500.0
             } else {
                 1.0
             };
-            assert!((render(Some(first_level)) + 23.15).abs() < 1e-9);
+            assert_eq!(render(Some(first_level)) as f32, -23.15);
             assert_ne!(view.content_version(), version);
             assert_eq!(single.content_version(), single_version);
 
@@ -330,6 +331,7 @@ mod tests {
             let engine = GribEngine::new("forecast", &config).unwrap();
             let views = engine.level_collections();
             let view = if split { &views[0] } else { &engine };
+            // Map tiles store f32 (#475): compare at f32 precision.
             let render = || {
                 view.get_raster_tile(
                     [0.0, 0.0, 1.0, 1.0],
@@ -349,14 +351,14 @@ mod tests {
                 .unwrap()
             };
             let version = view.content_version();
-            assert!((render() - 6.85).abs() < 1e-9);
+            assert_eq!(render() as f32, 6.85);
             source.write(
                 "air",
                 &[("TMP", "2 m above ground", message(0, 290.0, [0; 4], 103, 2))],
                 0,
             );
             engine.scan_once().unwrap();
-            assert!((render() - 16.85).abs() < 1e-9);
+            assert_eq!(render() as f32, 16.85);
             assert_ne!(view.content_version(), version);
         }
     }
@@ -434,10 +436,11 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        assert!((tile(single, None) - 6.85).abs() < 1e-9);
-        assert!((tile(pressure, Some(500.0)) + 23.15).abs() < 1e-9);
-        assert!((tile(model, Some(1.0)) + 63.15).abs() < 1e-9);
-        assert!((tile(pressure, None) + 3.15).abs() < 1e-9);
+        // Map tiles store f32 (#475): exact to f32 precision.
+        assert_eq!(tile(single, None) as f32, 6.85);
+        assert_eq!(tile(pressure, Some(500.0)) as f32, -23.15);
+        assert_eq!(tile(model, Some(1.0)) as f32, -63.15);
+        assert_eq!(tile(pressure, None) as f32, -3.15);
         let bytes = engine.storage_bytes_read();
         tile(pressure, Some(500.0));
         assert_eq!(

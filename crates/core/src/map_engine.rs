@@ -235,11 +235,14 @@ pub struct RasterTile {
 /// (`physical = raw as f64 * gain + offset`, `raw == nodata` ⇒ transparent),
 /// which the renderer colorizes through a 256-entry LUT indexed directly by
 /// the raw byte — no per-pixel float math or boxing anywhere in the pipeline.
+/// Float render paths (#475) should produce `F32`: 4 bytes per pixel, still
+/// colorized per pixel (a float cannot index a LUT).
 ///
 /// Consumers must treat the variants as equivalent descriptions of the same
-/// pixels: for every index, colorizing `U8` through the LUT must produce the
+/// pixels: for every index, colorizing `U8`/`F32` must produce the
 /// byte-identical RGBA that boxing the same sample to `F64` would (the LUT
-/// entry is *defined* as `colormap.color(value_at(i))`).
+/// entry is *defined* as `colormap.color(value_at(i))`; `F32` colorizes
+/// [`RasterValues::decode_f32`], the same function `value_at` uses).
 pub enum RasterValues {
     /// Row-major boxed physical values. None = nodata (transparent).
     F64(Vec<Option<f64>>),
@@ -252,6 +255,14 @@ pub enum RasterValues {
         /// `physical = raw as f64 * gain + offset`.
         gain: f64,
         offset: f64,
+    },
+    /// Row-major physical values as `f32`. NaN and ±∞ are always nodata
+    /// (transparent) — the natural "missing" of a float grid.
+    F32 {
+        data: Vec<f32>,
+        /// Additional finite sentinel meaning nodata (e.g. a source's
+        /// `-9999`). `None` ⇒ only non-finite samples are nodata.
+        nodata: Option<f32>,
     },
 }
 
@@ -267,6 +278,20 @@ impl RasterValues {
         match self {
             RasterValues::F64(v) => v.len(),
             RasterValues::U8 { data, .. } => data.len(),
+            RasterValues::F32 { data, .. } => data.len(),
+        }
+    }
+
+    /// Boxed-equivalent physical value of one `F32` sample: `None` for the
+    /// sentinel and for NaN/±∞. The single definition shared by
+    /// [`Self::value_at`] and the renderer's `F32` colorize, so the two
+    /// cannot disagree on which pixels are transparent.
+    #[inline]
+    pub fn decode_f32(raw: f32, nodata: Option<f32>) -> Option<f64> {
+        if !raw.is_finite() || Some(raw) == nodata {
+            None
+        } else {
+            Some(f64::from(raw))
         }
     }
 
@@ -292,6 +317,9 @@ impl RasterValues {
                     Some(raw as f64 * gain + offset)
                 }
             }),
+            RasterValues::F32 { data, nodata } => data
+                .get(idx)
+                .and_then(|&raw| Self::decode_f32(raw, *nodata)),
         }
     }
 
@@ -310,6 +338,9 @@ impl RasterValues {
                 // No nodata sentinel ⇒ every sample is a real value.
                 None => data.is_empty(),
             },
+            RasterValues::F32 { data, nodata } => data
+                .iter()
+                .all(|&raw| Self::decode_f32(raw, *nodata).is_none()),
         }
     }
 }
@@ -816,5 +847,42 @@ mod tests {
         let (w, h) = (256u32, 256u32);
         let (px_lo, px_hi, py_lo, py_hi) = crs.footprint_pixel_window(tight, FINLAND_WGS84, w, h);
         assert_eq!((px_lo, px_hi, py_lo, py_hi), (0, w - 1, 0, h - 1));
+    }
+
+    /// #475: the `F32` boxed view — sentinel and every non-finite sample are
+    /// nodata, everything else widens exactly.
+    #[test]
+    fn f32_values_box_to_exact_widened_values() {
+        let values = RasterValues::F32 {
+            data: vec![1.5, -9999.0, f32::NAN, f32::INFINITY, -0.1, f32::MAX],
+            nodata: Some(-9999.0),
+        };
+        assert_eq!(values.len(), 6);
+        assert_eq!(
+            values.iter_values().collect::<Vec<_>>(),
+            vec![
+                Some(1.5),
+                None,
+                None,
+                None,
+                Some(f64::from(-0.1f32)),
+                Some(f64::from(f32::MAX)),
+            ]
+        );
+        assert_eq!(values.value_at(6), None, "out of range");
+        assert!(!values.is_all_nodata());
+
+        let blank = RasterValues::F32 {
+            data: vec![f32::NAN, -9999.0, f32::NEG_INFINITY],
+            nodata: Some(-9999.0),
+        };
+        assert!(blank.is_all_nodata());
+        // Without a sentinel the same finite value is real data.
+        let real = RasterValues::F32 {
+            data: vec![f32::NAN, -9999.0],
+            nodata: None,
+        };
+        assert!(!real.is_all_nodata());
+        assert_eq!(real.value_at(1), Some(-9999.0));
     }
 }

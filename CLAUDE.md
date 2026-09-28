@@ -375,17 +375,27 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   that actually repeats (tile-aligned), or don't allocate the cache.
 - **Decode to compact native types, not `Vec<Option<f64>>`** — boxing every
   sample is a 16× memory blowup (#206). `RasterTile.values` is the
-  `RasterValues` enum: `F64` (boxed universal form) or
-  `U8 { data, nodata, gain, offset }` (raw bytes). Integer render paths
+  `RasterValues` enum: `F64` (boxed universal form),
+  `U8 { data, nodata, gain, offset }` (raw bytes) or
+  `F32 { data, nodata }` (4 B/px floats; NaN/±∞ and the optional sentinel
+  are nodata, #475). Integer render paths
   should produce `U8`, which `ds-render` colorizes through a 256-entry LUT
   indexed by the raw byte (built per call; entry i ≡ `colormap.color(
   value_at(i))`, so the variants are pixel-identical by construction — pinned
-  by the `u8_lut_colorize_matches_boxed_f64_exactly` test). GeoTIFF's map
+  by the `u8_lut_colorize_matches_boxed_f64_exactly` test). Float render
+  paths should produce `F32`: no LUT, per-pixel colormap evaluation of
+  `RasterValues::decode_f32` — the same function `value_at` uses (pinned by
+  `f32_colorize_matches_boxed_f64_exactly`). GeoTIFF's map
   path produces `U8` for local u8 sources with an integer u8 nodata
   (`reader::read_bbox_u8`, self-gating with `Ok(None)` → boxed fallback);
-  every other engine constructs `F64` via `.into()`. Adding a `RasterValues`
-  variant causes exhaustive-match compile errors in `colorize`/`value_at` —
-  keep them consistent.
+  GRIB's produces `F32` (f64 bilinear + display conversion, narrowed on
+  store); every other engine constructs `F64` via `.into()`. Narrowing an
+  f64 result to `F32` is not free: a value within half an f32 ulp of a
+  colormap LUT edge can shift one entry — only a source that is natively
+  f32 AND sampled without arithmetic is pixel-identical to its boxed form.
+  Adding a `RasterValues` variant causes exhaustive-match compile errors in
+  `colorize`/`value_at`/`is_all_nodata` (and engine-nowcast's frame intake)
+  — keep them consistent.
 - **All raster output→source coordinate mapping goes through
   `OutputCrs`/`ProjectionGrid`** (the `MapEngine::get_raster_tile` path). The
   WMS projected meta-tile assembly (`ds-render/src/metatile.rs`) is the

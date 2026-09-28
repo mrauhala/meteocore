@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut decode_times = Vec::with_capacity(iterations);
     let mut render_times = Vec::with_capacity(iterations);
+    let mut render_f32_times = Vec::with_capacity(iterations);
     let bbox = [19.0, 59.0, 32.0, 71.0];
     for _ in 0..iterations {
         let start = Instant::now();
@@ -44,9 +45,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         black_box(grid.resample(black_box(bbox), 512, 256, &OutputCrs::Wgs84));
         render_times.push(start.elapsed());
+        // The map-tile form (#475): same samples, stored as f32.
+        let start = Instant::now();
+        black_box(grid.resample_f32(black_box(bbox), 512, 256, &OutputCrs::Wgs84, |v| v));
+        render_f32_times.push(start.elapsed());
     }
     println!("decode_median_us={}", median(decode_times).as_micros());
     println!("resample_median_us={}", median(render_times).as_micros());
+    println!(
+        "resample_f32_median_us={}",
+        median(render_f32_times).as_micros()
+    );
+    println!(
+        "tile_buffer_bytes boxed_f64={} f32={}",
+        512 * 256 * std::mem::size_of::<Option<f64>>(),
+        512 * 256 * std::mem::size_of::<f32>()
+    );
 
     // Replay twelve distinct message keys through the same fixed cache budget.
     // Input bytes are reused to make this independent of network conditions.

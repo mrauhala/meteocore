@@ -29,7 +29,7 @@ use ds_core::config::{GribConfig, GribLevelType};
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::instances::{self, RunInfo};
-use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::model::*;
 
 use crate::cache::{DecodedGrid, GridCache};
@@ -1366,25 +1366,24 @@ impl MapEngine for GribEngine {
 
         let grid = self.fetch_grid(step_file, param_name, &keys)?;
 
-        let values = grid.resample(bbox, width, height, output_crs);
-
         // Apply unit conversion so colormap ranges use display units.
         // fetch_grid populates the metadata cache from the decoded message's
         // WMO triple on first decode, so this lookup is safe here.
         let meta = self.param_metadata_for(&keys, param_name);
-        let values = if meta.display.has_conversion() {
-            values
-                .into_iter()
-                .map(|v| v.map(|raw| meta.display.convert(raw)))
-                .collect()
+        // Compact f32 tile (#475): 4 B/px instead of a boxed Option<f64>;
+        // the conversion is fused into the sampling pass.
+        let data = if meta.display.has_conversion() {
+            grid.resample_f32(bbox, width, height, output_crs, |raw| {
+                meta.display.convert(raw)
+            })
         } else {
-            values
+            grid.resample_f32(bbox, width, height, output_crs, |raw| raw)
         };
 
         Ok(RasterTile {
             width,
             height,
-            values: values.into(),
+            values: RasterValues::F32 { data, nodata: None },
         })
     }
 
@@ -1604,7 +1603,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!((tile.values.iter_values().next().unwrap().unwrap() - 6.85).abs() < 1e-9);
+        // Map tiles store f32 (#475): exact to f32 precision.
+        assert_eq!(tile.values.value_at(0).unwrap() as f32, 6.85);
         assert!(engine
             .get_raster_tile(
                 [0.0, 0.0, 1.0, 1.0],
@@ -1689,7 +1689,8 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            assert!((tile.values.iter_values().next().unwrap().unwrap() - 6.85).abs() < 1e-9);
+            // Map tiles store f32 (#475): exact to f32 precision.
+            assert_eq!(tile.values.value_at(0).unwrap() as f32, 6.85);
             assert!(engine
                 .get_raster_tile(
                     [0.0, 0.0, 1.0, 1.0],
