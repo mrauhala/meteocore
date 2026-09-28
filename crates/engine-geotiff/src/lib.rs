@@ -5,6 +5,8 @@ mod decoded_cache;
 mod parse;
 mod range_batch;
 mod reader;
+#[cfg(test)]
+mod stac_preload_tests;
 
 /// Snapshot of the process-global decoded-chunk cache (#463) for `/metrics`:
 /// `(hits, misses, bytes, capacity_bytes)`.
@@ -31,6 +33,7 @@ use ds_poll::Shutdown;
 use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
 };
+use futures::StreamExt;
 use regex::Regex;
 use std::sync::Arc;
 
@@ -101,6 +104,22 @@ impl InFlightLoads {
             in_flight = guard;
         }
         if is_done() {
+            return None;
+        }
+        in_flight.insert(path.to_path_buf());
+        drop(in_flight);
+        Some(InFlightGuard::new(self, path.to_path_buf()))
+    }
+
+    /// Non-blocking claim for the async poll-cycle preload (#90): never
+    /// parks. `None` if another loader holds `path` (it will finish the
+    /// work) or `is_done` reports it complete; `Some(guard)` otherwise, and
+    /// requests for the path then wait on the preload instead of fetching
+    /// the same asset twice. Same lock rule for `is_done` as
+    /// [`wait_then_claim`](Self::wait_then_claim).
+    fn try_claim(&self, path: &Path, is_done: impl Fn() -> bool) -> Option<InFlightGuard<'_>> {
+        let mut in_flight = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight.contains(path) || is_done() {
             return None;
         }
         in_flight.insert(path.to_path_buf());
@@ -195,6 +214,18 @@ pub struct GeoTiffEngine {
     catalog_updated_at: Mutex<Option<DateTime<Utc>>>,
 }
 
+/// Most newly discovered STAC items whose metadata one poll cycle preloads
+/// (#90), newest first. A cold start or a poll after an outage can discover a
+/// backlog; items past the cap keep the lazy request-path load.
+const STAC_PRELOAD_MAX_ITEMS: usize = 24;
+/// Asset metadata fetches in flight during a poll-cycle preload (#90). I/O
+/// bound: enough to overlap round trips without fanning out a backlog.
+const STAC_PRELOAD_CONCURRENCY: usize = 4;
+/// Wall-clock cap on one poll cycle's preload (#90): a stalling asset host
+/// delays the next catalog poll by at most this. Unfinished items are left to
+/// the request path.
+const STAC_PRELOAD_BUDGET: Duration = Duration::from_secs(60);
+
 /// Circuit breaker threshold: number of consecutive failures before opening.
 const STAC_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 /// How long the circuit breaker stays open before allowing a retry.
@@ -282,11 +313,12 @@ impl GeoTiffEngine {
     /// already loaded, with **no** metadata fetch. `times` come from the entry
     /// keys (fixed at scan); `native_crs`/`grid_size` from currently-loaded entry
     /// metadata. Local entries are `Loaded` at scan (CRS correct from
-    /// construction); STAC entries are stubs until first render, so `native_crs`
-    /// is the `CRS:84` placeholder until `do_load_metadata` loads one and calls
+    /// construction); STAC entries are stubs until the poll preloads them (#90)
+    /// or a request loads one, so `native_crs` is the `CRS:84` placeholder
+    /// until `install_stac_metadata` calls
     /// [`refresh_raster_info`](Self::refresh_raster_info). The STAC cold-start
-    /// `CRS:84` window (GetCapabilities / `/collections` before the first
-    /// render) is tracked as a known limitation in #322.
+    /// `CRS:84` window (GetCapabilities / `/collections` before the first poll
+    /// that discovers items) is tracked in #322.
     fn build_raster_info(&self) -> ds_core::map_engine::RasterInfo {
         let catalog = self.catalog.load();
         let crs_name = catalog
@@ -693,30 +725,24 @@ impl GeoTiffEngine {
         Ok(catalog)
     }
 
-    /// Load GeoTIFF metadata for a STAC stub entry.
+    /// Fetch GeoTIFF metadata for a STAC asset: the one loader behind both the
+    /// poll-cycle preload (#90, awaited on the poll runtime) and the lazy
+    /// request path (bridged by [`load_stac_entry_metadata`](Self::load_stac_entry_metadata)).
     ///
-    /// For STAC mode, uses the StacClient's reqwest-based HTTP methods directly
+    /// Uses the StacClient's reqwest-based HTTP methods directly
     /// (bypassing object_store which URL-encodes path components and breaks
     /// servers like Ceph RGW that use colons in paths).
     ///
-    /// Tries COG range read first (64KB header), falls back to full download.
-    fn load_stac_entry_metadata(
+    /// Tries COG range read first (512KB header), falls back to full download.
+    async fn fetch_stac_entry_metadata(
         &self,
-        stub: &catalog::StacStub,
+        stac_client: &stac::StacClient,
+        asset_url: &str,
         file_size: u64,
     ) -> Result<(reader::TiffMetadata, reader::DataSource), DataServerError> {
-        let stac_client = match &self.store_mode {
-            StoreMode::RemoteStac { client } => client,
-            _ => {
-                return Err(DataServerError::Engine(
-                    "load_stac_entry_metadata called on non-STAC engine".into(),
-                ))
-            }
-        };
-
         // Get actual file size if not known from STAC
         let actual_size = if file_size == 0 {
-            stac_client.head_asset(&stub.asset_url).unwrap_or(0)
+            stac_client.head_asset_async(asset_url).await.unwrap_or(0)
         } else {
             file_size
         };
@@ -734,16 +760,16 @@ impl GeoTiffEngine {
         let http = stac_client.http_client();
         if actual_size > 0 {
             if let Some((metadata, tile_info)) =
-                reader::TiffMetadata::from_http_header_read(&http, &stub.asset_url, actual_size)
+                reader::TiffMetadata::from_http_header_read(&http, asset_url, actual_size).await
             {
                 tracing::debug!(
                     "[{}] STAC COG range read '{}' (header only, {} tiles)",
                     self.collection_id,
-                    stub.asset_url,
+                    asset_url,
                     tile_info.tile_offsets.len()
                 );
                 let source = reader::DataSource::HttpDirect {
-                    url: stub.asset_url.clone(),
+                    url: asset_url.to_string(),
                     http,
                     tile_info,
                 };
@@ -755,15 +781,34 @@ impl GeoTiffEngine {
         tracing::debug!(
             "[{}] STAC downloading '{}' ({})",
             self.collection_id,
-            stub.asset_url,
+            asset_url,
             format_bytes(actual_size)
         );
 
-        let data = stac_client.get_asset(&stub.asset_url)?;
+        let data = stac_client.get_asset_async(asset_url).await?;
         let source = reader::DataSource::from_bytes(data);
         let metadata = reader::TiffMetadata::from_source(&source)?;
 
         Ok((metadata, source))
+    }
+
+    /// Load GeoTIFF metadata for a STAC stub entry on the calling thread, for
+    /// the lazy request-path fallback: one sync bridge over
+    /// [`fetch_stac_entry_metadata`](Self::fetch_stac_entry_metadata).
+    fn load_stac_entry_metadata(
+        &self,
+        asset_url: &str,
+        file_size: u64,
+    ) -> Result<(reader::TiffMetadata, reader::DataSource), DataServerError> {
+        let stac_client = match &self.store_mode {
+            StoreMode::RemoteStac { client } => client,
+            _ => {
+                return Err(DataServerError::Engine(
+                    "load_stac_entry_metadata called on non-STAC engine".into(),
+                ))
+            }
+        };
+        stac_client.block_on(self.fetch_stac_entry_metadata(stac_client, asset_url, file_size))
     }
 
     /// Check if a catalog entry's metadata is already loaded.
@@ -776,6 +821,38 @@ impl GeoTiffEngine {
         }
     }
 
+    /// Publish fetched metadata for the STAC entry at `timestamp`: apply the
+    /// config overrides, promote the stub and refresh the cached snapshot.
+    /// `rcu`, not load-then-store: the poll-cycle preload (#90) and request
+    /// loads of other entries install concurrently and must not drop each
+    /// other's update.
+    fn install_stac_metadata(
+        &self,
+        timestamp: &DateTime<Utc>,
+        mut metadata: reader::TiffMetadata,
+        source: reader::DataSource,
+    ) {
+        metadata.apply_overrides(
+            self.override_nodata,
+            self.override_scale,
+            self.override_offset,
+        );
+        let (metadata, source) = (Arc::new(metadata), Arc::new(source));
+        self.catalog.rcu(|current| {
+            let mut next = (**current).clone();
+            if let Some(entry) = next.entries.get_mut(timestamp) {
+                entry.set_loaded(Arc::clone(&metadata), Arc::clone(&source));
+            }
+            next.recompute_extents();
+            next
+        });
+        // A STAC stub just gained metadata (CRS/grid/extent) — refresh the
+        // cached snapshot so `raster_info()` reflects it immediately rather than
+        // waiting for the next poll. Cheap + I/O-free (the metadata is already
+        // loaded), so it's safe here even on the render path (#211 review).
+        self.refresh_raster_info();
+    }
+
     /// Load metadata for a stub entry and update the catalog.
     fn do_load_metadata(
         &self,
@@ -783,33 +860,8 @@ impl GeoTiffEngine {
         asset_url: &str,
         file_size: u64,
     ) -> Result<(), DataServerError> {
-        let stub = catalog::StacStub {
-            bbox: None, // Not needed for loading
-            asset_url: asset_url.to_string(),
-        };
-        let (mut metadata, source) = self.load_stac_entry_metadata(&stub, file_size)?;
-
-        // Apply config overrides
-        metadata.apply_overrides(
-            self.override_nodata,
-            self.override_scale,
-            self.override_offset,
-        );
-
-        // Clone the catalog, update the entry, and swap
-        let current = self.catalog.load();
-        let mut new_catalog = (**current).clone();
-        if let Some(entry) = new_catalog.entries.get_mut(timestamp) {
-            entry.set_loaded(Arc::new(metadata), Arc::new(source));
-        }
-        new_catalog.recompute_extents();
-        self.catalog.store(Arc::new(new_catalog));
-        // A STAC stub just gained metadata (CRS/grid/extent) — refresh the
-        // cached snapshot so `raster_info()` reflects it immediately rather than
-        // waiting for the next poll. Cheap + I/O-free (the metadata is already
-        // loaded), so it's safe here even on the render path (#211 review).
-        self.refresh_raster_info();
-
+        let (metadata, source) = self.load_stac_entry_metadata(asset_url, file_size)?;
+        self.install_stac_metadata(timestamp, metadata, source);
         Ok(())
     }
 
@@ -849,6 +901,104 @@ impl GeoTiffEngine {
         };
 
         self.do_load_metadata(timestamp, &asset_url, file_size)
+    }
+
+    /// Preload metadata for the STAC items this poll cycle discovered (#90),
+    /// so the first request for a new timestep doesn't fetch the asset header
+    /// on a request worker. Entries absent from `previous` (the snapshot from
+    /// before the scan) are candidates, newest first, capped at
+    /// `STAC_PRELOAD_MAX_ITEMS` with `STAC_PRELOAD_CONCURRENCY` fetches in
+    /// flight, within `STAC_PRELOAD_BUDGET`. Async on the poll runtime: no
+    /// `block_in_place`, no sequential round trips. Anything skipped, failed
+    /// or cut off by the budget keeps the lazy
+    /// [`ensure_metadata`](Self::ensure_metadata) fallback.
+    async fn preload_stac_metadata(&self, previous: &Catalog) {
+        let StoreMode::RemoteStac { client } = &self.store_mode else {
+            return;
+        };
+        let targets: Vec<(DateTime<Utc>, PathBuf, String, u64)> = {
+            let catalog = self.catalog.load();
+            catalog
+                .entries
+                .iter()
+                .rev()
+                .filter(|(ts, _)| !previous.entries.contains_key(*ts))
+                .filter_map(|(ts, entry)| {
+                    let stub = entry.stac_stub_info()?;
+                    Some((
+                        *ts,
+                        entry.path.clone(),
+                        stub.asset_url.clone(),
+                        entry.file_size,
+                    ))
+                })
+                .take(STAC_PRELOAD_MAX_ITEMS)
+                .collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let attempted = targets.len();
+        let preload = futures::stream::iter(targets)
+            .map(|(ts, path, asset_url, file_size)| {
+                self.preload_stac_entry(client, ts, path, asset_url, file_size)
+            })
+            .buffer_unordered(STAC_PRELOAD_CONCURRENCY)
+            .filter(|loaded| futures::future::ready(*loaded))
+            .count();
+        // On timeout the unfinished fetches drop, releasing their claims.
+        match tokio::time::timeout(STAC_PRELOAD_BUDGET, preload).await {
+            Ok(loaded) => tracing::debug!(
+                "[{}] STAC preload: metadata for {}/{} new items",
+                self.collection_id,
+                loaded,
+                attempted
+            ),
+            Err(_) => tracing::warn!(
+                "[{}] STAC preload of {} new items exceeded {}s; the rest is left to the request path",
+                self.collection_id,
+                attempted,
+                STAC_PRELOAD_BUDGET.as_secs()
+            ),
+        }
+    }
+
+    /// Preload one entry for [`preload_stac_metadata`](Self::preload_stac_metadata).
+    /// Claims the path like a request would, so a request for this item
+    /// meanwhile waits for the preload instead of fetching it again; skips
+    /// the item if a request already holds the claim. `true` if it loaded.
+    async fn preload_stac_entry(
+        &self,
+        client: &stac::StacClient,
+        timestamp: DateTime<Utc>,
+        path: PathBuf,
+        asset_url: String,
+        file_size: u64,
+    ) -> bool {
+        let Some(_guard) = self
+            .loading_in_flight
+            .try_claim(&path, || self.is_metadata_loaded(&timestamp))
+        else {
+            return false;
+        };
+        match self
+            .fetch_stac_entry_metadata(client, &asset_url, file_size)
+            .await
+        {
+            Ok((metadata, source)) => {
+                // Installed before the guard drops, so woken waiters see it.
+                self.install_stac_metadata(&timestamp, metadata, source);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] STAC preload of '{}' failed, left to the request path: {e}",
+                    self.collection_id,
+                    asset_url
+                );
+                false
+            }
+        }
     }
 
     /// Ensure entries exist and have metadata loaded for the requested datetime range.
@@ -950,7 +1100,7 @@ impl GeoTiffEngine {
             if !self.shutdown.sleep(base * backoff_multiplier).await {
                 break;
             }
-            self.poll_once();
+            self.poll_cycle().await;
         }
         tracing::info!("[{}] Poll loop shutting down", self.collection_id);
     }
@@ -958,6 +1108,15 @@ impl GeoTiffEngine {
     /// Signal the polling loop to stop.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
+    }
+
+    /// One poll cycle: rescan, then preload metadata for the STAC items the
+    /// scan discovered (#90). The preload is a no-op for other sources, whose
+    /// scan already parses every header.
+    async fn poll_cycle(&self) {
+        let previous = self.catalog.load_full();
+        self.poll_once();
+        self.preload_stac_metadata(&previous).await;
     }
 
     fn poll_once(&self) {

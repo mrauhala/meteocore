@@ -128,7 +128,7 @@ impl StacClient {
 
     /// Bridge async to sync. Uses `block_in_place` when inside a tokio runtime,
     /// or creates a temporary runtime otherwise. Same pattern as DataStore.
-    fn block_on<F, T>(&self, future: F) -> Result<T, DataServerError>
+    pub(crate) fn block_on<F, T>(&self, future: F) -> Result<T, DataServerError>
     where
         F: std::future::Future<Output = Result<T, DataServerError>>,
     {
@@ -533,27 +533,29 @@ impl StacClient {
 
     /// Fetch the file size via a HEAD request.
     pub fn head_asset(&self, url: &str) -> Result<u64, DataServerError> {
-        let url_owned = url.to_string();
-        let http = self.http.clone();
-        self.block_on(async {
-            let resp = http.head(&url_owned).send().await.map_err(|e| {
-                tracing::warn!("HEAD failed for '{}': {}", url_owned, e);
-                DataServerError::Engine("Failed to fetch remote file metadata".into())
-            })?;
-            if !resp.status().is_success() {
-                tracing::warn!("HEAD returned {} for '{}'", resp.status(), url_owned);
-                return Err(DataServerError::Engine(
-                    "Failed to fetch remote file metadata".into(),
-                ));
-            }
-            let size = resp
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            Ok(size)
-        })
+        self.block_on(self.head_asset_async(url))
+    }
+
+    /// Async [`head_asset`](Self::head_asset), for callers already on a
+    /// runtime (the poll-cycle metadata preload, #90).
+    pub async fn head_asset_async(&self, url: &str) -> Result<u64, DataServerError> {
+        let resp = self.http.head(url).send().await.map_err(|e| {
+            tracing::warn!("HEAD failed for '{}': {}", url, e);
+            DataServerError::Engine("Failed to fetch remote file metadata".into())
+        })?;
+        if !resp.status().is_success() {
+            tracing::warn!("HEAD returned {} for '{}'", resp.status(), url);
+            return Err(DataServerError::Engine(
+                "Failed to fetch remote file metadata".into(),
+            ));
+        }
+        let size = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok(size)
     }
 
     /// Fetch a byte range from an asset URL.
@@ -590,25 +592,27 @@ impl StacClient {
 
     /// Download an entire asset.
     pub fn get_asset(&self, url: &str) -> Result<bytes::Bytes, DataServerError> {
-        let url_owned = url.to_string();
-        let http = self.http.clone();
-        self.block_on(async {
-            let resp = http.get(&url_owned).send().await.map_err(|e| {
-                tracing::warn!("Download failed for '{}': {:?}", url_owned, e);
-                DataServerError::Engine("Failed to download remote file".into())
-            })?;
-            if !resp.status().is_success() {
-                tracing::warn!("Download returned {} for '{}'", resp.status(), url_owned);
-                return Err(DataServerError::Engine(
-                    "Failed to download remote file".into(),
-                ));
-            }
-            let data = resp.bytes().await.map_err(|e| {
-                tracing::warn!("Failed to read download body from '{}': {}", url_owned, e);
-                DataServerError::Engine("Failed to download remote file".into())
-            })?;
-            Ok(data)
-        })
+        self.block_on(self.get_asset_async(url))
+    }
+
+    /// Async [`get_asset`](Self::get_asset), for callers already on a runtime
+    /// (the poll-cycle metadata preload, #90).
+    pub async fn get_asset_async(&self, url: &str) -> Result<bytes::Bytes, DataServerError> {
+        let resp = self.http.get(url).send().await.map_err(|e| {
+            tracing::warn!("Download failed for '{}': {:?}", url, e);
+            DataServerError::Engine("Failed to download remote file".into())
+        })?;
+        if !resp.status().is_success() {
+            tracing::warn!("Download returned {} for '{}'", resp.status(), url);
+            return Err(DataServerError::Engine(
+                "Failed to download remote file".into(),
+            ));
+        }
+        let data = resp.bytes().await.map_err(|e| {
+            tracing::warn!("Failed to read download body from '{}': {}", url, e);
+            DataServerError::Engine("Failed to download remote file".into())
+        })?;
+        Ok(data)
     }
 }
 

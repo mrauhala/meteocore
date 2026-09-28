@@ -636,8 +636,11 @@ impl TiffMetadata {
     /// of object_store. Used for STAC assets where object_store URL-encodes path
     /// components, breaking servers like Ceph RGW.
     ///
+    /// Async so the poll-cycle STAC preload (#90) can run several reads
+    /// concurrently; the request-path loader bridges it with one `block_on`.
+    ///
     /// Returns `None` if parsing fails (caller should fall back to full download).
-    pub fn from_http_header_read(
+    pub async fn from_http_header_read(
         http: &reqwest::Client,
         url: &str,
         file_size: u64,
@@ -647,19 +650,16 @@ impl TiffMetadata {
             return None;
         }
         let range_header = format!("bytes=0-{}", read_size - 1);
-        let url_owned = url.to_string();
-        let header_bytes = block_on_async(async {
-            let resp = http
-                .get(&url_owned)
-                .header(reqwest::header::RANGE, &range_header)
-                .send()
-                .await
-                .ok()?;
-            if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                return None;
-            }
-            resp.bytes().await.ok()
-        })?;
+        let resp = http
+            .get(url)
+            .header(reqwest::header::RANGE, &range_header)
+            .send()
+            .await
+            .ok()?;
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return None;
+        }
+        let header_bytes = resp.bytes().await.ok()?;
         let cursor = Cursor::new(SharedBytes::Heap(header_bytes));
         let mut decoder = DecoderWrapper(Decoder::new(cursor).ok()?);
         let metadata = Self::from_decoder_wrapper(&mut decoder, format!("<http:{}>", url)).ok()?;
@@ -3485,7 +3485,9 @@ mod tests {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap();
-        let (meta, info) = TiffMetadata::from_http_header_read(&http, &url, size).unwrap();
+        let (meta, info) = TiffMetadata::from_http_header_read(&http, &url, size)
+            .await
+            .unwrap();
         let handle = tokio::runtime::Handle::current();
         let calls = AtomicUsize::new(0);
         let transferred = AtomicUsize::new(0);
