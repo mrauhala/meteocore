@@ -603,7 +603,7 @@ impl MapEngine for QueryDataEngine {
             .unwrap_or_default();
 
         let gt = data.grid.geo_transform();
-        let bbox = gt.bbox();
+        let bbox = data.grid.bbox();
 
         let native_crs = match data.grid.area.crs {
             // Internal grids are lon-first, so CRS:84 (not EPSG:4326, which is
