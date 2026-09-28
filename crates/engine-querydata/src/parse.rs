@@ -71,11 +71,16 @@ pub struct GridInfo {
     pub area: GridArea,
     /// Pixel ↔ world mapping, derived once from `area` by [`Self::new`].
     transform: GeoTransform,
+    /// [`Self::bbox`], sampled once by [`Self::new`].
+    bbox: [f64; 4],
+    /// [`Self::lonlat_extent`], computed once by [`Self::new`].
+    lonlat_extent: [f64; 4],
 }
 
 impl GridInfo {
     /// Derives the pixel ↔ world transform once, so per-pixel sampling never
-    /// re-projects the corners.
+    /// re-projects the corners, and the WGS84 extents with it, so the
+    /// per-request metadata never re-projects the edges (Critical Rule 10).
     ///
     /// QueryData's corners are the *centres* of the first and last grid
     /// points (newbase maps grid index `0..n-1` onto the area), so the
@@ -120,11 +125,23 @@ impl GridInfo {
             height: ny,
             crs: area.crs.clone(),
         };
+        let bbox = transform.bbox();
+        let lonlat_extent = match area.crs {
+            Crs::Wgs84 => [
+                bl.0.min(tr.0),
+                bl.1.min(tr.1),
+                bl.0.max(tr.0),
+                bl.1.max(tr.1),
+            ],
+            _ => bbox,
+        };
         Self {
             nx,
             ny,
             area,
             transform,
+            bbox,
+            lonlat_extent,
         }
     }
 
@@ -137,7 +154,8 @@ impl GridInfo {
         &self.transform
     }
 
-    /// The grid's WGS84 extent `[west, south, east, north]`.
+    /// The grid's WGS84 extent `[west, south, east, north]`, computed once
+    /// by [`Self::new`].
     ///
     /// A lat/lon grid's is its corner points, normalised: `bottom_left` /
     /// `top_right` are the corners as stored, and a north-to-south (or
@@ -145,18 +163,15 @@ impl GridInfo {
     /// projected rectangle's edges, which reach past the corners' lon/lat
     /// box (an LCC rectangle's northern edge is wider than its corners).
     pub fn lonlat_extent(&self) -> [f64; 4] {
-        match self.area.crs {
-            Crs::Wgs84 => {
-                let (bl, tr) = (self.area.bottom_left, self.area.top_right);
-                [
-                    bl.0.min(tr.0),
-                    bl.1.min(tr.1),
-                    bl.0.max(tr.0),
-                    bl.1.max(tr.1),
-                ]
-            }
-            _ => self.transform.bbox(),
-        }
+        self.lonlat_extent
+    }
+
+    /// The WGS84 envelope `[west, south, east, north]` of the grid's cell
+    /// edges: [`GeoTransform::bbox`] of [`Self::geo_transform`], sampled once
+    /// by [`Self::new`]. A lat/lon grid's reaches half a cell past its corner
+    /// points; any other grid's equals [`Self::lonlat_extent`].
+    pub fn bbox(&self) -> [f64; 4] {
+        self.bbox
     }
 }
 
@@ -1246,5 +1261,55 @@ mod tests {
             "grid point (57, 57) is {:.1} m from the producer's",
             d_east.hypot(d_north)
         );
+    }
+
+    /// Both WGS84 extents are snapshots taken by `GridInfo::new` (#881): the
+    /// per-request metadata reads them without re-projecting the edges.
+    #[test]
+    fn extents_are_sampled_once_at_load() {
+        // A projected grid, MEPS's tangent LCC on its sphere: both are the
+        // rectangle's edge envelope.
+        let lat = 63.3_f64.to_radians();
+        let mut grid = GridInfo::new(
+            100,
+            120,
+            GridArea {
+                bottom_left: (9.0, 60.0),
+                top_right: (20.0, 65.0),
+                crs: Crs::LambertConformalConic {
+                    lat1: lat,
+                    lat2: lat,
+                    lat0: lat,
+                    lon0: 15.0_f64.to_radians(),
+                    false_e: 0.0,
+                    false_n: 0.0,
+                    radius: Some(6_371_220.0),
+                },
+            },
+        );
+        let bbox = grid.transform.bbox();
+        assert_eq!(grid.bbox(), bbox);
+        assert_eq!(grid.lonlat_extent(), bbox);
+        // Shift the transform behind the snapshots' back: an accessor that
+        // re-projected per call would follow it.
+        grid.transform.origin_x += 100_000.0;
+        assert_ne!(grid.transform.bbox(), bbox);
+        assert_eq!(grid.bbox(), bbox);
+        assert_eq!(grid.lonlat_extent(), bbox);
+
+        // A lat/lon grid stored north corner first, like the Kenya fixture:
+        // the extent is its corner points, the bbox its cell edges half a
+        // 0.5° cell further out.
+        let grid = GridInfo::new(
+            16,
+            21,
+            GridArea {
+                bottom_left: (34.0, 4.75),
+                top_right: (41.5, -5.25),
+                crs: Crs::Wgs84,
+            },
+        );
+        assert_eq!(grid.lonlat_extent(), [34.0, -5.25, 41.5, 4.75]);
+        assert_eq!(grid.bbox(), [33.75, -5.5, 41.75, 5.0]);
     }
 }

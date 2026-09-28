@@ -16,6 +16,8 @@ runtime).
 - **Grids:** WGS84, Rotated Lat-Lon, Stereographic, Lambert Conformal Conic
   (MEPS: tangent cone, `lat1 == lat2`). `GridInfo::new` derives the
   GeoTransform once; per-pixel code reads it, never re-projects corners.
+  It samples the WGS84 extents once too (`lonlat_extent`, `bbox`); the
+  per-request metadata reads them, never re-projects edges (#881).
 - **Corner gotchas (`GridInfo::new`):** the stored corners are grid-point
   *centres* (spacing = span / (n − 1)). A lat/lon area starts at its first
   stored corner even when that is the north edge (ECMWF Kenya). A projected
