@@ -42,7 +42,12 @@ the batch, and production deploys stay with the user.
   `main`, park it first (`git -C <repo> switch -c wip/worktree-host` or switch
   to that branch) or every worktree commit is blocked. Tell the user.
 - All worktrees share `<repo>/target` (`CARGO_TARGET_DIR`), so cargo runs
-  serialize: lint one worktree at a time.
+  serialize: lint one worktree at a time. Sharing also means a crate one
+  worktree didn't edit can reuse another worktree's build of it; `lint.sh`
+  touches the tree's sources to prevent that, and before a local
+  `cargo test` do the same: `git ls-files 'crates/*.rs' 'crates/**/*.rs' |
+  xargs touch`. A build error naming code that isn't in your worktree is
+  this, not a bug to fix.
 - Start the watchers as Monitors (max 30 min each; re-arm on expiry):
   `scripts/watch.sh <state>` (CI checks + comments for `<state>/prs`) and,
   unless `no-merge`, `scripts/merger.sh <state>` (the merge queue).
