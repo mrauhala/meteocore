@@ -787,6 +787,28 @@ mod get_tile {
         );
     }
 
+    /// Each map tile carries the render timing the server records per
+    /// collection and outcome (#466): the first render is cold, the repeat a
+    /// hit.
+    #[tokio::test]
+    async fn tile_reports_render_outcome_per_collection() {
+        use ds_executor::{RenderOutcome, RenderTiming};
+        let app = build_router();
+        for expected in [RenderOutcome::Cold, RenderOutcome::Hit] {
+            let req = Request::builder()
+                .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let timing = resp.extensions().get::<RenderTiming>().unwrap();
+            assert_eq!(
+                (timing.collection.as_str(), timing.outcome),
+                ("radar", expected)
+            );
+        }
+    }
+
     /// Pin the post-render MISS → 304 branch. Use a fresh router (no
     /// cache-warm) so the first `If-None-Match`-bearing request must
     /// go through the full render path; assert the 304 carries

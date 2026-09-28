@@ -34,6 +34,26 @@
           "text": "Loki",
           "value": "Loki"
         }
+      },
+      {
+        "name": "collection",
+        "label": "Render collection",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(render_duration_seconds_count, collection)",
+        "definition": "label_values(render_duration_seconds_count, collection)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
       }
     ]
   },
@@ -517,7 +537,7 @@
     {
       "type": "timeseries",
       "title": "WMS GetMap latency — p50 / p95 / p99",
-      "description": "The hot path. p50 ≈ warm cache hits (~20 ms); the p99 tail is cold renders. Sustained p99 > 1 s: check 'Cold tile renders /s' and the slow-render log panel.",
+      "description": "The hot path. p50 ≈ warm cache hits (~20 ms); the p99 tail is cold renders. Sustained p99 > 1 s: check 'Cold tile renders /s' and the slow-render log panel. For the cold tail per collection, see 'Render latency' in the render pipeline row.",
       "id": 12,
       "gridPos": {
         "h": 8,
@@ -1050,6 +1070,113 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Render latency — p50 / p95 / p99 by outcome",
+      "description": "WMS GetMap, Maps map and Tiles map-tile render latency, from the rendered-cache lookup to the response, for the collections picked in 'Render collection'. hit = rendered-cache hit (sub-ms), assembled = WMS view built from cached meta-tiles (assemble + encode only), cold = the engine read source data. The cold line is the render a user actually waits for; the /wms request histogram buries it under hits past p99 (#248). Shed and timed-out renders are not here: see 'Render shedding and deadlines'.",
+      "id": 72,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, outcome) (rate(render_duration_seconds_bucket{collection=~\"$collection\"}[5m])))",
+          "refId": "A",
+          "legendFormat": "{{outcome}} p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(render_duration_seconds_bucket{collection=~\"$collection\"}[5m])))",
+          "refId": "B",
+          "legendFormat": "{{outcome}} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, outcome) (rate(render_duration_seconds_bucket{collection=~\"$collection\"}[5m])))",
+          "refId": "C",
+          "legendFormat": "{{outcome}} p99"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Render latency p95 / p99 — by collection & outcome",
+      "description": "Which collection owns the render tail (#466). Hits are left out: they are sub-millisecond everywhere. A single slow collection here, with the others flat, points at its source (remote store, decode, overview choice) rather than at render admission. Quantiles are unreliable below ~0.1 renders/s per series.",
+      "id": 73,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, collection, outcome) (rate(render_duration_seconds_bucket{collection=~\"$collection\", outcome!=\"hit\"}[5m])))",
+          "refId": "A",
+          "legendFormat": "{{collection}} {{outcome}} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, collection, outcome) (rate(render_duration_seconds_bucket{collection=~\"$collection\", outcome!=\"hit\"}[5m])))",
+          "refId": "B",
+          "legendFormat": "{{collection}} {{outcome}} p99"
+        }
+      ]
+    },
+    {
       "type": "logs",
       "title": "Slow renders (>0.5 s) — from logs",
       "description": "Every `slow WMS meta-tile render` line: which layer, how long, how many tiles, and whether time went to the semaphore (sem_wait) or the tile loop. This panel is how the #472 night spikes and the #476 eviction bursts were diagnosed.",
@@ -1058,7 +1185,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 64
       },
       "datasource": {
         "type": "loki",
@@ -1091,7 +1218,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 73
       },
       "panels": []
     },
@@ -1104,7 +1231,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 66
+        "y": 74
       },
       "datasource": {
         "type": "prometheus",
@@ -1219,7 +1346,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 66
+        "y": 74
       },
       "datasource": {
         "type": "prometheus",
@@ -1332,7 +1459,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 66
+        "y": 74
       },
       "datasource": {
         "type": "prometheus",
@@ -1447,7 +1574,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 74
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -1503,7 +1630,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 74
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -1576,7 +1703,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 90
+        "y": 98
       },
       "panels": []
     },
@@ -1589,7 +1716,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 91
+        "y": 99
       },
       "datasource": {
         "type": "prometheus",
@@ -1640,7 +1767,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 91
+        "y": 99
       },
       "datasource": {
         "type": "prometheus",
@@ -1686,7 +1813,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 99
+        "y": 107
       },
       "datasource": {
         "type": "prometheus",
@@ -1733,7 +1860,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 99
+        "y": 107
       },
       "datasource": {
         "type": "prometheus",
@@ -1780,7 +1907,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 103
+        "y": 111
       },
       "panels": []
     },
@@ -1793,7 +1920,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 104
+        "y": 112
       },
       "datasource": {
         "type": "prometheus",
@@ -1844,7 +1971,7 @@
         "h": 8,
         "w": 10,
         "x": 4,
-        "y": 104
+        "y": 112
       },
       "datasource": {
         "type": "prometheus",
@@ -1905,7 +2032,7 @@
         "h": 8,
         "w": 10,
         "x": 14,
-        "y": 104
+        "y": 112
       },
       "datasource": {
         "type": "prometheus",
@@ -1971,7 +2098,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 112
+        "y": 120
       },
       "panels": []
     },
@@ -1984,7 +2111,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 113
+        "y": 121
       },
       "datasource": {
         "type": "prometheus",
@@ -2037,7 +2164,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 113
+        "y": 121
       },
       "datasource": {
         "type": "prometheus",
@@ -2100,7 +2227,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 121
+        "y": 129
       },
       "datasource": {
         "type": "prometheus",
@@ -2151,7 +2278,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 121
+        "y": 129
       },
       "datasource": {
         "type": "prometheus",
@@ -2198,7 +2325,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 121
+        "y": 129
       },
       "datasource": {
         "type": "prometheus",
@@ -2249,7 +2376,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 129
+        "y": 137
       },
       "datasource": {
         "type": "prometheus",
@@ -2316,7 +2443,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 129
+        "y": 137
       },
       "datasource": {
         "type": "prometheus",
@@ -2364,7 +2491,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 137
+        "y": 145
       },
       "panels": []
     },
@@ -2377,7 +2504,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 138
+        "y": 146
       },
       "datasource": {
         "type": "prometheus",
@@ -2435,7 +2562,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 138
+        "y": 146
       },
       "datasource": {
         "type": "prometheus",
@@ -2488,7 +2615,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 138
+        "y": 146
       },
       "datasource": {
         "type": "prometheus",
@@ -2551,7 +2678,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 154
       },
       "datasource": {
         "type": "prometheus",
@@ -2619,7 +2746,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 146
+        "y": 154
       },
       "datasource": {
         "type": "prometheus",
@@ -2672,7 +2799,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 154
+        "y": 162
       },
       "datasource": {
         "type": "prometheus",
@@ -2725,7 +2852,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 154
+        "y": 162
       },
       "datasource": {
         "type": "prometheus",
@@ -2783,7 +2910,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 162
+        "y": 170
       },
       "panels": []
     },
@@ -2796,7 +2923,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 163
+        "y": 171
       },
       "datasource": {
         "type": "loki",
@@ -2829,7 +2956,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 172
+        "y": 180
       },
       "datasource": {
         "type": "loki",
@@ -2862,7 +2989,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 82
+        "y": 90
       },
       "datasource": {
         "type": "prometheus",
@@ -2945,7 +3072,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 182
+        "y": 190
       },
       "datasource": {
         "type": "prometheus",
@@ -2997,7 +3124,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 182
+        "y": 190
       },
       "datasource": {
         "type": "prometheus",
@@ -3043,7 +3170,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 190
+        "y": 198
       },
       "datasource": {
         "type": "prometheus",
@@ -3082,7 +3209,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 190
+        "y": 198
       },
       "datasource": {
         "type": "prometheus",
@@ -3120,7 +3247,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 198
+        "y": 206
       },
       "targets": [
         {
@@ -3162,7 +3289,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 198
+        "y": 206
       },
       "targets": [
         {
@@ -3201,7 +3328,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 206
+        "y": 214
       },
       "datasource": {
         "type": "prometheus",
@@ -3240,7 +3367,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 206
+        "y": 214
       },
       "datasource": {
         "type": "prometheus",
@@ -3284,7 +3411,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 206
+        "y": 214
       },
       "datasource": {
         "type": "prometheus",
@@ -3323,7 +3450,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 214
+        "y": 222
       },
       "datasource": {
         "type": "prometheus",
@@ -3367,7 +3494,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 214
+        "y": 222
       },
       "datasource": {
         "type": "prometheus",

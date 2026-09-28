@@ -1265,6 +1265,27 @@ mod get_map {
         );
     }
 
+    /// Each map carries the render timing the server records per collection
+    /// and outcome (#466): the first render is cold, the repeat a hit.
+    #[tokio::test]
+    async fn map_reports_render_outcome_per_collection() {
+        use ds_executor::{RenderOutcome, RenderTiming};
+        let app = build_router();
+        for expected in [RenderOutcome::Cold, RenderOutcome::Hit] {
+            let req = Request::builder()
+                .uri("/collections/radar/map?bbox=10,55,30,70")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let timing = resp.extensions().get::<RenderTiming>().unwrap();
+            assert_eq!(
+                (timing.collection.as_str(), timing.outcome),
+                ("radar", expected)
+            );
+        }
+    }
+
     /// Cross-parameter staleness protection: different `parameter-name`
     /// values must produce different rendered bytes (because the
     /// `MultiParamMockEngine` varies its output by parameter), which under

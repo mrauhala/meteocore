@@ -9,6 +9,7 @@ use axum::response::IntoResponse;
 use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
+use ds_executor::{RenderOutcome, RenderTiming};
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
 use crate::error::WmsError;
@@ -34,6 +35,20 @@ enum RenderPath {
     Fallback,
     /// Genuine non-meta path (non-3857 CRS, or meta cache disabled).
     Direct,
+}
+
+impl RenderPath {
+    /// The render-latency outcome (#466): a meta-tiled view whose covering
+    /// tiles were all cached only assembled and encoded; every other path
+    /// read the engine.
+    fn outcome(&self) -> RenderOutcome {
+        match self {
+            RenderPath::Meta(stats) | RenderPath::MetaEmpty(stats) if stats.misses == 0 => {
+                RenderOutcome::Assembled
+            }
+            _ => RenderOutcome::Cold,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -316,6 +331,9 @@ pub async fn wms_handler(
             // request matching the cache key, even after a server-side fix
             // produces different pixels. Mirror the MVT path in
             // `render_vector_tile` (the bug #145 fixed for raster tiles).
+            // The render-latency clock (#466) starts at this lookup, so hits,
+            // assembled views and cold renders each report their own tail.
+            let render_start = std::time::Instant::now();
             if let Some(cached) = state.rendered_cache.get(&cache_key) {
                 if let Some(ref inm) = if_none_match {
                     if ds_render::etag_matches(inm, cached.etag()) {
@@ -328,6 +346,11 @@ pub async fn wms_handler(
                             .header(header::ETAG, cached.etag())
                             .header(header::CACHE_CONTROL, cache_control)
                             .header(header::HeaderName::from_static("x-cache"), "HIT")
+                            .extension(RenderTiming::since(
+                                &collection_id,
+                                RenderOutcome::Hit,
+                                render_start,
+                            ))
                             .body(axum::body::Body::empty())
                             .unwrap()
                             .into_response());
@@ -342,6 +365,11 @@ pub async fn wms_handler(
                         "nosniff",
                     )
                     .header(header::HeaderName::from_static("x-cache"), "HIT")
+                    .extension(RenderTiming::since(
+                        &collection_id,
+                        RenderOutcome::Hit,
+                        render_start,
+                    ))
                     .body(axum::body::Body::from(cached.into_bytes()))
                     .unwrap()
                     .into_response());
@@ -490,6 +518,9 @@ pub async fn wms_handler(
                 Ok((bytes, path)) => (Ok(bytes), Some(path)),
                 Err(e) => (Err(e), None),
             };
+            // `None` exactly for a failed render: an error tile is not a
+            // render outcome and records no latency.
+            let outcome = render_path.as_ref().map(RenderPath::outcome);
             // Only log *successful* slow renders (the 200-status tail we're
             // diagnosing); errors are surfaced by the WmsError render warn arm
             // below. The arms stay distinct so a meta render that fell back to
@@ -588,37 +619,46 @@ pub async fn wms_handler(
             // `If-None-Match` comparison. Same flow as `render_vector_tile`
             // in api-tiles: cache lookup → revalidate against cached ETag,
             // miss → encode → revalidate against fresh ETag.
-            if let Some(ref inm) = if_none_match {
-                if ds_render::etag_matches(inm, cached.etag()) {
-                    // 304 from the post-render branch. Forward the same
-                    // `x_cache` label the 200 response would carry — `"MISS"`,
-                    // `"EMPTY"`, or `"ERROR"` — so revalidations look the
-                    // same on dashboards as initial fetches. A client
-                    // revalidating a cached transparent-tile response sees
-                    // `304 x-cache: EMPTY`, not a misleading `MISS`.
-                    return Ok(axum::response::Response::builder()
-                        .status(StatusCode::NOT_MODIFIED)
-                        .header(header::ETAG, cached.etag())
-                        .header(header::CACHE_CONTROL, cache_control)
-                        .header(header::HeaderName::from_static("x-cache"), x_cache)
-                        .body(axum::body::Body::empty())
-                        .unwrap()
-                        .into_response());
-                }
+            let not_modified = if_none_match
+                .as_deref()
+                .is_some_and(|inm| ds_render::etag_matches(inm, cached.etag()));
+            let mut response = if not_modified {
+                // 304 from the post-render branch. Forward the same
+                // `x_cache` label the 200 response would carry — `"MISS"`,
+                // `"EMPTY"`, or `"ERROR"` — so revalidations look the
+                // same on dashboards as initial fetches. A client
+                // revalidating a cached transparent-tile response sees
+                // `304 x-cache: EMPTY`, not a misleading `MISS`.
+                axum::response::Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, cached.etag())
+                    .header(header::CACHE_CONTROL, cache_control)
+                    .header(header::HeaderName::from_static("x-cache"), x_cache)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+                    .into_response()
+            } else {
+                axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, response_content_type)
+                    .header(header::ETAG, cached.etag())
+                    .header(header::CACHE_CONTROL, cache_control)
+                    .header(
+                        header::HeaderName::from_static("x-content-type-options"),
+                        "nosniff",
+                    )
+                    .header(header::HeaderName::from_static("x-cache"), x_cache)
+                    .body(axum::body::Body::from(cached.into_bytes()))
+                    .unwrap()
+                    .into_response()
+            };
+            if let Some(outcome) = outcome {
+                response.extensions_mut().insert(RenderTiming::since(
+                    &collection_id,
+                    outcome,
+                    render_start,
+                ));
             }
-
-            Ok(axum::response::Response::builder()
-                .header(header::CONTENT_TYPE, response_content_type)
-                .header(header::ETAG, cached.etag())
-                .header(header::CACHE_CONTROL, cache_control)
-                .header(
-                    header::HeaderName::from_static("x-content-type-options"),
-                    "nosniff",
-                )
-                .header(header::HeaderName::from_static("x-cache"), x_cache)
-                .body(axum::body::Body::from(cached.into_bytes()))
-                .unwrap()
-                .into_response())
+            Ok(response)
         }
         WmsRequestType::GetLegendGraphic => {
             let layer_name = query

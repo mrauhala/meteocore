@@ -15,6 +15,7 @@ use ds_core::config::CollectionConfig;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::MapEngine;
+use ds_executor::{RenderOutcome, RenderTiming};
 use ds_mvt::{
     encode_tile, properties_hash, CachedTile, PropertyAllowlist, TileEncodeOptions, TmsKind,
     VectorTileCache, VectorTileKey,
@@ -2205,7 +2206,10 @@ async fn render_tile(
     // short-circuit would be wrong: it would let a browser holding the
     // pre-fix entry keep getting 304 after the server starts producing
     // different pixels. Mirror the MVT path in `render_vector_tile` (the
-    // bug #145 fixed for raster tiles).
+    // bug #145 fixed for raster tiles). The render-latency clock (#466)
+    // starts at this lookup, so hits and cold renders each report their
+    // own tail.
+    let render_start = std::time::Instant::now();
     if let Some(cached) = state.rendered_cache.get(&cache_key) {
         if let Some(ref inm) = if_none_match {
             if ds_render::etag_matches(inm, cached.etag()) {
@@ -2218,6 +2222,11 @@ async fn render_tile(
                     .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
                     .header(header::HeaderName::from_static("x-cache"), "HIT")
+                    .extension(RenderTiming::since(
+                        collection_id,
+                        RenderOutcome::Hit,
+                        render_start,
+                    ))
                     .body(axum::body::Body::empty())
                     .unwrap()
                     .into_response());
@@ -2233,6 +2242,11 @@ async fn render_tile(
                 "nosniff",
             )
             .header(header::HeaderName::from_static("x-cache"), "HIT")
+            .extension(RenderTiming::since(
+                collection_id,
+                RenderOutcome::Hit,
+                render_start,
+            ))
             .body(axum::body::Body::from(cached.into_bytes()))
             .unwrap()
             .into_response());
@@ -2362,6 +2376,11 @@ async fn render_tile(
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
                 .header(header::HeaderName::from_static("x-cache"), x_cache)
+                .extension(RenderTiming::since(
+                    collection_id,
+                    RenderOutcome::Cold,
+                    render_start,
+                ))
                 .body(axum::body::Body::empty())
                 .unwrap()
                 .into_response());
@@ -2378,6 +2397,11 @@ async fn render_tile(
             "nosniff",
         )
         .header(header::HeaderName::from_static("x-cache"), x_cache)
+        .extension(RenderTiming::since(
+            collection_id,
+            RenderOutcome::Cold,
+            render_start,
+        ))
         .body(axum::body::Body::from(cached.into_bytes()))
         .unwrap()
         .into_response())

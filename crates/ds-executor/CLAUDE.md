@@ -21,4 +21,6 @@ queue or metrics before the server sets it; tests of it need process isolation.
 Raster default: MC_RENDER_TIMEOUT_MS=3000. Shared 3D points/meshes use 30 s.
 MC_RENDER_QUEUE_CAPACITY defaults to 3× render concurrency; zero permits no
 waiting. Global slots and queue survive reload. Metrics snapshot is exported
-through server and its Grafana dashboard.
+through server and its Grafana dashboard. `RenderTiming` is the response
+extension raster handlers attach (registry collection id + fixed
+`RenderOutcome`); server records it as `render_duration_seconds` (#466).
