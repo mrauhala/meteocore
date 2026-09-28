@@ -55,6 +55,20 @@ const MAX_TRACK_PROBES: usize = 200;
 /// keeps a pathological frame from being unbounded.
 const MAX_CELLS_PER_PROBED_FRAME: usize = 1_000;
 const DEFAULT_TRACK_SAMPLES: usize = 24;
+/// Cap on cells read from one frame when `get_storm_cells` has a
+/// `min_significance` floor.
+///
+/// The engine's property filters are exact-match only, so a numeric floor
+/// cannot ride in the query. It is applied in the handler before the page is
+/// cut to `limit` (#652), which means reading past the page — no extra engine
+/// work, since engine-nowcast builds every cell of a frame before paging. A
+/// convective day carries ~170 cells, so this guards a pathological frame
+/// rather than limiting a real one; past it, the note says the counts are
+/// partial.
+const MAX_CELLS_CHECKED_FOR_FLOOR: usize = MAX_CELLS_PER_PROBED_FRAME;
+
+const DISCLAIMER: &str = "Ranking heuristic, not an official warning. Issued warnings come from \
+                          the CAP alert collections.";
 
 #[derive(Clone)]
 pub struct McpState {
@@ -129,7 +143,9 @@ pub struct StormCellsParams {
     /// How many cells to return (default 10, max 50).
     pub limit: Option<usize>,
     /// RFC 3339 instant. Returns the cell situation at the newest analysis
-    /// frame at or before this time. Omit for the latest frame.
+    /// frame at or before this time. Omit for the latest frame. A time after
+    /// the newest frame returns that frame and sets
+    /// requested_time_after_newest_frame; cells are never extrapolated.
     pub at: Option<String>,
     /// Property to order by. Omit for significance, which is almost always
     /// what you want. Must be one of the collection's sortable_properties
@@ -139,8 +155,9 @@ pub struct StormCellsParams {
     /// "desc" (default) or "asc". Requires sort_by — setting it alone is an
     /// error, not a silent no-op.
     pub order: Option<String>,
-    /// Drop cells below this significance, 0..=1. Applied after ordering, so
-    /// it narrows the result rather than changing what ranks first.
+    /// Only cells at or above this significance, 0..=1. Filters the whole
+    /// frame before limit, so the page is the first `limit` qualifying cells
+    /// in the requested order; matching_min_significance counts all of them.
     pub min_significance: Option<f64>,
 }
 
@@ -341,11 +358,17 @@ impl MeteoCoreMcp {
         });
 
         // One bounded call: ranking is server-side now (#605), so top-K does
-        // not mean fetching every cell and sorting here.
+        // not mean fetching every cell and sorting here. A significance floor
+        // reads the whole frame instead (bounded), because it is applied
+        // below rather than in the query.
         let page = engine
             .get_features(&FeatureQuery {
                 bbox: None,
-                limit,
+                limit: if min_significance.is_some() {
+                    MAX_CELLS_CHECKED_FOR_FLOOR
+                } else {
+                    limit
+                },
                 offset: 0,
                 datetime,
                 sortby,
@@ -353,14 +376,17 @@ impl MeteoCoreMcp {
             })
             .map_err(query_failed)?;
 
-        // Applied AFTER the bounded page, so it narrows what was returned
-        // rather than reaching deeper into the ranking. The count of what it
-        // removed is reported: a model that asked for 10 and got 3 must be
-        // able to tell "only 3 cells exist" from "7 were below your floor".
-        let (cells, below_floor) = match min_significance {
-            None => (page.features.clone(), 0usize),
+        // The floor applies BEFORE the page is cut to `limit`, so "every cell
+        // at or above 0.3" is answerable when more than `limit` qualify
+        // (#652). Filtering the page instead — as this first did — returned
+        // only the qualifying cells that happened to land in it, and with
+        // `sort_by` could return none while qualifying cells existed. Both
+        // counts cover the frame, not the page: how many qualify in all, even
+        // past `limit`, and how many did not.
+        let (cells, floor_counts): (Vec<&Feature>, _) = match min_significance {
+            None => (page.features.iter().collect(), None),
             Some(min) => {
-                let kept: Vec<_> = page
+                let qualifying: Vec<&Feature> = page
                     .features
                     .iter()
                     .filter(|f| {
@@ -369,19 +395,18 @@ impl MeteoCoreMcp {
                             .and_then(|v| v.as_f64())
                             .is_some_and(|v| v >= min)
                     })
-                    .cloned()
                     .collect();
-                let removed = page.features.len() - kept.len();
-                (kept, removed)
+                let matching = qualifying.len();
+                let below = page.features.len() - matching;
+                let page_of_qualifying = qualifying.into_iter().take(limit).collect();
+                (page_of_qualifying, Some((matching, below)))
             }
         };
-
-        let observed = page
-            .features
-            .first()
-            .and_then(|f| f.properties.get("observed"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        // Cells past the read cap were never checked against the floor.
+        let floor_unchecked = match min_significance {
+            Some(_) => page.number_matched.saturating_sub(page.features.len()),
+            None => 0,
+        };
 
         // Compare the REQUESTED instant against the retained window. Deriving
         // this from an empty page would be wrong: engine-nowcast retains a
@@ -401,20 +426,49 @@ impl MeteoCoreMcp {
             (requested_at, retained),
             (Some(t), Some((start, _))) if t < start
         );
+        // The engine resolves a future `at` to the newest frame, silently
+        // (#652): a model asking for 09:00 got 08:25 with only `observed` <
+        // `at` as a hint, and could present it as the 09:00 situation.
+        let after_newest_frame = matches!(
+            (requested_at, retained),
+            (Some(t), Some((_, end))) if t > end
+        );
+
+        // The frame served. A cell carries it; a quiet frame has no cell to
+        // ask, but when the request resolved to the newest frame (no `at`, or
+        // one at or after it) that frame is the retained window's end, so
+        // even an empty answer names the frame it describes. (Two snapshot
+        // loads: a generation landing between them could skew this by one
+        // frame, which a ~5-minute cadence makes negligible.)
+        let observed = page
+            .features
+            .first()
+            .and_then(|f| f.properties.get("observed"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| match retained {
+                Some((_, end)) if requested_at.is_none_or(|t| t >= end) => Some(rfc3339(end)),
+                _ => None,
+            });
 
         Ok(json!({
             "collection": collection,
             "observed": observed,
             "no_frame_for_requested_time": outside_retention,
+            "requested_time_after_newest_frame": after_newest_frame,
             "retained_frames": retained_frames,
             "returned": cells.len(),
             "total_tracked": page.number_matched,
-            // Present only when a floor was applied, so its absence cannot be
-            // read as "nothing was filtered" on a call that set no floor.
-            "below_min_significance": min_significance.map(|_| below_floor),
-            "cells": cells.iter().map(cell_json).collect::<Vec<_>>(),
-            "note": "Ranking heuristic, not an official warning. Issued warnings come from \
-                     the CAP alert collections.",
+            // Both null unless a floor was applied, so a call that set no
+            // floor cannot read as "nothing was filtered".
+            "matching_min_significance": floor_counts.map(|(matching, _)| matching),
+            "below_min_significance": floor_counts.map(|(_, below)| below),
+            "cells": cells.into_iter().map(cell_json).collect::<Vec<_>>(),
+            "note": storm_cells_note(
+                observed.as_deref().filter(|_| after_newest_frame),
+                floor_unchecked,
+                page.number_matched,
+            ),
         })
         .to_string())
     }
@@ -564,6 +618,32 @@ impl MeteoCoreMcp {
         })
         .to_string())
     }
+}
+
+/// `get_storm_cells`' note: anything about this answer a model could misread,
+/// then the disclaimer, which every response repeats.
+fn storm_cells_note(
+    newest_frame_for_future_at: Option<&str>,
+    floor_unchecked: usize,
+    total: usize,
+) -> String {
+    let mut note = String::new();
+    if let Some(observed) = newest_frame_for_future_at {
+        note.push_str(&format!(
+            "The requested time is after the newest analysis frame, so this is that frame, \
+             observed {observed}, not the situation at the requested time. Cells are never \
+             extrapolated forward. "
+        ));
+    }
+    if floor_unchecked > 0 {
+        note.push_str(&format!(
+            "Only the first {} of {total} cells in this order were checked against \
+             min_significance; its counts cover those. ",
+            total - floor_unchecked
+        ));
+    }
+    note.push_str(DISCLAIMER);
+    note
 }
 
 /// What an empty or partial `get_cell_track` walk means, from how it ended
