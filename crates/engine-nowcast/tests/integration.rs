@@ -1091,6 +1091,26 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         None,
         "a dry scene must leave the gauge pair unset"
     );
+
+    // Quiet generations are still frames a history walk steps through
+    // (#646): an empty snapshot carries no cell to name its instant, so the
+    // frame list is the only place it shows up.
+    use ds_core::feature::{DatetimeInterval, FeatureQuery};
+    use ds_core::feature_engine::FeatureEngine;
+    let frames = engine.available_times();
+    assert_eq!(frames, vec![anchor1, anchor1 + Duration::minutes(5)]);
+    for t in frames {
+        let page = engine
+            .get_features(&FeatureQuery {
+                datetime: Some(DatetimeInterval {
+                    start: Some(t),
+                    end: Some(t),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.number_matched, 0, "dry frame {t}");
+    }
 }
 
 /// V2.2 (#544): after a generation, tracked cells serve as Point features
@@ -1224,6 +1244,69 @@ fn cell_features_are_served_and_tracks_persist() {
         .unwrap();
     assert_eq!(none.number_matched, 0, "before all snapshots: nothing");
     assert_eq!(engine.feature_count(), 1);
+}
+
+/// #646: the retained snapshots are enumerable, and a track is addressable
+/// by id in each one — the two things the MCP track walk steps through
+/// instead of probing instants and paging whole frames.
+#[test]
+fn cell_history_is_enumerable_and_addressable_by_id() {
+    use ds_core::feature::{DatetimeInterval, FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT30M", &[t0(), anchor1]);
+    assert!(engine.available_times().is_empty(), "nothing retained yet");
+    engine.poll_once();
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    assert_eq!(engine.available_times(), vec![anchor1, anchor2]);
+
+    let id = engine
+        .get_features(&FeatureQuery::default())
+        .unwrap()
+        .features[0]
+        .id
+        .clone();
+    let at = |t| DatetimeInterval {
+        start: Some(t),
+        end: Some(t),
+    };
+    // Each snapshot's own version of the track, not the latest one's.
+    for (t, age) in [(anchor1, 2), (anchor2, 3)] {
+        let f = engine.get_feature_at(&id, &at(t)).unwrap();
+        assert_eq!(f.id, id);
+        assert_eq!(
+            f.properties.get("track_age"),
+            Some(&PropertyValue::Integer(age)),
+            "{t}"
+        );
+    }
+    // Same selection as `get_features`: an open start picks the newest
+    // snapshot at or before the end.
+    let f = engine
+        .get_feature_at(
+            &id,
+            &DatetimeInterval {
+                start: None,
+                end: Some(anchor2 - Duration::minutes(1)),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        f.properties.get("track_age"),
+        Some(&PropertyValue::Integer(2))
+    );
+    assert!(matches!(
+        engine.get_feature_at("9999", &at(anchor2)),
+        Err(DataServerError::FeatureNotFound(_))
+    ));
+    // No snapshot selected: not found, whatever the id.
+    assert!(matches!(
+        engine.get_feature_at(&id, &at(t0())),
+        Err(DataServerError::FeatureNotFound(_))
+    ));
 }
 
 /// Geometry-change reset (#545 round 3/4): a source that changes its

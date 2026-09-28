@@ -113,6 +113,14 @@ impl FeatureEngine for CellEngine {
         Err(DataServerError::FeatureNotFound(id.into()))
     }
 
+    fn get_feature_at(
+        &self,
+        id: &str,
+        datetime: &DatetimeInterval,
+    ) -> Result<Feature, DataServerError> {
+        feature_at(self, id, datetime)
+    }
+
     fn feature_count(&self) -> usize {
         3
     }
@@ -125,6 +133,32 @@ impl FeatureEngine for CellEngine {
             "2026-08-21T14:25:00Z".parse().unwrap(),
         ))
     }
+
+    fn available_times(&self) -> Vec<chrono::DateTime<chrono::Utc>> {
+        vec![
+            "2026-08-21T14:20:00Z".parse().unwrap(),
+            "2026-08-21T14:25:00Z".parse().unwrap(),
+        ]
+    }
+}
+
+/// A mock's `get_feature_at`: the frame its `get_features` selects for
+/// `datetime`, searched for the id.
+fn feature_at(
+    engine: &dyn FeatureEngine,
+    id: &str,
+    datetime: &DatetimeInterval,
+) -> Result<Feature, DataServerError> {
+    engine
+        .get_features(&FeatureQuery {
+            limit: usize::MAX,
+            datetime: Some(datetime.clone()),
+            ..Default::default()
+        })?
+        .features
+        .into_iter()
+        .find(|f| f.id == id)
+        .ok_or_else(|| DataServerError::FeatureNotFound(id.into()))
 }
 
 /// A cells engine with nothing retained yet — the state right after a boot or
@@ -594,14 +628,24 @@ async fn collection_info_does_not_touch_a_non_cells_engine() {
 /// An engine whose queries fail with a message carrying internal detail.
 struct FailingEngine;
 
+const LEAKY_DETAIL: &str = "/meteo/data/secret-path/db.sqlite: connection refused from 10.0.0.7";
+
 impl FeatureEngine for FailingEngine {
     fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
-        Err(DataServerError::Storage(
-            "/meteo/data/secret-path/db.sqlite: connection refused from 10.0.0.7".into(),
-        ))
+        Err(DataServerError::Storage(LEAKY_DETAIL.into()))
     }
     fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
         Err(DataServerError::FeatureNotFound(id.into()))
+    }
+    fn get_feature_at(
+        &self,
+        _id: &str,
+        _datetime: &DatetimeInterval,
+    ) -> Result<Feature, DataServerError> {
+        Err(DataServerError::Storage(LEAKY_DETAIL.into()))
+    }
+    fn available_times(&self) -> Vec<chrono::DateTime<chrono::Utc>> {
+        vec!["2026-08-21T14:25:00Z".parse().unwrap()]
     }
 }
 
@@ -624,32 +668,41 @@ async fn an_engine_failure_does_not_leak_internal_detail() {
     );
     let sid = handshake(&app).await;
 
-    let (status, _, body) = call(
-        &app,
-        Some(TOKEN),
-        Some(&sid),
-        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
-               "params": {"name": "get_storm_cells", "arguments": {"collection": "cells"}}}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    for leaked in [
-        "/meteo/data",
-        "secret-path",
-        "db.sqlite",
-        "10.0.0.7",
-        "connection refused",
+    // Both data paths: a frame query, and the track walk's by-id lookups.
+    for (tool, args) in [
+        ("get_storm_cells", json!({"collection": "cells"})),
+        (
+            "get_cell_track",
+            json!({"collection": "cells", "cell_id": "42"}),
+        ),
     ] {
+        let (status, _, body) = call(
+            &app,
+            Some(TOKEN),
+            Some(&sid),
+            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": tool, "arguments": args}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        for leaked in [
+            "/meteo/data",
+            "secret-path",
+            "db.sqlite",
+            "10.0.0.7",
+            "connection refused",
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "{tool}: internal detail {leaked:?} reached the client: {body}"
+            );
+        }
         assert!(
-            !body.contains(leaked),
-            "internal detail {leaked:?} reached the client: {body}"
+            body.contains("Query failed"),
+            "{tool}: the client should still learn the query failed: {body}"
         );
     }
-    assert!(
-        body.contains("Query failed"),
-        "the client should still learn the query failed: {body}"
-    );
 }
 
 /// `samples` bounds frames WALKED, not frames containing the cell — a cell
@@ -764,7 +817,7 @@ async fn the_track_walk_says_why_it_stopped() {
         json!({"collection": "cells", "cell_id": "42", "samples": 1}),
     )
     .await;
-    // "gave_up_in_empty_gap" must never be mistaken for "the cell stopped
+    // "samples_reached" must never be mistaken for "the cell stopped
     // existing", so the reason is always reported.
     assert_eq!(out["stopped_because"], "samples_reached");
 }
@@ -796,7 +849,6 @@ async fn an_empty_track_note_follows_why_the_walk_stopped() {
         "{note}"
     );
     assert!(note.contains("Raise `samples`"), "{note}");
-    assert_eq!(short["frames_truncated"], 0);
 
     let full = track(2).await;
     assert_eq!(full["stopped_because"], "reached_earliest_retained_frame");
@@ -804,60 +856,124 @@ async fn an_empty_track_note_follows_why_the_walk_stopped() {
     assert!(note.contains("not present in any retained frame"), "{note}");
 }
 
-/// One retained frame that matched more cells than a page holds.
-struct CrowdedEngine;
+/// Retained frames at 5-minute cadence, 14:00 through 17:55 (48 of them,
+/// the engine's full retention), where only the OLDEST holds a cell: 230
+/// minutes of quiet frames separate it from the newest.
+struct GappyEngine;
 
-impl FeatureEngine for CrowdedEngine {
-    fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+impl GappyEngine {
+    fn frames() -> Vec<chrono::DateTime<chrono::Utc>> {
+        let first: chrono::DateTime<chrono::Utc> = "2026-08-21T14:00:00Z".parse().unwrap();
+        (0..48)
+            .map(|i| first + chrono::Duration::minutes(5 * i))
+            .collect()
+    }
+}
+
+impl FeatureEngine for GappyEngine {
+    fn get_features(&self, q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        // Newest frame inside the interval, as engine-nowcast selects.
+        let frame = Self::frames().into_iter().rev().find(|t| {
+            let dt = q.datetime.as_ref();
+            dt.and_then(|d| d.start).is_none_or(|s| *t >= s)
+                && dt.and_then(|d| d.end).is_none_or(|e| *t <= e)
+        });
+        let features = match frame {
+            Some(t) if t == Self::frames()[0] => {
+                vec![CellEngine::cell("early", 0.5, 50.0, "2026-08-21T14:00:00Z")]
+            }
+            _ => vec![],
+        };
         Ok(FeaturePage {
-            features: vec![CellEngine::cell("1", 0.5, 50.0, "2026-08-21T14:25:00Z")],
-            number_matched: 5_000,
-            number_returned: 1,
+            number_matched: features.len(),
+            number_returned: features.len(),
+            features,
             next_offset: None,
         })
     }
     fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
         Err(DataServerError::FeatureNotFound(id.into()))
     }
+    fn get_feature_at(
+        &self,
+        id: &str,
+        datetime: &DatetimeInterval,
+    ) -> Result<Feature, DataServerError> {
+        feature_at(self, id, datetime)
+    }
     fn temporal_extent(
         &self,
     ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
-        let t = "2026-08-21T14:25:00Z".parse().unwrap();
-        Some((t, t))
+        let frames = Self::frames();
+        Some((frames[0], frames[frames.len() - 1]))
+    }
+    fn available_times(&self) -> Vec<chrono::DateTime<chrono::Utc>> {
+        Self::frames()
     }
 }
 
-/// A frame read only in part must not let the walk claim the id is absent.
+/// #646: the walk probed one minute at a time with a 200-probe budget for
+/// quiet frames, so a cell behind more than ~199 minutes of them was
+/// unreachable although retention is ~240. Stepping frame to frame reaches
+/// it, and quiet frames count as frames walked.
 #[tokio::test]
-async fn a_truncated_frame_keeps_the_track_note_uncertain() {
-    let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
-    engines.insert("cells".into(), Arc::new(CrowdedEngine));
-    let mut collections = HashMap::new();
-    collections.insert("cells".to_string(), collection("cells", "nowcast"));
-    let app = api_mcp::router(
-        Arc::new(ArcSwap::from_pointee(McpState {
-            engines,
-            collections,
-        })),
-        Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
-        api_mcp::allowed_hosts(BASE_URL, &[]),
+async fn a_long_quiet_stretch_does_not_hide_an_older_cell() {
+    let app = cells_app(Arc::new(GappyEngine));
+    let sid = handshake(&app).await;
+
+    let full = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "early", "samples": 48}),
+    )
+    .await;
+    let history = full["history"].as_array().unwrap();
+    assert_eq!(history.len(), 1, "{full}");
+    assert_eq!(history[0]["observed"], "2026-08-21T14:00:00Z");
+    assert_eq!(full["frames_walked"], 48, "{full}");
+    assert_eq!(full["stopped_because"], "reached_earliest_retained_frame");
+    assert_eq!(full["retained_frames"]["from"], "2026-08-21T14:00:00Z");
+
+    // Quiet frames spend `samples` like any other, and the note says the
+    // older frames were left unread rather than that the id is gone.
+    let half = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "early", "samples": 24}),
+    )
+    .await;
+    assert!(half["history"].as_array().unwrap().is_empty(), "{half}");
+    assert_eq!(half["frames_walked"], 24);
+    assert_eq!(half["stopped_because"], "samples_reached");
+    assert!(
+        half["note"].as_str().unwrap().contains("Raise `samples`"),
+        "{half}"
     );
+}
+
+/// #646: each frame was read as one page of at most 1000 cells, in id order,
+/// so a cell past the page was reported missing from a frame it was in. A
+/// by-id lookup has no page to fall off.
+#[tokio::test]
+async fn a_crowded_frame_does_not_hide_the_cell() {
+    let app = cells_app(Arc::new(ManyCellEngine(1_005)));
     let sid = handshake(&app).await;
     let track = call_tool(
         &app,
         &sid,
         "get_cell_track",
-        json!({"collection": "cells", "cell_id": "no-such-cell"}),
+        json!({"collection": "cells", "cell_id": "c1004"}),
     )
     .await;
+    assert_eq!(track["history"].as_array().unwrap().len(), 1, "{track}");
+    assert_eq!(track["history"][0]["id"], "c1004");
     assert_eq!(track["stopped_because"], "reached_earliest_retained_frame");
-    assert_eq!(track["frames_truncated"], 1);
-    let note = track["note"].as_str().unwrap();
     assert!(
-        !note.contains("not present in any retained frame"),
-        "{note}"
+        track.get("frames_truncated").is_none(),
+        "no frame is read in part any more: {track}"
     );
-    assert!(note.contains("read only in part"), "{note}");
 }
 
 /// An engine whose frames are retained but contain no cells — engine-nowcast
@@ -1419,11 +1535,23 @@ impl FeatureEngine for ManyCellEngine {
         Err(DataServerError::FeatureNotFound(id.into()))
     }
 
+    fn get_feature_at(
+        &self,
+        id: &str,
+        datetime: &DatetimeInterval,
+    ) -> Result<Feature, DataServerError> {
+        feature_at(self, id, datetime)
+    }
+
     fn temporal_extent(
         &self,
     ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
         let t = "2026-08-21T14:25:00Z".parse().unwrap();
         Some((t, t))
+    }
+
+    fn available_times(&self) -> Vec<chrono::DateTime<chrono::Utc>> {
+        vec!["2026-08-21T14:25:00Z".parse().unwrap()]
     }
 }
 

@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ErrorData, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use ds_core::config::CollectionConfig;
+use ds_core::error::DataServerError;
 use ds_core::feature::{DatetimeInterval, Feature, FeatureQuery, PropertyValue, SortKey};
 use ds_core::feature_engine::FeatureEngine;
 
@@ -38,22 +39,11 @@ const CELL_ENGINE_TYPE: &str = "nowcast";
 const MAX_CELLS: usize = 50;
 const DEFAULT_CELLS: usize = 10;
 
-/// Cap on snapshots walked when reconstructing one cell's history. The engine
-/// retains ~48 (4 h at 5-minute cadence), and each step materializes that
-/// snapshot's whole cell set.
+/// Cap on retained frames walked when reconstructing one cell's history —
+/// the engine retains 48 (4 h at 5-minute cadence), so the maximum walks all
+/// of them. Each step is one by-id lookup in that frame, so the cap bounds
+/// the response rather than the work.
 const MAX_TRACK_SAMPLES: usize = 48;
-/// Hard cap on backward probes, which exceed the sample count when frames are
-/// empty. Bounds the loop regardless of how quiet the radar was.
-const MAX_TRACK_PROBES: usize = 200;
-/// Cap on cells fetched per probed frame.
-///
-/// The whole frame is needed: `FeatureEngine` has no by-id query at a past
-/// instant (`get_feature` serves only the latest snapshot), so finding one
-/// cell in an older frame means materializing that frame and searching it.
-/// Deliberately unlike `get_storm_cells`, which IS a bounded top-K. A
-/// `get_feature(id, datetime)` would remove the asymmetry; until then the cap
-/// keeps a pathological frame from being unbounded.
-const MAX_CELLS_PER_PROBED_FRAME: usize = 1_000;
 const DEFAULT_TRACK_SAMPLES: usize = 24;
 /// Cap on cells read from one frame when `get_storm_cells` has a
 /// `min_significance` floor.
@@ -65,7 +55,7 @@ const DEFAULT_TRACK_SAMPLES: usize = 24;
 /// convective day carries ~170 cells, so this guards a pathological frame
 /// rather than limiting a real one; past it, the note says the counts are
 /// partial.
-const MAX_CELLS_CHECKED_FOR_FLOOR: usize = MAX_CELLS_PER_PROBED_FRAME;
+const MAX_CELLS_CHECKED_FOR_FLOOR: usize = 1_000;
 
 const DISCLAIMER: &str = "Ranking heuristic, not an official warning. Issued warnings come from \
                           the CAP alert collections.";
@@ -168,7 +158,9 @@ pub struct CellTrackParams {
     pub collection: String,
     /// Cell track id, as returned by get_storm_cells.
     pub cell_id: String,
-    /// How many past analysis frames to walk (default 24, max 48).
+    /// How many retained analysis frames to walk, newest first, counting
+    /// frames with no cells too (default 24, max 48 — the whole ~4 h
+    /// retention at 5-minute cadence).
     pub samples: Option<usize>,
 }
 
@@ -477,8 +469,10 @@ impl MeteoCoreMcp {
 
     #[tool(
         description = "One cell's history: its properties at each retained analysis frame, \
-                       newest first. Shows how it moved and whether it intensified. Cells are \
-                       analysis-only — this never returns future positions."
+                       newest first. Shows how it moved and whether it intensified. Walks the \
+                       newest `samples` retained frames, quiet ones included, looking the id up \
+                       in each; `stopped_because` says whether older retained frames were left \
+                       unread. Cells are analysis-only — this never returns future positions."
     )]
     fn get_cell_track(
         &self,
@@ -502,7 +496,13 @@ impl MeteoCoreMcp {
             None => DEFAULT_TRACK_SAMPLES,
         };
 
-        let Some((extent_start, extent_end)) = engine.temporal_extent() else {
+        // The engine's own frame instants, oldest first: the walk steps from
+        // one retained frame to the next (#646). No cadence is assumed, and
+        // a frame with no cells is an ordinary step. The one-minute probing
+        // this replaces could not see a quiet frame at all, so its probe
+        // budget gave up behind ~200 minutes of them — short of retention.
+        let frame_times = engine.available_times();
+        let (Some(&first), Some(&last)) = (frame_times.first(), frame_times.last()) else {
             return Ok(json!({
                 "collection": collection,
                 "cell_id": cell_id,
@@ -518,104 +518,49 @@ impl MeteoCoreMcp {
             .to_string());
         };
 
-        // Walk snapshots backward by asking for "newest frame at or before
-        // t", then stepping to just before whatever that frame's instant was.
-        // No cadence is assumed — the engine's own retention decides the
-        // steps, so a source that changes interval still walks correctly.
-        // A frame with no cells at all (a quiet radar period) carries no
-        // `observed` to step from, so the walk needs its own probe budget:
-        // stepping back a minute and retrying finds the next older frame
-        // instead of stopping and silently reporting a truncated history.
         // `samples` bounds frames WALKED, which is what the parameter says it
         // does. Counting only frames that contained the cell would let a
         // small `samples` be consumed by frames the cell is simply absent
         // from, and report "not tracked" for a cell that is two frames older.
-        // Empty frames get their own allowance so they cannot do that either.
+        // Each frame is a by-id lookup rather than a page of its cells, so a
+        // crowded frame cannot hide the cell past a page cap.
         let mut history = Vec::new();
-        let mut cursor = extent_end;
         let mut frames = 0;
-        let mut empty_probes = 0;
-        // Frames that matched more cells than the per-frame cap returned,
-        // without the cell in the page: it may be there beyond the cap
-        // (#646). `number_matched` is the pre-paging total, so a frame of
-        // exactly the cap is not mistaken for a truncated one.
-        let mut frames_truncated = 0;
-        // Option, so a reason set on the way out survives: `frames += 1`
-        // happens before the boundary check, so a walk that reaches retention
-        // start on its samples-th frame would otherwise be relabelled.
-        let mut stopped: Option<&str> = None;
-        while frames < samples && empty_probes < MAX_TRACK_PROBES {
-            let page = engine
-                .get_features(&FeatureQuery {
-                    bbox: None,
-                    limit: MAX_CELLS_PER_PROBED_FRAME,
-                    offset: 0,
-                    datetime: Some(DatetimeInterval {
-                        start: None,
-                        end: Some(cursor),
-                    }),
-                    sortby: Vec::new(),
-                    property_filters: Vec::new(),
-                })
-                .map_err(query_failed)?;
-
-            let frame_time = page
-                .features
-                .first()
-                .and_then(|f| f.properties.get("observed"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&Utc));
-
-            let Some(frame_time) = frame_time else {
-                // Empty frame: probe further back rather than concluding the
-                // history ends here. Does not count against `samples`.
-                if cursor <= extent_start {
-                    stopped = Some("reached_earliest_retained_frame");
-                    break;
-                }
-                empty_probes += 1;
-                cursor -= Duration::minutes(1);
-                continue;
-            };
+        for &frame_time in frame_times.iter().rev().take(samples) {
             frames += 1;
-            if let Some(f) = page.features.iter().find(|f| f.id == cell_id) {
-                history.push(cell_json(f));
-            } else if page.number_matched > page.features.len() {
-                frames_truncated += 1;
+            let frame = DatetimeInterval {
+                start: Some(frame_time),
+                end: Some(frame_time),
+            };
+            match engine.get_feature_at(&cell_id, &frame) {
+                Ok(f) => history.push(cell_json(&f)),
+                // Absent from this frame (or the frame aged out since the
+                // list was read — equally a frame without the cell).
+                Err(DataServerError::FeatureNotFound(_)) => {}
+                Err(e) => return Err(query_failed(e)),
             }
-            if frame_time <= extent_start {
-                stopped = Some("reached_earliest_retained_frame");
-                break;
-            }
-            cursor = frame_time - Duration::seconds(1);
         }
-        let stopped = stopped.unwrap_or(if frames >= samples {
-            "samples_reached"
-        } else if empty_probes >= MAX_TRACK_PROBES {
-            "gave_up_in_empty_gap"
+        // "reached_earliest_retained_frame" deliberately does not claim a
+        // retention POLICY limit: this layer cannot tell a full buffer from a
+        // server that started an hour ago, and the old
+        // "reached_retention_start" made short walks early in an archive's
+        // life read as a policy boundary. Compare `retained_frames.from` to
+        // see which it was.
+        let stopped = if frames == frame_times.len() {
+            "reached_earliest_retained_frame"
         } else {
-            "budget_exhausted"
-        });
+            "samples_reached"
+        };
 
         Ok(json!({
             "collection": collection,
             "cell_id": cell_id,
             "frames_walked": frames,
-            // Which exit happened. "gave_up_in_empty_gap" in particular must
-            // not be read as "the cell stopped existing", and
-            // "reached_earliest_retained_frame" deliberately does not claim a
-            // retention POLICY limit: this layer cannot tell a full buffer
-            // from a server that started an hour ago, and the old
-            // "reached_retention_start" made short walks early in an
-            // archive's life read as a policy boundary. Compare
-            // `retained_frames.from` to see which it was.
             "stopped_because": stopped,
-            "retained_frames": engine
-                .temporal_extent()
-                .map(|(start, end)| json!({ "from": rfc3339(start), "to": rfc3339(end) })),
-            "frames_truncated": frames_truncated,
-            "note": track_note(history.is_empty(), stopped, frames, frames_truncated),
+            // From the same frame list the walk used, so `from` is exactly
+            // the frame a "reached_earliest_retained_frame" walk ended on.
+            "retained_frames": { "from": rfc3339(first), "to": rfc3339(last) },
+            "note": track_note(history.is_empty(), stopped, frames),
             "history": history,
         })
         .to_string())
@@ -648,40 +593,24 @@ fn storm_cells_note(
     note
 }
 
-/// What an empty or partial `get_cell_track` walk means, from how it ended
-/// (#646). Only a walk that reached the earliest retained frame, with no
-/// frame truncated, may say the id is not retained at all.
-fn track_note(empty: bool, stopped: &str, frames: usize, truncated: usize) -> String {
-    let truncation = if truncated > 0 {
-        format!(
-            " {truncated} of the frames walked held more than {MAX_CELLS_PER_PROBED_FRAME} cells \
-             and were read only in part, so the cell may be in them."
-        )
-    } else {
-        String::new()
-    };
+/// What an empty `get_cell_track` walk means, from how it ended (#646). Only
+/// a walk that reached the earliest retained frame may say the id is not
+/// retained at all.
+fn track_note(empty: bool, stopped: &str, frames: usize) -> String {
     if !empty {
-        return format!("Newest frame first. Analysis only — no forecast positions.{truncation}");
+        return "Newest frame first. Analysis only — no forecast positions.".to_string();
     }
-    let why = match stopped {
-        "reached_earliest_retained_frame" if truncated == 0 => {
-            return "This cell id is not present in any retained frame. Track ids restart when \
-                    the server reloads, so an id from an earlier session may no longer exist."
+    match stopped {
+        "reached_earliest_retained_frame" => {
+            "This cell id is not present in any retained frame. Track ids restart when the \
+             server reloads, so an id from an earlier session may no longer exist."
                 .to_string()
         }
-        "reached_earliest_retained_frame" => {
-            "The cell id was not found in the retained frames read.".to_string()
-        }
-        "samples_reached" => format!(
+        _ => format!(
             "The cell id is not in the newest {frames} frames walked; older retained frames \
              were not read. Raise `samples` to look further back."
         ),
-        "gave_up_in_empty_gap" => "The cell id was not found before a long stretch with no \
-                                   cells; older retained frames were not reached."
-            .to_string(),
-        _ => "The cell id was not found in the frames read; the walk stopped early.".to_string(),
-    };
-    format!("{why}{truncation}")
+    }
 }
 
 #[tool_handler(router = self.tool_router)]

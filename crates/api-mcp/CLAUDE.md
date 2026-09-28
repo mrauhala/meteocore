@@ -105,14 +105,20 @@ postgis engine issues a COUNT against the database.
   retained window's end.
 - The default is unchanged and should stay: no `sort_by` means most
   significant first, which is what a caller almost always wants.
-- `get_cell_track` walks snapshots backward by asking for "newest frame at or
-  before t", then stepping to just before that frame's instant. **No cadence
-  is assumed** — the engine's retention decides the steps, so a source that
-  changes interval still walks correctly. Capped at `MAX_TRACK_SAMPLES`,
-  because each step materializes that frame's whole cell set. A frame with
-  **zero** cells carries no `observed` to step from, so the walk probes a
-  minute further back rather than concluding the history ends there — bounded
-  separately by `MAX_TRACK_PROBES`.
+- `get_cell_track` walks the engine's own frame list
+  (`FeatureEngine::available_times`, one instant per retained snapshot)
+  newest first, and looks the id up in each frame with
+  `FeatureEngine::get_feature_at` (#646). **No cadence is assumed**, and a
+  frame with **zero** cells is an ordinary step. The walk used to probe one
+  minute at a time, because a quiet frame has no cell to carry its
+  `observed`. Its 200-probe budget then made a cell behind ~200 quiet minutes
+  unreachable inside ~240 minutes of retention. It also read each frame as a
+  1000-cell page, so a cell past the page was reported missing. Neither
+  bound exists now. `samples` counts every frame walked, quiet ones
+  included, capped at `MAX_TRACK_SAMPLES` = the full retention.
+  `stopped_because` is `reached_earliest_retained_frame` or
+  `samples_reached`, and only the first licenses the note "not present in
+  any retained frame".
 
 ## Writing for a model, not a person
 
