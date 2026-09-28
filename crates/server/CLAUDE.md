@@ -152,7 +152,13 @@ client could spoof the emitted self-links (open-redirect risk downstream).
 ## Render admission and deadlines
 
 `ds-executor` owns process-wide render slots and the waiting queue, preserved
-across registry reloads. `MC_RENDER_QUEUE_CAPACITY` defaults to 3× slot count;
+across registry reloads. The slot count is `[server] render_concurrency`
+(1..=512, validated at config load; default 2× CPUs, min 8), fixed by
+`admin::init_render_concurrency` in `main` before the first
+`load_collections`, which is the first reader of the slots — keep that order.
+A reload cannot resize the slots: a changed value logs a restart WARN, and
+`render_semaphore_total` keeps reporting the live count.
+`MC_RENDER_QUEUE_CAPACITY` defaults to 3× slot count;
 full queues shed immediately with 503 + Retry-After, and cached bytes bypass it.
 `MC_RENDER_TIMEOUT_MS` defaults to 3000 for raster work and MVT encoding. The
 absolute deadline includes memory and semaphore waits, blocking-pool dispatch, engine
