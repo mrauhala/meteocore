@@ -215,7 +215,7 @@ layer but has no effect on this engine.
 | PostGIS events | — no `FeatureEngine` (EDR area + WMS only; Features items = #503) — | | | | — | | | |
 | BUFR | one station (Point) from the observation store; properties `wigos_station_identifier`, `name`, `elevation`, `first_report`, `last_report`, `report_count` | station point inside box | station has ≥ 1 report inside the interval | ✓ last_report, first_report, report_count, name | ✓ name, wigos_station_identifier, elevation, first_report, last_report, report_count | ✓ | ✓ (oldest → newest report held) | ✓ (snapshot version) |
 | ODIM PVOL network | one radar site (Point) — site inventory | site point inside box | sites with a volume inside the interval | – (400) | ✓ all site inventory properties (including quantities/elevation_angles lists) | ✓ | – | ✓ (inventory-sensitive) |
-| Nowcast | one tracked storm cell (Point + fact-sheet properties) from one generation | cell centroid inside box | with none: latest generation; with `datetime`: the newest retained generation inside the interval (~4 h history) | ✓ significance, significance_rank, max_dbz, area_km2, track_age, speed_ms, bearing_deg, intensity_trend_dbz_min + lightning / impact / radar extras when those sources are wired | ✓ all base cell properties + wired lightning/impact/radar groups | ✓ | ✓ (retained history span) | ✓ |
+| Nowcast | one tracked storm cell (Point + fact-sheet properties) from one generation | cell centroid inside box | with none: latest generation; with `datetime`: the newest retained generation inside the interval (~4 h history) | ✓ significance, significance_rank, max_dbz, area_km2, track_age, speed_ms, bearing_deg, intensity_trend_dbz_min + lightning / impact / radar extras when those sources are wired | ✓ all base cell properties except `significance_contributions` + wired lightning/impact/radar groups | ✓ | ✓ (retained history span) | ✓ |
 | GeoTIFF, GRIB, QueryData, Zarr, ODIM composite, ODIM PVOL site | — no `FeatureEngine` (EDR / Maps only) — | | | | — | | | |
 
 CSV pagination uses an immutable station inventory built at load time, in
@@ -258,6 +258,20 @@ keep their original facts. Replaced lightning sources restart the jump baseline
 without restarting radar tracks. Reuse requires unchanged nowcast config, the
 same raster engine and a matching retained geometry/product contract. Missing
 or invalid configured dependencies still fail load validation.
+
+Nowcast optional property groups (lightning, impact, radar) share one rule:
+absent when no source is wired, present with its per-generation values `null`
+when that generation's join was skipped, values when it ran (#650);
+`lightning_coverage` describes the source's footprint and survives a failed
+fetch. `impact_exposure`
+is numeric whenever the impact join ran, so a null `impact_over` beside it
+means "over no area". `significance_contributions` lists every term that moved
+the score as signed `{term, value}` objects, largest first; negative values
+(`clutter`, `weakening`) pulled the cell down, the values sum to `significance`
+up to rounding, and `significance_reasons` names the first three. It is a list
+of objects, so it is not a property filter. `age_minutes` is wall-clock time
+since first detection; `track_age` counts observed frames. An unmeasured flash
+rate and a zero-area cell's flash density are `null`, never `0`.
 
 Nowcast cells have a 2.5 km² minimum footprint, summed at each pixel row's
 latitude. `area_km2`, severity and flash density use that physical area;

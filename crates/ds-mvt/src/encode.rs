@@ -135,7 +135,8 @@ fn add_tag(feature: &mut mvt::Feature, key: &str, value: &PropertyValue) {
         PropertyValue::Bool(b) => feature.add_tag_bool(key, *b),
         // MVT has no null tag type. Dropping a null-valued tag matches what
         // every other tile-producing stack does (PostGIS ST_AsMVT, tippecanoe).
-        PropertyValue::Null => {}
+        // A record has no scalar form either, so it is dropped the same way.
+        PropertyValue::Null | PropertyValue::Object(_) => {}
         // MVT tag values are scalar — flatten a list to a comma-joined string
         // (nested lists / nulls contribute nothing).
         PropertyValue::List(items) => {
@@ -155,14 +156,15 @@ fn add_tag(feature: &mut mvt::Feature, key: &str, value: &PropertyValue) {
 
 /// Render a scalar `PropertyValue` as a string for the MVT list-flattening
 /// path. Returns `None` for `Null` and nested `List`s (which have no scalar
-/// representation), so they're skipped in the joined output.
+/// representation), so they're skipped in the joined output. Records
+/// likewise.
 fn scalar_tag_string(v: &PropertyValue) -> Option<String> {
     match v {
         PropertyValue::String(s) => Some(s.clone()),
         PropertyValue::Float(f) => Some(f.to_string()),
         PropertyValue::Integer(i) => Some(i.to_string()),
         PropertyValue::Bool(b) => Some(b.to_string()),
-        PropertyValue::Null | PropertyValue::List(_) => None,
+        PropertyValue::Null | PropertyValue::List(_) | PropertyValue::Object(_) => None,
     }
 }
 
@@ -672,6 +674,13 @@ mod tests {
             Geometry::Point { x: 0.0, y: 0.0 },
             &[
                 ("empty", PropertyValue::List(vec![PropertyValue::Null])),
+                (
+                    "record",
+                    PropertyValue::Object(vec![(
+                        "term".into(),
+                        PropertyValue::String("clutter".into()),
+                    )]),
+                ),
                 ("name", PropertyValue::String("origin".into())),
             ],
         );
@@ -681,6 +690,10 @@ mod tests {
         assert!(
             !slice_contains(&bytes, b"empty"),
             "an all-null list tag must be dropped"
+        );
+        assert!(
+            !slice_contains(&bytes, b"record") && !slice_contains(&bytes, b"clutter"),
+            "a record has no scalar tag form and must be dropped"
         );
     }
 
@@ -696,6 +709,7 @@ mod tests {
         );
         assert_eq!(scalar_tag_string(&PropertyValue::Null), None);
         assert_eq!(scalar_tag_string(&PropertyValue::List(vec![])), None);
+        assert_eq!(scalar_tag_string(&PropertyValue::Object(vec![])), None);
     }
 
     #[test]
