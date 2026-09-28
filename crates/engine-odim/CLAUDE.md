@@ -130,7 +130,7 @@ in `crates/api-3dtiles/CLAUDE.md`.
   envelope-guarded `sample_polar_slant` — never fabricate data across the
   cone of silence. Unknown quantity ⇒ `InvalidParameter` (→ 400).
 - `read_point_cloud`/`read_voxel_grid` are sync (blocking HDF5 I/O + long
-  CPU loops); the API layer bounds them with the render semaphore and
+  CPU loops); the API layer bounds them with its 3D Tiles content pool and
   `spawn_blocking`.
 - **`VOXEL_GRID_CACHE`**: `read_voxel_grid` returns `Arc<VoxelGrid>` from a
   global LRU keyed (file, quantity, dims) — isosurface/echo-top/voxels and

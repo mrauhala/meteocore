@@ -228,7 +228,7 @@ fn router() -> axum::Router {
             -32.0,
             95.0,
         )),
-        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        content_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
         trust_proxy_headers: false,
     }));
@@ -491,7 +491,7 @@ async fn voxels_not_advertised_without_coverage() {
             -32.0,
             95.0,
         )),
-        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        content_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
         trust_proxy_headers: false,
     }));
@@ -550,7 +550,7 @@ async fn isosurface_on_unsupported_collection_is_400() {
             -32.0,
             95.0,
         )),
-        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        content_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
         trust_proxy_headers: false,
     }));
@@ -1002,7 +1002,7 @@ fn router_with(id: &str, engine: Arc<dyn VolumeEngine>) -> axum::Router {
             -32.0,
             95.0,
         )),
-        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        content_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
         trust_proxy_headers: false,
     }));
@@ -1220,11 +1220,25 @@ async fn exact_time_entry_survives_new_volume_arrival() {
     );
 }
 
-/// A real blocking engine call that can outlive its HTTP waiter.
+/// A real blocking engine call that can outlive its HTTP waiter. Point reads
+/// block until released; voxel reads are only counted.
 struct GatedVolume {
     started: Arc<tokio::sync::Notify>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     reads: std::sync::atomic::AtomicU64,
+    voxel_reads: std::sync::atomic::AtomicU64,
+}
+impl GatedVolume {
+    fn new() -> (Arc<Self>, std::sync::mpsc::Sender<()>) {
+        let (release, receiver) = std::sync::mpsc::channel();
+        let engine = Arc::new(Self {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Mutex::new(receiver),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            voxel_reads: std::sync::atomic::AtomicU64::new(0),
+        });
+        (engine, release)
+    }
 }
 impl VolumeEngine for GatedVolume {
     fn volume_info(&self) -> Arc<VolumeInfo> {
@@ -1243,32 +1257,44 @@ impl VolumeEngine for GatedVolume {
         self.release.lock().unwrap().recv().unwrap();
         MockVolume.read_point_cloud(quantity, time, min_value, reference_time)
     }
+    fn read_voxel_grid(
+        &self,
+        quantity: Option<&str>,
+        time: Option<chrono::DateTime<Utc>>,
+        dims: Option<[usize; 3]>,
+        reference_time: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Arc<VoxelGrid>, DataServerError> {
+        self.voxel_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MockVolume.read_voxel_grid(quantity, time, dims, reference_time)
+    }
+}
+
+/// A router over one collection whose content computes draw from `pool`.
+fn router_with_pool(
+    id: &str,
+    engine: Arc<dyn VolumeEngine>,
+    pool: Arc<tokio::sync::Semaphore>,
+) -> axum::Router {
+    api_3dtiles::router(Arc::new(ArcSwap::from_pointee(TilesState3d {
+        volume_engines: [(id.into(), engine)].into(),
+        collections: [(id.into(), collection_config(id))].into(),
+        colormap: api_3dtiles::default_point_colormap(),
+        content_semaphore: pool,
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    })))
 }
 
 #[tokio::test]
-async fn canceled_http_waiter_keeps_render_permit_and_populates_cache() {
-    let started = Arc::new(tokio::sync::Notify::new());
-    let (release, receiver) = std::sync::mpsc::channel();
-    let engine = Arc::new(GatedVolume {
-        started: started.clone(),
-        release: std::sync::Mutex::new(receiver),
-        reads: std::sync::atomic::AtomicU64::new(0),
-    });
-    let id = "radar-cancel";
+async fn canceled_http_waiter_keeps_content_permit_and_populates_cache() {
+    let (engine, release) = GatedVolume::new();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-    let state = Arc::new(ArcSwap::from_pointee(TilesState3d {
-        volume_engines: [(id.into(), engine.clone() as Arc<dyn VolumeEngine>)].into(),
-        collections: [(id.into(), collection_config(id))].into(),
-        colormap: api_3dtiles::default_point_colormap(),
-        render_semaphore: semaphore.clone(),
-        base_url: String::new(),
-        trust_proxy_headers: false,
-    }));
-    let app = api_3dtiles::router(state);
+    let app = router_with_pool("radar-cancel", engine.clone(), semaphore.clone());
     let uri = "/collections/radar-cancel/content.pnts";
     let first = app.clone();
     let request = tokio::spawn(async move { get_on(&first, uri).await });
-    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(2), engine.started.notified())
         .await
         .unwrap();
     request.abort();
@@ -1281,5 +1307,78 @@ async fn canceled_http_waiter_keeps_render_permit_and_populates_cache() {
         .unwrap();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(engine.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+/// #380: points and mesh computes run on the 3D content pool, so they complete
+/// with every raster render slot taken — and a cold 3D preload never occupies
+/// one. Wired like the server: `CONTENT_SLOTS` in the state, while the
+/// process-wide `RENDER_SLOTS` WMS/Maps/Tiles share are all held.
+#[tokio::test]
+async fn content_computes_while_every_raster_render_slot_is_taken() {
+    let raster = ds_executor::RENDER_SLOTS.clone();
+    let _busy = raster
+        .clone()
+        .try_acquire_many_owned(ds_executor::render_concurrency() as u32)
+        .expect("no other test in this binary takes raster slots");
+    let app = router_with_pool(
+        "radar-raster-busy",
+        Arc::new(MockVolume),
+        api_3dtiles::CONTENT_SLOTS.clone(),
+    );
+    for uri in [
+        "/collections/radar-raster-busy/content.pnts",
+        "/collections/radar-raster-busy/content.glb?resolution=low",
+        "/collections/radar-raster-busy/content.glb?representation=echotop&resolution=low",
+    ] {
+        // Far inside the 30 s volume deadline a raster-slot wait would burn.
+        let (status, _, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), get_on(&app, uri))
+                .await
+                .unwrap_or_else(|_| panic!("{uri} waited for a raster render slot"));
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+    assert_eq!(raster.available_permits(), 0);
+}
+
+/// #380: voxels share the one content pool with points and meshes, so total
+/// 3D CPU has one bound. While a point compute holds the only permit, a voxel
+/// compute waits instead of starting.
+#[tokio::test]
+async fn voxel_content_waits_on_the_shared_content_pool() {
+    let (engine, release) = GatedVolume::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let app = router_with_pool("radar-pool-share", engine.clone(), semaphore.clone());
+    let spawn = |uri: &'static str| {
+        let app = app.clone();
+        tokio::spawn(async move { get_on(&app, uri).await })
+    };
+    let points = spawn("/collections/radar-pool-share/content.pnts");
+    tokio::time::timeout(std::time::Duration::from_secs(2), engine.started.notified())
+        .await
+        .unwrap();
+    let voxels = spawn("/collections/radar-pool-share/voxel/content/0/0/0/0.glb?resolution=low");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        engine
+            .voxel_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "voxel compute must wait for the point compute's permit"
+    );
+    release.send(()).unwrap();
+    for task in [points, voxels] {
+        let (status, _, _) = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        engine
+            .voxel_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
     assert_eq!(semaphore.available_permits(), 1);
 }

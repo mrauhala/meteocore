@@ -1061,7 +1061,7 @@ mod tests {
                 volume_engines: std::collections::HashMap::new(),
                 collections: std::collections::HashMap::new(),
                 colormap: api_3dtiles::default_point_colormap(),
-                render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                content_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                 base_url: String::new(),
                 trust_proxy_headers: false,
             })),
