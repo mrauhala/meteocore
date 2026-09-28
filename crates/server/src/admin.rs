@@ -47,7 +47,18 @@ struct DeltaCounter {
 
 impl DeltaCounter {
     fn new(name: &str, help: &str) -> Self {
-        let counter = IntCounter::new(name, help).unwrap();
+        Self::with_opts(Opts::new(name, help))
+    }
+
+    /// One series of a labelled family: the counter carries `label="value"`
+    /// as a constant label, and its sibling series register under the same
+    /// name and help with the other values (the registry merges them).
+    fn labelled(name: &str, help: &str, label: &str, value: &str) -> Self {
+        Self::with_opts(Opts::new(name, help).const_label(label, value))
+    }
+
+    fn with_opts(opts: Opts) -> Self {
+        let counter = IntCounter::with_opts(opts).unwrap();
         REGISTRY.register(Box::new(counter.clone())).unwrap();
         DeltaCounter {
             counter,
@@ -185,6 +196,30 @@ static RENDER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
         )
         .buckets(LATENCY_BUCKETS.to_vec()),
         &["api", "collection", "outcome"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// Where served raster renders spend their time (#147), by API and phase:
+/// `queue` (memory + render-slot admission), `engine` (`get_raster_tile`),
+/// `assemble` (WMS meta-tile resample) and `encode` (colorize + image
+/// encode). Fed from the phases in the same `RenderTiming` extension; a hit
+/// runs none. No `collection` label: queue wait is a property of the shared
+/// render slots, the per-collection tail is already `render_duration_seconds`,
+/// and the fixed labels need no reload pruning.
+static RENDER_PHASE: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "render_phase_seconds",
+            "WMS GetMap, Maps map and Tiles map-tile render time per phase in seconds, for \
+             renders that ran it. phase: queue = memory + render-slot admission, engine = \
+             engine get_raster_tile, assemble = WMS meta-tile resample, encode = colorize + \
+             image encode",
+        )
+        .buckets(LATENCY_BUCKETS.to_vec()),
+        &["api", "phase"],
     )
     .unwrap();
     REGISTRY.register(Box::new(histogram.clone())).unwrap();
@@ -1309,11 +1344,19 @@ static RENDER_QUEUE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
         "Requests rejected immediately because the render queue was full",
     )
 });
-static RENDER_DEADLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
-    DeltaCounter::new(
-        "render_deadline_exceeded_total",
-        "Requests exceeding their queue plus execution deadline",
-    )
+/// By `stage` (#147): a render that expires is never in
+/// `render_phase_seconds`, so this says whether it ran out of time waiting
+/// for admission or while rendering.
+static RENDER_DEADLINES: LazyLock<[DeltaCounter; 2]> = LazyLock::new(|| {
+    ["queue", "render"].map(|stage| {
+        DeltaCounter::labelled(
+            "render_deadline_exceeded_total",
+            "Requests exceeding their queue plus execution deadline. stage: queue = waiting \
+             for raster memory or a render slot, render = after admission",
+            "stage",
+            stage,
+        )
+    })
 });
 
 static RENDER_MEMORY_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -1328,11 +1371,18 @@ static RENDER_MEMORY_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
         "Total transient raster render budget",
     )
 });
-static RENDER_MEMORY_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
-    DeltaCounter::new(
-        "render_budget_rejected_total",
-        "Raster requests too large for memory admission or timed out waiting for memory",
-    )
+/// By `reason`: `oversize` is an immediate 503, `deadline` a memory wait
+/// that expired (also counted in `render_deadline_exceeded_total`).
+static RENDER_MEMORY_REJECTED: LazyLock<[DeltaCounter; 2]> = LazyLock::new(|| {
+    ["oversize", "deadline"].map(|reason| {
+        DeltaCounter::labelled(
+            "render_budget_rejected_total",
+            "Raster requests too large for memory admission or timed out waiting for memory. \
+             reason: oversize = rejected at once, deadline = expired waiting for memory",
+            "reason",
+            reason,
+        )
+    })
 });
 
 static STORAGE_BYTES_READ: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -5271,7 +5321,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     RENDER_QUEUE_DEPTH.set(execution.queued as i64);
     RENDER_QUEUE_CAPACITY.set(execution.capacity as i64);
     RENDER_QUEUE_REJECTED.feed(execution.rejected);
-    RENDER_DEADLINES.feed(execution.timed_out);
+    let [queue, render] = &*RENDER_DEADLINES;
+    queue.feed(execution.timed_out_queue);
+    render.feed(execution.timed_out_render);
     let memory = &*ds_executor::budget::RENDER_MEMORY;
     RENDER_MEMORY_AVAILABLE.set(memory.available().min(i64::MAX as u64) as i64);
     RENDER_MEMORY_TOTAL.set(memory.capacity().min(i64::MAX as u64) as i64);
@@ -5285,7 +5337,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     let mut counter_state = CACHE_COUNTER_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    RENDER_MEMORY_REJECTED.feed(memory.rejected());
+    let [oversize, deadline] = &*RENDER_MEMORY_REJECTED;
+    oversize.feed(memory.rejected_oversize());
+    deadline.feed(memory.rejected_deadline());
 
     // Rendered image cache: global (single cache shared across collections).
     RENDERED_CACHE_METRICS.update(
@@ -5807,6 +5861,11 @@ pub async fn metrics_middleware(
         RENDER_DURATION
             .with_label_values(&[api, timing.collection.as_str(), timing.outcome.as_str()])
             .observe(timing.elapsed.as_secs_f64());
+        for (phase, elapsed) in timing.phases.iter() {
+            RENDER_PHASE
+                .with_label_values(&[api, phase.as_str()])
+                .observe(elapsed.as_secs_f64());
+        }
     }
 
     response
@@ -7354,6 +7413,109 @@ mod tests {
         series
     }
 
+    /// `(phase, sample count)` of each `render_phase_seconds` series of
+    /// `api`, sorted.
+    fn phase_series(api: &str) -> Vec<(String, u64)> {
+        use prometheus::core::Collector;
+        let mut series = Vec::new();
+        for family in super::RENDER_PHASE.collect() {
+            for metric in family.get_metric() {
+                let label = |name: &str| {
+                    let pair = metric.get_label().iter().find(|l| l.name() == name);
+                    pair.map_or(String::new(), |l| l.value().to_string())
+                };
+                if label("api") == api {
+                    let count = metric.get_histogram().get_sample_count();
+                    series.push((label("phase"), count));
+                }
+            }
+        }
+        series.sort();
+        series
+    }
+
+    /// The phases a raster handler measured reach `render_phase_seconds`
+    /// through the metrics middleware (#147): one sample per phase the render
+    /// ran, in seconds, none for a phase it skipped and none for a hit.
+    #[tokio::test]
+    async fn render_phases_are_exported_per_api_and_phase() {
+        use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
+        use std::time::{Duration, Instant};
+        use tower::ServiceExt;
+        // Its own `api` value keeps these series apart from real renders.
+        const API: &str = "render-phase-test";
+        let cold = axum::routing::get(|| async {
+            let mut phases = RenderPhases::default();
+            phases.add(RenderPhase::Queue, Duration::from_millis(2));
+            phases.add(RenderPhase::Engine, Duration::from_millis(30));
+            phases.add(RenderPhase::Encode, Duration::from_millis(4));
+            let timing = RenderTiming::since("radar", RenderOutcome::Cold, Instant::now());
+            (axum::Extension(timing.with_phases(phases)), "cold")
+        });
+        let hit = axum::routing::get(|| async {
+            let timing = RenderTiming::since("radar", RenderOutcome::Hit, Instant::now());
+            (axum::Extension(timing), "hit")
+        });
+        let app = api_common::tag_api_kind(
+            axum::Router::new().route("/cold", cold).route("/hit", hit),
+            API,
+        )
+        .layer(axum::middleware::from_fn(super::metrics_middleware));
+        for uri in ["/cold", "/hit", "/hit"] {
+            let request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+        let phases = |counts: &[(&str, u64)]| -> Vec<(String, u64)> {
+            counts.iter().map(|&(p, n)| (p.into(), n)).collect()
+        };
+        assert_eq!(
+            phase_series(API),
+            phases(&[("encode", 1), ("engine", 1), ("queue", 1)])
+        );
+        let engine = super::RENDER_PHASE.with_label_values(&[API, "engine"]);
+        assert!((engine.get_sample_sum() - 0.030).abs() < 1e-9);
+    }
+
+    /// Immediate sheds and deadline expiries are told apart (#147): memory
+    /// rejections by `reason`, deadline expiries by `stage`, each family one
+    /// set of labelled series with no unlabelled leftover.
+    #[test]
+    fn render_rejections_are_attributed_by_reason_and_stage() {
+        std::sync::LazyLock::force(&super::RENDER_DEADLINES);
+        std::sync::LazyLock::force(&super::RENDER_MEMORY_REJECTED);
+        use super::Encoder as _;
+        let mut text = Vec::new();
+        super::TextEncoder::new()
+            .encode(&super::REGISTRY.gather(), &mut text)
+            .unwrap();
+        let text = String::from_utf8(text).unwrap();
+        for (family, label, values) in [
+            (
+                "render_deadline_exceeded_total",
+                "stage",
+                ["queue", "render"],
+            ),
+            (
+                "render_budget_rejected_total",
+                "reason",
+                ["oversize", "deadline"],
+            ),
+        ] {
+            for value in values {
+                let series = format!("{family}{{{label}=\"{value}\"}} ");
+                assert!(text.lines().any(|l| l.starts_with(&series)), "{series}");
+            }
+            let bare = format!("{family} ");
+            assert!(!text.lines().any(|l| l.starts_with(&bare)), "{family}");
+            let kind = format!("# TYPE {family} counter");
+            assert_eq!(text.lines().filter(|l| *l == kind).count(), 1, "{family}");
+        }
+    }
+
     /// Render latency end to end (#466): the metrics middleware records the
     /// WMS handler's timing under the collection's registry id, split into a
     /// cold render and a hit, and a reload that removes a collection drops
@@ -7406,6 +7568,10 @@ mod tests {
                 "{id}"
             );
         }
+        // The two cold direct renders' phases (#147); the hits ran none.
+        let phases = phase_series("wms");
+        let phases: Vec<_> = phases.iter().map(|(p, n)| (p.as_str(), *n)).collect();
+        assert_eq!(phases, [("encode", 2), ("engine", 2), ("queue", 2)]);
 
         std::fs::write(&config_path, format!("{server}{}", collection(kept))).unwrap();
         super::do_reload(&state).unwrap();

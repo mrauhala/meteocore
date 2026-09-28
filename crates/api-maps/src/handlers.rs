@@ -13,7 +13,7 @@ use api_common::workbench::Surface;
 use api_common::{mounts, rel, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::map_engine::MapEngine;
-use ds_executor::{RenderOutcome, RenderTiming};
+use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
 use crate::error::MapsError;
@@ -1356,6 +1356,7 @@ async fn render_map(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
+    let queue_start = std::time::Instant::now();
     let (job, memory_permit) = ds_executor::RenderJob::acquire_raster(
         state.render_semaphore.clone(),
         validated.width,
@@ -1364,6 +1365,10 @@ async fn render_map(
     .await
     .map_err(MapsError::from)?;
     let worker_memory = memory_permit.clone();
+    // Where the render's time goes (#147): admission here, the engine read
+    // and encode in the worker.
+    let mut phases = RenderPhases::default();
+    phases.add(RenderPhase::Queue, queue_start.elapsed());
 
     // Render on a blocking thread
     let engine = engine.clone();
@@ -1380,7 +1385,9 @@ async fn render_map(
     let render_result = job
         .run(move || {
             let _memory_permit = worker_memory;
+            let mut phases = phases;
 
+            let engine_start = std::time::Instant::now();
             let tile = engine.get_raster_tile(
                 bbox,
                 width,
@@ -1394,14 +1401,21 @@ async fn render_map(
                 // run swap mid-render without mixing runs in one response.
                 reference_time,
             )?;
+            phases.add(RenderPhase::Engine, engine_start.elapsed());
             // If every pixel is nodata, skip colorization + encoding entirely.
             if tile.is_empty() {
-                return Ok(None);
+                return Ok((None, phases));
             }
-            ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
+            let encode_start = std::time::Instant::now();
+            let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
+            phases.add(RenderPhase::Encode, encode_start.elapsed());
+            Ok::<_, ds_core::error::DataServerError>((Some(bytes), phases))
         })
         .await
         .map_err(MapsError::from)?;
+    let phases = render_result
+        .as_ref()
+        .map_or(RenderPhases::default(), |&(_, phases)| phases);
 
     // The EMPTY fast path skips the format-aware encoder and emits PNG
     // bytes directly. Track the actual Content-Type per branch so the
@@ -1415,12 +1429,12 @@ async fn render_map(
     // for fixed dimensions). Engine errors bail with 500 before this
     // match.
     let (cached, x_cache, response_content_type) = match render_result {
-        Ok(Some(bytes)) => {
+        Ok((Some(bytes), _)) => {
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
             rendered_cache.insert(cache_key, cached.clone());
             (cached, "MISS", content_type)
         }
-        Ok(None) => {
+        Ok((None, _)) => {
             // Empty tile: a transparent PNG, encoded once per (w,h) and shared
             // across WMS/Maps/Tiles (#171). Not inserted into the rendered cache.
             let cached = ds_render::empty_tile(width, height)
@@ -1485,11 +1499,10 @@ async fn render_map(
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
                 .header(header::HeaderName::from_static("x-cache"), x_cache)
-                .extension(RenderTiming::since(
-                    collection_id,
-                    RenderOutcome::Cold,
-                    render_start,
-                ))
+                .extension(
+                    RenderTiming::since(collection_id, RenderOutcome::Cold, render_start)
+                        .with_phases(phases),
+                )
                 .body(axum::body::Body::empty())
                 .unwrap()
                 .into_response());
@@ -1506,11 +1519,10 @@ async fn render_map(
             "nosniff",
         )
         .header(header::HeaderName::from_static("x-cache"), x_cache)
-        .extension(RenderTiming::since(
-            collection_id,
-            RenderOutcome::Cold,
-            render_start,
-        ))
+        .extension(
+            RenderTiming::since(collection_id, RenderOutcome::Cold, render_start)
+                .with_phases(phases),
+        )
         .body(axum::body::Body::from(cached.into_bytes()))
         .unwrap()
         .into_response())

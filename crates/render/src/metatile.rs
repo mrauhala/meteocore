@@ -32,7 +32,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -274,8 +274,9 @@ impl TilePixelCache {
 }
 
 /// Per-render phase timing, returned with [`MetaTile::Image`] so the caller can
-/// log where a slow render spent its time (the framework-free render layer can't
-/// log itself). Times are wall-clock milliseconds.
+/// log where a slow render spent its time and report its render phases (the
+/// framework-free render layer can't log or export metrics itself). Times are
+/// wall-clock.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetaTileStats {
     /// Covering tiles for this request.
@@ -286,11 +287,15 @@ pub struct MetaTileStats {
     /// decode + reproject) plus colorize for the `misses`, plus cache lookups
     /// for hits (normally negligible). For a cold render (all misses) this is
     /// the miss-render time — the metric the cold-tail diagnosis cares about.
-    pub tile_loop_ms: u64,
+    pub tile_loop: Duration,
+    /// Of `tile_loop`, the time inside the engine closure for the `misses`.
+    pub engine: Duration,
+    /// Of `tile_loop`, the time colorizing the misses that had data.
+    pub colorize: Duration,
     /// Time assembling the mosaic into the output (nearest-neighbour resample).
-    pub assemble_ms: u64,
+    pub assemble: Duration,
     /// Time encoding the final image (PNG/JPEG/WebP). 0 for an all-nodata render.
-    pub encode_ms: u64,
+    pub encode: Duration,
 }
 
 /// Outcome of a meta-tiled render.
@@ -418,6 +423,7 @@ where
     };
     let mut any_data = false;
     let mut misses: u32 = 0;
+    let (mut engine, mut colorize_time) = (Duration::ZERO, Duration::ZERO);
     let tiles_count = (ncols * nrows) as u32;
     let t_loop = Instant::now();
     for row in row0..=row1 {
@@ -471,7 +477,9 @@ where
                         OutputCrs::WebMercator,
                     ),
                 };
+                let t_engine = Instant::now();
                 let tile = render_tile(tbbox, TILE_PX, TILE_PX, &tile_output)?;
+                engine += t_engine.elapsed();
                 // All-nodata tiles are cached as a `None` marker: cheap to store
                 // (no 256 KB buffer) yet still a cache hit, so a sparse extent is
                 // not re-decoded every request nor crowds out real-data tiles.
@@ -479,9 +487,10 @@ where
                     None
                 } else {
                     any_data = true;
-                    Some(Arc::<[u8]>::from(
-                        colorize(&tile, colormap).into_boxed_slice(),
-                    ))
+                    let t_colorize = Instant::now();
+                    let rgba = colorize(&tile, colormap).into_boxed_slice();
+                    colorize_time += t_colorize.elapsed();
+                    Some(Arc::<[u8]>::from(rgba))
                 };
                 cache.cache.insert(
                     key,
@@ -494,16 +503,17 @@ where
             tiles.tiles.push(rgba);
         }
     }
-    let tile_loop_ms = t_loop.elapsed().as_millis() as u64;
+    let tile_loop = t_loop.elapsed();
 
     if !any_data {
         return Ok(MetaTile::Empty {
             stats: MetaTileStats {
                 tiles: tiles_count,
                 misses,
-                tile_loop_ms,
-                assemble_ms: 0,
-                encode_ms: 0,
+                tile_loop,
+                engine,
+                colorize: colorize_time,
+                ..MetaTileStats::default()
             },
         });
     }
@@ -533,7 +543,7 @@ where
             out[o..o + 4].copy_from_slice(&rgba);
         }
     }
-    let assemble_ms = t_assemble.elapsed().as_millis() as u64;
+    let assemble = t_assemble.elapsed();
 
     let t_encode = Instant::now();
     let bytes = match format {
@@ -541,15 +551,17 @@ where
         ImageFormat::Jpeg => crate::encode_jpeg(&out, width, height)?,
         ImageFormat::Webp => crate::encode_webp(&out, width, height)?,
     };
-    let encode_ms = t_encode.elapsed().as_millis() as u64;
+    let encode = t_encode.elapsed();
     Ok(MetaTile::Image {
         bytes,
         stats: MetaTileStats {
             tiles: tiles_count,
             misses,
-            tile_loop_ms,
-            assemble_ms,
-            encode_ms,
+            tile_loop,
+            engine,
+            colorize: colorize_time,
+            assemble,
+            encode,
         },
     })
 }
@@ -890,6 +902,56 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(out, MetaTile::Empty { .. }));
+    }
+
+    /// The render-phase split (#147): engine time is the closure's own, the
+    /// colorize of fresh tiles is apart from it, and a view served entirely
+    /// from cached tiles reports neither.
+    #[test]
+    fn stats_split_engine_and_colorize_out_of_the_tile_loop() {
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        let slow_tile = |b: [f64; 4], w: u32, h: u32, output: &OutputCrs| {
+            std::thread::sleep(Duration::from_millis(2));
+            solid_tile(b, w, h, output)
+        };
+        let render = || {
+            let out = render_metatiled(
+                [20.0, 58.0, 30.0, 64.0],
+                &OutputCrs::WebMercator,
+                512,
+                512,
+                &prefix,
+                &SolidRed,
+                ImageFormat::Png,
+                &cache,
+                slow_tile,
+            );
+            match out.unwrap() {
+                MetaTile::Image { stats, .. } => stats,
+                _ => panic!("expected an image"),
+            }
+        };
+        let cold = render();
+        assert!(cold.misses > 0);
+        assert!(cold.engine >= Duration::from_millis(2) * cold.misses);
+        assert!(cold.colorize > Duration::ZERO);
+        assert!(cold.engine + cold.colorize <= cold.tile_loop);
+        let cached = render();
+        assert_eq!(cached.misses, 0);
+        assert_eq!(
+            (cached.engine, cached.colorize),
+            (Duration::ZERO, Duration::ZERO)
+        );
+        assert!(cached.encode > Duration::ZERO);
     }
 
     #[test]

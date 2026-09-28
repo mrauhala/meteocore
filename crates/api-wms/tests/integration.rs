@@ -1360,6 +1360,52 @@ async fn error_tile_reports_no_render_timing() {
     assert_eq!(timing, None);
 }
 
+/// The phases a served GetMap reports for `render_phase_seconds` (#147).
+async fn render_phases(app: &axum::Router, crs: &str, bbox: &str, size: u32) -> Vec<&'static str> {
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH={size}&HEIGHT={size}"
+    );
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let timing = resp
+        .extensions()
+        .get::<ds_executor::RenderTiming>()
+        .unwrap();
+    timing
+        .phases
+        .iter()
+        .map(|(phase, _)| phase.as_str())
+        .collect()
+}
+
+/// Each path reports the phases it ran: a cold meta-tiled view all four, a
+/// hit none, a view from cached meta-tiles no engine read, and a direct
+/// render no assembly.
+#[tokio::test]
+async fn getmap_reports_render_phases_per_path() {
+    let (app, _tiles, _calls) = build_counting_router(64);
+    let full = "2000000,8000000,3000000,9000000";
+    assert_eq!(
+        render_phases(&app, "EPSG:3857", full, 512).await,
+        ["queue", "engine", "assemble", "encode"]
+    );
+    assert!(render_phases(&app, "EPSG:3857", full, 512).await.is_empty());
+    let quarter = "2000000,8000000,2500000,8500000";
+    assert_eq!(
+        render_phases(&app, "EPSG:3857", quarter, 256).await,
+        ["queue", "assemble", "encode"]
+    );
+    assert_eq!(
+        render_phases(&app, "CRS:84", "10,55,30,70", 256).await,
+        ["queue", "engine", "encode"]
+    );
+}
+
 /// Multi-parameter mock standing in for a PVOL radar-site collection: two
 /// bare-quantity parameters with human labels, and a `layer_subtitle` carrying
 /// the site place name. Drives the flat-client disambiguation in

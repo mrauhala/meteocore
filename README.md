@@ -189,7 +189,8 @@ MeteoCore container environment and recreate that service; reload is not enough.
 Short timeline bursts wait for memory without occupying CPU slots. Sustained
 load still has finite capacity: watch `render_queue_depth`,
 `render_queue_rejected_total`, `render_deadline_exceeded_total`, and host
-available memory during busy weather. More RAM cannot remove CPU or upstream
+available memory during busy weather. `render_phase_seconds` shows whether
+served renders wait in the queue or in the engine read. More RAM cannot remove CPU or upstream
 I/O bottlenecks. Clients should retry 503 responses according to `Retry-After`
 with bounded backoff, and cap concurrent full-resolution frame prefetches.
 Keep the three-second interactive deadline unless measurements justify a
@@ -1828,7 +1829,9 @@ Returns HTTP 503 only when all collections have failed.
 | `render_semaphore_available` | gauge | — | Available render permits |
 | `render_budget_available_bytes` | gauge | — | Available transient render memory estimate |
 | `render_budget_total_bytes` | gauge | — | Configured transient render memory budget |
-| `render_budget_rejected_total` | counter | — | Requests rejected at memory admission |
+| `render_budget_rejected_total` | counter | reason | Requests rejected at memory admission: `oversize` at once, `deadline` after an expired memory wait |
+| `render_deadline_exceeded_total` | counter | stage | Render deadline expiries: `queue` waiting for memory or a slot, `render` after admission |
+| `render_phase_seconds` | histogram | api, phase | Served WMS/Maps/Tiles render time per phase: `queue`, `engine`, `assemble` (WMS meta-tiles), `encode` |
 | `render_semaphore_total` | gauge | — | Total render permits (`[server] render_concurrency`, default 2× CPU cores, min 8) |
 | `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
 

@@ -9,7 +9,7 @@ use axum::response::IntoResponse;
 use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
-use ds_executor::{RenderOutcome, RenderTiming};
+use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
 use crate::error::WmsError;
@@ -31,10 +31,10 @@ enum RenderPath {
     /// timing (assemble/encode skipped).
     MetaEmpty(ds_render::MetaTileStats),
     /// Meta-tiling declined (degenerate bbox / over tile budget / extreme
-    /// zoom) → direct.
-    Fallback,
+    /// zoom) → direct, with its engine and encode phases.
+    Fallback(RenderPhases),
     /// Genuine non-meta path (non-3857 CRS, or meta cache disabled).
-    Direct,
+    Direct(RenderPhases),
 }
 
 impl RenderPath {
@@ -47,6 +47,28 @@ impl RenderPath {
                 RenderOutcome::Assembled
             }
             _ => RenderOutcome::Cold,
+        }
+    }
+
+    /// The worker's render phases (#147), from the same measurements the
+    /// slow-render log reads. A meta-tiled view's `engine` is the uncached
+    /// tiles' engine reads, and its `encode` also counts colorizing them, as
+    /// the direct path's `render_tile` does. Phases a path skipped stay unset.
+    fn phases(&self) -> RenderPhases {
+        match self {
+            RenderPath::Meta(stats) | RenderPath::MetaEmpty(stats) => {
+                let mut phases = RenderPhases::default();
+                if stats.misses > 0 {
+                    phases.add(RenderPhase::Engine, stats.engine);
+                }
+                // An all-nodata view skips assembly and encoding.
+                if matches!(self, RenderPath::Meta(_)) {
+                    phases.add(RenderPhase::Assemble, stats.assemble);
+                    phases.add(RenderPhase::Encode, stats.colorize + stats.encode);
+                }
+                phases
+            }
+            RenderPath::Fallback(phases) | RenderPath::Direct(phases) => *phases,
         }
     }
 }
@@ -386,7 +408,10 @@ pub async fn wms_handler(
             .map_err(WmsError::from)?;
             let worker_memory = memory_permit.clone();
 
-            let sem_wait_ms = t_sem.elapsed().as_millis() as u64;
+            // Admission wait: the `queue` render phase (#147) and the slow
+            // log's `sem_wait_ms`.
+            let queue_wait = t_sem.elapsed();
+            let sem_wait_ms = queue_wait.as_millis() as u64;
 
             // Render on a blocking thread
             let engine = engine.clone();
@@ -425,7 +450,9 @@ pub async fn wms_handler(
                         let _memory_permit = worker_memory;
 
                         // Direct single-shot render: one get_raster_tile → colorize → encode.
-                        let direct = || -> Result<Option<Vec<u8>>, DataServerError> {
+                        let direct = || {
+                            let mut phases = RenderPhases::default();
+                            let engine_start = std::time::Instant::now();
                             let tile = engine.get_raster_tile(
                                 bbox,
                                 width,
@@ -436,11 +463,15 @@ pub async fn wms_handler(
                                 elevation,
                                 reference_time,
                             )?;
+                            phases.add(RenderPhase::Engine, engine_start.elapsed());
                             // If every pixel is nodata, skip colorization + encoding entirely.
                             if tile.is_empty() {
-                                return Ok(None);
+                                return Ok((None, phases));
                             }
-                            ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
+                            let encode_start = std::time::Instant::now();
+                            let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
+                            phases.add(RenderPhase::Encode, encode_start.elapsed());
+                            Ok::<_, DataServerError>((Some(bytes), phases))
                         };
 
                         // Supported projected CRSs: cache 256×256 meta-tiles and
@@ -493,11 +524,11 @@ pub async fn wms_handler(
                                     Ok((None, RenderPath::MetaEmpty(stats)))
                                 }
                                 ds_render::MetaTile::Fallback => {
-                                    direct().map(|o| (o, RenderPath::Fallback))
+                                    direct().map(|(o, phases)| (o, RenderPath::Fallback(phases)))
                                 }
                             }
                         } else {
-                            direct().map(|o| (o, RenderPath::Direct))
+                            direct().map(|(o, phases)| (o, RenderPath::Direct(phases)))
                         }
                     },
                 )
@@ -520,7 +551,11 @@ pub async fn wms_handler(
             };
             // `None` exactly for a failed render: an error tile is not a
             // render outcome and records no latency.
-            let outcome = render_path.as_ref().map(RenderPath::outcome);
+            let outcome = render_path.as_ref().map(|path| {
+                let mut phases = path.phases();
+                phases.add(RenderPhase::Queue, queue_wait);
+                (path.outcome(), phases)
+            });
             // Only log *successful* slow renders (the 200-status tail we're
             // diagnosing); errors are surfaced by the WmsError render warn arm
             // below. The arms stay distinct so a meta render that fell back to
@@ -533,9 +568,9 @@ pub async fn wms_handler(
                         render_ms,
                         tiles = s.tiles,
                         misses = s.misses,
-                        tile_loop_ms = s.tile_loop_ms,
-                        assemble_ms = s.assemble_ms,
-                        encode_ms = s.encode_ms,
+                        tile_loop_ms = s.tile_loop.as_millis() as u64,
+                        assemble_ms = s.assemble.as_millis() as u64,
+                        encode_ms = s.encode.as_millis() as u64,
                         width = params.width,
                         height = params.height,
                         "slow WMS meta-tile render"
@@ -546,12 +581,12 @@ pub async fn wms_handler(
                         render_ms,
                         tiles = s.tiles,
                         misses = s.misses,
-                        tile_loop_ms = s.tile_loop_ms,
+                        tile_loop_ms = s.tile_loop.as_millis() as u64,
                         width = params.width,
                         height = params.height,
                         "slow WMS meta-tile render (all nodata)"
                     ),
-                    Some(RenderPath::Fallback) => tracing::info!(
+                    Some(RenderPath::Fallback(_)) => tracing::info!(
                         layer = %params.layer,
                         sem_wait_ms,
                         render_ms,
@@ -562,7 +597,7 @@ pub async fn wms_handler(
                     // `Direct` covers geographic output and any request
                     // with meta-tiling disabled (metatile_cache_mb
                     // = 0), so the label stays generic rather than claiming a CRS.
-                    Some(RenderPath::Direct) => tracing::info!(
+                    Some(RenderPath::Direct(_)) => tracing::info!(
                         layer = %params.layer,
                         sem_wait_ms,
                         render_ms,
@@ -651,12 +686,10 @@ pub async fn wms_handler(
                     .unwrap()
                     .into_response()
             };
-            if let Some(outcome) = outcome {
-                response.extensions_mut().insert(RenderTiming::since(
-                    &collection_id,
-                    outcome,
-                    render_start,
-                ));
+            if let Some((outcome, phases)) = outcome {
+                response.extensions_mut().insert(
+                    RenderTiming::since(&collection_id, outcome, render_start).with_phases(phases),
+                );
             }
             Ok(response)
         }

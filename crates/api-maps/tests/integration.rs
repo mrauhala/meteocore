@@ -1286,6 +1286,28 @@ mod get_map {
         }
     }
 
+    /// A cold map reports its admission, engine read and encode phases
+    /// (#147); the cached repeat ran none of them.
+    #[tokio::test]
+    async fn map_reports_render_phases() {
+        use ds_executor::RenderTiming;
+        let app = build_router();
+        let mut recorded = Vec::new();
+        for _ in 0..2 {
+            let req = Request::builder()
+                .uri("/collections/radar/map?bbox=10,55,30,70")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let timing = resp.extensions().get::<RenderTiming>().unwrap();
+            let phases: Vec<_> = timing.phases.iter().map(|(p, _)| p.as_str()).collect();
+            recorded.push(phases);
+        }
+        assert_eq!(recorded[0], ["queue", "engine", "encode"]);
+        assert!(recorded[1].is_empty(), "a hit runs no phase");
+    }
+
     /// Cross-parameter staleness protection: different `parameter-name`
     /// values must produce different rendered bytes (because the
     /// `MultiParamMockEngine` varies its output by parameter), which under

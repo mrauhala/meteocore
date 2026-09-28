@@ -49,7 +49,9 @@ static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_millis(env_usize("MC_RENDER_TIMEOUT_MS", 3000).min(86_400_000) as u64)
 });
 static REJECTED: AtomicU64 = AtomicU64::new(0);
-static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+/// Deadline expiries by stage: waiting for memory or a slot, or admitted.
+static TIMED_OUT_QUEUE: AtomicU64 = AtomicU64::new(0);
+static TIMED_OUT_RENDER: AtomicU64 = AtomicU64::new(0);
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -62,15 +64,21 @@ fn env_usize(name: &str, default: usize) -> usize {
 pub struct Metrics {
     pub queued: usize,
     pub capacity: usize,
+    /// Shed at once because the waiting queue was full: never a deadline.
     pub rejected: u64,
-    pub timed_out: u64,
+    /// Deadline expired while waiting for raster memory or a render slot.
+    pub timed_out_queue: u64,
+    /// Deadline expired after admission: blocking-pool dispatch, engine read
+    /// or encoding (#147).
+    pub timed_out_render: u64,
 }
 pub fn metrics() -> Metrics {
     Metrics {
         queued: QUEUE_CAPACITY.saturating_sub(WAITING.available_permits()),
         capacity: *QUEUE_CAPACITY,
         rejected: REJECTED.load(Ordering::Relaxed),
-        timed_out: TIMED_OUT.load(Ordering::Relaxed),
+        timed_out_queue: TIMED_OUT_QUEUE.load(Ordering::Relaxed),
+        timed_out_render: TIMED_OUT_RENDER.load(Ordering::Relaxed),
     }
 }
 
@@ -100,17 +108,72 @@ impl RenderOutcome {
     }
 }
 
+/// One step of a served render: the fixed `phase` label of the server's
+/// `render_phase_seconds` histogram (#147).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderPhase {
+    /// Admission: waiting for raster memory and a render slot.
+    Queue,
+    /// The engine's `get_raster_tile`: source read, decode and reproject.
+    /// Summed over the uncached tiles of a meta-tiled WMS view.
+    Engine,
+    /// WMS meta-tiling only: resampling cached tiles into the viewport.
+    Assemble,
+    /// Colorize and image encode.
+    Encode,
+}
+
+impl RenderPhase {
+    pub const ALL: [Self; 4] = [Self::Queue, Self::Engine, Self::Assemble, Self::Encode];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Engine => "engine",
+            Self::Assemble => "assemble",
+            Self::Encode => "encode",
+        }
+    }
+}
+
+/// Where one served render spent its time, by [`RenderPhase`]. A phase the
+/// render skipped (a hit's admission, an all-nodata tile's encode) stays
+/// unset and records nothing, so it cannot drag that phase's quantiles to 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderPhases([Option<Duration>; 4]);
+
+impl RenderPhases {
+    /// Add `elapsed` to `phase`.
+    pub fn add(&mut self, phase: RenderPhase, elapsed: Duration) {
+        let slot = &mut self.0[phase as usize];
+        *slot = Some(slot.unwrap_or_default() + elapsed);
+    }
+
+    pub fn get(&self, phase: RenderPhase) -> Option<Duration> {
+        self.0[phase as usize]
+    }
+
+    /// The phases this render ran, in [`RenderPhase::ALL`] order.
+    pub fn iter(&self) -> impl Iterator<Item = (RenderPhase, Duration)> + '_ {
+        RenderPhase::ALL
+            .into_iter()
+            .filter_map(|phase| self.get(phase).map(|elapsed| (phase, elapsed)))
+    }
+}
+
 /// Response extension carrying one render's latency, from the rendered-cache
-/// lookup to the response. The raster API handlers attach it and the
-/// server's metrics middleware records it, so engines and API crates stay
-/// metric-free. Only served renders carry one: shed, timed-out and failed
-/// renders have their own counters and error responses.
+/// lookup to the response, and its phase breakdown. The raster API handlers
+/// attach it and the server's metrics middleware records it, so engines and
+/// API crates stay metric-free. Only served renders carry one: shed,
+/// timed-out and failed renders have their own counters and error responses.
 #[derive(Clone, Debug)]
 pub struct RenderTiming {
     /// The collection's registry id: config-bounded, never a raw layer name.
     pub collection: String,
     pub outcome: RenderOutcome,
     pub elapsed: Duration,
+    /// Empty for a hit, which runs none of the phases.
+    pub phases: RenderPhases,
 }
 
 impl RenderTiming {
@@ -120,7 +183,13 @@ impl RenderTiming {
             collection: collection.to_owned(),
             outcome,
             elapsed: start.elapsed(),
+            phases: RenderPhases::default(),
         }
+    }
+
+    /// The same timing, with the phases the render measured.
+    pub fn with_phases(self, phases: RenderPhases) -> Self {
+        Self { phases, ..self }
     }
 }
 
@@ -171,7 +240,7 @@ impl RenderJob {
         let deadline = Instant::now() + timeout;
         // A request that can never fit must not occupy the waiting queue.
         if !memory.fits(width, height) {
-            memory.reject();
+            memory.reject_oversize();
             return Err(ExecutionError::Busy);
         }
         if let Some(reservation) = memory.try_reserve(width, height) {
@@ -186,12 +255,12 @@ impl RenderJob {
         let reservation = tokio::time::timeout_at(deadline.into(), memory.reserve(width, height))
             .await
             .map_err(|_| {
-                memory.reject();
-                timeout_error()
+                memory.reject_deadline();
+                timeout_error(&TIMED_OUT_QUEUE)
             })?;
         let permit = tokio::time::timeout_at(deadline.into(), slots.acquire_owned())
             .await
-            .map_err(|_| timeout_error())?
+            .map_err(|_| timeout_error(&TIMED_OUT_QUEUE))?
             .map_err(|_| ExecutionError::Busy)?;
         Ok((Self { permit, deadline }, Arc::new(reservation)))
     }
@@ -223,7 +292,7 @@ impl RenderJob {
                 })?;
                 tokio::time::timeout_at(deadline.into(), slots.acquire_owned())
                     .await
-                    .map_err(|_| timeout_error())?
+                    .map_err(|_| timeout_error(&TIMED_OUT_QUEUE))?
                     .map_err(|_| ExecutionError::Busy)?
             }
         };
@@ -248,18 +317,19 @@ impl RenderJob {
         let _abort = AbortOnDrop(task.abort_handle());
         let result = tokio::time::timeout_at(deadline.into(), task)
             .await
-            .map_err(|_| timeout_error())??;
+            .map_err(|_| timeout_error(&TIMED_OUT_RENDER))??;
         // Count at the request boundary, exactly once. Counting inside the
         // worker would race the outer timeout and could count one expiry twice.
         if matches!(&result, Err(ExecutionError::Timeout)) || Instant::now() >= deadline {
-            return Err(timeout_error());
+            return Err(timeout_error(&TIMED_OUT_RENDER));
         }
         result
     }
 }
 
-fn timeout_error() -> ExecutionError {
-    TIMED_OUT.fetch_add(1, Ordering::Relaxed);
+/// Count one deadline expiry against its stage's counter.
+fn timeout_error(stage: &AtomicU64) -> ExecutionError {
+    stage.fetch_add(1, Ordering::Relaxed);
     ExecutionError::Timeout
 }
 struct AbortOnDrop(tokio::task::AbortHandle);
@@ -402,6 +472,11 @@ mod tests {
             Err(ExecutionError::Busy)
         ));
         assert_eq!(waiting.available_permits(), 1);
+        // Shed at once, never queued: attributed apart from deadline expiries.
+        assert_eq!(
+            (memory.rejected_oversize(), memory.rejected_deadline()),
+            (1, 0)
+        );
         let held = memory.try_reserve(1, 1).unwrap();
         assert!(matches!(
             RenderJob::acquire_raster_on(
@@ -415,6 +490,10 @@ mod tests {
             .await,
             Err(ExecutionError::Timeout)
         ));
+        assert_eq!(
+            (memory.rejected_oversize(), memory.rejected_deadline()),
+            (1, 1)
+        );
         assert_eq!(memory.rejected(), 2);
         assert_eq!(waiting.available_permits(), 1);
         assert_eq!(slots.available_permits(), 1);
@@ -438,13 +517,13 @@ mod tests {
     }
 
     #[test]
-    fn expired_dispatch_is_counted_once_per_request() {
+    fn deadline_expiries_are_counted_once_by_stage() {
         const CHILD: &str = "MC_TEST_RENDER_DEADLINE_COUNTER_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "tests::expired_dispatch_is_counted_once_per_request",
+                    "tests::deadline_expiries_are_counted_once_by_stage",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
@@ -456,7 +535,22 @@ mod tests {
         // Process isolation makes the cumulative counter assertion independent
         // of timeout tests running concurrently elsewhere in this test binary.
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let before = metrics().timed_out;
+            // Expired waiting for a slot: the queue stage.
+            assert!(matches!(
+                RenderJob::acquire_on(
+                    Arc::new(Semaphore::new(0)),
+                    Arc::new(Semaphore::new(1)),
+                    Duration::from_millis(10),
+                )
+                .await,
+                Err(ExecutionError::Timeout)
+            ));
+            assert_eq!(
+                (metrics().timed_out_queue, metrics().timed_out_render),
+                (1, 0)
+            );
+            // Admitted, then expired before dispatch: the render stage.
+            let before = metrics().timed_out_render;
             for completed in 1..=20 {
                 let job = RenderJob::acquire_on(
                     Arc::new(Semaphore::new(1)),
@@ -469,9 +563,31 @@ mod tests {
                     job.run(|| panic!("expired work ran")).await,
                     Err(ExecutionError::Timeout)
                 ));
-                assert_eq!(metrics().timed_out, before + completed);
+                assert_eq!(metrics().timed_out_render, before + completed);
             }
+            assert_eq!(metrics().timed_out_queue, 1);
         });
+    }
+
+    #[test]
+    fn render_phases_record_only_the_phases_that_ran() {
+        let mut phases = RenderPhases::default();
+        assert_eq!(phases.iter().count(), 0, "a hit runs no phase");
+        phases.add(RenderPhase::Encode, Duration::from_millis(2));
+        phases.add(RenderPhase::Queue, Duration::from_millis(1));
+        phases.add(RenderPhase::Engine, Duration::ZERO);
+        // A meta-tiled view adds colorize and the final encode to one phase.
+        phases.add(RenderPhase::Encode, Duration::from_millis(3));
+        let recorded: Vec<_> = phases.iter().map(|(phase, _)| phase.as_str()).collect();
+        assert_eq!(recorded, ["queue", "engine", "encode"]);
+        assert_eq!(phases.get(RenderPhase::Assemble), None);
+        assert_eq!(
+            phases.get(RenderPhase::Encode),
+            Some(Duration::from_millis(5))
+        );
+        let timing = RenderTiming::since("radar", RenderOutcome::Cold, Instant::now());
+        assert_eq!(timing.phases, RenderPhases::default());
+        assert_eq!(timing.with_phases(phases).phases, phases);
     }
 
     /// Re-runs `test` alone in a child process and returns `true` in the
