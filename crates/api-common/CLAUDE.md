@@ -25,7 +25,8 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   `/api`, `/conformance`, `/collections`, `/collections/{id}`. Merge rules: links
   concatenate in block order, the first block to describe a field wins unless an
   earlier block `claims` it (raster blocks claim `storageCrs`), `styles` merge by
-  id. Block order (Maps, Tiles, Features in `server/src/main.rs`) is therefore
+  id, `crs` lists union in block order (Features Part 2: a feature collection's
+  list must be exactly what `/items` accepts, #685). Block order (Maps, Tiles, Features in `server/src/main.rs`) is therefore
   field precedence; discovery bounds follow the kept extent. Blocks must keep
   overlapping OpenAPI components identical — or namespace them, as Features
   does — and operation ids unique (tested); one route per path across blocks

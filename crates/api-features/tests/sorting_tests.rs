@@ -514,19 +514,22 @@ async fn sortby_is_declared_with_the_schema_the_standard_requires() {
 
 #[tokio::test]
 async fn property_filters_reject_unknown_and_unsupported_parameters() {
-    for name in [
-        "typo",
-        "crs",
-        "bbox-crs",
-        "filter",
-        "filter-lang",
-        "filter-crs",
-        "properties",
-    ] {
+    for name in ["typo", "filter", "filter-lang", "filter-crs", "properties"] {
         let (status, doc) = get(&format!("/collections/sortable/items?{name}=value")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
         let message = doc["description"].as_str().unwrap();
         assert!(message.contains(name) && message.contains("awareness_type"));
+    }
+    // `crs` and `bbox-crs` are Part 2 controls: an unsupported value is a 400
+    // naming the supported CRSs, never a property filter.
+    for name in ["crs", "bbox-crs"] {
+        let (status, doc) = get(&format!("/collections/sortable/items?{name}=value")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        let message = doc["description"].as_str().unwrap();
+        assert!(
+            message.contains(name) && message.contains("EPSG/0/3067"),
+            "{message}"
+        );
     }
     let (status, doc) = get("/collections/plain/items?name=Helsinki").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

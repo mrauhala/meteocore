@@ -12,6 +12,10 @@ pub struct ItemsQueryParams {
     pub offset: Option<usize>,
     pub datetime: Option<String>,
     pub sortby: Option<String>,
+    /// Part 2 output CRS (a URI; parsed by [`crate::crs::FeatureCrs::parse`]).
+    pub crs: Option<String>,
+    /// Part 2 CRS of `bbox`.
+    pub bbox_crs: Option<String>,
     pub property_filters: Vec<(String, String)>,
 }
 
@@ -51,6 +55,8 @@ impl ItemsQueryParams {
                 "bbox" => params.bbox = Some(value),
                 "datetime" => params.datetime = Some(value),
                 "sortby" => params.sortby = Some(value),
+                "crs" => params.crs = Some(value),
+                "bbox-crs" => params.bbox_crs = Some(value),
                 "limit" | "offset" => {
                     let n = value.parse().map_err(|_| {
                         DataServerError::InvalidParameter(format!(
@@ -91,26 +97,36 @@ impl ItemsQueryParams {
     }
 }
 
-/// The query of `/items/{featureId}`: at most one `f`, nothing else. Any
-/// other parameter is an `InvalidParameter` naming it (#681).
-pub fn item_format(pairs: Vec<(String, String)>) -> Result<Option<String>, DataServerError> {
-    let mut f = None;
-    for (name, value) in pairs {
-        match name.as_str() {
-            "f" if f.is_none() => f = Some(value),
-            "f" => {
-                return Err(DataServerError::InvalidParameter(
-                    "duplicate parameter 'f'".into(),
-                ))
-            }
-            _ => {
+/// The query of `/items/{featureId}`: `f` and `crs` (Part 2), each at most
+/// once, nothing else.
+#[derive(Debug, Default)]
+pub struct ItemQueryParams {
+    pub f: Option<String>,
+    pub crs: Option<String>,
+}
+
+impl ItemQueryParams {
+    /// Any other parameter is an `InvalidParameter` naming it (#681).
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, DataServerError> {
+        let mut params = Self::default();
+        for (name, value) in pairs {
+            let slot = match name.as_str() {
+                "f" => &mut params.f,
+                "crs" => &mut params.crs,
+                _ => {
+                    return Err(DataServerError::InvalidParameter(format!(
+                        "unsupported parameter '{name}' on a single feature; only 'f' and 'crs' are accepted"
+                    )))
+                }
+            };
+            if slot.replace(value).is_some() {
                 return Err(DataServerError::InvalidParameter(format!(
-                    "unsupported parameter '{name}' on a single feature; only 'f' is accepted"
-                )))
+                    "duplicate parameter '{name}'"
+                )));
             }
         }
+        Ok(params)
     }
-    Ok(f)
 }
 
 /// Parse an OGC API – Features Part 8 `sortby` value.
@@ -189,7 +205,14 @@ pub fn parse_sortby(s: &str, sortables: &[&str]) -> Result<Vec<SortKey>, DataSer
     Ok(keys)
 }
 
+/// Parse a CRS84 `bbox`.
 pub fn parse_bbox(s: &str) -> Result<Bbox, DataServerError> {
+    crate::crs::FeatureCrs::Crs84.bbox_to_crs84(parse_bbox_values(s)?)
+}
+
+/// The four horizontal values of a `bbox` in request order, whatever its CRS:
+/// lower corner then upper corner, each in the CRS's axis order.
+pub fn parse_bbox_values(s: &str) -> Result<[f64; 4], DataServerError> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 4 && parts.len() != 6 {
         return Err(DataServerError::InvalidBbox(
@@ -206,16 +229,13 @@ pub fn parse_bbox(s: &str) -> Result<Bbox, DataServerError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // For 6-value bbox, ignore height dimensions (indices 2,5 in raw order are heights)
-    // OGC format: west, south, [min-height,] east, north [,max-height]
-    // Actually the 6-value format is: west, south, min-height, east, north, max-height
-    let (west, south, east, north) = if values.len() == 6 {
-        (values[0], values[1], values[3], values[4])
+    // A 6-value bbox is axis 1, axis 2, min height, axis 1, axis 2, max
+    // height; the heights are ignored.
+    Ok(if values.len() == 6 {
+        [values[0], values[1], values[3], values[4]]
     } else {
-        (values[0], values[1], values[2], values[3])
-    };
-
-    Bbox::new(west, south, east, north).map_err(DataServerError::InvalidBbox)
+        [values[0], values[1], values[2], values[3]]
+    })
 }
 
 /// Parse an OGC datetime parameter value.

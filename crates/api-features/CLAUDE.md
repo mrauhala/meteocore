@@ -31,6 +31,14 @@ without reading code.
   `caching.rs` middleware honours a handler-set ETag. It is a near-twin of
   `api-edr/src/caching.rs` — keep the two in sync (ds-core is
   framework-free, so the axum glue cannot be shared; #306).
+- **Part 2 CRS lives in `src/crs.rs`** (#685). `crs::SUPPORTED` is both the
+  advertised collection `crs` list and the set `/items` accepts in `crs` and
+  `bbox-crs` — change them together. Projection math comes from
+  `ds_core::web_mercator` / `ds_core::geo` (Critical Rule 4); this crate only
+  picks the transform and the EPSG axis order (EPSG:4326 lat/lon, EPSG:3035
+  northing/easting). Output is per vertex (Critical Rule 5); a projected
+  `bbox-crs` becomes the envelope of densely sampled edges, never two corners.
+  HTML is CRS84 only.
 - **`api_definition()` is hand-written `serde_json::json!`** and validated
   against `schemas/openapi-3.0.json` in tests. New route or parameter ⇒
   update it in the same PR; copy standard parameter schemas verbatim,

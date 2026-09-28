@@ -1033,6 +1033,7 @@ async fn shared_root_composes_maps_tiles_and_features_over_one_catalog() {
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/html",
         "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
+        "http://www.opengis.net/spec/ogcapi-features-2/1.0/conf/crs",
     ] {
         assert!(
             classes.as_array().unwrap().iter().any(|c| c == class),
@@ -1334,8 +1335,8 @@ async fn shared_root_serves_items_only_for_feature_collections() {
 /// Where Maps and Features both describe a collection, the shared root keeps
 /// Maps' extent (block order) and discovery follows the advertised extent,
 /// never feature bounds the description does not show. A collection that
-/// only Features serves gets Features' extent, CRS84 storage and
-/// `dataType: vector`.
+/// only Features serves gets Features' extent and `crs` list, CRS84 storage
+/// and `dataType: vector`.
 #[tokio::test]
 async fn shared_root_extent_precedence_matches_discovery() {
     let (configs, _, mut maps, mut features) = catalog();
@@ -1414,7 +1415,10 @@ async fn shared_root_extent_precedence_matches_discovery() {
     assert_eq!(features_only["dataType"], "vector");
     assert_eq!(features_only["itemType"], "feature");
     assert_eq!(features_only["storageCrs"], crs84);
-    assert_eq!(features_only["crs"], json!([crs84]));
+    assert_eq!(
+        features_only["crs"],
+        json!(api_features::crs::supported_uris())
+    );
     assert!(!features_only["links"]
         .as_array()
         .unwrap()
@@ -1468,9 +1472,96 @@ async fn items_parameters_follow_features_part_1_on_both_surfaces() {
         );
         assert_eq!(bbox["items"]["type"], "number");
         assert_eq!(parameter("datetime")["schema"]["type"], "string");
-        assert!(api["paths"]
-            .get(format!("{mount}/collections/c-match/items/{{featureId}}"))
-            .is_some());
+        // Features Part 2 declares both as a URI string, form, not exploded.
+        for name in ["crs", "bbox-crs"] {
+            let p = parameter(name);
+            assert_eq!(p["schema"], json!({"type": "string", "format": "uri"}));
+            assert_eq!(
+                (p["in"].clone(), p["style"].clone(), p["explode"].clone()),
+                (json!("query"), json!("form"), json!(false)),
+                "{surface} {name}"
+            );
+        }
+        let item = &api["paths"][format!("{mount}/collections/c-match/items/{{featureId}}")]["get"];
+        assert!(
+            item["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p["$ref"].as_str())
+                .any(|r| api.pointer(r.strip_prefix('#').unwrap()).unwrap()["name"] == "crs"),
+            "{surface}: the item operation takes crs"
+        );
+    }
+}
+
+/// Features Part 2: a feature collection's `crs` list is exactly the set its
+/// `/items` accepts in `crs` and `bbox-crs` (#685) — on `/features`, at the
+/// shared root where Maps' output CRSs describe the collection, and at a shared
+/// root where vector Tiles (CRS84 and Web Mercator tile matrix sets) come
+/// before Features.
+#[tokio::test]
+async fn feature_collection_crs_lists_are_exactly_what_items_accepts() {
+    let vector_shared = {
+        let (configs, _, maps, features) = catalog();
+        let api = api_common::shared::SharedApi::new(
+            "",
+            vec![
+                Arc::new(api_maps::MapsBlock::new(maps_state(
+                    configs.clone(),
+                    HashMap::new(),
+                ))),
+                Arc::new(api_tiles::TilesBlock::new(tiles_state(
+                    configs.clone(),
+                    maps,
+                    features.clone(),
+                    true,
+                ))),
+                Arc::new(api_features::FeaturesBlock::new(features_state(
+                    configs, features,
+                ))),
+            ],
+            vec![],
+        );
+        (
+            Router::new().nest("/base", api_common::shared::router(api)),
+            "/base".to_owned(),
+        )
+    };
+    let crs84 = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+    let mut accepted = api_features::crs::supported_uris();
+    accepted.sort_unstable();
+    for (surface, (app, prefix)) in [
+        ("features", app("features")),
+        ("shared", app("shared")),
+        ("vector-shared", vector_shared),
+    ] {
+        let doc = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+        assert_eq!(doc["itemType"], "feature", "{surface}");
+        let list: Vec<&str> = doc["crs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert_eq!(list[0], crs84, "{surface}: CRS84 is the default");
+        let mut sorted = list.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, accepted, "{surface}: {list:?}");
+        for crs in list {
+            let encoded = crs.replace(':', "%3A").replace('/', "%2F");
+            for query in [format!("crs={encoded}"), format!("bbox-crs={encoded}")] {
+                let url = format!("{prefix}/collections/c-match/items?{query}");
+                let (status, headers, body) = get(&app, &url, None).await;
+                assert_eq!(status, StatusCode::OK, "{surface} {url}: {body}");
+                let expected = if query.starts_with("crs=") {
+                    crs
+                } else {
+                    crs84
+                };
+                assert_eq!(headers["content-crs"], format!("<{expected}>"), "{url}");
+            }
+        }
     }
 }
 

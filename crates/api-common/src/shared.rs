@@ -8,8 +8,8 @@
 //! the Common resources and merges a collection's contributions into one
 //! description: links are concatenated in block order, the first block to
 //! describe a field wins (unless an earlier block [claims](Contribution::claims)
-//! it), and `styles` merge by style id so each block can add its per-style
-//! links. Common Part 2 §6.2: "the available data access
+//! it), `styles` merge by style id so each block can add its per-style
+//! links, and `crs` lists union in block order. Common Part 2 §6.2: "the available data access
 //! mechanisms supported for a specific collection are typically advertised by
 //! including links … in the links array of the collection description."
 //!
@@ -517,6 +517,9 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
                 Entry::Occupied(mut entry) if entry.key() == "styles" => {
                     merge_styles(entry.get_mut(), value);
                 }
+                Entry::Occupied(mut entry) if entry.key() == "crs" => {
+                    merge_crs(entry.get_mut(), value);
+                }
                 // The first block to describe a field wins.
                 Entry::Occupied(_) => {}
             }
@@ -538,6 +541,22 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
         bbox,
         time,
     })
+}
+
+/// Union `crs` lists, keeping the earlier block's order (its first entry is
+/// the default). The collection offers every CRS one of its access
+/// mechanisms serves, and Features Part 2 requires `/items` to accept
+/// exactly its collection's list, so a vector-tiled feature collection
+/// cannot advertise only its tile matrix sets' CRSs (#685).
+fn merge_crs(existing: &mut Value, incoming: Value) {
+    let (Value::Array(existing), Value::Array(incoming)) = (existing, incoming) else {
+        return;
+    };
+    for crs in incoming {
+        if !existing.contains(&crs) {
+            existing.push(crs);
+        }
+    }
 }
 
 /// Merge style entries by `id`: a later block's links join the earlier
@@ -717,14 +736,14 @@ mod tests {
     fn merge_keeps_first_fields_concatenates_links_and_joins_styles_by_id() {
         let maps = contribution(
             "radar",
-            json!({"crs": ["maps"], "styles": [
+            json!({"crs": ["crs84", "maps"], "dataType": "map", "styles": [
                 {"id": "default", "links": [{"rel": "map", "href": "/m/default"}]},
                 {"id": "rain", "links": [{"rel": "map", "href": "/m/rain"}]}]}),
             vec![json!({"rel": "map", "href": "/map"})],
         );
         let tiles = contribution(
             "radar",
-            json!({"crs": ["tiles"], "dataType": "map", "styles": [
+            json!({"crs": ["crs84", "tiles"], "dataType": "vector", "styles": [
                 {"id": "default", "links": [
                     {"rel": "map", "href": "/m/default"},
                     {"rel": rel::TILESETS_MAP, "href": "/t/default"}]},
@@ -732,8 +751,12 @@ mod tests {
             vec![json!({"rel": rel::TILESETS_MAP, "href": "/map/tiles"})],
         );
         let merged = merge(vec![maps, tiles], "https://x").unwrap().metadata;
-        assert_eq!(merged["crs"], json!(["maps"]));
-        assert_eq!(merged["dataType"], "map");
+        assert_eq!(
+            merged["crs"],
+            json!(["crs84", "maps", "tiles"]),
+            "crs lists union, earlier order first"
+        );
+        assert_eq!(merged["dataType"], "map", "the first block wins");
         let rels: Vec<_> = merged["links"]
             .as_array()
             .unwrap()

@@ -12,7 +12,8 @@ Features work.
 `temporal_extent`) — must update the tables below in the same PR.** The
 `crates/api-features/CLAUDE.md` rule points here.
 
-Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4). Served twice from
+Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4) and Part 2:
+Coordinate Reference Systems by Reference 1.0 (OGC 18-058). Served twice from
 the same handlers and state: the per-API service at `/features`, and as a
 building block of the shared OGC API root at `/` (see
 [Shared OGC API root](#shared-ogc-api-root)).
@@ -26,7 +27,7 @@ building block of the shared OGC API root at `/` (see
 | Part 1 `geojson` | ✓ | GeoJSON feature encoding (default) |
 | Part 1 `html` | ✓ | metadata, feature pages and individual features negotiate HTML; property tables, geometry details and a map using the preview’s vendored MapLibre assets |
 | Part 1 `gmlsf0` / `gmlsf2` | ✗ | no GML |
-| Part 2 CRS by reference (`crs`) | ✗ | CRS84 only; `crs` on `/items` returns 400; collections advertise `crs: [CRS84]` + `storageCrs` |
+| Part 2 CRS by reference (`crs`) | ✓ | `crs` on `/items` and `/items/{featureId}`, `bbox-crs` on `/items`, `Content-Crs` on every feature response; collections advertise CRS84, EPSG:4326, EPSG:3857, EPSG:3067 and EPSG:3035 with `storageCrs` CRS84 — see [CRS by reference](#crs-by-reference-part-2) (#685) |
 | Part 3 Filtering / CQL2 (`filter`, `queryables`) | ✗ | `filter` controls return 400; no `/queryables` |
 | Part 4 Create/Replace/Update/Delete | ✗ | read-only server by design |
 | Part 5 Schemas | ✗ | no `/schema`; properties are untyped `PropertyValue`s |
@@ -68,7 +69,7 @@ imply a regular sampling grid.
 | `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
 | `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link; a `tilesets-vector` link when the Tiles service registered the collection for vector tiles (listing `tiles` in `apis` is not enough: a nowcast renders only map tiles) |
 | `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
-| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links; takes only `f` — any other parameter (`crs`, `properties`, a filter, a duplicate `f`) → 400 (#681) |
+| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links; takes only `f` and `crs` — any other parameter (`bbox-crs`, `properties`, a filter, a duplicate) → 400 (#681) |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
 
 ## Shared OGC API root
@@ -89,19 +90,22 @@ and Tiles. The same handlers serve:
   `/items` is 404.
 - **Field precedence** follows block order. A collection only Features serves
   (CSV observations, BUFR stations, the PVOL site inventory) is
-  `dataType: vector` with CRS84 `crs` and `storageCrs`. Where Maps also serves
-  it (CAP, nowcast, lightning events), the extent, `crs` and `dataType` are
-  Maps', collection search follows that extent, and a projected raster's
-  unknown `storageCrs` stays unlabelled instead of becoming CRS84. Vector-tiled
-  GeoJSON takes `dataType` and `crs` from Tiles and `storageCrs` from Features.
+  `dataType: vector` with Features' `crs` list and CRS84 `storageCrs`. Where
+  Maps also serves it (CAP, nowcast, lightning events), the extent and
+  `dataType` are Maps', collection search follows that extent, and a projected
+  raster's unknown `storageCrs` stays unlabelled instead of becoming CRS84.
+  Vector-tiled GeoJSON takes `dataType` from Tiles and `storageCrs` from
+  Features. `crs` lists union in block order; Maps' and Tiles' lists hold no
+  CRS Features lacks, so a feature collection's list is exactly what `/items`
+  accepts (the `common_discovery` contract test pins this).
 - **Links:** vector tilesets are Tiles' own shared-root link
   (`/collections/{id}/tiles`); the per-API service's cross-link to
   `/tiles/…` is not repeated.
 - **OpenAPI:** the items operations join the shared `/api`, with components
   named `features-bbox`, `features-limit`, … because Maps already defines a
   different `bbox`, `datetime` and `link`.
-- **Conformance:** `/conformance` adds Features `core`, `oas30`, `geojson` and
-  `html`.
+- **Conformance:** `/conformance` adds Features `core`, `oas30`, `geojson`,
+  `html` and Part 2 `crs`.
 
 The per-API `/features` service is unchanged: the tutka.meteo.fi client and the
 MCP tool guide use it.
@@ -117,13 +121,14 @@ tiles render the selected instant. Not part of this crate.
 
 | Parameter | Status | Notes |
 |---|---|---|
-| `bbox` | ✓ | 4 or 6 values (heights ignored); `west > east` is an antimeridian-crossing box (Features §7.15.3); 400 on malformed input |
+| `bbox` | ✓ | 4 or 6 values (heights ignored), in `bbox-crs`; `west > east` is an antimeridian-crossing box (Features §7.15.3); 400 on malformed input |
 | `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`; an interval that ends before it starts is 400. Engines with no time dimension (GeoJSON, PostGIS stations) answer 400 rather than ignoring it (#682); CSV filters stations to those with a report in the interval — see matrix |
 | `limit` | ✓ | default 100, clamped to `[1, 1000]` (out-of-range values are clamped, not rejected) |
 | `offset` | ✓ | offset pagination (non-standard extension; Part 1 only mandates `next`) |
 | `sortby` | ✓ | Part 8 syntax `[+\|-]property,…`; a decoded `+` (space) is accepted as ascending; 400 unless every property is in `FeatureEngine::sortables`; applied before paging (`ds_core::feature::sort_features`) |
 | `f` | ✓ | `json` (GeoJSON for features) / `html` on metadata, `/items` and `/items/{featureId}`; overrides `Accept`; feature routes also accept `application/geo+json` (encode `+` as `%2B`), `application/json`, and `text/html` aliases, case-insensitively; unsupported formats → 400. HTML pagination retains format, filters and sort |
-| `crs`, `bbox-crs` (on `/items`) | ✗ | 400; CRS84 only |
+| `crs` | ✓ | Part 2: one of the collection's `crs` URIs (or its `https` / `[EPSG:4326]` / `EPSG:4326` forms); geometry reprojected per vertex in that CRS's axis order; default CRS84; 400 naming the valid URIs otherwise. GeoJSON only: HTML with another CRS → 400 |
+| `bbox-crs` | ✓ | Part 2: CRS of `bbox`, same values as `crs`; the engine gets a CRS84 box. Validated even without `bbox` |
 | `filter`, `filter-lang`, `filter-crs` | ✗ | 400 (CQL2 is not implemented) |
 | `properties` | ✗ | 400; every property is always returned |
 | `<property>=value` (Part 1 §7.15.5–6 optional property filters) | ✓ | validated against `FeatureEngine::filterables`; unknown names → 400 listing valid ones; exact strings, list membership, canonical numbers/bools; numeric comma-separated alternatives; predicates ANDed before counting/sorting/paging |
@@ -139,6 +144,44 @@ are ANDed with each other and with `bbox`/`datetime`. For a list, each predicate
 can match a different element. Empty strings remain valid literal values.
 Names and values are URL-encoded in every `self`/`next`/`prev` link, including
 numeric alternative lists.
+
+### CRS by reference (Part 2)
+
+Engines hold CRS84 geometry; `crs` and `bbox-crs` are an output and input
+transform in this crate (`src/crs.rs`), with the projection math from
+`ds_core::web_mercator` and `ds_core::geo::projected_output_crs` — the same
+definitions Maps renders with. Each collection's `crs` list is exactly the set
+`/items` accepts, on `/features` and at the shared root.
+
+| CRS | URI | Axis order (`crs` output and `bbox-crs` input) |
+|---|---|---|
+| CRS84 (default, `storageCrs`) | `http://www.opengis.net/def/crs/OGC/1.3/CRS84` | longitude, latitude |
+| EPSG:4326 | `http://www.opengis.net/def/crs/EPSG/0/4326` | latitude, longitude |
+| EPSG:3857 | `http://www.opengis.net/def/crs/EPSG/0/3857` | easting, northing |
+| EPSG:3067 | `http://www.opengis.net/def/crs/EPSG/0/3067` | easting, northing |
+| EPSG:3035 | `http://www.opengis.net/def/crs/EPSG/0/3035` | northing, easting |
+
+Axis orders are EPSG's, as PROJ's `cs2cs` prints them; the tests pin projected
+coordinates against it. Note that WMS here takes EPSG:3035 `BBOX` easting first.
+
+- **`Content-Crs`** (`<uri>`) is on every `/items` and `/items/{featureId}`
+  response, CRS84 included.
+- **Output:** every vertex is reprojected. A geometry with a vertex that has no
+  finite coordinates in the CRS (the South Pole in EPSG:3857) is `null`.
+  Regional projections stay defined far outside their area of use, where the
+  numbers mean little.
+- **`bbox-crs`:** EPSG:4326 swaps the axes; a longitude west edge east of the
+  east edge still crosses the antimeridian. EPSG:3857 maps exactly, and a box
+  with `minx > maxx` or past ±180° crosses the antimeridian. EPSG:3067/3035
+  boxes (lower corner first) become the envelope of densely sampled edge points,
+  so a curved edge between corners is covered, widened to a pole the box
+  contains. The envelope may also match features just outside the projected
+  rectangle near its corners, never fewer.
+- **Links:** `self`/`next`/`prev` and each feature's `self` repeat a requested
+  `crs`; the bbox is repeated as its CRS84 conversion, without `bbox-crs`. The
+  HTML view is CRS84, so the GeoJSON response's `alternate` HTML link drops `crs`.
+- Not implemented: the optional `/collections` global CRS list (`#/crs`
+  references), `storageCrsCoordinateEpoch`, 3D CRSs (CRS84h).
 
 `/features/api` lists the accepted property parameters per collection from
 cached engine catalogs. CAP, GeoJSON and PostGIS advertise names present in
@@ -233,10 +276,8 @@ responses are buffered rather than streamed.
 2. Declare Part 8 sorting + serve `/sortables` (#683).
 3. PostGIS events shape as Features items with keyset pagination (#503).
 4. `Geometry::LineString` for storm tracks (#408); polygon cells.
-5. Part 2 CRS (`crs`, `bbox-crs` on `/items`) — engines hold CRS84 only, so
-   this is an output-transform concern in the API layer (#685).
-6. Part 3 CQL2 filtering + `/queryables`; Part 5 `/schema` (#686).
-7. GeoJSON engine `bbox` refines envelope hits against the geometry (#687).
+5. Part 3 CQL2 filtering + `/queryables`; Part 5 `/schema` (#686).
+6. GeoJSON engine `bbox` refines envelope hits against the geometry (#687).
 
 Related issues: #605 sortby · #532 pagination without materializing · #503
 PostGIS events items · #408 LineString · #119 ErrorReason · #127 MVT ·
