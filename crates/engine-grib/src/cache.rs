@@ -357,10 +357,14 @@ impl DecodedGrid {
     ///   sample per pixel. This path also keeps the ±360° longitude wrap that a
     ///   global grid needs for viewports crossing the antimeridian.
     /// - `Projected` (EPSG:3067/3035): `project_node` runs `Crs::inverse` per
-    ///   node — so map output→source through [`ProjectionGrid::build_2d`] (coarse
+    ///   node — so map output→source through a [`ProjectionGrid`] (coarse
     ///   grid + bilinear) rather than per pixel, per the CLAUDE.md "never project
-    ///   per output pixel" rule (matches engine-geotiff/odim-COMP). Projected
-    ///   output is regional, so no cell crosses the antimeridian wrap.
+    ///   per output pixel" rule (matches engine-geotiff/odim-COMP). A global
+    ///   grid passes its column period, so cells across the output inverse's
+    ///   longitude cut or around a pole — both inside any projected view of
+    ///   the Arctic — stay registered (#323).
+    ///
+    /// [`ProjectionGrid`]: ds_core::resample::ProjectionGrid
     pub fn resample(
         &self,
         bbox: [f64; 4],
@@ -409,11 +413,12 @@ impl DecodedGrid {
 
         match output_crs {
             OutputCrs::Projected { .. } => {
-                let grid = ds_core::resample::ProjectionGrid::build_2d(
+                let grid = ds_core::resample::ProjectionGrid::build_2d_periodic(
                     width,
                     height,
                     self.ni as u32,
                     self.nj as u32,
+                    self.wrap_modulus(),
                     |fx, fy| output_crs.project_node(bbox, fx, fy),
                     |lon, lat| self.lonlat_to_src_px(lon, lat),
                 );
@@ -756,6 +761,82 @@ mod tests {
             assert!(
                 *v > 0.5,
                 "lon_first seam mis-sample: cos={v} (≈ -1 means it sampled ~180° away)"
+            );
+        }
+    }
+
+    /// #323: a global grid rendered on the EPSG:3035 WMS meta-tile (level
+    /// 10, 4 km texels) that holds the North Pole and the 170°W longitude
+    /// cut of the 3035 inverse. Three fields — cos lon, sin lon, lat — let
+    /// every pixel report where it sampled. Before the fix the pole region
+    /// rendered blank wedges and the cut sampled ~180° away.
+    #[test]
+    fn resample_projected_global_grid_registers_over_the_pole() {
+        let (ni, nj) = (360usize, 181usize);
+        let field = |f: fn(f64, f64) -> f64| DecodedGrid {
+            ni,
+            nj,
+            lon_first: 0.0,
+            lat_first: 90.0,
+            lon_inc: 1.0,
+            lat_inc: -1.0,
+            values: Arc::new(
+                (0..nj)
+                    .flat_map(|r| (0..ni).map(move |c| f(c as f64, 90.0 - r as f64) as f32))
+                    .collect(),
+            ),
+            triple: (0, 0, 0),
+            centre: 0,
+            first_surface_type: 1,
+            first_surface_value: None,
+        };
+        let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
+        let bbox = [4_096_000.0, 7_168_000.0, 5_120_000.0, 8_192_000.0];
+        let read = ds_core::geo::wgs84_envelope(&crs, bbox).unwrap();
+        let output = OutputCrs::Projected { crs, bbox };
+        let render = |f: fn(f64, f64) -> f64| field(f).resample(read, 256, 256, &output);
+        let cos = render(|lon, _| lon.to_radians().cos());
+        let sin = render(|lon, _| lon.to_radians().sin());
+        let lat = render(|_, lat| lat);
+        let at = |ox: usize, oy: usize| {
+            let i = oy * 256 + ox;
+            match (cos[i], sin[i], lat[i]) {
+                (Some(c), Some(s), Some(l)) => Some((s.atan2(c).to_degrees(), l)),
+                _ => None,
+            }
+        };
+        let blank = (0..256 * 256)
+            .filter(|i| at(i % 256, i / 256).is_none())
+            .count();
+        assert_eq!(blank, 0, "the whole tile is on the globe");
+
+        let ground_km = |(lon1, lat1): (f64, f64), (lon2, lat2): (f64, f64)| {
+            let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+            let dl = (lon2 - lon1).to_radians();
+            let h =
+                ((p2 - p1) / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+            2.0 * 6371.0 * h.sqrt().min(1.0).asin()
+        };
+        // Pixel centres pinned to `cs2cs +proj=laea +lat_0=52 +lon_0=10
+        // +x_0=4321000 +y_0=3210000 +datum=WGS84 +units=m +to
+        // +proj=longlat +datum=WGS84` (PROJ 9.8): either side of the cut,
+        // around the pole (at pixel 56.25, 205.57), and far corners.
+        for (ox, oy, lon, lat) in [
+            (55, 100, -169.641582578, 85.991893101),
+            (56, 100, -170.119473941, 85.991965549),
+            (60, 200, 153.238680311, 89.759875091),
+            (50, 210, -36.208945280, 89.730344939),
+            (62, 208, 72.354877183, 89.761205443),
+            (255, 0, 150.865239665, 79.563619678),
+            (0, 255, -35.403882861, 87.335741867),
+            (200, 40, 153.342493925, 81.976953632),
+            (20, 240, -32.733783926, 88.210352817),
+        ] {
+            let sampled = at(ox, oy).unwrap();
+            let km = ground_km(sampled, (lon, lat));
+            assert!(
+                km < 2.0,
+                "pixel ({ox}, {oy}) sampled {sampled:?}, PROJ ({lon}, {lat}): {km:.1} km off"
             );
         }
     }

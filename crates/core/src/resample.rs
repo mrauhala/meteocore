@@ -50,9 +50,10 @@ const MAX_CELLS: u32 = 256;
 /// boundary to this many pixels.
 const BOUNDARY_STEP_PX: f64 = 2.0;
 
-/// Interpolation-error budget, in source pixels. Refinement stops once the
-/// estimated error over the on-raster region drops below this. Kept well under
-/// the 0.5 px resolution of nearest-neighbour resampling.
+/// Interpolation-error budget, in source pixels (output pixels on a periodic
+/// column axis, see [`ProjectionGrid::build_2d_periodic`]). Refinement stops
+/// once the estimated error over the on-raster region drops below this. Kept
+/// well under the 0.5 px resolution of nearest-neighbour resampling.
 const MAX_INTERP_ERROR_PX: f64 = 0.2;
 
 /// Per-axis fractions of the 2-D grid of interior probe points `(tx, ty)` that
@@ -102,9 +103,15 @@ pub struct ProjectionGrid {
     /// Exact `(col, row)` source pixel coordinates at each node, row-major,
     /// `(cells_y + 1)` rows of `stride` nodes.
     nodes: Vec<(f64, f64)>,
-    /// Sub-grids of the cells on a domain boundary, keyed and sorted by the
-    /// index of the cell's top-left node.
+    /// Sub-grids of the cells on a domain boundary or around a pole, keyed
+    /// and sorted by the index of the cell's top-left node.
     boundary: Vec<(usize, SubGrid)>,
+    /// Source columns per 360° when the column axis is a whole turn of
+    /// longitude (see [`ProjectionGrid::build_2d_periodic`]).
+    col_period: Option<f64>,
+    /// Whether `boundary` holds a pole cell — one with four finite corners,
+    /// which [`Self::sample`] must still route to its sub-grid.
+    pole_cells: bool,
 }
 
 /// A boundary cell's nodes at [`BOUNDARY_STEP_PX`] spacing, row-major.
@@ -118,7 +125,7 @@ impl SubGrid {
     /// Interpolated source `(col, row)` at fractional position `(tx, ty)`
     /// within the cell; non-finite where the enclosing sub-cell touches
     /// the boundary.
-    fn sample(&self, tx: f64, ty: f64) -> (f64, f64) {
+    fn sample(&self, tx: f64, ty: f64, col_period: Option<f64>) -> (f64, f64) {
         let gx = tx * self.cells_x as f64;
         let gy = ty * self.cells_y as f64;
         let cx = (gx.floor() as usize).min(self.cells_x - 1);
@@ -126,13 +133,62 @@ impl SubGrid {
         let (tx, ty) = (gx - cx as f64, gy - cy as f64);
         let stride = self.cells_x + 1;
         let n = cy * stride + cx;
-        let (c00, c10) = (self.nodes[n], self.nodes[n + 1]);
-        let (c01, c11) = (self.nodes[n + stride], self.nodes[n + stride + 1]);
+        let [c00, c10, c01, c11] = unwrap_cols(
+            [
+                self.nodes[n],
+                self.nodes[n + 1],
+                self.nodes[n + stride],
+                self.nodes[n + stride + 1],
+            ],
+            col_period,
+        );
         (
             bilerp(c00.0, c10.0, c01.0, c11.0, tx, ty),
             bilerp(c00.1, c10.1, c01.1, c11.1, tx, ty),
         )
     }
+}
+
+/// `d` reduced to within half a turn of zero, for a period of `p`.
+#[inline]
+fn wrap_half(d: f64, p: f64) -> f64 {
+    d - p * (d / p).round()
+}
+
+/// A cell's corners `[c00, c10, c01, c11]` with their columns unwrapped to
+/// within half a turn of the first finite one. On a periodic column axis two
+/// adjacent nodes either side of the source's seam (or of the output
+/// projection's longitude cut) are a column apart, not a turn apart;
+/// interpolating the raw columns would sweep the whole grid in between. The
+/// caller's sampler wraps the interpolated column back into the grid.
+#[inline]
+fn unwrap_cols(mut corners: [(f64, f64); 4], col_period: Option<f64>) -> [(f64, f64); 4] {
+    if let Some(p) = col_period {
+        if let Some(r) = corners.iter().map(|c| c.0).find(|c| c.is_finite()) {
+            for c in &mut corners {
+                c.0 = r + wrap_half(c.0 - r, p);
+            }
+        }
+    }
+    corners
+}
+
+/// Whether a cell's corners `[c00, c10, c01, c11]` bracket a pole of a
+/// periodic column axis: some edge turns more than a quarter of the period.
+/// Around a pole every longitude meets, so the column is singular there and
+/// has no bilinear interpolant — a cell enclosing one winds a whole turn,
+/// and one with the pole on an edge turns half a turn along it. Refining
+/// the whole grid never resolves such a cell (the geometry is self-similar
+/// around the pole), so it gets a sub-grid instead. Always `false` without a
+/// period or with a non-finite corner.
+fn brackets_pole(corners: &[(f64, f64); 4], col_period: Option<f64>) -> bool {
+    let Some(p) = col_period else {
+        return false;
+    };
+    let [c00, c10, c01, c11] = corners.map(|c| c.0);
+    [(c00, c10), (c10, c11), (c11, c01), (c01, c00)]
+        .iter()
+        .any(|&(a, b)| wrap_half(b - a, p).abs() > p / 4.0)
 }
 
 impl ProjectionGrid {
@@ -196,6 +252,45 @@ impl ProjectionGrid {
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> Self {
+        Self::build_2d_periodic(
+            out_width,
+            out_height,
+            src_cols,
+            src_rows,
+            None,
+            out_to_world,
+            world_to_src_px,
+        )
+    }
+
+    /// Like [`build_2d`](Self::build_2d) for a source whose column axis may
+    /// be a whole turn of longitude: `col_period = Some(p)` for a global
+    /// lat/lon grid with `p` columns per 360° (`None` is exactly
+    /// `build_2d`). `world_to_src_px` must then be continuous in longitude
+    /// and the caller's sampler must wrap the column it is given modulo `p`.
+    ///
+    /// A global source in a projected output CRS meets two longitude
+    /// discontinuities `build_2d` cannot interpolate across (#323): the
+    /// output inverse's cut (EPSG:3035 returns longitudes within ±180° of
+    /// 10°E, so they jump a turn along 170°W) and the poles, where every
+    /// longitude meets. With a period, each cell's columns are unwrapped
+    /// before interpolating, so the cut costs nothing; a cell around a pole
+    /// gets a [`BOUNDARY_STEP_PX`] sub-grid and is left out of the error
+    /// estimate. The error budget becomes a ground distance in output
+    /// pixels, the column error measured along the parallel (scaled by
+    /// cos lat): a source-pixel budget cannot converge on a column axis that
+    /// shrinks to a point at the pole, and is too loose where one source
+    /// pixel spans several output pixels.
+    pub fn build_2d_periodic(
+        out_width: u32,
+        out_height: u32,
+        src_cols: u32,
+        src_rows: u32,
+        col_period: Option<f64>,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
+        let col_period = col_period.filter(|p| p.is_finite() && *p > 0.0);
         let mut cells_x = out_width.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS);
         let mut cells_y = out_height
             .div_ceil(GRID_STEP_PX)
@@ -206,6 +301,7 @@ impl ProjectionGrid {
                 out_height,
                 cells_x,
                 cells_y,
+                col_period,
                 &out_to_world,
                 &world_to_src_px,
             );
@@ -240,7 +336,8 @@ impl ProjectionGrid {
     /// Give every cell on a domain boundary — some corner nodes finite,
     /// some not — a sub-grid at [`BOUNDARY_STEP_PX`] spacing, so the
     /// boundary is resolved to that many pixels instead of blanking the
-    /// whole cell.
+    /// whole cell. A cell bracketing a pole of a periodic column axis gets
+    /// one too, confining the pole's singularity to one sub-cell.
     ///
     /// This stays a coarse-grid mapping (Critical Rule 5): a boundary curve
     /// crosses O(perimeter / cell) cells, each costing
@@ -271,13 +368,15 @@ impl ProjectionGrid {
                     self.nodes[n + self.stride + 1],
                 ];
                 let valid = corners.iter().filter(|&&c| finite(c)).count();
-                if valid == 0 || valid == 4 {
+                let pole = valid == 4 && brackets_pole(&corners, self.col_period);
+                if valid == 0 || (valid == 4 && !pole) {
                     continue;
                 }
                 if per_cell > budget {
                     return;
                 }
                 budget -= per_cell;
+                self.pole_cells |= pole;
                 let mut nodes = Vec::with_capacity(per_cell);
                 for j in 0..=sub_y {
                     let fy = (cy as f64 + j as f64 / sub_y as f64) / self.cells_y as f64;
@@ -300,12 +399,13 @@ impl ProjectionGrid {
     }
 
     /// Build a grid with an explicit cell count (no refinement).
-    #[allow(clippy::too_many_arguments)] // output dims + cell counts + 2 mapping closures are all genuine inputs
+    #[allow(clippy::too_many_arguments)] // output dims + cell counts + period + 2 mapping closures are all genuine inputs
     fn with_cells(
         out_width: u32,
         out_height: u32,
         cells_x: u32,
         cells_y: u32,
+        col_period: Option<f64>,
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> Self {
@@ -330,6 +430,8 @@ impl ProjectionGrid {
             stride,
             nodes,
             boundary: Vec::new(),
+            col_period,
+            pole_cells: false,
         }
     }
 
@@ -346,6 +448,15 @@ impl ProjectionGrid {
     /// nodata regardless of interpolation error, so refining for them would be
     /// wasted work (and could needlessly hit the [`MAX_CELLS`] cap on a viewport
     /// that mostly misses the raster).
+    ///
+    /// On a periodic column axis every column is on-raster, the column error
+    /// is taken modulo the period and scaled by cos lat (a distance along
+    /// the parallel), and cells bracketing a pole are skipped — they get a
+    /// sub-grid instead (see [`Self::build_2d_periodic`]). That ground error
+    /// is reported in output pixels, using the cell's own footprint: a
+    /// global grid's pixel is tens of kilometres, several output pixels of a
+    /// regional view, so a fifth of a source pixel would still be visibly
+    /// misregistered there.
     fn estimate_error(
         &self,
         src_cols: u32,
@@ -355,14 +466,27 @@ impl ProjectionGrid {
     ) -> f64 {
         // Generous on-raster window: within one raster-size of the data.
         let (w, h) = (src_cols as f64, src_rows as f64);
-        let in_window = |c: f64, r: f64| c > -w && c < 2.0 * w && r > -h && r < 2.0 * h;
+        let periodic = self.col_period.is_some();
+        let in_window =
+            |c: f64, r: f64| (periodic || (c > -w && c < 2.0 * w)) && r > -h && r < 2.0 * h;
 
         let mut max = 0.0_f64;
         for j in 0..self.cells_y {
             for i in 0..self.cells_x {
                 let n = j * self.stride + i;
-                let (c00, c10) = (self.nodes[n], self.nodes[n + 1]);
-                let (c01, c11) = (self.nodes[n + self.stride], self.nodes[n + self.stride + 1]);
+                let corners = unwrap_cols(
+                    [
+                        self.nodes[n],
+                        self.nodes[n + 1],
+                        self.nodes[n + self.stride],
+                        self.nodes[n + self.stride + 1],
+                    ],
+                    self.col_period,
+                );
+                if brackets_pole(&corners, self.col_period) {
+                    continue;
+                }
+                let [c00, c10, c01, c11] = corners;
                 for (tx, ty) in error_probes() {
                     let (lon, lat) = out_to_world(
                         (i as f64 + tx) / self.cells_x as f64,
@@ -374,7 +498,19 @@ impl ProjectionGrid {
                     }
                     let ic = bilerp(c00.0, c10.0, c01.0, c11.0, tx, ty);
                     let ir = bilerp(c00.1, c10.1, c01.1, c11.1, tx, ty);
-                    max = max.max((ic - ec).abs()).max((ir - er).abs());
+                    let Some(p) = self.col_period else {
+                        max = max.max((ic - ec).abs()).max((ir - er).abs());
+                        continue;
+                    };
+                    let k = lat.to_radians().cos().abs();
+                    let err = (wrap_half(ic - ec, p).abs() * k).max((ir - er).abs());
+                    // One output pixel's footprint, in the same units: the
+                    // cell's mean edge per output pixel along each axis.
+                    let edge = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0) * k).hypot(b.1 - a.1);
+                    let px = ((edge(c00, c10) + edge(c01, c11)) / self.cell_w)
+                        .max((edge(c00, c01) + edge(c10, c11)) / self.cell_h)
+                        / 2.0;
+                    max = max.max(if px > 0.0 { err / px } else { err });
                 }
             }
         }
@@ -395,6 +531,10 @@ impl ProjectionGrid {
     /// such a domain boundary and is interpolated from its
     /// [`BOUNDARY_STEP_PX`] sub-grid, so the defined region is under-filled
     /// by at most that many pixels along the boundary.
+    ///
+    /// On a periodic column axis ([`Self::build_2d_periodic`]) the column is
+    /// continuous across the source's seam but not reduced into the grid:
+    /// the caller wraps it modulo the period.
     pub fn sample(&self, ox: u32, oy: u32) -> (f64, f64) {
         // Position of the pixel centre in grid-cell units.
         let gx = (ox as f64 + 0.5) / self.cell_w;
@@ -406,19 +546,23 @@ impl ProjectionGrid {
         let ty = gy - cy as f64;
 
         let i00 = cy * self.stride + cx;
-        let (c00, c10) = (self.nodes[i00], self.nodes[i00 + 1]);
-        let (c01, c11) = (
-            self.nodes[i00 + self.stride],
-            self.nodes[i00 + self.stride + 1],
+        let [c00, c10, c01, c11] = unwrap_cols(
+            [
+                self.nodes[i00],
+                self.nodes[i00 + 1],
+                self.nodes[i00 + self.stride],
+                self.nodes[i00 + self.stride + 1],
+            ],
+            self.col_period,
         );
 
         let col = bilerp(c00.0, c10.0, c01.0, c11.0, tx, ty);
         let row = bilerp(c00.1, c10.1, c01.1, c11.1, tx, ty);
-        if col.is_finite() && row.is_finite() {
+        if col.is_finite() && row.is_finite() && !self.pole_cells {
             return (col, row);
         }
         match self.boundary.binary_search_by_key(&i00, |(cell, _)| *cell) {
-            Ok(k) => self.boundary[k].1.sample(tx, ty),
+            Ok(k) => self.boundary[k].1.sample(tx, ty, self.col_period),
             Err(_) => (col, row),
         }
     }
@@ -798,6 +942,88 @@ mod tests {
             nodes <= (size * size / 4) as usize,
             "{nodes} sub-grid nodes"
         );
+    }
+
+    /// Great-circle distance in km (sphere) — the ground misregistration
+    /// between a sampled and a reference position.
+    fn ground_km((lon1, lat1): (f64, f64), (lon2, lat2): (f64, f64)) -> f64 {
+        let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+        let dl = (lon2 - lon1).to_radians();
+        let h = ((p2 - p1) / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+        2.0 * 6371.0 * h.sqrt().min(1.0).asin()
+    }
+
+    /// #323: a global lat/lon source (GFS-shaped: 0.25°, 1440×721, first
+    /// column at Greenwich) on the EPSG:3035 WMS meta-tile (level 10, 4 km
+    /// texels) holding the North Pole and the 170°W longitude cut of the
+    /// 3035 inverse. Without a period the cut cells interpolated through the
+    /// whole grid (samples ~180° away), and the pole drove every such tile
+    /// to `MAX_CELLS` — tens of seconds per Arctic view.
+    #[test]
+    fn periodic_grid_registers_a_global_source_over_the_pole() {
+        use crate::map_engine::OutputCrs;
+        let bbox = [4_096_000.0, 7_168_000.0, 5_120_000.0, 8_192_000.0];
+        let out = OutputCrs::Projected {
+            crs: crate::geo::projected_output_crs("EPSG:3035").unwrap(),
+            bbox,
+        };
+        let size = 256;
+        let node = |fx: f64, fy: f64| out.project_node([0.0; 4], fx, fy);
+        let to_src = |lon: f64, lat: f64| (lon / 0.25, (90.0 - lat) / 0.25);
+        let grid =
+            ProjectionGrid::build_2d_periodic(size, size, 1440, 721, Some(1440.0), node, to_src);
+        assert!(grid.pole_cells, "the pole cell gets a sub-grid");
+        // Converged within budget: no MAX_CELLS warning for the pole tile.
+        let err = grid.estimate_error(1440, 721, node, to_src);
+        assert!(err <= MAX_INTERP_ERROR_PX, "estimate {err} over budget");
+        let at = |ox: u32, oy: u32| {
+            let (c, r) = grid.sample(ox, oy);
+            (c * 0.25, 90.0 - r * 0.25)
+        };
+        // Pixel centres pinned to `cs2cs +proj=laea +lat_0=52 +lon_0=10
+        // +x_0=4321000 +y_0=3210000 +datum=WGS84 +units=m +to
+        // +proj=longlat +datum=WGS84` (PROJ 9.8): either side of the cut,
+        // around the pole (at pixel 56.25, 205.57), and the corners.
+        let pins = [
+            (55, 100, -169.641582578, 85.991893101),
+            (56, 100, -170.119473941, 85.991965549),
+            (55, 20, -169.799393084, 82.903521887),
+            (56, 20, -170.066869241, 82.903563322),
+            (60, 200, 153.238680311, 89.759875091),
+            (50, 210, -36.208945280, 89.730344939),
+            (52, 205, -81.248427083, 89.873093569),
+            (62, 208, 72.354877183, 89.761205443),
+            (0, 0, -156.855754147, 81.896455619),
+            (255, 0, 150.865239665, 79.563619678),
+            (0, 255, -35.403882861, 87.335741867),
+            (255, 255, 86.139274750, 83.015023026),
+            (128, 128, 150.727354516, 86.172095052),
+        ];
+        for (ox, oy, lon, lat) in pins {
+            let km = ground_km(at(ox, oy), (lon, lat));
+            assert!(
+                km < 2.0,
+                "pixel ({ox}, {oy}) sampled {:?}, PROJ ({lon}, {lat}): {km:.1} km off",
+                at(ox, oy)
+            );
+        }
+        // Every pixel within half a texel of the exact per-pixel mapping
+        // (the inverse itself is pinned to PROJ in geo's LAEA test), except
+        // within the pole's own sub-cell, interpolated across the
+        // singularity: there within one texel.
+        for oy in 0..size {
+            for ox in 0..size {
+                let (fx, fy) = (ox as f64 + 0.5, oy as f64 + 0.5);
+                let exact = node(fx / size as f64, fy / size as f64);
+                let km = ground_km(at(ox, oy), exact);
+                let limit = if (fx - 56.25).hypot(fy - 205.57) < BOUNDARY_STEP_PX {
+                    4.0
+                } else {
+                    2.0
+                };
+                assert!(km < limit, "pixel ({ox}, {oy}) {km:.2} km off (texel 4 km)");
+            }
+        }
     }
 
     /// Web Mercator latitude for fractional y in `[0, 1]` over `[south, north]`.
