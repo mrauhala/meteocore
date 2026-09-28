@@ -1353,6 +1353,11 @@ impl GeoTiffEngine {
 
         let nx = (col_end - col_start) as usize;
         let ny = (row_end - row_start) as usize;
+        // The shared per-response budget (#673) over EVERY matching timestep,
+        // before the `timesteps × ny × nx` result is allocated or a file read
+        // (#858). The answer stays at native resolution, like GRIB: no
+        // `MAX_AREA_DIM` coarsening, so an over-budget window is the 400.
+        ds_core::feature::check_area_budget(entries.len(), ny, nx, 1)?;
 
         // Build x and y axis values (pixel centers).
         // For projected CRS (LCC, TM, etc.) WGS84 axes aren't truly separable —
@@ -1396,14 +1401,12 @@ impl GeoTiffEngine {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }
-                Err(
-                    e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
-                ) => return Err(e),
-                Err(e) => {
+                Err(e) if is_unreadable_file(&e) => {
                     tracing::warn!("Failed to read bbox from {}: {e}", entry.path.display());
                     // Fill with None for this timestep
                     all_values.extend(std::iter::repeat_n(None, nx * ny));
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1458,6 +1461,18 @@ impl GeoTiffEngine {
             ranges,
         })
     }
+}
+
+/// Whether an EDR area read error means the file itself could not be read
+/// (fetch, decode or I/O failure), which the query answers as a timestep of
+/// nulls. Every other error belongs to the request and fails it (#858):
+/// admission and deadline (503/504), and client errors such as
+/// `QueryTooLarge` / `InvalidParameter` (400) — never nulls with HTTP 200.
+fn is_unreadable_file(e: &DataServerError) -> bool {
+    matches!(
+        e,
+        DataServerError::Engine(_) | DataServerError::Storage(_) | DataServerError::Io(_)
+    )
 }
 
 /// Filter catalog entries by an optional datetime range.
@@ -2637,5 +2652,142 @@ mod tests {
     #[test]
     fn template_no_codes_rejected() {
         assert!(expand_filename_template("radar_data.tif").is_err());
+    }
+
+    /// The committed five-timestep WGS84 radar fixture: 3249 × 1750 pixels
+    /// of ~0.0116°, so the whole raster (5.7 M) is over the 1 M area budget at
+    /// one timestep, and an 8° × 4.6° window (~275 k) only across all five.
+    fn radar_engine() -> GeoTiffEngine {
+        let config = GeoTiffConfig {
+            filename_template: Some("radar_%Y%m%dT%H%MZ.tif".to_string()),
+            ..tm35fin_test_config()
+        };
+        GeoTiffEngine::new("radar", Some("../../testdata/radar"), &config)
+            .expect("engine builds from the committed radar fixture")
+    }
+
+    fn area_values(result: &QueryResult) -> &[Option<f64>] {
+        &result.ranges["reflectivity"].values
+    }
+
+    /// #858: the area budget counts every matching timestep and is checked
+    /// before the `timesteps × ny × nx` result is allocated. Each timestep of
+    /// this window is within budget on its own, so the old per-timestep check
+    /// in `read_bbox` let the query return ~1.4 M values.
+    #[test]
+    fn area_budget_counts_every_timestep() {
+        let engine = radar_engine();
+        let times: Vec<_> = engine.catalog.load().entries.keys().copied().collect();
+        assert_eq!(times.len(), 5);
+        let (west, south, east, north) = (15.0, 60.0, 23.0, 64.6);
+
+        match engine.query_bbox(west, south, east, north, None, None) {
+            Err(DataServerError::QueryTooLarge(msg)) => {
+                assert!(msg.contains("5 timesteps"), "{msg}");
+                let limit = ds_core::feature::MAX_AREA_VALUES.to_string();
+                assert!(msg.contains(&limit), "names the limit: {msg}");
+            }
+            other => panic!(
+                "expected QueryTooLarge, got {:?} values",
+                other.map(|r| area_values(&r).len())
+            ),
+        }
+
+        let one = engine
+            .query_bbox(west, south, east, north, Some((times[0], times[0])), None)
+            .expect("one timestep of the window is within budget");
+        let cells = area_values(&one).len();
+        assert!(cells <= ds_core::feature::MAX_AREA_VALUES);
+        assert!(cells * times.len() > ds_core::feature::MAX_AREA_VALUES);
+    }
+
+    /// #858: a window over the budget at a single timestep used to reach
+    /// `read_bbox`'s own check, whose `QueryTooLarge` was logged and served as
+    /// a timestep of nulls with HTTP 200.
+    #[test]
+    fn over_budget_area_is_query_too_large_not_nulls() {
+        let engine = radar_engine();
+        let t0 = *engine.catalog.load().entries.keys().next().unwrap();
+        assert!(matches!(
+            engine.query_bbox(0.5, 54.6, 37.9, 74.8, Some((t0, t0)), None),
+            Err(DataServerError::QueryTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn small_area_answers_every_timestep() {
+        let engine = radar_engine();
+        let result = engine
+            .query_bbox(24.5, 60.0, 25.0, 60.5, None, None)
+            .unwrap();
+        let DomainDescription::Grid { x, y, t, .. } = &result.domain else {
+            panic!("expected a Grid domain, got {:?}", result.domain);
+        };
+        assert_eq!(t.as_ref().map(Vec::len), Some(5));
+        let ndarray = &result.ranges["reflectivity"];
+        assert_eq!(ndarray.shape, vec![5, y.len(), x.len()]);
+        assert_eq!(ndarray.values.len(), 5 * y.len() * x.len());
+    }
+
+    /// The null fill stays for a file that cannot be read (#858): its
+    /// timestep is nulls and the readable ones are answered.
+    #[test]
+    fn unreadable_file_is_a_timestep_of_nulls() {
+        let engine = radar_engine();
+        let (t0, readable) = {
+            let catalog = engine.catalog.load();
+            let (ts, entry) = catalog.entries.iter().next().unwrap();
+            (*ts, entry.clone())
+        };
+        let metadata = (**readable.metadata().unwrap()).clone();
+        let missing = PathBuf::from("../../testdata/radar/missing_20260324T2316Z.tif");
+        let t1 = t0 + chrono::Duration::minutes(1);
+        let mut catalog = crate::catalog::Catalog::empty();
+        catalog.entries.insert(t0, readable);
+        catalog.entries.insert(
+            t1,
+            crate::catalog::FileEntry::loaded(
+                missing.clone(),
+                reader::DataSource::from_path(&missing),
+                metadata,
+                0,
+                None,
+                None,
+            ),
+        );
+        engine.catalog.store(Arc::new(catalog));
+
+        let (west, south, east, north) = (24.5, 60.0, 25.0, 60.5);
+        let alone = engine
+            .query_bbox(west, south, east, north, Some((t0, t0)), None)
+            .unwrap();
+        let both = engine
+            .query_bbox(west, south, east, north, None, None)
+            .expect("an unreadable file does not fail the query");
+        let (expected, values) = (area_values(&alone), area_values(&both));
+        assert_eq!(values.len(), 2 * expected.len());
+        assert_eq!(&values[..expected.len()], expected);
+        assert!(values[expected.len()..].iter().all(Option::is_none));
+    }
+
+    /// Only a file failure becomes nulls; request errors fail the query.
+    #[test]
+    fn only_file_failures_are_unreadable() {
+        for e in [
+            DataServerError::Engine("decode".into()),
+            DataServerError::Storage("fetch".into()),
+            DataServerError::Io(std::io::Error::other("read")),
+        ] {
+            assert!(is_unreadable_file(&e), "{e:?}");
+        }
+        for e in [
+            DataServerError::QueryTooLarge("budget".into()),
+            DataServerError::InvalidParameter("window".into()),
+            DataServerError::InvalidBbox("bbox".into()),
+            DataServerError::ResourceExhausted,
+            DataServerError::DeadlineExceeded,
+        ] {
+            assert!(!is_unreadable_file(&e), "{e:?}");
+        }
     }
 }

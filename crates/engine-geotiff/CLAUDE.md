@@ -116,6 +116,15 @@ budget and its client-visible failure.
 
 Position + area queries. Nearest-neighbour sampling of the source grid.
 
+Area (and radius) answers the native pixel window of the polygon's bbox, like
+GRIB: no `MAX_AREA_DIM` coarsening, which would need overview selection and a
+strided polygon mask. `query_bbox` checks the shared
+`ds_core::feature::check_area_budget` over `timesteps × ny × nx` before it
+allocates the result or reads a file, so an over-budget area is a 400 naming
+the limit (#858). Per timestep, only a file that cannot be read (`Engine`,
+`Storage`, `Io`: `is_unreadable_file`) becomes logged nulls; any other read
+error fails the query — client errors stay 400, admission/deadline 503/504.
+
 Encoded remote tile ranges are validated before fetching: each is capped at
 64 MiB and included in decode admission alongside raw and boxed output buffers.
 Direct HTTP range bodies are also streamed with the requested length as a cap,

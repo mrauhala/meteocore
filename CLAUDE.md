@@ -437,10 +437,11 @@ one never implies the other.
 - The GeoTIFF source cap only trips on a full-resolution read: over it,
   `get_raster_tile` switches to the finest overview under it, else the
   coarsest, so in practice only COGs without overviews hit it.
-- GeoTIFF EDR area applies `MAX_AREA_VALUES` per timestep to its native
-  window (no `MAX_AREA_DIM` coarsening), and `query_bbox` currently logs a
-  failed read and returns that timestep as nulls (HTTP 200), not the 400 —
-  after allocating the full `timesteps × ny × nx` grid.
+- GeoTIFF EDR area answers at the native window, like GRIB (no
+  `MAX_AREA_DIM` coarsening): `query_bbox` checks `MAX_AREA_VALUES` over
+  `timesteps × ny × nx` before allocating the result or reading a file, so
+  an over-budget area is the 400. Only a file that cannot be read becomes a
+  logged timestep of nulls; client errors fail the query (#858).
 - A new source cap must name the pixel space it counts and fail with
   `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
   `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine
