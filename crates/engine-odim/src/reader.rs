@@ -391,6 +391,8 @@ pub struct OdimComposite {
     /// for instance, reaches ~29° further west at its `UL` corner
     /// than at `LL`. Edge sampling captures that (the same approach
     /// `ds_core::geo::GeoTransform::bbox` uses for GeoTIFF).
+    ///
+    /// A grid crossing the antimeridian has `west > east` (#180).
     pub wgs84_bbox: [f64; 4],
     /// Nominal acquisition time (UTC), parsed from
     /// `/what/date` + `/what/time`.
@@ -434,37 +436,58 @@ impl OdimComposite {
 /// the bow of a projected grid in lon/lat — the same technique
 /// `ds_core::geo::GeoTransform::bbox` uses for GeoTIFF, so the two
 /// raster engines report consistent extents for the same data.
+///
+/// Longitude is antimeridian-aware (#180): a grid crossing ±180°
+/// reports its narrow extent as `west > east` (the `Bbox`
+/// convention), not a near-global `min`/`max` of mixed-sign
+/// longitudes, and never a longitude past ±180°. A grid containing
+/// a pole spans every longitude and reaches that pole's latitude.
+/// For every other grid the result is the plain `min`/`max`, as
+/// before.
 fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     /// Samples per edge. 20 matches `GeoTransform::bbox`; enough to
     /// pin the bow of a continental LAEA grid to well under a pixel.
     const EDGE_SAMPLES: usize = 20;
 
     let [w, s, e, n] = bbox;
-    let mut min_lon = f64::MAX;
-    let mut max_lon = f64::MIN;
+    let x_at = |i: usize| w + (i as f64 / EDGE_SAMPLES as f64) * (e - w);
+    let y_at = |i: usize| s + (i as f64 / EDGE_SAMPLES as f64) * (n - s);
+    // The perimeter as one closed ring (bottom W→E, right S→N, top
+    // E→W, left N→S), so consecutive samples are neighbours on a
+    // continuous curve.
+    let ring = (0..=EDGE_SAMPLES)
+        .map(|i| (x_at(i), s))
+        .chain((0..=EDGE_SAMPLES).map(|i| (e, y_at(i))))
+        .chain((0..=EDGE_SAMPLES).rev().map(|i| (x_at(i), n)))
+        .chain((0..=EDGE_SAMPLES).rev().map(|i| (w, y_at(i))));
+
     let mut min_lat = f64::MAX;
     let mut max_lat = f64::MIN;
-    let mut accumulate = |lon: f64, lat: f64| {
-        min_lon = min_lon.min(lon);
-        max_lon = max_lon.max(lon);
+    // Longitude unrolled along the ring: each sample moves by whole
+    // turns to within 180° of its predecessor, so the curve stays
+    // continuous across ±180° and the extent is the interval
+    // `[min, max]` of the unrolled values. Each extreme keeps the
+    // sample's own longitude, so a grid that never crosses the seam
+    // (every shift zero) yields exactly the plain `min`/`max`.
+    let mut prev: Option<f64> = None;
+    let mut west = (f64::MAX, 0.0);
+    let mut east = (f64::MIN, 0.0);
+    for (x, y) in ring {
+        let Some((lon, lat)) = crs.inverse(x, y) else {
+            continue;
+        };
         min_lat = min_lat.min(lat);
         max_lat = max_lat.max(lat);
-    };
-    for i in 0..=EDGE_SAMPLES {
-        let frac = i as f64 / EDGE_SAMPLES as f64;
-        // Top + bottom edges (x varies, y pinned).
-        let x = w + frac * (e - w);
-        for &y in &[s, n] {
-            if let Some((lon, lat)) = crs.inverse(x, y) {
-                accumulate(lon, lat);
-            }
+        let unrolled = match prev {
+            Some(p) => lon + 360.0 * ((p - lon) / 360.0).round(),
+            None => lon,
+        };
+        prev = Some(unrolled);
+        if unrolled < west.0 {
+            west = (unrolled, lon);
         }
-        // Left + right edges (y varies, x pinned).
-        let y = s + frac * (n - s);
-        for &x in &[w, e] {
-            if let Some((lon, lat)) = crs.inverse(x, y) {
-                accumulate(lon, lat);
-            }
+        if unrolled > east.0 {
+            east = (unrolled, lon);
         }
     }
 
@@ -475,10 +498,43 @@ fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     // 180, 90]` is over-broad but at least dimensionally valid.
     // (Unreachable for any real grid — `Crs::Wgs84::inverse` is the
     // identity and projected inverses succeed near the grid.)
-    if min_lon > max_lon {
+    if west.0 > east.0 {
         return [-180.0, -90.0, 180.0, 90.0];
     }
-    [min_lon, min_lat, max_lon, max_lat]
+
+    // A pole inside a projected grid is its latitude extreme and
+    // spans every longitude, but no edge sample reaches it. (A
+    // lon/lat grid's pole is a whole edge, already sampled.)
+    let contains_pole = |lat: f64| {
+        if matches!(crs, Crs::Wgs84) {
+            return false;
+        }
+        let (x, y) = crs.forward(0.0, lat);
+        (w..=e).contains(&x) && (s..=n).contains(&y)
+    };
+    let (north_pole, south_pole) = (contains_pole(90.0), contains_pole(-90.0));
+    if north_pole {
+        max_lat = 90.0;
+    }
+    if south_pole {
+        min_lat = -90.0;
+    }
+    if north_pole || south_pole || east.0 - west.0 >= 360.0 {
+        return [-180.0, min_lat, 180.0, max_lat];
+    }
+    // Back into the CRS84 domain, leaving in-range longitudes
+    // untouched: west in [-180, 180), east in (-180, 180].
+    let west = if (-180.0..180.0).contains(&west.1) {
+        west.1
+    } else {
+        (west.1 + 180.0).rem_euclid(360.0) - 180.0
+    };
+    let east = if east.1 > -180.0 && east.1 <= 180.0 {
+        east.1
+    } else {
+        180.0 - (180.0 - east.1).rem_euclid(360.0)
+    };
+    [west, min_lat, east, max_lat]
 }
 
 /// Parse an ODIM_H5 composite from a byte slice. The whole file must
@@ -831,6 +887,100 @@ mod tests {
         for (got, want) in env.iter().zip(bbox.iter()) {
             assert!((got - want).abs() < 1e-9, "got {env:?}, want {bbox:?}");
         }
+    }
+
+    /// Asserts an envelope matches a PROJ reference to 1e-6°.
+    fn assert_envelope(got: [f64; 4], want: [f64; 4]) {
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "got {got:?}, want {want:?}");
+        }
+    }
+
+    /// A grid clear of the antimeridian keeps the plain edge
+    /// `min`/`max` (#180): OPERA's west and east are its UL and UR
+    /// corners. Reference: `cs2cs +proj=laea +lat_0=55 +lon_0=10
+    /// +x_0=1950000 +y_0=-2100000 +ellps=WGS84 +to +proj=longlat
+    /// +ellps=WGS84` of `0 0` (UL) and `3800000 0` (UR).
+    #[test]
+    fn wgs84_envelope_of_a_normal_grid_spans_its_corners() {
+        let crs =
+            proj::parse("+proj=laea +lat_0=55 +lon_0=10 +x_0=1950000 +y_0=-2100000 +ellps=WGS84")
+                .unwrap();
+        let [w, _, e, _] = wgs84_envelope(&crs, [0.0, -4_400_000.0, 3_800_000.0, 0.0]);
+        assert!((w - -39.535_786_412_5).abs() < 1e-6, "west {w}");
+        assert!((e - 57.811_964_750_1).abs() < 1e-6, "east {e}");
+    }
+
+    /// #180: a grid straddling ±180° reports its narrow extent as
+    /// `west > east`, never a longitude past 180°. This LAEA grid is
+    /// centred on Fiji (`lon_0=178`), so its inverse runs on to
+    /// ~181.9°E. Reference: `cs2cs +proj=laea +lat_0=-18 +lon_0=178
+    /// +ellps=WGS84 +to +proj=longlat +ellps=WGS84` of the SW corner
+    /// (west), the SE corner (east), the bottom-edge midpoint (south)
+    /// and the NW corner (north).
+    #[test]
+    fn wgs84_envelope_of_a_grid_centred_on_the_antimeridian_crosses_it() {
+        let crs =
+            proj::parse("+proj=laea +lat_0=-18 +lon_0=178 +x_0=0 +y_0=0 +ellps=WGS84").unwrap();
+        let env = wgs84_envelope(&crs, [-400_000.0, -400_000.0, 400_000.0, 400_000.0]);
+        assert_envelope(
+            env,
+            [
+                174.138_829_357_9,
+                -21.613_972_286_2,
+                -178.138_829_357_9,
+                -14.350_642_887_3,
+            ],
+        );
+    }
+
+    /// #180: a polar-stereographic grid over the Bering Strait, where
+    /// the inverse's longitudes wrap at ±180° mid-grid. The plain
+    /// `min`/`max` of those mixed-sign longitudes was a near-global
+    /// ~-179°..180° box, the wrong way round. Reference: `cs2cs +proj=stere
+    /// +lat_0=90 +lon_0=0 +lat_ts=60 +ellps=WGS84 +to +proj=longlat
+    /// +ellps=WGS84` of the bottom-right corner (west), bottom-left
+    /// corner (east), a top corner (south) and the bottom-edge
+    /// midpoint (north).
+    #[test]
+    fn wgs84_envelope_of_a_grid_with_wrapped_longitudes_crosses_the_antimeridian() {
+        let crs = proj::parse("+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60 +ellps=WGS84").unwrap();
+        let env = wgs84_envelope(&crs, [-300_000.0, 2_350_000.0, 300_000.0, 2_950_000.0]);
+        assert_envelope(
+            env,
+            [
+                172.724_995_042_1,
+                62.090_965_712_6,
+                -172.724_995_042_1,
+                67.724_695_454_7,
+            ],
+        );
+    }
+
+    /// A grid around a pole spans every longitude and reaches the
+    /// pole, which no edge sample does (the edges peak at ~85.2°N).
+    /// South is a corner: `cs2cs +proj=stere +lat_0=90 +lon_0=0
+    /// +lat_ts=60 +ellps=WGS84 +to +proj=longlat +ellps=WGS84` of
+    /// `-500000 -500000`.
+    #[test]
+    fn wgs84_envelope_of_a_grid_around_the_pole_spans_every_longitude() {
+        let crs = proj::parse("+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60 +ellps=WGS84").unwrap();
+        let env = wgs84_envelope(&crs, [-500_000.0, -500_000.0, 500_000.0, 500_000.0]);
+        assert_envelope(env, [-180.0, 83.222_724_961_6, 180.0, 90.0]);
+    }
+
+    /// Lon/lat grids: one past 180° is wrapped into a crossing box, a
+    /// global one stays global.
+    #[test]
+    fn wgs84_envelope_of_lon_lat_grids_across_the_antimeridian() {
+        assert_eq!(
+            wgs84_envelope(&Crs::Wgs84, [170.0, -20.0, 190.0, -10.0]),
+            [170.0, -20.0, -170.0, -10.0]
+        );
+        assert_eq!(
+            wgs84_envelope(&Crs::Wgs84, [-180.0, -90.0, 180.0, 90.0]),
+            [-180.0, -90.0, 180.0, 90.0]
+        );
     }
 
     /// Date+time parsing accepts the canonical ODIM format.

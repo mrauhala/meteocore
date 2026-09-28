@@ -1134,6 +1134,24 @@ fn source_label(source: &Source) -> String {
     }
 }
 
+/// The source footprint handed to the #449 ghost guard,
+/// [`OutputCrs::footprint_pixel_window`], whose perimeter walk assumes
+/// `west <= east`.
+///
+/// Fed an antimeridian-crossing extent (`west > east`, #180) directly,
+/// the walk covers the complement and clips real data on one side of
+/// the seam. So a crossing footprint is passed unwrapped across both
+/// sides of the seam, `[west - 360, south, east + 360, north]`: inside
+/// ±180° that spans every longitude, as the old near-global extent did,
+/// and in a viewport crossing ±180° it still contains the footprint.
+/// The latitude bound is kept either way.
+fn footprint_guard_envelope(extent: [f64; 4]) -> [f64; 4] {
+    match extent {
+        [w, s, e, n] if w > e => [w - 360.0, s, e + 360.0, n],
+        extent => extent,
+    }
+}
+
 impl MapEngine for OdimEngine {
     #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
@@ -1194,8 +1212,12 @@ impl MapEngine for OdimEngine {
         // far-away output pixel onto a valid source pixel, painting the composite
         // far from its coverage. Bound the output window to the source footprint
         // (WGS84 `seed_spatial_extent`); everything outside is nodata (#449).
-        let (px_lo, px_hi, py_lo, py_hi) =
-            output_crs.footprint_pixel_window(bbox, self.seed_spatial_extent, width, height);
+        let (px_lo, px_hi, py_lo, py_hi) = output_crs.footprint_pixel_window(
+            bbox,
+            footprint_guard_envelope(self.seed_spatial_extent),
+            width,
+            height,
+        );
 
         // Resample source grid to output dimensions using nearest-neighbour.
         // The grid interpolates only the output→source coordinate map; the data
@@ -1323,6 +1345,46 @@ mod tests {
         // None of the generic projected labels resolve to a storageCrs URI.
         assert!(ds_core::geo::native_crs_uri("stere").is_none());
         assert!(ds_core::geo::native_crs_uri("rotated_ll").is_none());
+    }
+
+    /// #180: the ghost guard keeps an antimeridian-crossing footprint
+    /// (160°E..170°W) on either side of the seam, in viewports crossing
+    /// it, and whole-world. Fed the raw `west > east` extent, the walk
+    /// clipped most of these. The latitude bound still applies.
+    #[test]
+    fn footprint_guard_keeps_both_sides_of_the_antimeridian() {
+        let guard = footprint_guard_envelope([160.0, -25.0, -170.0, -10.0]);
+        let (width, height) = (256, 256);
+        for (view, lon) in [
+            ([150.0, -30.0, 180.0, -5.0], 179.0),
+            ([-180.0, -30.0, -150.0, -5.0], -179.0),
+            ([150.0, -30.0, 210.0, -5.0], 189.0),
+            ([-210.0, -30.0, -150.0, -5.0], -171.0),
+            ([-180.0, -30.0, 180.0, -5.0], 179.0),
+            ([-180.0, -30.0, 180.0, -5.0], -179.0),
+        ] {
+            for output in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
+                let (x_lo, x_hi, y_lo, y_hi) =
+                    output.footprint_pixel_window(view, guard, width, height);
+                let (fx, fy) = output.world_to_fraction(view, lon, -15.0);
+                let (col, row) = ((fx * width as f64) as u32, (fy * height as f64) as u32);
+                assert!(
+                    (x_lo..=x_hi).contains(&col) && (y_lo..=y_hi).contains(&row),
+                    "{output:?} {view:?}: ({lon}, -15) at ({col}, {row}) is outside \
+                     {x_lo}..={x_hi}, {y_lo}..={y_hi}"
+                );
+                let (_, fy) = output.world_to_fraction(view, lon, -29.0);
+                assert!(
+                    (fy * height as f64) as u32 > y_hi,
+                    "{output:?} {view:?}: south of the footprint must stay guarded"
+                );
+            }
+        }
+        let clear_of_the_seam = [10.0, 50.0, 30.0, 70.0];
+        assert_eq!(
+            footprint_guard_envelope(clear_of_the_seam),
+            clear_of_the_seam
+        );
     }
 
     /// Minimal `OdimConfig` for `build_source` routing tests — only the

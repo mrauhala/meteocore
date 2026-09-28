@@ -295,11 +295,11 @@ impl OdimEngine {
         // (every timestep shares the same grid) — no probe load, so
         // a single unreadable first file no longer hard-fails the
         // whole query the way an earlier `load_composite(...)?` did.
-        let [ll_lon, ll_lat, ur_lon, ur_lat] = self.seed_spatial_extent;
-        let deg_per_px_lon =
-            ((ur_lon - ll_lon).abs() / self.seed_xsize as f64).max(f64::MIN_POSITIVE);
-        let deg_per_px_lat =
-            ((ur_lat - ll_lat).abs() / self.seed_ysize as f64).max(f64::MIN_POSITIVE);
+        // `crs84_bbox_spans` keeps an antimeridian-crossing extent
+        // (`west > east`, #180) narrow instead of ~360° wide.
+        let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(self.seed_spatial_extent);
+        let deg_per_px_lon = (lon_span / self.seed_xsize as f64).max(f64::MIN_POSITIVE);
+        let deg_per_px_lat = (lat_span / self.seed_ysize as f64).max(f64::MIN_POSITIVE);
 
         // Shared cell-centre construction (ds-core, #671): x ascends
         // west→east, y descends north→south, each ≤ `MAX_AREA_DIM`.
