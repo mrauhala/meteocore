@@ -951,12 +951,20 @@ pub enum PropertyValue {
     Null,
     /// An ordered, **flat** list of scalar values (e.g. a radar site's measured
     /// quantities or sweep elevation angles). Elements are expected to be
-    /// scalars — engines do not nest `List`s, and the Features JSON serializer
-    /// (which recurses) and the MVT tag encoder (which flattens to a joined
-    /// string) both rely on shallow, engine-constructed nesting rather than a
-    /// runtime depth guard. Engines accepting source arrays must check that
-    /// every element is scalar before constructing a `List`.
+    /// scalars or [`PropertyValue::Object`] records of scalars — engines do
+    /// not nest `List`s, and the Features JSON serializer (which recurses) and
+    /// the MVT tag encoder (which flattens to a joined string) both rely on
+    /// shallow, engine-constructed nesting rather than a runtime depth guard.
+    /// Engines accepting source arrays must check that every element is
+    /// scalar before constructing a `List`.
     List(Vec<PropertyValue>),
+    /// A small record of named scalar values, serialized as a JSON object —
+    /// e.g. one `{term, value}` entry of a storm cell's signed significance
+    /// breakdown (#650). Ordered pairs rather than a map, so serialization is
+    /// deterministic and ETags do not churn. Engine-constructed and shallow
+    /// like `List`: values are scalars. It never matches a property filter
+    /// (there is no exact-string form to compare) and has no MVT tag form.
+    Object(Vec<(String, PropertyValue)>),
 }
 
 impl PropertyValue {
@@ -1039,7 +1047,9 @@ pub fn matches_property_values(
             PropertyValue::Float(n) => n.is_finite() && numeric_matches(&n.to_string(), expected),
             PropertyValue::Bool(b) => b.to_string() == expected,
             PropertyValue::List(values) => values.iter().any(|v| matches(v, expected)),
-            PropertyValue::Null => false,
+            // A record has no canonical string to compare against; engines
+            // keep record-valued properties out of their filterables.
+            PropertyValue::Null | PropertyValue::Object(_) => false,
         }
     }
     filters
@@ -1195,7 +1205,8 @@ fn type_rank(v: &PropertyValue) -> u8 {
         PropertyValue::Integer(_) | PropertyValue::Float(_) => 1,
         PropertyValue::String(_) => 2,
         PropertyValue::List(_) => 3,
-        PropertyValue::Null => 4,
+        PropertyValue::Object(_) => 4,
+        PropertyValue::Null => 5,
     }
 }
 
@@ -1227,6 +1238,13 @@ fn compare_present(a: &PropertyValue, b: &PropertyValue) -> std::cmp::Ordering {
             .iter()
             .zip(y.iter())
             .map(|(a, b)| compare_present(a, b))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
+        // Same reasoning, field by field: name first, then value.
+        (PropertyValue::Object(x), PropertyValue::Object(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|((ka, va), (kb, vb))| ka.cmp(kb).then_with(|| compare_present(va, vb)))
             .find(|o| *o != Ordering::Equal)
             .unwrap_or_else(|| x.len().cmp(&y.len())),
         _ => type_rank(a).cmp(&type_rank(b)),
@@ -1379,6 +1397,34 @@ mod tests {
         assert!(matches_property_filters(&f, &filters));
         filters.push(("bool".into(), "false".into()));
         assert!(!matches_property_filters(&f, &filters));
+    }
+
+    #[test]
+    fn records_never_match_a_property_filter() {
+        // A `{term, value}` record has no exact-string form. Matching on a
+        // field would invent a CQL-like semantics nothing documents.
+        let record = |term: &str, value: f64| {
+            PropertyValue::Object(vec![
+                ("term".into(), PropertyValue::String(term.into())),
+                ("value".into(), PropertyValue::Float(value)),
+            ])
+        };
+        let f = feat(
+            "f",
+            vec![
+                ("one", record("clutter", -0.4)),
+                ("many", PropertyValue::List(vec![record("impact", 0.3)])),
+            ],
+        );
+        let check = |k: &str, v: &str| matches_property_filters(&f, &[(k.into(), v.into())]);
+        for (k, v) in [
+            ("one", "clutter"),
+            ("one", "-0.4"),
+            ("many", "impact"),
+            ("many", "0.3"),
+        ] {
+            assert!(!check(k, v), "{k}={v}");
+        }
     }
 
     #[test]
@@ -1937,10 +1983,27 @@ mod tests {
             feat("s", vec![("v", PropertyValue::String("a".into()))]),
             feat("n", vec![("v", PropertyValue::Integer(1))]),
             feat("b", vec![("v", PropertyValue::Bool(true))]),
+            feat("o", vec![("v", PropertyValue::Object(vec![]))]),
             feat("l", vec![("v", PropertyValue::List(vec![]))]),
         ];
         sort_features(&mut fs, &[SortKey::ascending("v")]);
-        assert_eq!(ids(&fs), ["b", "n", "s", "l"]);
+        assert_eq!(ids(&fs), ["b", "n", "s", "l", "o"]);
+    }
+
+    #[test]
+    fn records_compare_field_by_field() {
+        let record = |value: f64| {
+            PropertyValue::Object(vec![
+                ("term".into(), PropertyValue::String("impact".into())),
+                ("value".into(), PropertyValue::Float(value)),
+            ])
+        };
+        let mut fs = vec![
+            feat("high", vec![("r", record(0.5))]),
+            feat("low", vec![("r", record(-0.5))]),
+        ];
+        sort_features(&mut fs, &[SortKey::ascending("r")]);
+        assert_eq!(ids(&fs), ["low", "high"]);
     }
 
     #[test]

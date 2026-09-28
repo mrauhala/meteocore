@@ -323,6 +323,7 @@ pub struct NowcastEngine {
     auxiliary: ArcSwap<AuxiliarySources>,
     // Configuration capabilities stay fixed for this engine's lifetime.
     lightning_configured: bool,
+    impact_configured: bool,
     radar_configured: bool,
     /// Sortable properties for THIS instance, resolved once whenever a
     /// source is wired. Stored rather than recomputed so the per-request
@@ -452,6 +453,7 @@ impl NowcastEngine {
             radar_empty_warned: AtomicBool::new(false),
             auxiliary: ArcSwap::from_pointee(AuxiliarySources::default()),
             lightning_configured: false,
+            impact_configured: false,
             radar_configured: false,
             sortables: SORTABLES_BASE.to_vec(),
             filterables: cell_filterables(false, false, false),
@@ -580,6 +582,7 @@ impl NowcastEngine {
     fn recompute_sortables(&mut self) {
         let sources = self.auxiliary.load();
         self.lightning_configured = sources.lightning.is_some();
+        self.impact_configured = sources.impact.is_some();
         self.radar_configured = sources.radar.is_some();
         let mut v = SORTABLES_BASE.to_vec();
         if sources.lightning.is_some() {
@@ -1682,6 +1685,7 @@ fn score_cells(
                 max_dbz: round_to(f64::from(t.blob.max_value), 1),
                 area_km2,
                 age: t.age,
+                age_minutes: round_to(f64::from(t.tracked_secs) / 60.0, 1),
                 speed_ms: speed_raw.map(|v| round_to(v, 1)),
                 bearing_deg: bearing_raw.map(|b| round_to(b, 0) % 360.0),
                 // Only knowable once the track has a velocity. A newborn
@@ -1719,18 +1723,10 @@ fn score_cells(
                 lightning_coverage: t.lightning_coverage,
                 lightning: t.flash_count.map(|count| LightningFacts {
                     flash_count: count,
-                    flash_rate_per_min: t
-                        .flash_rate_per_min
-                        .map(|r| round_to(f64::from(r), 2))
-                        .unwrap_or(0.0),
-                    // Guard the divide: a degenerate zero-area cell would
-                    // otherwise produce inf and poison every downstream
-                    // comparison.
-                    flash_density_per_km2: if area_km2 > 0.0 {
-                        round_to(f64::from(count) / area_km2, 4)
-                    } else {
-                        0.0
-                    },
+                    // Unknown stays unknown: a defaulted 0.0 would serve
+                    // (and score) an unmeasured rate as a quiet cell.
+                    flash_rate_per_min: t.flash_rate_per_min.map(|r| round_to(f64::from(r), 2)),
+                    flash_density_per_km2: flash_density(count, area_km2),
                     // Not computable from a single frame: with no baseline
                     // the test never runs, so `false` would claim a jump was
                     // ruled out rather than never tested.
@@ -1790,7 +1786,20 @@ fn score_cells(
         .collect()
 }
 
+/// Flashes per km² of footprint, at served precision.
+///
+/// `None` for a degenerate zero-area cell: dividing would produce inf and
+/// poison every downstream comparison, and 0.0 would claim a measured-quiet
+/// cell. A density over no area is undefined (#650).
+fn flash_density(count: u32, area_km2: f64) -> Option<f64> {
+    (area_km2 > 0.0).then(|| round_to(f64::from(count) / area_km2, 4))
+}
+
 /// Resolve the accepted property groups once when sources are wired.
+///
+/// Every served property is filterable except `significance_contributions`:
+/// a list of `{term, value}` records has no exact-string form, so accepting
+/// it would answer every request with zero cells instead of a 400.
 fn cell_filterables(
     lightning: bool,
     impact: bool,
@@ -1801,6 +1810,7 @@ fn cell_filterables(
         "max_dbz",
         "area_km2",
         "track_age",
+        "age_minutes",
         "net_displacement_km",
         "path_straightness",
         "deviant_mover",
@@ -1830,7 +1840,12 @@ fn cell_filterables(
         ]);
     }
     if impact {
-        names.extend(["impact_over", "impact_approaching", "impact_eta_minutes"]);
+        names.extend([
+            "impact_over",
+            "impact_approaching",
+            "impact_eta_minutes",
+            "impact_exposure",
+        ]);
     }
     if radar {
         names.extend([
@@ -1848,7 +1863,22 @@ fn cell_filterables(
 /// Build one cell feature from its fact sheet and score. Shared by
 /// `get_features` and `get_feature` so the two paths cannot drift (and the
 /// by-id path needn't materialize every cell).
-fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, Feature) {
+///
+/// The `lightning` / `impact` / `radar` flags say which optional join groups
+/// this engine has WIRED, and all three follow one rule (#650): an unwired
+/// group is absent; a wired group whose join was skipped this generation is
+/// present with its per-generation keys null (`lightning_coverage` describes
+/// the source's configured footprint, not the fetch, so it keeps its value);
+/// a join that ran serves its values, where null means "nothing there" or
+/// "not computable". Keying presence on the
+/// fact sheet instead made a skipped impact join drop its keys while a
+/// skipped lightning join nulled them — two encodings of one state.
+fn cell_feature(
+    cell: &ScoredCell,
+    lightning: bool,
+    impact: bool,
+    radar: bool,
+) -> (f64, f64, Feature) {
     let t = &cell.facts;
     // Values were rounded to their MEANINGFUL precision when the fact sheet
     // was built (5 lon/lat decimals ≈ 1 m, finer than the working grid;
@@ -1862,6 +1892,9 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
     props.insert("max_dbz".into(), PropertyValue::Float(t.max_dbz));
     props.insert("area_km2".into(), PropertyValue::Float(t.area_km2));
     props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
+    // Frames and minutes are different clocks: a missed or skipped frame is
+    // invisible in `track_age` and counted at its real length here.
+    props.insert("age_minutes".into(), PropertyValue::Float(t.age_minutes));
     for (key, value) in [
         ("net_displacement_km", t.net_displacement_km),
         ("path_straightness", t.path_straightness),
@@ -1920,52 +1953,79 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
     );
     // WHY it ranked there, biggest reason first — an unexplainable ranking
     // is one nobody can argue with, and a weight table with no ground truth
-    // has to be arguable to be tunable.
+    // has to be arguable to be tunable. Signed (#650): a bare list of names
+    // read `["clutter", "impact", …]` as three reasons a cell ranked HIGH;
+    // the value says what each term added or, negative, removed. At the
+    // score's own precision, so the values sum to `significance` up to
+    // rounding (to the unclamped score, which differs only under a negative
+    // graded weight override).
+    let contributions: Vec<(&'static str, f64)> = cell
+        .significance
+        .contributions
+        .iter()
+        .map(|c| (c.term, round_to(c.value, SIGNIFICANCE_DECIMALS)))
+        // A term that contributed NOTHING is not a reason. Every weighted
+        // term appears in `contributions`, including flags that are false or
+        // unknown, so an unfiltered list will name `deviant_mover` on a cell
+        // whose motion is unknown — an explanation citing a flag that is not
+        // set. "Nothing" is judged at served precision, so the reasons are
+        // always the first three served contributions. Negative ones stay:
+        // "demoted as likely clutter" is a real reason a cell ranked where
+        // it did.
+        .filter(|&(_, value)| value != 0.0)
+        .collect();
     props.insert(
         "significance_reasons".into(),
         PropertyValue::List(
-            cell.significance
-                .contributions
+            contributions
                 .iter()
-                // A term that contributed NOTHING is not a reason. Every
-                // weighted term appears in `contributions`, including flags
-                // that are false or unknown, so an unfiltered top-3 will
-                // name `deviant_mover` on a cell whose motion is unknown —
-                // an explanation citing a flag that is not set. Negative
-                // contributions stay: "demoted as likely clutter" is a real
-                // reason a cell ranked where it did.
-                .filter(|c| c.value != 0.0)
                 .take(3)
-                .map(|c| PropertyValue::String(c.term.into()))
+                .map(|&(term, _)| PropertyValue::String(term.into()))
                 .collect(),
         ),
     );
-    // Impact context. Present only when an impact source is wired — same
-    // tri-state discipline as the flash properties: absent means "not
-    // measured", null within the group means "nothing there".
-    if let Some(impact) = &t.impact {
-        props.insert(
-            "impact_over".into(),
-            impact
-                .over
-                .as_ref()
-                .map(|n| PropertyValue::String(n.clone()))
-                .unwrap_or(PropertyValue::Null),
-        );
+    props.insert(
+        "significance_contributions".into(),
+        PropertyValue::List(
+            contributions
+                .iter()
+                .map(|&(term, value)| {
+                    PropertyValue::Object(vec![
+                        ("term".into(), PropertyValue::String(term.into())),
+                        ("value".into(), PropertyValue::Float(value)),
+                    ])
+                })
+                .collect(),
+        ),
+    );
+    // Impact context: absent unless a source is wired, all null when this
+    // generation's join was skipped (source error, bad grid bbox).
+    if impact {
+        let i = t.impact.as_ref();
+        let name = |v: Option<&String>| {
+            v.map_or(PropertyValue::Null, |n| PropertyValue::String(n.clone()))
+        };
+        props.insert("impact_over".into(), name(i.and_then(|i| i.over.as_ref())));
         props.insert(
             "impact_approaching".into(),
-            impact
-                .approaching
-                .as_ref()
-                .map(|n| PropertyValue::String(n.clone()))
-                .unwrap_or(PropertyValue::Null),
+            name(i.and_then(|i| i.approaching.as_ref())),
         );
         props.insert(
             "impact_eta_minutes".into(),
-            impact
-                .eta_minutes
-                .map(PropertyValue::Float)
-                .unwrap_or(PropertyValue::Null),
+            i.and_then(|i| i.eta_minutes)
+                .map_or(PropertyValue::Null, PropertyValue::Float),
+        );
+        // The input to the most heavily weighted term, and a number whenever
+        // the join ran (0.0 = measured, nothing near). That also makes it the
+        // group's joined-this-generation marker: a null `impact_over` beside
+        // a numeric exposure is "over no area", beside a null one "unknown".
+        // Rounded here, not in `score_cells`: it is a scoring input, and the
+        // ranking must see the unrounded value it always has.
+        props.insert(
+            "impact_exposure".into(),
+            i.map_or(PropertyValue::Null, |i| {
+                PropertyValue::Float(round_to(i.exposure, SIGNIFICANCE_DECIMALS))
+            }),
         );
     }
     // Beam geometry (#642). Same tri-state as the impact group: absent when
@@ -2041,7 +2101,8 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
         props.insert(
             "flash_rate_per_min".into(),
             t.lightning
-                .map(|l| PropertyValue::Float(l.flash_rate_per_min))
+                .and_then(|l| l.flash_rate_per_min)
+                .map(PropertyValue::Float)
                 .unwrap_or(PropertyValue::Null),
         );
         for (key, value) in [
@@ -2070,8 +2131,11 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
         );
         props.insert(
             "flash_density_per_km2".into(),
+            // Null for a zero-area cell too: a density over no area is
+            // undefined, not a measured zero.
             t.lightning
-                .map(|l| PropertyValue::Float(l.flash_density_per_km2))
+                .and_then(|l| l.flash_density_per_km2)
+                .map(PropertyValue::Float)
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(
@@ -2417,8 +2481,12 @@ impl FeatureEngine for NowcastEngine {
             .cells
             .iter()
             .filter_map(|t| {
-                let (lon, lat, feature) =
-                    cell_feature(t, self.lightning_configured, self.radar_configured);
+                let (lon, lat, feature) = cell_feature(
+                    t,
+                    self.lightning_configured,
+                    self.impact_configured,
+                    self.radar_configured,
+                );
                 if let Some(b) = &query.bbox {
                     if !b.contains(lon, lat) {
                         return None;
@@ -2483,7 +2551,13 @@ impl FeatureEngine for NowcastEngine {
             .iter()
             .find(|t| t.facts.id == id)
             .ok_or_else(not_found)?;
-        Ok(cell_feature(track, self.lightning_configured, self.radar_configured).2)
+        Ok(cell_feature(
+            track,
+            self.lightning_configured,
+            self.impact_configured,
+            self.radar_configured,
+        )
+        .2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on
@@ -2507,5 +2581,204 @@ impl FeatureEngine for NowcastEngine {
             (Some(first), Some(last)) => Some((first.anchor, last.anchor)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ds_core::cell_facts::{ImpactFacts, Severity};
+
+    fn facts() -> CellFactSheet {
+        CellFactSheet {
+            id: 7,
+            observed: "2026-09-28T12:00:00Z".parse().unwrap(),
+            lon: 24.9,
+            lat: 60.2,
+            severity: Severity::Severe,
+            max_dbz: 52.0,
+            area_km2: 30.0,
+            age: 3,
+            age_minutes: 15.0,
+            speed_ms: Some(10.0),
+            bearing_deg: Some(90.0),
+            deviant_mover: Some(false),
+            net_displacement_km: Some(9.0),
+            path_straightness: Some(0.9),
+            likely_clutter: false,
+            trend: None,
+            intensity_trend_dbz_min: None,
+            lightning: None,
+            lightning_coverage: None,
+            volume: None,
+            impact: None,
+            radar: None,
+            environment: Vec::new(),
+        }
+    }
+
+    /// Serve `facts` with the given join groups wired: (lightning, impact,
+    /// radar).
+    fn served(facts: CellFactSheet, wired: (bool, bool, bool)) -> HashMap<String, PropertyValue> {
+        let significance = WeightedScorer::new(DEFAULT_CELL_WEIGHTS)
+            .rank_quantized(std::slice::from_ref(&facts), SIGNIFICANCE_DECIMALS);
+        let cell = ScoredCell {
+            facts,
+            significance: significance.into_iter().next().unwrap(),
+        };
+        let (_, _, feature) = cell_feature(&cell, wired.0, wired.1, wired.2);
+        feature.properties.as_ref().clone()
+    }
+
+    #[test]
+    fn a_zero_area_cell_has_no_flash_density() {
+        // #650: this used to serve 0.0 — a measured-quiet claim about a
+        // quantity that is undefined for a cell with no footprint.
+        assert_eq!(flash_density(4, 0.0), None);
+        assert_eq!(flash_density(4, 8.0), Some(0.5));
+        assert_eq!(
+            flash_density(0, 8.0),
+            Some(0.0),
+            "no flashes is a real zero"
+        );
+    }
+
+    #[test]
+    fn unmeasured_flash_numbers_serve_as_null_not_zero() {
+        let mut f = facts();
+        f.lightning_coverage = Some(true);
+        f.lightning = Some(LightningFacts {
+            flash_count: 3,
+            flash_rate_per_min: None,
+            flash_density_per_km2: None,
+            jump: None,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        });
+        let p = served(f, (true, false, false));
+        assert_eq!(p.get("flash_count"), Some(&PropertyValue::Integer(3)));
+        assert_eq!(p.get("flash_rate_per_min"), Some(&PropertyValue::Null));
+        assert_eq!(p.get("flash_density_per_km2"), Some(&PropertyValue::Null));
+    }
+
+    #[test]
+    fn every_join_group_encodes_a_skipped_join_the_same_way() {
+        // #650: a skipped impact join dropped its keys while a skipped
+        // lightning or radar join nulled them. Wired + skipped = present and
+        // null for all three; unwired = absent for all three.
+        let keys = [
+            "flash_count",
+            "flash_rate_per_min",
+            "lightning_jump",
+            "impact_over",
+            "impact_approaching",
+            "impact_eta_minutes",
+            "impact_exposure",
+            "nearest_radar_id",
+            "beam_height_m",
+        ];
+        let skipped = served(facts(), (true, true, true));
+        for key in keys {
+            assert_eq!(skipped.get(key), Some(&PropertyValue::Null), "{key}");
+        }
+        let unwired = served(facts(), (false, false, false));
+        for key in keys {
+            assert!(!unwired.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_joined_impact_serves_its_exposure_even_over_nothing() {
+        let mut f = facts();
+        f.impact = Some(ImpactFacts {
+            over: None,
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.0,
+        });
+        let p = served(f.clone(), (false, true, false));
+        assert_eq!(p.get("impact_over"), Some(&PropertyValue::Null));
+        assert_eq!(
+            p.get("impact_exposure"),
+            Some(&PropertyValue::Float(0.0)),
+            "a number marks the join as run: over nothing, not unknown"
+        );
+        f.impact = Some(ImpactFacts {
+            over: Some("Bigtown".into()),
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.123456,
+        });
+        let p = served(f, (false, true, false));
+        assert_eq!(
+            p.get("impact_exposure"),
+            Some(&PropertyValue::Float(0.1235))
+        );
+    }
+
+    #[test]
+    fn contributions_are_signed_sum_to_the_score_and_lead_the_reasons() {
+        let mut f = facts();
+        f.likely_clutter = true;
+        f.impact = Some(ImpactFacts {
+            over: Some("Bigtown".into()),
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.8,
+        });
+        let p = served(f, (false, true, false));
+        let Some(PropertyValue::List(entries)) = p.get("significance_contributions") else {
+            panic!("contributions must be a list: {p:?}");
+        };
+        let pairs: Vec<(String, f64)> = entries
+            .iter()
+            .map(|e| match e {
+                PropertyValue::Object(fields) => match fields.as_slice() {
+                    [(t, PropertyValue::String(term)), (v, PropertyValue::Float(value))]
+                        if t == "term" && v == "value" =>
+                    {
+                        (term.clone(), *value)
+                    }
+                    other => panic!("expected {{term, value}}, got {other:?}"),
+                },
+                other => panic!("expected a record, got {other:?}"),
+            })
+            .collect();
+        let clutter = pairs
+            .iter()
+            .find(|(t, _)| t == "clutter")
+            .expect("the clutter discount is served");
+        assert!(clutter.1 < 0.0, "a demotion is negative: {pairs:?}");
+        assert!(pairs.iter().all(|(_, v)| *v != 0.0), "no zero entries");
+
+        let Some(PropertyValue::Float(score)) = p.get("significance") else {
+            panic!("missing significance");
+        };
+        let sum: f64 = pairs.iter().map(|(_, v)| v).sum();
+        assert!(
+            (sum - score).abs() < 1e-3,
+            "contributions {sum} must add up to the score {score}"
+        );
+
+        let Some(PropertyValue::List(reasons)) = p.get("significance_reasons") else {
+            panic!("missing reasons");
+        };
+        let leading: Vec<PropertyValue> = pairs
+            .iter()
+            .take(3)
+            .map(|(t, _)| PropertyValue::String(t.clone()))
+            .collect();
+        assert_eq!(reasons, &leading, "reasons are the leading contributions");
+    }
+
+    #[test]
+    fn age_minutes_is_served_next_to_track_age() {
+        let p = served(facts(), (false, false, false));
+        assert_eq!(p.get("track_age"), Some(&PropertyValue::Integer(3)));
+        assert_eq!(p.get("age_minutes"), Some(&PropertyValue::Float(15.0)));
     }
 }

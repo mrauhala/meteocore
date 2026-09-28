@@ -242,6 +242,12 @@ pub struct CellTrack {
     pub blob: CellBlob,
     /// Generations this track has been observed in (1 = newborn).
     pub age: u32,
+    /// Wall-clock seconds from first detection to this observation (0 for a
+    /// newborn): the sum of the spans each match covered, so a coasted or
+    /// skipped frame counts at its real duration while `age` counts only
+    /// observations. Time-base free like `velocity_kms` — the tracker never
+    /// sees an instant, only the elapsed seconds its caller passes (#650).
+    pub tracked_secs: f32,
     /// EMA of the track's own velocity, km/SECOND in grid axes
     /// (+x east, +y south) — time-base free, so lead-step configs and
     /// skipped generations cannot skew it. `None` until the second
@@ -583,6 +589,7 @@ pub fn advance_tracks_with_stats(
                     trend_anchor_volume: blob.volume,
                     blob,
                     age: 1,
+                    tracked_secs: 0.0,
                     velocity_kms: None,
                     deviant_streak: 0,
                     growing: None,
@@ -676,6 +683,10 @@ pub fn advance_tracks_with_stats(
                         severity: severity_hysteretic(&blob, area_km2, Some(prev.severity)),
                         blob,
                         age: prev.age + 1,
+                        // `ds` is this match's span: previous anchor → now,
+                        // or last actual observation → now for a rescued
+                        // coast, so a coast is counted once, at its length.
+                        tracked_secs: prev.tracked_secs + ds,
                         growing,
                         trend_anchor_volume,
                         intensity_tendency,
@@ -941,6 +952,7 @@ mod tests {
                 max_value: 40.0,
             },
             age: 1,
+            tracked_secs: 0.0,
             first_centroid: (cx, cy),
             net_displacement_km: 0.0,
             path_length_km: 0.0,
@@ -1070,6 +1082,46 @@ mod tests {
         );
         assert!(expired.is_empty());
         assert_eq!(stats.deaths, 1);
+    }
+
+    #[test]
+    fn tracked_time_counts_a_coasted_frame_at_its_real_length() {
+        // #650: `age` counts observations, so a track seen at 0, 5 and 15
+        // minutes (missed at 10) has age 3 but is 15 minutes old — not the
+        // 10 that `(age - 1) × cadence` would claim.
+        let field = MotionField {
+            block: 1,
+            bw: 1,
+            bh: 1,
+            u: vec![0.0],
+            v: vec![0.0],
+            measured: vec![false],
+        };
+        let scale = PixelScale::uniform(1.0, 1.0);
+        let at = |x: f32| bare_track(0, x, 0.0).blob;
+        let born = advance_tracks(&[], vec![at(0.0)], scale, &field, 300.0, 300.0, || 5);
+        assert_eq!((born[0].age, born[0].tracked_secs), (1, 0.0));
+        let seen = advance_tracks(&born, vec![at(1.0)], scale, &field, 300.0, 300.0, || 6);
+        assert_eq!((seen[0].age, seen[0].tracked_secs), (2, 300.0));
+        let (_, coast, _) =
+            advance_tracks_coasting(&seen, &[], vec![], scale, &field, 300.0, 300.0, 300.0, || 7);
+        // Rescued: the coast's span is last observation → now, 600 s.
+        let (back, _, _) = advance_tracks_coasting(
+            &[],
+            &coast,
+            vec![at(3.0)],
+            scale,
+            &field,
+            300.0,
+            600.0,
+            300.0,
+            || 8,
+        );
+        assert_eq!(
+            back[0].id, seen[0].id,
+            "precondition: the coast was rescued"
+        );
+        assert_eq!((back[0].age, back[0].tracked_secs), (3, 900.0));
     }
 
     #[test]
@@ -1255,6 +1307,7 @@ mod tests {
             path_length_km: 0.0,
             blob: blob.clone(),
             age: 1,
+            tracked_secs: 0.0,
             velocity_kms: None,
             deviant_streak: 0,
             severity: Severity::Weak,

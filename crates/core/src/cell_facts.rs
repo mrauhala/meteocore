@@ -81,12 +81,18 @@ impl Trend {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct LightningFacts {
     pub flash_count: u32,
-    pub flash_rate_per_min: f64,
+    /// The window's flashes per minute. `None` when the rate was not
+    /// measured — never a defaulted 0.0, which would read as a quiet cell
+    /// (#650). The tracker sets count and rate together, so a present count
+    /// with an unknown rate is a guard, not a state seen in production.
+    pub flash_rate_per_min: Option<f64>,
     /// Flashes per km² of cell footprint.
     ///
     /// Normalizes for size: a small intense cell and a large diffuse one can
-    /// share a flash count while meaning quite different things.
-    pub flash_density_per_km2: f64,
+    /// share a flash count while meaning quite different things. `None` for a
+    /// degenerate zero-area cell: a density over no area is undefined, not
+    /// zero (#650).
+    pub flash_density_per_km2: Option<f64>,
     /// Schultz-style 2σ jump fired this generation. Derived from `jump_sigma`
     /// so the two cannot disagree.
     ///
@@ -191,7 +197,9 @@ pub struct ImpactFacts {
     /// Minutes until it reaches `approaching`.
     pub eta_minutes: Option<f64>,
     /// Pre-normalized 0..=1 exposure, so the scorer stays domain-agnostic
-    /// about how "how much does this matter to people" was computed.
+    /// about how "how much does this matter to people" was computed. Served
+    /// as `impact_exposure` (#650): the input to the most heavily weighted
+    /// term, and the marker that the join ran (0.0 = measured, nothing near).
     pub exposure: f64,
 }
 
@@ -217,6 +225,11 @@ pub struct CellFactSheet {
     pub area_km2: f64,
     /// Generations observed; 1 = newborn.
     pub age: u32,
+    /// Wall-clock minutes from the track's first detection to `observed`;
+    /// 0 for a newborn (#650). `age` counts observations, so a frame the cell
+    /// was missed in, or a skipped source frame, is invisible there and
+    /// counted at its real duration here.
+    pub age_minutes: f64,
     pub speed_ms: Option<f64>,
     /// Compass bearing the cell moves toward.
     pub bearing_deg: Option<f64>,
@@ -465,14 +478,15 @@ impl SignificanceTerms for CellFactSheet {
                     ramp(frac, POSITIVE_CG_FLOOR, POSITIVE_CG_CEILING),
                 ));
             }
-            terms.push(Term::new(
-                "flash_rate",
-                ramp(
-                    lightning.flash_rate_per_min,
-                    0.0,
-                    FLASH_RATE_CEILING_PER_MIN,
-                ),
-            ));
+            // An unmeasured rate drops the term, like an unreported
+            // positive-CG share: scoring it as 0.0 would rank an unknown as
+            // a measured-quiet cell.
+            if let Some(rate) = lightning.flash_rate_per_min {
+                terms.push(Term::new(
+                    "flash_rate",
+                    ramp(rate, 0.0, FLASH_RATE_CEILING_PER_MIN),
+                ));
+            }
         }
 
         if let Some(volume) = self.volume {
@@ -527,6 +541,7 @@ mod tests {
             max_dbz: 47.0,
             area_km2: 40.0,
             age: 5,
+            age_minutes: 20.0,
             speed_ms: Some(14.0),
             bearing_deg: Some(45.0),
             deviant_mover: Some(false),
@@ -596,8 +611,8 @@ mod tests {
             cg_polarity_known: None,
             positive_cg_fraction: Some(0.25),
             flash_count: 12,
-            flash_rate_per_min: 4.0,
-            flash_density_per_km2: 0.0,
+            flash_rate_per_min: Some(4.0),
+            flash_density_per_km2: Some(0.0),
             jump_sigma: None,
             first_flash: None,
             jump: Some(true),
@@ -729,8 +744,8 @@ mod tests {
         let mut quiet = cell(1);
         quiet.lightning = Some(LightningFacts {
             flash_count: 0,
-            flash_rate_per_min: 0.0,
-            flash_density_per_km2: 0.0,
+            flash_rate_per_min: Some(0.0),
+            flash_density_per_km2: Some(0.0),
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
@@ -813,8 +828,8 @@ mod tests {
         let mut quiet = cell(1);
         quiet.lightning = Some(LightningFacts {
             flash_count: 2,
-            flash_rate_per_min: 1.0,
-            flash_density_per_km2: 0.0,
+            flash_rate_per_min: Some(1.0),
+            flash_density_per_km2: Some(0.0),
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
@@ -826,8 +841,8 @@ mod tests {
         let mut jumping = cell(2);
         jumping.lightning = Some(LightningFacts {
             flash_count: 2,
-            flash_rate_per_min: 1.0,
-            flash_density_per_km2: 0.0,
+            flash_rate_per_min: Some(1.0),
+            flash_density_per_km2: Some(0.0),
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
@@ -853,8 +868,8 @@ mod tests {
         dangerous.intensity_trend_dbz_min = Some(1.2);
         dangerous.lightning = Some(LightningFacts {
             flash_count: 40,
-            flash_rate_per_min: 25.0,
-            flash_density_per_km2: 0.0,
+            flash_rate_per_min: Some(25.0),
+            flash_density_per_km2: Some(0.0),
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
@@ -965,8 +980,8 @@ mod tests {
         let mut small = cell(1);
         small.lightning = Some(LightningFacts {
             flash_count: 30,
-            flash_rate_per_min: 12.0,
-            flash_density_per_km2: 0.5,
+            flash_rate_per_min: Some(12.0),
+            flash_density_per_km2: Some(0.5),
             jump: Some(true),
             jump_sigma: Some(2.1),
             cg_count: None,
@@ -994,8 +1009,8 @@ mod tests {
         let mut c = cell(1);
         c.lightning = Some(LightningFacts {
             flash_count: 40,
-            flash_rate_per_min: 20.0,
-            flash_density_per_km2: 1.0,
+            flash_rate_per_min: Some(20.0),
+            flash_density_per_km2: Some(1.0),
             jump: Some(true),
             jump_sigma: None,
             cg_count: None,
@@ -1017,8 +1032,8 @@ mod tests {
     fn a_high_positive_cg_share_raises_significance() {
         let base = LightningFacts {
             flash_count: 20,
-            flash_rate_per_min: 8.0,
-            flash_density_per_km2: 0.5,
+            flash_rate_per_min: Some(8.0),
+            flash_density_per_km2: Some(0.5),
             jump: Some(false),
             jump_sigma: Some(0.5),
             cg_count: Some(20),
@@ -1050,8 +1065,8 @@ mod tests {
         let mut unknown = cell(1);
         unknown.lightning = Some(LightningFacts {
             flash_count: 20,
-            flash_rate_per_min: 8.0,
-            flash_density_per_km2: 0.5,
+            flash_rate_per_min: Some(8.0),
+            flash_density_per_km2: Some(0.5),
             jump: Some(false),
             jump_sigma: None,
             cg_count: None,
@@ -1067,6 +1082,37 @@ mod tests {
     }
 
     #[test]
+    fn an_unmeasured_flash_rate_is_not_scored_as_a_quiet_cell() {
+        // #650: the rate used to default to 0.0 when missing, which scored
+        // (and served) an unknown as a measured-quiet cell.
+        let lightning = |rate| LightningFacts {
+            flash_count: 0,
+            flash_rate_per_min: rate,
+            flash_density_per_km2: None,
+            jump: None,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        };
+        let mut unknown = cell(1);
+        unknown.lightning = Some(lightning(None));
+        let mut quiet = cell(2);
+        quiet.lightning = Some(lightning(Some(0.0)));
+        assert!(
+            !unknown.terms().iter().any(|t| t.name == "flash_rate"),
+            "an unmeasured rate must emit no term at all"
+        );
+        let s = scorer();
+        assert!(
+            s.score_one(&quiet).score < s.score_one(&unknown).score,
+            "measured-quiet ranks below unknown, as for an absent group"
+        );
+    }
+
+    #[test]
     fn positive_cg_saturates_at_the_documented_ceiling() {
         // Pins the RAMP, which relative ordering alone cannot: a raw fraction
         // and a ramped one both put 0.75 above 0.05.
@@ -1074,8 +1120,8 @@ mod tests {
             let mut c = cell(1);
             c.lightning = Some(LightningFacts {
                 flash_count: 20,
-                flash_rate_per_min: 8.0,
-                flash_density_per_km2: 0.5,
+                flash_rate_per_min: Some(8.0),
+                flash_density_per_km2: Some(0.5),
                 jump: Some(false),
                 jump_sigma: None,
                 cg_count: Some(20),
@@ -1147,8 +1193,8 @@ mod tests {
     fn an_unknown_lightning_jump_scores_zero_but_a_baseline_free_jump_scores_full() {
         let facts = |jump, sigma| LightningFacts {
             flash_count: 30,
-            flash_rate_per_min: 12.0,
-            flash_density_per_km2: 1.0,
+            flash_rate_per_min: Some(12.0),
+            flash_density_per_km2: Some(1.0),
             jump,
             jump_sigma: sigma,
             cg_count: None,

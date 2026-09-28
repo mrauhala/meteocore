@@ -13,6 +13,12 @@ fn property_value_to_json(v: &PropertyValue) -> Value {
         PropertyValue::List(items) => {
             Value::Array(items.iter().map(property_value_to_json).collect())
         }
+        PropertyValue::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), property_value_to_json(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -224,6 +230,13 @@ mod tests {
                 PropertyValue::String("VRADH".into()),
             ]),
         );
+        properties.insert(
+            "contributions".into(),
+            PropertyValue::List(vec![PropertyValue::Object(vec![
+                ("term".into(), PropertyValue::String("clutter".into())),
+                ("value".into(), PropertyValue::Float(-0.4)),
+            ])]),
+        );
 
         Feature {
             id: "Helsinki".into(),
@@ -251,6 +264,15 @@ mod tests {
         assert!(json["properties"]["missing"].is_null());
         // List → JSON array
         assert_eq!(json["properties"]["quantities"], json!(["DBZH", "VRADH"]));
+        // Record → JSON object, fields in their built order.
+        assert_eq!(
+            json["properties"]["contributions"],
+            json!([{"term": "clutter", "value": -0.4}])
+        );
+        assert_eq!(
+            serde_json::to_string(&json["properties"]["contributions"]).unwrap(),
+            r#"[{"term":"clutter","value":-0.4}]"#
+        );
     }
 
     #[test]

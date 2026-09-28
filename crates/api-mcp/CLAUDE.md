@@ -113,6 +113,11 @@ postgis engine issues a COUNT against the database.
   summarizing one call in isolation still sees it.
 - **Null is passed through as null.** Flattening it to `false`/`0` would let a
   model state something untrue about a frame where a join was skipped.
+- **Records pass through as objects, sign intact.** `significance_contributions`
+  is a list of `{term, value}` (#650); a negative value is a reason the cell
+  ranked LOWER. A bare `significance_reasons` list read `["clutter", …]` as
+  reasons a cell ranked high, which is why the tool description points at
+  the signed values.
 
 ## Gotchas
 

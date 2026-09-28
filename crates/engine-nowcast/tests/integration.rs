@@ -544,6 +544,10 @@ fn lightning_source_error_degrades_to_null_fields() {
         f.properties.get("track_age"),
         Some(PropertyValue::Integer(3))
     ));
+    assert_eq!(
+        f.properties.get("age_minutes"),
+        Some(&PropertyValue::Float(10.0))
+    );
     assert!(matches!(
         f.properties.get("flash_count"),
         Some(PropertyValue::Null)
@@ -1036,8 +1040,15 @@ fn cell_features_are_served_and_tracks_persist() {
     let f = &page.features[0];
     assert_eq!(f.id, id1, "track id persists across generations");
     for name in f.properties.keys() {
+        // A list of `{term, value}` records has no exact-match form; it is
+        // the one served property deliberately not filterable (#650).
+        if name == "significance_contributions" {
+            continue;
+        }
         assert!(engine.filterables().contains(name), "{name}");
     }
+    assert!(f.properties.contains_key("significance_contributions"));
+    assert!(!engine.filterables().contains("significance_contributions"));
     assert!(!engine.filterables().contains("lightning_jump"));
     let mut filtered = FeatureQuery {
         property_filters: vec![
@@ -1063,6 +1074,12 @@ fn cell_features_are_served_and_tracks_persist() {
         f.properties.get("track_age"),
         Some(PropertyValue::Integer(3))
     ));
+    // Observed at t0 (startup replay), anchor1 and anchor2: three frames,
+    // ten minutes since first detection (#650).
+    assert_eq!(
+        f.properties.get("age_minutes"),
+        Some(&PropertyValue::Float(10.0))
+    );
     assert!(engine.get_feature(&id1).is_ok());
     assert!(engine.get_feature("9999").is_err());
 
@@ -1107,6 +1124,10 @@ fn cell_features_are_served_and_tracks_persist() {
         hist.features[0].properties.get("track_age"),
         Some(PV::Integer(2))
     ));
+    assert_eq!(
+        hist.features[0].properties.get("age_minutes"),
+        Some(&PV::Float(5.0))
+    );
     let none = engine
         .get_features(&FeatureQuery {
             datetime: Some(DatetimeInterval {
@@ -1448,6 +1469,44 @@ fn cells_are_ranked_by_significance_with_reasons() {
         }
         other => panic!("missing significance_reasons, got {other:?}"),
     }
+    // #650: the signed breakdown behind every score, biggest first; it adds
+    // up to the served score and its leading terms are the reasons.
+    for f in &page.features {
+        let Some(PropertyValue::List(entries)) = f.properties.get("significance_contributions")
+        else {
+            panic!("missing significance_contributions: {:?}", f.properties);
+        };
+        let pairs: Vec<(String, f64)> = entries
+            .iter()
+            .map(|e| match e {
+                PropertyValue::Object(fields) => match fields.as_slice() {
+                    [(t, PropertyValue::String(term)), (v, PropertyValue::Float(value))]
+                        if t == "term" && v == "value" =>
+                    {
+                        (term.clone(), *value)
+                    }
+                    other => panic!("expected {{term, value}}, got {other:?}"),
+                },
+                other => panic!("expected a record, got {other:?}"),
+            })
+            .collect();
+        let sum: f64 = pairs.iter().map(|(_, v)| v).sum();
+        assert!(
+            (sum - score(f)).abs() < 1e-3,
+            "contributions sum {sum} vs significance {}",
+            score(f)
+        );
+        assert!(pairs.windows(2).all(|w| w[0].1.abs() >= w[1].1.abs()));
+        let Some(PropertyValue::List(reasons)) = f.properties.get("significance_reasons") else {
+            panic!("missing reasons");
+        };
+        let leading: Vec<_> = pairs
+            .iter()
+            .take(3)
+            .map(|(t, _)| PropertyValue::String(t.clone()))
+            .collect();
+        assert_eq!(reasons, &leading);
+    }
 }
 
 /// A typo in a `[nowcast.significance]` weight name must fail the collection
@@ -1659,10 +1718,12 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
         1,
         "without impact context, the strongest cell ranks first"
     );
-    assert!(
-        strong.properties.get("impact_over").is_none(),
-        "impact properties must be ABSENT when no source is wired, not null"
-    );
+    for key in ["impact_over", "impact_exposure"] {
+        assert!(
+            strong.properties.get(key).is_none(),
+            "impact properties must be ABSENT when no source is wired, not null: {key}"
+        );
+    }
 
     // Same scene, with a populated area over the WEAK cell only.
     let mut config = base_config();
@@ -1697,12 +1758,58 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
         ),
         "a cell over nothing reports null, not a missing key"
     );
+    // #650: the exposure behind the heaviest-weighted term is served, and it
+    // is a number whenever the join ran — 0 for the cell over nothing, which
+    // is what tells its null `impact_over` from a skipped join.
+    let exposure_of = |f: &Feature| match f.properties.get("impact_exposure") {
+        Some(PropertyValue::Float(v)) => *v,
+        other => panic!("a joined cell must serve its exposure, got {other:?}"),
+    };
+    assert!(exposure_of(weak) > 0.0, "over Bigtown");
+    assert_eq!(exposure_of(strong), 0.0, "over nothing, measured");
     assert_eq!(
         rank_of(weak),
         1,
         "a moderate cell over a city must outrank a very severe cell over nothing"
     );
     assert_eq!(rank_of(strong), 2);
+
+    // Same scene, impact source DOWN for the generation: the group keeps its
+    // keys, all null — the encoding a skipped lightning or radar join uses
+    // (#650). It used to vanish, so a model could not tell "impact context
+    // unavailable" from "this server has none".
+    struct FailingAreas;
+    impl FeatureEngine for FailingAreas {
+        fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            Err(DataServerError::Engine("areas unavailable".into()))
+        }
+        fn get_feature(&self, _id: &str) -> Result<Feature, DataServerError> {
+            unreachable!("impact index only calls get_features")
+        }
+    }
+    let engine = NowcastEngine::new("skipped", "mock", Arc::new(TwoCellSource), &config)
+        .expect("engine builds")
+        .with_impact_source(Arc::new(FailingAreas), "name", Some("population"));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(
+        page.number_matched, 2,
+        "a failed join never fails the generation"
+    );
+    for f in &page.features {
+        for key in [
+            "impact_over",
+            "impact_approaching",
+            "impact_eta_minutes",
+            "impact_exposure",
+        ] {
+            assert_eq!(
+                f.properties.get(key),
+                Some(&PropertyValue::Null),
+                "a skipped join is present-and-null: {key}"
+            );
+        }
+    }
 }
 
 /// #605 / review: an unwired collection must not advertise properties its
@@ -1900,6 +2007,26 @@ fn a_stationary_echo_is_flagged_and_demoted() {
         ),
         other => panic!("missing reasons: {other:?}"),
     }
+    // ...and its served value says it pulled the cell DOWN (#650): a bare
+    // name in the reasons read as one more reason the cell ranked high.
+    let Some(PropertyValue::List(entries)) = p.get("significance_contributions") else {
+        panic!("missing contributions: {p:?}");
+    };
+    let clutter = entries.iter().find_map(|e| match e {
+        PropertyValue::Object(fields)
+            if fields.contains(&("term".into(), PropertyValue::String("clutter".into()))) =>
+        {
+            fields.iter().find_map(|(k, v)| match v {
+                PropertyValue::Float(x) if k == "value" => Some(*x),
+                _ => None,
+            })
+        }
+        _ => None,
+    });
+    assert!(
+        clutter.is_some_and(|v| v < 0.0),
+        "the clutter contribution must be negative: {entries:?}"
+    );
 }
 
 /// Reported by a model consuming the live `/mcp` surface on 2026-08-24:
@@ -2447,6 +2574,9 @@ fn unknown_and_outside_lightning_coverage_are_not_measured_quiet() {
             );
         }
         for name in props.keys() {
+            if name == "significance_contributions" {
+                continue;
+            }
             assert!(engine.filterables().contains(name), "{name}");
         }
     }

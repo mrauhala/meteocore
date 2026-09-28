@@ -42,6 +42,18 @@ impl CellEngine {
         // Present-but-null: "configured, not measured this frame". A client
         // that flattens this to false would state something untrue.
         m.insert("lightning_jump".into(), PropertyValue::Null);
+        // The signed breakdown (#650): a negative entry is a reason the cell
+        // ranked LOWER, and must reach the model as a number, not a name.
+        let record = |term: &str, value: f64| {
+            PropertyValue::Object(vec![
+                ("term".into(), PropertyValue::String(term.into())),
+                ("value".into(), PropertyValue::Float(value)),
+            ])
+        };
+        m.insert(
+            "significance_contributions".into(),
+            PropertyValue::List(vec![record("impact", 0.5), record("clutter", -0.25)]),
+        );
         Feature {
             id: id.into(),
             geometry: Arc::new(Geometry::Point { x: 24.9, y: 60.2 }),
@@ -437,6 +449,14 @@ async fn storm_cells_come_back_ranked_and_bounded() {
         cells[0]["lightning_jump"].is_null(),
         "null must not be flattened: {}",
         cells[0]
+    );
+    // Records survive as objects, sign included.
+    assert_eq!(
+        cells[0]["significance_contributions"],
+        json!([
+            {"term": "impact", "value": 0.5},
+            {"term": "clutter", "value": -0.25}
+        ])
     );
 
     // The response carries its own disclaimer, so a model summarizing one

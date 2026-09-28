@@ -202,8 +202,11 @@ coasting, joins, or raw-byte forecast encoding. See
   still scores (it happened; it just can't be graded).
 - A perfectly flat history has zero spread, making the true sigma infinite.
   Clamped to `JUMP_SIGMA_FLAT_HISTORY` so it stays a renderable number.
-- `flash_density_per_km2` normalizes for cell size; guarded against a
-  degenerate zero-area cell producing `inf`.
+- `flash_density_per_km2` normalizes for cell size. A degenerate zero-area
+  cell serves `null` — neither `inf` nor `0.0`, which would claim a
+  measured-quiet cell (#650). `flash_rate_per_min` is `null` when unmeasured
+  for the same reason, and its scoring term then drops out; the tracker sets
+  count and rate together, so both are guards, not states seen live.
 - `first_flash` is the track's FIRST ever, carried across generations, never
   overwritten by a later one — electrification age, not "most recent".
 - Scoring ramps the jump between `JUMP_SIGMA_FLOOR` (2.0, the test
@@ -456,7 +459,18 @@ see `docs/cell-intelligence-plan-amendment.md`).
 - **`significance_reasons` names demotions too.** `clutter` and `weakening`
   in the list are reasons a cell ranked LOWER (the MCP tool text says so);
   `significance_is_demoted()` is true whenever any discount fired, weakening
-  included. Signed contribution values are the #650 follow-up.
+  included. `significance_contributions` (#650) carries the signed values —
+  see the fact-sheet section.
+- **One absent/null rule for every optional join group (#650).** Lightning,
+  impact and radar: ABSENT when no source is wired; present with its
+  per-generation keys `null` when the source is wired but this generation's
+  join was skipped (source error, no radar sites yet, bad grid bbox); values
+  when the join ran, where `null` inside the group means "nothing there" or
+  "not computable". `lightning_coverage` is the one key that keeps its value
+  on a failed fetch: it describes the source's configured footprint. Presence is keyed on the engine's `*_configured` flags passed
+  to `cell_feature`, never on whether the fact sheet holds the group — keying
+  on the fact sheet is how a skipped impact join used to drop its keys while
+  a skipped lightning join nulled them.
 
 ## Fact sheets + significance ranking
 
@@ -483,9 +497,26 @@ see `docs/cell-intelligence-plan-amendment.md`).
   wire, where the id-string tie-break can point the other way — a limited
   page then held rank 2 without rank 1 (the #635 hole, second form).
 - Served as `significance` (0..=1), `significance_rank` (1-based within the
-  snapshot) and `significance_reasons` (top 3 contributing terms). The
-  reasons field is load-bearing: a weight table with no ground truth has to
-  be arguable to be tunable.
+  snapshot), `significance_contributions` and `significance_reasons`. The
+  explanation is load-bearing: a weight table with no ground truth has to be
+  arguable to be tunable.
+- **`significance_contributions` is the signed breakdown (#650):** a list of
+  `{term, value}` records (`PropertyValue::Object`), biggest magnitude first,
+  every term that moved the score — negative for a discount (`clutter`,
+  `weakening`). Values are rounded to `SIGNIFICANCE_DECIMALS` like the score
+  and sum to it up to rounding (to the unclamped `raw`, which differs only
+  under a negative graded weight override). A term that rounds to zero is
+  neither served nor a reason, so `significance_reasons` is always the first
+  three terms of this list. It is the one served property NOT in
+  `filterables`: a record has no exact-match form, and accepting it would
+  answer every filter with zero cells instead of a 400.
+- `impact_exposure` serves `ImpactFacts.exposure` — the input to the heaviest
+  default term — rounded in `cell_feature`, not `score_cells`, because it is a
+  scoring input and the ranking must keep seeing the unrounded value.
+- `age_minutes` sits next to `track_age`: wall-clock minutes since first
+  detection (0 for a newborn), accumulated on the track as `tracked_secs` from
+  each match's own span. A coasted or skipped frame therefore counts at its
+  real length, where `track_age` counts only observations.
 - **Absent GRADED terms renormalize.** A cell with no volume/impact/lightning
   data simply omits those terms. That is why wiring a new source later needs no
   config flag day — but it also means `measured-quiet` ranks BELOW
@@ -644,9 +675,11 @@ see `docs/cell-intelligence-plan-amendment.md`).
   treating a missing value as zero would silently erase that area from
   every ranking.
 - Feature properties `impact_over` / `impact_approaching` /
-  `impact_eta_minutes` exist ONLY when a source is wired (same tri-state
-  discipline as the flash properties); `null` inside the group means
-  "nothing there".
+  `impact_eta_minutes` / `impact_exposure` exist ONLY when a source is wired,
+  and are all `null` when this generation's join was skipped (the shared
+  group rule above). `impact_exposure` is a number whenever the join ran —
+  0.0 when nothing is near — so it tells a null `impact_over` meaning "over
+  no area" from one meaning "not joined".
 - `testdata/municipalities.geojson` carries a `population` property joined
   from Statistics Finland (`vaestoalue:kunta_vaki2025`, 308 municipalities,
   2025 figures) — that's what makes the example config's weighting real.

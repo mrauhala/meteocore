@@ -249,8 +249,10 @@ impl MeteoCoreMcp {
         description = "Tracked storm cells at one analysis frame, most significant first. \
                        Significance combines radar intensity, size, trend, lightning and \
                        impact on populated areas — it is a ranking heuristic, NOT an official \
-                       warning. Each cell carries the reasons it ranked where it did; \
-                       `clutter` and `weakening` among them are reasons it ranked LOWER."
+                       warning. Each cell carries the reasons it ranked where it did, and \
+                       `significance_contributions` gives every term's signed share of the \
+                       score: a negative value (`clutter`, `weakening`) is a reason it ranked \
+                       LOWER."
     )]
     fn get_storm_cells(
         &self,
@@ -679,5 +681,11 @@ fn property_json(v: &PropertyValue) -> Value {
         PropertyValue::Bool(b) => json!(b),
         PropertyValue::Null => Value::Null,
         PropertyValue::List(items) => Value::Array(items.iter().map(property_json).collect()),
+        PropertyValue::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), property_json(v)))
+                .collect(),
+        ),
     }
 }

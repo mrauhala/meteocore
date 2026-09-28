@@ -854,6 +854,15 @@ fn hash_property(v: &PropertyValue, h: &mut u64) {
                 hash_property(item, h);
             }
         }
+        PropertyValue::Object(fields) => {
+            fnv1a(&[7], h);
+            fnv1a(&(fields.len() as u64).to_le_bytes(), h);
+            for (key, value) in fields {
+                fnv1a(&(key.len() as u64).to_le_bytes(), h);
+                fnv1a(key.as_bytes(), h);
+                hash_property(value, h);
+            }
+        }
     }
 }
 
