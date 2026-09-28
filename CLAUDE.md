@@ -506,6 +506,9 @@ port = 8000
 # collections_dir = "collections.d"     # optional, directory of per-collection .toml files
 # watch_collections_dir = true          # optional, auto-reload on collections_dir + colormaps_dir changes (default false)
 # watch_debounce_ms = 500               # optional, coalesce-window for the watcher (default 500)
+# render_concurrency = 24               # optional, render CPU slots shared by WMS/Maps/Tiles/3D Tiles
+                                        # (default 2× CPUs, min 8; 1..=512). Fixed at boot: a reload
+                                        # cannot resize the slots (logs a WARN), restart to change.
 # colormaps_dir = "colormaps.d"  # optional, directory of palette files loaded as
                                  # named colormaps (name = file stem). Formats:
                                  # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,
@@ -791,7 +794,8 @@ a non-http(s) license URL are rejected.
   follow the established panel pattern: hit ratio, bytes vs capacity, miss
   rate.
 - **State:** API state wrapped in `ArcSwap` for lock-free reads. Render
-  semaphore (2× CPU cores, min 8) shared across Maps/Tiles/WMS. Engine
+  semaphore (`[server] render_concurrency`, default 2× CPU cores, min 8;
+  fixed at boot, so restart to change) shared across Maps/Tiles/WMS. Engine
   loading lives in `server/src/admin.rs`.
 
 ## Code Style

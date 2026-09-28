@@ -1,16 +1,37 @@
 //! Bounded render admission and blocking execution shared by HTTP APIs.
 pub mod budget;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-pub fn render_concurrency() -> usize {
+/// Built-in slot count: 2× available CPUs, min 8. A slot's "ownership" of a
+/// CPU is loose because decode/encode interleaves with bilinear passes.
+pub fn default_render_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
         .saturating_mul(2)
         .max(8)
+}
+
+static SLOT_COUNT: OnceLock<usize> = OnceLock::new();
+
+/// The process-wide render slot count. The first read fixes it: the value
+/// from [`set_render_concurrency`], else [`default_render_concurrency`].
+pub fn render_concurrency() -> usize {
+    *SLOT_COUNT.get_or_init(default_render_concurrency)
+}
+
+/// Fix the slot count from `[server] render_concurrency` (#209; range is
+/// validated at config load). Call before anything reads the slots: they are
+/// sized once and survive reloads. Too late, it returns the fixed count.
+pub fn set_render_concurrency(slots: usize) -> Result<(), usize> {
+    match SLOT_COUNT.set(slots) {
+        Ok(()) => Ok(()),
+        Err(_) if render_concurrency() == slots => Ok(()),
+        Err(_) => Err(render_concurrency()),
+    }
 }
 
 /// Process lifetime: reload must not double the number of running renders.
@@ -401,6 +422,52 @@ mod tests {
                 assert_eq!(metrics().timed_out, before + completed);
             }
         });
+    }
+
+    /// Re-runs `test` alone in a child process and returns `true` in the
+    /// parent: the slot count is process-global and fixed by its first read.
+    fn ran_in_child(test: &str) -> bool {
+        const CHILD: &str = "MC_TEST_RENDER_CONCURRENCY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, "1")
+            .env_remove("MC_RENDER_QUEUE_CAPACITY")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{test} failed in its child process");
+        true
+    }
+
+    #[test]
+    fn configured_render_concurrency_sizes_slots_and_queue() {
+        if ran_in_child("tests::configured_render_concurrency_sizes_slots_and_queue") {
+            return;
+        }
+        assert_eq!(set_render_concurrency(3), Ok(()));
+        assert_eq!(
+            set_render_concurrency(3),
+            Ok(()),
+            "same value is idempotent"
+        );
+        assert_eq!(render_concurrency(), 3);
+        assert_eq!(RENDER_SLOTS.available_permits(), 3);
+        assert_eq!(metrics().capacity, 9, "queue defaults to 3x the slots");
+        assert_eq!(set_render_concurrency(4), Err(3));
+        assert_eq!(RENDER_SLOTS.available_permits(), 3);
+    }
+
+    #[test]
+    fn render_concurrency_is_fixed_by_its_first_read() {
+        if ran_in_child("tests::render_concurrency_is_fixed_by_its_first_read") {
+            return;
+        }
+        let default = default_render_concurrency();
+        assert_eq!(RENDER_SLOTS.available_permits(), default);
+        assert_eq!(set_render_concurrency(default + 1), Err(default));
+        assert_eq!(render_concurrency(), default);
     }
 
     #[tokio::test]

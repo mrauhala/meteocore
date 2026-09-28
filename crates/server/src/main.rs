@@ -465,6 +465,12 @@ async fn main() {
     // will see the port open early; probe `/health` over HTTP instead.)
     info!("Socket bound to {addr} — loading collections, not yet serving");
 
+    // Must precede the first load_collections, which sizes the render slots.
+    if let Err(e) = admin::init_render_concurrency(config.server.render_concurrency) {
+        tracing::error!("{e}");
+        std::process::exit(1);
+    }
+
     let result = admin::load_collections(
         &style_ctx,
         &config.collections,

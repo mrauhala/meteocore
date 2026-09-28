@@ -110,7 +110,19 @@ pub struct ServerSettings {
     /// base URL (`BASE_URL` env > `[server] base_url` > `http://{host}:{port}`).
     #[serde(default)]
     pub trust_proxy_headers: bool,
+    /// Render CPU slots shared by WMS, Maps, Tiles and 3D Tiles (#209).
+    /// Default (`None`): 2× available CPUs, min 8. Lower it for CPU-bound
+    /// deployments, raise it when renders mostly wait on remote reads.
+    /// Must be 1..=[`MAX_RENDER_CONCURRENCY`]. Fixed at boot: the slots
+    /// survive reloads, so a change needs a restart.
+    #[serde(default)]
+    pub render_concurrency: Option<usize>,
 }
+
+/// Upper bound for `[server] render_concurrency`. Each slot runs its render
+/// on Tokio's blocking pool (512 threads by default); more slots than that
+/// cannot run at once and would only wait in the pool while holding a slot.
+pub const MAX_RENDER_CONCURRENCY: usize = 512;
 
 impl ServerSettings {
     /// Resolved base URL with no trailing slash.
@@ -148,6 +160,7 @@ impl ServerConfig {
                 watch_collections_dir: false,
                 watch_debounce_ms: default_watch_debounce_ms(),
                 trust_proxy_headers: false,
+                render_concurrency: None,
             },
             collections: Vec::new(),
             style_bundles: Vec::new(),
@@ -2950,6 +2963,17 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // Zero slots would stall every uncached render until its deadline.
+        if let Some(n) = self.server.render_concurrency {
+            if !(1..=MAX_RENDER_CONCURRENCY).contains(&n) {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "[server] render_concurrency must be between 1 and \
+                     {MAX_RENDER_CONCURRENCY} (got {n}); omit it for the default \
+                     of 2x available CPUs, min 8"
+                )));
+            }
+        }
+
         // [mcp]: an enabled endpoint MUST have a resolvable token. Failing
         // the load is the point — the alternative is a typo publishing an
         // unauthenticated tool surface over every collection, which nothing
@@ -4456,6 +4480,46 @@ description = "A test"
         let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
         assert!(config.server.watch_collections_dir);
         assert_eq!(config.server.watch_debounce_ms, 250);
+    }
+
+    fn load_render_concurrency(line: &str) -> Result<Option<usize>, String> {
+        let tmp = TempDir::new().unwrap();
+        let toml = format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{line}\n");
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        ServerConfig::from_file(path.to_str().unwrap())
+            .map(|(config, _)| config.server.render_concurrency)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn render_concurrency_is_optional_and_parses_explicit_values() {
+        assert_eq!(load_render_concurrency(""), Ok(None));
+        assert_eq!(
+            ServerConfig::default_for_auto().server.render_concurrency,
+            None
+        );
+        assert_eq!(
+            load_render_concurrency("render_concurrency = 1"),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            load_render_concurrency("render_concurrency = 512"),
+            Ok(Some(MAX_RENDER_CONCURRENCY))
+        );
+    }
+
+    #[test]
+    fn render_concurrency_out_of_range_is_a_load_error() {
+        for value in [0, MAX_RENDER_CONCURRENCY + 1] {
+            let err = load_render_concurrency(&format!("render_concurrency = {value}"))
+                .expect_err("out-of-range render_concurrency must fail the load");
+            assert!(
+                err.contains("render_concurrency must be between 1 and 512")
+                    && err.contains(&format!("got {value}")),
+                "{err}"
+            );
+        }
+        assert!(load_render_concurrency("render_concurrency = -1").is_err());
     }
 
     #[test]
