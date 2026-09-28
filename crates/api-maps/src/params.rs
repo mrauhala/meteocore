@@ -3,13 +3,24 @@ use serde::Deserialize;
 
 use crate::error::MapsError;
 
-/// Maximum map pixels (width * height). 64M matches the engine-geotiff cap so
-/// requests that pass API validation never get rejected further down the stack.
+/// Output-pixel cap of one map: `width × height` of the returned image.
+///
+/// It bounds the output only, so passing it guarantees neither of the budgets
+/// behind it ("Pixel budgets" in the root CLAUDE.md, #120): engine-geotiff's
+/// `reader::MAX_MAP_PIXELS` has the same value but counts native *source*
+/// pixels, and render admission charges 32 B per output pixel against
+/// `MC_RENDER_MEMORY_MB`, whose 1024 MiB default admits at most 33 554 432.
+///
+/// Enforced in [`MapQueryParams::validate`]: HTTP 400 `BadRequest`
+/// "width * height (N) exceeds maximum of 64000000". [`MAX_MAP_DIMENSION`]²
+/// equals this cap, so the per-side check always fires first today; this one
+/// only guards a future per-side increase.
 pub const MAX_MAP_PIXELS: u64 = 64_000_000;
 
-/// Maximum single dimension (width or height). 8000 chosen so 8000 × 8000
+/// Output-pixel cap per side (width or height). 8000 chosen so 8000 × 8000
 /// equals MAX_MAP_PIXELS — a square at the per-dim cap doesn't trip the
-/// pixel cap with a confusing second error.
+/// pixel cap with a confusing second error. Tripping it is HTTP 400
+/// `BadRequest` "width and height must not exceed 8000".
 pub const MAX_MAP_DIMENSION: u32 = 8000;
 
 /// Supported CRS identifiers.
