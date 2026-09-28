@@ -12,6 +12,7 @@ and API-specific fields.
 | `collections_response` | Sort by ID, filter before paging, counts, JSON/HTML, explicit-format self/next/prev and alternate links |
 | `collection_metadata`, `collection_card` | Common descriptive fields, keywords, license and HTML alternate links; API fields may override defaults for EDR instances |
 | `collection_operation` | OpenAPI discovery operation, supported parameters, JSON/HTML responses and structured 400 errors |
+| `parameter_names`, `parameter_name_parameter` | Maps/Tiles parameter discovery: a multi-parameter raster's EDR-shaped `parameter_names` member, with label, unit and a parameter's own time axis, and the render routes' `parameter-name` OpenAPI component, one definition for every block |
 | `CONFORMANCE_CLASSES` | One Common class inventory, combined with each API's own declarations |
 
 ## Shared OGC API root

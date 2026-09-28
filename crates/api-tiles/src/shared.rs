@@ -92,7 +92,7 @@ impl BuildingBlock for TilesBlock {
         // The shared layout references only these per-API components; its
         // tile-format parameters are inline (they differ from Maps' `f`).
         let per_api = handlers::openapi_components();
-        let parameters: Map<String, Value> = ["datetime", "elevation"]
+        let parameters: Map<String, Value> = ["datetime", "elevation", "parameter-name"]
             .into_iter()
             .filter_map(|name| {
                 let definition = per_api["parameters"].get(name)?.clone();
@@ -254,9 +254,7 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
         vec![
             json!({"$ref": "#/components/parameters/datetime"}),
             json!({"$ref": "#/components/parameters/elevation"}),
-            json!({"name": "parameter-name", "in": "query", "required": false,
-                   "schema": {"type": "string"},
-                   "description": "Render this parameter of a multi-parameter collection."}),
+            json!({"$ref": "#/components/parameters/parameter-name"}),
             json!({"name": "f", "in": "query", "required": false,
                    "schema": {"type": "string", "default": "image/png", "enum": raster_formats},
                    "description": "Image format. `image/png` emits an 8-bit palette PNG for colormap layers when possible."}),

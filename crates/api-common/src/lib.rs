@@ -5,6 +5,8 @@ pub mod caching;
 pub mod shared;
 pub mod workbench;
 
+use std::sync::Arc;
+
 use axum::extract::{FromRequestParts, Query};
 use axum::http::{header, request::Parts, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -16,6 +18,7 @@ use ds_core::collection_search::{
 };
 use ds_core::config::CollectionConfig;
 use ds_core::html::{self, LinkView, Wanted};
+use ds_core::map_engine::RasterInfo;
 use serde_json::{json, Value};
 
 /// Existing Common declarations, centralized to keep all API surfaces aligned.
@@ -303,6 +306,64 @@ pub fn collection_metadata(
     metadata
 }
 
+/// Collection member listing the parameters a multi-parameter raster renders:
+/// the valid `parameter-name` values of the Maps and Tiles render routes
+/// (#279). Neither standard has a parameter concept, so the member and its
+/// entries are EDR's, which the selector already borrows: the same data
+/// described the same way on every surface.
+pub const PARAMETER_NAMES: &str = "parameter_names";
+
+/// The [`PARAMETER_NAMES`] object of a multi-parameter raster, or `None` when
+/// `info.parameters` is empty: a single-parameter collection, whose renders
+/// ignore `parameter-name`.
+///
+/// Entries are EDR `Parameter` objects keyed by name, in name order so equal
+/// snapshots serialize to equal bytes (ETags, #499). A parameter on its own
+/// time axis (`MapEngine::parameter_times`, #819) adds its `extent.temporal`
+/// in the collection extent's Common shape; the collection's is the union.
+pub fn parameter_names(
+    info: &RasterInfo,
+    parameter_times: impl Fn(&str) -> Option<Arc<[DateTime<Utc>]>>,
+) -> Option<Value> {
+    if info.parameters.is_empty() {
+        return None;
+    }
+    let mut parameters: Vec<_> = info.parameters.iter().collect();
+    parameters.sort_by(|a, b| a.name.cmp(&b.name));
+    let entries = parameters.into_iter().map(|p| {
+        let label = if p.title.trim().is_empty() {
+            &p.name
+        } else {
+            &p.title
+        };
+        let mut entry = json!({"type": "Parameter", "observedProperty": {"label": {"en": label}}});
+        let unit = p.unit.trim();
+        if !unit.is_empty() {
+            entry["unit"] = json!({
+                "label": {"en": unit},
+                "symbol": {"value": unit, "type": "http://www.opengis.net/def/uom/UCUM/"}
+            });
+        }
+        let extent = parameter_times(&p.name)
+            .and_then(|times| ds_core::ogc_extent::build_extent(None, None, "", &times, None));
+        if let Some(extent) = extent {
+            entry["extent"] = serde_json::to_value(extent).expect("Extent serializes to JSON");
+        }
+        (p.name.clone(), entry)
+    });
+    Some(Value::Object(entries.collect()))
+}
+
+/// The `parameter-name` query parameter of the Maps and Tiles render routes,
+/// one definition so the blocks of the shared root declare one component.
+pub fn parameter_name_parameter() -> Value {
+    json!({
+        "name": "parameter-name", "in": "query", "required": false,
+        "schema": {"type": "string"},
+        "description": "Parameter of a multi-parameter collection to render: one of the keys of the collection's `parameter_names`; an unknown name returns 400. Without it, the style's parameter or else the collection's default is rendered. A collection that advertises no `parameter_names` has one parameter and ignores this."
+    })
+}
+
 /// OpenAPI descriptions draw names from the same inventory used by validation.
 /// Pure bounds/defaults come from ds-core, not copies in each API crate.
 pub fn collection_parameters() -> Value {
@@ -363,4 +424,50 @@ pub fn collection_operation() -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ds_core::map_engine::ParameterInfo;
+
+    fn raster(parameters: &[(&str, &str, &str)]) -> RasterInfo {
+        RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: None,
+            times: vec![],
+            parameter: "t".into(),
+            unit: "K".into(),
+            parameters: parameters
+                .iter()
+                .map(|&(name, title, unit)| ParameterInfo {
+                    name: name.into(),
+                    title: title.into(),
+                    unit: unit.into(),
+                })
+                .collect(),
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: vec![],
+        }
+    }
+
+    #[test]
+    fn single_parameter_rasters_list_no_parameter_names() {
+        assert_eq!(parameter_names(&raster(&[]), |_| None), None);
+    }
+
+    #[test]
+    fn parameter_names_label_untitled_parameters_by_name_and_omit_blank_units() {
+        let names = parameter_names(
+            &raster(&[("t", "Temperature", " K "), ("x", " ", " ")]),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(names["t"]["observedProperty"]["label"]["en"], "Temperature");
+        assert_eq!(names["t"]["unit"]["symbol"]["value"], "K");
+        assert_eq!(names["x"]["observedProperty"]["label"]["en"], "x");
+        assert!(names["x"].get("unit").is_none());
+    }
 }

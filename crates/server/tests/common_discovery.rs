@@ -15,7 +15,7 @@ use ds_core::{
     error::DataServerError,
     feature::{Feature, FeaturePage, FeatureQuery},
     feature_engine::FeatureEngine,
-    map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile},
+    map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile},
     model::{CoverageResponse, Location},
     vertical::{VerticalDimension, VerticalKind},
 };
@@ -38,6 +38,8 @@ struct Fixture {
     time: Option<(DateTime<Utc>, DateTime<Utc>)>,
     times: Vec<DateTime<Utc>>,
     vertical: Option<VerticalDimension>,
+    /// Render parameters, each with its own time axis if it has one (#819).
+    parameters: Vec<(ParameterInfo, Option<Vec<DateTime<Utc>>>)>,
 }
 
 impl EdrEngine for Fixture {
@@ -130,12 +132,16 @@ impl MapEngine for Fixture {
             times: self.times.clone(),
             parameter: "rain".into(),
             unit: "mm".into(),
-            parameters: vec![],
+            parameters: self.parameters.iter().map(|(p, _)| p.clone()).collect(),
             vertical: self.vertical.clone(),
             grid_size: self.bbox.map(|_| [80, 80]),
             layer_subtitle: None,
             reference_times: vec![],
         }
+    }
+    fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+        let (_, times) = self.parameters.iter().find(|(p, _)| p.name == parameter)?;
+        times.as_deref().map(Arc::from)
     }
 }
 
@@ -194,11 +200,29 @@ fn catalog() -> Catalog {
             .unwrap_or_default();
         let vertical = (id == "c-match")
             .then(|| VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0, 700.0]));
+        // One multi-parameter raster; `rain` lacks the last timestep.
+        let parameters = if id == "d-match" {
+            let parameter = |name: &str, title: &str, unit: &str| ParameterInfo {
+                name: name.into(),
+                title: title.into(),
+                unit: unit.into(),
+            };
+            vec![
+                (
+                    parameter("rain", "Rain rate", "mm/h"),
+                    Some(times[..2].to_vec()),
+                ),
+                (parameter("hail", "Hail", ""), None),
+            ]
+        } else {
+            vec![]
+        };
         let fixture = Arc::new(Fixture {
             bbox,
             time,
             times,
             vertical,
+            parameters,
         });
         edr.insert(id.into(), fixture.clone());
         maps.insert(id.into(), fixture.clone());
@@ -1326,6 +1350,7 @@ async fn shared_root_extent_precedence_matches_discovery() {
             )),
             times: vec![],
             vertical: None,
+            parameters: vec![],
         }),
     );
     // `f-wind` is served by Features alone: no map, no tiles.
@@ -1499,4 +1524,73 @@ async fn every_operation_is_tagged_and_shared_tags_are_declared() {
         doc["paths"]["/collections/c-match/map/tiles"]["get"]["tags"],
         json!(["c-match"])
     );
+}
+
+/// A multi-parameter raster advertises its `parameter-name` values in one
+/// shape on every Maps and Tiles surface, and every render route declares the
+/// selector (#279). Single-parameter collections advertise none.
+#[tokio::test]
+async fn render_parameters_are_advertised_and_declared_on_every_raster_surface() {
+    let mut baseline: Option<Value> = None;
+    for surface in ["maps", "tiles", "shared"] {
+        let (app, prefix) = app(surface);
+        let doc = get_json(&app, &format!("{prefix}/collections/d-match")).await;
+        let parameters = &doc["parameter_names"];
+        let names: Vec<_> = parameters.as_object().unwrap().keys().collect();
+        assert_eq!(names, ["hail", "rain"], "{surface}");
+        let rain = &parameters["rain"];
+        assert_eq!(rain["type"], "Parameter");
+        assert_eq!(rain["observedProperty"]["label"]["en"], "Rain rate");
+        assert_eq!(rain["unit"]["symbol"]["value"], "mm/h");
+        assert!(parameters["hail"].get("unit").is_none(), "{surface}");
+        // A parameter on its own time axis (#819) narrows the collection's.
+        assert_eq!(
+            rain["extent"]["temporal"]["interval"],
+            json!([["2024-01-01T00:00:00+00:00", "2024-01-01T00:20:00+00:00"]]),
+            "{surface}"
+        );
+        assert!(parameters["hail"].get("extent").is_none(), "{surface}");
+        if let Some(baseline) = &baseline {
+            assert_eq!(parameters, baseline, "{surface}");
+        }
+        baseline = Some(parameters.clone());
+        let list = get_json(&app, &format!("{prefix}/collections")).await;
+        for entry in list["collections"].as_array().unwrap() {
+            let expected = (entry["id"] == "d-match").then_some(parameters);
+            assert_eq!(entry.get("parameter_names"), expected, "{surface}");
+        }
+
+        let api = get_json(&app, &format!("{prefix}/api")).await;
+        let m = prefix.strip_prefix("/base").unwrap();
+        let tile = "{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}";
+        let render_paths = match surface {
+            "maps" => vec![
+                "/collections/d-match/map".to_owned(),
+                "/collections/d-match/styles/{styleId}/map".to_owned(),
+            ],
+            "tiles" => vec![
+                format!("/collections/d-match/tiles/{tile}"),
+                format!("/collections/d-match/styles/{{styleId}}/tiles/{tile}"),
+            ],
+            _ => vec![
+                "/collections/d-match/map".to_owned(),
+                "/collections/d-match/styles/{styleId}/map".to_owned(),
+                format!("/collections/d-match/map/tiles/{tile}"),
+                format!("/collections/d-match/styles/{{styleId}}/map/tiles/{tile}"),
+            ],
+        };
+        for path in render_paths {
+            let operation = &api["paths"][format!("{m}{path}")]["get"];
+            let declared = operation["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{surface}: no operation at {path}"))
+                .iter()
+                .map(|p| match p["$ref"].as_str() {
+                    Some(r) => api.pointer(r.strip_prefix('#').unwrap()).unwrap(),
+                    None => p,
+                })
+                .any(|p| p["name"] == "parameter-name" && p["in"] == "query");
+            assert!(declared, "{surface}: {path} lacks parameter-name");
+        }
+    }
 }
