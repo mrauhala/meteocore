@@ -8,6 +8,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+use api_common::JsonError;
 use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
 use ds_core::edr_engine::EdrEngine;
@@ -24,7 +25,9 @@ use crate::params::{
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{coverage_response_to_json, locations_to_writer, LocationsContext};
 
-type HandlerError = (StatusCode, Json<serde_json::Value>);
+/// Converting through [`JsonError`] is what attaches the `ErrorReason` the
+/// request log reads (#119); a `(StatusCode, Json)` tuple converts via `?`.
+type HandlerError = JsonError;
 
 /// The executor owns admission and keeps running work accounted for after a
 /// client timeout. No engine-specific execution decisions belong in handlers.
@@ -33,7 +36,7 @@ async fn execute_query<T: Send + 'static>(
     work: impl FnOnce(crate::executor::QueryBudget) -> Result<T, HandlerError> + Send + 'static,
 ) -> Result<T, HandlerError> {
     crate::executor::run(blocking, work).await.map_err(|e| match e {
-        crate::executor::ExecutionError::Busy => (
+        crate::executor::ExecutionError::Busy => JsonError(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"code": "ServerBusy", "description": "EDR query capacity exhausted; retry later"})),
         ),
@@ -46,7 +49,7 @@ async fn execute_query<T: Send + 'static>(
 }
 
 fn query_timeout() -> HandlerError {
-    (
+    JsonError(
         StatusCode::GATEWAY_TIMEOUT,
         Json(json!({"code": "Timeout", "description": "EDR query exceeded its time budget"})),
     )
@@ -94,27 +97,27 @@ fn render_coverage_response(
 fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
     match e {
         DataServerError::DeadlineExceeded => query_timeout(),
-        DataServerError::ResourceExhausted => (
+        DataServerError::ResourceExhausted => JsonError(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"code": "ServerBusy", "description": "Server busy, try again later"})),
         ),
         DataServerError::InvalidParameter(_)
         | DataServerError::InvalidBbox(_)
         | DataServerError::InvalidDatetime(_)
-        | DataServerError::QueryTooLarge(_) => (
+        | DataServerError::QueryTooLarge(_) => JsonError(
             StatusCode::BAD_REQUEST,
             Json(json!({ "code": "BadRequest", "description": e.to_string() })),
         ),
         DataServerError::LocationNotFound(_)
         | DataServerError::CollectionNotFound(_)
         | DataServerError::FeatureNotFound(_)
-        | DataServerError::ReferenceTimeNotFound(_) => (
+        | DataServerError::ReferenceTimeNotFound(_) => JsonError(
             StatusCode::NOT_FOUND,
             Json(json!({ "code": "NotFound", "description": e.to_string() })),
         ),
         _ => {
             tracing::error!("{label} query error: {e}");
-            (
+            JsonError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "code": "ServerError", "description": "Internal server error" })),
             )
@@ -123,14 +126,14 @@ fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
 }
 
 fn bad_request(e: &DataServerError) -> HandlerError {
-    (
+    JsonError(
         StatusCode::BAD_REQUEST,
         Json(json!({ "code": "BadRequest", "description": e.to_string() })),
     )
 }
 
 fn server_error() -> HandlerError {
-    (
+    JsonError(
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "code": "ServerError", "description": "Internal server error" })),
     )
@@ -138,7 +141,7 @@ fn server_error() -> HandlerError {
 
 /// A 400 from a plain message (used for `?f=` content negotiation errors).
 fn bad_request_msg(msg: &str) -> HandlerError {
-    (
+    JsonError(
         StatusCode::BAD_REQUEST,
         Json(json!({ "code": "BadRequest", "description": msg })),
     )
@@ -219,7 +222,7 @@ fn request_base_url(state: &EdrState, headers: &HeaderMap) -> String {
 fn lookup_collection<'a>(
     state: &'a EdrState,
     id: &str,
-) -> Result<(&'a Arc<dyn EdrEngine>, &'a CollectionConfig), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(&'a Arc<dyn EdrEngine>, &'a CollectionConfig), HandlerError> {
     let engine = state.engines.get(id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -256,12 +259,12 @@ fn lookup_collection<'a>(
 fn resolve_instance(
     engine: &Arc<dyn EdrEngine>,
     instance_id: Option<&str>,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, HandlerError> {
     let Some(iid) = instance_id else {
         return Ok(None);
     };
     if !engine.has_instances() {
-        return Err((
+        return Err(JsonError(
             StatusCode::NOT_FOUND,
             Json(json!({
                 "code": "NotFound",
@@ -292,13 +295,13 @@ fn resolve_instance(
 fn resolve_request_z(
     engine: &Arc<dyn EdrEngine>,
     z: Option<&str>,
-) -> Result<Option<Vec<f64>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Option<Vec<f64>>, HandlerError> {
     let Some(sel) = parse_z(z).map_err(|e| bad_request(&e))? else {
         return Ok(None);
     };
     let extent = engine.get_vertical_extent();
     if extent.is_none() {
-        return Err((
+        return Err(JsonError(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": "BadRequest",
@@ -1225,7 +1228,7 @@ pub async fn instance(
     // any id (parseable or not) is 404 — consistent with the query path's
     // `resolve_instance` guard, rather than 400 on an unparseable id.
     if !engine.has_instances() {
-        return Err((
+        return Err(JsonError(
             StatusCode::NOT_FOUND,
             Json(json!({
                 "code": "NotFound",
@@ -1281,7 +1284,7 @@ pub async fn locations(
     Path(id): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
@@ -1289,7 +1292,7 @@ pub async fn locations(
     let query_engine = engine.clone();
     let (body, etag) = execute_query(false, move |budget| {
         let server_error = || {
-            (
+            JsonError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "code": "ServerError", "description": "Internal server error" })),
             )
@@ -1312,11 +1315,11 @@ pub async fn locations(
         locations_to_writer(&locs, &ctx, &mut writer).map_err(|_| {
             match writer.failure {
                 Some(crate::location_budget::Failure::Cancelled) => query_timeout(),
-                Some(crate::location_budget::Failure::Limit) => (
+                Some(crate::location_budget::Failure::Limit) => JsonError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({"code": "ResponseLimit", "description": "Complete location inventory exceeds the configured response limit"})),
                 ),
-                Some(crate::location_budget::Failure::Memory) => (
+                Some(crate::location_budget::Failure::Memory) => JsonError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({"code": "ServerBusy", "description": "Location response memory capacity exhausted; retry later"})),
                 ),
@@ -1341,7 +1344,7 @@ pub async fn location_query(
     Path((id, loc_id)): Path<(String, String)>,
     Query(params): Query<LocationQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
@@ -1392,11 +1395,11 @@ fn require_query_type(
     id: &str,
     query: &str,
     label: &str,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(), HandlerError> {
     if engine.supported_query_types().iter().any(|q| q == query) {
         return Ok(());
     }
-    Err((
+    Err(JsonError(
         StatusCode::NOT_FOUND,
         Json(json!({
             "code": "NotFound",
@@ -1409,7 +1412,7 @@ pub async fn position_query(
     Path(id): Path<String>,
     Query(params): Query<PositionQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     run_position_query(id, None, params, state).await
 }
 
@@ -1419,7 +1422,7 @@ pub async fn instance_position_query(
     Path((id, instance_id)): Path<(String, String)>,
     Query(params): Query<PositionQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     run_position_query(id, Some(instance_id), params, state).await
 }
 
@@ -1428,7 +1431,7 @@ async fn run_position_query(
     instance_id: Option<String>,
     params: PositionQueryParams,
     state: AppState,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "position", "position")?;
@@ -1524,7 +1527,7 @@ pub async fn area_query(
     Path(id): Path<String>,
     Query(params): Query<AreaQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     run_area_query(id, None, params, state).await
 }
 
@@ -1534,7 +1537,7 @@ pub async fn instance_area_query(
     Path((id, instance_id)): Path<(String, String)>,
     Query(params): Query<AreaQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     run_area_query(id, Some(instance_id), params, state).await
 }
 
@@ -1543,7 +1546,7 @@ async fn run_area_query(
     instance_id: Option<String>,
     params: AreaQueryParams,
     state: AppState,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "area", "area")?;
@@ -1611,7 +1614,7 @@ pub async fn radius_query(
     Path(id): Path<String>,
     Query(params): Query<RadiusQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     run_radius_query(id, None, params, state).await
 }
 
@@ -1621,7 +1624,7 @@ pub async fn instance_radius_query(
     Path((id, instance_id)): Path<(String, String)>,
     Query(params): Query<RadiusQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     run_radius_query(id, Some(instance_id), params, state).await
 }
 
@@ -1634,7 +1637,7 @@ async fn run_radius_query(
     instance_id: Option<String>,
     params: RadiusQueryParams,
     state: AppState,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
@@ -1706,7 +1709,7 @@ pub async fn trajectory_query(
     Path(id): Path<String>,
     Query(params): Query<TrajectoryQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 

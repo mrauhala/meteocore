@@ -563,6 +563,108 @@ async fn error_response_format_is_consistent() {
     }
 }
 
+/// Status, request-log reason and JSON body of one request against `app`.
+async fn get_error_reason(
+    app: axum::Router,
+    uri: &str,
+) -> (StatusCode, Option<String>, serde_json::Value) {
+    let response = app
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let reason = response
+        .extensions()
+        .get::<ds_core::error::ErrorReason>()
+        .map(|r| r.0.clone());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, reason, serde_json::from_slice(&body).unwrap())
+}
+
+/// The server's request-logging middleware writes the `ErrorReason` response
+/// extension as the log line's `error` field (#119). Every EDR error carries
+/// one, and it is the body's `code: description`.
+#[tokio::test]
+async fn error_responses_carry_the_request_log_reason() {
+    let (status, reason, _) = get_error_reason(app(), "/collections/nonexistent").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        reason.as_deref(),
+        Some("NotFound: Collection 'nonexistent' not found")
+    );
+
+    for uri in [
+        "/collections/nonexistent/locations",
+        "/collections/weather/locations/nonexistent",
+        "/collections/weather/locations/helsinki?datetime=invalid",
+        "/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)",
+        "/collections/weather/instances/20260607T0600Z",
+        "/collections?unknown=1",
+        "/conformance?f=xml",
+    ] {
+        let (status, reason, body) = get_error_reason(app(), uri).await;
+        assert!(status.is_client_error(), "{uri}: {status}");
+        let expected = format!(
+            "{}: {}",
+            body["code"].as_str().unwrap(),
+            body["description"].as_str().unwrap()
+        );
+        assert_eq!(reason.as_deref(), Some(expected.as_str()), "{uri}");
+    }
+}
+
+/// An engine whose every query fails with internal detail in the message.
+struct FailingEngine;
+
+const INTERNAL_DETAIL: &str = "connection refused at 10.0.0.5:5432";
+
+impl EdrEngine for FailingEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Err(DataServerError::Engine(INTERNAL_DETAIL.into()))
+    }
+
+    fn query_location(
+        &self,
+        _location_id: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::Storage(INTERNAL_DETAIL.into()))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        None
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn internal_error_reason_is_redacted() {
+    for uri in [
+        "/collections/weather/locations",
+        "/collections/weather/locations/helsinki",
+    ] {
+        let app = api_edr::router(make_edr_state(Arc::new(FailingEngine)));
+        let (status, reason, body) = get_error_reason(app, uri).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+        assert_eq!(
+            reason.as_deref(),
+            Some("ServerError: Internal server error"),
+            "{uri}: 5xx must attach the generic reason, never the engine error"
+        );
+        assert!(!body.to_string().contains("10.0.0.5"), "{uri}: {body}");
+    }
+}
+
 // ===========================================================================
 // 3. HEADER SECURITY TESTS
 // ===========================================================================

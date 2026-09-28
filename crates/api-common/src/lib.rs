@@ -101,6 +101,32 @@ pub fn tag_api_kind(router: axum::Router, kind: &'static str) -> axum::Router {
     ))
 }
 
+/// A JSON error response: a status and a `{"code", "description"}` body.
+/// Converting it into a response also attaches `code: description` as a
+/// [`ds_core::error::ErrorReason`], which the server's request-logging
+/// middleware writes as the log line's `error` field (#119). The reason
+/// mirrors the client-visible body, so a 5xx whose body carries only a
+/// generic description (root CLAUDE.md Critical Rule 11) logs only that too.
+pub struct JsonError(pub StatusCode, pub Json<Value>);
+
+impl From<(StatusCode, Json<Value>)> for JsonError {
+    fn from((status, body): (StatusCode, Json<Value>)) -> Self {
+        Self(status, body)
+    }
+}
+
+impl IntoResponse for JsonError {
+    fn into_response(self) -> Response {
+        let Self(status, body) = self;
+        let field = |name| body.get(name).and_then(Value::as_str).unwrap_or_default();
+        let reason =
+            ds_core::error::ErrorReason(format!("{}: {}", field("code"), field("description")));
+        let mut response = (status, body).into_response();
+        response.extensions_mut().insert(reason);
+        response
+    }
+}
+
 pub fn conformance_classes(api_classes: &[&'static str]) -> Vec<&'static str> {
     CONFORMANCE_CLASSES
         .iter()
@@ -142,11 +168,11 @@ impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
 }
 
 fn bad_request(description: &str) -> Response {
-    (
+    JsonError(
         StatusCode::BAD_REQUEST,
         Json(json!({"code": "BadRequest", "description": description})),
     )
-        .into_response()
+    .into_response()
 }
 
 /// One API adapter's view of a collection. Metadata retains API-specific fields;
@@ -429,6 +455,7 @@ pub fn collection_operation() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ds_core::error::ErrorReason;
     use ds_core::map_engine::ParameterInfo;
 
     fn raster(parameters: &[(&str, &str, &str)]) -> RasterInfo {
@@ -469,5 +496,58 @@ mod tests {
         assert_eq!(names["t"]["unit"]["symbol"]["value"], "K");
         assert_eq!(names["x"]["observedProperty"]["label"]["en"], "x");
         assert!(names["x"].get("unit").is_none());
+    }
+
+    /// Locks in the contract the request-logging middleware depends on:
+    /// every `JsonError` → response carries an `ErrorReason` extension. EDR
+    /// and Features route every handler error through this type, so dropping
+    /// the `extensions_mut().insert(...)` call would silently re-empty the
+    /// `error` field of their log lines (#119).
+    #[test]
+    fn into_response_attaches_error_reason_extension() {
+        let err = JsonError::from((
+            StatusCode::NOT_FOUND,
+            Json(json!({"code": "NotFound", "description": "Collection 'foo' not found"})),
+        ));
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("ErrorReason must be attached so request_logging_middleware can pick it up");
+        assert_eq!(reason.0, "NotFound: Collection 'foo' not found");
+    }
+
+    #[test]
+    fn server_error_reason_is_the_redacted_body_text() {
+        // Handlers log the underlying error themselves and send a generic
+        // 500 body; the reason carries that same text and nothing more.
+        let response = JsonError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"code": "ServerError", "description": "Internal server error"})),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("5xx must also attach ErrorReason");
+        assert_eq!(reason.0, "ServerError: Internal server error");
+    }
+
+    #[test]
+    fn collection_request_rejection_attaches_error_reason() {
+        let response = bad_request("Unsupported collection query parameter 'x'");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("attached");
+        assert_eq!(
+            reason.0,
+            "BadRequest: Unsupported collection query parameter 'x'"
+        );
     }
 }

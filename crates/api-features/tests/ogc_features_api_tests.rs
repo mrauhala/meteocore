@@ -889,6 +889,87 @@ mod errors {
                 .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "reversed interval");
     }
+
+    /// Status, request-log reason and JSON body of one request against `app`.
+    async fn get_error_reason(app: axum::Router, uri: &str) -> (StatusCode, Option<String>, Value) {
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let reason = resp
+            .extensions()
+            .get::<ds_core::error::ErrorReason>()
+            .map(|r| r.0.clone());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, reason, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// The server's request-logging middleware writes the `ErrorReason`
+    /// response extension as the log line's `error` field (#119). Every
+    /// Features error carries one, and it is the body's `code: description`.
+    #[tokio::test]
+    async fn error_responses_carry_the_request_log_reason() {
+        let (status, reason, _) =
+            get_error_reason(build_router(), "/collections/cities/items?bbox=invalid").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let reason = reason.expect("a 400 must attach an ErrorReason");
+        assert!(reason.starts_with("BadRequest: Invalid bbox: "), "{reason}");
+
+        for uri in [
+            "/collections/nonexistent",
+            "/collections/nonexistent/items",
+            "/collections/cities/items/nope",
+            "/collections/cities/items/helsinki?crs=EPSG%3A3067",
+            "/collections/cities/items?sortby=bogus",
+            "/collections/cities/items?f=xml",
+            "/collections?unknown=1",
+        ] {
+            let (status, reason, body) = get_error_reason(build_router(), uri).await;
+            assert!(status.is_client_error(), "{uri}: {status}");
+            let expected = format!(
+                "{}: {}",
+                body["code"].as_str().unwrap(),
+                body["description"].as_str().unwrap()
+            );
+            assert_eq!(reason.as_deref(), Some(expected.as_str()), "{uri}");
+        }
+    }
+
+    /// An engine whose every read fails with internal detail in the message.
+    struct FailingEngine;
+
+    const INTERNAL_DETAIL: &str = "connection refused at 10.0.0.5:5432";
+
+    impl FeatureEngine for FailingEngine {
+        fn get_features(&self, _query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            Err(DataServerError::Engine(INTERNAL_DETAIL.into()))
+        }
+        fn get_feature(&self, _feature_id: &str) -> Result<Feature, DataServerError> {
+            Err(DataServerError::Storage(INTERNAL_DETAIL.into()))
+        }
+        fn feature_count(&self) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_error_reason_is_redacted() {
+        for uri in [
+            "/collections/cities/items",
+            "/collections/cities/items/helsinki",
+        ] {
+            let app = build_router_with(Arc::new(FailingEngine));
+            let (status, reason, body) = get_error_reason(app, uri).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+            assert_eq!(
+                reason.as_deref(),
+                Some("ServerError: Internal server error"),
+                "{uri}: 5xx must attach the generic reason, never the engine error"
+            );
+            assert!(!body.to_string().contains("10.0.0.5"), "{uri}: {body}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
