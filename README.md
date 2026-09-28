@@ -251,7 +251,7 @@ Tiles (raster) reuses `MapEngine` — z/x/y coordinates are converted to a bbox 
 
 Each state struct is wrapped in `Arc<ArcSwap<…>>` for lock-free reads and atomic swaps on reload. `ServerState` (in `server/src/admin.rs`) owns all six `ArcSwap` pointers plus the health registry and GeoTIFF engine list (kept separately for the poll runtime). Engine loading lives in `admin::load_collections()`, called by both startup and `POST /admin/collections/reload`.
 
-The render semaphore (2× CPU cores, minimum 8) and rendered-image cache are shared across `MapsState`, `TilesState`, and `WmsState`. `TilesState3d` instead holds its own 3D Tiles content pool (`api_3dtiles::CONTENT_SLOTS`, ¼ CPU cores, minimum 2), shared by `.pnts`, the `.glb` isosurface/echo-top meshes and voxels, so slow cold 3D computes serialize among themselves and never occupy raster render slots; it also has its own content cache (`api-3dtiles/src/cache.rs`). The semaphore uses `acquire().await` so excess requests queue rather than fail. The 2× factor reflects loose CPU ownership — libpng decode bursts and bilinear-sample passes interleave, leaving the slot idle a non-trivial fraction of its wall time.
+The render semaphore (`[server] render_concurrency`, default 2× CPU cores, minimum 8) and rendered-image cache are shared across `MapsState`, `TilesState`, and `WmsState`. `TilesState3d` instead holds its own 3D Tiles content pool (`api_3dtiles::CONTENT_SLOTS`, ¼ CPU cores, minimum 2), shared by `.pnts`, the `.glb` isosurface/echo-top meshes and voxels, so slow cold 3D computes serialize among themselves and never occupy raster render slots; it also has its own content cache (`api-3dtiles/src/cache.rs`). The semaphore uses `acquire().await` so excess requests queue rather than fail. The 2× factor reflects loose CPU ownership — libpng decode bursts and bilinear-sample passes interleave, leaving the slot idle a non-trivial fraction of its wall time.
 
 ## Route Structure
 
@@ -363,6 +363,7 @@ port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
 # collections_dir = "collections.d"     # optional, load per-collection .toml files from directory
 # metatile_cache_mb = 1024              # optional, global WMS meta-tile cache (MB); 0 disables meta-tiling
+# render_concurrency = 24              # optional, render CPU slots (default 2× CPUs, min 8); restart to change
 
 [[collections]]
 id = "weather"
@@ -418,6 +419,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `watch_collections_dir` | no | `false` | Auto-reload when files in `collections_dir` are added, changed, or removed. Debounced; runs on the background runtime. See trust-model note in [Per-File Collection Configs](#per-file-collection-configs). |
 | `watch_debounce_ms` | no | `500` | Coalesce-window in milliseconds for the filesystem watcher (only used when `watch_collections_dir = true`). |
 | `metatile_cache_mb` | no | `1024` | Size (MB) of the global EPSG:3857/3067/3035 meta-tile cache. Server-wide, not per-collection. `0` disables meta-tiling (projected GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
+| `render_concurrency` | no | 2× CPUs, min 8 | Render CPU slots shared by WMS, Maps, Tiles and 3D Tiles; `MC_RENDER_QUEUE_CAPACITY` defaults to 3× this. Lower it for CPU-bound deployments, raise it when renders mostly wait on remote reads. Must be 1–512. Fixed at boot: a reload cannot resize the slots and logs a warning instead; restart to change. The effective value is logged at startup and exported as `render_semaphore_total`. |
 
 ### Collection Config Fields
 
@@ -1539,7 +1541,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 |-------|-------|
 | `MAX_MAP_PIXELS` (`WIDTH × HEIGHT`) | 64,000,000 |
 | `MAX_MAP_DIMENSION` (`WIDTH` or `HEIGHT`) | 8,000 px |
-| Render permits | 2× CPU cores (minimum 8) |
+| Render permits | `[server] render_concurrency`, default 2× CPU cores (minimum 8) |
 | `LAYERS` count | exactly 1 |
 | Supported CRS | `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, `EPSG:3035` |
 | Supported `FORMAT` (GetMap) | `image/png`, `image/jpeg`, `image/webp` |
@@ -1816,7 +1818,7 @@ Returns HTTP 503 only when all collections have failed.
 | `render_budget_available_bytes` | gauge | — | Available transient render memory estimate |
 | `render_budget_total_bytes` | gauge | — | Configured transient render memory budget |
 | `render_budget_rejected_total` | counter | — | Requests rejected at memory admission |
-| `render_semaphore_total` | gauge | — | Total render permits (2× CPU cores, min 8) |
+| `render_semaphore_total` | gauge | — | Total render permits (`[server] render_concurrency`, default 2× CPU cores, min 8) |
 | `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
 
 #### Computing cache hit rates

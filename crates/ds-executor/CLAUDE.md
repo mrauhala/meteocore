@@ -14,6 +14,10 @@ returns. A timeout cannot release a running worker's permit. Abort handles may
 cancel pending blocking jobs but cannot preempt running CPU work. Keep tests for overload, canceled
 waiters, deadline expiry, and worker permit ownership.
 
+Slot count: `render_concurrency()`, fixed by its first read — the server's
+`[server] render_concurrency` via `set_render_concurrency` at boot, else
+`default_render_concurrency()` (2× CPUs, min 8). Nothing may read the slots,
+queue or metrics before the server sets it; tests of it need process isolation.
 Raster default: MC_RENDER_TIMEOUT_MS=3000. Shared 3D points/meshes use 30 s.
 MC_RENDER_QUEUE_CAPACITY defaults to 3× render concurrency; zero permits no
 waiting. Global slots and queue survive reload. Metrics snapshot is exported

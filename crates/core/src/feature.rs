@@ -347,14 +347,17 @@ pub fn check_mask_budget(cells: usize, polygon: &QueryPolygon) -> Result<(), Dat
 }
 
 /// Per-dimension cap of a gridded engine's EDR area grid (cells per axis);
-/// a wider bbox is *coarsened* to this, never refused.
+/// a wider bbox is *coarsened* to this, never refused. An output-grid cap,
+/// used by ODIM, QueryData, Satellite and Zarr; GRIB and GeoTIFF answer at
+/// native resolution, bounded only by [`MAX_AREA_VALUES`].
 pub const MAX_AREA_DIM: usize = 256;
 /// Total value budget of one gridded area response across timesteps ×
 /// cells × parameters (≈ 8 MB of CoverageJSON). One home for every gridded
 /// engine — GRIB, GeoTIFF, ODIM, QueryData, Zarr, nowcast — so the budget
 /// cannot drift per engine (#672 review, #673). PostGIS keeps its own
 /// `MAX_RESPONSE_VALUES`: that bounds SQL rows fetched across *every* query
-/// type (position, location, area), not a grid.
+/// type (position, location, area), not a grid. EDR serves the resulting
+/// `QueryTooLarge` as HTTP 400 `BadRequest`.
 pub const MAX_AREA_VALUES: usize = 1_000_000;
 
 /// Enforce [`MAX_AREA_VALUES`] for a `timesteps × ny × nx × parameters`

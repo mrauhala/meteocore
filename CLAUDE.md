@@ -206,6 +206,9 @@ Backlog is in GitHub Issues: https://github.com/mrauhala/meteocore/issues
   improvements + multi-band GeoTIFF), **v1.0** (spec compliance + production
   hardening).
 - When completing work, close the issue: `gh issue close <number>`.
+- Batch runs over the backlog (pick → worktree per issue → PR → review →
+  self-merge, N at a time, filtered by focus/priority/effort) follow the
+  `/issue-batch` skill in `.claude/skills/issue-batch/`.
 
 ```bash
 gh issue list                              # All open issues
@@ -397,6 +400,42 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   (a parked runtime worker, a held lock, sequential network calls), not
   extra CPU.
 
+### Pixel budgets: output vs source
+
+Output caps bound the image or grid a client asks for; source budgets bound
+what an engine decodes to produce it. They count different pixels and are
+deliberately not tied by a ratio (#120): a projected source (TM35FIN radar
+over Scandinavia) can need far more native pixels than the viewport has, and
+a fixed ratio would reject valid viewports without proving safety. Passing
+one never implies the other.
+
+| Budget (home) | Bounds | Value | When it trips |
+|---|---|---|---|
+| `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms, api-maps `params.rs`) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps `BadRequest`): "… must not exceed 8000" |
+| `api_tiles::params::TILE_SIZE` | output, fixed | 256 × 256 | never |
+| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
+| `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
+| `engine_geotiff::decode_budget::BUDGET` | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
+| engine-zarr `read_budget::BUDGET` | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
+| `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
+| EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
+
+- At the default `MC_RENDER_MEMORY_MB` the API caps' full 64 M px is
+  unreachable: anything over 33 554 432 output px (e.g. 5793 × 5793) is a 503
+  on every retry. To serve larger images, raise the budget (README "Sizing
+  render memory").
+- The GeoTIFF source cap only trips on a full-resolution read: over it,
+  `get_raster_tile` switches to the finest overview under it, else the
+  coarsest, so in practice only COGs without overviews hit it.
+- GeoTIFF EDR area applies `MAX_AREA_VALUES` per timestep to its native
+  window (no `MAX_AREA_DIM` coarsening), and `query_bbox` currently logs a
+  failed read and returns that timestep as nulls (HTTP 200), not the 400 —
+  after allocating the full `timesteps × ny × nx` grid.
+- A new source cap must name the pixel space it counts and fail with
+  `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
+  `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine
+  error except `ResourceExhausted`/`DeadlineExceeded` (503) into the red tile.
+
 ## Shared Domain Machinery (ds-core, `crates/core/`)
 
 - **`ds_core::web_mercator`** — the ONLY EPSG:3857↔WGS84 implementation
@@ -506,6 +545,9 @@ port = 8000
 # collections_dir = "collections.d"     # optional, directory of per-collection .toml files
 # watch_collections_dir = true          # optional, auto-reload on collections_dir + colormaps_dir changes (default false)
 # watch_debounce_ms = 500               # optional, coalesce-window for the watcher (default 500)
+# render_concurrency = 24               # optional, render CPU slots shared by WMS/Maps/Tiles/3D Tiles
+                                        # (default 2× CPUs, min 8; 1..=512). Fixed at boot: a reload
+                                        # cannot resize the slots (logs a WARN), restart to change.
 # colormaps_dir = "colormaps.d"  # optional, directory of palette files loaded as
                                  # named colormaps (name = file stem). Formats:
                                  # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,
@@ -791,7 +833,8 @@ a non-http(s) license URL are rejected.
   follow the established panel pattern: hit ratio, bytes vs capacity, miss
   rate.
 - **State:** API state wrapped in `ArcSwap` for lock-free reads. Render
-  semaphore (2× CPU cores, min 8) shared across Maps/Tiles/WMS. Engine
+  semaphore (`[server] render_concurrency`, default 2× CPU cores, min 8;
+  fixed at boot, so restart to change) shared across Maps/Tiles/WMS. Engine
   loading lives in `server/src/admin.rs`.
 
 ## Code Style

@@ -1560,6 +1560,40 @@ pub fn mcp_state_from(features: &FeaturesState) -> api_mcp::McpState {
     }
 }
 
+/// Fix the process-wide render slot count from `[server] render_concurrency`
+/// (#209). Boot calls this before the first [`load_collections`], the first
+/// reader of `ds_executor::RENDER_SLOTS`; a reload cannot resize the slots.
+pub fn init_render_concurrency(configured: Option<usize>) -> Result<usize, String> {
+    let source = match configured {
+        Some(slots) => {
+            ds_executor::set_render_concurrency(slots).map_err(|live| {
+                format!(
+                    "[server] render_concurrency = {slots} arrived after the render \
+                     slots were already sized to {live}"
+                )
+            })?;
+            "[server] render_concurrency"
+        }
+        None => "default: 2× available CPUs, min 8",
+    };
+    let slots = ds_executor::render_concurrency();
+    info!("Render concurrency: {slots} ({source}; restart to change)");
+    Ok(slots)
+}
+
+/// A reload re-reads `[server] render_concurrency` but cannot resize the live
+/// slots: the restart warning to log when the reloaded value differs.
+fn render_concurrency_reload_warning(configured: Option<usize>) -> Option<String> {
+    let wanted = configured.unwrap_or_else(ds_executor::default_render_concurrency);
+    let live = ds_executor::render_concurrency();
+    (wanted != live).then(|| {
+        format!(
+            "[server] render_concurrency now resolves to {wanted}, but a reload \
+             cannot resize the {live} live render slots; restart to apply"
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
 pub fn load_collections(
     style_ctx: &ds_render::StyleContext,
@@ -3742,11 +3776,9 @@ pub fn load_collections(
     // collections, so it is passed in as a single value (no per-collection
     // aggregation). `0` disables meta-tiling.
 
-    // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
-    // because decode/encode interleaves with bilinear passes; configurable
-    // knob tracked in #147.
+    // Slot count fixed at boot by `init_render_concurrency` (`[server]
+    // render_concurrency`, else 2× cores, min 8); the slots survive reloads.
     let render_concurrency = ds_executor::render_concurrency();
-    tracing::info!("Render concurrency: {render_concurrency} (2× available CPUs, min 8)");
     let render_semaphore = ds_executor::RENDER_SLOTS.clone();
     // Reuse the live render caches across a reload when their configured byte
     // size is unchanged, so a reload preserves the warm cache instead of
@@ -4239,6 +4271,9 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
             ReloadError::ConfigRead(format!("{e}"))
         })?;
     for warning in &config_warnings {
+        tracing::warn!("{warning}");
+    }
+    if let Some(warning) = render_concurrency_reload_warning(config.server.render_concurrency) {
         tracing::warn!("{warning}");
     }
 
@@ -7602,5 +7637,59 @@ colormap = "no_such_map"
         )
         .expect_err("unknown bundle extra colormap must be rejected");
         assert!(format!("{err}").contains("no_such_map"));
+    }
+
+    /// #209: `[server] render_concurrency` sizes the render slots every API
+    /// state shares, and `/metrics` reports it. Runs in a child process: the
+    /// slot count is process-global and fixed by its first read.
+    #[test]
+    fn configured_render_concurrency_reaches_slots_and_metrics() {
+        const CHILD: &str = "MC_TEST_SERVER_RENDER_CONCURRENCY_CHILD";
+        const NAME: &str = "admin::tests::configured_render_concurrency_reaches_slots_and_metrics";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{NAME} failed in its child process");
+            return;
+        }
+        assert_eq!(super::init_render_concurrency(Some(3)), Ok(3));
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        assert_eq!(result.wms_state.render_semaphore.available_permits(), 3);
+        assert!(Arc::ptr_eq(
+            &result.wms_state.render_semaphore,
+            &result.tiles_3d_state.render_semaphore
+        ));
+        use super::Encoder as _;
+        let mut text = Vec::new();
+        super::TextEncoder::new()
+            .encode(&super::REGISTRY.gather(), &mut text)
+            .unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(
+            text.lines().any(|l| l == "render_semaphore_total 3"),
+            "{text}"
+        );
+
+        // A reload cannot resize the slots: an unchanged value is silent, a
+        // different one (or dropping the key: the default is at least 8)
+        // asks for a restart.
+        assert_eq!(super::render_concurrency_reload_warning(Some(3)), None);
+        for reloaded in [Some(4), None] {
+            let warning = super::render_concurrency_reload_warning(reloaded).unwrap();
+            assert!(warning.contains("restart to apply"), "{warning}");
+        }
+        assert!(super::init_render_concurrency(Some(4)).is_err());
     }
 }
