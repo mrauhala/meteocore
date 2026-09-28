@@ -1233,6 +1233,7 @@ impl EdrEngine for GribEngine {
                     label: meta.label(),
                     unit: meta.display.display_unit.to_string(),
                     observed_property: p,
+                    standard_name: None,
                 },
             );
         }

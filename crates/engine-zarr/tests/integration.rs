@@ -416,6 +416,8 @@ fn forecast_uses_latest_run_with_lead_as_time() {
     };
     let e = ZarrEngine::new("fc", &cfg).expect("open forecast store");
     assert_eq!(e.get_parameters(), vec!["temp".to_string()]);
+    // No `standard_name` attribute: none is invented.
+    assert_eq!(e.get_parameter_descriptions()["temp"].standard_name, None);
 
     // Temporal extent = the LATEST run (12Z) + leads [0h,1h,2h] → 12:00..14:00.
     let (first, last) = e.get_temporal_extent().unwrap();
@@ -630,6 +632,18 @@ fn parameter_descriptions_carry_units_and_label() {
     let t2m = descs.get("t2m").unwrap();
     assert_eq!(t2m.unit, "K");
     assert_eq!(t2m.label, "2 metre temperature");
+    // The CF `standard_name` attribute is passed through for EDR's
+    // `observedProperty.id` (#273), in collection metadata and query results.
+    assert_eq!(t2m.standard_name.as_deref(), Some("air_temperature"));
+    let qr = single(
+        engine()
+            .query_position("POINT(5.5 54.5)", None, None, None, None)
+            .unwrap(),
+    );
+    assert_eq!(
+        qr.parameters["t2m"].standard_name.as_deref(),
+        Some("air_temperature")
+    );
 }
 
 #[test]

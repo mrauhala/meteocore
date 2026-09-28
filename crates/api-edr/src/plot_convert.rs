@@ -384,6 +384,7 @@ mod tests {
             label: label.into(),
             unit: unit.into(),
             observed_property: label.into(),
+            standard_name: None,
         }
     }
 

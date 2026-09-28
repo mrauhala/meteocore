@@ -55,6 +55,7 @@ impl MockEngine {
                 label: "temperature".into(),
                 unit: "degC".into(),
                 observed_property: "temperature".into(),
+                standard_name: None,
             },
         );
 
@@ -698,6 +699,171 @@ mod collections {
                     .map(Vec::len),
                 Some(2)
             );
+            let validator = jsonschema::Validator::new(
+                &schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
+                    ["schema"],
+            )
+            .unwrap();
+            let errors: Vec<String> = validator
+                .iter_errors(&json)
+                .map(|e| format!("- {} (at {})", e, e.instance_path()))
+                .collect();
+            assert!(errors.is_empty(), "{uri}:\n{}", errors.join("\n"));
+        }
+    }
+
+    /// `parameter_names` follows OGC API - EDR Metocean Profile Requirement 7
+    /// (#273) as far as the engine's metadata goes: a `label` of at most 50
+    /// characters, a `description` that is not just the label, a QUDT
+    /// `unit.symbol` for units QUDT has, and the CF standard name URI as
+    /// `observedProperty.id` when the engine knows one. Still EDR 1.1-valid.
+    #[tokio::test]
+    async fn parameter_names_follow_metocean_profile() {
+        struct DescribedEngine(MockEngine);
+        impl EdrEngine for DescribedEngine {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                self.0.get_locations()
+            }
+            fn query_location(
+                &self,
+                location_id: &str,
+                dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                params: Option<&[String]>,
+                z: Option<&[f64]>,
+                rt: Option<DateTime<Utc>>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                self.0.query_location(location_id, dt, params, z, rt)
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                self.get_parameter_descriptions().into_keys().collect()
+            }
+            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+                let desc = |label: &str, unit: &str, id: &str, cf: Option<&str>| {
+                    let desc = ParameterDescription {
+                        label: label.into(),
+                        unit: unit.into(),
+                        observed_property: id.into(),
+                        standard_name: cf.map(Into::into),
+                    };
+                    (id.to_string(), desc)
+                };
+                HashMap::from([
+                    desc("2 metre temperature", "K", "t2m", Some("air_temperature")),
+                    desc("DBZH — Reflectivity (horizontal)", "dBZ", "DBZH", None),
+                    desc(
+                        "Water equivalent of accumulated snow depth (2 m above ground)",
+                        "kg m-2",
+                        "sd",
+                        None,
+                    ),
+                    desc("Correlation coefficient", "", "RHOHV", None),
+                    // A CF modifier is not a bare standard name: no URI.
+                    desc(
+                        "Temperature error",
+                        "K",
+                        "t_err",
+                        Some("air_temperature standard_error"),
+                    ),
+                ])
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                self.0.get_temporal_extent()
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                self.0.get_spatial_extent()
+            }
+            fn supported_query_types(&self) -> Vec<String> {
+                self.0.supported_query_types()
+            }
+        }
+
+        let engine: Arc<dyn EdrEngine> = Arc::new(DescribedEngine(MockEngine));
+        let schema: Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../schemas/ogcapi-edr-1.1-bundled.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        for (uri, path) in [
+            ("/collections", "/collections"),
+            ("/collections/weather", "/collections/{collectionId}"),
+        ] {
+            let router = api_edr::router(make_edr_state(engine.clone()));
+            let resp = router
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            let collection = match json.get("collections") {
+                Some(list) => &list[0],
+                None => &json,
+            };
+            let names = collection["parameter_names"].as_object().unwrap();
+            assert_eq!(names.len(), 5, "{uri}");
+            for (name, param) in names {
+                let label = param["label"].as_str().unwrap();
+                let description = param["description"].as_str().unwrap();
+                assert!(label.chars().count() <= 50, "{uri} {name}: {label}");
+                assert_ne!(label, description, "{uri} {name}");
+            }
+
+            // A CF standard name identifies the property; QUDT names the unit.
+            let t2m = &names["t2m"];
+            assert_eq!(t2m["label"], "2 metre temperature");
+            assert_eq!(t2m["description"], "2 metre temperature, in K");
+            assert_eq!(
+                t2m["unit"]["symbol"],
+                serde_json::json!({"value": "K", "type": "https://qudt.org/vocab/unit/K"})
+            );
+            assert_eq!(
+                t2m["observedProperty"]["id"],
+                "https://vocab.nerc.ac.uk/standard_name/air_temperature"
+            );
+            assert!(t2m["observedProperty"].get("description").is_none());
+
+            // No QUDT unit for radar reflectivity: the UCUM form stays. No CF
+            // name: the property is described instead of identified.
+            let dbzh = &names["DBZH"];
+            assert_eq!(
+                dbzh["unit"]["symbol"],
+                serde_json::json!({"value": "dBZ", "type": "http://www.opengis.net/def/uom/UCUM/"})
+            );
+            assert!(dbzh["observedProperty"].get("id").is_none());
+            assert_eq!(
+                dbzh["observedProperty"]["description"],
+                "DBZH — Reflectivity (horizontal), in dBZ"
+            );
+
+            // An over-long label is shortened; the description keeps it whole.
+            let sd = &names["sd"];
+            assert_eq!(sd["label"].as_str().unwrap().chars().count(), 50);
+            assert!(sd["label"].as_str().unwrap().ends_with('…'));
+            assert_eq!(
+                sd["description"],
+                "Water equivalent of accumulated snow depth (2 m above ground), in kg/m²"
+            );
+            assert_eq!(
+                sd["observedProperty"]["label"]["en"],
+                "Water equivalent of accumulated snow depth (2 m above ground)"
+            );
+            assert_eq!(
+                sd["unit"]["symbol"]["type"],
+                "https://qudt.org/vocab/unit/KiloGM-PER-M2"
+            );
+
+            // An engine that knows no unit advertises none.
+            assert!(names["RHOHV"].get("unit").is_none());
+            assert_eq!(
+                names["RHOHV"]["description"],
+                "Correlation coefficient (unit not specified)"
+            );
+            assert!(names["t_err"]["observedProperty"].get("id").is_none());
+
             let validator = jsonschema::Validator::new(
                 &schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
                     ["schema"],
@@ -1548,6 +1714,7 @@ mod unimplemented_queries {
                         label: "Reflectivity".into(),
                         unit: "dBZ".into(),
                         observed_property: "DBZH".into(),
+                        standard_name: None,
                     },
                 );
                 let mut ranges = HashMap::new();

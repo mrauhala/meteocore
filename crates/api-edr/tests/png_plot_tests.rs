@@ -32,6 +32,7 @@ fn profile_result() -> QueryResult {
             label: "Reflectivity".into(),
             unit: "dBZ".into(),
             observed_property: "DBZH".into(),
+            standard_name: None,
         },
     );
     let mut ranges = HashMap::new();
@@ -69,6 +70,7 @@ fn series_result() -> QueryResult {
             label: "Temperature".into(),
             unit: "degC".into(),
             observed_property: "temperature".into(),
+            standard_name: None,
         },
     );
     let mut ranges = HashMap::new();

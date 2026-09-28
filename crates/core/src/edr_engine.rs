@@ -86,6 +86,7 @@ pub trait EdrEngine: Send + Sync {
                     label: name.replace('_', " "),
                     unit: String::new(),
                     observed_property: name.clone(),
+                    standard_name: None,
                 };
                 (name, desc)
             })

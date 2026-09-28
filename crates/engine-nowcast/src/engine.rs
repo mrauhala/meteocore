@@ -2206,6 +2206,7 @@ fn describe_motion_param(p: &motion_grid::ParamSpec) -> ParameterDescription {
         label: p.label.into(),
         unit: p.unit.into(),
         observed_property: p.observed_property.into(),
+        standard_name: None,
     }
 }
 

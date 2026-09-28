@@ -115,6 +115,45 @@ Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499
 `/api/docs/{asset}`, with a same-origin script policy and `nosniff` headers.
 No executable documentation assets or validation requests use a CDN (#587).
 
+## Parameter metadata (Metocean Profile, Requirement 7)
+
+A collection's `parameter_names` and a data query's CoverageJSON
+`parameters` come from the same builders in `src/response.rs`, so a query
+describes each parameter the way its collection does. Status against the
+EUMETNET/OGC API - EDR Metocean Profile `/req/core/collection_parameter_names`
+(#273):
+
+| | Requirement | Status | Notes |
+|---|---|---|---|
+| A | keys and `id` carry no structured metadata | ✓ | keys are the engine's parameter names; no parameter-level `id` is emitted |
+| B | `label`, `description`, `unit` | partial | `label` and `description` always, and they differ: `description` is the full engine label plus the served unit (`2 metre temperature, in K`), or `… (unit not specified)`. `unit` only where the engine knows one (table below) |
+| C | `label` ≤ 50 characters | ✓ | a longer engine label is cut to 49 characters + `…`; the whole text stays in `description` and `observedProperty.label` |
+| D | `label` in English | partial | the built-in tables (ODIM quantities, GRIB WMO Code Table 4.2, BUFR SYNOP) are English; config- or source-given labels (CSV column names, GeoTIFF/PostGIS/Satellite config, Zarr `long_name`) are served as given, tagged `en` |
+| E | `unit.symbol.type` = `https://qudt.org/vocab/unit/<unit>`, `value` = `qudt:symbol` | partial | every unit `ds_core::units::qudt_unit` knows — `K`, `°C`, `Pa`, `hPa`, `m/s`, `km/h`, `m`, `km`, `cm`, `mm`, `mm/h`, `%`, `dB`, `°`, `kg/m²`, `kg/(m²·s)`, `kg/m³`, `kg/kg`, `J/kg`, `J/m²`, `W/m²`, `m²/s²`, `m³/m³`, `Pa/s`, `/s`, `s`, `min`, `h`, `DU`, `kA`, in their UCUM, CF/udunits and WMO spellings. Units with no faithful QUDT entry keep the engine's string typed as UCUM: `dBZ` (QUDT's `DeciB_Z` is acoustic Z-weighting, not reflectivity), `gpm`, `deg/km`, CF `1`, BUFR code tables. `unit.label` stays the engine's unit string |
+| F | `observedProperty.id` = `https://vocab.nerc.ac.uk/standard_name/<name>` when CF, else `observedProperty.description` | partial | the CF URI when the engine knows the standard name (`ParameterDescription.standard_name`, only set from a CF `standard_name` attribute; a value with a CF modifier is not published). Otherwise `observedProperty.description` carries the description, and CoverageJSON keeps the engine's parameter name as `observedProperty.id` |
+
+CoverageJSON parameters carry no parameter-level `label`: CoverageJSON asks
+to leave it out when it equals `observedProperty.label`, which holds it.
+
+| Engine | `unit` from | CF standard name |
+|---|---|---|
+| CSV | built-in column table (`temperature` °C, `humidity` %, `wind_speed` m/s, `pressure` hPa, `precipitation` mm); other columns none | – |
+| GeoTIFF | config `unit` | – |
+| GRIB | Code Table 4.2 unit after display conversion (`°C`, `hPa`, `m s-1`, `mm`, `%`, …) | – (WMO triples are not mapped to CF) |
+| QueryData | none: descriptors carry no trustworthy unit | – |
+| Zarr | CF `units` attribute | ✓ `standard_name` attribute |
+| ODIM composite | config `unit` | – |
+| ODIM PVOL | ODIM quantity table (`dBZ`, `m/s`, `dB`, `deg`, …), in `parameter_names` too; none for dimensionless quantities (RHOHV, SQI, QIND) | – |
+| PostGIS | config `unit` | – (config `observed_property` is free text) |
+| BUFR | Table B unit after display conversion (`°C`, `hPa`, `mm`, …) | – (built-in `observed_property` values are CF names, except `present_weather`, but not marked as such) |
+| Nowcast | `m/s` (motion); none for `motion_quality` | – |
+| Satellite | config product `unit` | – (the NetCDF `standard_name` is not read) |
+
+Remaining for Requirement 7: CF standard names for every engine but Zarr (a
+vocabulary for GRIB/ODIM/BUFR built-ins, a `standard_name` config key for the
+config-driven engines), QueryData units, and a check that config-given
+labels are English.
+
 ## Domain types produced
 
 `PointSeries`, `Point` (events), `Grid` (with optional `t` and `z` axes),

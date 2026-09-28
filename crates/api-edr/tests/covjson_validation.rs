@@ -51,6 +51,7 @@ fn make_query_result(
                 label: name.replace('_', " "),
                 unit: unit.to_string(),
                 observed_property: name.to_string(),
+                standard_name: None,
             },
         );
         ranges.insert(
@@ -348,6 +349,7 @@ fn make_grid_query_result(
                 label: name.replace('_', " "),
                 unit: unit.to_string(),
                 observed_property: name.to_string(),
+                standard_name: None,
             },
         );
 
@@ -614,6 +616,7 @@ fn vertical_profile_validates() {
             label: "DBZH".to_string(),
             unit: String::new(),
             observed_property: "DBZH".to_string(),
+            standard_name: None,
         },
     );
     let mut ranges = HashMap::new();
@@ -656,6 +659,7 @@ fn vertical_profile_collection_validates() {
                 label: "DBZH".to_string(),
                 unit: String::new(),
                 observed_property: "DBZH".to_string(),
+                standard_name: None,
             },
         );
         let mut ranges = HashMap::new();
@@ -700,6 +704,7 @@ fn grid_with_z_validates() {
             label: "temperature".to_string(),
             unit: "K".to_string(),
             observed_property: "temperature".to_string(),
+            standard_name: None,
         },
     );
     let mut ranges = HashMap::new();
@@ -751,6 +756,7 @@ fn section_coverage_validates_against_schema() {
             label: "Reflectivity".to_string(),
             unit: "dBZ".to_string(),
             observed_property: "DBZH".to_string(),
+            standard_name: None,
         },
     );
     let mut ranges = HashMap::new();
@@ -816,6 +822,7 @@ fn section_coverage_floor_foreign_member_validates() {
             label: "Reflectivity".to_string(),
             unit: "dBZ".to_string(),
             observed_property: "DBZH".to_string(),
+            standard_name: None,
         },
     );
     let mut ranges = HashMap::new();
@@ -867,6 +874,7 @@ fn make_point_result(hour: u32, params: Vec<(&str, &str, Option<f64>)>) -> Query
                 label: name.replace('_', " "),
                 unit: unit.to_string(),
                 observed_property: name.to_string(),
+                standard_name: None,
             },
         );
         ranges.insert(
@@ -962,6 +970,74 @@ fn point_coverage_collection_validates() {
     for cov in json["coverages"].as_array().unwrap() {
         assert_eq!(cov["domain"]["domainType"], "Point");
     }
+
+    validate(&json, &schema);
+}
+
+/// Coverage `parameters` say what the collection's `parameter_names` say
+/// (OGC API - EDR Metocean Profile, #273): a description that is not just
+/// the label, a QUDT unit symbol where QUDT has the unit, the CF standard
+/// name URI as `observedProperty.id` when known — else the engine's id plus
+/// an `observedProperty.description` — and no `unit` when none is known.
+#[test]
+fn coverage_parameters_follow_metocean_profile() {
+    let schema = load_schema();
+    let times: Vec<DateTime<Utc>> = (0..2).map(make_time).collect();
+    let mut result = make_query_result(
+        times,
+        vec![
+            ("t2m", "K", vec![Some(271.5), None]),
+            ("wind_speed", "m s-1", vec![Some(4.2), Some(5.0)]),
+            ("DBZH", "dBZ", vec![Some(12.5), None]),
+            ("RHOHV", "", vec![Some(0.98), Some(0.97)]),
+        ],
+    );
+    let t2m = result.parameters.get_mut("t2m").unwrap();
+    t2m.label = "2 metre temperature".into();
+    t2m.standard_name = Some("air_temperature".into());
+    let json = query_result_to_coverage_json(&result);
+    let params = &json["parameters"];
+
+    let t2m = &params["t2m"];
+    assert_eq!(t2m["description"]["en"], "2 metre temperature, in K");
+    assert_eq!(
+        t2m["unit"],
+        serde_json::json!({
+            "label": {"en": "K"},
+            "symbol": {"value": "K", "type": "https://qudt.org/vocab/unit/K"}
+        })
+    );
+    assert_eq!(
+        t2m["observedProperty"],
+        serde_json::json!({
+            "id": "https://vocab.nerc.ac.uk/standard_name/air_temperature",
+            "label": {"en": "2 metre temperature"}
+        })
+    );
+
+    // UCUM spelling in, QUDT symbol out; no CF name ⇒ the engine's id stays.
+    let wind = &params["wind_speed"];
+    assert_eq!(wind["unit"]["label"]["en"], "m s-1");
+    assert_eq!(
+        wind["unit"]["symbol"],
+        serde_json::json!({"value": "m/s", "type": "https://qudt.org/vocab/unit/M-PER-SEC"})
+    );
+    assert_eq!(wind["description"]["en"], "wind speed, in m/s");
+    assert_eq!(wind["observedProperty"]["id"], "wind_speed");
+    assert_eq!(
+        wind["observedProperty"]["description"]["en"],
+        "wind speed, in m/s"
+    );
+
+    // QUDT has no radar-reflectivity unit: the UCUM form is kept.
+    assert_eq!(
+        params["DBZH"]["unit"]["symbol"],
+        serde_json::json!({"value": "dBZ", "type": "http://www.opengis.net/def/uom/UCUM/"})
+    );
+
+    let rhohv = &params["RHOHV"];
+    assert!(rhohv.get("unit").is_none());
+    assert_eq!(rhohv["description"]["en"], "RHOHV (unit not specified)");
 
     validate(&json, &schema);
 }

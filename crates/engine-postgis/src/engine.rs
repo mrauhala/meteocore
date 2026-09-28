@@ -1083,11 +1083,13 @@ fn assemble_event_coverages(
                     label: p.label.clone(),
                     unit: p.unit.clone(),
                     observed_property: p.observed_property.clone(),
+                    standard_name: None,
                 })
                 .unwrap_or_else(|| ParameterDescription {
                     label: pname.clone(),
                     unit: String::new(),
                     observed_property: pname.clone(),
+                    standard_name: None,
                 });
             (pname, desc)
         })
@@ -1173,11 +1175,13 @@ fn assemble_long(
                 label: p.label.clone(),
                 unit: p.unit.clone(),
                 observed_property: p.observed_property.clone(),
+                standard_name: None,
             })
             .unwrap_or_else(|| ParameterDescription {
                 label: pname.clone(),
                 unit: String::new(),
                 observed_property: pname.clone(),
+                standard_name: None,
             });
         let row_map: HashMap<DateTime<Utc>, Option<f64>> = rows.into_iter().collect();
         let values: Vec<Option<f64>> = all_times
@@ -1276,11 +1280,13 @@ fn assemble_wide(
                 label: p.label.clone(),
                 unit: p.unit.clone(),
                 observed_property: p.observed_property.clone(),
+                standard_name: None,
             })
             .unwrap_or_else(|| ParameterDescription {
                 label: pname.clone(),
                 unit: String::new(),
                 observed_property: pname.clone(),
+                standard_name: None,
             });
         let values = per_param.remove(key).unwrap();
         let n = values.len();
@@ -1360,11 +1366,13 @@ fn assemble_per_parameter(
                 label: p.label.clone(),
                 unit: p.unit.clone(),
                 observed_property: p.observed_property.clone(),
+                standard_name: None,
             })
             .unwrap_or_else(|| ParameterDescription {
                 label: pname.clone(),
                 unit: String::new(),
                 observed_property: pname.clone(),
+                standard_name: None,
             });
         let row_map: HashMap<DateTime<Utc>, Option<f64>> = rows.into_iter().collect();
         let values: Vec<Option<f64>> = all_times

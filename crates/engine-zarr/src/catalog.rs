@@ -53,6 +53,8 @@ pub struct Variable {
     decoded: Option<DecodedArray>,
     pub units: String,
     pub label: String,
+    /// The CF `standard_name` attribute, when the variable has one.
+    pub standard_name: Option<String>,
     /// Axis index of the time dimension within this variable's dim order. For a
     /// forecast (reference + lead), this is the **lead** axis.
     pub time_axis: Option<usize>,
@@ -850,10 +852,14 @@ fn build_with_codec_setup(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let standard_name = attrs
+            .get("standard_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let label = attrs
             .get("long_name")
             .and_then(|v| v.as_str())
-            .or_else(|| attrs.get("standard_name").and_then(|v| v.as_str()))
+            .or(standard_name.as_deref())
             .unwrap_or(name)
             .to_string();
         let scale_factor = attrs
@@ -907,6 +913,7 @@ fn build_with_codec_setup(
             array,
             units,
             label,
+            standard_name,
             time_axis,
             ref_axis,
             lat_axis,

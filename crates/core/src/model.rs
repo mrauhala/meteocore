@@ -78,6 +78,11 @@ pub struct ParameterDescription {
     pub label: String,
     pub unit: String,
     pub observed_property: String,
+    /// CF standard name of the observed property (`air_temperature`), only
+    /// when the source asserts one — a CF `standard_name` attribute. `None`
+    /// when unknown; never guessed from the parameter name. The EDR layer
+    /// publishes it as the NERC vocabulary URI in `observedProperty.id`.
+    pub standard_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]

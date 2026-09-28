@@ -1907,6 +1907,7 @@ mod tests {
                         label: "2 metre temperature".into(),
                         unit: "K".into(),
                         observed_property: "2t".into(),
+                        standard_name: None,
                     },
                 );
                 m.insert(
@@ -1915,6 +1916,7 @@ mod tests {
                         label: "Mean sea level pressure".into(),
                         unit: "Pa".into(),
                         observed_property: "msl".into(),
+                        standard_name: None,
                     },
                 );
                 m.insert(
@@ -1923,6 +1925,7 @@ mod tests {
                         label: "10 metre U wind".into(),
                         unit: "m/s".into(),
                         observed_property: "10u".into(),
+                        standard_name: None,
                     },
                 );
                 m
@@ -2157,6 +2160,7 @@ mod tests {
                             label: n.to_string(),
                             unit: String::new(),
                             observed_property: n.into(),
+                            standard_name: None,
                         },
                     );
                 }
@@ -2254,6 +2258,7 @@ mod tests {
                         label: "Temperature".into(),
                         unit: "K".into(),
                         observed_property: "2t".into(),
+                        standard_name: None,
                     },
                 );
                 m.insert(
@@ -2262,6 +2267,7 @@ mod tests {
                         label: "Mean SLP".into(),
                         unit: "Pa".into(),
                         observed_property: "msl".into(),
+                        standard_name: None,
                     },
                 );
                 m.insert(
@@ -2270,6 +2276,7 @@ mod tests {
                         label: "Derived index".into(),
                         unit: "1".into(),
                         observed_property: "derived_index".into(),
+                        standard_name: None,
                     },
                 );
                 m
