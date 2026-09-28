@@ -216,7 +216,7 @@ fn prune_render_duration(
         for outcome in ds_executor::RenderOutcome::ALL {
             // Err = no such series (never rendered with that outcome).
             let _ =
-                RENDER_DURATION.remove_label_values(&[api, collection.as_str(), outcome.as_str()]);
+                RENDER_DURATION.remove_label_values(&[*api, collection.as_str(), outcome.as_str()]);
         }
     }
 }
