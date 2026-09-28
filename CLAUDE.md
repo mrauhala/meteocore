@@ -206,6 +206,9 @@ Backlog is in GitHub Issues: https://github.com/mrauhala/meteocore/issues
   improvements + multi-band GeoTIFF), **v1.0** (spec compliance + production
   hardening).
 - When completing work, close the issue: `gh issue close <number>`.
+- Batch runs over the backlog (pick → worktree per issue → PR → review →
+  self-merge, N at a time, filtered by focus/priority/effort) follow the
+  `/issue-batch` skill in `.claude/skills/issue-batch/`.
 
 ```bash
 gh issue list                              # All open issues
