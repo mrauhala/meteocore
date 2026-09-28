@@ -9,7 +9,10 @@ pub const MAX_ZOOM_LEVEL: u32 = 24;
 /// Default per-collection maximum zoom level.
 pub const DEFAULT_MAX_ZOOM: u32 = 18;
 
-/// Standard tile size in pixels.
+/// Standard tile size in pixels. Every raster tile renders exactly
+/// `TILE_SIZE × TILE_SIZE` output pixels, so Tiles has no client-controlled
+/// output cap; render admission and the engine's source budget still apply
+/// ("Pixel budgets" in the root CLAUDE.md).
 pub const TILE_SIZE: u32 = 256;
 
 /// Maximum number of features a single MVT tile is allowed to carry. At

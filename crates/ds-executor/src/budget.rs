@@ -7,10 +7,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Notify;
 
+/// Bytes charged per *output* pixel (`width × height` of the rendered image,
+/// never source pixels) against [`RENDER_MEMORY`].
 pub const BYTES_PER_PIXEL: u64 = 32;
 
 /// An environment setting, like the other process-wide render/cache budgets.
 /// A single instance survives collection reloads and spans all raster APIs.
+///
+/// Output-allocation budget in bytes: `MC_RENDER_MEMORY_MB` (default 1024 MiB,
+/// i.e. 33 554 432 output pixels at [`BYTES_PER_PIXEL`]), charged by
+/// `RenderJob::acquire_raster` for every WMS/Maps/Tiles cache miss. At the
+/// default it is tighter than the APIs' own 64 M-pixel `MAX_MAP_PIXELS`.
+/// Temporary exhaustion waits in the bounded queue, at most until the render
+/// deadline;
+/// a request larger than the whole budget is rejected at once as
+/// `ExecutionError::Busy`. Both reach the client as HTTP 503 "Server busy, try
+/// again later" with `Retry-After: 1`, although retrying an oversized request
+/// cannot succeed ("Pixel budgets" in the root CLAUDE.md, #120).
 pub static RENDER_MEMORY: LazyLock<Arc<RenderBudget>> = LazyLock::new(|| {
     Arc::new(RenderBudget::new(
         ds_cache::env_mb("MC_RENDER_MEMORY_MB", 1024).saturating_mul(1024 * 1024),

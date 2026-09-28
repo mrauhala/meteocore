@@ -34,6 +34,9 @@ reservations include bounded raw output and boxed samples and stay owned until
 parallel tile assembly releases them. Exhaustion propagates as HTTP 503, never
 as transparent pixels or an error image. This is separate from render output
 admission and does not cover other engines or the final source-window buffer.
+A full-resolution map window has its own source-pixel cap,
+`reader::MAX_MAP_PIXELS`; the root CLAUDE.md "Pixel budgets" lists each
+budget and its client-visible failure.
 
 ## Caches
 

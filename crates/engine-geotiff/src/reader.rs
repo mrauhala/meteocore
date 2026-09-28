@@ -27,8 +27,15 @@ where
     }
 }
 
-/// Security limits
+// Security limits. The first two bound source files, not requests: both are
+// checked when a file's header is parsed, so an oversized file is rejected
+// rather than served.
+/// Per-side cap of a GeoTIFF's native grid, in pixels.
 const MAX_RASTER_DIMENSION: u32 = 100_000;
+/// Cap on one decoded source tile in bytes (tile width × height × bands ×
+/// bytes/sample), rechecked before every decode, and on the tiff decoder's
+/// buffers. A cold local decode reserves its tile plus this intermediate cap
+/// from `decode_budget::BUDGET`.
 const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 const MAX_IFD_LEVELS: usize = 256;
 
@@ -1887,6 +1894,17 @@ fn copy_u8_tile(
 /// resampled to output resolution. Needs to be generous because projected CRS
 /// data (e.g., TM35FIN radar covering all of Scandinavia) can have large source
 /// extents even for moderate output sizes.
+///
+/// Source-decode budget: native pixels (`cols × rows` in the file's own grid)
+/// of the window one `get_raster_tile` reads. The APIs' `MAX_MAP_PIXELS` has
+/// the same value but bounds *output* pixels, and neither implies the other
+/// (#120). Enforced by [`read_bbox_map`] and [`read_bbox_u8`] on
+/// full-resolution reads only: when full resolution is over it,
+/// `get_raster_tile` falls back to the finest overview under it, else the
+/// coarsest regardless, so only a COG without overviews trips it. Tripping it
+/// returns `InvalidParameter` "Map render source area N pixels exceeds maximum
+/// 64000000.", which Maps and Tiles serve as HTTP 400 `BadRequest`; WMS logs
+/// it at WARN and serves its red error tile (HTTP 200, `x-cache: ERROR`).
 const MAX_MAP_PIXELS: usize = 64_000_000;
 
 /// Public accessor for MAX_MAP_PIXELS (used by overview selection in lib.rs).
