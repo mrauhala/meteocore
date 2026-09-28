@@ -8,6 +8,10 @@
 #
 # Every worktree shares the main checkout's target dir, so cargo runs
 # serialize on its lock: run lints one after another, not in parallel.
+# Cargo records workspace sources relative to each crate, so a crate this
+# worktree didn't edit could otherwise reuse ANOTHER worktree's build of it
+# (its files are older than that artifact). The script touches this tree's
+# sources first so the lint reflects this tree only.
 #
 # Prints "LINT OK <name>" or "LINT FAILED <name>" plus the first diagnostics.
 set -u
@@ -17,6 +21,7 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$main/target}
 name=${wt:t}
 cd "$wt" || exit 1
 cargo fmt || { echo "FMT FAILED $name"; exit 1; }
+git ls-files -z 'crates/*.rs' 'crates/**/*.rs' | xargs -0 touch
 pkgs=()
 for crate in "$@"; do pkgs+=(-p "$crate"); done
 out=$(cargo clippy "${pkgs[@]}" --all-targets -- -D warnings 2>&1)
