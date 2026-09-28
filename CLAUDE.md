@@ -404,6 +404,11 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   misplaced" report, first confirm which render path the failing request
   uses: **WMS EPSG:3857/3067/3035 go through meta-tiling, not the direct
   `get_raster_tile` path that Maps/Tiles use.**
+  A global lat/lon source in a projected CRS builds its grid with
+  `ProjectionGrid::build_2d_periodic` (its column period) and wraps the
+  sampled column: EPSG:3035's inverse cuts longitude at 170°W and every
+  longitude meets at the pole, so plain `build_2d` interpolates straight
+  through both in any Arctic view (#323; engine-grib does this).
 - **Before blaming a mechanism for a latency spike, check the magnitude adds
   up.** A 2.3 MB local read from page cache is tens of ms, not seconds.
   Multi-second stalls at low load almost always mean blocking/contention

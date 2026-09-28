@@ -1141,34 +1141,36 @@ fn laea_forward(
     (x, y)
 }
 
+/// Closed-form inverse, Snyder eqs. 24-26 to 24-30 (oblique ellipsoid) with
+/// the authalic-latitude inverse (3-18). Every point of the projection's disk
+/// resolves to its own `(lat, lon)`, including points beyond the pole; the
+/// longitude comes back within ±180° of `lon0`, so it is continuous except
+/// across the antimeridian of `lon0`. Outside the disk (`ρ > 2·Rq`) it is
+/// NaN.
+///
+/// This replaced a Newton iteration on [`laea_forward`], which folds at the
+/// pole: past it the iteration settled on latitudes above 90° or never
+/// converged, blanking and scrambling every polar EPSG:3035 view (#323).
 fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
-    // Newton iteration from projection center — robust at any distance.
-    let mut lat = lat0;
-    let mut lon = lon0;
+    let e2 = WGS84_E2;
+    let e = e2.sqrt();
+    let qp = q_authalic(PI / 2.0, e);
+    let beta0 = (q_authalic(lat0, e) / qp).clamp(-1.0, 1.0).asin();
+    let rq = WGS84_A * (qp / 2.0).sqrt();
+    let m0 = lat0.cos() / (1.0 - e2 * lat0.sin().powi(2)).sqrt();
+    let dd = WGS84_A * m0 / (rq * beta0.cos());
 
-    for _ in 0..20 {
-        let (fx, fy) = laea_forward(lat, lon, lat0, lon0, false_e, false_n);
-        let ex = x - fx;
-        let ey = y - fy;
-        if ex.abs() < 0.01 && ey.abs() < 0.01 {
-            break;
-        }
-        let h = 1e-8;
-        let (fx_dlat, fy_dlat) = laea_forward(lat + h, lon, lat0, lon0, false_e, false_n);
-        let (fx_dlon, fy_dlon) = laea_forward(lat, lon + h, lat0, lon0, false_e, false_n);
-        let de_dlat = (fx_dlat - fx) / h;
-        let de_dlon = (fx_dlon - fx) / h;
-        let dn_dlat = (fy_dlat - fy) / h;
-        let dn_dlon = (fy_dlon - fy) / h;
-        let det = de_dlat * dn_dlon - de_dlon * dn_dlat;
-        if det.abs() < 1e-30 {
-            break;
-        }
-        lat += (dn_dlon * ex - de_dlon * ey) / det;
-        lon += (-dn_dlat * ex + de_dlat * ey) / det;
+    let (x, y) = (x - false_e, y - false_n);
+    let rho = ((x / dd).powi(2) + (dd * y).powi(2)).sqrt();
+    if rho < 1e-9 {
+        return (lat0, lon0);
     }
-
-    (lat, lon)
+    let ce = 2.0 * (rho / (2.0 * rq)).asin();
+    let (sin_ce, cos_ce) = ce.sin_cos();
+    let q = qp * (cos_ce * beta0.sin() + dd * y * sin_ce * beta0.cos() / rho);
+    let lon = lon0
+        + (x * sin_ce).atan2(dd * rho * beta0.cos() * cos_ce - dd * dd * y * beta0.sin() * sin_ce);
+    (authalic_inverse(q, e), lon)
 }
 
 fn q_authalic(lat: f64, e: f64) -> f64 {
@@ -1179,7 +1181,6 @@ fn q_authalic(lat: f64, e: f64) -> f64 {
             - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln())
 }
 
-#[allow(dead_code)]
 fn authalic_inverse(q: f64, e: f64) -> f64 {
     let e2 = e * e;
     let e4 = e2 * e2;
@@ -2388,6 +2389,51 @@ mod tests {
         let (lon, lat) = crs.inverse(3_799_000.0, -4_399_000.0).unwrap();
         assert!((lon - 29.41).abs() < 1.0, "LR lon={lon}, expected ~29.41");
         assert!((lat - 31.99).abs() < 1.0, "LR lat={lat}, expected ~31.99");
+    }
+
+    /// The EPSG:3035 inverse across the North Pole and the antimeridian,
+    /// pinned to `cs2cs +proj=laea +lat_0=52 +lon_0=10 +x_0=4321000
+    /// +y_0=3210000 +datum=WGS84 +units=m +to +proj=longlat +datum=WGS84`
+    /// (PROJ 9.8). The old Newton inverse settled beyond the pole on
+    /// latitudes above 90° or never converged: every Arctic view of a
+    /// global field rendered blank wedges and scrambled data (#323).
+    /// Longitudes compare modulo a turn — the inverse returns them within
+    /// ±180° of 10°E, PROJ within ±180° of Greenwich.
+    #[test]
+    fn laea_3035_inverse_matches_proj_across_the_pole() {
+        let crs = projected_output_crs("EPSG:3035").unwrap();
+        let cases = [
+            // Ireland, west of Greenwich.
+            (3_036_306.0, 3_606_514.0, -9.859444076, 53.963967699),
+            // Arabia, far south-east of the centre.
+            (9_000_000.0, 1_000_000.0, 55.324361180, 19.442161595),
+            // Within a degree of the pole, then beyond it.
+            (4_400_000.0, 7_400_000.0, 123.422114951, 89.272405714),
+            (4_600_000.0, 7_500_000.0, 128.251176664, 87.330881556),
+            // On the longitude cut (170°W, straight up from the pole).
+            (4_321_000.0, 8_407_544.0, -170.0, 80.000002880),
+            // The antimeridian, then Alaska and Kamchatka either side of it.
+            (4_755_500.0, 9_368_548.0, -179.999992499, 69.999998778),
+            (2_000_000.0, 9_500_000.0, -131.219110202, 60.483853425),
+            (7_000_000.0, 10_000_000.0, 154.078024408, 54.167651717),
+        ];
+        for (x, y, lon_proj, lat_proj) in cases {
+            let (lon, lat) = crs.inverse(x, y).expect("inside the projection's disk");
+            let dlon = (lon - lon_proj + 180.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                dlon.abs() < 1e-7 && (lat - lat_proj).abs() < 1e-7,
+                "inverse({x}, {y}) = ({lon}, {lat}), PROJ ({lon_proj}, {lat_proj})"
+            );
+            // The forward agrees with PROJ too, so the pair is anchored.
+            let (fx, fy) = crs.forward(lon_proj, lat_proj);
+            assert!(
+                (fx - x).abs() < 0.01 && (fy - y).abs() < 0.01,
+                "forward({lon_proj}, {lat_proj}) = ({fx}, {fy}), PROJ ({x}, {y})"
+            );
+        }
+        // Past the far side of the disk (twice the authalic radius from
+        // the centre) there is no inverse, rather than an invented one.
+        assert_eq!(crs.inverse(4_321_000.0, 3_210_000.0 + 13_000_000.0), None);
     }
 
     // Test GeoTransform with projected CRS
