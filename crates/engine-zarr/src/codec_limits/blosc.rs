@@ -1,20 +1,37 @@
-//! Preflight Blosc frames without replacing its block-level partial decoder.
+//! Preflight Blosc frames without replacing its block-level partial decoding.
 use super::*;
-use std::sync::Mutex;
 use zarrs::{
-    array::codec::bytes_to_bytes::blosc::blosc_validate,
+    array::codec::bytes_to_bytes::blosc::{blosc_decompress_bytes_partial, blosc_validate},
     storage::{
-        byte_range::{extract_byte_ranges, ByteRange, ByteRangeIterator},
+        byte_range::{ByteRange, ByteRangeIterator},
         StorageError,
     },
 };
+
+#[cfg(feature = "icechunk")]
+use zarrs::array::codec::api::AsyncBytesPartialDecoderTraits;
 
 mod partial;
 pub(super) use partial::PartialDecoder;
 
 pub(super) struct Frame {
     length: u64,
+    typesize: u64,
     _scratch: Option<crate::encoded::Scratch>,
+}
+
+impl Frame {
+    // c-blosc 1 getitem returns before freeing scratch on out-of-bounds
+    // regions. Resolve every range against the checked frame before getitem.
+    fn bounds(&self, range: ByteRange) -> Option<(usize, usize)> {
+        let (start, end) = match range {
+            ByteRange::FromStart(start, Some(length)) => (start, start.checked_add(length)?),
+            ByteRange::FromStart(start, None) => (start, self.length),
+            ByteRange::Suffix(length) => (self.length.checked_sub(length)?, self.length),
+        };
+        // Checked frame lengths fit c-blosc's 32-bit buffer sizes.
+        (start <= end && end <= self.length).then_some((start as usize, end as usize))
+    }
 }
 
 pub(super) fn validate_and_admit(
@@ -61,144 +78,7 @@ pub(super) fn validate_and_admit(
     };
     Ok(Frame {
         length: length as u64,
+        typesize,
         _scratch: scratch,
     })
-}
-
-// One state per decoder invocation, never shared between overlapping calls.
-// CheckedInput acquires scratch only once the frame is available; the outer
-// partial decoder retains it until upstream getitem has returned/unwound.
-#[derive(Default)]
-struct Call {
-    context: Option<Arc<crate::encoded::Context>>,
-    frames: Vec<Frame>,
-    invalid_range: bool,
-}
-
-impl Call {
-    fn new() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            context: crate::encoded::current(),
-            ..Default::default()
-        }))
-    }
-
-    fn check_range(&mut self, range: ByteRange) -> bool {
-        let valid = !self.invalid_range
-            && self.frames.last().is_some_and(|frame| match range {
-                ByteRange::FromStart(start, Some(length)) => start
-                    .checked_add(length)
-                    .is_some_and(|end| end <= frame.length),
-                ByteRange::FromStart(start, None) => start <= frame.length,
-                ByteRange::Suffix(length) => length <= frame.length,
-            });
-        self.invalid_range |= !valid;
-        valid
-    }
-}
-
-struct CheckedInput<T: ?Sized> {
-    inner: Arc<T>,
-    representation: BytesRepresentation,
-    call: Arc<Mutex<Call>>,
-}
-
-impl<T: ?Sized> CheckedInput<T> {
-    fn new(inner: Arc<T>, representation: BytesRepresentation, call: Arc<Mutex<Call>>) -> Self {
-        Self {
-            inner,
-            representation,
-            call,
-        }
-    }
-
-    fn admit(&self, bytes: &[u8]) -> Result<(), CodecError> {
-        let context = self.call.lock().unwrap().context.clone();
-        let frame = validate_and_admit(bytes, &self.representation, true, context.as_ref())?;
-        self.call.lock().unwrap().frames.push(frame);
-        Ok(())
-    }
-}
-
-impl BytesPartialDecoderTraits for CheckedInput<dyn BytesPartialDecoderTraits> {
-    fn exists(&self) -> Result<bool, StorageError> {
-        self.inner.exists()
-    }
-
-    fn size_held(&self) -> usize {
-        self.inner.size_held()
-    }
-
-    fn supports_partial_decode(&self) -> bool {
-        false
-    }
-
-    fn decode(&self, options: &CodecOptions) -> Result<Option<ArrayBytesRaw<'_>>, CodecError> {
-        check_deadline()?;
-        let value = self.inner.decode(options)?;
-        if let Some(bytes) = &value {
-            self.admit(bytes)?;
-        }
-        Ok(value)
-    }
-
-    fn partial_decode_many(
-        &self,
-        regions: ByteRangeIterator,
-        options: &CodecOptions,
-    ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
-        self.decode(options)?
-            .map(|bytes| {
-                extract_byte_ranges(&bytes, regions)
-                    .map(|ranges| ranges.into_iter().map(Cow::Owned).collect())
-                    .map_err(CodecError::from)
-            })
-            .transpose()
-    }
-}
-
-#[cfg(feature = "icechunk")]
-use zarrs::array::codec::api::AsyncBytesPartialDecoderTraits;
-
-#[cfg(feature = "icechunk")]
-#[async_trait::async_trait]
-impl AsyncBytesPartialDecoderTraits for CheckedInput<dyn AsyncBytesPartialDecoderTraits> {
-    async fn exists(&self) -> Result<bool, StorageError> {
-        self.inner.exists().await
-    }
-
-    fn size_held(&self) -> usize {
-        self.inner.size_held()
-    }
-
-    fn supports_partial_decode(&self) -> bool {
-        false
-    }
-
-    async fn decode<'a>(
-        &'a self,
-        options: &CodecOptions,
-    ) -> Result<Option<ArrayBytesRaw<'a>>, CodecError> {
-        check_deadline()?;
-        let value = self.inner.decode(options).await?;
-        if let Some(bytes) = &value {
-            self.admit(bytes)?;
-        }
-        Ok(value)
-    }
-
-    async fn partial_decode_many<'a>(
-        &'a self,
-        regions: ByteRangeIterator<'a>,
-        options: &CodecOptions,
-    ) -> Result<Option<Vec<ArrayBytesRaw<'a>>>, CodecError> {
-        self.decode(options)
-            .await?
-            .map(|bytes| {
-                extract_byte_ranges(&bytes, regions)
-                    .map(|ranges| ranges.into_iter().map(Cow::Owned).collect())
-                    .map_err(CodecError::from)
-            })
-            .transpose()
-    }
 }

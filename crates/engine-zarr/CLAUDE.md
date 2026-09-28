@@ -122,17 +122,20 @@ pool: they do not use the Icechunk runtime bridge.
   Do not trust frame headers to increase codec output limits. Preserve typed
   allocation/admission failures and deadline errors through `chunk_read_error`.
   Blosc validates the encoded frame and block size before both full decoding
-  and getitem partial decoding. Keep its upstream partial decoder behind the
-  checked input: replacing getitem with full decompression amplifies small reads.
+  and getitem partial decoding. Keep getitem for partial reads: replacing it
+  with full decompression amplifies small reads.
   Admit the serial/getitem scratch allowance from the same budget
   (2/3 times block size plus 4 times typesize in the pinned c-blosc). Keep its
   `encoded::Scratch` guard through the native call, then release extra capacity
   and refund only its borrowed prepaid credit. Never refund encoded/intermediate
-  copy allowances at that boundary. Partial calls own separate checked-input
-  states around the upstream decoder; preserve async context ownership and
-  cleanup on cancellation. Validate byte ranges before getitem: its out-of-bounds
-  branches leak the allocated scratch buffer. Valid unaligned ranges retain
-  the upstream limitation tracked in #780. Do not
+  copy allowances at that boundary. Each partial call decodes and admits its
+  own frame; preserve async context ownership and cleanup on cancellation.
+  Validate byte ranges before getitem: its out-of-bounds branches leak the
+  allocated scratch buffer. `blosc::PartialDecoder` stands in for zarrs'
+  decoder, which truncates byte ranges to whole typesize elements (#780): it
+  expands unaligned ranges to covering elements and trims them. Only ranges
+  reaching a final partial element (frame length not a multiple of typesize)
+  slice one full decode. Do not
   claim this covers compressor-private contexts or every native allocation.
   Other codecs and coordinate discovery are not wrapped.
   Each chunk worker installs a fresh scope with the caller's budget. Never

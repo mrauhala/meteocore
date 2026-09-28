@@ -5,7 +5,7 @@ use zarrs::{
     filesystem::FilesystemStore,
 };
 
-fn codecs() -> [BoundedCodec; 2] {
+pub(super) fn codecs() -> [BoundedCodec; 2] {
     [
         BoundedCodec {
             inner: Arc::new(GzipCodec::new(1).unwrap()),
@@ -355,52 +355,59 @@ fn independent_v2_compressed_fortran_arrays_keep_layout_and_chunk_keys() {
 #[test]
 fn stacked_compression_in_nested_shards_remains_bounded() {
     let options = crate::catalog::single_threaded_opts();
-    let dir = tempfile::tempdir().unwrap();
-    let storage = Arc::new(FilesystemStore::new(dir.path()).unwrap());
-    let [gzip, zstd] = codecs();
+    let values: Vec<f32> = (0..64).map(|n| n as f32).collect();
     // The intermediate gzip stream is opaque bytes, not float32 elements.
-    let blosc = BloscCodec::new(
-        zarrs::array::codec::BloscCompressor::LZ4,
-        1.try_into().unwrap(),
-        None,
-        zarrs::array::codec::BloscShuffleMode::NoShuffle,
-        Some(1),
-    )
-    .unwrap();
-    let inner = ShardingCodecBuilder::new(vec![2.try_into().unwrap(); 2], &data_type::float32())
-        .bytes_to_bytes_codecs(vec![gzip.inner, Arc::new(blosc), zstd.inner])
-        .build();
-    let outer = ShardingCodecBuilder::new(vec![4.try_into().unwrap(); 2], &data_type::float32())
-        .array_to_bytes_codec(Arc::new(inner))
-        .build();
-    let writer = ArrayBuilder::new(vec![8, 8], vec![8, 8], data_type::float32(), -999f32)
-        .array_to_bytes_codec(Arc::new(outer))
-        .build(storage.clone(), "/")
-        .unwrap();
-    writer.store_metadata().unwrap();
-    writer
-        .store_chunk_opt(
-            &[0, 0],
-            (0..64).map(|n| n as f32).collect::<Vec<_>>(),
-            &options,
+    // Typesize 4 leaves most streams with a final partial element (#780).
+    for (shuffle, typesize) in [
+        (zarrs::array::codec::BloscShuffleMode::NoShuffle, 1),
+        (zarrs::array::codec::BloscShuffleMode::Shuffle, 4),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FilesystemStore::new(dir.path()).unwrap());
+        let [gzip, zstd] = codecs();
+        let blosc = BloscCodec::new(
+            zarrs::array::codec::BloscCompressor::LZ4,
+            1.try_into().unwrap(),
+            None,
+            shuffle,
+            Some(typesize),
         )
         .unwrap();
-    let array =
-        bounded_array(Array::open(Arc::new(EngineStore::new(storage)), "/").unwrap()).unwrap();
-    let budget = Arc::new(crate::read_budget::Budget::new(1024 * 1024));
-    for subset in [
-        ArraySubset::new_with_ranges(&[1..7, 1..7]),
-        array.subset_all(),
-    ] {
-        let expected: Vec<f32> = writer.retrieve_array_subset_opt(&subset, &options).unwrap();
-        let scope = crate::encoded::enter(Some(budget.clone()));
-        let actual: Vec<f32> = array.retrieve_array_subset_opt(&subset, &options).unwrap();
-        assert_eq!(actual, expected);
-        assert!(
-            budget.metrics().0 > 0,
-            "stacked compression admits intermediate buffers"
-        );
-        drop(scope);
-        assert_eq!(budget.metrics().0, 0);
+        let inner =
+            ShardingCodecBuilder::new(vec![2.try_into().unwrap(); 2], &data_type::float32())
+                .bytes_to_bytes_codecs(vec![gzip.inner, Arc::new(blosc), zstd.inner])
+                .build();
+        let outer =
+            ShardingCodecBuilder::new(vec![4.try_into().unwrap(); 2], &data_type::float32())
+                .array_to_bytes_codec(Arc::new(inner))
+                .build();
+        let writer = ArrayBuilder::new(vec![8, 8], vec![8, 8], data_type::float32(), -999f32)
+            .array_to_bytes_codec(Arc::new(outer))
+            .build(storage.clone(), "/")
+            .unwrap();
+        writer.store_metadata().unwrap();
+        writer
+            .store_chunk_opt(&[0, 0], values.clone(), &options)
+            .unwrap();
+        let array =
+            bounded_array(Array::open(Arc::new(EngineStore::new(storage)), "/").unwrap()).unwrap();
+        let budget = Arc::new(crate::read_budget::Budget::new(1024 * 1024));
+        for (rows, cols) in [(1..7u64, 1..7u64), (0..8, 0..8)] {
+            let subset = ArraySubset::new_with_ranges(&[rows.clone(), cols.clone()]);
+            // Independent of zarrs' own Blosc partial decoder, which truncates
+            // the unaligned stream.
+            let expected: Vec<f32> = rows
+                .flat_map(|row| cols.clone().map(move |col| (row * 8 + col) as f32))
+                .collect();
+            let scope = crate::encoded::enter(Some(budget.clone()));
+            let actual: Vec<f32> = array.retrieve_array_subset_opt(&subset, &options).unwrap();
+            assert_eq!(actual, expected, "typesize {typesize}");
+            assert!(
+                budget.metrics().0 > 0,
+                "stacked compression admits intermediate buffers"
+            );
+            drop(scope);
+            assert_eq!(budget.metrics().0, 0);
+        }
     }
 }

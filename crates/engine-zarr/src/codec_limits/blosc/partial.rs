@@ -1,8 +1,15 @@
 use super::*;
 
-/// Wrap one upstream getitem invocation with scratch ownership. Constructing
-/// its checked input per call avoids sharing guards between concurrent users
-/// or retaining scratch for the lifetime of a reusable partial decoder.
+/// Decode exact byte ranges from one checked frame per call with c-blosc
+/// getitem. Validating and admitting the frame per call avoids sharing guards
+/// between concurrent users or retaining scratch for the lifetime of a
+/// reusable partial decoder.
+///
+/// This stands in for zarrs' `BloscPartialDecoder`, which divides byte
+/// offsets and lengths by the frame's typesize and so returns the wrong bytes
+/// for unaligned ranges of opaque intermediate streams (#780; zarrs 0.23.14,
+/// unchanged on its main branch). Delegate to it again once upstream returns
+/// exact ranges, including the final partial element.
 pub(crate) struct PartialDecoder<T: ?Sized> {
     input: Arc<T>,
     codec: Arc<dyn BytesToBytesCodecTraits>,
@@ -21,38 +28,70 @@ impl<T: ?Sized> PartialDecoder<T> {
             representation,
         }
     }
-}
 
-// c-blosc 1 getitem returns before freeing scratch on out-of-bounds regions.
-// Check each range after CheckedInput has validated the frame, but before the
-// upstream iterator invokes getitem. Stop on error, then discard prior outputs.
-fn checked_ranges<'a>(
-    regions: ByteRangeIterator<'a>,
-    call: &'a Mutex<Call>,
-) -> ByteRangeIterator<'a> {
-    Box::new(regions.take_while(move |range| call.lock().unwrap().check_range(*range)))
-}
-
-fn finish(
-    result: Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError>,
-    call: &Mutex<Call>,
-) -> Result<Option<Vec<ArrayBytesRaw<'static>>>, CodecError> {
-    check_deadline()?;
-    if call.lock().unwrap().invalid_range {
-        return Err(CodecError::Other(
-            "Blosc decoded byte range is outside the frame".into(),
-        ));
+    // getitem addresses whole typesize elements: expand each range to its
+    // covering elements and trim the owned output in place. Aligned ranges
+    // make the same getitem call as upstream; rounding adds under two elements
+    // of output capacity and never passes the admitted frame length. A frame
+    // whose length is not a multiple of typesize ends in a partial element
+    // getitem cannot index. Ranges reaching it slice one full decode of the
+    // admitted output; its serial scratch fits the admitted getitem allowance.
+    // Stop on the first invalid range, discarding prior outputs.
+    fn decode_ranges(
+        &self,
+        encoded: &[u8],
+        frame: &Frame,
+        regions: ByteRangeIterator<'_>,
+        options: &CodecOptions,
+    ) -> Result<Option<Vec<ArrayBytesRaw<'static>>>, CodecError> {
+        let typesize = frame.typesize as usize;
+        let length = frame.length as usize;
+        let mut full: Option<Vec<u8>> = None;
+        let mut values = Vec::new();
+        for range in regions {
+            let (start, end) = frame.bounds(range).ok_or_else(|| {
+                CodecError::Other("Blosc decoded byte range is outside the frame".into())
+            })?;
+            let (first, last) = (
+                start / typesize * typesize,
+                end.div_ceil(typesize) * typesize,
+            );
+            let value = if start == end {
+                // getitem reports zero items as a failure.
+                Vec::new()
+            } else if last <= length {
+                let mut value =
+                    blosc_decompress_bytes_partial(encoded, first, last - first, typesize)
+                        .map_err(|error| CodecError::Other(error.to_string()))?;
+                value.truncate(end - first);
+                value.drain(..start - first);
+                value
+            } else {
+                let decoded = match full.take() {
+                    Some(decoded) => decoded,
+                    None => self
+                        .codec
+                        .decode(Cow::Borrowed(encoded), &self.representation, options)?
+                        .into_owned(),
+                };
+                if decoded.len() != length {
+                    return Err(CodecError::Other(
+                        "Blosc output does not match its frame".into(),
+                    ));
+                }
+                if (start, end) == (0, length) {
+                    decoded
+                } else {
+                    let value = decoded[start..end].to_vec();
+                    full = Some(decoded);
+                    value
+                }
+            };
+            values.push(Cow::Owned(value));
+        }
+        check_deadline()?;
+        Ok(Some(values))
     }
-    // Upstream getitem returns owned Vecs. Explicitly own the results before
-    // dropping its temporary decoder; no additional payload copy is needed.
-    result.map(|values| {
-        values.map(|values| {
-            values
-                .into_iter()
-                .map(|value| Cow::Owned(value.into_owned()))
-                .collect()
-        })
-    })
 }
 
 impl BytesPartialDecoderTraits for PartialDecoder<dyn BytesPartialDecoderTraits> {
@@ -74,20 +113,14 @@ impl BytesPartialDecoderTraits for PartialDecoder<dyn BytesPartialDecoderTraits>
         options: &CodecOptions,
     ) -> Result<Option<Vec<ArrayBytesRaw<'_>>>, CodecError> {
         check_deadline()?;
-        let call = Call::new();
-        let decoder = self.codec.clone().partial_decoder(
-            Arc::new(CheckedInput::new(
-                self.input.clone(),
-                self.representation,
-                call.clone(),
-            )),
-            &self.representation,
-            options,
-        )?;
-        finish(
-            decoder.partial_decode_many(checked_ranges(regions, &call), options),
-            &call,
-        )
+        let context = crate::encoded::current();
+        let Some(encoded) = self.input.decode(options)? else {
+            return Ok(None);
+        };
+        // Scratch is admitted once the frame is available and held until
+        // every native call below has returned or unwound.
+        let frame = validate_and_admit(&encoded, &self.representation, true, context.as_ref())?;
+        self.decode_ranges(&encoded, &frame, regions, options)
     }
 }
 
@@ -112,25 +145,13 @@ impl AsyncBytesPartialDecoderTraits for PartialDecoder<dyn AsyncBytesPartialDeco
         options: &CodecOptions,
     ) -> Result<Option<Vec<ArrayBytesRaw<'a>>>, CodecError> {
         check_deadline()?;
-        let call = Call::new();
-        let decoder = self
-            .codec
-            .clone()
-            .async_partial_decoder(
-                Arc::new(CheckedInput::new(
-                    self.input.clone(),
-                    self.representation,
-                    call.clone(),
-                )),
-                &self.representation,
-                options,
-            )
-            .await?;
-        finish(
-            decoder
-                .partial_decode_many(checked_ranges(regions, &call), options)
-                .await,
-            &call,
-        )
+        // A pending call keeps the scope it started in, even after the caller
+        // leaves that scope; cancellation drops it with the future.
+        let context = crate::encoded::current();
+        let Some(encoded) = self.input.decode(options).await? else {
+            return Ok(None);
+        };
+        let frame = validate_and_admit(&encoded, &self.representation, true, context.as_ref())?;
+        self.decode_ranges(&encoded, &frame, regions, options)
     }
 }
