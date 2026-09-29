@@ -20,9 +20,10 @@
 //!    template or an explicit regex (#817).
 //! 4. [`scan_remote`] / [`scan_local`] — the catalog scan: list the
 //!    prefixes, at most [`MAX_CONCURRENT_LISTS`] at a time, or read the
-//!    directory, then match, window, dedup and cap into `(key, timestamp)`
-//!    entries (#817). [`list_prefixes`] is its bounded concurrent LIST, for
-//!    an engine that recognises files without a matcher.
+//!    directory, then exclude, match, window, dedup and cap into
+//!    `(key, timestamp)` entries (#817). [`list_prefixes`] is its bounded
+//!    concurrent LIST, for an engine that recognises files without a
+//!    matcher.
 //!
 //! This module is the shared home for all four. `engine-odim` and
 //! `engine-geotiff` use it; `engine-grib` expands its model-run
@@ -916,16 +917,21 @@ pub const MAX_FILENAME_LEN: usize = 255;
 /// What a catalog scan keeps. [`ScanSpec::new`] sets no limits; set the
 /// optional ones with struct-update syntax.
 ///
-/// A scan keeps a file when its basename matches the [`FilenameMatcher`]
-/// and its timestamp lies inside `time_filter`. It then returns the kept
-/// files oldest first, one per timestamp, capped to the newest
-/// `max_files` timestamps. Of files that share a timestamp, the greatest
-/// key or path wins, and each file dropped for it is logged at WARN.
+/// A scan keeps a file when its basename is not `exclude`d, matches the
+/// [`FilenameMatcher`] and has a timestamp inside `time_filter`. It then
+/// returns the kept files oldest first, one per timestamp, capped to the
+/// newest `max_files` timestamps. Of files that share a timestamp, the
+/// greatest key or path wins, and each file dropped for it is logged at
+/// WARN. An excluded file is dropped before any of that, so it never wins
+/// a timestamp or takes a `max_files` slot.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanSpec<'a> {
     /// Recognises the collection's files and reads their timestamps. A
     /// name that matches but holds no valid time is logged at WARN.
     pub matcher: &'a FilenameMatcher,
+    /// Basenames to skip before matching, in [`is_excluded`]'s pattern
+    /// forms: `*.tmp`, `.*`, or an exact name.
+    pub exclude: &'a [String],
     /// Keep only files timestamped inside this inclusive `(start, end)`.
     pub time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// Keep only the newest N timestamps, counted after deduplication.
@@ -937,6 +943,24 @@ pub struct ScanSpec<'a> {
     pub symlinks: Symlinks,
     /// Prefix of the scan's log lines, normally the collection id.
     pub label: &'a str,
+}
+
+/// Whether `filename` matches one of `patterns`, the forms a collection's
+/// `exclude_patterns` take:
+///
+/// - `*.ext` matches a name ending in `.ext`, e.g. `*.part`.
+/// - A pattern starting with `.` matches every hidden name, e.g. `.*`.
+/// - Anything else matches that exact name.
+pub fn is_excluded(filename: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        if let Some(ext) = pattern.strip_prefix('*').filter(|e| e.starts_with('.')) {
+            filename.ends_with(ext)
+        } else if pattern.starts_with('.') {
+            filename.starts_with('.')
+        } else {
+            filename == pattern
+        }
+    })
 }
 
 /// Whether [`scan_local`] catalogues a symlink to a regular file.
@@ -951,10 +975,12 @@ pub enum Symlinks {
 }
 
 impl<'a> ScanSpec<'a> {
-    /// A scan with no time filter, cap or size limit, regular files only.
+    /// A scan with no exclusions, time filter, cap or size limit, regular
+    /// files only.
     pub fn new(matcher: &'a FilenameMatcher, label: &'a str) -> Self {
         Self {
             matcher,
+            exclude: &[],
             time_filter: None,
             max_files: None,
             max_size: None,
@@ -965,7 +991,7 @@ impl<'a> ScanSpec<'a> {
 
     /// The timestamp of a file this scan keeps by name, or `None`.
     fn timestamp(&self, name: &str) -> Option<DateTime<Utc>> {
-        if name.len() > MAX_FILENAME_LEN {
+        if name.len() > MAX_FILENAME_LEN || is_excluded(name, self.exclude) {
             return None;
         }
         let time = match self.matcher.match_timestamp(name)? {
@@ -1700,6 +1726,78 @@ mod scan_tests {
         let dir = tempfile::tempdir().unwrap();
         let matcher = opera();
         assert!(scan_local(&dir.path().join("missing"), &ScanSpec::new(&matcher, "t")).is_err());
+    }
+
+    #[test]
+    fn exclude_pattern_forms() {
+        let patterns = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let defaults = patterns(&["*.tmp", "*.part"]);
+        assert!(is_excluded("data.tmp", &defaults));
+        assert!(is_excluded("radar.tif.part", &defaults));
+        assert!(!is_excluded("radar_20240101T0000Z.tif", &defaults));
+        assert!(!is_excluded("radar.part.tif", &defaults));
+        assert!(is_excluded(".hidden", &patterns(&[".*"])));
+        assert!(!is_excluded("visible", &patterns(&[".*"])));
+        assert!(is_excluded("LOCK", &patterns(&["LOCK"])));
+        assert!(!is_excluded("LOCKED", &patterns(&["LOCK"])));
+        assert!(!is_excluded("anything", &[]));
+    }
+
+    /// An unanchored explicit pattern matches a partial upload too. The
+    /// default exclusions must drop it before the dedup, where it would
+    /// beat its finished file as the greater name, and before the cap,
+    /// where it would take a slot (#817 review).
+    const UNANCHORED: &str = r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif";
+    const PARTIAL_LAYOUT: [&str; 4] = [
+        "radar_20260324T2310Z.tif",
+        "radar_20260324T2315Z.tif",
+        "radar_20260324T2315Z.tif.part",
+        "radar_20260324T2320Z.tif.tmp",
+    ];
+
+    fn default_excludes() -> Vec<String> {
+        vec!["*.tmp".to_string(), "*.part".to_string()]
+    }
+
+    #[test]
+    fn local_scan_excludes_before_dedup_and_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in PARTIAL_LAYOUT {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let matcher = FilenameMatcher::from_pattern(UNANCHORED, "%Y%m%dT%H%MZ").unwrap();
+        let exclude = default_excludes();
+        let spec = ScanSpec {
+            exclude: &exclude,
+            max_files: Some(2),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        assert_eq!(
+            local_names(&scan_local(dir.path(), &spec).unwrap()),
+            ["radar_20260324T2310Z.tif", "radar_20260324T2315Z.tif"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_scan_excludes_before_dedup_and_cap() {
+        let keys = PARTIAL_LAYOUT.map(|name| format!("d/{name}"));
+        let probe = ListProbe::default()
+            .with_objects(&keys.iter().map(String::as_str).collect::<Vec<_>>())
+            .await;
+        let store = DataStore::new(Arc::new(probe));
+        let matcher = FilenameMatcher::from_pattern(UNANCHORED, "%Y%m%dT%H%MZ").unwrap();
+        let exclude = default_excludes();
+        let spec = ScanSpec {
+            exclude: &exclude,
+            max_files: Some(2),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        let scan = scan_remote(&store, &[ObjectPath::from("d")], &spec).unwrap();
+        assert_eq!(
+            remote_keys(&scan),
+            ["d/radar_20260324T2310Z.tif", "d/radar_20260324T2315Z.tif"]
+        );
+        assert_eq!(scan.prefixes[0].listed.as_ref().ok(), Some(&4));
     }
 
     /// A name over `MAX_FILENAME_LEN` is skipped even when it matches.

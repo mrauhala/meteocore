@@ -22,7 +22,9 @@ rebinding or validate arbitrary operator-configured source hosts.
 the `time_window`, strftime prefix expansion, the `FilenameMatcher` and the
 catalog scan. Engines call `scan_local` for a directory and `scan_remote` for
 an object store's date-expanded prefixes. Both keep a file when its basename
-matches and its timestamp falls inside the inclusive window. They return the
+is not excluded, matches and has a timestamp inside the inclusive window.
+Exclusion comes first, so an excluded partial upload never displaces the
+finished file of the same timestamp or takes a `max_files` slot. They return the
 kept files oldest first, one per timestamp, capped to the newest `max_files`.
 Of files sharing a timestamp the greatest key or path wins, whatever the
 listing order, and each dropped file is logged at WARN.

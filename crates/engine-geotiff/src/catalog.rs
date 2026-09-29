@@ -224,8 +224,8 @@ pub struct PendingFile {
 /// Scan a directory for GeoTIFF files matching a filename pattern.
 ///
 /// Lists and matches with the shared catalog scan
-/// ([`discovery::scan_local`]): regular files only, one per timestamp (the
-/// lexicographically-last path wins). Returns a new Catalog containing all
+/// ([`discovery::scan_local`]): regular files only, `exclude_patterns`
+/// dropped first, one per timestamp (the lexicographically-last path wins). Returns a new Catalog containing all
 /// valid files. Files that fail to parse are logged and skipped.
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
@@ -237,11 +237,16 @@ pub fn scan_directory(
     pending: &mut BTreeMap<PathBuf, PendingFile>,
     existing: &HashMap<&Path, &FileEntry>,
 ) -> Result<Catalog, DataServerError> {
-    // Symlinks stay skipped: the reuse test below compares the directory
-    // entry's own size, mtime and inode, which a symlink's target can
-    // change under.
+    // Excluded names are dropped inside the scan, before the dedup, so an
+    // excluded partial upload never displaces its finished file. Symlinks
+    // stay skipped: the reuse test below compares the directory entry's own
+    // size, mtime and inode, which a symlink's target can change under.
     let label = dir.display().to_string();
-    let files = discovery::scan_local(dir, &ScanSpec::new(matcher, &label)).map_err(|e| {
+    let spec = ScanSpec {
+        exclude: exclude_patterns,
+        ..ScanSpec::new(matcher, &label)
+    };
+    let files = discovery::scan_local(dir, &spec).map_err(|e| {
         DataServerError::Engine(format!("Cannot read directory {}: {e}", dir.display()))
     })?;
 
@@ -250,15 +255,6 @@ pub fn scan_directory(
     for file in files {
         let datetime = file.time;
         let path = file.path;
-
-        // Skip excluded patterns
-        let excluded = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| is_excluded(name, exclude_patterns));
-        if excluded {
-            continue;
-        }
 
         // File size, mtime and inode from the scan's one stat. mtime is
         // `Option<SystemTime>` because some filesystems (FAT, exotic NFS
@@ -390,26 +386,6 @@ pub fn scan_directory(
     })
 }
 
-fn is_excluded(filename: &str, patterns: &[String]) -> bool {
-    for pattern in patterns {
-        if pattern.starts_with("*.") {
-            // Extension match
-            let ext = &pattern[1..]; // e.g. ".tmp"
-            if filename.ends_with(ext) {
-                return true;
-            }
-        } else if pattern.starts_with('.') {
-            // Hidden file match
-            if filename.starts_with('.') {
-                return true;
-            }
-        } else if filename == pattern {
-            return true;
-        }
-    }
-    false
-}
-
 /// Maximum file size for remote downloads (50 MB).
 /// `u64` to match `ObjectMeta::size`, which object_store widened from `usize`
 /// in 0.14 so 32-bit targets can still describe large objects.
@@ -422,11 +398,12 @@ pub type FailedPrefix = (ObjectPath, DataServerError);
 /// filename pattern.
 ///
 /// Lists and matches with the shared catalog scan
-/// ([`discovery::scan_remote`]): the prefixes are listed concurrently, at
-/// most [`discovery::MAX_CONCURRENT_LISTS`] at a time, and the matches are
-/// windowed by `time_filter`, deduplicated per timestamp and capped to the
-/// newest `max_files` before any metadata is read. Objects over
-/// [`MAX_REMOTE_FILE_SIZE`] are skipped.
+/// ([`discovery::scan_remote`]) under `spec`: the prefixes are listed
+/// concurrently, at most [`discovery::MAX_CONCURRENT_LISTS`] at a time, and
+/// the matches are filtered by `spec.exclude`, windowed, deduplicated per
+/// timestamp and capped before any metadata is read. Objects over
+/// [`MAX_REMOTE_FILE_SIZE`] are skipped. `spec.label` is the collection id
+/// the log lines name.
 ///
 /// Uses COG-style byte-range reads to fetch only the IFD metadata (first 64 KB)
 /// instead of downloading entire files. Falls back to full download if the
@@ -440,17 +417,13 @@ pub type FailedPrefix = (ObjectPath, DataServerError);
 pub fn scan_remote(
     store: &ds_storage::DataStore,
     prefixes: &[ObjectPath],
-    matcher: &FilenameMatcher,
+    spec: &ScanSpec<'_>,
     existing: &HashMap<&Path, &FileEntry>,
-    max_files: Option<usize>,
-    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    collection_id: &str,
 ) -> Result<(Catalog, Vec<FailedPrefix>), DataServerError> {
+    let collection_id = spec.label;
     let spec = ScanSpec {
-        time_filter,
-        max_files,
         max_size: Some(MAX_REMOTE_FILE_SIZE),
-        ..ScanSpec::new(matcher, collection_id)
+        ..*spec
     };
     let RemoteScan {
         entries: files,
@@ -466,7 +439,7 @@ pub fn scan_remote(
                 continue;
             }
         };
-        if time_filter.is_some() {
+        if spec.time_filter.is_some() {
             tracing::info!(
                 "[{}] Prefix '{}': {} listed, {} within time window",
                 collection_id,
@@ -730,6 +703,7 @@ mod tests {
     use super::*;
     use crate::reader::{DataSource, TiffMetadata};
     use ds_core::geo::{Crs, GeoTransform};
+    use ds_storage::discovery::is_excluded;
 
     #[test]
     fn exclude_patterns() {
