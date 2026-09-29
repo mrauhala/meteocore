@@ -625,14 +625,15 @@ Values are converted to `f64` internally. Physical values: `physical = raw * sca
 |------|--------|-------------|
 | Local directory | `data_path = "path/to/dir"` | Scans a local directory |
 | Fixed remote prefix | `data_path = "s3://bucket/prefix/"` | Scans a single S3/HTTP prefix |
-| Dynamic remote prefix | `endpoint` + `bucket` + `prefix_pattern` | Expands date-based prefixes on each poll cycle (one per day, or per hour when the template has `%H`) |
+| Dynamic remote prefix | `endpoint` + `bucket` + `prefix_pattern` | Expands date-based prefixes on each poll cycle (one per day, or per hour when the template has `%H`) and lists them concurrently, at most eight at a time |
 | STAC catalog | `stac_url` + `stac_asset_allowlist` | Discovers files via STAC API items endpoint |
 
 #### Polling and File Discovery
 
 The engine polls for new files at a configurable interval (`poll_interval_secs`, default 30s):
 
-- **Local files:** New files are held in a "pending" state for one poll cycle to confirm they are fully written (size stability check). Files matching `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped.
+- **Local files:** New files are held in a "pending" state for one poll cycle to confirm they are fully written (size stability check).
+- **Excluded files:** Local files and remote objects whose names match `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped before the filename is matched, so a partial upload never replaces the finished file of the same timestamp or counts toward `max_files`.
 - **Remote files:** Uses COG byte-range reads to fetch only the 64 KB IFD header for metadata. Falls back to full download if header-only parse fails.
 - **Metadata caching:** Files with unchanged size reuse their cached metadata across poll cycles.
 - **Failure handling:** If a poll cycle fails, the old catalog is preserved. Zero-file results when the old catalog had files are treated as transient failures.

@@ -197,8 +197,19 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   it here. A template is anchored `^…$`, so `.tmp`/`.part` partial uploads
   never match; an explicit pattern is used as written and logged at WARN
   when unanchored.
+- COMP `scan_local_directory` / `scan_remote` are thin wrappers over the
+  shared catalog scan, `ds_storage::discovery::{scan_local, scan_remote}`
+  (#817): prefixes listed concurrently (at most `MAX_CONCURRENT_LISTS`),
+  window, one entry per timestamp (greatest key or path wins, logged), cap.
+  The local scan follows symlinks to files (`Symlinks::Follow`). The engine
+  keeps only its error policy: all prefixes failing with nothing kept is an
+  error, some failing is a WARN.
 - PVOL `enumerate_remote` uses no template: `parse_key_timestamp` reads the
-  basename's first 12-digit run, only as a pre-fetch window filter.
+  basename's first 12-digit run, only as a pre-fetch window filter. It lists
+  through the shared bounded-concurrent `discovery::list_prefixes`, never a
+  `list` per prefix in a loop, but not the matcher scan: many sites share a
+  timestamp, so dedup and cap would drop volumes. Its bootstrap
+  newest-per-stream reduction stays here.
 
 ## Retention & fixtures
 

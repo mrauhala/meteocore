@@ -76,7 +76,8 @@ use ds_core::volume::{
 use ds_poll::{FirstTick, Shutdown};
 
 use ds_storage::discovery::{
-    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
+    expand_prefix_for_range, expand_prefix_pattern, list_prefixes, validate_prefix_pattern,
+    TimeWindow,
 };
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
@@ -1060,6 +1061,11 @@ fn stream_key(key: &str) -> String {
 /// of the whole window — the rest is filled by the background poll, which
 /// scans in [`ScanDepth::Full`].
 ///
+/// The prefixes are listed through the shared bounded-concurrent
+/// [`list_prefixes`]. PVOL recognises files by the `.h5` suffix and a
+/// timestamp run, not a `FilenameMatcher`, and many sites share each
+/// timestamp, so it does not use the matcher scan's dedup and cap.
+///
 /// A prefix that fails to `list` (e.g. a date partition that doesn't
 /// exist yet) is logged and skipped. If *every* prefix fails the call
 /// errors rather than silently returning an empty catalog. Mirrors
@@ -1089,15 +1095,21 @@ fn enumerate_remote(
         ),
     };
 
-    // First pass: list each prefix and collect surviving `(key, timestamp)`
-    // candidates. The bootstrap slot filter needs to see every candidate's
-    // timestamp before it can pick the most-recent slots, so building the
-    // fetch closures is deferred to the second pass below.
+    // First pass: list the prefixes concurrently (the shared bounded LIST,
+    // Critical Rule 9) and collect surviving `(key, timestamp)` candidates.
+    // The bootstrap slot filter needs to see every candidate's timestamp
+    // before it can pick the most-recent slots, so building the fetch
+    // closures is deferred to the second pass below.
+    let object_prefixes: Vec<ObjectPath> = prefixes
+        .iter()
+        .map(|prefix| ObjectPath::from(prefix.as_str()))
+        .collect();
+    let listings = list_prefixes(store, &object_prefixes)?;
     let mut candidates: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    for prefix in &prefixes {
-        let listed = match store.list(&ObjectPath::from(prefix.as_str())) {
+    for (prefix, listed) in prefixes.iter().zip(listings) {
+        let listed = match listed {
             Ok(objects) => objects,
             Err(e) => {
                 errors.push(format!("'{prefix}': {e}"));

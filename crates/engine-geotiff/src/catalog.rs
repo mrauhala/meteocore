@@ -4,12 +4,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
-use ds_storage::discovery::FilenameMatcher;
+use ds_storage::discovery::{self, FilenameMatcher, RemoteFile, RemoteScan, ScanSpec};
+use ds_storage::object_store::path::Path as ObjectPath;
 
 use crate::reader::{DataSource, TiffMetadata};
-
-/// Maximum filename length to prevent abuse.
-const MAX_FILENAME_LENGTH: usize = 255;
 
 /// Lightweight stub for STAC entries that haven't had their GeoTIFF metadata loaded yet.
 #[derive(Debug, Clone)]
@@ -215,66 +213,6 @@ fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Op
     result
 }
 
-/// The timestamp of a file the collection's matcher recognises, or `None`
-/// to skip it. A name that matches but carries no valid time is logged.
-fn file_timestamp(matcher: &FilenameMatcher, filename: &str) -> Option<DateTime<Utc>> {
-    match matcher.match_timestamp(filename)? {
-        Ok(datetime) => Some(datetime),
-        Err(timestamp_str) => {
-            tracing::warn!(
-                "Cannot parse timestamp '{}' from file '{}'",
-                timestamp_str,
-                filename
-            );
-            None
-        }
-    }
-}
-
-/// Parse candidate files from an iterator of (filename, file_size) pairs.
-///
-/// Matches filenames with the collection's [`FilenameMatcher`] and returns
-/// a vec of (datetime, filename, file_size) tuples.
-pub fn parse_candidates_from_names<'a>(
-    names: impl Iterator<Item = (&'a str, u64)>,
-    matcher: &FilenameMatcher,
-) -> Vec<(DateTime<Utc>, String, u64)> {
-    let mut candidates = Vec::new();
-    for (filename, file_size) in names {
-        if filename.len() > MAX_FILENAME_LENGTH {
-            continue;
-        }
-        let Some(datetime) = file_timestamp(matcher, filename) else {
-            continue;
-        };
-        candidates.push((datetime, filename.to_string(), file_size));
-    }
-    candidates
-}
-
-/// Apply time window filter and max_files limit to a list of candidates.
-///
-/// Filters by time window (if set), sorts by timestamp descending, truncates
-/// to max_files, then re-sorts ascending for BTreeMap insertion order.
-pub fn apply_scan_filters(
-    candidates: &mut Vec<(DateTime<Utc>, String, u64)>,
-    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    max_files: Option<usize>,
-) {
-    // Filter by time window
-    if let Some((start, end)) = time_filter {
-        candidates.retain(|(dt, _, _)| *dt >= start && *dt <= end);
-    }
-
-    // Sort by timestamp descending and take only max_files most recent
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
-    if let Some(max) = max_files {
-        candidates.truncate(max);
-    }
-    // Re-sort ascending for BTreeMap insertion order
-    candidates.sort_by_key(|c| c.0);
-}
-
 /// Tracks files seen but not yet confirmed as fully written.
 #[derive(Debug)]
 pub struct PendingFile {
@@ -285,8 +223,10 @@ pub struct PendingFile {
 
 /// Scan a directory for GeoTIFF files matching a filename pattern.
 ///
-/// Returns a new Catalog containing all valid files. Files that fail to parse
-/// are logged and skipped.
+/// Lists and matches with the shared catalog scan
+/// ([`discovery::scan_local`]): regular files only, `exclude_patterns`
+/// dropped first, one per timestamp (the lexicographically-last path wins). Returns a new Catalog containing all
+/// valid files. Files that fail to parse are logged and skipped.
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
 /// Files with unchanged size reuse their cached metadata (no re-parse).
@@ -297,58 +237,31 @@ pub fn scan_directory(
     pending: &mut BTreeMap<PathBuf, PendingFile>,
     existing: &HashMap<&Path, &FileEntry>,
 ) -> Result<Catalog, DataServerError> {
-    let read_dir = std::fs::read_dir(dir).map_err(|e| {
+    // Excluded names are dropped inside the scan, before the dedup, so an
+    // excluded partial upload never displaces its finished file. Symlinks
+    // stay skipped: the reuse test below compares the directory entry's own
+    // size, mtime and inode, which a symlink's target can change under.
+    let label = dir.display().to_string();
+    let spec = ScanSpec {
+        exclude: exclude_patterns,
+        ..ScanSpec::new(matcher, &label)
+    };
+    let files = discovery::scan_local(dir, &spec).map_err(|e| {
         DataServerError::Engine(format!("Cannot read directory {}: {e}", dir.display()))
     })?;
 
     let mut entries = BTreeMap::new();
 
-    for entry in read_dir {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+    for file in files {
+        let datetime = file.time;
+        let path = file.path;
 
-        let file_name = match entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue, // non-UTF8 filename
-        };
-
-        // Security: skip overly long filenames
-        if file_name.len() > MAX_FILENAME_LENGTH {
-            continue;
-        }
-
-        // Skip excluded patterns
-        if is_excluded(&file_name, exclude_patterns) {
-            continue;
-        }
-
-        // Skip non-files (directories, symlinks)
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-
-        // Match the filename and read its timestamp
-        let Some(datetime) = file_timestamp(matcher, &file_name) else {
-            continue;
-        };
-
-        let path = entry.path();
-
-        // Get file size, mtime, and inode in one stat. mtime is
+        // File size, mtime and inode from the scan's one stat. mtime is
         // `Option<SystemTime>` because some filesystems (FAT, exotic NFS
         // configs) don't expose it; inode is Unix-only. Together they catch
         // the same-second atomic-rename case that mtime alone misses on
         // 1-second-resolution filesystems (#253 round-3 finding).
-        let dir_meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let dir_meta = file.metadata;
         let file_size = dir_meta.len();
         let current_mtime = dir_meta.modified().ok();
         #[cfg(unix)]
@@ -442,20 +355,6 @@ pub fn scan_directory(
             }
         };
 
-        // Handle duplicate timestamps: keep lexicographically last filename
-        if let Some(existing) = entries.get(&datetime) {
-            let existing_entry: &FileEntry = existing;
-            if path.to_string_lossy() <= existing_entry.path.to_string_lossy() {
-                continue;
-            }
-            tracing::warn!(
-                "Duplicate timestamp {}: using {}, replacing {}",
-                datetime,
-                path.display(),
-                existing_entry.path.display()
-            );
-        }
-
         entries.insert(
             datetime,
             FileEntry::loaded(
@@ -487,32 +386,24 @@ pub fn scan_directory(
     })
 }
 
-fn is_excluded(filename: &str, patterns: &[String]) -> bool {
-    for pattern in patterns {
-        if pattern.starts_with("*.") {
-            // Extension match
-            let ext = &pattern[1..]; // e.g. ".tmp"
-            if filename.ends_with(ext) {
-                return true;
-            }
-        } else if pattern.starts_with('.') {
-            // Hidden file match
-            if filename.starts_with('.') {
-                return true;
-            }
-        } else if filename == pattern {
-            return true;
-        }
-    }
-    false
-}
-
 /// Maximum file size for remote downloads (50 MB).
 /// `u64` to match `ObjectMeta::size`, which object_store widened from `usize`
 /// in 0.14 so 32-bit targets can still describe large objects.
 pub(crate) const MAX_REMOTE_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
-/// Scan a remote object store for GeoTIFF files matching a filename pattern.
+/// A prefix whose LIST failed during [`scan_remote`], with the error.
+pub type FailedPrefix = (ObjectPath, DataServerError);
+
+/// Scan a remote object store's prefixes for GeoTIFF files matching a
+/// filename pattern.
+///
+/// Lists and matches with the shared catalog scan
+/// ([`discovery::scan_remote`]) under `spec`: the prefixes are listed
+/// concurrently, at most [`discovery::MAX_CONCURRENT_LISTS`] at a time, and
+/// the matches are filtered by `spec.exclude`, windowed, deduplicated per
+/// timestamp and capped before any metadata is read. Objects over
+/// [`MAX_REMOTE_FILE_SIZE`] are skipped. `spec.label` is the collection id
+/// the log lines name.
 ///
 /// Uses COG-style byte-range reads to fetch only the IFD metadata (first 64 KB)
 /// instead of downloading entire files. Falls back to full download if the
@@ -520,91 +411,85 @@ pub(crate) const MAX_REMOTE_FILE_SIZE: u64 = 50 * 1024 * 1024;
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
 /// Files with unchanged size reuse their cached entry (no re-download).
-pub fn scan_remote_with_limit(
+///
+/// Returns the catalog and the prefixes whose LIST failed; whether a
+/// failure fails the scan is the caller's call.
+pub fn scan_remote(
     store: &ds_storage::DataStore,
-    prefix: &ds_storage::object_store::path::Path,
-    matcher: &FilenameMatcher,
+    prefixes: &[ObjectPath],
+    spec: &ScanSpec<'_>,
     existing: &HashMap<&Path, &FileEntry>,
-    max_files: Option<usize>,
-    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    collection_id: &str,
-) -> Result<Catalog, DataServerError> {
-    let entries_list = store.list(prefix)?;
+) -> Result<(Catalog, Vec<FailedPrefix>), DataServerError> {
+    let collection_id = spec.label;
+    let spec = ScanSpec {
+        max_size: Some(MAX_REMOTE_FILE_SIZE),
+        ..*spec
+    };
+    let RemoteScan {
+        entries: files,
+        prefixes: reports,
+    } = discovery::scan_remote(store, prefixes, &spec)?;
 
-    // Build location index and extract basenames for pattern matching.
-    // parse_candidates_from_names works with basenames; we keep the full key
-    // in a parallel vec so we can look up the object_store path afterward.
-    let remote_entries: Vec<(String, String, u64, ds_storage::object_store::path::Path)> =
-        entries_list
-            .iter()
-            .filter_map(|obj| {
-                if obj.size > MAX_REMOTE_FILE_SIZE {
-                    return None;
-                }
-                let key = obj.location.to_string();
-                let filename = key.rsplit('/').next().unwrap_or(&key).to_string();
-                Some((key, filename, obj.size, obj.location.clone()))
-            })
-            .collect();
-
-    let mut candidates = parse_candidates_from_names(
-        remote_entries
-            .iter()
-            .map(|(_, filename, size, _)| (filename.as_str(), *size)),
-        matcher,
-    );
-
-    apply_scan_filters(&mut candidates, time_filter, max_files);
-
-    // Build a filename→(key, location) lookup for resolving full paths.
-    // (candidates contain basenames from parse_candidates_from_names)
-    let filename_to_remote: HashMap<&str, (&str, &ds_storage::object_store::path::Path)> =
-        remote_entries
-            .iter()
-            .map(|(key, filename, _, location)| (filename.as_str(), (key.as_str(), location)))
-            .collect();
-
-    let listed = entries_list.len();
-    let kept = candidates.len();
-    if time_filter.is_some() {
-        tracing::info!(
-            "[{}] Prefix '{}': {} listed, {} within time window",
-            collection_id,
-            prefix,
-            listed,
-            kept
-        );
-    } else {
-        tracing::info!(
-            "[{}] Prefix '{}': {} listed, {} matching",
-            collection_id,
-            prefix,
-            listed,
-            kept
-        );
+    let mut failed = Vec::new();
+    for report in reports {
+        let listed = match report.listed {
+            Ok(listed) => listed,
+            Err(e) => {
+                failed.push((report.prefix, e));
+                continue;
+            }
+        };
+        if spec.time_filter.is_some() {
+            tracing::info!(
+                "[{}] Prefix '{}': {} listed, {} within time window",
+                collection_id,
+                report.prefix,
+                listed,
+                report.kept
+            );
+        } else {
+            tracing::info!(
+                "[{}] Prefix '{}': {} listed, {} matching",
+                collection_id,
+                report.prefix,
+                listed,
+                report.kept
+            );
+        }
     }
 
-    // Second pass: parse metadata (range read, falling back to full download)
+    Ok((load_remote(store, files, existing, collection_id), failed))
+}
+
+/// Build the catalog of the files a remote scan kept, reading each one's
+/// metadata.
+fn load_remote(
+    store: &ds_storage::DataStore,
+    files: Vec<RemoteFile>,
+    existing: &HashMap<&Path, &FileEntry>,
+    collection_id: &str,
+) -> Catalog {
+    // Parse metadata (range read, falling back to full download)
     let mut entries = BTreeMap::new();
 
-    for (datetime, filename, file_size) in &candidates {
-        let &(key, location) = match filename_to_remote.get(filename.as_str()) {
-            Some(kl) => kl,
-            None => continue, // shouldn't happen
-        };
+    for file in &files {
+        let datetime = file.time;
+        let key = file.key();
+        let location = &file.object.location;
+        let file_size = file.object.size;
         let pseudo_path = PathBuf::from(key);
 
         // Reuse cached entry if file size unchanged
         if let Some(entry) = existing.get(pseudo_path.as_path()) {
-            if entry.file_size == *file_size {
-                entries.insert(*datetime, (*entry).clone());
+            if entry.file_size == file_size {
+                entries.insert(datetime, (*entry).clone());
                 continue;
             }
         }
 
         // Try COG range read first (header only)
         if let Some((metadata, tile_info)) =
-            TiffMetadata::from_header_read(store, location, *file_size)
+            TiffMetadata::from_header_read(store, location, file_size)
         {
             tracing::debug!("[{}] {} — range read OK", collection_id, key);
             let source = DataSource::Remote {
@@ -613,8 +498,8 @@ pub fn scan_remote_with_limit(
                 tile_info,
             };
             entries.insert(
-                *datetime,
-                FileEntry::loaded(pseudo_path, source, metadata, *file_size, None, None),
+                datetime,
+                FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
             );
             continue;
         }
@@ -627,7 +512,7 @@ pub fn scan_remote_with_limit(
              Convert to COG for faster serving.",
             collection_id,
             key,
-            super::format_bytes(*file_size)
+            super::format_bytes(file_size)
         );
         let data = match store.get(location) {
             Ok(d) => d,
@@ -647,8 +532,8 @@ pub fn scan_remote_with_limit(
         };
 
         entries.insert(
-            *datetime,
-            FileEntry::loaded(pseudo_path, source, metadata, *file_size, None, None),
+            datetime,
+            FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
         );
     }
 
@@ -659,11 +544,11 @@ pub fn scan_remote_with_limit(
 
     let spatial_extent = compute_spatial_union(entries.values());
 
-    Ok(Catalog {
+    Catalog {
         entries,
         temporal_extent,
         spatial_extent,
-    })
+    }
 }
 
 /// Create a catalog seeded from STAC collection extent — no items fetched.
@@ -818,6 +703,7 @@ mod tests {
     use super::*;
     use crate::reader::{DataSource, TiffMetadata};
     use ds_core::geo::{Crs, GeoTransform};
+    use ds_storage::discovery::is_excluded;
 
     #[test]
     fn exclude_patterns() {

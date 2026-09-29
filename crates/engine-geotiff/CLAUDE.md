@@ -29,6 +29,22 @@ apply here.
   `filename_template` is anchored `^…$`, so `.tmp`/`.part` partial uploads
   never match even with `exclude_patterns` emptied; an explicit
   `filename_pattern` is used as written and logged at WARN when unanchored.
+- **Catalog scan:** `catalog::scan_directory` and `catalog::scan_remote` list
+  and match through the shared `ds_storage::discovery::{scan_local,
+  scan_remote}` (#817), which sorts, keeps one file per timestamp (greatest
+  path or key wins, logged) and caps. A dynamic prefix pattern's prefixes are
+  listed concurrently, at most `MAX_CONCURRENT_LISTS` at a time, never one
+  `list` per prefix in a loop (root Critical Rule 9). `exclude_patterns` go
+  into the scan as `ScanSpec.exclude`, for local and remote sources, and drop
+  a basename before it is matched. Never filter them after the scan: an
+  unanchored `filename_pattern` matches `….tif.part`, which sorts after its
+  finished `….tif` and would win the timestamp before being dropped (#817
+  review). The engine keeps its post-processing: the pending-file readiness
+  check and metadata reuse (local), header reads (remote). The local scan skips
+  symlinks, because metadata reuse compares the directory entry's own size,
+  mtime and inode. A dynamic source passes no `max_files` to the scan:
+  `do_scan` trims after the metadata pass, so a file that fails to parse
+  does not cost a slot.
 
 ## STAC metadata loading (#90)
 
