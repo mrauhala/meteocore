@@ -677,6 +677,65 @@ impl GeoTransform {
         })
     }
 
+    /// Create a geostationary grid from CGMS image navigation (the CGMS
+    /// LRIT/HRIT Global Specification, §4.4): the scaling factors `cfac`,
+    /// `lfac` and offsets `coff`, `loff` of a `columns` × `lines` image, as
+    /// KMA GK2A AMI files carry them.
+    ///
+    /// Columns and lines are numbered from 1, west to east and north to
+    /// south. Column `c` and line `l` centre on the scan angles, in degrees,
+    ///
+    /// ```text
+    /// x = (c − COFF) · 2¹⁶ / CFAC      positive east
+    /// y = (l − LOFF) · 2¹⁶ / LFAC      positive south (CGMS: y = asin(−r3/rn))
+    /// ```
+    ///
+    /// These are PROJ's `+sweep=y` angles; projected `y` is positive north,
+    /// the negated CGMS angle. Both factors are positive for a north-up
+    /// image with west on the left. A negative one means a flipped image
+    /// (MSG HRIT stores both negative), which is rejected here rather than
+    /// mislocated. A producer may negate `lfac` on a north-up image (KMA
+    /// does); its adapter passes the CGMS sign.
+    ///
+    /// `crs` must be [`Crs::Geostationary`]: its `height` turns the angles
+    /// into the projection's metres.
+    pub fn from_cgms(
+        cfac: f64,
+        lfac: f64,
+        coff: f64,
+        loff: f64,
+        columns: u32,
+        lines: u32,
+        crs: Crs,
+    ) -> Result<Self, String> {
+        let Crs::Geostationary { height, .. } = crs else {
+            return Err("CGMS navigation needs a geostationary CRS".to_string());
+        };
+        if !(cfac.is_finite() && lfac.is_finite() && coff.is_finite() && loff.is_finite()) {
+            return Err("non-finite CGMS navigation".to_string());
+        }
+        if cfac <= 0.0 || lfac <= 0.0 {
+            return Err(format!(
+                "CGMS CFAC and LFAC must be positive (north up, west on the left), \
+                 got CFAC={cfac}, LFAC={lfac}"
+            ));
+        }
+        // Metres per pixel: 2¹⁶ / FAC degrees of scan angle times the height.
+        let dx = (65_536.0 / cfac).to_radians() * height;
+        let dy = (65_536.0 / lfac).to_radians() * height;
+        // Pixel (1, 1)'s centre is (1 − COFF) steps east of nadir and
+        // (1 − LOFF) steps south of it, i.e. (LOFF − 1) steps north.
+        Self::from_cell_centres(
+            (1.0 - coff) * dx,
+            dx,
+            (loff - 1.0) * dy,
+            -dy,
+            columns,
+            lines,
+            crs,
+        )
+    }
+
     /// Convert WGS84 (lon, lat) to *fractional, unclamped* pixel coordinates.
     ///
     /// Returns `(col, row)` as floats **before** flooring or bounds-checking;
@@ -3197,6 +3256,116 @@ mod tests {
         // Up to 20°E: past the eastern limb (6.3°E) on the equator.
         let (_, _, col_end, _) = gt.bbox_to_pixels(-20.0, -5.0, 20.0, 5.0).unwrap();
         assert!(col_end >= 5423, "col_end={col_end}");
+    }
+
+    /// GK2A (128.2°E) as its AMI L1B files describe it: `sub_longitude`
+    /// 2.23751210105673 rad, `nominal_satellite_height` 42164000 m from the
+    /// Earth's centre, radii 6378137 and 6356752.3 m, and the CGMS grid,
+    /// whose angles are PROJ's sweep y.
+    fn gk2a(sweep: SweepAxis) -> Crs {
+        Crs::Geostationary {
+            lon0: 2.237_512_101_056_73,
+            height: 42_164_000.0 - 6_378_137.0,
+            semi_major: 6_378_137.0,
+            semi_minor: 6_356_752.3,
+            sweep,
+        }
+    }
+
+    /// The navigation of a real GK2A AMI 2 km full disk
+    /// (`gk2a_ami_le1b_ir105_fd020ge_202609281200.nc`): CFAC 20425338.9033394,
+    /// LFAC the same (the file stores it negated), COFF = LOFF = 2750.5,
+    /// 5500 × 5500 pixels.
+    fn gk2a_full_disk(sweep: SweepAxis) -> GeoTransform {
+        let fac = 20_425_338.903_339_4;
+        GeoTransform::from_cgms(fac, fac, 2750.5, 2750.5, 5500, 5500, gk2a(sweep)).unwrap()
+    }
+
+    /// The first and last pixel centres are the scan angles the file itself
+    /// states (`image_upperleft_x/y` −0.153972/0.153972 rad,
+    /// `image_lowerright_x/y` 0.153972/−0.153972): pixels are numbered from
+    /// 1 (from 0 they would start at −0.154028), and the grid is north up.
+    #[test]
+    fn cgms_navigation_matches_the_file_corners() {
+        let gt = gk2a_full_disk(SweepAxis::Y);
+        let h = 42_164_000.0 - 6_378_137.0;
+        let centre = |col: u32, row: u32| {
+            (
+                (gt.origin_x + (col as f64 + 0.5) * gt.pixel_width) / h,
+                (gt.origin_y - (row as f64 + 0.5) * gt.pixel_height) / h,
+            )
+        };
+        let (x, y) = centre(0, 0);
+        assert!(
+            (x + 0.153972).abs() < 5e-7 && (y - 0.153972).abs() < 5e-7,
+            "{x} {y}"
+        );
+        let (x, y) = centre(5499, 5499);
+        assert!(
+            (x - 0.153972).abs() < 5e-7 && (y + 0.153972).abs() < 5e-7,
+            "{x} {y}"
+        );
+        // 56 µrad pixels (`ground_sample_distance_ew`/`_ns`).
+        assert!((gt.pixel_width / h - 5.6e-5).abs() < 1e-12);
+        assert!((gt.pixel_height / h - 5.6e-5).abs() < 1e-12);
+    }
+
+    /// Pixel centres at the CGMS scan angles, computed independently, then
+    /// through `cs2cs +proj=geos +h=35785863 +lon_0=128.2 +a=6378137
+    /// +b=6356752.3 +sweep=y +units=m +to +proj=longlat +a=6378137
+    /// +b=6356752.3` (PROJ 9.8.1). KMA's own navigation sample code (the
+    /// CGMS formulas) agrees to 6e-7°. The last pixel is past the
+    /// antimeridian.
+    #[test]
+    fn cgms_navigation_matches_proj() {
+        let gt = gk2a_full_disk(SweepAxis::Y);
+        let centre = |line: u32, col: u32| {
+            (
+                gt.origin_x + (col as f64 - 0.5) * gt.pixel_width,
+                gt.origin_y - (line as f64 - 0.5) * gt.pixel_height,
+            )
+        };
+        // (line, column) numbered from 1, then longitude and latitude.
+        let cases = [
+            (1200, 3900, 154.161_441_588_5, 30.810_560_631_8),
+            (400, 2751, 128.215_998_327_9, 53.043_875_545_7),
+            (4500, 1100, 83.928_097_301_2, -36.810_442_294_4),
+            (2751, 5300, -169.824_159_648_2, -0.010_020_021_8),
+        ];
+        for (line, col, lon, lat) in cases {
+            let (x, y) = centre(line, col);
+            let (got_lon, got_lat) = gt.crs.inverse(x, y).unwrap();
+            let got_lon = wrap_lon(got_lon);
+            assert!(
+                (got_lon - lon).abs() < 1e-7 && (got_lat - lat).abs() < 1e-7,
+                "({line}, {col}): ({got_lon}, {got_lat}) vs ({lon}, {lat})"
+            );
+            assert_eq!(gt.world_to_pixel(lon, lat), Some((col - 1, line - 1)));
+        }
+        // Sweep x reads the same angles 0.18° away (cs2cs `+sweep=x` puts
+        // line 4500, column 1100 at 83.7916°E 36.6279°S): not GK2A's grid.
+        let sweep_x = gk2a_full_disk(SweepAxis::X);
+        let (x, y) = centre(4500, 1100);
+        let (lon, lat) = sweep_x.crs.inverse(x, y).unwrap();
+        assert!(
+            (lon - 83.791_628).abs() < 1e-5 && (lat + 36.627_915).abs() < 1e-5,
+            "{lon} {lat}"
+        );
+    }
+
+    #[test]
+    fn cgms_navigation_rejects_flipped_images_and_other_crs() {
+        let fac = 20_425_338.903_339_4;
+        let gk2a = gk2a(SweepAxis::Y);
+        for (cfac, lfac) in [(fac, -fac), (-fac, fac), (0.0, fac), (f64::NAN, fac)] {
+            assert!(
+                GeoTransform::from_cgms(cfac, lfac, 2750.5, 2750.5, 5500, 5500, gk2a.clone())
+                    .is_err(),
+                "CFAC {cfac}, LFAC {lfac}"
+            );
+        }
+        assert!(GeoTransform::from_cgms(fac, fac, 2750.5, 2750.5, 5500, 5500, Crs::Wgs84).is_err());
+        assert!(GeoTransform::from_cgms(fac, fac, 2750.5, 2750.5, 0, 5500, gk2a).is_err());
     }
 
     #[test]

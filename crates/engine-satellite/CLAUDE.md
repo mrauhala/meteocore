@@ -26,7 +26,8 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   netcdf-reader, so no second copy) across the full width, so a block read
   inflates each chunk once. The reader's own chunk cache is off because
   decoded blocks are cached in `cache::STRIPS`, which keeps its phase-2
-  name, env var and metric family.
+  name, env var and metric family. A GK2A AMI block is one 1375 × 1375
+  chunk (`Part::open_ami`): a full-width strip of them would decode 15 MB.
 - **No request-time S3 in the steady state.** The poll loop downloads each
   new scan whole and inserts it into `cache::FRAMES`. A scan the cache
   evicted is fetched again by `Source::fetch` → `DataStore::get`, from a
@@ -75,6 +76,31 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     blanks those cells. It costs two bisections per row.
   - A limb crop's warm values can lie wholly off the ellipsoid: that is the
     atmosphere a grazing line of sight crosses.
+- **GK2A AMI L1B is not CF** (`provider = "gk2a"`, `Format::AmiL1b`,
+  `ami.rs`). One file per channel and ten-minute scan,
+  `AMI/L1B/FD/%Y%m/%d/%H/gk2a_ami_le1b_ir105_fd020ge_<%Y%m%d%H%M>.nc`,
+  keyed on the nominal slot in its name (the scan starts ~30 s later).
+  - Navigation is CGMS (`GeoTransform::from_cgms`): columns and lines
+    numbered from 1, angles `(n − OFF) · 2¹⁶ / FAC` degrees, PROJ sweep y
+    (KMA's navigation code is the CGMS formulas; sweep x is 0.18° off).
+    `sub_longitude` is radians; `nominal_satellite_height` is from the
+    Earth's centre (subtract `earth_equatorial_radius`). KMA stores `lfac`
+    negated on a north-up image, so orientation comes from the
+    `image_upperleft_*`/`image_lowerright_*` scan angles, and the grid must
+    put its corner pixel centres on them (a 0-based numbering is a pixel
+    off).
+  - Values are 16-bit words: a quality flag in the top 2 bits (only 0,
+    good, is served; space is 0x8000) and the count in the low
+    `number_of_valid_bits_per_pixel`. Blocks map words to centi-kelvin
+    through a table built per scan from the file's own coefficients
+    (`ami::Counts`, 8192 entries), and decode through the ordinary linear
+    packing (×0.01).
+  - Brightness temperature needs the channel's central wavenumber, which
+    the files do not carry (`channel_center_wavelength` "10.5" is the
+    name, 1.2–1.65 K too cold). `ami::CHANNELS` has IR105 only, with its
+    provenance; `ds_core::config::GK2A_BANDS` refuses the other bands at
+    load. Do not add a channel without a first-hand source for its
+    wavenumber.
 - **Overview**: a render whose source window spans ≥ `OVERVIEW_FACTOR`
   (4) source pixels per output pixel samples the ingest-time overview
   instead of decoding strips. A full-disk decode is ~160 ms.
@@ -115,14 +141,15 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
 
 ## Config
 
-`[satellite]`: `provider = "goes-r" | "isatss"`, `data_path` XOR
+`[satellite]`: `provider = "goes-r" | "isatss" | "gk2a"`, `data_path` XOR
 `endpoint`+`bucket`, `time_window` (required for a bucket: ≤ 24 h of GOES-R
 hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
 `Naming::validate_window`),
 `poll_interval_secs`, and `[[satellite.products]]` with `parameter`, `title`,
 `unit` (declared: styles resolve at load, before any scan), `product`,
 `band` (required for ISatSS, whose `product` is the sector, `HFD`),
-`variable`. `[[satellite.composites]]` with `name` (`^[a-z0-9_]+$`, not a
+`variable`. GK2A takes `product = "FD"`, `band = 13` and
+`variable = "image_pixel_values"`. `[[satellite.composites]]` with `name` (`^[a-z0-9_]+$`, not a
 product parameter), `title` (defaults to the name) and `red`, `green`,
 `blue`, each `{ parameter, minus, min, max, gamma }`: `minus` makes a band
 difference, `min > max` inverts, `gamma` defaults to 1. `parameter` and
@@ -133,8 +160,8 @@ land; unknown keys in a composite are a load error. Validation:
 ## Bandwidth
 
 Each scan is downloaded whole: GOES-19 band 13 ~24 MB, cloud top temperature
-~30 MB per 10 minutes, Himawari-9 band 13 ~26 MB in 88 tiles; startup
-ingests the whole window. The user is often
+~30 MB per 10 minutes, Himawari-9 band 13 ~26 MB in 88 tiles, GK2A IR105
+~35 MB; startup ingests the whole window. The user is often
 on a metered connection — never run a bucket-backed collection for tests
 without asking; use the local fixtures.
 
@@ -147,6 +174,11 @@ the global `meteocore_fixture` attribute records each crop. Tests copy them
 into a nested temp directory (local discovery lists recursively).
 `testdata/goes18-abi/…_G18_s20262701850224_*.nc`: a GOES-18 C13 crop
 straddling 180° at 11–16°N (`lon_0` −137.0, read from the file).
+`testdata/gk2a-ami/`: a real GK2A IR105 full disk cropped to 96 × 160
+straddling 180° at 14–16°N (original count words, navigation rewritten
+for the window; its README and the `meteocore_fixture` attribute have the
+crop). `tests/gk2a.rs` pins pixel centres to `cs2cs` and temperatures to
+an independent Python calibration.
 `testdata/himawari9-isatss/`: three real Himawari-9 band 13 tiles of one
 scan, cropped to 64 × 64 around a lattice corner on the NW limb whose fourth
 cell has no tile (its README has the layout).
@@ -160,12 +192,14 @@ feeds each product's own `extent.temporal` in `parameter_names`. Area grids
 sample at the finest selected product's nadir pixel size through a
 `ProjectionGrid` (never a per-cell geostationary forward). Update `crates/api-edr/README.md` with any change here.
 Budgets, checked before any work: at most `MAX_QUERY_FETCHES` (8) evicted
-scans to download and `MAX_QUERY_BLOCKS` (1024) blocks to decode per query,
-summed per product on its own grid (products may mix 0.5/1/2 km).
+scans to download and `MAX_QUERY_PIXELS` of blocks to decode per query
+(1024 GOES-R strips, 70 GK2A chunks), summed per product on its own grid
+(products may mix 0.5/1/2 km).
 
 ## Not yet
 
-Other providers (GMGSI lat/lon mosaics, GK2A CGMS navigation, MTG) are
-phases 3 and 5. Built-in composite recipes are a phase 4 follow-up. WMS,
-Maps and Tiles serve the composites from `composites()`: see "RGB
-composite layers" in `crates/api-wms/CLAUDE.md`.
+Other providers (GMGSI lat/lon mosaics, MTG) are phases 3 and 5; GK2A
+bands other than IR105 wait for a sourced central wavenumber. Built-in
+composite recipes are a phase 4 follow-up. WMS, Maps and Tiles serve the
+composites from `composites()`: see "RGB composite layers" in
+`crates/api-wms/CLAUDE.md`.
