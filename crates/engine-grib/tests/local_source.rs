@@ -130,8 +130,10 @@ fn grib_area_query_masks_outside_the_polygon() {
 }
 
 /// Discovery settings the poll would reject are load errors: an invalid
-/// `time_window` (the poll used to skip its filter silently) and a
-/// `prefix_pattern` with an unknown or hour specifier (the run hour is `{run}`).
+/// `time_window` (the poll used to skip its filter silently), a
+/// `prefix_pattern` with an unknown or hour specifier (the run hour is `{run}`),
+/// a misspelt `{run}`, and run hours `{run}` cannot be expanded with.
+/// Each fails before the store is built, so no request leaves the test.
 #[test]
 fn invalid_discovery_settings_fail_at_load() {
     let bad_window = GribConfig {
@@ -149,6 +151,14 @@ fn invalid_discovery_settings_fail_at_load() {
     };
     assert!(GribEngine::new("grib-s3-test", &s3("%Y%m%d/%H/")).is_err());
     assert!(GribEngine::new("grib-s3-test", &s3("%Y%m%d/%!/")).is_err());
+    assert!(GribEngine::new("grib-s3-test", &s3("%Y%m%d/{RUN}z/")).is_err());
+    for run_hours in [vec![], vec![0, 24]] {
+        let config = GribConfig {
+            run_hours: Some(run_hours),
+            ..s3("%Y%m%d/{run}z/")
+        };
+        assert!(GribEngine::new("grib-s3-test", &config).is_err());
+    }
 }
 
 /// #475: the map path emits the compact `F32` form, and every sample is

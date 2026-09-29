@@ -20,8 +20,9 @@
 //!    template or an explicit regex (#817).
 //!
 //! This module is the shared home for all three. `engine-odim` and
-//! `engine-geotiff` use it; `engine-grib` formats its run-hour
-//! prefixes itself.
+//! `engine-geotiff` use it; `engine-grib` expands its model-run
+//! prefixes, a strftime date plus a `{run}` hour, with
+//! [`expand_run_prefixes`].
 
 use std::fmt::Write as _;
 
@@ -314,6 +315,327 @@ pub fn expand_prefix_pattern(
     let now = Utc::now();
     let first = now.date_naive() - Duration::days(i64::from(scan_days.max(1)) - 1);
     expand_prefix_for_range(pattern, first.and_time(Default::default()).and_utc(), now)
+}
+
+// ---------------------------------------------------------------------------
+// Model-run prefixes: `{run}` (engine-grib, #817)
+// ---------------------------------------------------------------------------
+
+/// The placeholder a prefix template names a model run's hour with, as in
+/// ECMWF's `%Y%m%d/{run}z/ifs/0p25/oper/`. Each run hour is substituted as
+/// two digits (`00`, `06`, …). The date part stays strftime: to strftime,
+/// `{run}` is literal text.
+pub const RUN_PLACEHOLDER: &str = "{run}";
+
+/// The prefix one model run's files are listed under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPrefix {
+    /// The run's reference time: its day at its run hour, or the day's
+    /// 00 UTC for a template without [`RUN_PLACEHOLDER`].
+    pub reference_time: DateTime<Utc>,
+    pub prefix: String,
+}
+
+/// Validate a model-run prefix template and the run hours substituted into
+/// it, at config load.
+///
+/// On top of the strftime rules of [`prefix_step`]:
+///
+/// - No hour specifier. The run hour comes from [`RUN_PLACEHOLDER`]; a
+///   `%H` would name the hour of the poll, not of the run.
+/// - No `{` or `}` outside [`RUN_PLACEHOLDER`]. A misspelt placeholder
+///   such as `{RUN}` or `{run` would otherwise be listed literally and
+///   match nothing.
+/// - With the placeholder, at least one run hour, each 0–23.
+///
+/// `run_hours` is not used by a template without the placeholder, so it is
+/// not checked then.
+pub fn validate_run_prefix_pattern(
+    pattern: &str,
+    run_hours: &[u32],
+) -> Result<PrefixStep, DataServerError> {
+    let invalid =
+        |why: &str| DataServerError::Config(format!("Invalid prefix_pattern '{pattern}': {why}"));
+    let step = prefix_step(pattern)?;
+    if step == PrefixStep::Hour {
+        return Err(invalid(&format!(
+            "the model run hour goes in {RUN_PLACEHOLDER}, not in a strftime hour specifier"
+        )));
+    }
+    if pattern.replace(RUN_PLACEHOLDER, "").contains(['{', '}']) {
+        return Err(invalid(&format!(
+            "'{{' and '}}' are only allowed as the {RUN_PLACEHOLDER} placeholder"
+        )));
+    }
+    if pattern.contains(RUN_PLACEHOLDER) {
+        if run_hours.is_empty() {
+            return Err(invalid(&format!(
+                "{RUN_PLACEHOLDER} needs at least one run hour"
+            )));
+        }
+        if let Some(hour) = run_hours.iter().find(|&&h| h > 23) {
+            return Err(invalid(&format!(
+                "run hour {hour} is not an hour of the day (0-23)"
+            )));
+        }
+    }
+    Ok(step)
+}
+
+/// Expand a model-run prefix template over every day `[start, end]`
+/// touches, one prefix per run hour, newest run first.
+///
+/// Each day's prefix comes from [`expand_prefix_for_range`], so it is
+/// formatted and trimmed exactly like every other expanded prefix; then
+/// [`RUN_PLACEHOLDER`] is substituted with each run hour. A run whose
+/// reference time is after `end` is skipped: with `end` = now, it cannot
+/// have been published yet. A template without the placeholder is one
+/// prefix per day, ordered by the day's 00 UTC, and ignores `run_hours`.
+///
+/// A prefix repeated across runs, such as a template with no day specifier,
+/// is listed once, under its newest run.
+///
+/// E.g. `%Y%m%d/{run}z/ifs/0p25/oper/` with run hours 0 and 12, from
+/// 00:00 on 5 April to 09:00 on 6 April, yields `20260406/00z/ifs/0p25/oper`,
+/// `20260405/12z/ifs/0p25/oper` and `20260405/00z/ifs/0p25/oper`.
+pub fn expand_run_prefixes(
+    pattern: &str,
+    run_hours: &[u32],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<RunPrefix>, DataServerError> {
+    validate_run_prefix_pattern(pattern, run_hours)?;
+    let has_run = pattern.contains(RUN_PLACEHOLDER);
+    let hours = if has_run { run_hours } else { &[0][..] };
+    let mut runs = Vec::new();
+    let mut day = start.date_naive();
+    while day <= end.date_naive() {
+        let midnight = day.and_time(chrono::NaiveTime::MIN).and_utc();
+        // One entry: a single instant of a template no finer than a day.
+        for day_prefix in expand_prefix_for_range(pattern, midnight, midnight)? {
+            for &hour in hours {
+                let reference_time = midnight + Duration::hours(i64::from(hour));
+                if reference_time > end {
+                    continue;
+                }
+                let prefix = if has_run {
+                    day_prefix.replace(RUN_PLACEHOLDER, &format!("{hour:02}"))
+                } else {
+                    day_prefix.clone()
+                };
+                runs.push(RunPrefix {
+                    reference_time,
+                    prefix,
+                });
+            }
+        }
+        let Some(next) = day.succ_opt() else { break };
+        day = next;
+    }
+    // Newest first; a repeated prefix keeps its newest run.
+    runs.sort_by_key(|run| std::cmp::Reverse(run.reference_time));
+    let mut seen = std::collections::HashSet::new();
+    runs.retain(|run| seen.insert(run.prefix.clone()));
+    Ok(runs)
+}
+
+#[cfg(test)]
+mod run_prefix_tests {
+    use super::*;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    fn expand(
+        pattern: &str,
+        run_hours: &[u32],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<(String, String)> {
+        expand_run_prefixes(pattern, run_hours, start, end)
+            .unwrap()
+            .into_iter()
+            .map(|run| {
+                (
+                    run.reference_time.format("%m-%dT%H").to_string(),
+                    run.prefix,
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(t, p)| (t.to_string(), p.to_string()))
+            .collect()
+    }
+
+    const IFS: &str = "%Y%m%d/{run}z/ifs/0p25/oper/";
+
+    #[test]
+    fn runs_newest_first_skipping_future_ones() {
+        assert_eq!(
+            expand(
+                IFS,
+                &[0, 6, 12, 18],
+                at(2026, 4, 5, 0, 0),
+                at(2026, 4, 6, 15, 0)
+            ),
+            pairs(&[
+                ("04-06T12", "20260406/12z/ifs/0p25/oper"),
+                ("04-06T06", "20260406/06z/ifs/0p25/oper"),
+                ("04-06T00", "20260406/00z/ifs/0p25/oper"),
+                ("04-05T18", "20260405/18z/ifs/0p25/oper"),
+                ("04-05T12", "20260405/12z/ifs/0p25/oper"),
+                ("04-05T06", "20260405/06z/ifs/0p25/oper"),
+                ("04-05T00", "20260405/00z/ifs/0p25/oper"),
+            ])
+        );
+        // Run hours may be listed in any order.
+        assert_eq!(
+            expand(IFS, &[12, 0], at(2026, 4, 5, 0, 0), at(2026, 4, 6, 9, 0)),
+            pairs(&[
+                ("04-06T00", "20260406/00z/ifs/0p25/oper"),
+                ("04-05T12", "20260405/12z/ifs/0p25/oper"),
+                ("04-05T00", "20260405/00z/ifs/0p25/oper"),
+            ])
+        );
+    }
+
+    /// A run is listed from its reference time on, inclusive, including
+    /// the 00 UTC run at exactly midnight.
+    #[test]
+    fn run_at_end_is_included() {
+        let end = at(2026, 4, 6, 0, 0);
+        assert_eq!(
+            expand(IFS, &[0, 18], at(2026, 4, 5, 0, 0), end)[0],
+            (
+                "04-06T00".to_string(),
+                "20260406/00z/ifs/0p25/oper".to_string()
+            )
+        );
+        assert_eq!(
+            expand(IFS, &[6], at(2026, 4, 6, 0, 0), end),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    /// The date part follows each run's own day across month, year and
+    /// leap-day boundaries.
+    #[test]
+    fn date_part_crosses_month_and_year() {
+        let gfs = "gfs.%Y%m%d/{run}/atmos/";
+        assert_eq!(
+            expand(gfs, &[0, 18], at(2028, 2, 29, 0, 0), at(2028, 3, 1, 1, 0)),
+            pairs(&[
+                ("03-01T00", "gfs.20280301/00/atmos"),
+                ("02-29T18", "gfs.20280229/18/atmos"),
+                ("02-29T00", "gfs.20280229/00/atmos"),
+            ])
+        );
+        assert_eq!(
+            expand(gfs, &[12], at(2026, 12, 31, 0, 0), at(2027, 1, 1, 23, 0)),
+            pairs(&[
+                ("01-01T12", "gfs.20270101/12/atmos"),
+                ("12-31T12", "gfs.20261231/12/atmos"),
+            ])
+        );
+    }
+
+    /// Without `{run}`, a template is one prefix per day under the day's
+    /// 00 UTC, and the run hours are not used.
+    #[test]
+    fn template_without_run_is_one_prefix_per_day() {
+        assert_eq!(
+            expand(
+                "%Y%m%d/00z/ifs/0p25/oper/",
+                &[0, 6, 12, 18],
+                at(2026, 4, 5, 0, 0),
+                at(2026, 4, 6, 15, 0)
+            ),
+            pairs(&[
+                ("04-06T00", "20260406/00z/ifs/0p25/oper"),
+                ("04-05T00", "20260405/00z/ifs/0p25/oper"),
+            ])
+        );
+        assert_eq!(
+            expand(
+                "%Y%m%d/00z/",
+                &[],
+                at(2026, 4, 6, 0, 0),
+                at(2026, 4, 6, 1, 0)
+            ),
+            pairs(&[("04-06T00", "20260406/00z")])
+        );
+    }
+
+    /// A prefix that does not change from day to day, or a run hour given
+    /// twice, is listed once, under its newest run.
+    #[test]
+    fn repeated_prefix_is_listed_once() {
+        let (start, end) = (at(2026, 4, 5, 0, 0), at(2026, 4, 6, 15, 0));
+        assert_eq!(
+            expand("latest/{run}/", &[0, 12], start, end),
+            pairs(&[("04-06T12", "latest/12"), ("04-06T00", "latest/00")])
+        );
+        assert_eq!(
+            expand("static/", &[0], start, end),
+            pairs(&[("04-06T00", "static")])
+        );
+        assert_eq!(
+            expand("%Y%m/{run}/", &[6, 6], start, end),
+            pairs(&[("04-06T06", "202604/06")])
+        );
+    }
+
+    #[test]
+    fn empty_or_reversed_range_is_empty() {
+        let t = at(2026, 4, 6, 12, 0);
+        assert!(expand_run_prefixes(IFS, &[0], t, t - Duration::days(2))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn run_templates_validate() {
+        for ok in [
+            IFS,
+            "%Y%m%d/{run}z/aifs-single/0p25/oper/",
+            "gfs.%Y%m%d/{run}/atmos/",
+            "%Y%m%d/00z/ifs/0p25/oper/",
+            "%Y/%m/%d/{run}/{run}/",
+            "static/",
+        ] {
+            validate_run_prefix_pattern(ok, &[0, 6, 12, 18])
+                .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        // Unknown and sub-hour specifiers, as for every prefix template.
+        for bad in ["%Y%m%d/%!/", "%Y%m%d/%M/{run}/"] {
+            assert!(validate_run_prefix_pattern(bad, &[0]).is_err(), "{bad}");
+        }
+        // The run hour is `{run}`, never `%H`.
+        let err = validate_run_prefix_pattern("%Y%m%d/%H/", &[0]).unwrap_err();
+        assert!(err.to_string().contains("{run}"), "{err}");
+        // A misspelt placeholder would be listed literally.
+        for bad in ["%Y%m%d/{RUN}z/", "%Y%m%d/{run/", "%Y%m%d/run}/", "{{run}}/"] {
+            assert!(validate_run_prefix_pattern(bad, &[0]).is_err(), "{bad}");
+        }
+        // Run hours are checked only when `{run}` uses them.
+        assert!(validate_run_prefix_pattern(IFS, &[]).is_err());
+        assert!(validate_run_prefix_pattern(IFS, &[0, 24]).is_err());
+        assert!(validate_run_prefix_pattern("%Y%m%d/00z/", &[]).is_ok());
+        assert!(validate_run_prefix_pattern("%Y%m%d/00z/", &[24]).is_ok());
+        // Expansion applies the same rules.
+        let t = at(2026, 4, 6, 12, 0);
+        assert!(expand_run_prefixes(IFS, &[24], t, t).is_err());
+        assert!(expand_run_prefixes("%Y%m%d/%H/", &[0], t, t).is_err());
+    }
 }
 
 /// The strftime specifiers a filename template may use, each with the

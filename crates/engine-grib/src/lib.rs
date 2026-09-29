@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Utc};
 use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::config::{GribConfig, GribLevelType};
@@ -35,7 +35,9 @@ use ds_core::model::*;
 use crate::cache::{DecodedGrid, GridCache};
 use crate::catalog::{Catalog, ForecastRun, ParameterKey, ParameterKeys, StepFile};
 use crate::units::{DisplayConversion, SourceUnit};
-use ds_storage::discovery::TimeWindow;
+use ds_storage::discovery::{
+    expand_run_prefixes, validate_run_prefix_pattern, RunPrefix, TimeWindow,
+};
 
 /// Resolved metadata for a parameter, populated by a successful header probe
 /// or decode of that parameter and level. Derived from the WMO triple
@@ -328,17 +330,9 @@ impl GribEngine {
                     "Collection '{collection_id}': remote GRIB engine requires 'prefix_pattern'"
                 ))
             })?;
-            // Each day's prefix is formatted per poll; reject an unknown
-            // specifier now rather than panicking then. The run hour comes
-            // from `{run}`, so an hour specifier would only name the poll hour.
-            if ds_storage::discovery::prefix_step(&prefix_pattern)?
-                == ds_storage::discovery::PrefixStep::Hour
-            {
-                return Err(DataServerError::Config(format!(
-                    "Collection '{collection_id}': GRIB prefix_pattern names the run hour \
-                     with '{{run}}', not a strftime hour specifier"
-                )));
-            }
+            // The run prefixes are expanded on every poll; reject a template
+            // (or run hour) they cannot be expanded from now, not then.
+            validate_run_prefix_pattern(&prefix_pattern, run_hours(config))?;
             // Construct URL from endpoint+bucket for S3 region detection.
             let store_url = format!("{endpoint}/{bucket}/");
             let (store, _prefix) = ds_storage::build_store(&store_url).map_err(|e| {
@@ -439,21 +433,17 @@ impl GribEngine {
             .data_suffix
             .as_deref()
             .unwrap_or(".grib2");
-        let run_hours = self
-            .source
-            .config
-            .run_hours
-            .as_deref()
-            .unwrap_or(DEFAULT_RUN_HOURS);
-
         // Generate all prefixes to scan. Remote: expand over recent dates × run
         // hours, newest-first (skipping future runs). Local: a single literal
         // prefix (static data — no date/run templating).
         let prefixes = match &self.source.scan_mode {
             ScanMode::Remote { prefix_pattern } => {
-                build_scan_prefixes(prefix_pattern, now, run_hours)
+                build_scan_prefixes(prefix_pattern, now, run_hours(&self.source.config))?
             }
-            ScanMode::FixedPrefix { prefix } => vec![(now, prefix.clone())],
+            ScanMode::FixedPrefix { prefix } => vec![RunPrefix {
+                reference_time: now,
+                prefix: prefix.clone(),
+            }],
         };
 
         // Optional filename substring filter. Applied in addition to the
@@ -499,7 +489,7 @@ impl GribEngine {
             .is_none_or(|t| t.elapsed() >= SETTLED_REVALIDATE_INTERVAL);
         let settled_snapshot = self.source.settled_prefixes.lock().unwrap().clone();
         let mut listed_with_hits: Vec<String> = Vec::new();
-        for (_ref_time, prefix) in &prefixes {
+        for RunPrefix { prefix, .. } in &prefixes {
             if let Some(budget) = scan_budget {
                 if runs_with_hits >= budget {
                     break;
@@ -549,7 +539,7 @@ impl GribEngine {
         // unbounded as old runs age out (and so a prefix that ever reappears is
         // rescanned).
         {
-            let window: HashSet<&str> = prefixes.iter().map(|(_, p)| p.as_str()).collect();
+            let window: HashSet<&str> = prefixes.iter().map(|run| run.prefix.as_str()).collect();
             let mut settled = self.source.settled_prefixes.lock().unwrap();
             settle_completed_runs(&mut settled, &listed_with_hits, &window);
         }
@@ -1446,72 +1436,29 @@ fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
     ds_core::feature::parse_point_coords(coords).map(|(lat, lon)| (lon, lat))
 }
 
-/// Build `(reference_time, prefix)` pairs to scan for the given pattern,
-/// dates, and run hours.
+/// The run hours substituted into a remote `prefix_pattern`'s `{run}`.
+fn run_hours(config: &GribConfig) -> &[u32] {
+    config.run_hours.as_deref().unwrap_or(DEFAULT_RUN_HOURS)
+}
+
+/// The run prefixes to scan at `now`: every run of the last [`SCAN_DAYS`]
+/// UTC days, today included, up to `now`.
 ///
-/// The pattern supports strftime placeholders for the date part, plus `{run}`
-/// which is expanded to each run hour (zero-padded, e.g., "00", "06", "12", "18").
-///
-/// Behaviour notes:
-/// - Returned pairs are sorted by `reference_time` **descending** (newest
-///   first), so callers can iterate and stop early once they have collected
-///   enough runs.
-/// - Future runs (reference time strictly after `now`) are skipped — a model
-///   run cannot exist before its reference time.
-/// - If the pattern contains no `{run}` placeholder, the reference time is
-///   taken to be the UTC start of the scan date and only one prefix is
-///   emitted per day (backward compatible with the date-only behaviour).
+/// The shared [`expand_run_prefixes`] formats each day's strftime date and
+/// substitutes each run hour into `{run}`, zero-padded (`00`, `06`, …).
+/// Runs come newest first, so the scan can stop once it has `max_runs`
+/// runs, and `settle_completed_runs` relies on that order. A future run is
+/// skipped, since a run cannot be published before its reference time. A
+/// pattern without `{run}` is one prefix per day, ordered by the day's
+/// 00 UTC.
 fn build_scan_prefixes(
     pattern: &str,
     now: DateTime<Utc>,
     run_hours: &[u32],
-) -> Vec<(DateTime<Utc>, String)> {
-    use chrono::{Duration, TimeZone};
-
-    let mut out: Vec<(DateTime<Utc>, String)> = Vec::new();
-
-    for days_back in 0..SCAN_DAYS {
-        let date = now - Duration::days(i64::from(days_back));
-
-        if pattern.contains("{run}") {
-            for &hour in run_hours {
-                let ref_time = Utc
-                    .with_ymd_and_hms(
-                        date.year_ce().1 as i32,
-                        date.month(),
-                        date.day(),
-                        hour,
-                        0,
-                        0,
-                    )
-                    .single();
-                let Some(ref_time) = ref_time else {
-                    continue;
-                };
-                if ref_time > now {
-                    continue;
-                }
-                let run_str = format!("{hour:02}");
-                let with_run = pattern.replace("{run}", &run_str);
-                let prefix = date.format(&with_run).to_string();
-                out.push((ref_time, prefix));
-            }
-        } else {
-            let ref_time = Utc
-                .with_ymd_and_hms(date.year_ce().1 as i32, date.month(), date.day(), 0, 0, 0)
-                .single();
-            if let Some(ref_time) = ref_time {
-                if ref_time > now {
-                    continue;
-                }
-                out.push((ref_time, date.format(pattern).to_string()));
-            }
-        }
-    }
-
-    // Sort newest-first so callers can break early once they have enough runs.
-    out.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    out
+) -> Result<Vec<RunPrefix>, DataServerError> {
+    let first_day = now.date_naive() - chrono::Days::new(u64::from(SCAN_DAYS - 1));
+    let start = first_day.and_time(chrono::NaiveTime::MIN).and_utc();
+    expand_run_prefixes(pattern, run_hours, start, now)
 }
 
 /// Update the set of "settled" run prefixes after a scan.
@@ -1523,7 +1470,7 @@ fn build_scan_prefixes(
 /// sequentially, so once a newer run exists an older one is static and need not
 /// be re-listed; the newest stays unsettled so its still-trickling steps keep
 /// being picked up.) The caller derives the order from `build_scan_prefixes`,
-/// which sorts `Reverse` by ref-time. `window` is the current scan window;
+/// which returns runs newest first. `window` is the current scan window;
 /// settled prefixes outside it are pruned so the set cannot grow unbounded as
 /// old runs age out.
 fn settle_completed_runs(
@@ -2230,53 +2177,139 @@ mod tests {
         assert!((lat - 60.2).abs() < 1e-10);
     }
 
+    /// The prefixes each shipped layout scans: `collections.d/ecmwf-ifs.toml`,
+    /// `ecmwf-aifs.toml` and `noaa-gfs.toml` (also `testdata/gfs/test-config.toml`),
+    /// plus the README example without `{run}`. Each list is what the pre-#817
+    /// `build_scan_prefixes` returned for the same `now` and run hours, in the
+    /// same order, without its trailing `/`: the shared expansion trims it,
+    /// and the object-store path a prefix is listed as drops it anyway.
     #[test]
-    fn test_build_scan_prefixes_with_run() {
-        use chrono::TimeZone;
-        // 2026-04-06 15:00 UTC: today's 00/06/12 have published, 18z is future.
-        let dt = Utc.with_ymd_and_hms(2026, 4, 6, 15, 0, 0).unwrap();
-        let prefixes = build_scan_prefixes("%Y%m%d/{run}z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
-
-        // 2 days × 4 run hours minus 1 future run (today's 18z) = 7 prefixes.
-        assert_eq!(prefixes.len(), 7);
-
-        // Newest-first ordering.
-        assert_eq!(prefixes[0].1, "20260406/12z/ifs/0p25/oper/");
-        assert_eq!(prefixes[1].1, "20260406/06z/ifs/0p25/oper/");
-        assert_eq!(prefixes[2].1, "20260406/00z/ifs/0p25/oper/");
-        assert_eq!(prefixes[3].1, "20260405/18z/ifs/0p25/oper/");
-        assert_eq!(prefixes[6].1, "20260405/00z/ifs/0p25/oper/");
-
-        // Reference times are strictly descending.
-        for pair in prefixes.windows(2) {
-            assert!(pair[0].0 > pair[1].0);
+    fn scan_prefixes_for_each_shipped_layout() {
+        const IFS: &str = "%Y%m%d/{run}z/ifs/0p25/oper/";
+        const AIFS: &str = "%Y%m%d/{run}z/aifs-single/0p25/oper/";
+        const GFS: &str = "gfs.%Y%m%d/{run}/atmos/";
+        const README: &str = "%Y%m%d/00z/ifs/0p25/oper/";
+        const RUNS: &[u32] = &[0, 6, 12, 18];
+        let cases: &[(&str, &str, &[u32], &[&str])] = &[
+            // Today's 18z is still in the future.
+            (
+                IFS,
+                "2026-04-06T15:00:00Z",
+                RUNS,
+                &[
+                    "20260406/12z/ifs/0p25/oper",
+                    "20260406/06z/ifs/0p25/oper",
+                    "20260406/00z/ifs/0p25/oper",
+                    "20260405/18z/ifs/0p25/oper",
+                    "20260405/12z/ifs/0p25/oper",
+                    "20260405/06z/ifs/0p25/oper",
+                    "20260405/00z/ifs/0p25/oper",
+                ],
+            ),
+            // Today's 00z is listed while it may still be publishing.
+            (
+                IFS,
+                "2026-04-06T02:00:00Z",
+                RUNS,
+                &[
+                    "20260406/00z/ifs/0p25/oper",
+                    "20260405/18z/ifs/0p25/oper",
+                    "20260405/12z/ifs/0p25/oper",
+                    "20260405/06z/ifs/0p25/oper",
+                    "20260405/00z/ifs/0p25/oper",
+                ],
+            ),
+            // Run hours in any order.
+            (
+                IFS,
+                "2026-04-06T11:00:00Z",
+                &[12, 0],
+                &[
+                    "20260406/00z/ifs/0p25/oper",
+                    "20260405/12z/ifs/0p25/oper",
+                    "20260405/00z/ifs/0p25/oper",
+                ],
+            ),
+            // Exactly midnight on the 1st: the new day's 00z, then February.
+            (
+                AIFS,
+                "2026-03-01T00:00:00Z",
+                RUNS,
+                &[
+                    "20260301/00z/aifs-single/0p25/oper",
+                    "20260228/18z/aifs-single/0p25/oper",
+                    "20260228/12z/aifs-single/0p25/oper",
+                    "20260228/06z/aifs-single/0p25/oper",
+                    "20260228/00z/aifs-single/0p25/oper",
+                ],
+            ),
+            (
+                GFS,
+                "2027-01-01T05:59:59Z",
+                RUNS,
+                &[
+                    "gfs.20270101/00/atmos",
+                    "gfs.20261231/18/atmos",
+                    "gfs.20261231/12/atmos",
+                    "gfs.20261231/06/atmos",
+                    "gfs.20261231/00/atmos",
+                ],
+            ),
+            // One second before midnight on a leap day: all of today's runs.
+            (
+                GFS,
+                "2028-02-29T23:59:59Z",
+                RUNS,
+                &[
+                    "gfs.20280229/18/atmos",
+                    "gfs.20280229/12/atmos",
+                    "gfs.20280229/06/atmos",
+                    "gfs.20280229/00/atmos",
+                    "gfs.20280228/18/atmos",
+                    "gfs.20280228/12/atmos",
+                    "gfs.20280228/06/atmos",
+                    "gfs.20280228/00/atmos",
+                ],
+            ),
+            // No `{run}`: one prefix per day, and the run hours are unused.
+            (
+                README,
+                "2026-04-06T15:00:00Z",
+                RUNS,
+                &["20260406/00z/ifs/0p25/oper", "20260405/00z/ifs/0p25/oper"],
+            ),
+            (
+                README,
+                "2026-03-01T00:00:00Z",
+                RUNS,
+                &["20260301/00z/ifs/0p25/oper", "20260228/00z/ifs/0p25/oper"],
+            ),
+        ];
+        for &(pattern, now, run_hours, expected) in cases {
+            let now: DateTime<Utc> = now.parse().unwrap();
+            let runs = build_scan_prefixes(pattern, now, run_hours).unwrap();
+            let prefixes: Vec<&str> = runs.iter().map(|run| run.prefix.as_str()).collect();
+            assert_eq!(prefixes, expected, "{pattern} at {now}");
+            // Each prefix is its run's reference time formatted with the
+            // run hour in place of `{run}`: 00 UTC without it.
+            let with_hour = pattern.replace("{run}", "%H");
+            for run in &runs {
+                assert!(run.reference_time <= now, "{run:?}");
+                let formatted = run.reference_time.format(&with_hour).to_string();
+                assert_eq!(formatted.trim_end_matches('/'), run.prefix);
+                if !pattern.contains("{run}") {
+                    assert_eq!(run.reference_time.format("%H:%M").to_string(), "00:00");
+                }
+            }
+            for pair in runs.windows(2) {
+                assert!(pair[0].reference_time > pair[1].reference_time);
+            }
         }
-    }
-
-    #[test]
-    fn test_build_scan_prefixes_skips_future_runs() {
-        use chrono::TimeZone;
-        // 2026-04-06 02:00 UTC: yesterday 18z is the latest published run.
-        // Today's 00z technically has a reference time of 00:00 UTC which is
-        // <= now, so it should still be listed (even if still publishing).
-        let dt = Utc.with_ymd_and_hms(2026, 4, 6, 2, 0, 0).unwrap();
-        let prefixes = build_scan_prefixes("%Y%m%d/{run}z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
-
-        // Today: 00z only. Yesterday: all 4. Total 5.
-        assert_eq!(prefixes.len(), 5);
-        assert_eq!(prefixes[0].1, "20260406/00z/ifs/0p25/oper/");
-        assert_eq!(prefixes[1].1, "20260405/18z/ifs/0p25/oper/");
-    }
-
-    #[test]
-    fn test_build_scan_prefixes_no_run_placeholder() {
-        use chrono::TimeZone;
-        let dt = Utc.with_ymd_and_hms(2026, 4, 6, 15, 0, 0).unwrap();
-        let prefixes = build_scan_prefixes("%Y%m%d/00z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
-
-        // No {run} placeholder — 2 dates, 1 prefix each, newest-first.
-        assert_eq!(prefixes.len(), 2);
-        assert_eq!(prefixes[0].1, "20260406/00z/ifs/0p25/oper/");
-        assert_eq!(prefixes[1].1, "20260405/00z/ifs/0p25/oper/");
+        // The trimmed prefix lists the same object-store path.
+        use ds_storage::object_store::path::Path;
+        assert_eq!(
+            Path::from("20260406/12z/ifs/0p25/oper/"),
+            Path::from("20260406/12z/ifs/0p25/oper")
+        );
     }
 }
