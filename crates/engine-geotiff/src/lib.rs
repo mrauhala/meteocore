@@ -1553,6 +1553,7 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
         // Rotated lat/lon is NOT EPSG:4326 — it has no standard EPSG code.
         ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
         ds_core::geo::Crs::Geostationary { .. } => "geos".to_string(),
+        ds_core::geo::Crs::WebMercator => "EPSG:3857".to_string(),
     }
 }
 

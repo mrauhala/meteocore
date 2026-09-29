@@ -485,11 +485,14 @@ one never implies the other.
 ## Shared Domain Machinery (ds-core, `crates/core/`)
 
 - **`ds_core::web_mercator`** — the ONLY EPSG:3857↔WGS84 implementation
-  (Critical Rule 4).
+  (Critical Rule 4). `Crs::WebMercator` is its `Crs` form for a source grid
+  (GMGSI): forward keeps longitude unwrapped, and a global grid wraps its
+  own columns.
 - **`ds_core::geo`** — CRS transforms (WGS84, TM, LAEA, LCC, Stereographic,
-  Geostationary), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
+  Geostationary, WebMercator), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
   `geodetic_to_ecef`, `OutputCrs::footprint_pixel_window` (low-zoom ghost
-  guard, #453). `Crs::Geostationary` is the one **partial** transform:
+  guard, #453). `Crs::WebMercator`'s northing is unbounded at the poles.
+  `Crs::Geostationary` is the one **partial** transform:
   `forward` is NaN on the far side of the Earth and `inverse` `None` off the
   disk, so code mapping many points must skip non-finite results; its
   `GeoTransform::bbox` comes from the limb and may be `west > east` (#819).
@@ -577,7 +580,7 @@ one never implies the other.
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
-| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4 and Himawari-9 ISatSS tiles on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819); RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
+| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
 
 ## Config Format

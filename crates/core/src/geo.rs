@@ -202,6 +202,18 @@ pub enum Crs {
         semi_minor: f64, // ellipsoid semi-minor axis (metres); equal for a sphere
         sweep: SweepAxis,
     },
+    /// Spherical Web Mercator (EPSG:3857) as a **source** grid's CRS, e.g.
+    /// NOAA's GMGSI global satellite mosaic. The math is
+    /// [`crate::web_mercator`]; Web Mercator as an *output* CRS is
+    /// [`OutputCrs::WebMercator`](crate::map_engine::OutputCrs::WebMercator).
+    ///
+    /// `forward` keeps longitude unwrapped: x is linear in longitude for
+    /// any input, so a longitude past ±180° (a client wrapping the world)
+    /// lands a turn (2π·R) further along x rather than jumping back. A grid
+    /// that spans the globe wraps its columns itself. `inverse` returns
+    /// longitude in [-180, 180]. At the poles the northing is unbounded:
+    /// `forward` is ±∞ (or a huge finite value) there.
+    WebMercator,
 }
 
 /// The axis a geostationary imager sweeps, which fixes the order of its
@@ -226,10 +238,9 @@ pub enum SweepAxis {
 ///
 /// This is keyed on the engine's `native_crs` *label*: a CRS only gets a
 /// `storageCrs` if some engine's `crs_label` emits the matching string. The
-/// `"EPSG:4326"` and `"EPSG:3857"` arms are forward-looking — no current engine
-/// emits those labels (WGS84 grids are tagged `"CRS:84"`, and there is no Web
-/// Mercator `Crs` variant) — so a new engine for one of those must emit the
-/// label here for the URI to apply.
+/// `"EPSG:4326"` arm is forward-looking — no current engine emits it (WGS84
+/// grids are tagged `"CRS:84"`). `"EPSG:3857"` is the label of a
+/// [`Crs::WebMercator`] source grid (engine-satellite's GMGSI mosaic).
 pub fn native_crs_uri(label: &str) -> Option<&'static str> {
     match label {
         "CRS:84" => Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
@@ -406,9 +417,9 @@ pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> Option<[f64; 4]> {
 /// The inverse of [`wgs84_envelope`]: used by OGC API Maps, where the request
 /// `bbox` is in CRS:84 but the output `crs` is projected — the projected map
 /// frame must cover the requested geographic box. `Crs::forward` is total for
-/// every output CRS (Geostationary, the one partial variant, is never an
-/// output CRS), so this always returns `Some`; the `unwrap_or` is a defensive
-/// identity fallback.
+/// every output CRS (Geostationary and WebMercator, the partial variants, are
+/// source CRSs only), so this always returns `Some`; the `unwrap_or` is a
+/// defensive identity fallback.
 pub fn projected_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     edge_envelope(bbox, |lon, lat| Some(crs.forward(lon, lat))).unwrap_or(bbox)
 }
@@ -418,7 +429,8 @@ impl Crs {
     /// For Wgs84, returns (lon, lat) unchanged.
     /// For RotatedLatLon, returns rotated (lon, lat) in degrees.
     /// For Geostationary, returns `(NaN, NaN)` for a point the satellite
-    /// cannot see; every other variant is total. Callers mapping many points
+    /// cannot see; for WebMercator the northing is unbounded at the poles.
+    /// Every other variant is total. Callers mapping many points
     /// (`ProjectionGrid`, envelopes) must skip non-finite results.
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
         match self {
@@ -490,6 +502,10 @@ impl Crs {
                 geos.forward(lat_deg.to_radians(), lon_deg.to_radians())
                     .unwrap_or((f64::NAN, f64::NAN))
             }
+            Crs::WebMercator => (
+                crate::web_mercator::lon_to_x(lon_deg),
+                crate::web_mercator::lat_to_y(lat_deg),
+            ),
         }
     }
 
@@ -556,6 +572,10 @@ impl Crs {
                 let (lat, lon) = geos.inverse(x, y)?;
                 (wrap_lon(lon.to_degrees()), lat.to_degrees())
             }
+            Crs::WebMercator => (
+                wrap_lon(crate::web_mercator::x_to_lon(x)),
+                crate::web_mercator::y_to_lat(y),
+            ),
         };
         if result.0.is_finite() && result.1.is_finite() {
             Some(result)
@@ -2929,6 +2949,51 @@ mod tests {
         let one_deg = great_circle_distance_m(25.0, 60.0, 25.0, 61.0);
         assert!((one_deg - 111_195.0).abs() < 200.0, "got {one_deg}");
         assert_eq!(great_circle_distance_m(25.0, 60.0, 25.0, 60.0), 0.0);
+    }
+
+    // --- Web Mercator source grid -----------------------------------------
+
+    /// `Crs::WebMercator` against PROJ 9.8.1:
+    /// `cs2cs -d 6 EPSG:4326 EPSG:3857` (input `lat lon`). The first two are
+    /// GMGSI pixel centres (the global mosaic's first and last pixel).
+    #[test]
+    fn web_mercator_matches_cs2cs() {
+        let crs = Crs::WebMercator;
+        for (lon, lat, x, y) in [
+            (179.9996, 72.71541, 20_037_463.814_993, 12_015_991.631_465),
+            (179.9004, -72.73677, 20_026_420.921_506, -12_023_999.255_654),
+            (24.94, 60.17, 2_776_308.100_384, 8_437_684.160_973),
+            (151.2, -33.9, 16_831_507.007_943, -4_015_382.360_073),
+            (0.0, 0.0, 0.0, 0.0),
+        ] {
+            let (fx, fy) = crs.forward(lon, lat);
+            assert!(
+                (fx - x).abs() < 1e-3 && (fy - y).abs() < 1e-3,
+                "forward({lon}, {lat}) = ({fx}, {fy}), cs2cs ({x}, {y})"
+            );
+            let (ilon, ilat) = crs.inverse(x, y).unwrap();
+            assert!(
+                (ilon - lon).abs() < 1e-9 && (ilat - lat).abs() < 1e-9,
+                "inverse({x}, {y}) = ({ilon}, {ilat})"
+            );
+        }
+        // `cs2cs -d 9 EPSG:3857 EPSG:4326`: an easting past the world's
+        // edge comes back wrapped into [-180, 180].
+        let (lon, lat) = crs.inverse(21_000_000.0, 5_000_000.0).unwrap();
+        assert!((lon - -171.353_790_335).abs() < 1e-8, "{lon}");
+        assert!((lat - 40.916_274_471).abs() < 1e-8, "{lat}");
+    }
+
+    /// Forward keeps longitude unwrapped: past 180° the easting keeps
+    /// growing a turn along, so a render across the seam stays continuous.
+    #[test]
+    fn web_mercator_forward_is_unwrapped() {
+        let crs = Crs::WebMercator;
+        let turn = crs.forward(360.0, 0.0).0;
+        let (a, _) = crs.forward(-170.0, 10.0);
+        let (b, _) = crs.forward(190.0, 10.0);
+        assert!((b - a - turn).abs() < 1e-6, "{a} {b} {turn}");
+        assert!(crs.forward(179.0, 0.0).0 < crs.forward(181.0, 0.0).0);
     }
 
     // --- Geostationary -----------------------------------------------------

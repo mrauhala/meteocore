@@ -8,6 +8,9 @@
 //!   `AHI-L2-FLDK-ISatSS/<year>/<month>/<day>/<hour><minute>/OR_<sector>-<res>-B<bits>-M<mode>C<band>-T<tile>_G<satellite>_s<start>_c<created>.nc`,
 //!   one file per tile (88 for a full disk), `<start>` `%Y%j%H%M%S` plus a
 //!   tenths digit.
+//! - GMGSI (`gmgsi`), NOAA's hourly global mosaic:
+//!   `GMGSI_<product>/<year>/<month>/<day>/<hour>/GLOBCOMP<band>_v<v>r<r>_blend_s<start>_e<end>_c<created>.nc`,
+//!   one file per hour, each time stamp `%Y%m%d%H%M%S` plus a tenths digit.
 
 use chrono::{DateTime, Duration, DurationRound, NaiveDateTime, Utc};
 use ds_core::error::DataServerError;
@@ -39,6 +42,27 @@ pub(crate) struct Naming {
     /// `start` captures the scan start stamp; `tile`, when present, the
     /// tile number.
     file: Regex,
+    /// How the first digits of `start` read, to the minute.
+    stamp: Stamp,
+}
+
+/// The minute-precision prefix of a file's scan start stamp.
+#[derive(Clone, Copy)]
+enum Stamp {
+    /// `%Y%j%H%M` (GOES-R, ISatSS: day of year).
+    DayOfYear,
+    /// `%Y%m%d%H%M` (GMGSI).
+    Calendar,
+}
+
+impl Stamp {
+    /// The digits read and their format.
+    fn format(self) -> (usize, &'static str) {
+        match self {
+            Stamp::DayOfYear => (11, "%Y%j%H%M"),
+            Stamp::Calendar => (12, "%Y%m%d%H%M"),
+        }
+    }
 }
 
 impl Naming {
@@ -54,6 +78,7 @@ impl Naming {
         Naming {
             layout: Layout::Hourly(format!("{product}/%Y/%j/%H/")),
             file,
+            stamp: Stamp::DayOfYear,
         }
     }
 
@@ -68,6 +93,29 @@ impl Naming {
         Naming {
             layout: Layout::IsatssSlots,
             file,
+            stamp: Stamp::DayOfYear,
+        }
+    }
+
+    /// The GMGSI mosaic `product` (`LW`, `SW`, `WV` or `VIS`, the
+    /// `GMGSI_<product>/` directory), whose files name the band a little
+    /// differently: `GLOBCOMPLIR`, `GLOBCOMPSIR`, `GLOBCOMPWV`,
+    /// `GLOBCOMPVIS`.
+    pub fn gmgsi(product: &str) -> Self {
+        let band = match product {
+            "LW" => "LIR",
+            "SW" => "SIR",
+            other => other,
+        };
+        let file = Regex::new(&format!(
+            r"^GLOBCOMP{}_v\d+r\d+_blend_s(?P<start>\d{{14}})\d_e\d{{15}}_c\d{{15}}\.nc$",
+            regex::escape(band)
+        ))
+        .expect("config validation restricts the product to GMGSI_PRODUCTS");
+        Naming {
+            layout: Layout::Hourly(format!("GMGSI_{product}/%Y/%m/%d/%H/")),
+            file,
+            stamp: Stamp::Calendar,
         }
     }
 
@@ -137,7 +185,8 @@ impl Naming {
     /// scan per minute, so the minute still identifies the scan.
     pub fn scan_start(&self, basename: &str) -> Option<DateTime<Utc>> {
         let digits = self.file.captures(basename)?.name("start")?.as_str();
-        NaiveDateTime::parse_from_str(&format!("{}00", &digits[..11]), "%Y%j%H%M%S")
+        let (len, format) = self.stamp.format();
+        NaiveDateTime::parse_from_str(&format!("{}00", digits.get(..len)?), &format!("{format}%S"))
             .ok()
             .map(|t| t.and_utc())
     }
@@ -191,6 +240,46 @@ mod tests {
                 "OR_ABI-L2-ACHTF-M6_G19_s20262681910199_e20262681919507_c20262681922250.nc"
             ),
             Some("2026-09-25T19:10:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn gmgsi_names_select_product_and_hour() {
+        let lw = Naming::gmgsi("LW");
+        assert!(!lw.tiled());
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            lw.prefixes(
+                at("2026-09-28T11:00:00Z"),
+                at("2026-09-28T12:30:00Z"),
+                |_| false
+            )
+            .unwrap(),
+            ["GMGSI_LW/2026/09/28/11", "GMGSI_LW/2026/09/28/12"]
+        );
+        let name = "GLOBCOMPLIR_v3r0_blend_s202609281200000_e202609281209599_c202609281234509.nc";
+        assert_eq!(lw.scan_start(name), Some(at("2026-09-28T12:00:00Z")));
+        // Other mosaics, partial uploads and malformed stamps are not it.
+        for other in [
+            "GLOBCOMPSIR_v3r0_blend_s202609281200000_e202609281209599_c202609281237257.nc",
+            "GLOBCOMPLIR_v3r0_blend_s202609281200000_e202609281209599_c202609281234509.nc.tmp",
+            "GLOBCOMPLIR_v3r0_blend_s20260928120000_e202609281209599_c202609281234509.nc",
+            "GLOBCOMPSSR_nc.2021071221",
+        ] {
+            assert_eq!(lw.scan_start(other), None, "{other}");
+        }
+        // The shortwave and visible mosaics name their band their own way.
+        assert_eq!(
+            Naming::gmgsi("SW").scan_start(
+                "GLOBCOMPSIR_v3r0_blend_s202609281200000_e202609281209599_c202609281237257.nc"
+            ),
+            Some(at("2026-09-28T12:00:00Z"))
+        );
+        assert_eq!(
+            Naming::gmgsi("VIS").scan_start(
+                "GLOBCOMPVIS_v3r0_blend_s202609281200000_e202609281209599_c202609281242446.nc"
+            ),
+            Some(at("2026-09-28T12:00:00Z"))
         );
     }
 

@@ -22,7 +22,8 @@ pub(crate) struct CoordinateMaps<'a> {
     width: u32,
     height: u32,
     output_crs: &'a OutputCrs,
-    built: Vec<(GeoTransform, ProjectionGrid)>,
+    /// Each grid with its column period (a global grid's) and its map.
+    built: Vec<(GeoTransform, Option<f64>, ProjectionGrid)>,
 }
 
 #[cfg(test)]
@@ -47,26 +48,35 @@ impl<'a> CoordinateMaps<'a> {
     /// cannot see project to NaN; the grid refines cells on the limb, and no
     /// footprint guard is needed: there is no far side for a coarse cell to
     /// alias onto.
-    fn onto(&mut self, gt: &GeoTransform) -> &ProjectionGrid {
-        let index = match self.built.iter().position(|(g, _)| same_grid(g, gt)) {
+    ///
+    /// A global grid (GMGSI) passes its column `period`: the map then
+    /// interpolates across the grid's seam, and a projected output's own
+    /// longitude cut, and `Frame::pixel` wraps the columns it samples.
+    fn onto(&mut self, gt: &GeoTransform, period: Option<f64>) -> &ProjectionGrid {
+        let index = match self
+            .built
+            .iter()
+            .position(|(g, p, _)| same_grid(g, gt) && *p == period)
+        {
             Some(index) => index,
             None => {
                 #[cfg(test)]
                 MAPS_BUILT.with(|n| n.set(n.get() + 1));
                 let (bbox, output_crs) = (self.bbox, self.output_crs);
-                let grid = ProjectionGrid::build_2d(
+                let grid = ProjectionGrid::build_2d_periodic(
                     self.width,
                     self.height,
                     gt.width,
                     gt.height,
+                    period,
                     |fx, fy| output_crs.project_node(bbox, fx, fy),
                     |lon, lat| gt.world_to_pixel_f64(lon, lat),
                 );
-                self.built.push((gt.clone(), grid));
+                self.built.push((gt.clone(), period, grid));
                 self.built.len() - 1
             }
         };
-        &self.built[index].1
+        &self.built[index].2
     }
 }
 
@@ -165,45 +175,42 @@ impl SatelliteEngine {
         maps: &mut CoordinateMaps,
     ) -> Result<RasterTile, DataServerError> {
         let (width, height) = (maps.width, maps.height);
-        // The part of the disk the request sees decides the level: sample
+        // The part of the grid the request sees decides the level: sample
         // the overview when a full-resolution read would take several
-        // source pixels per output pixel.
-        let [west, south, east, north] = maps.bbox;
-        let Some((c0, r0, c1, r1)) = frame.gt.bbox_to_pixels(west, south, east, north) else {
+        // source pixels per output pixel. On a global grid a request across
+        // its seam sees two windows.
+        let windows = frame.windows(maps.bbox);
+        if windows.is_empty() {
             return Ok(empty_tile(width, height));
-        };
-        let density = f64::max(
-            (c1 - c0) as f64 / width as f64,
-            (r1 - r0) as f64 / height as f64,
-        );
+        }
+        let cols: u32 = windows.iter().map(|[c0, _, c1, _]| c1 - c0).sum();
+        let rows = windows
+            .iter()
+            .map(|[_, r0, _, r1]| r1 - r0)
+            .max()
+            .unwrap_or(0);
+        let density = f64::max(cols as f64 / width as f64, rows as f64 / height as f64);
         let overview = density >= OVERVIEW_FACTOR as f64;
         let gt = if overview {
             &frame.overview.gt
         } else {
             &frame.gt
         };
-        let grid = maps.onto(gt);
+        let grid = maps.onto(gt, frame.period(overview));
 
         let mut reader = PixelReader::new(self.frame_key(index, time), frame);
         let mut values = Vec::with_capacity(width as usize * height as usize);
         for oy in 0..height {
             for ox in 0..width {
                 let (c, r) = grid.sample(ox, oy);
-                let inside = c.is_finite()
-                    && r.is_finite()
-                    && c >= 0.0
-                    && r >= 0.0
-                    && c < gt.width as f64
-                    && r < gt.height as f64;
-                if !inside {
+                let Some((col, row)) = frame.pixel(overview, c, r) else {
                     values.push(None);
                     continue;
-                }
-                let (col, row) = (c as usize, r as u32);
+                };
                 let raw = if overview {
-                    frame.overview.raw[row as usize * gt.width as usize + col]
+                    frame.overview.raw[row as usize * gt.width as usize + col as usize]
                 } else {
-                    reader.raw(row, col as u32)?
+                    reader.raw(row, col)?
                 };
                 values.push(frame.packing.decode(raw));
             }
