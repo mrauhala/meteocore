@@ -42,10 +42,11 @@ use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 
 use ds_storage::discovery::{
-    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
+    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
+    TimeWindow,
 };
 
-use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, FilenameMatcher, Location};
+use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, CatalogError, Location};
 use crate::reader::{read_composite, OdimComposite};
 
 /// Days of date-partitioned prefixes to scan when an S3 source has no
@@ -453,7 +454,7 @@ pub enum EngineError {
     #[error("either `filename_template` or `filename_pattern`+`timestamp_format` must be set")]
     NoFilenamePattern,
     #[error("filename pattern build failed: {0}")]
-    BadPattern(#[from] crate::catalog::CatalogError),
+    BadPattern(#[from] CatalogError),
     #[error(
         "ODIM collection has no source — set a local `data_path`, an \
          `http(s)://` `data_path`, or an S3 `endpoint` + `bucket`"
@@ -915,15 +916,15 @@ impl OdimEngine {
     }
 }
 
-/// Resolve the engine's `FilenameMatcher` from config: prefer
+/// Resolve the engine's shared [`FilenameMatcher`] from config: prefer
 /// `filename_template` (strftime), fall back to the explicit
 /// `filename_pattern` + `timestamp_format` pair.
 fn build_matcher(config: &ds_core::config::OdimConfig) -> Result<FilenameMatcher, EngineError> {
     if let Some(template) = &config.filename_template {
-        return Ok(FilenameMatcher::from_template(template)?);
+        return Ok(FilenameMatcher::from_template(template).map_err(CatalogError::from)?);
     }
     if let (Some(pattern), Some(format)) = (&config.filename_pattern, &config.timestamp_format) {
-        return Ok(FilenameMatcher::from_pattern(pattern, format)?);
+        return Ok(FilenameMatcher::from_pattern(pattern, format).map_err(CatalogError::from)?);
     }
     Err(EngineError::NoFilenamePattern)
 }

@@ -696,8 +696,8 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `filename_template` | * | — | Strftime-based template, e.g., `"radar_%Y%m%dT%H%MZ.tif"`. Auto-derives regex and timestamp format. |
-| `filename_pattern` | * | — | Explicit regex with `(?P<timestamp>...)` capture group. Requires `timestamp_format`. |
+| `filename_template` | * | — | Strftime-based template, e.g., `"radar_%Y%m%dT%H%MZ.tif"`. Auto-derives regex and timestamp format. The whole filename must match, so partial uploads such as `….tif.tmp` never do. |
+| `filename_pattern` | * | — | Explicit regex with `(?P<timestamp>...)` capture group. Requires `timestamp_format`. Used as written: anchor it with `^…$`, or partial uploads may match (a WARN at load says so). |
 | `timestamp_format` | * | — | chrono strftime format for the captured timestamp |
 | `parameter` | yes | — | Parameter name, e.g., `"reflectivity"` |
 | `unit` | yes | — | Unit of measurement, e.g., `"dBZ"` |

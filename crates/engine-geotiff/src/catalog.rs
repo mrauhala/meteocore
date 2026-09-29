@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
-use regex::Regex;
+use ds_storage::discovery::FilenameMatcher;
 
 use crate::reader::{DataSource, TiffMetadata};
 
@@ -215,38 +215,37 @@ fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Op
     result
 }
 
+/// The timestamp of a file the collection's matcher recognises, or `None`
+/// to skip it. A name that matches but carries no valid time is logged.
+fn file_timestamp(matcher: &FilenameMatcher, filename: &str) -> Option<DateTime<Utc>> {
+    match matcher.match_timestamp(filename)? {
+        Ok(datetime) => Some(datetime),
+        Err(timestamp_str) => {
+            tracing::warn!(
+                "Cannot parse timestamp '{}' from file '{}'",
+                timestamp_str,
+                filename
+            );
+            None
+        }
+    }
+}
+
 /// Parse candidate files from an iterator of (filename, file_size) pairs.
 ///
-/// Matches filenames against the regex pattern, extracts timestamps, and
-/// returns a vec of (datetime, filename, file_size) tuples.
+/// Matches filenames with the collection's [`FilenameMatcher`] and returns
+/// a vec of (datetime, filename, file_size) tuples.
 pub fn parse_candidates_from_names<'a>(
     names: impl Iterator<Item = (&'a str, u64)>,
-    pattern: &Regex,
-    ts_format: &str,
+    matcher: &FilenameMatcher,
 ) -> Vec<(DateTime<Utc>, String, u64)> {
     let mut candidates = Vec::new();
     for (filename, file_size) in names {
         if filename.len() > MAX_FILENAME_LENGTH {
             continue;
         }
-        let caps = match pattern.captures(filename) {
-            Some(c) => c,
-            None => continue,
-        };
-        let timestamp_str = match caps.name("timestamp") {
-            Some(m) => m.as_str(),
-            None => continue,
-        };
-        let datetime = match NaiveDateTime::parse_from_str(timestamp_str, ts_format) {
-            Ok(dt) => dt.and_utc(),
-            Err(_) => {
-                tracing::warn!(
-                    "Cannot parse timestamp '{}' from file '{}'",
-                    timestamp_str,
-                    filename
-                );
-                continue;
-            }
+        let Some(datetime) = file_timestamp(matcher, filename) else {
+            continue;
         };
         candidates.push((datetime, filename.to_string(), file_size));
     }
@@ -293,8 +292,7 @@ pub struct PendingFile {
 /// Files with unchanged size reuse their cached metadata (no re-parse).
 pub fn scan_directory(
     dir: &Path,
-    pattern: &Regex,
-    timestamp_format: &str,
+    matcher: &FilenameMatcher,
     exclude_patterns: &[String],
     pending: &mut BTreeMap<PathBuf, PendingFile>,
     existing: &HashMap<&Path, &FileEntry>,
@@ -335,28 +333,9 @@ pub fn scan_directory(
             continue;
         }
 
-        // Match filename against pattern
-        let caps = match pattern.captures(&file_name) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let timestamp_str = match caps.name("timestamp") {
-            Some(m) => m.as_str().to_string(),
-            None => continue,
-        };
-
-        // Parse timestamp
-        let datetime = match NaiveDateTime::parse_from_str(&timestamp_str, timestamp_format) {
-            Ok(dt) => dt.and_utc(),
-            Err(_) => {
-                tracing::warn!(
-                    "Cannot parse timestamp '{}' from file '{}'",
-                    timestamp_str,
-                    file_name
-                );
-                continue;
-            }
+        // Match the filename and read its timestamp
+        let Some(datetime) = file_timestamp(matcher, &file_name) else {
+            continue;
         };
 
         let path = entry.path();
@@ -541,12 +520,10 @@ pub(crate) const MAX_REMOTE_FILE_SIZE: u64 = 50 * 1024 * 1024;
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
 /// Files with unchanged size reuse their cached entry (no re-download).
-#[allow(clippy::too_many_arguments)]
 pub fn scan_remote_with_limit(
     store: &ds_storage::DataStore,
     prefix: &ds_storage::object_store::path::Path,
-    pattern: &Regex,
-    timestamp_format: &str,
+    matcher: &FilenameMatcher,
     existing: &HashMap<&Path, &FileEntry>,
     max_files: Option<usize>,
     time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -574,8 +551,7 @@ pub fn scan_remote_with_limit(
         remote_entries
             .iter()
             .map(|(_, filename, size, _)| (filename.as_str(), *size)),
-        pattern,
-        timestamp_format,
+        matcher,
     );
 
     apply_scan_filters(&mut candidates, time_filter, max_files);
@@ -995,19 +971,16 @@ mod tests {
             .find(|p| p.is_dir())
             .expect("testdata/radar fixture");
 
-        let pattern = Regex::new(r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif").unwrap();
+        let pattern = FilenameMatcher::from_pattern(
+            r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif",
+            "%Y%m%dT%H%MZ",
+        )
+        .unwrap();
         let mut pending = BTreeMap::new();
 
         // First scan — `existing` is empty, all files freshly mmapped.
-        let first = scan_directory(
-            &dir,
-            &pattern,
-            "%Y%m%dT%H%MZ",
-            &[],
-            &mut pending,
-            &HashMap::new(),
-        )
-        .expect("first scan");
+        let first =
+            scan_directory(&dir, &pattern, &[], &mut pending, &HashMap::new()).expect("first scan");
         assert!(!first.entries.is_empty(), "fixture should contain TIFFs");
 
         // Force the lazy mmap_cache to populate on one entry so we can prove
@@ -1034,15 +1007,8 @@ mod tests {
             .values()
             .map(|e| (e.path.as_path(), e))
             .collect();
-        let second = scan_directory(
-            &dir,
-            &pattern,
-            "%Y%m%dT%H%MZ",
-            &[],
-            &mut pending,
-            &path_index,
-        )
-        .expect("second scan");
+        let second =
+            scan_directory(&dir, &pattern, &[], &mut pending, &path_index).expect("second scan");
 
         // The entry for the same timestamp must reuse the prior source (same
         // mmap_cache OnceLock, populated with the same Arc<Mmap>).
@@ -1160,18 +1126,15 @@ mod tests {
         let dst_path = tmp_dir.join(&dst_name);
         std::fs::copy(src_file.path(), &dst_path).unwrap();
 
-        let pattern = Regex::new(r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif").unwrap();
+        let pattern = FilenameMatcher::from_pattern(
+            r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif",
+            "%Y%m%dT%H%MZ",
+        )
+        .unwrap();
         let mut pending = BTreeMap::new();
 
-        let first = scan_directory(
-            &tmp_dir,
-            &pattern,
-            "%Y%m%dT%H%MZ",
-            &[],
-            &mut pending,
-            &HashMap::new(),
-        )
-        .expect("first scan");
+        let first = scan_directory(&tmp_dir, &pattern, &[], &mut pending, &HashMap::new())
+            .expect("first scan");
         assert_eq!(first.entries.len(), 1);
 
         let first_entry = first.entries.values().next().unwrap();
@@ -1203,15 +1166,8 @@ mod tests {
             .values()
             .map(|e| (e.path.as_path(), e))
             .collect();
-        let second = scan_directory(
-            &tmp_dir,
-            &pattern,
-            "%Y%m%dT%H%MZ",
-            &[],
-            &mut pending,
-            &path_index,
-        )
-        .expect("second scan");
+        let second = scan_directory(&tmp_dir, &pattern, &[], &mut pending, &path_index)
+            .expect("second scan");
 
         let second_entry = second.entries.values().next().unwrap();
         let second_lock_ptr = match &**second_entry.source().unwrap() {
@@ -1283,18 +1239,15 @@ mod tests {
         let dst_path = tmp_dir.join(src_file.file_name());
         std::fs::copy(src_file.path(), &dst_path).unwrap();
 
-        let pattern = Regex::new(r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif").unwrap();
+        let pattern = FilenameMatcher::from_pattern(
+            r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif",
+            "%Y%m%dT%H%MZ",
+        )
+        .unwrap();
         let mut pending = BTreeMap::new();
 
-        let first = scan_directory(
-            &tmp_dir,
-            &pattern,
-            "%Y%m%dT%H%MZ",
-            &[],
-            &mut pending,
-            &HashMap::new(),
-        )
-        .expect("first scan");
+        let first = scan_directory(&tmp_dir, &pattern, &[], &mut pending, &HashMap::new())
+            .expect("first scan");
         let first_entry = first.entries.values().next().unwrap();
         let first_inode = first_entry.inode.expect("Unix scan captures inode");
         let first_mtime = first_entry.mtime.expect("Unix scan captures mtime");
@@ -1343,15 +1296,8 @@ mod tests {
             .values()
             .map(|e| (e.path.as_path(), e))
             .collect();
-        let second = scan_directory(
-            &tmp_dir,
-            &pattern,
-            "%Y%m%dT%H%MZ",
-            &[],
-            &mut pending,
-            &path_index,
-        )
-        .expect("second scan");
+        let second = scan_directory(&tmp_dir, &pattern, &[], &mut pending, &path_index)
+            .expect("second scan");
 
         let second_entry = second.entries.values().next().unwrap();
         let second_lock_ptr = match &**second_entry.source().unwrap() {

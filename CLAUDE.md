@@ -5,7 +5,9 @@ OGC API - Maps, OGC API - Tiles, OGC WMS 1.3.0, and OGC 3D Tiles servers for
 weather data (radar, NWP models, observations, alerts).
 
 Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
-`ds-storage` (S3/HTTP/local object store, directory `crates/storage`),
+`ds-storage` (S3/HTTP/local object store, directory `crates/storage`; its
+`discovery` module is the one home for time windows, strftime prefix
+expansion and the filename → timestamp matcher, #816/#817),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure),

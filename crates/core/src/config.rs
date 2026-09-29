@@ -787,10 +787,12 @@ pub struct GeoTiffConfig {
     /// Simple filename template with strftime placeholders.
     /// E.g. `"OPERA@%Y%m%dT%H%M@0@ACRR.tiff"` or `"radar_%Y%m%dT%H%MZ.tif"`
     /// Auto-derives regex and timestamp format. Preferred over filename_pattern.
+    /// The whole filename must match, so partial uploads never do.
     pub filename_template: Option<String>,
     /// Regex pattern with a named capture group `timestamp` for extracting
-    /// timestamps from filenames. E.g. `radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif`
+    /// timestamps from filenames. E.g. `^radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif$`
     /// Only needed for complex patterns that filename_template can't express.
+    /// Used as written: without `^…$` anchors partial uploads may match.
     pub filename_pattern: Option<String>,
     /// chrono strftime format for parsing the captured timestamp string.
     /// E.g. `%Y%m%dT%H%MZ`. Only needed when using filename_pattern.
@@ -1694,10 +1696,12 @@ pub struct OdimConfig {
     /// in the filename (e.g. `"202503251200_radar_fi.h5"` or
     /// `"%Y%m%dT%H%M_polar_finland_anjalankoski.h5"`). Auto-derives
     /// the regex and timestamp format. Preferred over `filename_pattern`.
+    /// The whole filename must match, so partial uploads never do.
     pub filename_template: Option<String>,
     /// Explicit regex with named `(?P<timestamp>…)` capture group, for
     /// filenames `filename_template` can't express. Requires
-    /// `timestamp_format`.
+    /// `timestamp_format`. Used as written: without `^…$` anchors partial
+    /// uploads may match.
     pub filename_pattern: Option<String>,
     /// chrono strftime format for parsing `filename_pattern`'s
     /// timestamp capture.

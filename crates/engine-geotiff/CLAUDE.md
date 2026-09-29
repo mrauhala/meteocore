@@ -23,6 +23,12 @@ apply here.
   `stac_asset_allowlist`).
 - **STAC security:** `stac_asset_allowlist` is mandatory (SSRF protection).
   HTTP redirects disabled. Pagination origin-checked.
+- **Filename → timestamp:** the shared `ds_storage::discovery::FilenameMatcher`
+  (#817), built once by `resolve_filename_config` (none in STAC mode) and
+  shared with engine-odim — never re-implement it here. A
+  `filename_template` is anchored `^…$`, so `.tmp`/`.part` partial uploads
+  never match even with `exclude_patterns` emptied; an explicit
+  `filename_pattern` is used as written and logged at WARN when unanchored.
 
 ## STAC metadata loading (#90)
 

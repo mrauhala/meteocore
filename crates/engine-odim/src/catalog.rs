@@ -1,45 +1,29 @@
-//! Filename-template parsing and local-directory scanning.
+//! Local-directory and object-store scanning.
 //!
 //! ODIM producers ship one file per timestep, with the timestamp
-//! encoded in the filename — there is no sidecar index. The catalog's
-//! job is to translate a strftime template like
-//! `"%Y%m%dT%H%M_radar_fi.h5"` into:
-//!
-//! 1. A regex that matches just the timestamp portion of the filename
-//! 2. A chrono strftime format for parsing the matched substring
+//! encoded in the filename — there is no sidecar index. The shared
+//! [`FilenameMatcher`] (`ds_storage::discovery`) turns the configured
+//! strftime template (e.g. `"%Y%m%dT%H%M_radar_fi.h5"`) or explicit
+//! regex into a basename match plus a parsed timestamp.
 //!
 //! A scan — local-directory ([`scan_local_directory`]) or S3/HTTP
-//! object-store ([`scan_remote`]) — applies the regex to each
-//! filename, parses the timestamp, and returns a list of
-//! [`CatalogEntry`] values sorted by timestamp ascending.
+//! object-store ([`scan_remote`]) — applies the matcher to each
+//! filename and returns a list of [`CatalogEntry`] values sorted by
+//! timestamp ascending.
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
-use regex::Regex;
+use ds_storage::discovery::{FilenameError, FilenameMatcher};
 use tracing::warn;
 
 /// Errors from catalog construction and scanning.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
-    #[error("filename_template `{template}` contains no strftime codes — at least one of %Y/%m/%d/%H/%M/%S/%j is required")]
-    NoStrftimeCodes { template: String },
-    #[error("filename_template `{template}` contains unknown strftime code `{code}`")]
-    UnknownCode { template: String, code: String },
-    #[error(
-        "filename_template `{template}` has non-contiguous strftime codes (more than one block of date/time codes separated by literal text — e.g. `%Y_STATION_%H%M.h5`). \
-         The template parser expects all strftime codes to form a single block. Use the explicit `filename_pattern` + `timestamp_format` config form for split layouts."
-    )]
-    SplitTimestamp { template: String },
-    #[error("invalid regex `{pattern}`: {source}")]
-    InvalidRegex {
-        pattern: String,
-        #[source]
-        source: regex::Error,
-    },
-    #[error("filename_pattern `{pattern}` is missing the required `(?P<timestamp>…)` named capture group")]
-    NoTimestampCapture { pattern: String },
+    /// The configured filename template or pattern cannot build a matcher.
+    #[error(transparent)]
+    Filename(#[from] FilenameError),
     #[error("failed to read directory `{dir}`: {source}")]
     ReadDir {
         dir: PathBuf,
@@ -85,94 +69,6 @@ impl Location {
             Location::Local(path) => path.display().to_string(),
             Location::Remote { key, .. } => key.clone(),
         }
-    }
-}
-
-/// Compiled regex + chrono format for matching ODIM filenames and
-/// extracting their timestamps. Build once at engine construction
-/// time; reuse across every poll.
-#[derive(Debug, Clone)]
-pub struct FilenameMatcher {
-    regex: Regex,
-    timestamp_format: String,
-}
-
-impl FilenameMatcher {
-    /// Build a matcher from a strftime template (e.g.
-    /// `"%Y%m%dT%H%M_radar_fi.h5"`). Inverts each known strftime code
-    /// to its fixed-width regex equivalent and wraps the contiguous
-    /// timestamp region in a `(?P<timestamp>…)` named capture.
-    pub fn from_template(template: &str) -> Result<Self, CatalogError> {
-        let (body, format) = expand_template(template)?;
-        // Anchor templates end-to-end so a trailing `.tmp` partial-
-        // upload marker doesn't match. Explicit-regex callers can
-        // opt out by adding their own anchors (or not) via
-        // `from_pattern`.
-        let pattern = format!("^{body}$");
-        let regex = Regex::new(&pattern).map_err(|e| CatalogError::InvalidRegex {
-            pattern: pattern.clone(),
-            source: e,
-        })?;
-        Ok(Self {
-            regex,
-            timestamp_format: format,
-        })
-    }
-
-    /// Build a matcher from an explicit regex + chrono format. Use
-    /// this when the producer's filename layout can't be expressed
-    /// as a single contiguous strftime template (e.g. when there
-    /// are literal `%` characters or interleaved tokens).
-    ///
-    /// **The pattern is not auto-anchored.** Unlike
-    /// [`from_template`], which wraps its regex in `^...$`, this
-    /// constructor leaves anchoring to the caller. An unanchored
-    /// pattern will match any substring of a filename — including
-    /// partial-upload markers such as `radar.h5.tmp` or `radar.h5.part`
-    /// — which means `scan_local_directory` will accept the partial
-    /// file as a valid catalog entry and could serve a corrupt or
-    /// half-written tile as the "latest" timestep. Always include
-    /// `^` and `$` in your pattern unless you have a deliberate
-    /// reason not to.
-    pub fn from_pattern(pattern: &str, timestamp_format: &str) -> Result<Self, CatalogError> {
-        if !pattern.contains("(?P<timestamp>") {
-            return Err(CatalogError::NoTimestampCapture {
-                pattern: pattern.to_string(),
-            });
-        }
-        // Belt-and-suspenders alongside the doc comment: surface a
-        // runtime WARN for an operator who reads the config docs
-        // but not this constructor's source. `^`/`$` anchors are
-        // optional by spec — we don't reject — but most callers
-        // want them, and forgetting them silently admits
-        // `.tmp`/`.part` partial-upload markers as catalog entries.
-        if !pattern.starts_with('^') || !pattern.ends_with('$') {
-            warn!(
-                "[catalog] filename_pattern `{pattern}` is not fully anchored (`^...$`) — \
-                 partial-upload markers like `.tmp` / `.part` may match and be served as \
-                 valid catalog entries. Add `^` and `$` to your pattern unless this is \
-                 intentional."
-            );
-        }
-        let regex = Regex::new(pattern).map_err(|e| CatalogError::InvalidRegex {
-            pattern: pattern.to_string(),
-            source: e,
-        })?;
-        Ok(Self {
-            regex,
-            timestamp_format: timestamp_format.to_string(),
-        })
-    }
-
-    /// Try to extract a UTC timestamp from a filename. Returns
-    /// `None` if the filename doesn't match the regex or if the
-    /// captured substring isn't a valid date under the format.
-    pub fn parse_timestamp(&self, filename: &str) -> Option<DateTime<Utc>> {
-        let caps = self.regex.captures(filename)?;
-        let stamp = caps.name("timestamp")?.as_str();
-        NaiveDateTime::parse_from_str(stamp, &self.timestamp_format)
-            .ok()
-            .map(|t| t.and_utc())
     }
 }
 
@@ -343,115 +239,6 @@ pub fn scan_remote(
     Ok(entries)
 }
 
-/// Convert a strftime template to a regex + chrono format.
-///
-/// Recognised codes: `%Y` `%m` `%d` `%H` `%M` `%S` `%j` (year,
-/// month, day, hour, minute, second, day-of-year). Each maps to a
-/// fixed-width digit regex.
-///
-/// Separator characters within the timestamp region (`T`, `-`, `:`,
-/// `_`, `Z`) are kept inside the named capture group so they round-
-/// trip through `parse_from_str` correctly.
-fn expand_template(template: &str) -> Result<(String, String), CatalogError> {
-    const CODES: &[(&str, &str)] = &[
-        ("%Y", r"\d{4}"),
-        ("%m", r"\d{2}"),
-        ("%d", r"\d{2}"),
-        ("%H", r"\d{2}"),
-        ("%M", r"\d{2}"),
-        ("%S", r"\d{2}"),
-        ("%j", r"\d{3}"),
-    ];
-
-    let mut regex = String::new();
-    let mut format = String::new();
-    let mut in_timestamp = false;
-    let mut timestamp_started = false;
-    let mut timestamp_closed = false;
-    let bytes = template.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() {
-            let mut matched = false;
-            for &(code, re) in CODES {
-                if template[i..].starts_with(code) {
-                    if !in_timestamp {
-                        // Re-entering the timestamp region after it
-                        // was already closed = split layout. Emit a
-                        // dedicated error rather than letting `Regex::new`
-                        // reject the "duplicate named capture group"
-                        // with an opaque message.
-                        if timestamp_closed {
-                            return Err(CatalogError::SplitTimestamp {
-                                template: template.to_string(),
-                            });
-                        }
-                        regex.push_str("(?P<timestamp>");
-                        in_timestamp = true;
-                    }
-                    timestamp_started = true;
-                    format.push_str(code);
-                    regex.push_str(re);
-                    i += code.len();
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
-                let code = std::str::from_utf8(&bytes[i..i + 2.min(bytes.len() - i)])
-                    .unwrap_or("??")
-                    .to_string();
-                return Err(CatalogError::UnknownCode {
-                    template: template.to_string(),
-                    code,
-                });
-            }
-        } else {
-            let ch = bytes[i] as char;
-            if in_timestamp {
-                let is_separator = matches!(ch, 'T' | '-' | ':' | '_' | 'Z');
-                let next_is_code = i + 2 < bytes.len()
-                    && bytes[i + 1] == b'%'
-                    && CODES.iter().any(|(c, _)| template[i + 1..].starts_with(c));
-                if is_separator && next_is_code {
-                    format.push(ch);
-                    regex.push_str(&regex::escape(&ch.to_string()));
-                    i += 1;
-                } else if ch == 'Z' && !next_is_code {
-                    format.push('Z');
-                    regex.push('Z');
-                    regex.push(')');
-                    in_timestamp = false;
-                    timestamp_closed = true;
-                    i += 1;
-                } else {
-                    regex.push(')');
-                    in_timestamp = false;
-                    timestamp_closed = true;
-                    regex.push_str(&regex::escape(&ch.to_string()));
-                    i += 1;
-                }
-            } else {
-                regex.push_str(&regex::escape(&ch.to_string()));
-                i += 1;
-            }
-        }
-    }
-
-    if in_timestamp {
-        regex.push(')');
-    }
-
-    if !timestamp_started {
-        return Err(CatalogError::NoStrftimeCodes {
-            template: template.to_string(),
-        });
-    }
-
-    Ok((regex, format))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,7 +293,7 @@ mod tests {
     fn split_timestamp_template_is_an_error() {
         let err = FilenameMatcher::from_template("%Y_STATION_%H%M.h5").unwrap_err();
         match err {
-            CatalogError::SplitTimestamp { ref template } => {
+            FilenameError::SplitTimestamp { ref template } => {
                 assert_eq!(template, "%Y_STATION_%H%M.h5");
             }
             other => panic!("expected SplitTimestamp, got {other:?}"),
@@ -529,7 +316,7 @@ mod tests {
     fn template_without_strftime_codes_is_an_error() {
         let err = FilenameMatcher::from_template("radar.h5").unwrap_err();
         match err {
-            CatalogError::NoStrftimeCodes { .. } => {}
+            FilenameError::NoStrftimeCodes { .. } => {}
             other => panic!("expected NoStrftimeCodes, got {other:?}"),
         }
     }
@@ -538,7 +325,7 @@ mod tests {
     fn unknown_strftime_code_is_an_error() {
         let err = FilenameMatcher::from_template("radar_%X.h5").unwrap_err();
         match err {
-            CatalogError::UnknownCode { code, .. } => assert_eq!(code, "%X"),
+            FilenameError::UnknownCode { code, .. } => assert_eq!(code, "%X"),
             other => panic!("expected UnknownCode, got {other:?}"),
         }
     }
@@ -557,7 +344,7 @@ mod tests {
     #[test]
     fn explicit_pattern_without_timestamp_capture_is_an_error() {
         let err = FilenameMatcher::from_pattern(r"^comp-(\d+)\.h5$", "%Y%m%d%H%M").unwrap_err();
-        assert!(matches!(err, CatalogError::NoTimestampCapture { .. }));
+        assert!(matches!(err, FilenameError::NoTimestampCapture { .. }));
     }
 
     #[test]
@@ -583,6 +370,33 @@ mod tests {
                 "2025-07-14T15:30:00+00:00",
             ]
         );
+    }
+
+    /// A partial upload next to finished files is never catalogued by
+    /// either scan: the shared template matcher is anchored `^…$`, so
+    /// `.tmp` / `.part` suffixes don't match (#817).
+    #[test]
+    fn scans_skip_partial_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "OPERA@20260515T0000@0@DBZH.h5",
+            "OPERA@20260515T0005@0@DBZH.h5.tmp",
+            "OPERA@20260515T0010@0@DBZH.h5.part",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let matcher = FilenameMatcher::from_template("OPERA@%Y%m%dT%H%M@0@DBZH.h5").unwrap();
+        let (store, _) = ds_storage::build_store(dir.path().to_str().unwrap()).unwrap();
+
+        let local = scan_local_directory(dir.path(), &matcher, None, None).unwrap();
+        let remote = scan_remote(&store, &["".to_string()], &matcher, None, None).unwrap();
+        for entries in [local, remote] {
+            let names: Vec<_> = entries
+                .iter()
+                .map(|e| e.location.id().rsplit('/').next().unwrap().to_string())
+                .collect();
+            assert_eq!(names, ["OPERA@20260515T0000@0@DBZH.h5"]);
+        }
     }
 
     /// `time_filter` drops entries outside the inclusive window (before
