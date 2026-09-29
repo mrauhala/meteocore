@@ -117,6 +117,15 @@ fn build_router() -> axum::Router {
 /// Build a Maps router backed by a caller-supplied engine (otherwise
 /// identical to `build_router`), for exercising engine error paths.
 fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
+    build_router_with_engine_and_wms(engine, None)
+}
+
+/// [`build_router_with_engine`] with the collection's `[wms]` config, for
+/// the per-collection settings the handler reads (e.g. `webp_quality`).
+fn build_router_with_engine_and_wms(
+    engine: Arc<dyn MapEngine>,
+    wms: Option<ds_core::config::WmsConfig>,
+) -> axum::Router {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -134,7 +143,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             license: None,
             geotiff: None,
             querydata: None,
-            wms: None,
+            wms,
             grib: None,
             zarr: None,
             odim: None,
@@ -3659,5 +3668,201 @@ mod composites {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("channels")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `quality` parameter and `[wms] webp_quality`
+// ---------------------------------------------------------------------------
+
+mod quality {
+    use super::*;
+
+    /// The first RIFF chunk of a WebP body: `VP8L` is lossless.
+    fn webp_chunk(body: &[u8]) -> &[u8] {
+        assert_eq!(&body[..4], b"RIFF", "not a WebP body");
+        &body[12..16]
+    }
+
+    struct Fetched {
+        status: StatusCode,
+        x_cache: String,
+        etag: String,
+        body: Vec<u8>,
+    }
+
+    async fn fetch(app: &axum::Router, query: &str) -> Fetched {
+        let uri = format!(
+            "/collections/radar/map?bbox=10,55,30,70&width=64&height=64\
+             &datetime=2024-01-01T00:00:00Z{query}"
+        );
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let (status, x_cache, etag) = (resp.status(), header("x-cache"), header("etag"));
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        Fetched {
+            status,
+            x_cache,
+            etag,
+            body,
+        }
+    }
+
+    fn app() -> axum::Router {
+        build_router_with_engine(Arc::new(MockMapEngine::new()))
+    }
+
+    #[tokio::test]
+    async fn lossy_and_lossless_webp_never_alias_in_the_cache() {
+        let app = app();
+        let lossless = fetch(&app, "&f=image/webp").await;
+        assert_eq!(lossless.status, StatusCode::OK);
+        assert_eq!(lossless.x_cache, "MISS");
+        assert_eq!(webp_chunk(&lossless.body), b"VP8L", "default is lossless");
+
+        let lossy = fetch(&app, "&f=image/webp&quality=80").await;
+        assert_eq!(lossy.status, StatusCode::OK);
+        assert_eq!(
+            lossy.x_cache, "MISS",
+            "a lossless entry must not serve lossy"
+        );
+        assert_ne!(webp_chunk(&lossy.body), b"VP8L");
+        assert_ne!(lossy.etag, lossless.etag);
+
+        let explicit = fetch(&app, "&f=image/webp&quality=100").await;
+        assert_eq!(explicit.x_cache, "HIT", "100 is the lossless request");
+        assert_eq!(explicit.body, lossless.body);
+        assert_eq!(fetch(&app, "&f=image/webp&quality=80").await.x_cache, "HIT");
+        assert_eq!(
+            fetch(&app, "&f=image/webp&quality=60").await.x_cache,
+            "MISS"
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_webp_quality_is_the_default_and_quality_overrides_it() {
+        let wms: ds_core::config::WmsConfig =
+            serde_json::from_value(serde_json::json!({ "webp_quality": 70 })).unwrap();
+        let configured =
+            build_router_with_engine_and_wms(Arc::new(MockMapEngine::new()), Some(wms));
+        let plain = app();
+        let default = fetch(&configured, "&f=image/webp").await;
+        assert_eq!(default.status, StatusCode::OK);
+        assert_ne!(
+            webp_chunk(&default.body),
+            b"VP8L",
+            "collection default is lossy"
+        );
+        let seventy = fetch(&configured, "&f=image/webp&quality=70").await;
+        assert_eq!(seventy.x_cache, "HIT", "the default is quality 70");
+        let lossless = fetch(&configured, "&f=image/webp&quality=100").await;
+        assert_eq!(lossless.x_cache, "MISS");
+        assert_eq!(
+            webp_chunk(&lossless.body),
+            b"VP8L",
+            "explicit 100 is lossless"
+        );
+        assert_eq!(lossless.body, fetch(&plain, "&f=image/webp").await.body);
+        // JPEG keeps its own default.
+        assert_eq!(
+            fetch(&configured, "&f=image/jpeg").await.body,
+            fetch(&plain, "&f=image/jpeg").await.body
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_sets_the_jpeg_quality() {
+        let app = app();
+        let default = fetch(&app, "&f=image/jpeg").await;
+        assert_eq!(fetch(&app, "&f=image/jpeg&quality=85").await.x_cache, "HIT");
+        let low = fetch(&app, "&f=image/jpeg&quality=20").await;
+        assert_eq!(low.x_cache, "MISS");
+        assert!(low.body.len() < default.body.len());
+    }
+
+    #[tokio::test]
+    async fn bad_quality_is_400_naming_the_range_or_formats() {
+        let app = app();
+        for (query, description) in [
+            (
+                "&f=image/webp&quality=0",
+                "quality '0' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/webp&quality=101",
+                "quality '101' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/jpeg&quality=4.5",
+                "quality '4.5' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/png&quality=80",
+                "quality applies only to image/jpeg and image/webp, not image/png",
+            ),
+            (
+                "&quality=80",
+                "quality applies only to image/jpeg and image/webp, not image/png",
+            ),
+        ] {
+            let resp = fetch(&app, query).await;
+            assert_eq!(resp.status, StatusCode::BAD_REQUEST, "{query}");
+            let json: Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(json["description"], description, "{query}");
+        }
+        // The styled route validates the same way.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/collections/radar/styles/default/map?bbox=10,55,30,70\
+                         &f=image/png&quality=50",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Both map routes declare `quality` (repo rule: every new parameter
+    /// updates `api_definition()`), as a bounded integer.
+    #[tokio::test]
+    async fn quality_is_in_the_api_definition() {
+        let (_, api) = get_on(app(), "/api").await;
+        for path in [
+            "/maps/collections/radar/map",
+            "/maps/collections/radar/styles/{styleId}/map",
+        ] {
+            let parameters = api["paths"][path]["get"]["parameters"].as_array().unwrap();
+            assert!(
+                parameters
+                    .contains(&serde_json::json!({"$ref": "#/components/parameters/quality"})),
+                "{path}"
+            );
+        }
+        let quality = &api["components"]["parameters"]["quality"];
+        assert_eq!(quality["in"], "query");
+        assert_eq!(
+            quality["schema"],
+            serde_json::json!({"type": "integer", "minimum": 1, "maximum": 100})
+        );
     }
 }

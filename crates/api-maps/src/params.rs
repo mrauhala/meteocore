@@ -56,6 +56,10 @@ pub struct MapQueryParams {
     /// Vertical level selector (e.g. a radar elevation angle). Rejected
     /// with HTTP 400 for collections with no vertical dimension.
     pub elevation: Option<String>,
+    /// Encoder quality (MeteoCore extension): 1–100 for `image/webp`
+    /// (100 = lossless) and `image/jpeg`; rejected for PNG. A string so a
+    /// bad value gets the range message instead of a deserialize error.
+    pub quality: Option<String>,
 }
 
 /// Query parameters for the style legend endpoint.
@@ -107,7 +111,12 @@ pub struct ValidatedMapParams {
     pub crs: String,
     pub time: Option<DateTime<Utc>>,
     pub output_crs: ds_core::map_engine::OutputCrs,
+    /// Output format at its default quality (JPEG 85, lossless WebP); the
+    /// handler applies [`Self::quality`] and the collection's `webp_quality`.
     pub format: ds_render::ImageFormat,
+    /// The `quality` parameter, 1–100, when supplied. Always `None` for PNG,
+    /// which rejects it.
+    pub quality: Option<u8>,
     pub parameter_name: Option<String>,
     /// Vertical level, parsed from the `elevation` query parameter.
     pub z: Option<f64>,
@@ -181,10 +190,13 @@ impl MapQueryParams {
             )));
         }
         let format = match format_str {
-            "image/jpeg" => ds_render::ImageFormat::Jpeg,
-            "image/webp" => ds_render::ImageFormat::Webp,
+            "image/jpeg" => ds_render::ImageFormat::JPEG,
+            "image/webp" => ds_render::ImageFormat::WEBP,
             _ => ds_render::ImageFormat::Png,
         };
+        // QUALITY — JPEG/WebP only; a value on PNG is an error, not ignored.
+        let quality = ds_render::parse_quality("quality", self.quality.as_deref(), format)
+            .map_err(MapsError::BadRequest)?;
 
         // DATETIME / TIME
         let time = self.datetime.as_deref().map(parse_time).transpose()?;
@@ -259,6 +271,7 @@ impl MapQueryParams {
             time,
             output_crs,
             format,
+            quality,
             parameter_name,
             z,
         })
@@ -458,6 +471,7 @@ mod tests {
             bbox_crs: None,
             parameter_name: None,
             elevation: None,
+            quality: None,
         }
     }
 
@@ -483,6 +497,53 @@ mod tests {
             "{:?}",
             validated.bbox
         );
+    }
+
+    #[test]
+    fn quality_is_parsed_for_webp_and_jpeg() {
+        for (f, q) in [
+            ("image/webp", "75"),
+            ("image/jpeg", "40"),
+            ("image/webp", "100"),
+        ] {
+            let mut query = query_with_crs("CRS:84");
+            query.format = Some(f.into());
+            query.quality = Some(q.into());
+            let validated = query.validate().unwrap();
+            assert_eq!(validated.quality, Some(q.parse().unwrap()), "{f}");
+            assert_eq!(validated.format, validated.format.with_default_quality());
+        }
+        let mut query = query_with_crs("CRS:84");
+        query.format = Some("image/webp".into());
+        assert_eq!(query.validate().unwrap().quality, None);
+    }
+
+    #[test]
+    fn quality_out_of_range_or_on_png_is_400() {
+        let bad = |f: &str, q: &str| {
+            let mut query = query_with_crs("CRS:84");
+            query.format = Some(f.into());
+            query.quality = Some(q.into());
+            match query.validate() {
+                Err(MapsError::BadRequest(msg)) => msg,
+                Err(other) => panic!("{f} {q}: expected BadRequest, got {other:?}"),
+                Ok(_) => panic!("{f} {q}: expected an error"),
+            }
+        };
+        for q in ["0", "101", "x", "7.5"] {
+            assert_eq!(
+                bad("image/webp", q),
+                format!("quality '{q}' must be an integer from 1 to 100")
+            );
+        }
+        assert_eq!(
+            bad("image/png", "80"),
+            "quality applies only to image/jpeg and image/webp, not image/png"
+        );
+        // f defaults to PNG, so a bare quality is rejected too.
+        let mut query = query_with_crs("CRS:84");
+        query.quality = Some("80".into());
+        assert!(matches!(query.validate(), Err(MapsError::BadRequest(_))));
     }
 
     #[test]

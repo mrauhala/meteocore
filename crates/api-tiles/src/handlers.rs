@@ -725,12 +725,13 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
-        // Only map tiles render a selected parameter.
+        // Only map tiles render a selected parameter at an encoder quality.
         if has_raster {
             if let Some(parameters) =
                 collection_paths[&tile_path]["get"]["parameters"].as_array_mut()
             {
                 parameters.push(json!({"$ref": "#/components/parameters/parameter-name"}));
+                parameters.push(json!({"$ref": "#/components/parameters/quality"}));
             }
         }
 
@@ -782,6 +783,7 @@ pub(crate) fn collection_openapi_paths(
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/elevation"},
                         {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/quality"},
                         {
                             "name": "f",
                             "in": "query",
@@ -930,7 +932,8 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "schema": {"type": "number"},
                 "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
             },
-            "parameter-name": api_common::parameter_name_parameter()
+            "parameter-name": api_common::parameter_name_parameter(),
+            "quality": api_common::quality_parameter(ds_render::DEFAULT_JPEG_QUALITY)
         },
         "schemas": {
             "legend": api_common::legend_schema()
@@ -1689,6 +1692,7 @@ pub async fn vector_tile(
         ("datetime", &params.datetime),
         ("elevation", &params.elevation),
         ("parameter-name", &params.parameter_name),
+        ("quality", &params.quality),
     ] {
         if value.is_some() {
             return Err(TilesError::BadRequest(format!(
@@ -1912,6 +1916,13 @@ pub async fn get_tile(
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
     if params.is_mvt() {
+        // A vector tile has no encoder quality; reject it rather than ignore
+        // it (#605).
+        if params.quality.is_some() {
+            return Err(TilesError::BadRequest(
+                "'quality' is not supported for vector tiles".into(),
+            ));
+        }
         return render_vector_tile(
             headers,
             &id,
@@ -2143,7 +2154,7 @@ async fn render_tile(
     state: AppState,
 ) -> Result<impl IntoResponse, TilesError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_engine(&state, collection_id)?;
+    let (engine, config) = lookup_engine(&state, collection_id)?;
 
     // Validate TileMatrixSet
     let tms = tilematrixset::get_tile_matrix_set(tms_id).ok_or_else(|| {
@@ -2175,6 +2186,13 @@ async fn render_tile(
 
     // Validate query params
     let validated = params.validate()?;
+    // The format as encoded: an explicit `quality`, else for WebP the
+    // collection's `[wms] webp_quality`, else the format default (JPEG 85,
+    // lossless WebP). It keys the rendered cache, so a lossy and a lossless
+    // tile never alias.
+    let format = validated
+        .format
+        .with_quality(validated.quality, config.webp_quality());
 
     // An RGB composite (#819) has no style map: its colours come from its
     // channels, and its one style is `default`.
@@ -2223,7 +2241,7 @@ async fn render_tile(
         }
     };
 
-    let content_type = validated.format.content_type();
+    let content_type = format.content_type();
     let has_explicit_time = validated.time.is_some();
 
     // Determine output CRS from TileMatrixSet
@@ -2294,11 +2312,7 @@ async fn render_tile(
         // parameter-layer style aliasing a same-named collection style.
         layer: style_layer_key,
         style: style_name.to_string(),
-        format: match validated.format {
-            ds_render::ImageFormat::Png => 0,
-            ds_render::ImageFormat::Jpeg => 1,
-            ds_render::ImageFormat::Webp => 2,
-        },
+        format,
         crs: tms_id.to_string(),
         bbox: ds_render::quantize_bbox(&bbox),
         width: tile_size,
@@ -2396,7 +2410,6 @@ async fn render_tile(
 
     // Render on a blocking thread
     let engine = engine.clone();
-    let format = validated.format;
     let rendered_cache = state.rendered_cache.clone();
 
     // The blocking closure returns Ok(None) for empty (all-nodata) tiles,

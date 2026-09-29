@@ -242,14 +242,21 @@ pub fn flatten_onto(rgba: &mut [u8], background: [u8; 3]) {
     }
 }
 
-/// Encode an RGBA buffer to JPEG bytes.
+/// Encode an RGBA buffer to JPEG bytes at `quality` (1–100).
 ///
 /// Drops the alpha channel (JPEG doesn't support transparency), compositing
 /// non-opaque pixels over white. A caller wanting another background (WMS
 /// `BGCOLOR`) flattens with [`flatten_onto`] first — an opaque buffer passes
 /// through unchanged.
-/// Quality 85 gives a good size/quality tradeoff.
-pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
+/// The request default, [`DEFAULT_JPEG_QUALITY`](crate::DEFAULT_JPEG_QUALITY)
+/// (85), gives a good size/quality tradeoff; `jpeg-encoder` clamps `quality`
+/// to 1–100 and switches from 4:2:0 chroma subsampling to none at 90.
+pub fn encode_jpeg(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, DataServerError> {
     let expected_len = (width * height * 4) as usize;
     if rgba.len() != expected_len {
         return Err(DataServerError::Render(format!(
@@ -269,7 +276,7 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
     }
 
     let mut buf = Vec::with_capacity((width * height * 3) as usize);
-    let encoder = jpeg_encoder::Encoder::new(&mut buf, 85);
+    let encoder = jpeg_encoder::Encoder::new(&mut buf, quality);
     encoder
         .encode(
             &rgb,
@@ -281,14 +288,26 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
     Ok(buf)
 }
 
-/// Encode an RGBA buffer to WebP bytes.
+/// libwebp effort (`method`, 0–6) of a lossy WebP encode: 0, the fastest.
 ///
-/// Uses lossless encoding. Our raster output is colormapped radar/NWP tiles:
-/// hard class boundaries drawn from a small palette. Lossy WebP introduces
-/// ringing around those edges and can shift pixels off the palette, which
-/// effectively corrupts the encoded data values. Lossless preserves every
-/// pixel exactly while still compressing the limited palette well.
-/// WebP supports alpha channel natively, so no transparency compositing needed.
+/// On a 2310×1734 continuous-tone IR frame (M2 Max, quality
+/// 80) method 0 encodes in ~53 ms, method 2 in ~100 ms and libwebp's default
+/// 4 in ~200 ms, while method 4's output is only ~15% smaller at the same
+/// PSNR. Method 4 would encode slower than the lossless path it replaces for
+/// such frames, and the encode runs on the render path, so speed wins.
+const WEBP_LOSSY_METHOD: i32 = 0;
+
+/// Encode an RGBA buffer to WebP bytes at `quality`.
+///
+/// `quality` [`MAX_QUALITY`](crate::MAX_QUALITY) (100, the default) is
+/// lossless; 1–99 is lossy at that quality.
+///
+/// **Lossless** suits colormapped radar/NWP tiles: hard class boundaries
+/// drawn from a small palette. Lossy WebP introduces ringing around those
+/// edges and can shift pixels off the palette, which effectively corrupts the
+/// encoded data values. Lossless preserves every pixel exactly while still
+/// compressing the limited palette well. WebP supports alpha channel natively,
+/// so no transparency compositing needed.
 ///
 /// We set libwebp's `exact` flag so the RGB channels are preserved even under
 /// fully transparent (alpha == 0) pixels. By default libwebp's lossless mode
@@ -296,7 +315,19 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
 /// make the output not byte-exact. For nodata pixels the RGB is irrelevant to
 /// the viewer, but keeping the encode truly exact avoids surprises and keeps
 /// the round-trip guarantee unconditional.
-pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
+///
+/// **Lossy** suits continuous-tone imagery such as satellite IR, where it is
+/// several times smaller and faster to encode. The alpha plane stays
+/// lossless (`alpha_quality` 100, losslessly compressed), so transparent
+/// nodata keeps exact edges and `TRANSPARENT=TRUE` output stays transparent;
+/// only the colour under full transparency may change. See
+/// [`WEBP_LOSSY_METHOD`] for the effort.
+pub fn encode_webp(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, DataServerError> {
     let expected_len = (width * height * 4) as usize;
     if rgba.len() != expected_len {
         return Err(DataServerError::Render(format!(
@@ -310,21 +341,28 @@ pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
 
     let encoder = webp::Encoder::from_rgba(rgba, width, height);
 
-    // Mirror `Encoder::encode_lossless()` but enable `exact` to keep transparent
-    // pixels' RGB intact. `WebPConfig::new()` only fails if libwebp's version
-    // doesn't match the header — treat that as a render error rather than panic.
-    //
-    // `WebPConfig::new()` uses the default preset, which leaves `method = 4`
-    // (a lossy-oriented effort level). `encode_lossless()` applies the lossless
-    // preset which sets `method = 0` (fastest lossless encoder); we replicate
-    // that here so we don't pay extra encode latency under the render semaphore.
+    // `WebPConfig::new()` only fails if libwebp's version doesn't match the
+    // header — treat that as a render error rather than panic.
     let mut config = webp::WebPConfig::new()
         .map_err(|()| DataServerError::Render("WebP config init failed".to_string()))?;
-    config.lossless = 1;
-    config.method = 0;
-    config.alpha_compression = 0;
-    config.quality = 75.0;
-    config.exact = 1;
+    if quality >= crate::MAX_QUALITY {
+        // Lossless, with `exact` to keep transparent pixels' RGB intact.
+        // `method = 0` is the fastest lossless effort (`WebPConfig::new()`
+        // defaults to 4); `quality` is the effort within it, and 75 is
+        // unchanged since lossless WebP first shipped so its bytes and
+        // ETags stay stable.
+        config.lossless = 1;
+        config.method = 0;
+        config.alpha_compression = 0;
+        config.quality = 75.0;
+        config.exact = 1;
+    } else {
+        config.lossless = 0;
+        config.quality = f32::from(quality);
+        config.method = WEBP_LOSSY_METHOD;
+        config.alpha_compression = 1;
+        config.alpha_quality = 100;
+    }
 
     let memory = encoder
         .encode_advanced(&config)
@@ -355,7 +393,7 @@ mod tests {
     #[test]
     fn test_encode_jpeg_valid() {
         let rgba = vec![255u8; 4 * 4 * 4]; // 4x4 white
-        let result = encode_jpeg(&rgba, 4, 4);
+        let result = encode_jpeg(&rgba, 4, 4, crate::DEFAULT_JPEG_QUALITY);
         assert!(result.is_ok());
         let bytes = result.unwrap();
         assert!(bytes[0] == 0xFF && bytes[1] == 0xD8); // JPEG SOI marker
@@ -364,7 +402,7 @@ mod tests {
     #[test]
     fn test_encode_webp_valid() {
         let rgba = vec![255u8; 4 * 4 * 4]; // 4x4 white
-        let result = encode_webp(&rgba, 4, 4);
+        let result = encode_webp(&rgba, 4, 4, crate::MAX_QUALITY);
         assert!(result.is_ok());
         let bytes = result.unwrap();
         // WebP files start with RIFF header
@@ -399,7 +437,8 @@ mod tests {
             }
         }
 
-        let bytes = encode_webp(&rgba, width, height).expect("encode should succeed");
+        let bytes =
+            encode_webp(&rgba, width, height, crate::MAX_QUALITY).expect("encode should succeed");
 
         let decoded = webp::Decoder::new(&bytes)
             .decode()
@@ -416,11 +455,125 @@ mod tests {
         );
     }
 
+    /// The first chunk of a WebP file: `VP8L` is the lossless bitstream,
+    /// `VP8 ` lossy without alpha, `VP8X` the extended container libwebp
+    /// writes for lossy with an `ALPH` chunk.
+    fn webp_first_chunk(bytes: &[u8]) -> &[u8] {
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
+        &bytes[12..16]
+    }
+
+    /// A smooth continuous-tone field (IR-like) with a fully transparent
+    /// left third, as nodata off the edge of coverage.
+    fn continuous_tone(width: u32, height: u32) -> Vec<u8> {
+        rgba_from(width, height, |x, y| {
+            if x < width / 3 {
+                [0, 0, 0, 0]
+            } else {
+                let v = ((x * 3 + y * 5) % 256) as u8;
+                [v, v / 2 + 40, 255 - v, 255]
+            }
+        })
+    }
+
+    #[test]
+    fn lossy_webp_decodes_with_exact_alpha() {
+        let (width, height) = (96u32, 64u32);
+        let rgba = continuous_tone(width, height);
+        let bytes = encode_webp(&rgba, width, height, 80).expect("lossy encode");
+        assert_eq!(webp_first_chunk(&bytes), b"VP8X", "lossy with alpha");
+
+        let decoded = webp::Decoder::new(&bytes).decode().expect("decodes");
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+        assert!(decoded.is_alpha(), "TRANSPARENT output must keep alpha");
+        let mut abs_err = 0u64;
+        let mut opaque = 0u64;
+        for (src, out) in rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(decoded.as_chunks::<4>().0)
+        {
+            // The alpha plane is lossless: nodata stays exactly transparent
+            // and data exactly opaque.
+            assert_eq!(src[3], out[3], "alpha must survive lossy encoding");
+            if src[3] == 255 {
+                abs_err += (0..3).map(|c| src[c].abs_diff(out[c]) as u64).sum::<u64>();
+                opaque += 3;
+            }
+        }
+        let mean = abs_err as f64 / opaque as f64;
+        assert!(mean < 6.0, "mean channel error {mean} too large for q=80");
+    }
+
+    #[test]
+    fn lossy_webp_of_opaque_image_has_no_alpha_chunk() {
+        let rgba = rgba_from(64, 64, |x, y| [(x * 4) as u8, (y * 4) as u8, 128, 255]);
+        let bytes = encode_webp(&rgba, 64, 64, 75).unwrap();
+        assert_eq!(webp_first_chunk(&bytes), b"VP8 ");
+        let decoded = webp::Decoder::new(&bytes).decode().unwrap();
+        assert!(!decoded.is_alpha());
+    }
+
+    #[test]
+    fn webp_quality_selects_lossless_only_at_100() {
+        let rgba = continuous_tone(96, 64);
+        assert_eq!(
+            webp_first_chunk(&encode_webp(&rgba, 96, 64, crate::MAX_QUALITY).unwrap()),
+            b"VP8L"
+        );
+        for quality in [1, 50, 99] {
+            let bytes = encode_webp(&rgba, 96, 64, quality).unwrap();
+            assert_ne!(webp_first_chunk(&bytes), b"VP8L", "quality {quality}");
+        }
+        // Lower quality, fewer bytes: the value reaches the encoder.
+        let low = encode_webp(&rgba, 96, 64, 10).unwrap();
+        let high = encode_webp(&rgba, 96, 64, 95).unwrap();
+        assert!(low.len() < high.len(), "{} vs {}", low.len(), high.len());
+    }
+
+    #[test]
+    fn lossy_webp_is_much_smaller_than_lossless_for_continuous_tone() {
+        // Smooth gradient plus deterministic per-pixel noise: many distinct
+        // colours, the case lossy WebP exists for.
+        let rgba = rgba_from(256, 256, |x, y| {
+            let mut s = x
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(y.wrapping_mul(12_345));
+            s ^= s >> 13;
+            let n = (s % 7) as u8;
+            [
+                (x as u8).wrapping_add(n),
+                (y as u8).wrapping_add(n),
+                128 + n,
+                255,
+            ]
+        });
+        let lossless = encode_webp(&rgba, 256, 256, crate::MAX_QUALITY).unwrap();
+        let lossy = encode_webp(&rgba, 256, 256, 80).unwrap();
+        assert!(
+            lossy.len() * 3 < lossless.len(),
+            "lossy {} B should be well under a third of lossless {} B",
+            lossy.len(),
+            lossless.len()
+        );
+    }
+
+    #[test]
+    fn jpeg_quality_reaches_the_encoder() {
+        let rgba = continuous_tone(96, 64);
+        let low = encode_jpeg(&rgba, 96, 64, 20).unwrap();
+        let default = encode_jpeg(&rgba, 96, 64, crate::DEFAULT_JPEG_QUALITY).unwrap();
+        let high = encode_jpeg(&rgba, 96, 64, 100).unwrap();
+        assert!(low.len() < default.len() && default.len() < high.len());
+    }
+
     #[test]
     fn test_encode_jpeg_transparent_to_white() {
         // Fully transparent pixel → white background in JPEG
         let rgba = vec![0, 0, 0, 0, 255, 0, 0, 255]; // 2x1: transparent, red
-        let result = encode_jpeg(&rgba, 2, 1);
+        let result = encode_jpeg(&rgba, 2, 1, crate::DEFAULT_JPEG_QUALITY);
         assert!(result.is_ok());
     }
 
@@ -455,8 +608,8 @@ mod tests {
         let mut flat = rgba.clone();
         flatten_onto(&mut flat, [255, 255, 255]);
         assert_eq!(
-            encode_jpeg(&rgba, 8, 8).unwrap(),
-            encode_jpeg(&flat, 8, 8).unwrap()
+            encode_jpeg(&rgba, 8, 8, crate::DEFAULT_JPEG_QUALITY).unwrap(),
+            encode_jpeg(&flat, 8, 8, crate::DEFAULT_JPEG_QUALITY).unwrap()
         );
     }
 

@@ -411,6 +411,8 @@ max_files = 24
 [collections.wms]
 colormap = "radar_dbz"          # built-in colormap (or use color_stops for custom)
 # rendered_cache_mb = 128       # optional, default 128 MB
+# webp_quality = 80             # optional, default WebP quality 1-100 (100 = lossless,
+                                # the default); lossy suits continuous-tone layers
 ```
 
 ### Server Config Fields
@@ -1491,6 +1493,9 @@ For multi-parameter engines, GetCapabilities emits a non-requestable parent laye
 | `TIME` | no | ISO 8601 timestamp; defaults to the latest available |
 | `TRANSPARENT` | no | `TRUE` (default) keeps nodata transparent; `FALSE` returns an opaque image with nodata painted in `BGCOLOR` |
 | `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output; default `0xFFFFFF` (white) |
+| `QUALITY` | no | Vendor parameter: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy at that quality, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range, it is `InvalidParameterValue` (400). GetMap only: GetLegendGraphic ignores it and stays lossless. |
+
+Lossy WebP suits continuous-tone layers such as satellite IR, where a frame is several times smaller and faster to encode than lossless. Its alpha plane stays lossless, so `TRANSPARENT=TRUE` nodata stays exactly transparent. Keep colormapped layers with discrete classes, such as radar, lossless: lossy coding blurs class edges and shifts pixels off the palette. The rendered-image cache and the ETag key on the quality actually used, so a lossy and a lossless image of one view are never mixed up.
 
 ### WMS 1.3.0 BBOX Axis Order
 
@@ -1690,6 +1695,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
 | `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. (Global cache; lives under `[wms]` for backward compatibility — see note.) |
+| `webp_quality` | no | lossless | Default quality, 1–100, for this collection's `image/webp` maps and tiles in WMS, Maps and Tiles: 1–99 lossy, 100 lossless. A request's own `QUALITY` / `quality` wins, including 100 for lossless. Not applied to JPEG. Validated at load. Collection-level only; style bundles do not carry it. |
 
 ### Limits
 
@@ -1729,6 +1735,7 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 | `f` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp` |
 | `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData), or an RGB composite of a satellite collection, which renders with the `default` style only (another style is 404). The valid names are the keys of the collection's `parameter_names`. Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
 | `transparent` | no | — | Accepted but currently a no-op |
+| `quality` | no | see description | MeteoCore extension: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range: 400. |
 
 `width × height` is additionally capped at `MAX_MAP_PIXELS = 64,000,000` (= 8000²), so a request at the per-dimension cap never trips the pixel cap with a confusing second error.
 
@@ -1789,6 +1796,7 @@ Both support `tileMatrix` 0–24 (capped by `MAX_ZOOM_LEVEL`). `tileMatrixSetLim
 | `f` | no | `image/png` | Raster: `image/png`, `image/jpeg`, `image/webp`. Vector: `mvt` or `application/vnd.mapbox-vector-tile`. |
 | `datetime` | no | latest | ISO 8601 instant; ignored for `?f=mvt` |
 | `parameter-name` | no | engine default | Same semantics as Maps `parameter-name`. Ignored for `?f=mvt`. |
+| `quality` | no | see description | Raster only, same semantics as Maps `quality`: 1–100 for `image/webp` (100 = lossless, default the collection's `[wms] webp_quality`, else lossless) and `image/jpeg` (default 85). With `image/png`, out of range or on a vector tile: 400. |
 
 `tileMatrix > 24` returns 400. Tile coordinates outside the matrix (e.g. `row=1` at `z=0` on `WebMercatorQuad`) return 404.
 
@@ -1827,7 +1835,7 @@ When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against 
 Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP bytes. Shared across WMS, Maps, and Tiles APIs.
 
 - Default size: 512 MB (configurable via `rendered_cache_mb`)
-- Cache key: quantized bbox (6 decimal places) + layer + style + format + width + height + CRS + time + parameter
+- Cache key: quantized bbox (6 decimal places) + layer + style + format with its encoder quality + width + height + CRS + time + parameter
 - Lock-free concurrent LRU (uses `quick_cache`)
 - No TTL — immutable data. Cache invalidated on collection reload.
 - Error tiles and empty tiles (all nodata) are NOT cached.

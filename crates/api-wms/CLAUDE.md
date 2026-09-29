@@ -126,6 +126,19 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - GetCapabilities advertises nothing for these; the layer `opaque` attribute
   is unrelated and unchanged.
 
+## QUALITY / `[wms] webp_quality`
+
+- `QUALITY` (vendor, GetMap only) is 1–100 for JPEG and WebP; WebP 100 is
+  lossless. PNG + `QUALITY` and out-of-range values are
+  `InvalidParameterValue`. GetLegendGraphic ignores it (legends stay
+  lossless) so clients that send it on every request keep working.
+- The handler resolves the effective format once, before keying:
+  `params.format.with_quality(params.quality, collection webp_quality)`.
+  `ds_render::ImageFormat` carries the quality, so `CacheKey.format` keys
+  it; the meta-tile key needs none (its tiles are RGBA, encoded per
+  request). Never re-derive the format from `params.format` after that
+  point, or lossy and lossless responses alias in the rendered cache.
+
 ## Capabilities niceties
 
 - Collection `keywords` → `<KeywordList>` (after `<Abstract>`, WMS 1.3.0

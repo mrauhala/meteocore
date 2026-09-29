@@ -98,9 +98,10 @@ GetFeatureInfo is not supported.
 | `BBOX` | yes | Bounding box (axis order depends on CRS) |
 | `WIDTH` | yes | Output image width in pixels (1–8000) |
 | `HEIGHT` | yes | Output image height in pixels (1–8000) |
-| `FORMAT` | yes | Must be `image/png` |
+| `FORMAT` | yes | `image/png`, `image/jpeg` or `image/webp` |
 | `TRANSPARENT` | no | `TRUE` (default) or `FALSE`. `FALSE` returns an opaque image with nodata painted in `BGCOLOR` |
 | `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output (default `0xFFFFFF`) |
+| `QUALITY` | no | Vendor parameter: encoder quality 1–100 for `image/webp` (1–99 lossy, 100 lossless; default the collection's `[wms] webp_quality`, else lossless) and `image/jpeg` (default 85). With `image/png` or out of range: `InvalidParameterValue` |
 | `TIME` | no | ISO 8601 timestamp. Defaults to latest available. |
 | `STYLES` | no | Ignored (only default style is supported) |
 

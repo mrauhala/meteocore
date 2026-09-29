@@ -116,6 +116,12 @@ fn build_router() -> axum::Router {
 }
 
 fn build_state() -> api_tiles::AppState {
+    build_state_with_wms(None)
+}
+
+/// [`build_state`] with the collection's `[wms]` config, for the
+/// per-collection settings the handler reads (e.g. `webp_quality`).
+fn build_state_with_wms(wms: Option<ds_core::config::WmsConfig>) -> api_tiles::AppState {
     let engine: Arc<dyn MapEngine> = Arc::new(MockMapEngine::new());
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -135,7 +141,7 @@ fn build_state() -> api_tiles::AppState {
             license: None,
             geotiff: None,
             querydata: None,
-            wms: None,
+            wms,
             grib: None,
             zarr: None,
             odim: None,
@@ -1635,6 +1641,35 @@ mod mvt {
 
     fn build_mvt_router() -> axum::Router {
         api_tiles::router(build_mvt_state())
+    }
+
+    /// A vector tile has no encoder quality: `quality` is a 400 on both the
+    /// per-API content-negotiated route and the shared root's vector route,
+    /// never silently ignored (#605).
+    #[tokio::test]
+    async fn quality_is_rejected_for_vector_tiles() {
+        for (app, uri) in [
+            (
+                build_mvt_router(),
+                "/collections/places/tiles/WebMercatorQuad/0/0/0?f=mvt&quality=80",
+            ),
+            (
+                super::shared_router(build_mvt_state()),
+                "/collections/places/tiles/WebMercatorQuad/0/0/0?quality=80",
+            ),
+        ] {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["description"], "'quality' is not supported for vector tiles",
+                "{uri}"
+            );
+        }
     }
 
     fn build_mvt_state() -> api_tiles::AppState {
@@ -3667,5 +3702,136 @@ mod composites {
         )
         .await;
         assert_eq!(other.status, StatusCode::NOT_FOUND);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `quality` parameter and `[wms] webp_quality`
+// ---------------------------------------------------------------------------
+
+mod quality {
+    use super::*;
+
+    /// The first RIFF chunk of a WebP body: `VP8L` is lossless.
+    fn webp_chunk(body: &[u8]) -> &[u8] {
+        assert_eq!(&body[..4], b"RIFF", "not a WebP body");
+        &body[12..16]
+    }
+
+    const TILE: &str =
+        "/collections/radar/tiles/WebMercatorQuad/3/2/4?datetime=2024-01-01T00:00:00Z";
+
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
+        let (status, headers, body) = get_raw_on(app.clone(), uri).await;
+        let x_cache = headers
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (status, x_cache, body)
+    }
+
+    #[tokio::test]
+    async fn lossy_and_lossless_webp_tiles_never_alias_in_the_cache() {
+        let app = build_router();
+        let (status, x_cache, lossless) = fetch(&app, &format!("{TILE}&f=image/webp")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(x_cache, "MISS");
+        assert_eq!(webp_chunk(&lossless), b"VP8L", "default is lossless");
+
+        let (status, x_cache, lossy) =
+            fetch(&app, &format!("{TILE}&f=image/webp&quality=75")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(x_cache, "MISS", "a lossless entry must not serve lossy");
+        assert_ne!(webp_chunk(&lossy), b"VP8L");
+
+        let (_, x_cache, explicit) = fetch(&app, &format!("{TILE}&f=image/webp&quality=100")).await;
+        assert_eq!(x_cache, "HIT", "100 is the lossless request");
+        assert_eq!(explicit, lossless);
+        let (_, x_cache, again) = fetch(&app, &format!("{TILE}&f=image/webp&quality=75")).await;
+        assert_eq!(x_cache, "HIT");
+        assert_eq!(again, lossy);
+    }
+
+    #[tokio::test]
+    async fn collection_webp_quality_is_the_default_and_quality_overrides_it() {
+        let wms: ds_core::config::WmsConfig =
+            serde_json::from_value(serde_json::json!({ "webp_quality": 60 })).unwrap();
+        let state = build_state_with_wms(Some(wms));
+        for (app, tile) in [
+            (api_tiles::router(state.clone()), TILE.to_string()),
+            // The shared root's map-tile route takes the same default.
+            (
+                shared_router(state.clone()),
+                TILE.replace("/tiles/", "/map/tiles/"),
+            ),
+        ] {
+            let (status, _, default) = fetch(&app, &format!("{tile}&f=image/webp")).await;
+            assert_eq!(status, StatusCode::OK, "{tile}");
+            assert_ne!(
+                webp_chunk(&default),
+                b"VP8L",
+                "{tile}: collection default is lossy"
+            );
+            let (_, x_cache, _) = fetch(&app, &format!("{tile}&f=image/webp&quality=60")).await;
+            assert_eq!(x_cache, "HIT", "{tile}: the default is quality 60");
+            let (_, _, lossless) = fetch(&app, &format!("{tile}&f=image/webp&quality=100")).await;
+            assert_eq!(
+                webp_chunk(&lossless),
+                b"VP8L",
+                "{tile}: explicit 100 is lossless"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_quality_is_400() {
+        let app = build_router();
+        for (query, description) in [
+            (
+                "&f=image/webp&quality=0",
+                "quality '0' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/jpeg&quality=200",
+                "quality '200' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/png&quality=80",
+                "quality applies only to image/jpeg and image/webp, not image/png",
+            ),
+        ] {
+            let (status, _, body) = fetch(&app, &format!("{TILE}{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["description"], description, "{query}");
+        }
+        // The styled route validates the same way.
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/styles/grayscale/tiles/WebMercatorQuad/0/0/0?quality=9",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Raster tile routes declare `quality` (repo rule: every new parameter
+    /// updates `api_definition()`), and the component is the one Maps uses.
+    #[tokio::test]
+    async fn quality_is_in_the_api_definition() {
+        let (_, api) = get("/api").await;
+        let quality_ref = serde_json::json!({"$ref": "#/components/parameters/quality"});
+        for path in [
+            "/tiles/collections/radar/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
+            "/tiles/collections/radar/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
+        ] {
+            let parameters = api["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} missing"));
+            assert!(parameters.contains(&quality_ref), "{path}");
+        }
+        assert_eq!(
+            api["components"]["parameters"]["quality"],
+            api_common::quality_parameter(ds_render::DEFAULT_JPEG_QUALITY)
+        );
     }
 }
