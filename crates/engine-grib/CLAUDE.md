@@ -19,6 +19,17 @@ unlike GeoTIFF's one band per collection.
   `data_path`, `prefix_pattern` is optional and literal (no date templating),
   appended to the URL's object prefix (or the local store root);
   index/data files must share a basename (`X.index` ↔ `X.grib2`).
+- **Run prefixes** (remote) come from the shared
+  `ds_storage::discovery::expand_run_prefixes` (#817), never a local copy:
+  every run of today and yesterday (`SCAN_DAYS`) up to now, each day's
+  strftime date formatted and each `run_hours` hour substituted into `{run}`
+  as two digits. Runs come newest first: the `max_runs` early stop and
+  `settle_completed_runs` depend on that order. A pattern without `{run}` is
+  one prefix per day. A prefix repeated across runs (no day specifier) is
+  listed once; a second copy would settle the newest run.
+  `validate_run_prefix_pattern` runs at load: no `%H` (the run hour is
+  `{run}`), no `{`/`}` outside `{run}`, and with `{run}` a non-empty
+  `run_hours` of 0–23.
 - **Index formats** via `index_format`: `"ecmwf-json"` (default, JSON-lines
   as shipped by ECMWF open data) and `"wgrib2"` (colon-separated text as
   shipped by NOAA GFS).

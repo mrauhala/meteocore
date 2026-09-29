@@ -882,7 +882,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `data_path` | * | — | Local directory of `.grib2` + index files, or an `s3://`/`http(s)://` fixed-prefix URL. Mutually exclusive with `endpoint`+`bucket`. |
 | `endpoint` | * | — | S3-compatible endpoint URL. |
 | `bucket` | * | — | S3 bucket name. |
-| `prefix_pattern` | * | — | Object prefix with optional strftime date templates (e.g. `"%Y%m%d/00z/ifs/0p25/oper/"`); the run hour goes in `{run}`, not `%H`. Unknown specifiers are rejected at load. Required for S3; optional literal sub-prefix for `data_path`. |
+| `prefix_pattern` | * | — | Object prefix with optional strftime date templates (e.g. `"%Y%m%d/{run}z/ifs/0p25/oper/"`); the run hour goes in `{run}`, not `%H`, and each of `run_hours` is substituted there as two digits. Today's and yesterday's runs are listed, newest first. Unknown specifiers, and `{` or `}` other than `{run}`, are rejected at load. Required for S3; optional literal sub-prefix for `data_path`. |
 | `index_format` | no | `"ecmwf-json"` | Index format: `"ecmwf-json"` (JSON-lines, ECMWF open data) or `"wgrib2"` (colon-separated text, NOAA GFS). |
 | `index_suffix` | no | `".index"` | Suffix for index sidecar files |
 | `data_suffix` | no | `".grib2"` | Suffix for GRIB data files |
@@ -893,7 +893,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
 | `message_cache_mb` | no | `0` | Optional compressed GRIB message cache in MiB; additional to `grid_cache_mb`, shared by the source's level collections. `0` disables it. |
-| `run_hours` | no | all | Model run hours to poll, e.g., `[0, 6, 12, 18]` |
+| `run_hours` | no | `[0, 6, 12, 18]` | Model run hours to poll, 0–23, substituted into `{run}`. Must not be empty when `prefix_pattern` uses `{run}`; unused without it. |
 
 #### GRIB Config Example
 
