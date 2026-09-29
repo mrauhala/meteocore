@@ -188,6 +188,18 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   animation works); `z` is ignored. 3D Tiles `representation=cells` +
   Features output are follow-ups of #367.
 
+## File discovery
+
+- COMP filenames go through the shared
+  `ds_storage::discovery::FilenameMatcher` (#817), built by `build_matcher`
+  in `src/engine.rs` from `filename_template` or `filename_pattern` +
+  `timestamp_format`, and shared with engine-geotiff — never re-implement
+  it here. A template is anchored `^…$`, so `.tmp`/`.part` partial uploads
+  never match; an explicit pattern is used as written and logged at WARN
+  when unanchored.
+- PVOL `enumerate_remote` uses no template: `parse_key_timestamp` reads the
+  basename's first 12-digit run, only as a pre-fetch window filter.
+
 ## Retention & fixtures
 
 - `[odim] max_files` (default unbounded) / `time_window` bound retained

@@ -603,7 +603,9 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "in": "query",
                 "required": true,
                 "schema": {"type": "string"},
-                "description": "Bounding box: west,south,east,north"
+                // The antimeridian sentences are OGC API - Maps / Features
+                // Part 1's own `bbox` wording (#828).
+                "description": "Bounding box of the rendered map: west,south,east,north, in WGS 84 longitude/latitude (http://www.opengis.net/def/crs/OGC/1.3/CRS84), the only supported `bbox-crs`. For WGS 84 longitude/latitude the values are in most cases the sequence of minimum longitude, minimum latitude, maximum longitude and maximum latitude. However, in cases where the box spans the antimeridian the first value (west-most box edge) is larger than the third value (east-most box edge)."
             },
             "width": {
                 "name": "width",

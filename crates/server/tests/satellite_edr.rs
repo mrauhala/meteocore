@@ -42,6 +42,7 @@ fn satellite_config(dir: &Path) -> SatelliteConfig {
         bucket: None,
         time_window: None,
         poll_interval_secs: 60,
+        composites: Vec::new(),
         products: vec![
             product(
                 "ir_10_3",

@@ -116,7 +116,10 @@ pub struct ValidatedMapParams {
 impl MapQueryParams {
     /// Validate and extract map parameters, applying defaults.
     pub fn validate(&self) -> Result<ValidatedMapParams, MapsError> {
-        // BBOX-CRS — only CRS:84 supported
+        // BBOX-CRS — only CRS:84 supported. `parse_bbox` relies on this: it
+        // reads `west > east` as a box crossing the antimeridian, which only
+        // holds for longitudes. A projected `bbox-crs`, if ever added, must
+        // keep rejecting `minx > maxx`.
         if let Some(ref bbox_crs) = self.bbox_crs {
             let normalized = bbox_crs.trim();
             if normalized != "CRS:84"
@@ -262,7 +265,25 @@ impl MapQueryParams {
     }
 }
 
-/// Parse bbox string. OGC API Maps always uses lon/lat order (west,south,east,north).
+/// Parse a CRS84 `bbox` string (`west,south,east,north`, lon/lat order) into
+/// the viewport the engine renders.
+///
+/// `west > east` is a box crossing the antimeridian, as OGC API Maps and
+/// Features define it for WGS 84 longitude/latitude: `170,10,-170,20` is the
+/// 20°-wide box over the seam, not a 340°-wide one. It is unwrapped to a
+/// continuous viewport, `east + 360`, so the engine receives
+/// `[170, 10, 190, 20]`: the same request as `170,10,190,20`, which was
+/// already accepted, and the form WMS sends for a CRS:84 box past 180°.
+/// Each engine maps such longitudes to the meridian they show; one that
+/// does not renders nodata past 180°, never an error. Both longitudes of a
+/// crossing box must lie in `[-180, 180]`, the domain where the convention
+/// is defined. A `west < east` viewport is passed through as is, never
+/// clamped, including one reaching past ±180° (root CLAUDE.md Critical
+/// Rule 4).
+///
+/// The caller must only use this for a CRS84 `bbox-crs`: in a projected
+/// `bbox-crs`, `west > east` has no antimeridian reading. api-maps accepts no
+/// other `bbox-crs` (see [`MapQueryParams::validate`]).
 fn parse_bbox(bbox_str: &str) -> Result<[f64; 4], MapsError> {
     let parts: Vec<f64> = bbox_str
         .split(',')
@@ -287,11 +308,31 @@ fn parse_bbox(bbox_str: &str) -> Result<[f64; 4], MapsError> {
         }
     }
 
-    let [west, south, east, north] = [parts[0], parts[1], parts[2], parts[3]];
+    let [west, south, mut east, north] = [parts[0], parts[1], parts[2], parts[3]];
 
-    if west >= east || south >= north {
+    if south >= north {
         return Err(MapsError::BadRequest(
-            "bbox: west must be less than east, south must be less than north".into(),
+            "bbox: south must be less than north".into(),
+        ));
+    }
+
+    if west > east {
+        if !(-180.0..=180.0).contains(&west) || !(-180.0..=180.0).contains(&east) {
+            return Err(MapsError::BadRequest(
+                "bbox: west greater than east is a box crossing the antimeridian, \
+                 which needs both longitudes within [-180, 180]"
+                    .into(),
+            ));
+        }
+        east += 360.0;
+    }
+
+    // Equal longitudes, or `180,…,-180,…` once unwrapped: a box of no width.
+    if west >= east {
+        return Err(MapsError::BadRequest(
+            "bbox: west and east must differ; west greater than east is a box \
+             crossing the antimeridian"
+                .into(),
         ));
     }
 
@@ -337,9 +378,56 @@ mod tests {
         assert!(parse_bbox("10,55,30").is_err());
     }
 
+    /// #828: `west > east` is a CRS84 box crossing the antimeridian, unwrapped
+    /// to a continuous viewport past 180°. The seam test box first.
     #[test]
-    fn test_parse_bbox_invalid_order() {
-        assert!(parse_bbox("30,55,10,70").is_err()); // west > east
+    fn test_parse_bbox_antimeridian_is_unwrapped() {
+        assert_eq!(
+            parse_bbox("170,10,-170,20").unwrap(),
+            [170.0, 10.0, 190.0, 20.0]
+        );
+        // GOES-West's advertised fixture extent, requested back as is.
+        let [w, s, e, n] = parse_bbox("173.9,11.2,-174.8,16.3").unwrap();
+        assert_eq!([w, s, n], [173.9, 11.2, 16.3]);
+        assert!((e - 185.2).abs() < 1e-9, "{e}");
+        // The domain edges: a box from 180° across to 179°W, and 30°..10° is
+        // the 340°-wide box the long way round, not an inverted one.
+        assert_eq!(
+            parse_bbox("180,0,-179,1").unwrap(),
+            [180.0, 0.0, 181.0, 1.0]
+        );
+        assert_eq!(
+            parse_bbox("30,55,10,70").unwrap(),
+            [30.0, 55.0, 370.0, 70.0]
+        );
+    }
+
+    /// A `west < east` viewport is never clamped or wrapped, even past ±180°.
+    #[test]
+    fn test_parse_bbox_past_180_is_passed_through() {
+        assert_eq!(
+            parse_bbox("170,10,190,20").unwrap(),
+            [170.0, 10.0, 190.0, 20.0]
+        );
+        assert_eq!(
+            parse_bbox("-200,-10,200,10").unwrap(),
+            [-200.0, -10.0, 200.0, 10.0]
+        );
+    }
+
+    #[test]
+    fn test_parse_bbox_rejects_degenerate_and_inverted_boxes() {
+        // Zero width, directly or once unwrapped.
+        assert!(parse_bbox("10,55,10,70").is_err());
+        assert!(parse_bbox("180,55,-180,70").is_err());
+        // south >= north stays an error, with or without a crossing.
+        assert!(parse_bbox("10,70,30,55").is_err());
+        assert!(parse_bbox("10,55,30,55").is_err());
+        assert!(parse_bbox("170,20,-170,10").is_err());
+        // A crossing needs both longitudes in the CRS84 domain.
+        assert!(parse_bbox("190,10,-170,20").is_err());
+        assert!(parse_bbox("170,10,-190,20").is_err());
+        assert!(parse_bbox("200,10,100,20").is_err());
     }
 
     #[test]

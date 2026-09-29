@@ -143,6 +143,25 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     period (a global grid's). Bands of one resolution share it. `render::tests` counts the builds.
   - Frames and blocks go through `frame()` and `PixelReader` exactly as in
     a single-band render, so the refetch rules above hold unchanged.
+- **RGB composites are layers, not parameters** (`[[satellite.composites]]`,
+  decision of 2026-09-29 on #819).
+  - `MapEngine::composites` returns the `CompositeDef`s built at
+    construction. Their names are not in `RasterInfo.parameters` or EDR's
+    parameters: the parameter layers stay the products.
+  - A composite's time axis, `parameter_times(<composite>)`, is the scans
+    every band has: `Catalog::composite_times`, intersected by
+    `shared_times` in `Catalog::build`. Every poll rebuilds the snapshot, so
+    the axis follows ingest and eviction, and a call only clones an `Arc`.
+  - `resolve_parameter_time(Some(<composite>))` is `select_common` over its
+    bands, the call `resolve_parameters_time` and `render_bands` make. Do
+    not resolve it from the advertised axis instead: one helper cannot
+    drift (#507).
+  - A composite name given where a band is expected (`get_raster_tile`,
+    `get_raster_tiles`, EDR) is `InvalidParameter` naming its bands
+    (`not_a_band`). The API layer renders one by passing
+    `CompositeDef::parameters()` to `get_raster_tiles` and composing the
+    tiles with `ds_render::CompositeSpec::from(&def)`, whose planes follow
+    that order.
 
 ## Config
 
@@ -154,7 +173,13 @@ or GMGSI hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
 `unit` (declared: styles resolve at load, before any scan), `product`,
 `band` (required for ISatSS, whose `product` is the sector, `HFD`; refused
 for GMGSI, whose `product` is the mosaic, `ds_core::config::GMGSI_PRODUCTS`),
-`variable` (`data` for GMGSI). Validation:
+`variable` (`data` for GMGSI). `[[satellite.composites]]` with `name`
+(`^[a-z0-9_]+$`, not a product parameter), `title` (defaults to the name)
+and `red`, `green`, `blue`, each `{ parameter, minus, min, max, gamma }`:
+`minus` makes a band difference, `min > max` inverts, `gamma` defaults to 1.
+`parameter` and `minus` name product parameters. `recipe` is reserved and a
+load error until built-in recipes land; unknown keys in a composite are a
+load error. Validation:
 `ds_core::config::validate_satellite`.
 
 ## Bandwidth
@@ -198,4 +223,5 @@ summed per product on its own grid (products may mix 0.5/1/2 km).
 
 Other providers (GK2A CGMS navigation, MTG) are phases 3 and 5. A
 regional (non-global) Mercator grid is refused: only GMGSI needs one, and
-it is global.
+it is global. Composite layers in WMS/Maps/Tiles (the API wiring from
+`composites()`) and built-in composite recipes are phase 4 follow-ups.

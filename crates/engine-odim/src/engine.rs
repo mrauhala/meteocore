@@ -42,10 +42,11 @@ use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 
 use ds_storage::discovery::{
-    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
+    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
+    TimeWindow,
 };
 
-use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, FilenameMatcher, Location};
+use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, CatalogError, Location};
 use crate::reader::{read_composite, OdimComposite};
 
 /// Days of date-partitioned prefixes to scan when an S3 source has no
@@ -453,7 +454,7 @@ pub enum EngineError {
     #[error("either `filename_template` or `filename_pattern`+`timestamp_format` must be set")]
     NoFilenamePattern,
     #[error("filename pattern build failed: {0}")]
-    BadPattern(#[from] crate::catalog::CatalogError),
+    BadPattern(#[from] CatalogError),
     #[error(
         "ODIM collection has no source — set a local `data_path`, an \
          `http(s)://` `data_path`, or an S3 `endpoint` + `bucket`"
@@ -915,15 +916,15 @@ impl OdimEngine {
     }
 }
 
-/// Resolve the engine's `FilenameMatcher` from config: prefer
+/// Resolve the engine's shared [`FilenameMatcher`] from config: prefer
 /// `filename_template` (strftime), fall back to the explicit
 /// `filename_pattern` + `timestamp_format` pair.
 fn build_matcher(config: &ds_core::config::OdimConfig) -> Result<FilenameMatcher, EngineError> {
     if let Some(template) = &config.filename_template {
-        return Ok(FilenameMatcher::from_template(template)?);
+        return Ok(FilenameMatcher::from_template(template).map_err(CatalogError::from)?);
     }
     if let (Some(pattern), Some(format)) = (&config.filename_pattern, &config.timestamp_format) {
-        return Ok(FilenameMatcher::from_pattern(pattern, format)?);
+        return Ok(FilenameMatcher::from_pattern(pattern, format).map_err(CatalogError::from)?);
     }
     Err(EngineError::NoFilenamePattern)
 }
@@ -1144,10 +1145,14 @@ fn source_label(source: &Source) -> String {
 /// sides of the seam, `[west - 360, south, east + 360, north]`: inside
 /// ±180° that spans every longitude, as the old near-global extent did,
 /// and in a viewport crossing ±180° it still contains the footprint.
+/// A footprint of every longitude (a composite containing a pole,
+/// `[-180, s, 180, n]`) is widened the same way: fed as is, the walk
+/// clipped a viewport past ±180° (OGC API Maps sends a bbox crossing the
+/// antimeridian unwrapped, #828) a few degrees past the seam.
 /// The latitude bound is kept either way.
 fn footprint_guard_envelope(extent: [f64; 4]) -> [f64; 4] {
     match extent {
-        [w, s, e, n] if w > e => [w - 360.0, s, e + 360.0, n],
+        [w, s, e, n] if w > e || e - w >= 360.0 => [w - 360.0, s, e + 360.0, n],
         extent => extent,
     }
 }
@@ -1386,6 +1391,22 @@ mod tests {
             footprint_guard_envelope(clear_of_the_seam),
             clear_of_the_seam
         );
+    }
+
+    /// #828: a footprint of every longitude (a composite containing the
+    /// pole) keeps the whole seam test viewport 170°..190°, the box
+    /// 170,10,-170,20 unwrapped, including its columns past 187.2°, where
+    /// the raw extent's perimeter walk used to clip it.
+    #[test]
+    fn footprint_guard_keeps_a_polar_footprint_across_the_seam() {
+        let guard = footprint_guard_envelope([-180.0, 50.0, 180.0, 90.0]);
+        let (width, height) = (256, 256);
+        for view in [[170.0, 55.0, 190.0, 80.0], [-190.0, 55.0, -170.0, 80.0]] {
+            for output in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
+                let (x_lo, x_hi, _, _) = output.footprint_pixel_window(view, guard, width, height);
+                assert_eq!((x_lo, x_hi), (0, width - 1), "{output:?} {view:?}");
+            }
+        }
     }
 
     /// Minimal `OdimConfig` for `build_source` routing tests — only the

@@ -787,10 +787,12 @@ pub struct GeoTiffConfig {
     /// Simple filename template with strftime placeholders.
     /// E.g. `"OPERA@%Y%m%dT%H%M@0@ACRR.tiff"` or `"radar_%Y%m%dT%H%MZ.tif"`
     /// Auto-derives regex and timestamp format. Preferred over filename_pattern.
+    /// The whole filename must match, so partial uploads never do.
     pub filename_template: Option<String>,
     /// Regex pattern with a named capture group `timestamp` for extracting
-    /// timestamps from filenames. E.g. `radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif`
+    /// timestamps from filenames. E.g. `^radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif$`
     /// Only needed for complex patterns that filename_template can't express.
+    /// Used as written: without `^…$` anchors partial uploads may match.
     pub filename_pattern: Option<String>,
     /// chrono strftime format for parsing the captured timestamp string.
     /// E.g. `%Y%m%dT%H%MZ`. Only needed when using filename_pattern.
@@ -1172,6 +1174,59 @@ pub struct SatelliteConfig {
     #[serde(default = "default_satellite_poll_interval_secs")]
     pub poll_interval_secs: u64,
     pub products: Vec<SatelliteProductConfig>,
+    /// RGB composites over the products, each served as its own layer on
+    /// the scans every band it reads has (`[[satellite.composites]]`).
+    #[serde(default)]
+    pub composites: Vec<SatelliteCompositeConfig>,
+}
+
+/// One RGB composite of a satellite collection (`[[satellite.composites]]`),
+/// served as its own layer. Unknown keys are a load error: a mistyped
+/// `minus` or `gamma` would otherwise draw a subtly different picture.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteCompositeConfig {
+    /// Layer name (`^[a-z0-9_]+$`), distinct from every product parameter,
+    /// e.g. `"airmass"`.
+    pub name: String,
+    /// Human title; defaults to the name.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// A built-in recipe such as `"airmass"`. Reserved: recipes are not
+    /// supported yet, so setting it is a load error.
+    #[serde(default)]
+    pub recipe: Option<String>,
+    /// The red channel. Red, green and blue are all required.
+    #[serde(default)]
+    pub red: Option<SatelliteCompositeChannel>,
+    #[serde(default)]
+    pub green: Option<SatelliteCompositeChannel>,
+    #[serde(default)]
+    pub blue: Option<SatelliteCompositeChannel>,
+}
+
+/// One channel of a [`SatelliteCompositeConfig`], e.g.
+/// `red = { parameter = "wv_6_2", minus = "wv_7_3", min = -25.0, max = 0.0 }`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteCompositeChannel {
+    /// The product parameter read, or the minuend of a difference.
+    pub parameter: String,
+    /// A product parameter subtracted from `parameter`, for a band
+    /// difference such as WV6.2 − WV7.3.
+    #[serde(default)]
+    pub minus: Option<String>,
+    /// Value (in the parameters' unit) that maps to intensity 0.
+    pub min: f64,
+    /// Value that maps to full intensity. `min > max` inverts the channel.
+    pub max: f64,
+    /// `intensity = stretch ^ (1 / gamma)`: above 1 brightens the low end.
+    #[serde(default = "default_composite_gamma")]
+    pub gamma: f64,
+}
+
+fn default_composite_gamma() -> f64 {
+    1.0
 }
 
 /// One product of a satellite collection, served as one parameter.
@@ -1255,11 +1310,7 @@ pub fn validate_satellite(
     let mut seen = std::collections::HashSet::new();
     for product in &cfg.products {
         let name = &product.parameter;
-        let valid_name = !name.is_empty()
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-        if !valid_name {
+        if !is_satellite_name(name) {
             return Err(Config(format!(
                 "Collection '{id}': satellite parameter '{name}' must match ^[a-z0-9_]+$"
             )));
@@ -1309,7 +1360,7 @@ pub fn validate_satellite(
             validate_gmgsi_product(id, product)?;
         }
     }
-    Ok(())
+    validate_satellite_composites(id, cfg)
 }
 
 /// A GMGSI product names its mosaic (`LW`, …), which is also its band.
@@ -1329,6 +1380,91 @@ fn validate_gmgsi_product(
             product.product,
             GMGSI_PRODUCTS.join(", ")
         )));
+    }
+    Ok(())
+}
+
+/// A satellite parameter or composite name: `^[a-z0-9_]+$`.
+fn is_satellite_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// `[[satellite.composites]]`: unique names that are not product
+/// parameters, and three channels reading product parameters with the
+/// range and gamma rules `ds_render::composite` renders by.
+fn validate_satellite_composites(
+    id: &str,
+    cfg: &SatelliteConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let is_product = |name: &str| cfg.products.iter().any(|p| p.parameter == name);
+    let mut seen = std::collections::HashSet::new();
+    for composite in &cfg.composites {
+        let name = &composite.name;
+        let prefix = format!("Collection '{id}': satellite composite '{name}'");
+        if !is_satellite_name(name) {
+            return Err(Config(format!("{prefix} must match ^[a-z0-9_]+$")));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(Config(format!("{prefix} is listed twice")));
+        }
+        if is_product(name) {
+            return Err(Config(format!(
+                "{prefix} has the name of a [[satellite.products]] parameter"
+            )));
+        }
+        if composite
+            .title
+            .as_ref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            return Err(Config(format!("{prefix} has an empty 'title'")));
+        }
+        if let Some(recipe) = &composite.recipe {
+            return Err(Config(format!(
+                "{prefix}: built-in recipes such as '{recipe}' are not supported yet; \
+                 configure its red, green and blue channels instead"
+            )));
+        }
+        for (label, channel) in [
+            ("red", &composite.red),
+            ("green", &composite.green),
+            ("blue", &composite.blue),
+        ] {
+            let Some(channel) = channel else {
+                return Err(Config(format!("{prefix} needs a '{label}' channel")));
+            };
+            for parameter in std::iter::once(&channel.parameter).chain(&channel.minus) {
+                if !is_product(parameter) {
+                    return Err(Config(format!(
+                        "{prefix} {label} channel reads '{parameter}', which is not a \
+                         [[satellite.products]] parameter"
+                    )));
+                }
+            }
+            if channel.minus.as_ref() == Some(&channel.parameter) {
+                return Err(Config(format!(
+                    "{prefix} {label} channel subtracts '{}' from itself",
+                    channel.parameter
+                )));
+            }
+            if !channel.min.is_finite() || !channel.max.is_finite() || channel.min == channel.max {
+                return Err(Config(format!(
+                    "{prefix} {label} channel: min and max must be finite and differ, got {} and {}",
+                    channel.min, channel.max
+                )));
+            }
+            if !channel.gamma.is_finite() || channel.gamma <= 0.0 {
+                return Err(Config(format!(
+                    "{prefix} {label} channel: gamma must be finite and greater than 0, got {}",
+                    channel.gamma
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1729,10 +1865,12 @@ pub struct OdimConfig {
     /// in the filename (e.g. `"202503251200_radar_fi.h5"` or
     /// `"%Y%m%dT%H%M_polar_finland_anjalankoski.h5"`). Auto-derives
     /// the regex and timestamp format. Preferred over `filename_pattern`.
+    /// The whole filename must match, so partial uploads never do.
     pub filename_template: Option<String>,
     /// Explicit regex with named `(?P<timestamp>…)` capture group, for
     /// filenames `filename_template` can't express. Requires
-    /// `timestamp_format`.
+    /// `timestamp_format`. Used as written: without `^…$` anchors partial
+    /// uploads may match.
     pub filename_pattern: Option<String>,
     /// chrono strftime format for parsing `filename_pattern`'s
     /// timestamp capture.
@@ -6544,6 +6682,7 @@ unit = "C"
                 band,
                 variable: "data".into(),
             }],
+            composites: Vec::new(),
         };
         for product in GMGSI_PRODUCTS {
             assert!(validate_satellite("g", &config(product, None)).is_ok());
@@ -6562,5 +6701,187 @@ unit = "C"
             .unwrap_err()
             .to_string()
             .contains("gmgsi"));
+    }
+}
+
+#[cfg(test)]
+mod satellite_composite_tests {
+    use super::{validate_satellite, SatelliteConfig};
+
+    /// A local-directory collection with IR and water-vapour products, plus
+    /// the `[[composites]]` given in TOML.
+    fn config(composites: &str) -> Result<SatelliteConfig, toml::de::Error> {
+        toml::from_str(&format!(
+            r#"
+            data_path = "/data/goes"
+
+            [[products]]
+            parameter = "ir_10_3"
+            title = "IR"
+            unit = "K"
+            product = "ABI-L2-CMIPF"
+            band = 13
+            variable = "CMI"
+
+            [[products]]
+            parameter = "wv_6_2"
+            title = "WV"
+            unit = "K"
+            product = "ABI-L2-CMIPF"
+            band = 8
+            variable = "CMI"
+
+            {composites}
+            "#
+        ))
+    }
+
+    fn error(composites: &str) -> String {
+        let cfg = config(composites).expect("parses");
+        validate_satellite("goes", &cfg)
+            .expect_err("invalid")
+            .to_string()
+    }
+
+    const VALID: &str = r#"
+        [[composites]]
+        name = "wv_ir"
+        title = "Water vapour and IR"
+        red = { parameter = "wv_6_2", minus = "ir_10_3", min = -40, max = 5.0 }
+        green = { parameter = "ir_10_3", min = 180.0, max = 330.0, gamma = 2.0 }
+
+        [composites.blue]
+        parameter = "wv_6_2"
+        min = 243.0
+        max = 208.0
+    "#;
+
+    #[test]
+    fn explicit_channels_parse_and_validate() {
+        let cfg = config(VALID).unwrap();
+        validate_satellite("goes", &cfg).unwrap();
+        let composite = &cfg.composites[0];
+        assert_eq!(composite.name, "wv_ir");
+        assert_eq!(composite.title.as_deref(), Some("Water vapour and IR"));
+        let red = composite.red.as_ref().unwrap();
+        assert_eq!(red.minus.as_deref(), Some("ir_10_3"));
+        // An integer range reads as a float; gamma defaults to linear.
+        assert_eq!((red.min, red.max, red.gamma), (-40.0, 5.0, 1.0));
+        assert_eq!(composite.green.as_ref().unwrap().gamma, 2.0);
+        let blue = composite.blue.as_ref().unwrap();
+        assert_eq!(
+            (blue.min, blue.max, blue.minus.as_deref()),
+            (243.0, 208.0, None)
+        );
+        // No composites at all is the default.
+        assert!(config("").unwrap().composites.is_empty());
+    }
+
+    #[test]
+    fn invalid_composites_are_rejected() {
+        let channels = r#"
+            red = { parameter = "wv_6_2", min = 0.0, max = 1.0 }
+            green = { parameter = "wv_6_2", min = 0.0, max = 1.0 }
+            blue = { parameter = "wv_6_2", min = 0.0, max = 1.0 }
+        "#;
+        let composite = |head: &str| format!("[[composites]]\n{head}\n{channels}");
+        for (composites, expected) in [
+            (composite(r#"name = "Airmass""#), "must match ^[a-z0-9_]+$"),
+            (composite(r#"name = """#), "must match ^[a-z0-9_]+$"),
+            (
+                format!(
+                    "{}\n{}",
+                    composite(r#"name = "rgb""#),
+                    composite(r#"name = "rgb""#)
+                ),
+                "'rgb' is listed twice",
+            ),
+            (
+                composite(r#"name = "ir_10_3""#),
+                "has the name of a [[satellite.products]] parameter",
+            ),
+            (
+                composite("name = \"rgb\"\ntitle = \"  \""),
+                "has an empty 'title'",
+            ),
+        ] {
+            let message = error(&composites);
+            assert!(message.contains(expected), "{composites}: {message}");
+        }
+
+        let head = "[[composites]]\nname = \"rgb\"";
+        let red = r#"red = { parameter = "wv_6_2", min = 0.0, max = 1.0 }"#;
+        let green = r#"green = { parameter = "wv_6_2", min = 0.0, max = 1.0 }"#;
+        for (blue, expected) in [
+            ("", "needs a 'blue' channel"),
+            (
+                r#"blue = { parameter = "vis", min = 0.0, max = 1.0 }"#,
+                "blue channel reads 'vis', which is not a [[satellite.products]] parameter",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", minus = "vis", min = 0.0, max = 1.0 }"#,
+                "blue channel reads 'vis'",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", minus = "wv_6_2", min = 0.0, max = 1.0 }"#,
+                "blue channel subtracts 'wv_6_2' from itself",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", min = 1.0, max = 1.0 }"#,
+                "blue channel: min and max must be finite and differ, got 1 and 1",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", min = nan, max = 1.0 }"#,
+                "min and max must be finite and differ",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", min = 0.0, max = inf }"#,
+                "min and max must be finite and differ",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", min = 0.0, max = 1.0, gamma = 0.0 }"#,
+                "blue channel: gamma must be finite and greater than 0, got 0",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", min = 0.0, max = 1.0, gamma = -1.0 }"#,
+                "gamma must be finite and greater than 0",
+            ),
+            (
+                r#"blue = { parameter = "wv_6_2", min = 0.0, max = 1.0, gamma = inf }"#,
+                "gamma must be finite and greater than 0",
+            ),
+        ] {
+            let message = error(&format!("{head}\n{red}\n{green}\n{blue}"));
+            assert!(message.contains(expected), "{blue}: {message}");
+            assert!(message.contains("Collection 'goes': satellite composite 'rgb'"));
+        }
+        assert!(error(&format!("{head}\n{green}")).contains("needs a 'red' channel"));
+    }
+
+    /// `recipe` is reserved for the built-in recipes of a later release: it
+    /// parses, and names what to do instead.
+    #[test]
+    fn recipes_are_not_supported_yet() {
+        let message = error("[[composites]]\nname = \"airmass\"\nrecipe = \"airmass\"");
+        assert!(
+            message.contains("built-in recipes such as 'airmass' are not supported yet"),
+            "{message}"
+        );
+        assert!(message.contains("configure its red, green and blue channels"));
+    }
+
+    /// A misspelt key in a composite fails the load instead of silently
+    /// falling back to a default.
+    #[test]
+    fn unknown_composite_keys_fail_to_parse() {
+        for composites in [
+            "[[composites]]\nname = \"rgb\"\ncolour = \"red\"",
+            r#"[[composites]]
+               name = "rgb"
+               red = { parameter = "wv_6_2", min = 0.0, max = 1.0, gama = 2.0 }"#,
+        ] {
+            let message = config(composites).expect_err("unknown key").to_string();
+            assert!(message.contains("unknown field"), "{message}");
+        }
     }
 }

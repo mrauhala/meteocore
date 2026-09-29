@@ -38,6 +38,7 @@ async fn evicted_scans_are_fetched_from_async_and_blocking_workers() {
         bucket: None,
         time_window: None,
         poll_interval_secs: 60,
+        composites: Vec::new(),
         products: vec![SatelliteProductConfig {
             parameter: "ir_10_3".into(),
             title: "IR 10.3 µm brightness temperature".into(),
@@ -128,6 +129,7 @@ fn ir_config(dir: &Path) -> SatelliteConfig {
         bucket: None,
         time_window: None,
         poll_interval_secs: 60,
+        composites: Vec::new(),
         products: vec![SatelliteProductConfig {
             parameter: "ir_10_3".into(),
             title: "IR 10.3 µm brightness temperature".into(),

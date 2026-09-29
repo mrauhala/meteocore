@@ -52,6 +52,7 @@ fn engine(id: &str, files: &[(&str, &str)]) -> (SatelliteEngine, tempfile::TempD
         bucket: None,
         time_window: None,
         poll_interval_secs: 60,
+        composites: Vec::new(),
         products: vec![
             product(IR, "ABI-L2-CMIPF", Some(13), "CMI"),
             product(CLOUD, "ABI-L2-ACHTF", None, "TEMP"),

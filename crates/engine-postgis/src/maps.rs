@@ -265,15 +265,28 @@ pub(crate) fn splat_strikes(
     let margin_lon = ((east - west) / width.max(1) as f64) * SYMBOL_RADIUS_PX as f64 * 4.0;
     let margin_lat = ((north - south) / height.max(1) as f64) * SYMBOL_RADIUS_PX as f64 * 4.0;
     for s in strikes {
+        // A viewport reaching past ±180° (a Maps bbox crossing the
+        // antimeridian arrives unwrapped, #828) shows a strike at −175° at
+        // 185°: take the world copy of the strike that falls in view. A
+        // projected output wraps longitude in its own forward transform.
+        let lon = if !prefilter {
+            s.lon
+        } else if s.lon < west - margin_lon {
+            s.lon + 360.0
+        } else if s.lon > east + margin_lon {
+            s.lon - 360.0
+        } else {
+            s.lon
+        };
         if prefilter
-            && (s.lon < west - margin_lon
-                || s.lon > east + margin_lon
+            && (lon < west - margin_lon
+                || lon > east + margin_lon
                 || s.lat < south - margin_lat
                 || s.lat > north + margin_lat)
         {
             continue;
         }
-        let (fx, fy) = output_crs.world_to_fraction(bbox, s.lon, s.lat);
+        let (fx, fy) = output_crs.world_to_fraction(bbox, lon, s.lat);
         if !fx.is_finite() || !fy.is_finite() {
             continue;
         }
@@ -470,6 +483,36 @@ mod tests {
             !tile.is_empty(),
             "edge strike's partial disc must paint into the canvas"
         );
+    }
+
+    /// #828: a viewport past ±180°, which is how OGC API Maps passes the
+    /// seam test box 170,10,-170,20, paints strikes on both sides of the
+    /// antimeridian at their positions in view.
+    #[test]
+    fn splat_paints_both_sides_of_the_antimeridian_in_a_viewport_past_180() {
+        let end = ts("2026-07-11T20:20:00Z");
+        let strike = |lon: f64| Strike {
+            time: ts("2026-07-11T20:15:00Z"),
+            lon,
+            lat: 15.5,
+        };
+        let strikes = [strike(175.5), strike(-175.5)];
+        // 1° per pixel: 175.5°E is column 5, at 175.5° or −184.5°; 175.5°W
+        // is column 14, at 184.5° or −175.5°; 15.5°N is row 4.
+        for bbox in [[170.0, 10.0, 190.0, 20.0], [-190.0, 10.0, -170.0, 20.0]] {
+            for output_crs in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
+                let tile = splat_strikes(&strikes, end, bbox, 20, 10, &output_crs);
+                for col in [5, 14] {
+                    assert_eq!(
+                        tile.values.value_at(4 * 20 + col),
+                        Some(5.0),
+                        "{bbox:?} {output_crs:?} column {col}"
+                    );
+                }
+                // Nothing at the seam itself, between the two discs.
+                assert!(tile.values.value_at(4 * 20 + 10).is_none());
+            }
+        }
     }
 
     #[test]

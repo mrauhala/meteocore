@@ -696,8 +696,8 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `filename_template` | * | — | Strftime-based template, e.g., `"radar_%Y%m%dT%H%MZ.tif"`. Auto-derives regex and timestamp format. |
-| `filename_pattern` | * | — | Explicit regex with `(?P<timestamp>...)` capture group. Requires `timestamp_format`. |
+| `filename_template` | * | — | Strftime-based template, e.g., `"radar_%Y%m%dT%H%MZ.tif"`. Auto-derives regex and timestamp format. The whole filename must match, so partial uploads such as `….tif.tmp` never do. |
+| `filename_pattern` | * | — | Explicit regex with `(?P<timestamp>...)` capture group. Requires `timestamp_format`. Used as written: anchor it with `^…$`, or partial uploads may match (a WARN at load says so). |
 | `timestamp_format` | * | — | chrono strftime format for the captured timestamp |
 | `parameter` | yes | — | Parameter name, e.g., `"reflectivity"` |
 | `unit` | yes | — | Unit of measurement, e.g., `"dBZ"` |
@@ -882,7 +882,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `data_path` | * | — | Local directory of `.grib2` + index files, or an `s3://`/`http(s)://` fixed-prefix URL. Mutually exclusive with `endpoint`+`bucket`. |
 | `endpoint` | * | — | S3-compatible endpoint URL. |
 | `bucket` | * | — | S3 bucket name. |
-| `prefix_pattern` | * | — | Object prefix with optional strftime date templates (e.g. `"%Y%m%d/00z/ifs/0p25/oper/"`); the run hour goes in `{run}`, not `%H`. Unknown specifiers are rejected at load. Required for S3; optional literal sub-prefix for `data_path`. |
+| `prefix_pattern` | * | — | Object prefix with optional strftime date templates (e.g. `"%Y%m%d/{run}z/ifs/0p25/oper/"`); the run hour goes in `{run}`, not `%H`, and each of `run_hours` is substituted there as two digits. Today's and yesterday's runs are listed, newest first. Unknown specifiers, and `{` or `}` other than `{run}`, are rejected at load. Required for S3; optional literal sub-prefix for `data_path`. |
 | `index_format` | no | `"ecmwf-json"` | Index format: `"ecmwf-json"` (JSON-lines, ECMWF open data) or `"wgrib2"` (colon-separated text, NOAA GFS). |
 | `index_suffix` | no | `".index"` | Suffix for index sidecar files |
 | `data_suffix` | no | `".grib2"` | Suffix for GRIB data files |
@@ -893,7 +893,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
 | `message_cache_mb` | no | `0` | Optional compressed GRIB message cache in MiB; additional to `grid_cache_mb`, shared by the source's level collections. `0` disables it. |
-| `run_hours` | no | all | Model run hours to poll, e.g., `[0, 6, 12, 18]` |
+| `run_hours` | no | `[0, 6, 12, 18]` | Model run hours to poll, 0–23, substituted into `{run}`. Must not be empty when `prefix_pattern` uses `{run}`; unused without it. |
 
 #### GRIB Config Example
 
@@ -1206,7 +1206,7 @@ Geostationary satellite imagery (`engine_type = "satellite"`, epic #819). One co
 
 Providers: `isatss` reads Himawari-9 AHI as the ISatSS tiles NOAA publishes on AWS (`s3://noaa-himawari9`, `AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/OR_HFD-…-M1C<band>-T<tile>_…nc`). There a scan is 88 tile files, mosaicked on ingest once all have arrived, and `product` is the sector, `HFD`. A bucket window may span at most 6 h of ten-minute scans; `collections.d/himawari9-fd.toml` is a runnable example. `goes-r` reads NOAA GOES-R ABI NetCDF-4 files as published on AWS (`s3://noaa-goes19`, `s3://noaa-goes18`), `<product>/%Y/%j/%H/OR_<product>-M<mode>[C<band>]_G<sat>_s<start>_….nc`. The engine lists one hourly prefix per hour of `time_window` (at most 24 h), downloads each new scan whole (newest first, a few per poll), and keeps it compressed in memory. Renders decode only the 24-row strips they touch, or sample a 4× overview built at ingest when zoomed out. Scan times are keyed on the scan's start **minute** (a full-disk scan starts ~20 s past its ten-minute slot), and a request snaps to the latest scan at or before it.
 
-The projection is `Crs::Geostationary` (PROJ `geos`): points behind the Earth have no projection, so the rendered disk ends at the limb, and extents come from the limb. GOES-West's crosses the antimeridian and is advertised `west > east` (about 142°E → 56°W). WMS keeps that in `EX_GeographicBoundingBox`, and its CRS:84 `BoundingBox` spans every longitude. Tiles `tileMatrixSetLimits` take every column. OGC API Maps does not yet accept a `bbox` with west > east (#828); WMS and Tiles render across the seam.
+The projection is `Crs::Geostationary` (PROJ `geos`): points behind the Earth have no projection, so the rendered disk ends at the limb, and extents come from the limb. GOES-West's crosses the antimeridian and is advertised `west > east` (about 142°E → 56°W). WMS keeps that in `EX_GeographicBoundingBox`, and its CRS:84 `BoundingBox` spans every longitude. Tiles `tileMatrixSetLimits` take every column. WMS, Tiles and OGC API Maps render across the seam; Maps reads a `bbox` with west > east as a box crossing the antimeridian (#828).
 
 ```toml
 [satellite]
@@ -1231,6 +1231,37 @@ unit = "K"
 product = "ABI-L2-ACHTF"
 variable = "TEMP"
 ```
+
+#### RGB composites
+
+An RGB composite is a layer of its own, next to the product parameters: each channel stretches one product, or the difference of two, over a range. Its time axis holds only the scans every product it reads has, and a composite always draws its channels from one scan. It has no numeric values of its own, so EDR does not serve it. A composite reads products of the same collection, so configure every band it needs under `[[satellite.products]]`. EUMETSAT's Airmass over GOES-19 ABI:
+
+```toml
+[[satellite.products]]
+parameter = "wv_6_2"                              # plus wv_7_3 (band 10) and ir_9_6 (band 12)
+title = "WV 6.2 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 8
+variable = "CMI"
+
+[[satellite.composites]]
+name = "airmass"                                  # ^[a-z0-9_]+$, not a product parameter
+title = "Airmass RGB"                             # optional, defaults to the name
+red = { parameter = "wv_6_2", minus = "wv_7_3", min = -25.0, max = 0.0 }
+green = { parameter = "ir_9_6", minus = "ir_10_3", min = -40.0, max = 5.0 }
+blue = { parameter = "wv_6_2", min = 243.0, max = 208.0 }
+```
+
+| Channel key | Required | Meaning |
+|---|---|---|
+| `parameter` | yes | Product parameter the channel reads |
+| `minus` | no | Product parameter subtracted from `parameter`, for a band difference |
+| `min` | yes | Value that gives intensity 0 |
+| `max` | yes | Value that gives full intensity; `min > max` inverts the channel, so colder is brighter |
+| `gamma` | no, `1.0` | `intensity = stretch ^ (1 / gamma)`: above 1 brightens the low end |
+
+`red`, `green` and `blue` are all required. `min` and `max` must be finite and differ, and `gamma` must be finite and above 0. `recipe = "…"` is reserved for built-in recipes and is a load error for now. An unknown key in a composite is a load error too, so a misspelt `minus` or `gamma` cannot silently change the picture.
 
 EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
 
@@ -1642,7 +1673,7 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `bbox` | yes | — | `west,south,east,north`, always lon/lat order |
+| `bbox` | yes | — | `west,south,east,north`, always lon/lat order. West > east is a box crossing the antimeridian: `170,10,-170,20` renders the 20° across 180°, as `170,10,190,20` does. Both longitudes of such a box must be within ±180. South must be less than north. GeoTIFF and Zarr sources stored in −180…180 do not yet render past 180° and show nodata there. |
 | `bbox-crs` | no | `CRS:84` | Only `CRS:84` (or `http://www.opengis.net/def/crs/OGC/1.3/CRS84`) is accepted — every other value returns 400 |
 | `width` | no | `256` | Image width in pixels, max 8000 |
 | `height` | no | `256` | Image height in pixels, max 8000 |

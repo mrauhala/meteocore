@@ -42,6 +42,7 @@ fn config(dir: &Path) -> SatelliteConfig {
             band: None,
             variable: "data".into(),
         }],
+        composites: Vec::new(),
     }
 }
 

@@ -39,6 +39,7 @@ fn config(dir: Option<&Path>) -> SatelliteConfig {
         bucket: dir.is_none().then(|| "noaa-himawari9".into()),
         time_window: dir.is_none().then(|| "-PT1H".into()),
         poll_interval_secs: 60,
+        composites: Vec::new(),
         products: vec![SatelliteProductConfig {
             parameter: "ir_10_4".into(),
             title: "IR 10.4 µm brightness temperature".into(),
