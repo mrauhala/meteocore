@@ -131,6 +131,26 @@ impl DecodedGrid {
         }
     }
 
+    /// `lon` moved by whole turns into the grid's own longitude frame,
+    /// `[lon_first, lon_first + 360)`, for the map sampler. A map viewport
+    /// may reach past ±180°: OGC API Maps unwraps a bbox crossing the
+    /// antimeridian (#828), and WMS CRS:84 boxes can too. On a regional
+    /// grid, which [`Self::wrap_col`] leaves unwrapped, the meridian such a
+    /// pixel shows is one turn away: 185° is 175°W on a grid stored from
+    /// 179.5°W, and 170°W is 190° on one stored from 160°E. A longitude
+    /// west of `lon_first` lands a turn east, still off a regional grid.
+    /// Global grids wrap in [`Self::wrap_col`] instead, and a longitude
+    /// already in the frame is returned as is, so neither sample moves by
+    /// a rounding error. Non-finite input stays non-finite.
+    fn lon_in_frame(&self, lon: f64) -> f64 {
+        if (self.lon_first..self.lon_first + 360.0).contains(&lon) || self.wrap_modulus().is_some()
+        {
+            lon
+        } else {
+            self.lon_first + (lon - self.lon_first).rem_euclid(360.0)
+        }
+    }
+
     /// Bilinear interpolation at (lon, lat).
     /// Interpolates between the 4 surrounding grid points.
     /// Returns None if the point is outside the grid.
@@ -435,7 +455,7 @@ impl DecodedGrid {
                     for col in 0..w {
                         let fx = (col as f64 + 0.5) / w as f64;
                         let (lon, lat) = output_crs.project_node(bbox, fx, fy);
-                        emit(self.bilinear_value(lon, lat));
+                        emit(self.bilinear_value(self.lon_in_frame(lon), lat));
                     }
                 }
             }
@@ -662,6 +682,53 @@ mod tests {
             assert_eq!(grid.bilinear_value(-45.0, 59.5), Some(15.0));
         }
         assert_eq!(grid_2x2().bilinear_value(11.5, 60.0), Some(2.0));
+    }
+
+    /// #828: a map viewport reaching past ±180° samples a regional grid on
+    /// the far side of the seam at the meridian each pixel shows. The seam
+    /// test box 170,10,-170,20 arrives unwrapped as either 170..190 or
+    /// −190..−170; a row at 15..16°N, one pixel per degree.
+    #[test]
+    fn map_viewport_past_180_samples_a_regional_grid_a_turn_away() {
+        // Ten 1° columns valued by index, from `lon_first`, two rows.
+        let regional = |lon_first: f64| DecodedGrid {
+            ni: 10,
+            nj: 2,
+            lon_first,
+            lat_first: 16.0,
+            lon_inc: 1.0,
+            lat_inc: -1.0,
+            values: Arc::new((0..20).map(|i| (i % 10) as f32).collect()),
+            triple: (0, 0, 0),
+            centre: 0,
+            first_surface_type: 1,
+            first_surface_value: None,
+        };
+        let row = |grid: &DecodedGrid, bbox: [f64; 4]| {
+            grid.resample(bbox, 20, 1, &OutputCrs::Wgs84)
+                .into_iter()
+                .map(|v| v.map(|v| v as f32))
+                .collect::<Vec<_>>()
+        };
+        // A grid west of the seam as stored, 179.5°W..170.5°W: pixel
+        // centres 180.5°..189.5° are its columns 0..9, exactly.
+        let alaska = regional(-179.5);
+        let mut expected = vec![None; 10];
+        expected.extend((0..10).map(|c| Some(c as f32)));
+        assert_eq!(row(&alaska, [170.0, 15.0, 190.0, 16.0]), expected);
+        // A grid stored across the seam, 175°E..184°E: pixel centres
+        // −184.5°..−175.5° are 175.5°..184.5°, half a column in.
+        let across = regional(175.0);
+        let mut expected = vec![None; 5];
+        expected.extend((0..9).map(|c| Some(c as f32 + 0.5)));
+        expected.push(Some(9.0)); // the clamped east edge
+        expected.extend(vec![None; 5]);
+        assert_eq!(row(&across, [-190.0, 15.0, -170.0, 16.0]), expected);
+        // Inside ±180° the same grid is still found at 175.5°W, 184.5°.
+        assert_eq!(
+            across.resample([-176.0, 15.0, -175.0, 16.0], 1, 1, &OutputCrs::Wgs84),
+            vec![Some(9.0)]
+        );
     }
 
     /// 2×2 regular lat/lon grid (10–11°E, 59–60°N) for sampling tests.

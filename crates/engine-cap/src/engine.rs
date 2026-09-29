@@ -710,7 +710,8 @@ impl MapEngine for CapEngine {
         // A degenerate request bbox (zero-area / non-finite) asks for no region,
         // so the tile is empty — never a full-catalog render (the API layer
         // already rejects such bboxes; this is the engine's own safety net).
-        let candidates: Vec<usize> = match Bbox::new(bbox[0], bbox[1], bbox[2], bbox[3]) {
+        let [query_west, query_east] = crs84_query_lons(bbox[0], bbox[2]);
+        let candidates: Vec<usize> = match Bbox::new(query_west, bbox[1], query_east, bbox[3]) {
             Ok(b) => cat.query_bbox(&b),
             Err(_) => {
                 return Ok(RasterTile {
@@ -721,24 +722,47 @@ impl MapEngine for CapEngine {
             }
         };
 
+        // A viewport reaching past ±180° (a Maps bbox crossing the
+        // antimeridian arrives unwrapped, #828) shows an area at −175° at
+        // 185°: draw each area at the world copies that fall in view.
+        // `world_to_fraction` is linear in `lon − west` there, so shifting the
+        // view by −k draws the area shifted by +k. A projected output wraps
+        // longitude in its own forward transform and needs no copies.
+        let shifts: &[f64] = match output_crs {
+            OutputCrs::Projected { .. } => &[0.0],
+            _ => &[0.0, 360.0, -360.0],
+        };
+
         let mut rendered = 0usize;
         for &i in &candidates {
             let rec = &cat.records[i];
             if !rec.window.active_at(t) {
                 continue;
             }
-            let px =
-                ds_core::geo::geometry_to_pixels(&rec.geometry, bbox, width, height, output_crs);
-            for poly in &px.polygons {
-                fill_polygon(
-                    &mut values,
+            for &k in shifts {
+                let in_view = |[w, _, e, _]: [f64; 4]| w + k <= bbox[2] && e + k >= bbox[0];
+                if k != 0.0 && !rec.bbox.is_some_and(in_view) {
+                    continue;
+                }
+                let view = [bbox[0] - k, bbox[1], bbox[2] - k, bbox[3]];
+                let px = ds_core::geo::geometry_to_pixels(
+                    &rec.geometry,
+                    view,
                     width,
                     height,
-                    &poly.exterior,
-                    &poly.holes,
-                    rec.severity_code,
-                    Combine::Max, // higher severity wins on overlap, order-independent
+                    output_crs,
                 );
+                for poly in &px.polygons {
+                    fill_polygon(
+                        &mut values,
+                        width,
+                        height,
+                        &poly.exterior,
+                        &poly.holes,
+                        rec.severity_code,
+                        Combine::Max, // higher severity wins on overlap, order-independent
+                    );
+                }
             }
             rendered += 1;
             if rendered >= MAX_RENDER_RECORDS {
@@ -761,6 +785,24 @@ impl MapEngine for CapEngine {
         // Cheap clone of the prebuilt snapshot — no recomputation (#211); the
         // cost is O(times), bounded by the 256-entry TIME cap.
         (*self.snapshot().info).clone()
+    }
+}
+
+/// The CRS84 `[west, east]` the catalog is queried with for a request
+/// viewport's longitudes. The catalog is indexed in −180…180, while a map
+/// viewport may reach past ±180° (#828): such a span is wrapped back into
+/// the domain, where it becomes a box crossing the antimeridian
+/// (`west > east`) that [`Catalog::query_bbox`] splits at the seam. A
+/// viewport of a whole turn or more queries every longitude. Non-finite
+/// values pass through for `Bbox::new` to reject.
+fn crs84_query_lons(west: f64, east: f64) -> [f64; 2] {
+    let in_domain = |lon: f64| (-180.0..=180.0).contains(&lon);
+    if !(west.is_finite() && east.is_finite()) || in_domain(west) && in_domain(east) {
+        [west, east]
+    } else if east - west >= 360.0 {
+        [-180.0, 180.0]
+    } else {
+        [ds_core::geo::wrap_lon(west), ds_core::geo::wrap_lon(east)]
     }
 }
 
