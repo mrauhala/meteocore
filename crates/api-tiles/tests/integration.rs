@@ -3259,3 +3259,413 @@ mod per_parameter_times {
         );
     }
 }
+
+// --- RGB composites (#819) --------------------------------------------------
+
+mod composites {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use ds_core::map_engine::{select_common_time, CompositeChannel, CompositeDef};
+    use ds_render::{CompositeSpec, ImageFormat};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    const T0: &str = "2026-09-25T19:00:00Z";
+    const T1: &str = "2026-09-25T19:10:00Z";
+    const T2: &str = "2026-09-25T19:20:00Z";
+    const RGB: &str = "rgb";
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// Red `a - b` over -10..40, green `b` over 0..100, blue `a` inverted
+    /// over 100..0.
+    fn rgb() -> CompositeDef {
+        let channel = |parameter: &str, minus: Option<&str>, min, max| CompositeChannel {
+            parameter: parameter.into(),
+            minus: minus.map(String::from),
+            min,
+            max,
+            gamma: 1.0,
+        };
+        CompositeDef {
+            name: RGB.into(),
+            title: "A and B".into(),
+            channels: [
+                channel("a", Some("b"), -10.0, 40.0),
+                channel("b", None, 0.0, 100.0),
+                channel("a", None, 100.0, 0.0),
+            ],
+        }
+    }
+
+    /// One band's tile: 50 (`a`) or 20 (`b`) plus the scan's ten-minute
+    /// step, so each scan draws its own pixels.
+    fn band(parameter: &str, time: DateTime<Utc>, w: u32, h: u32) -> RasterTile {
+        let step = ((time - t(T0)).num_minutes() / 10) as f64;
+        let value = if parameter == "a" { 50.0 } else { 20.0 } + step;
+        RasterTile {
+            width: w,
+            height: h,
+            values: vec![Some(value); (w * h) as usize].into(),
+        }
+    }
+
+    /// One `get_raster_tiles` call: its bands and time.
+    type Call = (Vec<String>, Option<DateTime<Utc>>);
+
+    /// Two bands on their own time axes, like a satellite collection, and
+    /// one composite over both. The axes can change under a running router.
+    struct Engine {
+        axes: Mutex<BTreeMap<&'static str, Vec<DateTime<Utc>>>>,
+        calls: Mutex<Vec<Call>>,
+    }
+
+    impl Engine {
+        fn new(a: &[&str], b: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                axes: Mutex::new(BTreeMap::from([
+                    ("a", a.iter().map(|s| t(s)).collect()),
+                    ("b", b.iter().map(|s| t(s)).collect()),
+                ])),
+                calls: Mutex::default(),
+            })
+        }
+
+        fn add_scan(&self, band: &'static str, time: &str) {
+            let mut axes = self.axes.lock().unwrap();
+            let axis = axes.get_mut(band).unwrap();
+            axis.push(t(time));
+            axis.sort();
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn axis(&self, band: &str) -> Vec<DateTime<Utc>> {
+            self.axes.lock().unwrap()[band].clone()
+        }
+    }
+
+    impl MapEngine for Engine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let parameter = parameter.unwrap_or("a");
+            if parameter == RGB {
+                return Err(DataServerError::InvalidParameter("not a band".into()));
+            }
+            let time = time.unwrap_or_else(|| *self.axis(parameter).last().unwrap());
+            Ok(band(parameter, time, width, height))
+        }
+
+        fn get_raster_tiles(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            parameters: &[&str],
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<Vec<RasterTile>, DataServerError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((parameters.iter().map(|p| p.to_string()).collect(), time));
+            let time = time.expect("a composite renders the time it was keyed on");
+            Ok(parameters
+                .iter()
+                .map(|p| band(p, time, width, height))
+                .collect())
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let parameter = |name: &str| ds_core::map_engine::ParameterInfo {
+                name: name.to_string(),
+                title: format!("Band {name}"),
+                unit: "K".into(),
+            };
+            let mut times: Vec<DateTime<Utc>> = self
+                .axes
+                .lock()
+                .unwrap()
+                .values()
+                .flatten()
+                .copied()
+                .collect();
+            times.sort();
+            times.dedup();
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([-180.0, -85.0, 180.0, 85.0]),
+                times,
+                parameter: "a".into(),
+                unit: "K".into(),
+                parameters: vec![parameter("a"), parameter("b")],
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+
+        fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+            if parameter == RGB {
+                let b = self.axis("b");
+                let shared: Vec<DateTime<Utc>> = self
+                    .axis("a")
+                    .into_iter()
+                    .filter(|t| b.contains(t))
+                    .collect();
+                return Some(shared.into());
+            }
+            Some(self.axis(parameter).into())
+        }
+
+        fn resolve_parameter_time(
+            &self,
+            parameter: Option<&str>,
+            time: Option<DateTime<Utc>>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let parameter = parameter.unwrap_or("a");
+            if parameter == RGB {
+                let (a, b) = (self.axis("a"), self.axis("b"));
+                return select_common_time(&[&a, &b], time);
+            }
+            select_common_time(&[&self.axis(parameter)], time)
+        }
+
+        fn composites(&self) -> Arc<[CompositeDef]> {
+            Arc::from([rgb()])
+        }
+    }
+
+    struct Reply {
+        status: StatusCode,
+        x_cache: String,
+        body: bytes::Bytes,
+    }
+
+    async fn fetch(app: &axum::Router, uri: &str) -> Reply {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let x_cache = resp
+            .headers()
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        Reply {
+            status,
+            x_cache,
+            body,
+        }
+    }
+
+    fn json(reply: &Reply) -> Value {
+        serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    /// The composite's expected image at `time`: its bands composed.
+    fn expected_png(w: u32, h: u32, time: &str) -> Vec<u8> {
+        let tiles = vec![band("a", t(time), w, h), band("b", t(time), w, h)];
+        ds_render::render_composite_tiles(
+            &tiles,
+            &CompositeSpec::from(&rgb()),
+            ImageFormat::Png,
+            None,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A Tiles router over `engine` as collection `radar`, with a `default`
+    /// and an `alt` style.
+    fn router(engine: Arc<Engine>) -> axum::Router {
+        let engine: Arc<dyn MapEngine> = engine;
+        let styles = HashMap::from([(
+            "radar".to_string(),
+            HashMap::from([
+                (
+                    "default".to_string(),
+                    palette_style("default", "viridis", None),
+                ),
+                ("alt".to_string(), palette_style("alt", "radar_dbz", None)),
+            ]),
+        )]);
+        let config = CollectionConfig {
+            id: "radar".to_string(),
+            title: "Satellite".to_string(),
+            description: "Two bands and an RGB composite".to_string(),
+            data_path: None,
+            apis: vec!["tiles".to_string()],
+            engine_type: "satellite".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            nowcast: None,
+            bufr: None,
+            satellite: None,
+            preview: None,
+        };
+        let state = Arc::new(ArcSwap::from_pointee(TilesState {
+            map_engines: HashMap::from([("radar".to_string(), engine)]),
+            collections: HashMap::from([("radar".to_string(), config)]),
+            styles,
+            feature_engines: HashMap::new(),
+            feature_collections: HashMap::new(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+            base_url: String::new(),
+            trust_proxy_headers: false,
+        }));
+        api_tiles::router(state)
+    }
+
+    fn tile_uri(extra: &str) -> String {
+        format!("/collections/radar/tiles/WebMercatorQuad/1/0/1?parameter-name=rgb{extra}")
+    }
+
+    /// `parameter-name=<composite>` renders the bands composed at the time
+    /// they share (T1, not `a`'s newer T2), and caches on it: a newer scan
+    /// of one band leaves the tile alone (#507).
+    #[tokio::test]
+    async fn tile_renders_the_composite_at_the_shared_time() {
+        let engine = Engine::new(&[T0, T1, T2], &[T0, T1]);
+        let app = router(engine.clone());
+        let first = fetch(&app, &tile_uri("")).await;
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.x_cache, "MISS");
+        assert_eq!(first.body, expected_png(256, 256, T1));
+        assert_eq!(
+            engine.calls(),
+            [(vec!["a".to_string(), "b".to_string()], Some(t(T1)))]
+        );
+
+        engine.add_scan("a", "2026-09-25T19:30:00Z");
+        assert_eq!(fetch(&app, &tile_uri("")).await.x_cache, "HIT");
+        let pinned = fetch(&app, &tile_uri(&format!("&datetime={T2}"))).await;
+        assert_eq!(pinned.x_cache, "HIT");
+        assert_eq!(engine.calls().len(), 1);
+
+        engine.add_scan("b", T2);
+        let moved = fetch(&app, &tile_uri("")).await;
+        assert_eq!(moved.x_cache, "MISS");
+        assert_eq!(moved.body, expected_png(256, 256, T2));
+    }
+
+    /// Bands that share no scan give an empty tile without an engine call.
+    #[tokio::test]
+    async fn no_shared_scan_is_an_empty_tile() {
+        let engine = Engine::new(&[T0], &[T1]);
+        let app = router(engine.clone());
+        let reply = fetch(&app, &tile_uri(&format!("&datetime={T1}"))).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.x_cache, "EMPTY");
+        assert!(engine.calls().is_empty());
+    }
+
+    /// Only the `default` style renders a composite; unknown names list
+    /// the composite with the parameters.
+    #[tokio::test]
+    async fn composites_have_only_the_default_style() {
+        let app = router(Engine::new(&[T0, T1], &[T0, T1]));
+        let styled = fetch(
+            &app,
+            "/collections/radar/styles/alt/tiles/WebMercatorQuad/1/0/1?parameter-name=rgb",
+        )
+        .await;
+        assert_eq!(styled.status, StatusCode::NOT_FOUND);
+        let named_default = fetch(
+            &app,
+            "/collections/radar/styles/default/tiles/WebMercatorQuad/1/0/1?parameter-name=rgb",
+        )
+        .await;
+        assert_eq!(named_default.status, StatusCode::OK);
+
+        let unknown = fetch(
+            &app,
+            "/collections/radar/tiles/WebMercatorQuad/1/0/1?parameter-name=nope",
+        )
+        .await;
+        assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+        assert!(json(&unknown)["description"]
+            .as_str()
+            .unwrap()
+            .contains("Available: a, b, rgb"));
+    }
+
+    /// The collection lists the composite among `parameter_names`, and its
+    /// legend is the channel list.
+    #[tokio::test]
+    async fn collection_and_legend_describe_the_composite() {
+        let app = router(Engine::new(&[T0, T1, T2], &[T0, T1]));
+        let collection = json(&fetch(&app, "/collections/radar").await);
+        let composite = &collection["parameter_names"]["rgb"];
+        assert_eq!(composite["observedProperty"]["label"]["en"], "A and B");
+        assert!(composite.get("unit").is_none());
+        assert_eq!(
+            composite["extent"]["temporal"]["interval"],
+            serde_json::json!([[t(T0).to_rfc3339(), t(T1).to_rfc3339()]])
+        );
+
+        let reply = fetch(
+            &app,
+            "/collections/radar/styles/default/legend?parameter-name=rgb",
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let legend = json(&reply);
+        assert_eq!(legend["style"], "default");
+        assert_eq!(legend["parameter"], "rgb");
+        assert_eq!(legend["channels"][1]["label"], "b");
+        assert_eq!(legend["channels"][2]["min"], 100.0);
+
+        let png = fetch(
+            &app,
+            "/collections/radar/styles/default/legend?parameter-name=rgb&f=png",
+        )
+        .await;
+        assert_eq!(png.status, StatusCode::OK);
+        let expected = ds_render::render_composite_legend(
+            &CompositeSpec::from(&rgb()),
+            &[Some("K"), Some("K")],
+            ds_render::LEGEND_DEFAULT_WIDTH,
+            ds_render::LEGEND_DEFAULT_HEIGHT,
+            ImageFormat::Png,
+        )
+        .unwrap();
+        assert_eq!(png.body, expected);
+        let other = fetch(
+            &app,
+            "/collections/radar/styles/alt/legend?parameter-name=rgb",
+        )
+        .await;
+        assert_eq!(other.status, StatusCode::NOT_FOUND);
+    }
+}

@@ -450,6 +450,11 @@ fn build_entry(
 /// Parameter list emitted as `parameters: [{name, title, unit}]` in the
 /// per-collection manifest entry. Sorted by name for stable ordering.
 ///
+/// The collection's RGB composites (`MapEngine::composites`, #819) are
+/// listed too, marked `"composite": true`, with an empty unit and their own
+/// time axis, the scans every band has. They render only with the default
+/// style, so the SPA requests them on the unstyled tile route.
+///
 /// A parameter with its own time axis (`MapEngine::parameter_times`, e.g. a
 /// satellite product that lags the others) also carries `temporal_extent`,
 /// shaped like the collection's and filtered by the same
@@ -514,6 +519,19 @@ fn collection_parameters(
             entry
         })
         .collect();
+    for composite in engine.composites().iter() {
+        let mut entry = json!({
+            "name": composite.name,
+            "title": composite.title,
+            "unit": "",
+            "composite": true,
+        });
+        if let Some(times) = engine.parameter_times(&composite.name) {
+            entry["temporal_extent"] =
+                parameter_temporal_extent(id, config, engine.as_ref(), &times);
+        }
+        out.push(entry);
+    }
 
     out.sort_by(|a, b| {
         a.get("name")
@@ -2120,6 +2138,104 @@ mod tests {
         // IR shares the collection axis: no per-parameter extent.
         assert_eq!(params[1]["name"], "ir");
         assert!(params[1].get("temporal_extent").is_none());
+    }
+
+    /// RGB composites (#819) join the parameter list, marked `composite`
+    /// with no unit and their own time axis, so the SPA can select them.
+    #[test]
+    fn manifest_lists_composites_with_their_own_time_axis() {
+        use ds_core::map_engine::{CompositeChannel, CompositeDef};
+        struct WithComposite {
+            inner: RasterMock,
+            shared: Vec<DateTime<Utc>>,
+            composites: Arc<[CompositeDef]>,
+        }
+        impl MapEngine for WithComposite {
+            #[allow(clippy::too_many_arguments)]
+            fn get_raster_tile(
+                &self,
+                _bbox: [f64; 4],
+                _w: u32,
+                _h: u32,
+                _t: Option<DateTime<Utc>>,
+                _crs: &OutputCrs,
+                _param: Option<&str>,
+                _z: Option<f64>,
+                _reference_time: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unimplemented!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                self.inner.raster_info()
+            }
+            fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+                (parameter == "rgb").then(|| Arc::from(self.shared.clone()))
+            }
+            fn composites(&self) -> Arc<[CompositeDef]> {
+                self.composites.clone()
+            }
+        }
+
+        let channel = |parameter: &str| CompositeChannel {
+            parameter: parameter.into(),
+            minus: None,
+            min: 300.0,
+            max: 200.0,
+            gamma: 1.0,
+        };
+        let shared = vec![t("2026-09-27T00:00:00Z"), t("2026-09-27T00:10:00Z")];
+        let parameters = ["ir", "cloud_top"]
+            .map(|name| ds_core::map_engine::ParameterInfo {
+                name: name.into(),
+                title: name.into(),
+                unit: "K".into(),
+            })
+            .into();
+        let mut tiles = empty_tiles();
+        tiles.map_engines.insert(
+            "sat".into(),
+            Arc::new(WithComposite {
+                inner: RasterMock {
+                    parameters,
+                    ..RasterMock::default()
+                },
+                shared: shared.clone(),
+                composites: Arc::from([CompositeDef {
+                    name: "rgb".into(),
+                    title: "IR and cloud top".into(),
+                    channels: [channel("ir"), channel("cloud_top"), channel("ir")],
+                }]),
+            }),
+        );
+        tiles
+            .collections
+            .insert("sat".into(), config("sat", &["tiles"]));
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let manifest = build_manifest(&state, 0, 100);
+        let params = manifest["collections"][0]["parameters"].as_array().unwrap();
+        let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["cloud_top", "ir", "rgb"]);
+        let rgb = &params[2];
+        assert_eq!(rgb["title"], "IR and cloud top");
+        assert_eq!(rgb["unit"], "");
+        assert_eq!(rgb["composite"], true);
+        let values: Vec<&str> = rgb["temporal_extent"]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            shared.iter().map(|t| t.to_rfc3339()).collect::<Vec<_>>()
+        );
+        assert!(params[0].get("composite").is_none());
     }
 
     #[test]

@@ -18,7 +18,7 @@ use ds_core::collection_search::{
 };
 use ds_core::config::CollectionConfig;
 use ds_core::html::{self, LinkView, Wanted};
-use ds_core::map_engine::RasterInfo;
+use ds_core::map_engine::{CompositeDef, RasterInfo};
 use serde_json::{json, Value};
 
 /// Existing Common declarations, centralized to keep all API surfaces aligned.
@@ -347,22 +347,37 @@ pub const PARAMETER_NAMES: &str = "parameter_names";
 /// snapshots serialize to equal bytes (ETags, #499). A parameter on its own
 /// time axis (`MapEngine::parameter_times`, #819) adds its `extent.temporal`
 /// in the collection extent's Common shape; the collection's is the union.
+///
+/// The collection's RGB composites (`MapEngine::composites`, #819) are
+/// `parameter-name` values too. Their entries have no unit, since a
+/// composite has no numeric values, and a `description` naming what each
+/// channel reads; their `extent.temporal` is the scans every band has.
 pub fn parameter_names(
     info: &RasterInfo,
+    composites: &[CompositeDef],
     parameter_times: impl Fn(&str) -> Option<Arc<[DateTime<Utc>]>>,
 ) -> Option<Value> {
     if info.parameters.is_empty() {
         return None;
     }
-    let mut parameters: Vec<_> = info.parameters.iter().collect();
-    parameters.sort_by(|a, b| a.name.cmp(&b.name));
-    let entries = parameters.into_iter().map(|p| {
-        let label = if p.title.trim().is_empty() {
-            &p.name
+    let label = |name: &'_ str, title: &'_ str| -> String {
+        if title.trim().is_empty() {
+            name.to_string()
         } else {
-            &p.title
-        };
-        let mut entry = json!({"type": "Parameter", "observedProperty": {"label": {"en": label}}});
+            title.to_string()
+        }
+    };
+    let extent = |name: &str| {
+        parameter_times(name)
+            .and_then(|times| ds_core::ogc_extent::build_extent(None, None, "", &times, None))
+            .map(|extent| serde_json::to_value(extent).expect("Extent serializes to JSON"))
+    };
+    let mut entries: Vec<(String, Value)> = Vec::new();
+    for p in &info.parameters {
+        let mut entry = json!({
+            "type": "Parameter",
+            "observedProperty": {"label": {"en": label(&p.name, &p.title)}}
+        });
         let unit = p.unit.trim();
         if !unit.is_empty() {
             entry["unit"] = json!({
@@ -370,14 +385,32 @@ pub fn parameter_names(
                 "symbol": {"value": unit, "type": "http://www.opengis.net/def/uom/UCUM/"}
             });
         }
-        let extent = parameter_times(&p.name)
-            .and_then(|times| ds_core::ogc_extent::build_extent(None, None, "", &times, None));
-        if let Some(extent) = extent {
-            entry["extent"] = serde_json::to_value(extent).expect("Extent serializes to JSON");
+        if let Some(extent) = extent(&p.name) {
+            entry["extent"] = extent;
         }
-        (p.name.clone(), entry)
-    });
-    Some(Value::Object(entries.collect()))
+        entries.push((p.name.clone(), entry));
+    }
+    for c in composites {
+        let channels: Vec<String> = ["red", "green", "blue"]
+            .iter()
+            .zip(&c.channels)
+            .map(|(name, channel)| {
+                let bands: Vec<&str> = channel.parameters().collect();
+                format!("{name} {}", bands.join(" - "))
+            })
+            .collect();
+        let mut entry = json!({
+            "type": "Parameter",
+            "description": format!("RGB composite: {}", channels.join(", ")),
+            "observedProperty": {"label": {"en": label(&c.name, &c.title)}}
+        });
+        if let Some(extent) = extent(&c.name) {
+            entry["extent"] = extent;
+        }
+        entries.push((c.name.clone(), entry));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(Value::Object(entries.into_iter().collect()))
 }
 
 /// The `parameter-name` query parameter of the Maps and Tiles render routes,
@@ -386,7 +419,76 @@ pub fn parameter_name_parameter() -> Value {
     json!({
         "name": "parameter-name", "in": "query", "required": false,
         "schema": {"type": "string"},
-        "description": "Parameter of a multi-parameter collection to render: one of the keys of the collection's `parameter_names`; an unknown name returns 400. Without it, the style's parameter or else the collection's default is rendered. A collection that advertises no `parameter_names` has one parameter and ignores this."
+        "description": "Parameter of a multi-parameter collection to render: one of the keys of the collection's `parameter_names`; an unknown name returns 400. Without it, the style's parameter or else the collection's default is rendered. An RGB composite listed there renders with the `default` style only. A collection that advertises no `parameter_names` has one parameter and ignores this."
+    })
+}
+
+/// The `legend` schema of the Maps and Tiles legend routes: a parameter
+/// style's palette legend (`ds_render::legend_json`), or an RGB composite's
+/// channel list (`ds_render::composite_legend_json`, #819). One definition
+/// so the blocks of the shared root declare one identical component.
+pub fn legend_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "description": "Palette legend of a parameter style",
+                "required": ["style", "title", "min", "max", "interpolation", "stops"],
+                "properties": {
+                    "style": {"type": "string", "description": "Style identifier"},
+                    "title": {"type": "string", "description": "Human-readable style title"},
+                    "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
+                    "unit": {"type": "string", "description": "Unit of the rendered values. Omitted when unknown."},
+                    "min": {"type": "number", "description": "Low end of the value range the colours span"},
+                    "max": {"type": "number", "description": "High end of the value range the colours span"},
+                    "interpolation": {"type": "string", "enum": ["linear", "step"],
+                                      "description": "How colours are produced between stops"},
+                    "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
+                    "stops": {
+                        "type": "array",
+                        "description": "Palette colour stops, ascending by value",
+                        "items": {
+                            "type": "object",
+                            "required": ["value", "color"],
+                            "properties": {
+                                "value": {"type": "number"},
+                                "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"}
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "description": "Channel list of an RGB composite, which has no colour bar",
+                "required": ["style", "parameter", "title", "channels"],
+                "properties": {
+                    "style": {"type": "string", "description": "Style identifier, always `default`"},
+                    "parameter": {"type": "string", "description": "The composite's `parameter-name`"},
+                    "title": {"type": "string", "description": "Human-readable composite title"},
+                    "channels": {
+                        "type": "array",
+                        "description": "Red, green and blue, in that order",
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "required": ["channel", "label", "parameters", "min", "max", "gamma"],
+                            "properties": {
+                                "channel": {"type": "string", "enum": ["red", "green", "blue"]},
+                                "label": {"type": "string", "description": "What the channel reads: a parameter, or `a - b` for a difference"},
+                                "parameters": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "string"},
+                                               "description": "The parameters read; two for a difference, first minus second"},
+                                "min": {"type": "number", "description": "Value that gives intensity 0"},
+                                "max": {"type": "number", "description": "Value that gives full intensity; below `min` inverts the channel"},
+                                "gamma": {"type": "number", "description": "Intensity is ((v - min) / (max - min)) ^ (1 / gamma), clamped to 0..1"},
+                                "unit": {"type": "string", "description": "Unit of min and max, when every parameter read shares a known one"}
+                            }
+                        }
+                    }
+                }
+            }
+        ]
     })
 }
 
@@ -482,13 +584,14 @@ mod tests {
 
     #[test]
     fn single_parameter_rasters_list_no_parameter_names() {
-        assert_eq!(parameter_names(&raster(&[]), |_| None), None);
+        assert_eq!(parameter_names(&raster(&[]), &[], |_| None), None);
     }
 
     #[test]
     fn parameter_names_label_untitled_parameters_by_name_and_omit_blank_units() {
         let names = parameter_names(
             &raster(&[("t", "Temperature", " K "), ("x", " ", " ")]),
+            &[],
             |_| None,
         )
         .unwrap();
@@ -496,6 +599,56 @@ mod tests {
         assert_eq!(names["t"]["unit"]["symbol"]["value"], "K");
         assert_eq!(names["x"]["observedProperty"]["label"]["en"], "x");
         assert!(names["x"].get("unit").is_none());
+    }
+
+    /// RGB composites (#819) are listed with the parameters, in name order:
+    /// no unit, a description of the channels and their own time axis.
+    #[test]
+    fn parameter_names_list_composites_without_a_unit() {
+        use ds_core::map_engine::CompositeChannel;
+        let channel = |parameter: &str, minus: Option<&str>| CompositeChannel {
+            parameter: parameter.into(),
+            minus: minus.map(String::from),
+            min: 0.0,
+            max: 1.0,
+            gamma: 1.0,
+        };
+        let composite = CompositeDef {
+            name: "m".into(),
+            title: "Mix".into(),
+            channels: [
+                channel("t", Some("x")),
+                channel("x", None),
+                channel("t", None),
+            ],
+        };
+        let t0: DateTime<Utc> = "2026-09-25T19:00:00Z".parse().unwrap();
+        let names = parameter_names(
+            &raster(&[("t", "Temperature", "K"), ("x", "X", "K")]),
+            std::slice::from_ref(&composite),
+            |name| (name == "m").then(|| Arc::from([t0])),
+        )
+        .unwrap();
+        let keys: Vec<&str> = names
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["m", "t", "x"]);
+        let m = &names["m"];
+        assert_eq!(m["type"], "Parameter");
+        assert_eq!(m["observedProperty"]["label"]["en"], "Mix");
+        assert_eq!(
+            m["description"],
+            "RGB composite: red t - x, green x, blue t"
+        );
+        assert!(m.get("unit").is_none());
+        assert_eq!(
+            m["extent"]["temporal"]["interval"],
+            json!([[t0.to_rfc3339(), t0.to_rfc3339()]])
+        );
+        assert!(names["t"].get("description").is_none());
     }
 
     /// Locks in the contract the request-logging middleware depends on:

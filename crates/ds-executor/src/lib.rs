@@ -218,17 +218,31 @@ impl RenderJob {
         width: u32,
         height: u32,
     ) -> Result<(Self, Arc<budget::RenderPermit>), ExecutionError> {
-        Self::acquire_raster_on(
+        Self::acquire_raster_planes(slots, width, height, 1).await
+    }
+
+    /// [`Self::acquire_raster`] for a render that holds `planes` value
+    /// planes of the output size at once: an RGB composite's bands (#819).
+    /// It charges [`budget::raster_bytes`], the single-plane charge plus
+    /// [`budget::PLANE_BYTES_PER_PIXEL`] per further plane, against the same
+    /// memory budget, queue and deadline.
+    pub async fn acquire_raster_planes(
+        slots: Arc<Semaphore>,
+        width: u32,
+        height: u32,
+        planes: usize,
+    ) -> Result<(Self, Arc<budget::RenderPermit>), ExecutionError> {
+        Self::acquire_bytes_on(
             slots,
             WAITING.clone(),
             *TIMEOUT,
             budget::RENDER_MEMORY.clone(),
-            width,
-            height,
+            budget::raster_bytes(width, height, planes),
         )
         .await
     }
 
+    #[cfg(test)]
     async fn acquire_raster_on(
         slots: Arc<Semaphore>,
         waiting: Arc<Semaphore>,
@@ -237,13 +251,32 @@ impl RenderJob {
         width: u32,
         height: u32,
     ) -> Result<(Self, Arc<budget::RenderPermit>), ExecutionError> {
+        Self::acquire_bytes_on(
+            slots,
+            waiting,
+            timeout,
+            memory,
+            budget::raster_bytes(width, height, 1),
+        )
+        .await
+    }
+
+    /// Reserve `bytes` of output memory (from [`budget::raster_bytes`];
+    /// `None` never fits), then a CPU slot.
+    async fn acquire_bytes_on(
+        slots: Arc<Semaphore>,
+        waiting: Arc<Semaphore>,
+        timeout: Duration,
+        memory: Arc<budget::RenderBudget>,
+        bytes: Option<u64>,
+    ) -> Result<(Self, Arc<budget::RenderPermit>), ExecutionError> {
         let deadline = Instant::now() + timeout;
         // A request that can never fit must not occupy the waiting queue.
-        if !memory.fits(width, height) {
+        if !memory.fits(bytes) {
             memory.reject_oversize();
             return Err(ExecutionError::Busy);
         }
-        if let Some(reservation) = memory.try_reserve(width, height) {
+        if let Some(reservation) = memory.try_reserve(bytes) {
             if let Ok(permit) = slots.clone().try_acquire_owned() {
                 return Ok((Self { permit, deadline }, Arc::new(reservation)));
             }
@@ -252,7 +285,7 @@ impl RenderJob {
             REJECTED.fetch_add(1, Ordering::Relaxed);
             ExecutionError::Busy
         })?;
-        let reservation = tokio::time::timeout_at(deadline.into(), memory.reserve(width, height))
+        let reservation = tokio::time::timeout_at(deadline.into(), memory.reserve(bytes))
             .await
             .map_err(|_| {
                 memory.reject_deadline();
@@ -356,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn raster_memory_wait_is_bounded_cancellable_and_does_not_hold_cpu() {
         let memory = Arc::new(budget::RenderBudget::new(budget::BYTES_PER_PIXEL));
-        let held = memory.try_reserve(1, 1).unwrap();
+        let held = memory.try_reserve(budget::raster_bytes(1, 1, 1)).unwrap();
         let slots = Arc::new(Semaphore::new(24));
         let waiting = Arc::new(Semaphore::new(1));
         let task = tokio::spawn(RenderJob::acquire_raster_on(
@@ -477,7 +510,7 @@ mod tests {
             (memory.rejected_oversize(), memory.rejected_deadline()),
             (1, 0)
         );
-        let held = memory.try_reserve(1, 1).unwrap();
+        let held = memory.try_reserve(budget::raster_bytes(1, 1, 1)).unwrap();
         assert!(matches!(
             RenderJob::acquire_raster_on(
                 slots.clone(),

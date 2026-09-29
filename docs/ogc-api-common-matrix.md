@@ -103,6 +103,13 @@ union. Every map and map-tile render route declares `parameter-name` in
 OpenAPI. The member is an extension borrowed from EDR, not a Maps, Tiles or
 Common requirement; no conformance classes change.
 
+RGB composites (2026-09-29, [#819](https://github.com/mrauhala/meteocore/issues/819)):
+a satellite collection's composites are `parameter_names` entries too, with no
+unit, a `description` naming what each channel reads, and their own
+`extent.temporal`, the scans every band has. EDR's own `parameter_names` does
+not list them: a composite has no numeric values. The Maps and Tiles `legend`
+schema is one of a palette legend or a composite's channel list.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a

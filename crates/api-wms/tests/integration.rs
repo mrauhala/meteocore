@@ -4050,3 +4050,596 @@ async fn malformed_bgcolor_or_transparent_is_invalid_parameter_value() {
         "rejected before rendering"
     );
 }
+
+// --- RGB composite layers (#819) ------------------------------------------
+
+mod composites {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use ds_core::map_engine::{select_common_time, CompositeChannel, CompositeDef};
+    use ds_render::{CompositeSpec, ImageFormat};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    const T0: &str = "2026-09-25T19:00:00Z";
+    const T1: &str = "2026-09-25T19:10:00Z";
+    const T2: &str = "2026-09-25T19:20:00Z";
+    const RGB: &str = "rgb";
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// Red `a - b` over -10..40, green `b` over 0..100, blue `a` inverted
+    /// over 100..0.
+    fn rgb() -> CompositeDef {
+        let channel = |parameter: &str, minus: Option<&str>, min, max| CompositeChannel {
+            parameter: parameter.into(),
+            minus: minus.map(String::from),
+            min,
+            max,
+            gamma: 1.0,
+        };
+        CompositeDef {
+            name: RGB.into(),
+            title: "A and B".into(),
+            channels: [
+                channel("a", Some("b"), -10.0, 40.0),
+                channel("b", None, 0.0, 100.0),
+                channel("a", None, 100.0, 0.0),
+            ],
+        }
+    }
+
+    /// One band's tile: `a` is 50 + the scan's ten-minute step everywhere;
+    /// `b` is 20 + the step east of 5°E and nodata west of it. So each
+    /// scan draws its own pixels, and a composite reading `b` is
+    /// transparent west of 5°E.
+    fn band(parameter: &str, time: DateTime<Utc>, bbox: [f64; 4], w: u32, h: u32) -> RasterTile {
+        let step = ((time - t(T0)).num_minutes() / 10) as f64;
+        let values: Vec<Option<f64>> = (0..h)
+            .flat_map(|_| {
+                (0..w).map(move |i| {
+                    let lon = bbox[0] + (i as f64 + 0.5) * (bbox[2] - bbox[0]) / w as f64;
+                    match parameter {
+                        "a" => Some(50.0 + step),
+                        "b" if lon >= 5.0 => Some(20.0 + step),
+                        _ => None,
+                    }
+                })
+            })
+            .collect();
+        RasterTile {
+            width: w,
+            height: h,
+            values: values.into(),
+        }
+    }
+
+    /// One `get_raster_tiles` call: its bands and time.
+    type Call = (Vec<String>, Option<DateTime<Utc>>);
+
+    /// Two bands on their own time axes, like a satellite collection, and
+    /// one composite over both. The axes can change under a running router.
+    struct Engine {
+        axes: Mutex<BTreeMap<&'static str, Vec<DateTime<Utc>>>>,
+        calls: Mutex<Vec<Call>>,
+    }
+
+    impl Engine {
+        fn new(a: &[&str], b: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                axes: Mutex::new(BTreeMap::from([
+                    ("a", a.iter().map(|s| t(s)).collect()),
+                    ("b", b.iter().map(|s| t(s)).collect()),
+                ])),
+                calls: Mutex::default(),
+            })
+        }
+
+        fn add_scan(&self, band: &'static str, time: &str) {
+            let mut axes = self.axes.lock().unwrap();
+            let axis = axes.get_mut(band).unwrap();
+            axis.push(t(time));
+            axis.sort();
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn axis(&self, band: &str) -> Vec<DateTime<Utc>> {
+            self.axes.lock().unwrap()[band].clone()
+        }
+
+        /// The scans both bands have.
+        fn shared(&self) -> Vec<DateTime<Utc>> {
+            let b = self.axis("b");
+            self.axis("a")
+                .into_iter()
+                .filter(|t| b.contains(t))
+                .collect()
+        }
+    }
+
+    impl MapEngine for Engine {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let parameter = parameter.unwrap_or("a");
+            if parameter == RGB {
+                return Err(DataServerError::InvalidParameter("not a band".into()));
+            }
+            let time = time.unwrap_or_else(|| *self.axis(parameter).last().unwrap());
+            Ok(band(parameter, time, bbox, width, height))
+        }
+
+        fn get_raster_tiles(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            parameters: &[&str],
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<Vec<RasterTile>, DataServerError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((parameters.iter().map(|p| p.to_string()).collect(), time));
+            let time = time.expect("a composite renders the time it was keyed on");
+            parameters
+                .iter()
+                .map(|p| {
+                    if self.axis(p).contains(&time) {
+                        Ok(band(p, time, bbox, width, height))
+                    } else {
+                        Err(DataServerError::InvalidParameter(format!(
+                            "{p} has no scan"
+                        )))
+                    }
+                })
+                .collect()
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let parameter = |name: &str| ds_core::map_engine::ParameterInfo {
+                name: name.to_string(),
+                title: format!("Band {name}"),
+                unit: "K".into(),
+            };
+            let mut times: Vec<DateTime<Utc>> = self
+                .axes
+                .lock()
+                .unwrap()
+                .values()
+                .flatten()
+                .copied()
+                .collect();
+            times.sort();
+            times.dedup();
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+                times,
+                parameter: "a".into(),
+                unit: "K".into(),
+                parameters: vec![parameter("a"), parameter("b")],
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+
+        fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+            if parameter == RGB {
+                return Some(self.shared().into());
+            }
+            Some(self.axis(parameter).into())
+        }
+
+        fn resolve_parameter_time(
+            &self,
+            parameter: Option<&str>,
+            time: Option<DateTime<Utc>>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let parameter = parameter.unwrap_or("a");
+            if parameter == RGB {
+                let (a, b) = (self.axis("a"), self.axis("b"));
+                return select_common_time(&[&a, &b], time);
+            }
+            select_common_time(&[&self.axis(parameter)], time)
+        }
+
+        fn composites(&self) -> Arc<[CompositeDef]> {
+            Arc::from([rgb()])
+        }
+    }
+
+    fn router(engine: Arc<Engine>) -> (axum::Router, Arc<ds_render::TilePixelCache>) {
+        let engine: Arc<dyn MapEngine> = engine;
+        let config = CollectionConfig {
+            id: "sat".to_string(),
+            title: "Satellite".to_string(),
+            description: "Two bands and an RGB composite".to_string(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "satellite".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            nowcast: None,
+            bufr: None,
+            satellite: None,
+            preview: None,
+        };
+        let style = StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
+            colormap: Arc::new(LutColorMap::from_builtin(
+                BuiltinColormap::Viridis,
+                0.0,
+                100.0,
+            )),
+            min: 0.0,
+            max: 100.0,
+            parameter: None,
+        };
+        let mut viridis = style.clone();
+        viridis.name = "viridis".into();
+        let tile_cache = Arc::new(ds_render::TilePixelCache::new(64));
+        let state = Arc::new(ArcSwap::from_pointee(WmsState {
+            engines: HashMap::from([("sat".to_string(), engine)]),
+            collections: HashMap::from([("sat".to_string(), config)]),
+            styles: HashMap::from([(
+                "sat".to_string(),
+                HashMap::from([
+                    ("default".to_string(), style),
+                    ("viridis".to_string(), viridis),
+                ]),
+            )]),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            tile_cache: tile_cache.clone(),
+            base_url: String::new(),
+            trust_proxy_headers: false,
+        }));
+        (api_wms::router(state), tile_cache)
+    }
+
+    struct Reply {
+        status: StatusCode,
+        x_cache: String,
+        content_type: String,
+        body: bytes::Bytes,
+    }
+
+    async fn get(app: &axum::Router, query: &str) -> Reply {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/?SERVICE=WMS&VERSION=1.3.0&{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let (status, x_cache, content_type) =
+            (resp.status(), header("x-cache"), header("content-type"));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        Reply {
+            status,
+            x_cache,
+            content_type,
+            body,
+        }
+    }
+
+    fn get_map(layer: &str, crs: &str, bbox: &str, extra: &str) -> String {
+        format!(
+            "REQUEST=GetMap&LAYERS={layer}&STYLES=&FORMAT=image/png&CRS={crs}\
+             &BBOX={bbox}&WIDTH=64&HEIGHT=64{extra}"
+        )
+    }
+
+    /// The `<Layer>` element named `name`, as text.
+    fn layer<'a>(caps: &'a str, name: &str) -> &'a str {
+        let start = caps.find(&format!("<Name>{name}</Name>")).unwrap();
+        let end = caps[start..].find("</Layer>").unwrap();
+        &caps[start..start + end]
+    }
+
+    /// The composite is a child layer next to the bands: its own time
+    /// dimension (the scans both bands have), one `default` style and a
+    /// legend URL.
+    #[tokio::test]
+    async fn capabilities_list_the_composite_layer() {
+        let (app, _) = router(Engine::new(&[T0, T1, T2], &[T0, T1]));
+        let reply = get(&app, "REQUEST=GetCapabilities").await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let caps = String::from_utf8(reply.body.to_vec()).unwrap();
+        assert!(caps.contains("<Name>sat/a</Name>"));
+        assert!(caps.contains("<Name>sat/b</Name>"));
+
+        let composite = layer(&caps, "sat/rgb");
+        assert!(composite.contains("<Title>A and B</Title>"), "{composite}");
+        assert!(
+            composite.contains("<Abstract>RGB composite: red a - b, green b, blue a</Abstract>"),
+            "{composite}"
+        );
+        assert!(
+            composite.contains(&format!(
+                "<Dimension name=\"time\" units=\"ISO8601\" default=\"{}\" nearestValue=\"1\">{},{}</Dimension>",
+                t(T1).to_rfc3339(),
+                t(T0).to_rfc3339(),
+                t(T1).to_rfc3339()
+            )),
+            "{composite}"
+        );
+        assert_eq!(composite.matches("<Style>").count(), 1, "{composite}");
+        assert!(composite.contains("<Name>default</Name>"), "{composite}");
+        assert!(
+            composite.contains("REQUEST=GetLegendGraphic&amp;LAYER=sat/rgb&amp;STYLE=default"),
+            "{composite}"
+        );
+    }
+
+    /// A GetMap is `render_composite_tiles` over the band tiles at the
+    /// resolved time: the scans both bands have, T1, not `a`'s newer T2.
+    /// TRANSPARENT=FALSE fills the nodata half with BGCOLOR, as for a
+    /// parameter layer.
+    #[tokio::test]
+    async fn getmap_composes_the_bands_at_the_shared_time() {
+        let engine = Engine::new(&[T0, T1, T2], &[T0, T1]);
+        let (app, _) = router(engine.clone());
+        let reply = get(&app, &get_map("sat/rgb", "CRS:84", "0,40,10,50", "")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.x_cache, "MISS");
+        assert_eq!(reply.content_type, "image/png");
+        assert_eq!(
+            engine.calls(),
+            [(vec!["a".to_string(), "b".to_string()], Some(t(T1)))]
+        );
+
+        let spec = CompositeSpec::from(&rgb());
+        let tiles = engine
+            .get_raster_tiles(
+                [0.0, 40.0, 10.0, 50.0],
+                64,
+                64,
+                Some(t(T1)),
+                &OutputCrs::Wgs84,
+                &["a", "b"],
+                None,
+                None,
+            )
+            .unwrap();
+        let expected = ds_render::render_composite_tiles(&tiles, &spec, ImageFormat::Png, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.body, expected);
+
+        // East of 5°E: red 51 - 21 = 30 over -10..40 → 204, green 21 → 54,
+        // blue 51 inverted over 100..0 → 125. West of it `b` is nodata.
+        let pixels = png_pixels(&reply.body);
+        assert_eq!(pixels[63], [204, 54, 125, 255]);
+        assert_eq!(pixels[0], [0, 0, 0, 0]);
+
+        let opaque = get(
+            &app,
+            &get_map(
+                "sat/rgb",
+                "CRS:84",
+                "0,40,10,50",
+                "&TRANSPARENT=FALSE&BGCOLOR=0x00FF00",
+            ),
+        )
+        .await;
+        assert_eq!(opaque.status, StatusCode::OK);
+        let pixels = png_pixels(&opaque.body);
+        assert_eq!(pixels[0], [0, 255, 0, 255]);
+        assert_eq!(pixels[63], [204, 54, 125, 255]);
+    }
+
+    /// #507: the caches key on the time every band is read from. A newer
+    /// scan of ONE band leaves the composite's frame, its key and its
+    /// pixels, alone; only a scan both bands have moves it.
+    #[tokio::test]
+    async fn a_newer_scan_of_one_band_does_not_move_the_frame() {
+        let engine = Engine::new(&[T0, T1], &[T0, T1]);
+        let (app, _) = router(engine.clone());
+        let map = |extra: &str| get_map("sat/rgb", "CRS:84", "0,40,10,50", extra);
+
+        let first = get(&app, &map("")).await;
+        assert_eq!(first.x_cache, "MISS");
+        assert_eq!(engine.calls().len(), 1);
+
+        engine.add_scan("a", T2);
+        let latest = get(&app, &map("")).await;
+        assert_eq!(latest.x_cache, "HIT");
+        assert_eq!(latest.body, first.body);
+        // T2 exists for `a` only: it resolves to T1, the same key.
+        let pinned = get(&app, &map(&format!("&TIME={T2}"))).await;
+        assert_eq!(pinned.x_cache, "HIT");
+        assert_eq!(engine.calls().len(), 1);
+
+        // Once `b` has T2 too, the frame moves and renders anew.
+        engine.add_scan("b", T2);
+        let moved = get(&app, &map("")).await;
+        assert_eq!(moved.x_cache, "MISS");
+        assert_ne!(moved.body, first.body);
+        assert_eq!(engine.calls()[1].1, Some(t(T2)));
+    }
+
+    /// Projected output goes through meta-tiling: every tile reads the
+    /// bands at the resolved time, the composed tiles are cached, and a
+    /// newer scan of one band reuses them (#507).
+    #[tokio::test]
+    async fn projected_composites_are_meta_tiled_at_the_resolved_time() {
+        let engine = Engine::new(&[T0, T1], &[T0, T1]);
+        let (app, tile_cache) = router(engine.clone());
+        let bbox = "0,4900000,1100000,6000000";
+        let first = get(&app, &get_map("sat/rgb", "EPSG:3857", bbox, "")).await;
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(first.content_type, "image/png");
+        let calls = engine.calls();
+        assert!(!calls.is_empty());
+        assert!(calls
+            .iter()
+            .all(|(bands, time)| bands == &["a", "b"] && *time == Some(t(T1))));
+        let (_, misses) = tile_cache.stats();
+        assert_eq!(misses as usize, calls.len());
+        let pixels = png_pixels(&first.body);
+        assert_eq!(pixels[63], [204, 54, 125, 255]);
+        assert_eq!(pixels[0], [0, 0, 0, 0]);
+
+        // Another format misses the rendered cache but assembles from the
+        // same composed tiles, still at T1 after `a` gains T2.
+        engine.add_scan("a", T2);
+        let webp = get(
+            &app,
+            &get_map("sat/rgb", "EPSG:3857", bbox, "").replace("image/png", "image/webp"),
+        )
+        .await;
+        assert_eq!(webp.status, StatusCode::OK);
+        assert_eq!(webp.content_type, "image/webp");
+        assert_eq!(engine.calls().len(), calls.len());
+
+        // EPSG:3067 meta-tiles too.
+        let projected = get(
+            &app,
+            &get_map("sat/rgb", "EPSG:3067", "100000,6500000,356000,6756000", ""),
+        )
+        .await;
+        assert_eq!(projected.status, StatusCode::OK);
+        assert!(engine.calls().len() > calls.len());
+        assert!(engine.calls().iter().all(|(_, time)| *time == Some(t(T1))));
+    }
+
+    /// Bands that share no scan resolve no time: an empty image, and the
+    /// engine is not asked for a timestep no key names.
+    #[tokio::test]
+    async fn no_shared_scan_is_an_empty_image() {
+        let engine = Engine::new(&[T0], &[T1]);
+        let (app, _) = router(engine.clone());
+        for (crs, bbox) in [
+            ("CRS:84", "0,40,10,50"),
+            ("EPSG:3857", "0,4900000,1100000,6000000"),
+        ] {
+            let reply = get(&app, &get_map("sat/rgb", crs, bbox, &format!("&TIME={T1}"))).await;
+            assert_eq!(reply.status, StatusCode::OK);
+            assert_eq!(reply.x_cache, "EMPTY");
+        }
+        assert!(engine.calls().is_empty());
+    }
+
+    /// A composite has one style: another is StyleNotDefined, on GetMap
+    /// and GetLegendGraphic alike. Unknown layer names list the composite.
+    #[tokio::test]
+    async fn composites_reject_other_styles_and_list_among_layers() {
+        let (app, _) = router(Engine::new(&[T0, T1], &[T0, T1]));
+        let styled = get(
+            &app,
+            &get_map("sat/rgb", "CRS:84", "0,40,10,50", "").replace("STYLES=", "STYLES=viridis"),
+        )
+        .await;
+        assert_eq!(styled.status, StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(styled.body.to_vec()).unwrap();
+        assert!(body.contains("StyleNotDefined"), "{body}");
+        assert!(body.contains("Available: default"), "{body}");
+
+        let legend = get(
+            &app,
+            "REQUEST=GetLegendGraphic&LAYER=sat/rgb&STYLE=viridis&FORMAT=image/png",
+        )
+        .await;
+        assert_eq!(legend.status, StatusCode::BAD_REQUEST);
+
+        let unknown = get(&app, &get_map("sat/nope", "CRS:84", "0,40,10,50", "")).await;
+        assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(unknown.body.to_vec()).unwrap();
+        assert!(body.contains("Available: a, b, rgb"), "{body}");
+
+        // The bands' own layers still render with their styles.
+        let band = get(
+            &app,
+            &get_map("sat/a", "CRS:84", "0,40,10,50", "").replace("STYLES=", "STYLES=viridis"),
+        )
+        .await;
+        assert_eq!(band.status, StatusCode::OK);
+    }
+
+    /// The composite's legend is its channel list, JSON or image, with the
+    /// bands' units and no colour bar.
+    #[tokio::test]
+    async fn legend_graphic_lists_the_channels() {
+        let (app, _) = router(Engine::new(&[T0, T1], &[T0, T1]));
+        let json = get(
+            &app,
+            "REQUEST=GetLegendGraphic&LAYER=sat/rgb&FORMAT=application/json",
+        )
+        .await;
+        assert_eq!(json.status, StatusCode::OK);
+        let legend: serde_json::Value = serde_json::from_slice(&json.body).unwrap();
+        assert_eq!(
+            legend,
+            serde_json::json!({
+                "style": "default",
+                "parameter": "rgb",
+                "title": "A and B",
+                "channels": [
+                    {"channel": "red", "label": "a - b", "parameters": ["a", "b"],
+                     "min": -10.0, "max": 40.0, "gamma": 1.0, "unit": "K"},
+                    {"channel": "green", "label": "b", "parameters": ["b"],
+                     "min": 0.0, "max": 100.0, "gamma": 1.0, "unit": "K"},
+                    {"channel": "blue", "label": "a", "parameters": ["a"],
+                     "min": 100.0, "max": 0.0, "gamma": 1.0, "unit": "K"},
+                ]
+            })
+        );
+
+        let image = get(
+            &app,
+            "REQUEST=GetLegendGraphic&LAYER=sat/rgb&STYLE=default&FORMAT=image/png",
+        )
+        .await;
+        assert_eq!(image.status, StatusCode::OK);
+        assert_eq!(image.content_type, "image/png");
+        let expected = ds_render::render_composite_legend(
+            &CompositeSpec::from(&rgb()),
+            &[Some("K"), Some("K")],
+            ds_render::LEGEND_DEFAULT_WIDTH,
+            ds_render::LEGEND_DEFAULT_HEIGHT,
+            ImageFormat::Png,
+        )
+        .unwrap();
+        assert_eq!(image.body, expected);
+    }
+}

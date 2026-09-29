@@ -10,7 +10,7 @@ use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
-use ds_render::{CacheKey, RenderedCache, StyleInfo};
+use ds_render::{CacheKey, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
 
 use crate::error::WmsError;
 use crate::params::{WmsQuery, WmsRequestType};
@@ -71,6 +71,36 @@ impl RenderPath {
             RenderPath::Fallback(phases) | RenderPath::Direct(phases) => *phases,
         }
     }
+}
+
+/// How a GetMap turns engine output into pixels.
+enum Paint {
+    /// One parameter through its style's colormap.
+    Colormap(Arc<dyn ColorMap>),
+    /// An RGB composite layer (#819): its bands from `get_raster_tiles`,
+    /// composed by its channels. It has one style, `default`.
+    Composite(Arc<CompositeSpec>),
+}
+
+impl Paint {
+    /// Value planes a render holds at once, for memory admission.
+    fn planes(&self) -> usize {
+        match self {
+            Paint::Colormap(_) => 1,
+            Paint::Composite(spec) => spec.parameters.len(),
+        }
+    }
+}
+
+/// The RGB composite `layer` names, when it is `{collection}/{composite}`
+/// of an engine that serves one (#819).
+fn composite_layer(engine: &dyn MapEngine, layer: &str) -> Option<Arc<CompositeSpec>> {
+    let (_, name) = layer.split_once('/')?;
+    engine
+        .composites()
+        .iter()
+        .find(|c| c.name == name)
+        .map(|def| Arc::new(CompositeSpec::from(def)))
 }
 
 #[derive(Clone)]
@@ -182,22 +212,50 @@ pub async fn wms_handler(
                 .get(&collection_id)
                 .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
 
+            // An RGB composite layer (#819) has no style map: its colours
+            // come from its channels, and its one style is `default`.
+            let composite = composite_layer(engine.as_ref(), &params.layer);
+
             // Look up style: try full layer name first (e.g., "ecmwf-kenya/2t" for
             // per-parameter defaults), then fall back to collection ID
-            let layer_styles = state
-                .styles
-                .get(&params.layer)
-                .or_else(|| state.styles.get(&collection_id))
-                .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
+            let (paint, style_name, style_parameter) = match &composite {
+                Some(spec) => {
+                    if params.style != ds_render::COMPOSITE_STYLE {
+                        return Err(WmsError::StyleNotDefined(format!(
+                            "Style '{}' not defined for layer '{}'. Available: {}",
+                            params.style,
+                            params.layer,
+                            ds_render::COMPOSITE_STYLE
+                        )));
+                    }
+                    (
+                        Paint::Composite(spec.clone()),
+                        ds_render::COMPOSITE_STYLE.to_string(),
+                        None,
+                    )
+                }
+                None => {
+                    let layer_styles = state
+                        .styles
+                        .get(&params.layer)
+                        .or_else(|| state.styles.get(&collection_id))
+                        .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
 
-            let style_info = layer_styles.get(&params.style).ok_or_else(|| {
-                WmsError::StyleNotDefined(format!(
-                    "Style '{}' not defined for layer '{}'. Available: {}",
-                    params.style,
-                    params.layer,
-                    layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-                ))
-            })?;
+                    let style_info = layer_styles.get(&params.style).ok_or_else(|| {
+                        WmsError::StyleNotDefined(format!(
+                            "Style '{}' not defined for layer '{}'. Available: {}",
+                            params.style,
+                            params.layer,
+                            layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
+                        ))
+                    })?;
+                    (
+                        Paint::Colormap(style_info.colormap.clone()),
+                        style_info.name.clone(),
+                        style_info.parameter.clone(),
+                    )
+                }
+            };
 
             // Share one metadata snapshot across parameter, ELEVATION and
             // reference_time validation below.
@@ -209,9 +267,17 @@ pub async fn wms_handler(
             // defaults to and cache that result under the invalid name —
             // ServiceException is the correct OGC response here.
             if let Some(pname) = layer_parameter.as_deref() {
-                if !info.parameters.is_empty() && !info.parameters.iter().any(|p| p.name == pname) {
-                    let mut supported: Vec<&str> =
-                        info.parameters.iter().map(|p| p.name.as_str()).collect();
+                if composite.is_none()
+                    && !info.parameters.is_empty()
+                    && !info.parameters.iter().any(|p| p.name == pname)
+                {
+                    let composites = engine.composites();
+                    let mut supported: Vec<&str> = info
+                        .parameters
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .chain(composites.iter().map(|c| c.name.as_str()))
+                        .collect();
                     supported.sort_unstable();
                     return Err(WmsError::LayerNotDefined(format!(
                         "Parameter '{pname}' is not available for layer \
@@ -248,16 +314,14 @@ pub async fn wms_handler(
                 }
             }
 
-            let colormap = style_info.colormap.clone();
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
 
             // WMS picks the parameter via `LAYERS=collection/param` (parsed
             // into layer_parameter) and then `style_info.parameter`. Settle it
-            // first: a parameter can have its own time axis.
-            let parameter = layer_parameter
-                .clone()
-                .or_else(|| style_info.parameter.clone());
+            // first: a parameter can have its own time axis, and so can a
+            // composite, whose name the engine resolves like a parameter's.
+            let parameter = layer_parameter.clone().or(style_parameter);
 
             // Engine-owned default first (CAP: active now), then the
             // parameter's (else the collection's) latest time. Resolve before
@@ -409,12 +473,14 @@ pub async fn wms_handler(
                     .into_response());
             }
 
-            // Acquire render semaphore (with timeout to shed load under pressure)
+            // Acquire render semaphore (with timeout to shed load under
+            // pressure). A composite holds one value plane per band.
             let t_sem = std::time::Instant::now();
-            let (job, memory_permit) = ds_executor::RenderJob::acquire_raster(
+            let (job, memory_permit) = ds_executor::RenderJob::acquire_raster_planes(
                 state.render_semaphore.clone(),
                 params.width,
                 params.height,
+                paint.planes(),
             )
             .await
             .map_err(WmsError::from)?;
@@ -444,13 +510,13 @@ pub async fn wms_handler(
             // Key meta-tiles on the *resolved* style name, not the raw STYLES
             // param: `STYLES=` (empty → default) and `STYLES=default` resolve to
             // the same StyleInfo, so they must share cached tiles.
-            let style = style_info.name.clone();
+            let style = style_name;
             let rendered_cache = state.rendered_cache.clone();
             let tile_cache = state.tile_cache.clone();
 
-            // Layer parameter (from "collection/param") takes priority over style parameter
-            let style_parameter =
-                layer_parameter.or_else(|| style_info.parameter.as_deref().map(String::from));
+            // Layer parameter (from "collection/param") takes priority over
+            // style parameter; for a composite it is the composite's name.
+            let style_parameter = parameter;
 
             // Spans spawn_blocking *dispatch* + execution, so `render_ms` includes
             // any wait for a free blocking-pool thread (itself a useful signal: if
@@ -462,33 +528,78 @@ pub async fn wms_handler(
                     move || -> Result<(Option<Vec<u8>>, RenderPath), DataServerError> {
                         let _memory_permit = worker_memory;
 
-                        // Direct single-shot render: one get_raster_tile → colorize → encode.
+                        // A composite's bands, in the plane order its spec reads.
+                        let bands: Vec<&str> = match &paint {
+                            Paint::Composite(spec) => {
+                                spec.parameters.iter().map(String::as_str).collect()
+                            }
+                            Paint::Colormap(_) => Vec::new(),
+                        };
+                        // Bands that share no scan resolve no time (#819):
+                        // nothing to draw, and nothing to cache under a key
+                        // that names no timestep.
+                        if matches!(paint, Paint::Composite(_)) && time.is_none() {
+                            return Ok((None, RenderPath::Direct(RenderPhases::default())));
+                        }
+
+                        // Direct single-shot render: one get_raster_tile →
+                        // colorize → encode, or a composite's bands → compose →
+                        // encode.
                         let direct = || {
                             let mut phases = RenderPhases::default();
                             let engine_start = std::time::Instant::now();
-                            let tile = engine.get_raster_tile(
-                                bbox,
-                                width,
-                                height,
-                                time,
-                                &output_crs,
-                                style_parameter.as_deref(),
-                                elevation,
-                                reference_time,
-                            )?;
-                            phases.add(RenderPhase::Engine, engine_start.elapsed());
-                            // If every pixel is nodata, skip colorization + encoding entirely.
-                            if tile.is_empty() {
-                                return Ok((None, phases));
-                            }
-                            let encode_start = std::time::Instant::now();
-                            let bytes = ds_render::render_tile_with_background(
-                                &tile,
-                                colormap.as_ref(),
-                                format,
-                                background,
-                            )?;
-                            phases.add(RenderPhase::Encode, encode_start.elapsed());
+                            let bytes = match &paint {
+                                Paint::Colormap(colormap) => {
+                                    let tile = engine.get_raster_tile(
+                                        bbox,
+                                        width,
+                                        height,
+                                        time,
+                                        &output_crs,
+                                        style_parameter.as_deref(),
+                                        elevation,
+                                        reference_time,
+                                    )?;
+                                    phases.add(RenderPhase::Engine, engine_start.elapsed());
+                                    // If every pixel is nodata, skip colorization + encoding entirely.
+                                    if tile.is_empty() {
+                                        return Ok((None, phases));
+                                    }
+                                    let encode_start = std::time::Instant::now();
+                                    let bytes = ds_render::render_tile_with_background(
+                                        &tile,
+                                        colormap.as_ref(),
+                                        format,
+                                        background,
+                                    )?;
+                                    phases.add(RenderPhase::Encode, encode_start.elapsed());
+                                    bytes
+                                }
+                                Paint::Composite(spec) => {
+                                    // Every band from the one timestep the
+                                    // cache key names (#507).
+                                    let tiles = engine.get_raster_tiles(
+                                        bbox,
+                                        width,
+                                        height,
+                                        time,
+                                        &output_crs,
+                                        &bands,
+                                        elevation,
+                                        reference_time,
+                                    )?;
+                                    phases.add(RenderPhase::Engine, engine_start.elapsed());
+                                    let encode_start = std::time::Instant::now();
+                                    let Some(bytes) = ds_render::render_composite_tiles(
+                                        &tiles, spec, format, background,
+                                    )?
+                                    else {
+                                        return Ok((None, phases));
+                                    };
+                                    phases.add(RenderPhase::Encode, encode_start.elapsed());
+                                    bytes
+                                }
+                            };
                             Ok::<_, DataServerError>((Some(bytes), phases))
                         };
 
@@ -511,30 +622,56 @@ pub async fn wms_handler(
                             };
                             // Projected output retains its exact metre rectangle;
                             // the helper supplies each tile's own OutputCrs and
-                            // WGS84 source-read envelope to the engine.
-                            let outcome = ds_render::render_metatiled(
-                                bbox,
-                                &output_crs,
-                                width,
-                                height,
-                                &prefix,
-                                colormap.as_ref(),
-                                format,
-                                background,
-                                tile_cache.as_ref(),
-                                |tbbox, tw, th, tile_output| {
-                                    engine.get_raster_tile(
-                                        tbbox,
-                                        tw,
-                                        th,
-                                        time,
-                                        tile_output,
-                                        style_parameter.as_deref(),
-                                        elevation,
-                                        reference_time,
-                                    )
-                                },
-                            )?;
+                            // WGS84 source-read envelope to the engine. A
+                            // composite's tiles cache its composed RGBA.
+                            let outcome = match &paint {
+                                Paint::Colormap(colormap) => ds_render::render_metatiled(
+                                    bbox,
+                                    &output_crs,
+                                    width,
+                                    height,
+                                    &prefix,
+                                    colormap.as_ref(),
+                                    format,
+                                    background,
+                                    tile_cache.as_ref(),
+                                    |tbbox, tw, th, tile_output| {
+                                        engine.get_raster_tile(
+                                            tbbox,
+                                            tw,
+                                            th,
+                                            time,
+                                            tile_output,
+                                            style_parameter.as_deref(),
+                                            elevation,
+                                            reference_time,
+                                        )
+                                    },
+                                )?,
+                                Paint::Composite(spec) => ds_render::render_metatiled_composite(
+                                    bbox,
+                                    &output_crs,
+                                    width,
+                                    height,
+                                    &prefix,
+                                    spec,
+                                    format,
+                                    background,
+                                    tile_cache.as_ref(),
+                                    |tbbox, tw, th, tile_output| {
+                                        engine.get_raster_tiles(
+                                            tbbox,
+                                            tw,
+                                            th,
+                                            time,
+                                            tile_output,
+                                            &bands,
+                                            elevation,
+                                            reference_time,
+                                        )
+                                    },
+                                )?,
+                            };
                             match outcome {
                                 ds_render::MetaTile::Image { bytes, stats } => {
                                     Ok((Some(bytes), RenderPath::Meta(stats)))
@@ -733,6 +870,17 @@ pub async fn wms_handler(
                 style_name
             };
 
+            // An RGB composite layer's legend is its channel list (#819).
+            let legend_engine = state
+                .engines
+                .get(layer_name.split('/').next().unwrap_or(layer_name));
+            if let Some((engine, spec)) = legend_engine.and_then(|engine| {
+                composite_layer(engine.as_ref(), layer_name).map(|s| (engine, s))
+            }) {
+                return composite_legend(&query, layer_name, style_name, engine.as_ref(), spec)
+                    .await;
+            }
+
             // Support "collection/parameter" layer names for legend. Resolve
             // the FULL layer key first, exactly as GetMap does: a
             // "{collection}/{param}" layer carries its own style map (the
@@ -803,21 +951,7 @@ pub async fn wms_handler(
                 crate::params::LegendFormat::Image(format) => format,
             };
 
-            // Default to a size that fits the value-tick labels + title (#371);
-            // a client can still request a smaller thumbnail, where the renderer
-            // degrades to a bare swatch.
-            let width: u32 = query
-                .width
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(ds_render::LEGEND_DEFAULT_WIDTH);
-            let height: u32 = query
-                .height
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(ds_render::LEGEND_DEFAULT_HEIGHT);
-            let width = width.clamp(1, 512);
-            let height = height.clamp(1, 1024);
+            let (width, height) = legend_size(&query);
 
             let colormap = style_info.colormap.clone();
             let min = style_info.min;
@@ -857,6 +991,84 @@ pub async fn wms_handler(
                 .into_response())
         }
     }
+}
+
+/// The legend image size a GetLegendGraphic asks for. The default fits the
+/// value-tick labels + title (#371); a client can still request a smaller
+/// thumbnail, where the renderer degrades to a bare swatch.
+fn legend_size(query: &WmsQuery) -> (u32, u32) {
+    let width: u32 = query
+        .width
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(ds_render::LEGEND_DEFAULT_WIDTH);
+    let height: u32 = query
+        .height
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(ds_render::LEGEND_DEFAULT_HEIGHT);
+    (width.clamp(1, 512), height.clamp(1, 1024))
+}
+
+/// GetLegendGraphic for an RGB composite layer (#819): the channel list,
+/// each channel's bands, range, gamma and unit, with no colour bar. The
+/// units are the bands' own. Its one style is `default`.
+async fn composite_legend(
+    query: &WmsQuery,
+    layer_name: &str,
+    style_name: &str,
+    engine: &dyn MapEngine,
+    spec: Arc<CompositeSpec>,
+) -> Result<axum::response::Response, WmsError> {
+    if style_name != ds_render::COMPOSITE_STYLE {
+        return Err(WmsError::StyleNotDefined(format!(
+            "Style '{style_name}' not defined for layer '{layer_name}'"
+        )));
+    }
+    let format = crate::params::parse_legend_format(query.format.as_deref())?;
+    let info = engine.raster_info_shared();
+    let units: Vec<Option<String>> = ds_render::composite_units(&spec, &info)
+        .into_iter()
+        .map(|unit| unit.map(str::to_string))
+        .collect();
+    let format = match format {
+        crate::params::LegendFormat::Json => {
+            let units: Vec<Option<&str>> = units.iter().map(Option::as_deref).collect();
+            let mut response =
+                axum::Json(ds_render::composite_legend_json(&spec, &units)).into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(ds_render::LEGEND_CACHE_CONTROL),
+            );
+            headers.insert(
+                header::HeaderName::from_static("x-content-type-options"),
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            return Ok(response);
+        }
+        crate::params::LegendFormat::Image(format) => format,
+    };
+    let (width, height) = legend_size(query);
+    let legend_bytes = tokio::task::spawn_blocking(move || {
+        let units: Vec<Option<&str>> = units.iter().map(Option::as_deref).collect();
+        ds_render::render_composite_legend(&spec, &units, width, height, format)
+    })
+    .await
+    .map_err(|e| WmsError::Internal(format!("Legend render failed: {e}")))?
+    .map_err(|e| WmsError::Internal(format!("Legend render error: {e}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, format.content_type()),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+            (header::CACHE_CONTROL, ds_render::LEGEND_CACHE_CONTROL),
+        ],
+        legend_bytes,
+    )
+        .into_response())
 }
 
 impl From<ds_executor::ExecutionError> for WmsError {

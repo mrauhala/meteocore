@@ -230,3 +230,50 @@ async fn satellite_edr_responses_validate() {
         "EDR collection",
     );
 }
+
+/// RGB composites (#819) are map layers only: EDR lists the products alone,
+/// and naming a composite is a 400, since it has no numeric values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn satellite_edr_leaves_composites_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/goes19-abi");
+    for name in [C13, ACHT] {
+        std::fs::copy(fixtures.join(name), dir.path().join(name)).unwrap();
+    }
+    let mut config = satellite_config(dir.path());
+    let with_composite: SatelliteConfig = toml::from_str(
+        r#"
+        products = []
+
+        [[composites]]
+        name = "ir_grey"
+        red = { parameter = "ir_10_3", min = 330.0, max = 180.0 }
+        green = { parameter = "ir_10_3", min = 330.0, max = 180.0 }
+        blue = { parameter = "ir_10_3", min = 330.0, max = 180.0 }
+        "#,
+    )
+    .unwrap();
+    config.composites = with_composite.composites;
+    let engine = SatelliteEngine::new("goes19-fd", &config).unwrap();
+    engine.poll_once();
+    assert_eq!(ds_core::map_engine::MapEngine::composites(&engine).len(), 1);
+    let app = router(Arc::new(engine), dir.path());
+
+    let (status, collection) = get(&app, "/collections/goes19-fd").await;
+    assert_eq!(status, StatusCode::OK);
+    let mut names: Vec<&str> = collection["parameter_names"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["cloud_top_temperature", "ir_10_3"]);
+
+    let (status, _) = get(
+        &app,
+        "/collections/goes19-fd/position?coords=POINT(-10%2042)&parameter-name=ir_grey",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

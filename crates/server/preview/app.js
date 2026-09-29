@@ -525,7 +525,9 @@
     function tileUrlFor(collection, styleId, time, parameter) {
         const raster = collection.tiles.raster;
         // 'default' style uses the plain …/map/tiles route, not /styles/default/...
-        const useStyled = styleId && styleId !== 'default' && raster.styled_url_template;
+        // An RGB composite has only the default style.
+        const useStyled = styleId && styleId !== 'default' && raster.styled_url_template
+            && !isComposite(collection, parameter);
         let template = useStyled ? raster.styled_url_template : raster.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
         template = template.replace('{tileMatrix}', '{z}');
@@ -647,6 +649,15 @@
         // doesn't trip CSP `connect-src 'self'`.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
         return window.location.origin + template;
+    }
+
+    // An RGB composite parameter (#819): its colours come from its channels,
+    // so it renders with the default style only.
+    function isComposite(collection, parameter) {
+        return Array.isArray(collection.parameters)
+            && collection.parameters.some(function (p) {
+                return p.name === parameter && p.composite === true;
+            });
     }
 
     function appendTimeParam(template, time) {
