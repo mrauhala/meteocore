@@ -18,18 +18,29 @@
 //! 3. [`FilenameMatcher`] — recognise a collection's files by name and
 //!    read the timestamp each name encodes, from a strftime filename
 //!    template or an explicit regex (#817).
+//! 4. [`scan_remote`] / [`scan_local`] — the catalog scan: list the
+//!    prefixes, at most [`MAX_CONCURRENT_LISTS`] at a time, or read the
+//!    directory, then match, window, dedup and cap into `(key, timestamp)`
+//!    entries (#817). [`list_prefixes`] is its bounded concurrent LIST, for
+//!    an engine that recognises files without a matcher.
 //!
-//! This module is the shared home for all three. `engine-odim` and
+//! This module is the shared home for all four. `engine-odim` and
 //! `engine-geotiff` use it; `engine-grib` expands its model-run
 //! prefixes, a strftime date plus a `{run}` hour, with
 //! [`expand_run_prefixes`].
 
 use std::fmt::Write as _;
+use std::fs::Metadata;
+use std::path::{Path, PathBuf};
 
 use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use ds_core::error::DataServerError;
+use object_store::path::Path as ObjectPath;
+use object_store::ObjectMeta;
 use regex::Regex;
+
+use crate::DataStore;
 
 /// A signed ISO 8601 duration describing how far back (or forward)
 /// from "now" a collection's useful data extends.
@@ -222,8 +233,8 @@ pub fn prefix_step(pattern: &str) -> Result<PrefixStep, DataServerError> {
 }
 
 /// Longest `time_window` an hourly prefix template may run with. Each hour
-/// is one `list` per poll, issued sequentially (Critical Rule 9), so this
-/// caps a poll at 26 calls. A longer window belongs on a day-level
+/// is one `list` per poll, at most [`MAX_CONCURRENT_LISTS`] in flight, so
+/// this caps a poll at 26 calls. A longer window belongs on a day-level
 /// template: listing a day prefix is recursive and covers all its hours.
 pub const MAX_HOURLY_PREFIX_WINDOW_HOURS: i64 = 24;
 
@@ -885,6 +896,336 @@ fn expand_template(template: &str) -> Result<(String, String), FilenameError> {
     Ok((regex, format))
 }
 
+// ---------------------------------------------------------------------------
+// Catalog scan (#817): list, match, window, dedup and cap, once for every
+// engine that discovers one file per timestep.
+// ---------------------------------------------------------------------------
+
+/// Most prefix LISTs one remote scan keeps in flight.
+///
+/// A window expands to one prefix per day, or per hour for an hourly
+/// template: up to 26 for a 24 h window. [`list_prefixes`] lists them
+/// concurrently on the store's runtime rather than one blocking `list`
+/// after another (Critical Rule 9), but never all at once, so a poll does
+/// not burst a bucket's request rate: 26 hourly prefixes take four rounds.
+pub const MAX_CONCURRENT_LISTS: usize = 8;
+
+/// Basenames longer than this are skipped without being matched.
+pub const MAX_FILENAME_LEN: usize = 255;
+
+/// What a catalog scan keeps. [`ScanSpec::new`] sets no limits; set the
+/// optional ones with struct-update syntax.
+///
+/// A scan keeps a file when its basename matches the [`FilenameMatcher`]
+/// and its timestamp lies inside `time_filter`. It then returns the kept
+/// files oldest first, one per timestamp, capped to the newest
+/// `max_files` timestamps. Of files that share a timestamp, the greatest
+/// key or path wins, and each file dropped for it is logged at WARN.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanSpec<'a> {
+    /// Recognises the collection's files and reads their timestamps. A
+    /// name that matches but holds no valid time is logged at WARN.
+    pub matcher: &'a FilenameMatcher,
+    /// Keep only files timestamped inside this inclusive `(start, end)`.
+    pub time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Keep only the newest N timestamps, counted after deduplication.
+    pub max_files: Option<usize>,
+    /// [`scan_remote`] only: skip an otherwise kept object larger than this,
+    /// logged at WARN.
+    pub max_size: Option<u64>,
+    /// [`scan_local`] only: whether a symlink to a regular file is a file.
+    pub symlinks: Symlinks,
+    /// Prefix of the scan's log lines, normally the collection id.
+    pub label: &'a str,
+}
+
+/// Whether [`scan_local`] catalogues a symlink to a regular file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Symlinks {
+    /// Regular files only. An engine that detects a replaced file by the
+    /// directory entry's own size, mtime and inode needs this.
+    Skip,
+    /// A symlink to a regular file counts as that file, with the target's
+    /// metadata. A symlink to a directory is still skipped.
+    Follow,
+}
+
+impl<'a> ScanSpec<'a> {
+    /// A scan with no time filter, cap or size limit, regular files only.
+    pub fn new(matcher: &'a FilenameMatcher, label: &'a str) -> Self {
+        Self {
+            matcher,
+            time_filter: None,
+            max_files: None,
+            max_size: None,
+            symlinks: Symlinks::Skip,
+            label,
+        }
+    }
+
+    /// The timestamp of a file this scan keeps by name, or `None`.
+    fn timestamp(&self, name: &str) -> Option<DateTime<Utc>> {
+        if name.len() > MAX_FILENAME_LEN {
+            return None;
+        }
+        let time = match self.matcher.match_timestamp(name)? {
+            Ok(time) => time,
+            Err(stamp) => {
+                tracing::warn!(
+                    "[{}] Cannot parse timestamp '{stamp}' from file '{name}'",
+                    self.label
+                );
+                return None;
+            }
+        };
+        match self.time_filter {
+            Some((start, end)) if time < start || time > end => None,
+            _ => Some(time),
+        }
+    }
+}
+
+/// A file [`scan_local`] kept.
+#[derive(Debug, Clone)]
+pub struct LocalFile {
+    pub path: PathBuf,
+    pub time: DateTime<Utc>,
+    /// The regular file's metadata: the directory entry's own, or a
+    /// followed symlink's target's.
+    pub metadata: std::fs::Metadata,
+}
+
+/// An object [`scan_remote`] kept.
+#[derive(Debug, Clone)]
+pub struct RemoteFile {
+    pub object: ObjectMeta,
+    pub time: DateTime<Utc>,
+}
+
+impl RemoteFile {
+    /// The full object key.
+    pub fn key(&self) -> &str {
+        self.object.location.as_ref()
+    }
+}
+
+/// What [`scan_remote`] found.
+#[derive(Debug)]
+pub struct RemoteScan {
+    /// The kept objects, oldest first, one per timestamp.
+    pub entries: Vec<RemoteFile>,
+    /// One report per prefix, in the order given.
+    pub prefixes: Vec<PrefixReport>,
+}
+
+/// How one prefix of a [`RemoteScan`] went.
+#[derive(Debug)]
+pub struct PrefixReport {
+    pub prefix: ObjectPath,
+    /// How many objects the LIST returned, or why it failed.
+    pub listed: Result<usize, DataServerError>,
+    /// How many of [`RemoteScan::entries`] came from this prefix.
+    pub kept: usize,
+}
+
+impl RemoteScan {
+    /// The prefixes whose LIST failed, formatted `'prefix': error` and
+    /// joined with `; `, and how many there were. `None` when every LIST
+    /// succeeded. Whether a failure fails the scan is the engine's call.
+    pub fn failures(&self) -> Option<(usize, String)> {
+        let failed: Vec<String> = self
+            .prefixes
+            .iter()
+            .filter_map(|report| {
+                let e = report.listed.as_ref().err()?;
+                Some(format!("'{}': {e}", report.prefix))
+            })
+            .collect();
+        (!failed.is_empty()).then(|| (failed.len(), failed.join("; ")))
+    }
+}
+
+/// List every prefix, at most [`MAX_CONCURRENT_LISTS`] at a time, on one
+/// bridge call ([`DataStore::list_many`]). Returns one result per prefix,
+/// in the order given: a prefix that fails to list carries its error and
+/// does not stop the others. The outer `Err` is a runtime-bridge failure.
+///
+/// Call it where [`DataStore::list`] may be called: from the background
+/// poll runtime, never from a request handler (Critical Rule 7). An engine
+/// that recognises its files without a [`FilenameMatcher`] lists through
+/// this; the others use [`scan_remote`].
+#[allow(clippy::type_complexity)]
+pub fn list_prefixes(
+    store: &DataStore,
+    prefixes: &[ObjectPath],
+) -> Result<Vec<Result<Vec<ObjectMeta>, DataServerError>>, DataServerError> {
+    store.list_many(prefixes, MAX_CONCURRENT_LISTS)
+}
+
+/// Scan an object store's prefixes for a collection's files.
+///
+/// The prefixes are listed concurrently ([`list_prefixes`]). Each object's
+/// basename goes through `spec` (see [`ScanSpec`]), and objects over
+/// `spec.max_size` are skipped. A prefix that fails to list is reported in
+/// [`RemoteScan::prefixes`] and does not stop the scan; the outer `Err` is a
+/// runtime-bridge failure only.
+pub fn scan_remote(
+    store: &DataStore,
+    prefixes: &[ObjectPath],
+    spec: &ScanSpec<'_>,
+) -> Result<RemoteScan, DataServerError> {
+    let listings = list_prefixes(store, prefixes)?;
+    let mut found = Vec::new();
+    let mut reports = Vec::with_capacity(prefixes.len());
+    for (origin, (prefix, listed)) in prefixes.iter().zip(listings).enumerate() {
+        let listed = listed.map(|objects| {
+            let count = objects.len();
+            for object in objects {
+                let key = object.location.as_ref();
+                let name = key.rsplit('/').next().unwrap_or(key);
+                let Some(time) = spec.timestamp(name) else {
+                    continue;
+                };
+                if spec.max_size.is_some_and(|max| object.size > max) {
+                    tracing::warn!(
+                        "[{}] skipping oversized remote object `{key}` ({} bytes)",
+                        spec.label,
+                        object.size
+                    );
+                    continue;
+                }
+                found.push(Found {
+                    time,
+                    key: key.to_string(),
+                    origin,
+                    item: object,
+                });
+            }
+            count
+        });
+        reports.push(PrefixReport {
+            prefix: prefix.clone(),
+            listed,
+            kept: 0,
+        });
+    }
+    let found = finish(found, spec);
+    for file in &found {
+        reports[file.origin].kept += 1;
+    }
+    Ok(RemoteScan {
+        entries: found
+            .into_iter()
+            .map(|file| RemoteFile {
+                object: file.item,
+                time: file.time,
+            })
+            .collect(),
+        prefixes: reports,
+    })
+}
+
+/// Scan one local directory, non-recursively, for a collection's files.
+///
+/// Returns the kept files as [`ScanSpec`] describes. Directories, names
+/// that are not UTF-8 and, unless `spec.symlinks` follows them, symlinks
+/// are skipped. The only error is the directory itself being unreadable;
+/// an entry that cannot be read is logged and skipped.
+pub fn scan_local(dir: &Path, spec: &ScanSpec<'_>) -> std::io::Result<Vec<LocalFile>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] failed to read entry in `{}`: {e}",
+                    spec.label,
+                    dir.display()
+                );
+                continue;
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(time) = spec.timestamp(&name) else {
+            continue;
+        };
+        let Some(metadata) = regular_file_metadata(&entry, spec.symlinks) else {
+            continue;
+        };
+        let path = entry.path();
+        found.push(Found {
+            time,
+            key: path.to_string_lossy().into_owned(),
+            origin: 0,
+            item: (path, metadata),
+        });
+    }
+    Ok(finish(found, spec)
+        .into_iter()
+        .map(|file| {
+            let (path, metadata) = file.item;
+            LocalFile {
+                path,
+                time: file.time,
+                metadata,
+            }
+        })
+        .collect())
+}
+
+/// The metadata of the regular file `entry` names, or `None` to skip it.
+fn regular_file_metadata(entry: &std::fs::DirEntry, symlinks: Symlinks) -> Option<Metadata> {
+    let file_type = entry.file_type().ok()?;
+    if file_type.is_file() {
+        return entry.metadata().ok();
+    }
+    if file_type.is_symlink() && symlinks == Symlinks::Follow {
+        return std::fs::metadata(entry.path())
+            .ok()
+            .filter(Metadata::is_file);
+    }
+    None
+}
+
+/// A file a scan matched, before [`finish`].
+struct Found<T> {
+    time: DateTime<Utc>,
+    /// The object key or path: the dedup tie-break.
+    key: String,
+    /// Index of the prefix it was listed under.
+    origin: usize,
+    item: T,
+}
+
+/// Sort `found` oldest first, keep one file per timestamp and cap to the
+/// newest `spec.max_files`. Of files that share a timestamp the greatest
+/// key wins, so the choice does not depend on listing order.
+fn finish<T>(mut found: Vec<Found<T>>, spec: &ScanSpec<'_>) -> Vec<Found<T>> {
+    // Within a timestamp, the greatest key sorts first, and `dedup_by`
+    // keeps the first of each run.
+    found.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| b.key.cmp(&a.key)));
+    found.dedup_by(|dropped, kept| {
+        let duplicate = dropped.time == kept.time;
+        if duplicate {
+            tracing::warn!(
+                "[{}] Duplicate timestamp {}: using {}, replacing {}",
+                spec.label,
+                kept.time,
+                kept.key,
+                dropped.key
+            );
+        }
+        duplicate
+    });
+    if let Some(max) = spec.max_files {
+        let excess = found.len().saturating_sub(max);
+        found.drain(..excess);
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,7 +1386,7 @@ mod tests {
         );
     }
 
-    /// Each hour is a sequential `list` per poll: an hourly template's window
+    /// Each hour is one `list` per poll: an hourly template's window
     /// is capped, while a day-level template may run with a long one.
     #[test]
     fn hourly_prefix_window_is_bounded() {
@@ -1226,5 +1567,270 @@ mod tests {
             FilenameMatcher::from_pattern(r"^comp-(?P<timestamp>\d{12}\.h5$", "%Y%m%d%H%M"),
             Err(FilenameError::InvalidRegex { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use crate::test_store::ListProbe;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn opera() -> FilenameMatcher {
+        FilenameMatcher::from_template("OPERA@%Y%m%dT%H%M@0@DBZH.h5").unwrap()
+    }
+
+    fn opera_name(hhmm: &str) -> String {
+        format!("OPERA@20260515T{hhmm}@0@DBZH.h5")
+    }
+
+    fn local_names(files: &[LocalFile]) -> Vec<String> {
+        files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn remote_keys(scan: &RemoteScan) -> Vec<&str> {
+        scan.entries.iter().map(RemoteFile::key).collect()
+    }
+
+    /// Oldest first, window inclusive at both ends and applied before the
+    /// cap, which keeps the newest. Directories, unrelated names and
+    /// partial uploads next to a finished file are never kept.
+    #[test]
+    fn local_scan_sorts_windows_and_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        for hhmm in ["0010", "0000", "0020", "0005", "0015"] {
+            std::fs::write(dir.path().join(opera_name(hhmm)), b"x").unwrap();
+        }
+        for other in ["README.md", "OPERA@20260515T0025@0@DBZH.h5.tmp"] {
+            std::fs::write(dir.path().join(other), b"x").unwrap();
+        }
+        std::fs::write(dir.path().join(opera_name("0030") + ".part"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join(opera_name("0035"))).unwrap();
+        let matcher = opera();
+
+        let all = scan_local(dir.path(), &ScanSpec::new(&matcher, "t")).unwrap();
+        assert_eq!(
+            local_names(&all),
+            ["0000", "0005", "0010", "0015", "0020"].map(opera_name)
+        );
+        assert_eq!(all[0].time, at("2026-05-15T00:00:00Z"));
+        assert_eq!(all[0].metadata.len(), 1);
+
+        let window = Some((at("2026-05-15T00:05:00Z"), at("2026-05-15T00:15:00Z")));
+        let windowed = ScanSpec {
+            time_filter: window,
+            ..ScanSpec::new(&matcher, "t")
+        };
+        assert_eq!(
+            local_names(&scan_local(dir.path(), &windowed).unwrap()),
+            ["0005", "0010", "0015"].map(opera_name)
+        );
+        let capped = ScanSpec {
+            max_files: Some(2),
+            ..windowed
+        };
+        assert_eq!(
+            local_names(&scan_local(dir.path(), &capped).unwrap()),
+            ["0010", "0015"].map(opera_name)
+        );
+    }
+
+    /// Files sharing a timestamp collapse to the greatest path whatever the
+    /// directory order, and the cap counts timestamps, not files.
+    #[test]
+    fn local_scan_keeps_the_greatest_path_per_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "202605150000_b.h5",
+            "202605150000_a.h5",
+            "202605150000_c.h5",
+            "202605150005_a.h5",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let matcher =
+            FilenameMatcher::from_pattern(r"^(?P<timestamp>\d{12})_[a-z]\.h5$", "%Y%m%d%H%M")
+                .unwrap();
+        let spec = ScanSpec {
+            max_files: Some(2),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        assert_eq!(
+            local_names(&scan_local(dir.path(), &spec).unwrap()),
+            ["202605150000_c.h5", "202605150005_a.h5"]
+        );
+    }
+
+    /// A symlink to a file is catalogued, with its target's metadata, only
+    /// when the spec follows symlinks. A symlink to a directory never is.
+    #[cfg(unix)]
+    #[test]
+    fn local_scan_follows_symlinks_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(opera_name("0000")), b"x").unwrap();
+        let target = elsewhere.path().join("volume.h5");
+        std::fs::write(&target, b"xyz").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(opera_name("0005"))).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(opera_name("0010"))).unwrap();
+        let matcher = opera();
+
+        let skip = scan_local(dir.path(), &ScanSpec::new(&matcher, "t")).unwrap();
+        assert_eq!(local_names(&skip), [opera_name("0000")]);
+
+        let follow = ScanSpec {
+            symlinks: Symlinks::Follow,
+            ..ScanSpec::new(&matcher, "t")
+        };
+        let followed = scan_local(dir.path(), &follow).unwrap();
+        assert_eq!(local_names(&followed), ["0000", "0005"].map(opera_name));
+        assert_eq!(followed[1].metadata.len(), 3, "the target's metadata");
+    }
+
+    #[test]
+    fn local_scan_of_a_missing_directory_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let matcher = opera();
+        assert!(scan_local(&dir.path().join("missing"), &ScanSpec::new(&matcher, "t")).is_err());
+    }
+
+    /// A name over `MAX_FILENAME_LEN` is skipped even when it matches.
+    #[test]
+    fn overlong_names_are_skipped_unmatched() {
+        let prefix = "a".repeat(MAX_FILENAME_LEN);
+        let matcher = FilenameMatcher::from_template(&format!("{prefix}%Y%m%d%H%M.h5")).unwrap();
+        let name = format!("{prefix}202605150000.h5");
+        assert!(matcher.parse_timestamp(&name).is_some());
+        assert_eq!(ScanSpec::new(&matcher, "t").timestamp(&name), None);
+    }
+
+    /// The remote scan merges its prefixes and applies the same window,
+    /// dedup and cap. The greatest key wins a timestamp two prefixes share,
+    /// and oversized and partially uploaded objects are skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_scan_merges_prefixes_dedups_windows_and_caps() {
+        let probe = ListProbe::default()
+            .with_objects(&[
+                &format!("d1/{}", opera_name("0000")),
+                &format!("d1/{}", opera_name("0005")),
+                &format!("d1/{}.tmp", opera_name("0010")),
+                "d1/README.md",
+                &format!("d2/{}", opera_name("0005")),
+                &format!("d2/{}", opera_name("0010")),
+                &format!("d2/{}.part", opera_name("0015")),
+            ])
+            .await
+            .with_object_of_size(&format!("d2/{}", opera_name("0020")), 100)
+            .await;
+        let store = DataStore::new(Arc::new(probe));
+        let prefixes = [ObjectPath::from("d1"), ObjectPath::from("d2")];
+        let matcher = opera();
+        let spec = ScanSpec {
+            time_filter: Some((at("2026-05-15T00:05:00Z"), at("2026-05-15T00:20:00Z"))),
+            max_size: Some(10),
+            ..ScanSpec::new(&matcher, "t")
+        };
+
+        let scan = scan_remote(&store, &prefixes, &spec).unwrap();
+        assert_eq!(
+            remote_keys(&scan),
+            [
+                format!("d2/{}", opera_name("0005")),
+                format!("d2/{}", opera_name("0010")),
+            ]
+        );
+        assert_eq!(scan.entries[0].time, at("2026-05-15T00:05:00Z"));
+        let reports: Vec<_> = scan
+            .prefixes
+            .iter()
+            .map(|r| (r.prefix.to_string(), *r.listed.as_ref().unwrap(), r.kept))
+            .collect();
+        assert_eq!(
+            reports,
+            [("d1".to_string(), 4, 0), ("d2".to_string(), 4, 2)]
+        );
+        assert!(scan.failures().is_none());
+
+        let capped = ScanSpec {
+            max_files: Some(1),
+            ..spec
+        };
+        let scan = scan_remote(&store, &prefixes, &capped).unwrap();
+        assert_eq!(remote_keys(&scan), [format!("d2/{}", opera_name("0010"))]);
+    }
+
+    /// A prefix that fails to list is reported and the others still count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_scan_reports_a_failed_prefix_and_keeps_the_rest() {
+        let probe = ListProbe {
+            failing: ["d1".to_string()].into(),
+            ..ListProbe::default()
+        }
+        .with_objects(&[
+            &format!("d1/{}", opera_name("0000")),
+            &format!("d2/{}", opera_name("0005")),
+        ])
+        .await;
+        let store = DataStore::new(Arc::new(probe));
+        let matcher = opera();
+        let scan = scan_remote(
+            &store,
+            &[ObjectPath::from("d1"), ObjectPath::from("d2")],
+            &ScanSpec::new(&matcher, "t"),
+        )
+        .unwrap();
+        assert_eq!(remote_keys(&scan), [format!("d2/{}", opera_name("0005"))]);
+        assert!(scan.prefixes[0].listed.is_err());
+        let (count, summary) = scan.failures().unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            summary.starts_with("'d1': ") && summary.contains("partition unavailable"),
+            "{summary}"
+        );
+    }
+
+    /// Hourly prefixes over a 24 h window are listed concurrently, never
+    /// more than `MAX_CONCURRENT_LISTS` at a time, each exactly once
+    /// (Critical Rule 9, #817).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_scan_lists_prefixes_concurrently_up_to_the_bound() {
+        let (start, end) = (at("2026-09-25T00:00:00Z"), at("2026-09-25T23:59:00Z"));
+        let prefixes = expand_prefix_for_range("ABI/%Y/%j/%H/", start, end).unwrap();
+        assert_eq!(prefixes.len(), 24);
+        let keys: Vec<String> = prefixes
+            .iter()
+            .enumerate()
+            .map(|(hour, p)| format!("{p}/OR_2026268{hour:02}00.nc"))
+            .collect();
+        let probe = ListProbe {
+            delay: std::time::Duration::from_millis(20),
+            ..ListProbe::default()
+        }
+        .with_objects(&keys.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+        let (peak, listed) = (probe.peak.clone(), probe.listed.clone());
+        let store = DataStore::new(Arc::new(probe));
+        let matcher = FilenameMatcher::from_template("OR_%Y%j%H%M.nc").unwrap();
+        let prefixes: Vec<ObjectPath> = prefixes
+            .iter()
+            .map(|p| ObjectPath::from(p.as_str()))
+            .collect();
+
+        let scan = scan_remote(&store, &prefixes, &ScanSpec::new(&matcher, "t")).unwrap();
+        assert_eq!(remote_keys(&scan), keys);
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_LISTS);
+        let mut listed = listed.lock().unwrap().clone();
+        listed.sort();
+        let mut expected: Vec<String> = prefixes.iter().map(ObjectPath::to_string).collect();
+        expected.sort();
+        assert_eq!(listed, expected, "each prefix listed exactly once");
     }
 }

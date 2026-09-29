@@ -42,7 +42,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
-use crate::catalog::{scan_directory, scan_remote_with_limit, Catalog, PendingFile};
+use crate::catalog::{scan_directory, scan_remote, Catalog, PendingFile};
 
 /// Tracks STAC entries currently being loaded, deduplicating concurrent
 /// loads: the first caller claims the path and loads, later callers park on
@@ -638,15 +638,22 @@ impl GeoTiffEngine {
                     &path_index,
                 )?
             }
-            StoreMode::Remote { store, prefix } => scan_remote_with_limit(
-                store,
-                prefix,
-                self.filename_matcher()?,
-                &path_index,
-                self.max_files,
-                None,
-                &self.collection_id,
-            )?,
+            StoreMode::Remote { store, prefix } => {
+                let (catalog, mut failed) = scan_remote(
+                    store,
+                    std::slice::from_ref(prefix),
+                    self.filename_matcher()?,
+                    &path_index,
+                    self.max_files,
+                    None,
+                    &self.collection_id,
+                )?;
+                // The one prefix failing to list is the scan failing.
+                if let Some((_, e)) = failed.pop() {
+                    return Err(e);
+                }
+                catalog
+            }
             StoreMode::RemoteDynamic {
                 store,
                 prefix_pattern,
@@ -663,43 +670,35 @@ impl GeoTiffEngine {
                 } else {
                     (expand_prefix_pattern(prefix_pattern, *scan_days)?, None)
                 };
-                let matcher = self.filename_matcher()?;
-                let mut merged = Catalog::empty();
-                let mut scan_errors: Vec<(String, DataServerError)> = Vec::new();
-                for prefix_str in &prefixes {
-                    let prefix = ds_storage::object_store::path::Path::from(prefix_str.as_str());
-                    match scan_remote_with_limit(
-                        store,
-                        &prefix,
-                        matcher,
-                        &path_index,
-                        None, // no per-prefix limit; apply max_files after merge
-                        time_filter,
-                        &self.collection_id,
-                    ) {
-                        Ok(partial) => {
-                            merged.entries.extend(partial.entries);
-                        }
-                        Err(e) => {
-                            scan_errors.push((prefix_str.clone(), e));
-                        }
-                    }
-                }
-                if !scan_errors.is_empty() {
+                let prefixes: Vec<ds_storage::object_store::path::Path> = prefixes
+                    .iter()
+                    .map(|prefix| ds_storage::object_store::path::Path::from(prefix.as_str()))
+                    .collect();
+                let (catalog, failed) = scan_remote(
+                    store,
+                    &prefixes,
+                    self.filename_matcher()?,
+                    &path_index,
+                    // No cap before the metadata pass: `max_files` trims
+                    // below, after files that fail to parse are dropped.
+                    None,
+                    time_filter,
+                    &self.collection_id,
+                )?;
+                if !failed.is_empty() {
                     tracing::warn!(
                         "[{}] {}/{} prefix scan(s) failed: {}",
                         self.collection_id,
-                        scan_errors.len(),
+                        failed.len(),
                         prefixes.len(),
-                        scan_errors
+                        failed
                             .iter()
                             .map(|(p, e)| format!("'{}': {}", p, e))
                             .collect::<Vec<_>>()
                             .join("; ")
                     );
                 }
-                merged.recompute_extents();
-                merged
+                catalog
             }
             StoreMode::RemoteStac { client } => {
                 let current_catalog = self.catalog.load();
@@ -2555,18 +2554,93 @@ mod tests {
         ] {
             assert_eq!(m.parse_timestamp(partial), None, "{partial}");
         }
-        // The remote scan's name filter drops them too.
-        let names = [
-            ("radar_20260324T2315Z.tif", 1),
-            ("radar_20260324T2320Z.tif.tmp", 1),
-            ("radar_20260324T2325Z.tif.part", 1),
-        ];
-        let candidates = catalog::parse_candidates_from_names(names.into_iter(), &m);
-        let kept: Vec<_> = candidates
+    }
+
+    /// A temporary directory removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "meteocore_{tag}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn radar_fixture() -> PathBuf {
+        ["testdata/radar", "../../testdata/radar"]
             .iter()
-            .map(|(_, name, _)| name.as_str())
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture")
+            .join("radar_20260324T2315Z.tif")
+    }
+
+    /// The remote scan end to end, over two day prefixes of a
+    /// filesystem-backed store: partial uploads next to finished files are
+    /// never catalogued, and each finished file is, with its metadata
+    /// (#817). The partial copies are real TIFFs, so only the anchored
+    /// template keeps them out.
+    #[test]
+    fn remote_scan_skips_partial_uploads_across_prefixes() {
+        let src = radar_fixture();
+        let dir = TempDir::new("remote_partial_upload_test");
+        for (day, name) in [
+            ("2026/03/24", "radar_20260324T2315Z.tif"),
+            ("2026/03/24", "radar_20260324T2320Z.tif.tmp"),
+            ("2026/03/25", "radar_20260325T0005Z.tif"),
+            ("2026/03/25", "radar_20260325T0010Z.tif.part"),
+        ] {
+            std::fs::create_dir_all(dir.0.join(day)).unwrap();
+            std::fs::copy(&src, dir.0.join(day).join(name)).unwrap();
+        }
+        let (store, _) = ds_storage::build_store(dir.0.to_str().unwrap()).unwrap();
+        let prefixes = ["2026/03/24", "2026/03/25"].map(ds_storage::object_store::path::Path::from);
+
+        let (catalog, failed) = catalog::scan_remote(
+            &store,
+            &prefixes,
+            &template_matcher("radar_%Y%m%dT%H%MZ.tif"),
+            &HashMap::new(),
+            None,
+            None,
+            "radar",
+        )
+        .unwrap();
+        assert!(failed.is_empty());
+        let entries: Vec<_> = catalog
+            .entries
+            .iter()
+            .map(|(time, entry)| (*time, entry.path.clone(), entry.is_loaded()))
             .collect();
-        assert_eq!(kept, ["radar_20260324T2315Z.tif"]);
+        assert_eq!(
+            entries,
+            [
+                (
+                    utc("2026-03-24T23:15:00Z").unwrap(),
+                    PathBuf::from("2026/03/24/radar_20260324T2315Z.tif"),
+                    true
+                ),
+                (
+                    utc("2026-03-25T00:05:00Z").unwrap(),
+                    PathBuf::from("2026/03/25/radar_20260325T0005Z.tif"),
+                    true
+                ),
+            ]
+        );
     }
 
     /// A local scan never catalogues a partial upload next to its finished
