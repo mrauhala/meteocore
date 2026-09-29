@@ -1185,14 +1185,16 @@ pub struct SatelliteCompositeConfig {
     /// Layer name (`^[a-z0-9_]+$`), distinct from every product parameter,
     /// e.g. `"airmass"`.
     pub name: String,
-    /// Human title; defaults to the name.
+    /// Human title; defaults to the recipe's title, else to the name.
     #[serde(default)]
     pub title: Option<String>,
-    /// A built-in recipe such as `"airmass"`. Reserved: recipes are not
-    /// supported yet, so setting it is a load error.
+    /// A built-in recipe, `"airmass"` or `"night_microphysics"`, instead of
+    /// `red`, `green` and `blue`: it fills them from the products whose
+    /// `band` it reads ([`crate::satellite_recipes`]).
     #[serde(default)]
     pub recipe: Option<String>,
-    /// The red channel. Red, green and blue are all required.
+    /// The red channel. Without a `recipe`, red, green and blue are all
+    /// required; with one, none may be set.
     #[serde(default)]
     pub red: Option<SatelliteCompositeChannel>,
     #[serde(default)]
@@ -1357,9 +1359,159 @@ fn is_satellite_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// Channel names in output order, for messages.
+const COMPOSITE_CHANNELS: [&str; 3] = ["red", "green", "blue"];
+
+/// `items` as English prose joined by `conjunction`: `a`, `a and b`,
+/// `a, b and c`.
+fn prose_list<T: std::fmt::Display>(items: &[T], conjunction: &str) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [init @ .., last] => {
+            let init: Vec<String> = init.iter().map(ToString::to_string).collect();
+            format!("{} {conjunction} {last}", init.join(", "))
+        }
+    }
+}
+
+/// The layer definition of a `[[satellite.composites]]` entry: its own red,
+/// green and blue, or its recipe's with each band read from the product
+/// that has that `band`. [`validate_satellite`] and engine-satellite both
+/// build composites here, so a recipe draws exactly what its channels
+/// written out would. This checks what a recipe needs; the channel rules
+/// for either form are [`validate_satellite`]'s.
+pub fn satellite_composite_def(
+    id: &str,
+    cfg: &SatelliteConfig,
+    composite: &SatelliteCompositeConfig,
+) -> Result<crate::map_engine::CompositeDef, crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+    use crate::map_engine::{CompositeChannel, CompositeDef};
+    use crate::satellite_recipes::{recipe, recipe_names, Instrument};
+
+    let name = &composite.name;
+    let prefix = format!("Collection '{id}': satellite composite '{name}'");
+    let written = [&composite.red, &composite.green, &composite.blue];
+
+    let Some(recipe_name) = &composite.recipe else {
+        let channel = |i: usize| -> Result<CompositeChannel, crate::error::DataServerError> {
+            let label = COMPOSITE_CHANNELS[i];
+            let channel = written[i]
+                .as_ref()
+                .ok_or_else(|| Config(format!("{prefix} needs a '{label}' channel")))?;
+            Ok(CompositeChannel {
+                parameter: channel.parameter.clone(),
+                minus: channel.minus.clone(),
+                min: channel.min,
+                max: channel.max,
+                gamma: channel.gamma,
+            })
+        };
+        return Ok(CompositeDef {
+            name: name.clone(),
+            title: composite.title.clone().unwrap_or_else(|| name.clone()),
+            channels: [channel(0)?, channel(1)?, channel(2)?],
+        });
+    };
+
+    let set: Vec<&str> = COMPOSITE_CHANNELS
+        .into_iter()
+        .zip(written)
+        .filter(|(_, channel)| channel.is_some())
+        .map(|(label, _)| label)
+        .collect();
+    if !set.is_empty() {
+        return Err(Config(format!(
+            "{prefix}: recipe '{recipe_name}' sets the red, green and blue channels itself; \
+             remove the {} channel{} or the recipe",
+            prose_list(&set, "and"),
+            if set.len() > 1 { "s" } else { "" }
+        )));
+    }
+    let Some(instrument) = Instrument::of_provider(&cfg.provider) else {
+        return Err(Config(format!(
+            "{prefix}: recipe '{recipe_name}' reads ABI or AHI brightness temperatures, \
+             which provider '{}' does not serve; configure the red, green and blue \
+             channels instead",
+            cfg.provider
+        )));
+    };
+    let Some(recipe) = recipe(recipe_name, instrument) else {
+        return Err(Config(format!(
+            "{prefix}: unknown recipe '{recipe_name}' (known: {})",
+            recipe_names(instrument).join(", ")
+        )));
+    };
+
+    let instrument = instrument.name();
+    let mut missing = Vec::new();
+    let mut parameters: Vec<(u8, &str)> = Vec::new();
+    for band in recipe.bands() {
+        let products: Vec<&SatelliteProductConfig> = cfg
+            .products
+            .iter()
+            .filter(|p| p.band == Some(band))
+            .collect();
+        match products.as_slice() {
+            [] => missing.push(band),
+            [product] if product.unit != "K" => {
+                return Err(Config(format!(
+                    "{prefix}: recipe '{recipe_name}' reads brightness temperatures in K, \
+                     but {instrument} band {band} is '{}' in '{}'",
+                    product.parameter, product.unit
+                )));
+            }
+            [product] => parameters.push((band, &product.parameter)),
+            several => {
+                let names: Vec<String> = several
+                    .iter()
+                    .map(|p| format!("'{}'", p.parameter))
+                    .collect();
+                return Err(Config(format!(
+                    "{prefix}: recipe '{recipe_name}' reads {instrument} band {band}, which \
+                     products {} each have; keep one, or configure the red, green and blue \
+                     channels instead",
+                    prose_list(&names, "and")
+                )));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(Config(format!(
+            "{prefix}: recipe '{recipe_name}' reads {instrument} bands {}, and no \
+             [[satellite.products]] entry has 'band' = {}",
+            prose_list(&recipe.bands(), "and"),
+            prose_list(&missing, "or"),
+        )));
+    }
+    let parameter = |band: u8| -> String {
+        let (_, name) = parameters
+            .iter()
+            .find(|(b, _)| *b == band)
+            .expect("every recipe band has a product");
+        (*name).to_string()
+    };
+    Ok(CompositeDef {
+        name: name.clone(),
+        title: composite
+            .title
+            .clone()
+            .unwrap_or_else(|| recipe.title.to_string()),
+        channels: recipe.channels.map(|channel| CompositeChannel {
+            parameter: parameter(channel.band),
+            minus: channel.minus.map(parameter),
+            min: channel.min,
+            max: channel.max,
+            gamma: channel.gamma,
+        }),
+    })
+}
+
 /// `[[satellite.composites]]`: unique names that are not product
-/// parameters, and three channels reading product parameters with the
-/// range and gamma rules `ds_render::composite` renders by.
+/// parameters, and three channels, written out or from a recipe, reading
+/// product parameters with the range and gamma rules `ds_render::composite`
+/// renders by.
 fn validate_satellite_composites(
     id: &str,
     cfg: &SatelliteConfig,
@@ -1389,21 +1541,9 @@ fn validate_satellite_composites(
         {
             return Err(Config(format!("{prefix} has an empty 'title'")));
         }
-        if let Some(recipe) = &composite.recipe {
-            return Err(Config(format!(
-                "{prefix}: built-in recipes such as '{recipe}' are not supported yet; \
-                 configure its red, green and blue channels instead"
-            )));
-        }
-        for (label, channel) in [
-            ("red", &composite.red),
-            ("green", &composite.green),
-            ("blue", &composite.blue),
-        ] {
-            let Some(channel) = channel else {
-                return Err(Config(format!("{prefix} needs a '{label}' channel")));
-            };
-            for parameter in std::iter::once(&channel.parameter).chain(&channel.minus) {
+        let def = satellite_composite_def(id, cfg, composite)?;
+        for (label, channel) in COMPOSITE_CHANNELS.into_iter().zip(&def.channels) {
+            for parameter in channel.parameters() {
                 if !is_product(parameter) {
                     return Err(Config(format!(
                         "{prefix} {label} channel reads '{parameter}', which is not a \
@@ -6784,16 +6924,250 @@ mod satellite_composite_tests {
         assert!(error(&format!("{head}\n{green}")).contains("needs a 'red' channel"));
     }
 
-    /// `recipe` is reserved for the built-in recipes of a later release: it
-    /// parses, and names what to do instead.
+    /// A collection of `provider` with one brightness-temperature product
+    /// per `(parameter, band)`, plus the `[[composites]]` given in TOML.
+    fn bands_config(provider: &str, bands: &[(&str, u8)], composites: &str) -> SatelliteConfig {
+        let product = if provider == "isatss" {
+            "HFD"
+        } else {
+            "ABI-L2-CMIPF"
+        };
+        let products: String = bands
+            .iter()
+            .map(|(parameter, band)| {
+                format!(
+                    "[[products]]\nparameter = \"{parameter}\"\ntitle = \"{parameter}\"\n\
+                     unit = \"K\"\nproduct = \"{product}\"\nband = {band}\nvariable = \"CMI\"\n"
+                )
+            })
+            .collect();
+        toml::from_str(&format!(
+            "provider = \"{provider}\"\ndata_path = \"/data/sat\"\n{products}\n{composites}"
+        ))
+        .expect("parses")
+    }
+
+    /// The ABI bands both recipes read, named by wavelength.
+    const ABI: [(&str, u8); 6] = [
+        ("ir_3_9", 7),
+        ("wv_6_2", 8),
+        ("wv_7_3", 10),
+        ("ir_9_6", 12),
+        ("ir_10_3", 13),
+        ("ir_12_3", 15),
+    ];
+
+    /// The AHI bands both recipes read: satpy's AHI recipes add band 14.
+    const AHI: [(&str, u8); 7] = [
+        ("b07", 7),
+        ("b08", 8),
+        ("b10", 10),
+        ("b12", 12),
+        ("b13", 13),
+        ("b14", 14),
+        ("b15", 15),
+    ];
+
+    const RECIPES: &str = r#"
+        [[composites]]
+        name = "airmass"
+        recipe = "airmass"
+
+        [[composites]]
+        name = "night"
+        title = "Fog and low cloud"
+        recipe = "night_microphysics"
+    "#;
+
+    /// A channel as `(parameter, minus, min, max, gamma)`.
+    fn spec(channel: &crate::map_engine::CompositeChannel) -> (&str, Option<&str>, f64, f64, f64) {
+        (
+            channel.parameter.as_str(),
+            channel.minus.as_deref(),
+            channel.min,
+            channel.max,
+            channel.gamma,
+        )
+    }
+
+    fn defs(cfg: &SatelliteConfig) -> Vec<crate::map_engine::CompositeDef> {
+        validate_satellite("goes", cfg).expect("valid");
+        cfg.composites
+            .iter()
+            .map(|c| super::satellite_composite_def("goes", cfg, c).unwrap())
+            .collect()
+    }
+
+    /// A recipe fills the cited channels, each band read from the product
+    /// with that `band`, and titles the layer unless the config does.
     #[test]
-    fn recipes_are_not_supported_yet() {
-        let message = error("[[composites]]\nname = \"airmass\"\nrecipe = \"airmass\"");
+    fn recipes_fill_the_channels_from_the_products_bands() {
+        let abi = defs(&bands_config("goes-r", &ABI, RECIPES));
+        assert_eq!(abi[0].name, "airmass");
+        assert_eq!(abi[0].title, "Airmass RGB");
+        assert_eq!(
+            abi[0].channels.each_ref().map(spec),
+            [
+                ("wv_6_2", Some("wv_7_3"), -26.2, 0.6, 1.0),
+                ("ir_9_6", Some("ir_10_3"), -43.2, 6.7, 1.0),
+                ("wv_6_2", None, 243.9, 208.5, 1.0),
+            ]
+        );
+        assert_eq!(abi[1].name, "night");
+        assert_eq!(abi[1].title, "Fog and low cloud", "a given title wins");
+        assert_eq!(
+            abi[1].channels.each_ref().map(spec),
+            [
+                ("ir_12_3", Some("ir_10_3"), -6.7, 2.6, 1.0),
+                ("ir_10_3", Some("ir_3_9"), -3.1, 5.2, 1.0),
+                ("ir_10_3", None, 243.55, 292.65, 1.0),
+            ]
+        );
+
+        // Product order does not matter: bands are matched by number.
+        let mut shuffled = ABI;
+        shuffled.reverse();
+        assert_eq!(defs(&bands_config("goes-r", &shuffled, RECIPES)), abi);
+
+        // Himawari takes satpy's AHI recipes.
+        let ahi = defs(&bands_config("isatss", &AHI, RECIPES));
+        assert_eq!(
+            ahi[0].channels.each_ref().map(spec),
+            [
+                ("b08", Some("b10"), -26.2, 0.6, 1.0),
+                ("b12", Some("b14"), -43.2, 6.7, 1.0),
+                ("b08", None, 243.9, 208.5, 1.0),
+            ]
+        );
+        assert_eq!(
+            ahi[1].channels.each_ref().map(spec),
+            [
+                ("b15", Some("b13"), -4.0, 2.0, 1.0),
+                ("b14", Some("b07"), 0.0, 10.0, 1.0),
+                ("b13", None, 243.0, 293.0, 1.0),
+            ]
+        );
+        let untitled = "[[composites]]\nname = \"nm\"\nrecipe = \"night_microphysics\"";
+        assert_eq!(
+            defs(&bands_config("isatss", &AHI, untitled))[0].title,
+            "Night Microphysics RGB"
+        );
+    }
+
+    /// A recipe composite is the composite its channels spell out.
+    #[test]
+    fn a_recipe_equals_its_channels_written_out() {
+        let written = r#"
+            [[composites]]
+            name = "airmass"
+            title = "Airmass RGB"
+            red = { parameter = "wv_6_2", minus = "wv_7_3", min = -26.2, max = 0.6 }
+            green = { parameter = "ir_9_6", minus = "ir_10_3", min = -43.2, max = 6.7 }
+            blue = { parameter = "wv_6_2", min = 243.9, max = 208.5 }
+        "#;
+        let recipe = "[[composites]]\nname = \"airmass\"\nrecipe = \"airmass\"";
+        assert_eq!(
+            defs(&bands_config("goes-r", &ABI, recipe)),
+            defs(&bands_config("goes-r", &ABI, written))
+        );
+    }
+
+    #[test]
+    fn recipe_errors_name_the_fix() {
+        let error = |provider: &str, bands: &[(&str, u8)], composites: &str| {
+            validate_satellite("goes", &bands_config(provider, bands, composites))
+                .expect_err("invalid")
+                .to_string()
+        };
+        let head = "[[composites]]\nname = \"rgb\"";
+        let red = r#"red = { parameter = "wv_6_2", min = 0.0, max = 1.0 }"#;
+        let blue = r#"blue = { parameter = "wv_6_2", min = 0.0, max = 1.0 }"#;
+        for (composites, expected) in [
+            (
+                format!("{head}\nrecipe = \"airmass\"\n{red}"),
+                "recipe 'airmass' sets the red, green and blue channels itself; \
+                 remove the red channel or the recipe",
+            ),
+            (
+                format!("{head}\nrecipe = \"airmass\"\n{red}\n{blue}"),
+                "remove the red and blue channels or the recipe",
+            ),
+            (
+                format!("{head}\nrecipe = \"true_color\""),
+                "unknown recipe 'true_color' (known: airmass, night_microphysics)",
+            ),
+        ] {
+            let message = error("goes-r", &ABI, &composites);
+            assert!(message.contains(expected), "{composites}: {message}");
+            assert!(message.contains("Collection 'goes': satellite composite 'rgb'"));
+        }
+
+        // Missing bands are named with the recipe that reads them.
+        let airmass = format!("{head}\nrecipe = \"airmass\"");
+        let message = error("goes-r", &[("ir_10_3", 13), ("wv_6_2", 8)], &airmass);
         assert!(
-            message.contains("built-in recipes such as 'airmass' are not supported yet"),
+            message.contains(
+                "recipe 'airmass' reads ABI bands 8, 10, 12 and 13, and no \
+                 [[satellite.products]] entry has 'band' = 10 or 12"
+            ),
             "{message}"
         );
-        assert!(message.contains("configure its red, green and blue channels"));
+        let message = error("isatss", &ABI, &airmass);
+        assert!(
+            message.contains(
+                "reads AHI bands 8, 10, 12 and 14, and no [[satellite.products]] entry \
+                 has 'band' = 14"
+            ),
+            "{message}"
+        );
+
+        // A band two products have is ambiguous.
+        let mut twice = ABI.to_vec();
+        twice.push(("ir_10_3_copy", 13));
+        let message = error("goes-r", &twice, &airmass);
+        assert!(
+            message.contains(
+                "recipe 'airmass' reads ABI band 13, which products 'ir_10_3' and \
+                 'ir_10_3_copy' each have"
+            ),
+            "{message}"
+        );
+    }
+
+    /// Recipes read brightness temperatures: a band declared in another
+    /// unit (an L1b radiance), or a provider without them, is refused.
+    #[test]
+    fn recipes_need_brightness_temperatures() {
+        let recipe = "[[composites]]\nname = \"rgb\"\nrecipe = \"night_microphysics\"";
+        let mut radiance = bands_config("goes-r", &ABI, recipe);
+        radiance.products[0].unit = "mW m-2 sr-1 (cm-1)-1".into();
+        let message = validate_satellite("goes", &radiance)
+            .expect_err("a radiance band")
+            .to_string();
+        assert!(
+            message.contains(
+                "recipe 'night_microphysics' reads brightness temperatures in K, but ABI \
+                 band 7 is 'ir_3_9' in 'mW m-2 sr-1 (cm-1)-1'"
+            ),
+            "{message}"
+        );
+
+        // `validate_satellite` rejects an unknown provider before any
+        // composite; the recipe resolution refuses one on its own too, so
+        // a provider added later without brightness temperatures (GMGSI's
+        // 8-bit counts) cannot reach a recipe.
+        let mut counts = bands_config("goes-r", &ABI, recipe);
+        counts.provider = "gmgsi".into();
+        let message = super::satellite_composite_def("goes", &counts, &counts.composites[0])
+            .expect_err("no brightness temperatures")
+            .to_string();
+        assert!(
+            message.contains(
+                "recipe 'night_microphysics' reads ABI or AHI brightness temperatures, which \
+                 provider 'gmgsi' does not serve"
+            ),
+            "{message}"
+        );
     }
 
     /// A misspelt key in a composite fails the load instead of silently

@@ -112,6 +112,24 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     tiles with `ds_render::CompositeSpec::from(&def)`, whose planes follow
     that order. WMS, Maps and Tiles do exactly that, keyed on
     `resolve_parameter_time(Some(<composite>))`.
+- **Built-in recipes resolve in ds-core, through one path.**
+  `recipe = "airmass"` / `"night_microphysics"` stands for the red, green
+  and blue channels written out.
+  - `ds_core::config::satellite_composite_def` builds every `CompositeDef`,
+    written out or from a recipe. `validate_satellite` checks what it builds
+    and `SatelliteEngine::new` serves it, so a recipe and its channels
+    spelled out give equal layers (`tests/composites.rs`).
+  - The coefficients live only in `ds_core::satellite_recipes`, one entry
+    per recipe and instrument, with the satpy files and agency quick guides
+    cited there. The provider picks the instrument: `goes-r` is ABI,
+    `isatss` AHI. Any other provider is refused, so GMGSI, whose values are
+    8-bit counts, must stay unmapped.
+  - Each band comes from the one product whose `band` is that number. The
+    load fails, naming the bands, if a band is missing, held by two
+    products, or declared in a unit other than `K` (an L1b radiance).
+  - satpy's AHI recipes read band 14 (11.2 µm) where ABI reads band 13, and
+    its AHI Night Microphysics keeps EUMETSAT's SEVIRI ranges. JMA's own
+    Himawari guides differ from both; the table follows satpy.
 
 ## Config
 
@@ -123,18 +141,22 @@ hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
 `unit` (declared: styles resolve at load, before any scan), `product`,
 `band` (required for ISatSS, whose `product` is the sector, `HFD`),
 `variable`. `[[satellite.composites]]` with `name` (`^[a-z0-9_]+$`, not a
-product parameter), `title` (defaults to the name) and `red`, `green`,
-`blue`, each `{ parameter, minus, min, max, gamma }`: `minus` makes a band
-difference, `min > max` inverts, `gamma` defaults to 1. `parameter` and
-`minus` name product parameters. `recipe` is reserved and a load error until built-in recipes
-land; unknown keys in a composite are a load error. Validation:
-`ds_core::config::validate_satellite`.
+product parameter), `title`, and either `recipe` or `red`, `green`, `blue`,
+never both. A channel is `{ parameter, minus, min, max, gamma }`: `minus`
+makes a band difference, `min > max` inverts, `gamma` defaults to 1.
+`parameter` and `minus` name product parameters. A `recipe` (`airmass`,
+`night_microphysics`) finds its bands by the products' `band` numbers.
+`title` defaults to the recipe's title, else the name. Unknown keys in a
+composite are a load error. Validation: `ds_core::config::validate_satellite`.
+`collections.d/goes19-fd-rgb.toml` is the runnable recipe example.
 
 ## Bandwidth
 
 Each scan is downloaded whole: GOES-19 band 13 ~24 MB, cloud top temperature
 ~30 MB per 10 minutes, Himawari-9 band 13 ~26 MB in 88 tiles; startup
-ingests the whole window. The user is often
+ingests the whole window. A recipe multiplies it: `goes19-fd-rgb`'s six
+bands are ~135 MB per scan, ~810 MB an hour, and hold ~157 MB per scan in
+`MC_SATELLITE_FRAME_CACHE_MB`, which every satellite collection shares. The user is often
 on a metered connection — never run a bucket-backed collection for tests
 without asking; use the local fixtures.
 
@@ -166,6 +188,7 @@ summed per product on its own grid (products may mix 0.5/1/2 km).
 ## Not yet
 
 Other providers (GMGSI lat/lon mosaics, GK2A CGMS navigation, MTG) are
-phases 3 and 5. Built-in composite recipes are a phase 4 follow-up. WMS,
-Maps and Tiles serve the composites from `composites()`: see "RGB
-composite layers" in `crates/api-wms/CLAUDE.md`.
+phases 3 and 5. A new provider gets recipes only with its own instrument
+table in `ds_core::satellite_recipes`: GK2A AMI and MTG FCI number their
+bands differently. WMS, Maps and Tiles serve the composites from
+`composites()`: see "RGB composite layers" in `crates/api-wms/CLAUDE.md`.

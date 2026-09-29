@@ -22,6 +22,7 @@ pub mod proxy;
 pub mod radar_sites;
 pub mod raster_paint;
 pub mod resample;
+pub mod satellite_recipes;
 pub mod significance;
 pub mod units;
 pub mod vertical;

@@ -1,0 +1,112 @@
+id = "goes19-fd-rgb"
+title = "GOES-19 full disk RGB composites"
+description = "NOAA GOES-19 (GOES-East, 75.2°W) ABI full-disk Airmass and Night Microphysics RGB composites every 10 minutes, built from six infrared bands (3.9, 6.2, 7.3, 9.6, 10.3 and 12.3 µm) of the L2 cloud and moisture imagery, from NOAA Open Data on AWS"
+engine_type = "satellite"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["satellite", "GOES-19", "GOES-East", "NOAA", "infrared", "water vapour", "RGB composite", "airmass", "night microphysics"]
+
+[license]
+title = "NOAA Open Data Dissemination (NODD)"
+url = "https://registry.opendata.aws/noaa-goes/"
+
+# ---------------------------------------------------------------------------
+# BANDWIDTH AND MEMORY. This collection downloads SIX full-disk bands per scan.
+#
+# Ingest: every new scan of every band is downloaded whole. On 2026-09-29 the
+# CMIPF files were C07 ~26 MB, C08 ~19 MB, C10 ~21 MB, C12 ~22.5 MB,
+# C13 ~23.5 MB and C15 ~23.5 MB: ~135 MB per scan × 6 scans an hour
+# ≈ 810 MB/hour, ~19 GB/day. Startup ingests the whole time_window at once:
+# 3–4 scans, up to ~540 MB. Keep the window short, and do not run this on a
+# metered link.
+#
+# Memory: each scan stays in the scan cache as its compressed file plus a
+# ~3.7 MB overview, ~157 MB for the six bands, so this -PT30M window holds
+# ~470–630 MB. That cache, MC_SATELLITE_FRAME_CACHE_MB (default 1024), is
+# shared by every satellite collection, and goes19-fd, goes18-fd and
+# himawari9-fd already take ~1 GB of it with their -PT1H windows. Next to
+# them, set MC_SATELLITE_FRAME_CACHE_MB=2048 or more: a scan evicted from the
+# cache is downloaded again whenever a render needs it.
+# ---------------------------------------------------------------------------
+[satellite]
+provider = "goes-r"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "noaa-goes19"
+time_window = "-PT30M"
+poll_interval_secs = 60
+
+# The composites find their bands by the `band` number, so the parameter
+# names are free. Each band is also served as a parameter of its own.
+[[satellite.products]]
+parameter = "ir_3_9"
+title = "IR 3.9 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 7
+variable = "CMI"
+
+[[satellite.products]]
+parameter = "wv_6_2"
+title = "WV 6.2 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 8
+variable = "CMI"
+
+[[satellite.products]]
+parameter = "wv_7_3"
+title = "WV 7.3 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 10
+variable = "CMI"
+
+[[satellite.products]]
+parameter = "ir_9_6"
+title = "IR 9.6 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 12
+variable = "CMI"
+
+[[satellite.products]]
+parameter = "ir_10_3"
+title = "IR 10.3 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 13
+variable = "CMI"
+
+[[satellite.products]]
+parameter = "ir_12_3"
+title = "IR 12.3 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 15
+variable = "CMI"
+
+# Built-in recipes (ds_core::satellite_recipes, satpy's ABI values): Airmass
+# reads bands 8, 10, 12 and 13; Night Microphysics bands 7, 13 and 15. Each
+# is a layer of its own (WMS goes19-fd-rgb/airmass, Maps/Tiles
+# parameter-name=airmass) on the scans all its bands have. The title
+# defaults to the recipe's.
+[[satellite.composites]]
+name = "airmass"
+recipe = "airmass"
+
+[[satellite.composites]]
+name = "night_microphysics"
+recipe = "night_microphysics"
+
+# The band layers take the enhanced-IR palette over 180–330 K; the classic
+# grey IR is a named style. Composites have only their default style.
+[wms]
+colormap = "ir_bt_enhanced"
+min = 180.0
+max = 330.0
+
+[[wms.styles]]
+name = "ir-grey"
+title = "IR brightness temperature · grey"
+colormap = "ir_bt_grey"
+min = 180.0
+max = 330.0
