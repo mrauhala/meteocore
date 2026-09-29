@@ -423,6 +423,18 @@ pub fn parameter_name_parameter() -> Value {
     })
 }
 
+/// The `quality` query parameter of the Maps and Tiles image routes, a
+/// MeteoCore extension; one definition so the blocks of the shared root
+/// declare one component. `jpeg_default` is `ds_render::DEFAULT_JPEG_QUALITY`
+/// (api-common does not depend on ds-render).
+pub fn quality_parameter(jpeg_default: u8) -> Value {
+    json!({
+        "name": "quality", "in": "query", "required": false,
+        "schema": {"type": "integer", "minimum": 1, "maximum": 100},
+        "description": format!("Encoder quality for `image/webp` and `image/jpeg`, an integer from 1 to 100 (MeteoCore extension). For WebP, 1–99 is lossy encoding at that quality and 100 is lossless; without it WebP uses the collection's default quality when the server configures one, else lossless. JPEG defaults to {jpeg_default}. Not accepted with `image/png`: 400.")
+    })
+}
+
 /// The `legend` schema of the Maps and Tiles legend routes: a parameter
 /// style's palette legend (`ds_render::legend_json`), or an RGB composite's
 /// channel list (`ds_render::composite_legend_json`, #819). One definition

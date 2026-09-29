@@ -408,6 +408,15 @@ fn build_populated_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Route
 }
 
 fn build_populated_state(engine: Arc<dyn MapEngine>) -> Arc<ArcSwap<WmsState>> {
+    build_populated_state_with_wms(engine, None)
+}
+
+/// [`build_populated_state`] with the collection's `[wms]` config, for the
+/// per-collection settings the handler reads (e.g. `webp_quality`).
+fn build_populated_state_with_wms(
+    engine: Arc<dyn MapEngine>,
+    wms: Option<ds_core::config::WmsConfig>,
+) -> Arc<ArcSwap<WmsState>> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -426,7 +435,7 @@ fn build_populated_state(engine: Arc<dyn MapEngine>) -> Arc<ArcSwap<WmsState>> {
             license: None,
             geotiff: None,
             querydata: None,
-            wms: None,
+            wms,
             grib: None,
             zarr: None,
             odim: None,
@@ -4642,4 +4651,246 @@ mod composites {
         .unwrap();
         assert_eq!(image.body, expected);
     }
+}
+
+// ---------------------------------------------------------------------------
+// QUALITY vendor parameter and `[wms] webp_quality`
+// ---------------------------------------------------------------------------
+
+/// The first RIFF chunk of a WebP body: `VP8L` is the lossless bitstream,
+/// `VP8 ` / `VP8X` lossy (the latter with an alpha chunk).
+fn webp_chunk(body: &[u8]) -> &[u8] {
+    assert_eq!(&body[..4], b"RIFF", "not a WebP body");
+    assert_eq!(&body[8..12], b"WEBP", "not a WebP body");
+    &body[12..16]
+}
+
+struct QualityResponse {
+    status: StatusCode,
+    content_type: String,
+    x_cache: String,
+    etag: String,
+    body: Vec<u8>,
+}
+
+async fn get_quality(app: &axum::Router, crs: &str, bbox: &str, extra: &str) -> QualityResponse {
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&STYLES=\
+         &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64&TIME=2024-01-01T00:00:00Z{extra}"
+    );
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    let (status, content_type, x_cache, etag) = (
+        resp.status(),
+        header("content-type"),
+        header("x-cache"),
+        header("etag"),
+    );
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    QualityResponse {
+        status,
+        content_type,
+        x_cache,
+        etag,
+        body,
+    }
+}
+
+/// Both render paths: the direct one (CRS:84) and the meta-tiled one
+/// (EPSG:3857), whose final encode of the assembled view takes the quality.
+const QUALITY_VIEWS: [(&str, &str); 2] = [
+    ("CRS:84", "10,55,30,70"),
+    ("EPSG:3857", "1113194,7361866,3339584,11068715"),
+];
+
+/// `QUALITY=1..99` on `image/webp` is a lossy encode; the key is
+/// case-insensitive like every WMS parameter.
+#[tokio::test]
+async fn quality_selects_lossy_webp_with_any_key_case() {
+    for (crs, bbox) in QUALITY_VIEWS {
+        let app = build_populated_router();
+        let upper = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=80").await;
+        assert_eq!(upper.status, StatusCode::OK, "{crs}");
+        assert_eq!(upper.content_type, "image/webp");
+        assert_eq!(upper.x_cache, "MISS");
+        assert_ne!(webp_chunk(&upper.body), b"VP8L", "{crs}: must be lossy");
+        // The other spellings name the same request: a cache hit on the
+        // same bytes.
+        for key in ["quality", "Quality"] {
+            let other = get_quality(&app, crs, bbox, &format!("&FORMAT=image/webp&{key}=80")).await;
+            assert_eq!(other.status, StatusCode::OK, "{crs} {key}");
+            assert_eq!(other.x_cache, "HIT", "{crs} {key}");
+            assert_eq!(other.body, upper.body, "{crs} {key}");
+        }
+    }
+}
+
+/// A lossy and a lossless WebP of one view never share a rendered-cache
+/// entry, on either render path; `QUALITY=100` is the lossless default.
+#[tokio::test]
+async fn lossy_and_lossless_webp_never_alias_in_the_cache() {
+    for (crs, bbox) in QUALITY_VIEWS {
+        let app = build_populated_router();
+        let lossless = get_quality(&app, crs, bbox, "&FORMAT=image/webp").await;
+        assert_eq!(lossless.x_cache, "MISS", "{crs}");
+        assert_eq!(
+            webp_chunk(&lossless.body),
+            b"VP8L",
+            "{crs}: default is lossless"
+        );
+
+        let lossy = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=80").await;
+        assert_eq!(
+            lossy.x_cache, "MISS",
+            "{crs}: a lossless entry must not serve lossy"
+        );
+        assert_ne!(webp_chunk(&lossy.body), b"VP8L");
+        assert_ne!(lossy.etag, lossless.etag);
+
+        // Explicit 100 is the lossless request: served from its entry.
+        let explicit = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=100").await;
+        assert_eq!(explicit.x_cache, "HIT", "{crs}");
+        assert_eq!(explicit.body, lossless.body);
+
+        // Another lossy quality is another entry; the first lossy one hits.
+        let q50 = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=50").await;
+        assert_eq!(q50.x_cache, "MISS", "{crs}");
+        let again = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=80").await;
+        assert_eq!(again.x_cache, "HIT", "{crs}");
+        assert_eq!(again.body, lossy.body);
+    }
+}
+
+/// `[wms] webp_quality` applies to a WebP GetMap without QUALITY; an explicit
+/// QUALITY wins, including 100 for lossless. JPEG keeps its own default.
+#[tokio::test]
+async fn collection_webp_quality_is_the_default_and_quality_overrides_it() {
+    let wms: ds_core::config::WmsConfig =
+        serde_json::from_value(serde_json::json!({ "webp_quality": 70 })).unwrap();
+    for (crs, bbox) in QUALITY_VIEWS {
+        let app = api_wms::router(build_populated_state_with_wms(
+            Arc::new(PopulatedMockMapEngine),
+            Some(wms.clone()),
+        ));
+        let plain = build_populated_router();
+
+        let default = get_quality(&app, crs, bbox, "&FORMAT=image/webp").await;
+        assert_eq!(default.status, StatusCode::OK);
+        assert_ne!(
+            webp_chunk(&default.body),
+            b"VP8L",
+            "{crs}: collection default is lossy"
+        );
+        // It is exactly QUALITY=70: same key, a cache hit.
+        let seventy = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=70").await;
+        assert_eq!(seventy.x_cache, "HIT", "{crs}");
+        assert_eq!(seventy.body, default.body);
+
+        let lossless = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=100").await;
+        assert_eq!(lossless.x_cache, "MISS", "{crs}");
+        assert_eq!(
+            webp_chunk(&lossless.body),
+            b"VP8L",
+            "{crs}: explicit 100 is lossless"
+        );
+        // …the same bytes a collection without a default serves.
+        let reference = get_quality(&plain, crs, bbox, "&FORMAT=image/webp").await;
+        assert_eq!(lossless.body, reference.body, "{crs}");
+
+        let q90 = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=90").await;
+        assert_eq!(q90.x_cache, "MISS", "{crs}");
+        assert_ne!(q90.body, default.body);
+
+        // JPEG ignores the WebP default.
+        let jpeg = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg").await;
+        let jpeg_plain = get_quality(&plain, crs, bbox, "&FORMAT=image/jpeg").await;
+        assert_eq!(jpeg.content_type, "image/jpeg");
+        assert_eq!(jpeg.body, jpeg_plain.body, "{crs}");
+    }
+}
+
+/// JPEG takes QUALITY as its quality factor (default 85).
+#[tokio::test]
+async fn quality_sets_the_jpeg_quality() {
+    let app = build_populated_router();
+    let (crs, bbox) = QUALITY_VIEWS[0];
+    let default = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg").await;
+    let q85 = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg&QUALITY=85").await;
+    assert_eq!(q85.x_cache, "HIT", "85 is the JPEG default");
+    assert_eq!(q85.body, default.body);
+    let q20 = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg&QUALITY=20").await;
+    assert_eq!(q20.status, StatusCode::OK);
+    assert_eq!(q20.x_cache, "MISS");
+    assert!(q20.body.len() < default.body.len());
+}
+
+/// A bad QUALITY, or one on PNG, is an `InvalidParameterValue` 400 naming
+/// the problem, never silently ignored.
+#[tokio::test]
+async fn bad_quality_is_invalid_parameter_value() {
+    let app = build_populated_router();
+    let (crs, bbox) = QUALITY_VIEWS[0];
+    for (extra, message) in [
+        (
+            "&FORMAT=image/webp&QUALITY=0",
+            "QUALITY &apos;0&apos; must be an integer from 1 to 100",
+        ),
+        (
+            "&FORMAT=image/webp&QUALITY=101",
+            "QUALITY &apos;101&apos; must be an integer from 1 to 100",
+        ),
+        (
+            "&FORMAT=image/jpeg&QUALITY=high",
+            "QUALITY &apos;high&apos; must be an integer from 1 to 100",
+        ),
+        (
+            "&FORMAT=image/png&QUALITY=80",
+            "QUALITY applies only to image/jpeg and image/webp, not image/png",
+        ),
+    ] {
+        let resp = get_quality(&app, crs, bbox, extra).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST, "{extra}");
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.contains("code=\"InvalidParameterValue\"") && body.contains(message),
+            "{extra}: {body}"
+        );
+    }
+}
+
+/// QUALITY is a GetMap parameter; GetLegendGraphic ignores it like the
+/// other GetMap-only parameters, so a client sending it everywhere works.
+#[tokio::test]
+async fn legend_graphic_ignores_quality() {
+    let app = build_populated_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+                     &LAYER=radar&FORMAT=image/webp&QUALITY=80",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(webp_chunk(&body), b"VP8L", "legends stay lossless");
 }

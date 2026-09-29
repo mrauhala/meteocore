@@ -314,7 +314,19 @@ pub async fn wms_handler(
                 }
             }
 
-            let content_type = params.format.content_type();
+            // The format as encoded: an explicit QUALITY, else for WebP the
+            // collection's `[wms] webp_quality`, else the format default
+            // (JPEG 85, lossless WebP). Resolved before keying, so the
+            // rendered cache never serves a lossy image for a lossless
+            // request or the reverse.
+            let format = params.format.with_quality(
+                params.quality,
+                state
+                    .collections
+                    .get(&collection_id)
+                    .and_then(CollectionConfig::webp_quality),
+            );
+            let content_type = format.content_type();
             let has_explicit_time = params.time.is_some();
 
             // WMS picks the parameter via `LAYERS=collection/param` (parsed
@@ -382,11 +394,9 @@ pub async fn wms_handler(
             let cache_key = CacheKey {
                 layer: params.layer.clone(),
                 style: params.style.clone(),
-                format: match params.format {
-                    ds_render::ImageFormat::Png => 0,
-                    ds_render::ImageFormat::Jpeg => 1,
-                    ds_render::ImageFormat::Webp => 2,
-                },
+                // Quality included; the meta-tile key below needs none, its
+                // tiles are RGBA encoded per request.
+                format,
                 crs: params.crs.clone(),
                 // For a projected output CRS the rendered pixels are laid out
                 // over the projected-metres bbox (carried in `output_crs`), not
@@ -499,7 +509,6 @@ pub async fn wms_handler(
             // `time` (latest-resolved above) is `Copy`; it flows into both the
             // direct and meta-tile render closures below.
             let output_crs = params.output_crs.clone();
-            let format = params.format;
             let background = params.background;
             let elevation = params.elevation;
             // `reference_time` (resolved to a concrete run above, #521) is
@@ -729,6 +738,8 @@ pub async fn wms_handler(
                         encode_ms = s.encode.as_millis() as u64,
                         width = params.width,
                         height = params.height,
+                        format = content_type,
+                        quality = ?format.quality(),
                         "slow WMS meta-tile render"
                     ),
                     Some(RenderPath::MetaEmpty(s)) => tracing::info!(
@@ -740,6 +751,8 @@ pub async fn wms_handler(
                         tile_loop_ms = s.tile_loop.as_millis() as u64,
                         width = params.width,
                         height = params.height,
+                        format = content_type,
+                        quality = ?format.quality(),
                         "slow WMS meta-tile render (all nodata)"
                     ),
                     Some(RenderPath::Fallback(_)) => tracing::info!(
@@ -748,6 +761,8 @@ pub async fn wms_handler(
                         render_ms,
                         width = params.width,
                         height = params.height,
+                        format = content_type,
+                        quality = ?format.quality(),
                         "slow WMS render (meta-tiling fell back to direct)"
                     ),
                     // `Direct` covers geographic output and any request
@@ -759,6 +774,8 @@ pub async fn wms_handler(
                         render_ms,
                         width = params.width,
                         height = params.height,
+                        format = content_type,
+                        quality = ?format.quality(),
                         "slow WMS direct render"
                     ),
                     None => {}

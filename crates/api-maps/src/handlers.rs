@@ -510,6 +510,7 @@ pub(crate) fn collection_openapi_paths(
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/transparent"},
                     {"$ref": "#/components/parameters/f"},
+                    {"$ref": "#/components/parameters/quality"},
                     {"$ref": "#/components/parameters/bbox-crs"},
                     {"$ref": "#/components/parameters/elevation"},
                     {"$ref": "#/components/parameters/parameter-name"}
@@ -580,6 +581,7 @@ pub(crate) fn collection_openapi_paths(
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/transparent"},
                     {"$ref": "#/components/parameters/f"},
+                    {"$ref": "#/components/parameters/quality"},
                     {"$ref": "#/components/parameters/bbox-crs"},
                     {"$ref": "#/components/parameters/elevation"},
                     {"$ref": "#/components/parameters/parameter-name"}
@@ -749,6 +751,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "schema": {"type": "number"},
                 "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
             },
+            "quality": api_common::quality_parameter(ds_render::DEFAULT_JPEG_QUALITY),
             "parameter-name": api_common::parameter_name_parameter()
         },
         "schemas": {
@@ -1267,9 +1270,16 @@ async fn render_map(
     state: AppState,
 ) -> Result<impl IntoResponse, MapsError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_engine(&state, collection_id)?;
+    let (engine, config) = lookup_engine(&state, collection_id)?;
 
     let validated = params.validate()?;
+    // The format as encoded: an explicit `quality`, else for WebP the
+    // collection's `[wms] webp_quality`, else the format default (JPEG 85,
+    // lossless WebP). It keys the rendered cache, so a lossy and a lossless
+    // image of one view never alias.
+    let format = validated
+        .format
+        .with_quality(validated.quality, config.webp_quality());
 
     // An RGB composite (#819) has no style map: its colours come from its
     // channels, and its one style is `default`.
@@ -1318,7 +1328,7 @@ async fn render_map(
         }
     };
 
-    let content_type = validated.format.content_type();
+    let content_type = format.content_type();
     let has_explicit_time = validated.time.is_some();
     let content_crs = crs_to_uri(&validated.crs);
 
@@ -1383,11 +1393,7 @@ async fn render_map(
         // and data parameter can never alias one cached image.
         layer: style_layer_key,
         style: style_name.to_string(),
-        format: match validated.format {
-            ds_render::ImageFormat::Png => 0,
-            ds_render::ImageFormat::Jpeg => 1,
-            ds_render::ImageFormat::Webp => 2,
-        },
+        format,
         crs: validated.crs.clone(),
         // Projected output renders over the projected-metres bbox carried in
         // `output_crs`, not the WGS84 envelope in `validated.bbox`; key on the
@@ -1498,7 +1504,6 @@ async fn render_map(
     let width = validated.width;
     let height = validated.height;
     let output_crs = validated.output_crs;
-    let format = validated.format;
     let rendered_cache = state.rendered_cache.clone();
 
     let render_parameter = effective_parameter;

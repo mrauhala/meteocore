@@ -50,6 +50,10 @@ pub struct TileQueryParams {
     /// with HTTP 400 for collections with no vertical dimension; ignored
     /// for MVT responses.
     pub elevation: Option<String>,
+    /// Encoder quality (MeteoCore extension): 1–100 for `image/webp`
+    /// (100 = lossless) and `image/jpeg`. Rejected for PNG and for vector
+    /// tiles. A string so a bad value gets the range message.
+    pub quality: Option<String>,
 }
 
 impl TileQueryParams {
@@ -106,7 +110,12 @@ impl LegendQueryParams {
 /// Validated tile query parameters.
 pub struct ValidatedTileParams {
     pub time: Option<DateTime<Utc>>,
+    /// Output format at its default quality (JPEG 85, lossless WebP); the
+    /// handler applies [`Self::quality`] and the collection's `webp_quality`.
     pub format: ds_render::ImageFormat,
+    /// The `quality` parameter, 1–100, when supplied. Always `None` for PNG,
+    /// which rejects it.
+    pub quality: Option<u8>,
     pub parameter_name: Option<String>,
     /// Vertical level, parsed from the `elevation` query parameter.
     pub z: Option<f64>,
@@ -122,10 +131,13 @@ impl TileQueryParams {
             )));
         }
         let format = match format_str {
-            "image/jpeg" => ds_render::ImageFormat::Jpeg,
-            "image/webp" => ds_render::ImageFormat::Webp,
+            "image/jpeg" => ds_render::ImageFormat::JPEG,
+            "image/webp" => ds_render::ImageFormat::WEBP,
             _ => ds_render::ImageFormat::Png,
         };
+        // QUALITY — JPEG/WebP only; a value on PNG is an error, not ignored.
+        let quality = ds_render::parse_quality("quality", self.quality.as_deref(), format)
+            .map_err(TilesError::BadRequest)?;
 
         let time = self.datetime.as_deref().map(parse_time).transpose()?;
 
@@ -156,6 +168,7 @@ impl TileQueryParams {
         Ok(ValidatedTileParams {
             time,
             format,
+            quality,
             parameter_name,
             z,
         })
@@ -192,6 +205,7 @@ mod tests {
             format: None,
             parameter_name: None,
             elevation: None,
+            quality: None,
         };
         let validated = params.validate().unwrap();
         assert!(matches!(validated.format, ds_render::ImageFormat::Png));
@@ -204,9 +218,10 @@ mod tests {
             format: Some("image/jpeg".to_string()),
             parameter_name: None,
             elevation: None,
+            quality: None,
         };
         let validated = params.validate().unwrap();
-        assert!(matches!(validated.format, ds_render::ImageFormat::Jpeg));
+        assert_eq!(validated.format, ds_render::ImageFormat::JPEG);
     }
 
     #[test]
@@ -216,8 +231,49 @@ mod tests {
             format: Some("text/html".to_string()),
             parameter_name: None,
             elevation: None,
+            quality: None,
         };
         assert!(params.validate().is_err());
+    }
+
+    fn with_quality(format: Option<&str>, quality: &str) -> TileQueryParams {
+        TileQueryParams {
+            datetime: None,
+            format: format.map(str::to_string),
+            parameter_name: None,
+            elevation: None,
+            quality: Some(quality.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_validate_quality() {
+        let validated = with_quality(Some("image/webp"), "60").validate().unwrap();
+        assert_eq!(validated.quality, Some(60));
+        assert_eq!(validated.format, ds_render::ImageFormat::WEBP);
+        let validated = with_quality(Some("image/jpeg"), "100").validate().unwrap();
+        assert_eq!(validated.quality, Some(100));
+        for q in ["0", "101", "abc", "50.5"] {
+            match with_quality(Some("image/webp"), q).validate() {
+                Err(TilesError::BadRequest(msg)) => {
+                    assert_eq!(
+                        msg,
+                        format!("quality '{q}' must be an integer from 1 to 100")
+                    )
+                }
+                _ => panic!("{q}: expected BadRequest"),
+            }
+        }
+        // PNG, explicit or by default, has no quality.
+        for f in [Some("image/png"), None] {
+            match with_quality(f, "80").validate() {
+                Err(TilesError::BadRequest(msg)) => assert_eq!(
+                    msg,
+                    "quality applies only to image/jpeg and image/webp, not image/png"
+                ),
+                _ => panic!("{f:?}: expected BadRequest"),
+            }
+        }
     }
 
     #[test]

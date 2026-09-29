@@ -44,7 +44,7 @@ use quick_cache::sync::Cache;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
 
-/// Output image format.
+/// Output image format, with the encoder quality it is written at.
 ///
 /// [`Png`] auto-selects an 8-bit indexed-palette encoding ("PNG8") when the
 /// rendered image carries ≤256 distinct RGBA colours — typical of every
@@ -52,21 +52,118 @@ use ds_core::map_engine::RasterTile;
 /// Bytes are roughly 3–4× smaller than the 32-bit RGBA path for the same
 /// image; content-type is `image/png` either way. See [`encode_png`] for the
 /// byte-level contract.
+///
+/// `Jpeg` and `Webp` carry a quality from 1 to [`MAX_QUALITY`]: the JPEG
+/// quality factor, and for WebP 1–99 lossy encoding at that quality and 100
+/// lossless (see [`encode_webp`]). The quality is part of the value, so every
+/// cache key holding a format (the rendered-image [`CacheKey`]) keeps a lossy
+/// and a lossless encode of one view apart. [`ImageFormat::JPEG`] and
+/// [`ImageFormat::WEBP`] are the defaults a request gets without a quality.
+///
+/// [`Png`]: ImageFormat::Png
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageFormat {
     Png,
-    Jpeg,
-    Webp,
+    Jpeg { quality: u8 },
+    Webp { quality: u8 },
 }
 
+/// The highest encoder quality. For WebP it selects lossless encoding.
+pub const MAX_QUALITY: u8 = 100;
+
+/// JPEG quality when a request names none.
+pub const DEFAULT_JPEG_QUALITY: u8 = 85;
+
 impl ImageFormat {
+    /// JPEG at [`DEFAULT_JPEG_QUALITY`].
+    pub const JPEG: Self = Self::Jpeg {
+        quality: DEFAULT_JPEG_QUALITY,
+    };
+
+    /// Lossless WebP, the WebP default.
+    pub const WEBP: Self = Self::Webp {
+        quality: MAX_QUALITY,
+    };
+
     pub fn content_type(&self) -> &'static str {
         match self {
             ImageFormat::Png => "image/png",
-            ImageFormat::Jpeg => "image/jpeg",
-            ImageFormat::Webp => "image/webp",
+            ImageFormat::Jpeg { .. } => "image/jpeg",
+            ImageFormat::Webp { .. } => "image/webp",
         }
     }
+
+    /// The encoder quality, `None` for PNG.
+    pub fn quality(&self) -> Option<u8> {
+        match *self {
+            ImageFormat::Png => None,
+            ImageFormat::Jpeg { quality } | ImageFormat::Webp { quality } => Some(quality),
+        }
+    }
+
+    /// This format at the quality a request without one gets.
+    pub fn with_default_quality(self) -> Self {
+        match self {
+            ImageFormat::Png => ImageFormat::Png,
+            ImageFormat::Jpeg { .. } => ImageFormat::JPEG,
+            ImageFormat::Webp { .. } => ImageFormat::WEBP,
+        }
+    }
+
+    /// The format a request is encoded in: its explicit `quality`, else for
+    /// WebP the collection's `webp_default` (`[wms] webp_quality`), else the
+    /// format's own default (JPEG 85, lossless WebP). PNG has no quality;
+    /// [`parse_quality`] rejects one for it, so PNG is returned as is.
+    pub fn with_quality(self, requested: Option<u8>, webp_default: Option<u8>) -> Self {
+        match self {
+            ImageFormat::Png => ImageFormat::Png,
+            ImageFormat::Jpeg { quality } => ImageFormat::Jpeg {
+                quality: requested.unwrap_or(quality),
+            },
+            ImageFormat::Webp { quality } => ImageFormat::Webp {
+                quality: requested.or(webp_default).unwrap_or(quality),
+            },
+        }
+    }
+
+    /// One byte per media type for the key-derived ETag, fixed so a
+    /// default-quality key keeps the ETag it had before formats carried one.
+    fn etag_code(&self) -> u8 {
+        match self {
+            ImageFormat::Png => 0,
+            ImageFormat::Jpeg { .. } => 1,
+            ImageFormat::Webp { .. } => 2,
+        }
+    }
+}
+
+/// Parse a request's encoder quality: WMS `QUALITY`, Maps and Tiles
+/// `quality`. `param` is the parameter's name as the request spells it, for
+/// the error message.
+///
+/// An integer from 1 to [`MAX_QUALITY`]; omitted or blank is `None`. It
+/// applies to JPEG and WebP only, so any value with `format` PNG is an error
+/// rather than silently ignored. The `Err` is the client-facing message for
+/// the API's 400.
+pub fn parse_quality(
+    param: &str,
+    raw: Option<&str>,
+    format: ImageFormat,
+) -> Result<Option<u8>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let quality = raw
+        .parse::<u8>()
+        .ok()
+        .filter(|q| (1..=MAX_QUALITY).contains(q))
+        .ok_or_else(|| format!("{param} '{raw}' must be an integer from 1 to {MAX_QUALITY}"))?;
+    if format == ImageFormat::Png {
+        return Err(format!(
+            "{param} applies only to image/jpeg and image/webp, not image/png"
+        ));
+    }
+    Ok(Some(quality))
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +194,10 @@ pub struct StyleInfo {
 pub struct CacheKey {
     pub layer: String,
     pub style: String,
-    pub format: u8, // 0=png, 1=jpeg, 2=webp
+    /// The format as encoded, quality included: the request's effective
+    /// quality (after the collection's WebP default), so a lossy and a
+    /// lossless response never share an entry.
+    pub format: ImageFormat,
     pub crs: String,
     pub bbox: [i64; 4], // bbox quantized to microdegrees (6 decimal places)
     pub width: u32,
@@ -160,7 +260,7 @@ impl CacheKey {
         fnv1a_mix(&mut h, b"|");
         fnv1a_mix(&mut h, self.style.as_bytes());
         fnv1a_mix(&mut h, b"|");
-        fnv1a_mix(&mut h, &[self.format]);
+        fnv1a_mix(&mut h, &[self.format.etag_code()]);
         fnv1a_mix(&mut h, self.crs.as_bytes());
         fnv1a_mix(&mut h, b"|");
         for v in &self.bbox {
@@ -220,6 +320,14 @@ impl CacheKey {
         if let Some(bg) = self.background {
             fnv1a_mix(&mut h, b"|bg");
             fnv1a_mix(&mut h, &bg);
+        }
+        // The encoder quality, only when it is not the format's default
+        // (JPEG 85, lossless WebP), so default-quality keys keep theirs.
+        if self.format != self.format.with_default_quality() {
+            if let Some(quality) = self.format.quality() {
+                fnv1a_mix(&mut h, b"|q");
+                fnv1a_mix(&mut h, &[quality]);
+            }
         }
         format!("\"{h:016x}\"")
     }
@@ -496,9 +604,10 @@ pub fn render_tile_with_background(
     encode_rgba(&mut rgba, tile.width, tile.height, format, background)
 }
 
-/// Encode a rendered RGBA image in `format`, first compositing it over
-/// `background` when one is given (opaque output). `None` keeps the alpha
-/// channel; JPEG, which has none, then flattens onto white itself.
+/// Encode a rendered RGBA image in `format` at its quality, first
+/// compositing it over `background` when one is given (opaque output).
+/// `None` keeps the alpha channel; JPEG, which has none, then flattens onto
+/// white itself.
 pub(crate) fn encode_rgba(
     rgba: &mut [u8],
     width: u32,
@@ -511,8 +620,8 @@ pub(crate) fn encode_rgba(
     }
     match format {
         ImageFormat::Png => encode::encode_png(rgba, width, height),
-        ImageFormat::Jpeg => encode::encode_jpeg(rgba, width, height),
-        ImageFormat::Webp => encode::encode_webp(rgba, width, height),
+        ImageFormat::Jpeg { quality } => encode::encode_jpeg(rgba, width, height, quality),
+        ImageFormat::Webp { quality } => encode::encode_webp(rgba, width, height, quality),
     }
 }
 
@@ -852,11 +961,7 @@ pub fn render_legend(
         }
     }
 
-    match format {
-        ImageFormat::Png => encode::encode_png(&rgba, width, height),
-        ImageFormat::Jpeg => encode::encode_jpeg(&rgba, width, height),
-        ImageFormat::Webp => encode::encode_webp(&rgba, width, height),
-    }
+    encode_rgba(&mut rgba, width, height, format, None)
 }
 
 /// Write one RGBA pixel, clipped to the buffer bounds. The legend's geometry can
@@ -998,7 +1103,7 @@ mod tests {
         let key_for = |layer: &str| CacheKey {
             layer: layer.to_string(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:4326".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1421,7 +1526,7 @@ mod tests {
                 .into(),
         };
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
-        let jpeg_bytes = render_tile(&tile, &cmap, ImageFormat::Jpeg).unwrap();
+        let jpeg_bytes = render_tile(&tile, &cmap, ImageFormat::JPEG).unwrap();
         assert!(jpeg_bytes[0] == 0xFF && jpeg_bytes[1] == 0xD8);
     }
 
@@ -1694,7 +1799,7 @@ mod tests {
         let base = CacheKey {
             layer: "radar".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1724,7 +1829,7 @@ mod tests {
         let base = CacheKey {
             layer: "ecmwf-fc".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1753,7 +1858,7 @@ mod tests {
         let base = CacheKey {
             layer: "ecmwf-fc".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1790,7 +1895,7 @@ mod tests {
         let base = CacheKey {
             layer: "cap".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1834,7 +1939,7 @@ mod tests {
         let base = CacheKey {
             layer: "radar".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1872,7 +1977,7 @@ mod tests {
         let key = CacheKey {
             layer: "radar".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 0, 0],
             width: 256,
@@ -1886,6 +1991,162 @@ mod tests {
         };
         // Pinned after introducing the `reference_time` field (cache-bust event).
         assert_eq!(key.etag(), "\"92a1d2349689898e\"");
+        // JPEG and WebP at their default quality keep the ETags they had
+        // when `format` was a bare 1 / 2 code; only another quality mixes in.
+        let jpeg = CacheKey {
+            format: ImageFormat::JPEG,
+            ..key.clone()
+        };
+        assert_eq!(jpeg.etag(), "\"fed5ae3148cdd289\"");
+        let webp = CacheKey {
+            format: ImageFormat::WEBP,
+            ..key.clone()
+        };
+        assert_eq!(webp.etag(), "\"4d28f2fa26aa942c\"");
+        let lossy = CacheKey {
+            format: ImageFormat::Webp { quality: 80 },
+            ..key
+        };
+        assert_eq!(lossy.etag(), "\"b05b73b226084439\"");
+    }
+
+    #[test]
+    fn cache_key_distinguishes_encoder_quality() {
+        // A lossy and a lossless WebP of one view differ in bytes; neither
+        // may be served for the other, nor one lossy quality for another.
+        let lossless = CacheKey {
+            layer: "sat/c13".into(),
+            style: "default".into(),
+            format: ImageFormat::WEBP,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: None,
+            parameter: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+            background: None,
+        };
+        let q80 = CacheKey {
+            format: ImageFormat::Webp { quality: 80 },
+            ..lossless.clone()
+        };
+        let q75 = CacheKey {
+            format: ImageFormat::Webp { quality: 75 },
+            ..lossless.clone()
+        };
+        let jpeg75 = CacheKey {
+            format: ImageFormat::Jpeg { quality: 75 },
+            ..lossless.clone()
+        };
+        for (a, b) in [(&lossless, &q80), (&q80, &q75), (&q75, &jpeg75)] {
+            assert_ne!(a, b);
+            assert_ne!(a.etag(), b.etag());
+        }
+        let cache = RenderedCache::new(1);
+        cache.insert(
+            lossless.clone(),
+            CachedRendered::new(Bytes::from_static(b"lossless")),
+        );
+        assert!(cache.get(&lossless).is_some());
+        assert!(cache.get(&q80).is_none());
+        cache.insert(q80.clone(), CachedRendered::new(Bytes::from_static(b"q80")));
+        assert_eq!(cache.get(&q80).unwrap().bytes().as_ref(), b"q80");
+        assert_eq!(cache.get(&lossless).unwrap().bytes().as_ref(), b"lossless");
+    }
+
+    #[test]
+    fn parse_quality_accepts_1_to_100_for_jpeg_and_webp() {
+        for format in [ImageFormat::JPEG, ImageFormat::WEBP] {
+            assert_eq!(parse_quality("quality", Some("1"), format), Ok(Some(1)));
+            assert_eq!(parse_quality("quality", Some(" 80 "), format), Ok(Some(80)));
+            assert_eq!(parse_quality("quality", Some("100"), format), Ok(Some(100)));
+            // Omitted or blank: no explicit quality.
+            assert_eq!(parse_quality("quality", None, format), Ok(None));
+            assert_eq!(parse_quality("quality", Some(""), format), Ok(None));
+        }
+        // PNG without a quality is fine.
+        assert_eq!(parse_quality("QUALITY", None, ImageFormat::Png), Ok(None));
+    }
+
+    #[test]
+    fn parse_quality_rejects_out_of_range_and_non_integers() {
+        for bogus in ["0", "101", "255", "256", "-1", "80.5", "1e2", "abc", "0x50"] {
+            let err = parse_quality("QUALITY", Some(bogus), ImageFormat::WEBP).expect_err(bogus);
+            assert_eq!(
+                err,
+                format!("QUALITY '{bogus}' must be an integer from 1 to 100"),
+                "{bogus}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_quality_rejects_a_value_for_png() {
+        let err = parse_quality("quality", Some("80"), ImageFormat::Png).unwrap_err();
+        assert_eq!(
+            err,
+            "quality applies only to image/jpeg and image/webp, not image/png"
+        );
+    }
+
+    #[test]
+    fn with_quality_resolves_request_then_collection_then_format_default() {
+        let webp = ImageFormat::WEBP;
+        // Neither: lossless, as before the parameter existed.
+        assert_eq!(webp.with_quality(None, None), ImageFormat::WEBP);
+        // The collection default applies when the request names none.
+        assert_eq!(
+            webp.with_quality(None, Some(70)),
+            ImageFormat::Webp { quality: 70 }
+        );
+        // An explicit quality wins, including 100 = lossless over a lossy
+        // collection default.
+        assert_eq!(
+            webp.with_quality(Some(90), Some(70)),
+            ImageFormat::Webp { quality: 90 }
+        );
+        assert_eq!(webp.with_quality(Some(100), Some(70)), ImageFormat::WEBP);
+        // The WebP default is not a JPEG default: JPEG keeps 85.
+        let jpeg = ImageFormat::JPEG;
+        assert_eq!(jpeg.with_quality(None, Some(70)), ImageFormat::JPEG);
+        assert_eq!(
+            jpeg.with_quality(Some(60), Some(70)),
+            ImageFormat::Jpeg { quality: 60 }
+        );
+        assert_eq!(
+            ImageFormat::Png.with_quality(None, Some(70)),
+            ImageFormat::Png
+        );
+        assert_eq!(ImageFormat::JPEG.quality(), Some(DEFAULT_JPEG_QUALITY));
+        assert_eq!(ImageFormat::WEBP.quality(), Some(MAX_QUALITY));
+        assert_eq!(ImageFormat::Png.quality(), None);
+        assert_eq!(
+            ImageFormat::Webp { quality: 40 }.with_default_quality(),
+            ImageFormat::WEBP
+        );
+    }
+
+    #[test]
+    fn render_tile_encodes_at_the_format_quality() {
+        // The quality carried by the format reaches the encoder: lossy WebP
+        // for 1–99, the lossless bitstream for 100.
+        let tile = RasterTile {
+            width: 64,
+            height: 64,
+            values: (0..64 * 64)
+                .map(|i| Some((i % 64) as f64 / 64.0 + (i / 64) as f64 / 128.0))
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.5);
+        let lossless = render_tile(&tile, &cmap, ImageFormat::WEBP).unwrap();
+        let lossy = render_tile(&tile, &cmap, ImageFormat::Webp { quality: 60 }).unwrap();
+        assert_eq!(&lossless[12..16], b"VP8L");
+        assert_ne!(&lossy[12..16], b"VP8L");
+        assert_ne!(lossless, lossy);
     }
 
     #[test]

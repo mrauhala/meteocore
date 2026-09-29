@@ -43,14 +43,15 @@ pub const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"
 /// Parse a WMS `FORMAT=` query parameter into the corresponding `ImageFormat`.
 ///
 /// `None` (parameter omitted) defaults to PNG, matching the WMS 1.3.0
-/// convention. Any value outside `SUPPORTED_FORMATS` yields
+/// convention. JPEG and WebP come at their default quality (85, lossless);
+/// GetMap then applies `QUALITY` and the collection's `webp_quality`. Any value outside `SUPPORTED_FORMATS` yields
 /// `WmsError::InvalidFormat`. Used by both `validate_get_map` and the
 /// `GetLegendGraphic` handler so the two paths can't drift.
 pub fn parse_image_format(format: Option<&str>) -> Result<ds_render::ImageFormat, WmsError> {
     match format {
         None | Some("image/png") => Ok(ds_render::ImageFormat::Png),
-        Some("image/jpeg") => Ok(ds_render::ImageFormat::Jpeg),
-        Some("image/webp") => Ok(ds_render::ImageFormat::Webp),
+        Some("image/jpeg") => Ok(ds_render::ImageFormat::JPEG),
+        Some("image/webp") => Ok(ds_render::ImageFormat::WEBP),
         Some(other) => Err(WmsError::invalid_format(other)),
     }
 }
@@ -123,6 +124,10 @@ pub struct WmsQuery {
     /// these aliases add the upper/title-case variants real clients send.
     #[serde(alias = "DIM_REFERENCE_TIME", alias = "Dim_Reference_Time")]
     pub dim_reference_time: Option<String>,
+    /// Encoder quality vendor parameter (GetMap only): 1–100 for
+    /// `image/webp` (100 = lossless) and `image/jpeg`; rejected for PNG.
+    #[serde(alias = "QUALITY", alias = "Quality")]
+    pub quality: Option<String>,
 }
 
 /// Validated GetMap parameters.
@@ -142,8 +147,13 @@ pub struct GetMapParams {
     pub time: Option<DateTime<Utc>>,
     /// Output CRS for pixel-to-coordinate mapping.
     pub output_crs: OutputCrs,
-    /// Output image format.
+    /// Output image format, at its default quality (JPEG 85, lossless WebP).
+    /// The handler applies [`Self::quality`] and the collection's
+    /// `webp_quality` with [`ds_render::ImageFormat::with_quality`].
     pub format: ds_render::ImageFormat,
+    /// The `QUALITY` vendor parameter, 1–100, when supplied. Always `None`
+    /// for PNG, which rejects it.
+    pub quality: Option<u8>,
     /// Vertical level from the WMS `ELEVATION` dimension, when supplied.
     pub elevation: Option<f64>,
     /// Forecast model run from the custom `reference_time` dimension
@@ -242,8 +252,11 @@ impl WmsQuery {
             )));
         }
 
-        // FORMAT
+        // FORMAT, and the QUALITY vendor parameter for JPEG/WebP (1–100; for
+        // WebP 100 = lossless). A value on PNG is an error, not ignored.
         let image_format = parse_image_format(self.format.as_deref())?;
+        let quality = ds_render::parse_quality("QUALITY", self.quality.as_deref(), image_format)
+            .map_err(|msg| WmsError::invalid_parameter(&msg))?;
 
         // TRANSPARENT + BGCOLOR (WMS 1.3.0 §7.3.3.9–10). With TRANSPARENT=FALSE,
         // or a format without alpha (JPEG), nodata pixels take the BGCOLOR
@@ -252,8 +265,9 @@ impl WmsQuery {
         // omits it opaque.
         let transparent = parse_transparent(self.transparent.as_deref())?;
         let bgcolor = parse_bgcolor(self.bgcolor.as_deref())?;
-        let background =
-            (!transparent || image_format == ds_render::ImageFormat::Jpeg).then_some(bgcolor);
+        let background = (!transparent
+            || matches!(image_format, ds_render::ImageFormat::Jpeg { .. }))
+        .then_some(bgcolor);
 
         // TIME
         let time = self.time.as_deref().map(parse_time).transpose()?;
@@ -319,6 +333,7 @@ impl WmsQuery {
             time,
             output_crs,
             format: image_format,
+            quality,
             elevation,
             reference_time,
         })
@@ -670,14 +685,15 @@ mod tests {
             parse_image_format(Some("image/png")).unwrap(),
             ds_render::ImageFormat::Png
         ));
-        assert!(matches!(
+        assert_eq!(
             parse_image_format(Some("image/jpeg")).unwrap(),
-            ds_render::ImageFormat::Jpeg
-        ));
-        assert!(matches!(
+            ds_render::ImageFormat::JPEG
+        );
+        // WebP defaults to lossless; QUALITY / webp_quality change it later.
+        assert_eq!(
             parse_image_format(Some("image/webp")).unwrap(),
-            ds_render::ImageFormat::Webp
-        ));
+            ds_render::ImageFormat::WEBP
+        );
     }
 
     #[test]
@@ -701,6 +717,84 @@ mod tests {
                 "expected InvalidFormat for {bogus:?}, got {err:?}"
             );
         }
+    }
+
+    fn get_map_query(format: &str, quality: Option<&str>) -> WmsQuery {
+        WmsQuery {
+            service: Some("WMS".into()),
+            request: Some("GetMap".into()),
+            version: Some("1.3.0".into()),
+            layers: Some("radar".into()),
+            layer: None,
+            styles: None,
+            style: None,
+            crs: Some("CRS:84".into()),
+            bbox: Some("10,55,30,70".into()),
+            width: Some("64".into()),
+            height: Some("64".into()),
+            format: Some(format.into()),
+            transparent: None,
+            bgcolor: None,
+            time: None,
+            elevation: None,
+            dim_reference_time: None,
+            quality: quality.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn quality_is_parsed_for_webp_and_jpeg() {
+        let p = get_map_query("image/webp", Some("80"))
+            .validate_get_map()
+            .unwrap();
+        assert_eq!(p.quality, Some(80));
+        // The format stays at its default; the handler applies the quality
+        // together with the collection's webp_quality.
+        assert_eq!(p.format, ds_render::ImageFormat::WEBP);
+        let p = get_map_query("image/jpeg", Some("100"))
+            .validate_get_map()
+            .unwrap();
+        assert_eq!(p.quality, Some(100));
+        for absent in [None, Some(""), Some("  ")] {
+            let p = get_map_query("image/webp", absent)
+                .validate_get_map()
+                .unwrap();
+            assert_eq!(p.quality, None);
+        }
+    }
+
+    #[test]
+    fn quality_out_of_range_or_not_an_integer_is_invalid_parameter_value() {
+        for bogus in ["0", "101", "-5", "80.5", "high"] {
+            let err = get_map_query("image/webp", Some(bogus))
+                .validate_get_map()
+                .err()
+                .expect(bogus);
+            match err {
+                WmsError::InvalidParameterValue(msg) => assert_eq!(
+                    msg,
+                    format!("QUALITY '{bogus}' must be an integer from 1 to 100")
+                ),
+                other => panic!("{bogus}: expected InvalidParameterValue, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn quality_on_png_is_invalid_parameter_value() {
+        let err = get_map_query("image/png", Some("80"))
+            .validate_get_map()
+            .err()
+            .unwrap();
+        match err {
+            WmsError::InvalidParameterValue(msg) => assert_eq!(
+                msg,
+                "QUALITY applies only to image/jpeg and image/webp, not image/png"
+            ),
+            other => panic!("expected InvalidParameterValue, got {other:?}"),
+        }
+        // Without QUALITY, PNG is unaffected.
+        assert!(get_map_query("image/png", None).validate_get_map().is_ok());
     }
 
     /// Adding an entry to `SUPPORTED_FORMATS` without extending the match in

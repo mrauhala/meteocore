@@ -258,6 +258,15 @@ pub struct CollectionConfig {
     pub preview: Option<PreviewConfig>,
 }
 
+impl CollectionConfig {
+    /// The collection's default WebP quality, `[wms] webp_quality`: what a
+    /// WebP map or tile request without its own quality is encoded at.
+    /// `None` = lossless.
+    pub fn webp_quality(&self) -> Option<u8> {
+        self.wms.as_ref()?.webp_quality
+    }
+}
+
 /// Configuration for the nowcast derived-collection engine (#522): wraps an
 /// already-configured raster collection and serves motion-extrapolated
 /// frames with TIME values in the future.
@@ -529,6 +538,15 @@ pub struct WmsConfig {
     /// cache knobs (e.g. `[server] metatile_cache_mb`) go under `[server]`.
     #[serde(default = "default_rendered_cache_mb")]
     pub rendered_cache_mb: u64,
+    /// Default WebP quality for this collection's WMS, Maps and Tiles
+    /// images, 1–100: 1–99 is lossy WebP at that quality, 100 lossless.
+    /// Applies when a WebP request names no `QUALITY` / `quality`; an
+    /// explicit one wins, including 100 for lossless. Unset = lossless.
+    /// Continuous-tone layers such as satellite IR are several times smaller
+    /// and faster to encode lossy; keep colormapped radar classes lossless.
+    /// Collection-level only: not part of style bundles, which carry styles.
+    #[serde(default)]
+    pub webp_quality: Option<u8>,
 }
 
 /// Per-parameter default colormap configuration for WMS.
@@ -4026,6 +4044,15 @@ impl ServerConfig {
                         )));
                     }
                 }
+                // 1–99 lossy, 100 lossless; 0 has no meaning.
+                if let Some(quality) = wms.webp_quality {
+                    if !(1..=100).contains(&quality) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [wms] webp_quality must be an integer \
+                             from 1 to 100 (100 = lossless), got {quality}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -5773,6 +5800,45 @@ description = "X"
         let wms = config.collections[0].wms.as_ref().unwrap();
         assert_eq!(wms.colormap, None);
         assert_eq!(wms.style_bundle, None);
+        // No webp_quality: WebP stays lossless.
+        assert_eq!(wms.webp_quality, None);
+        assert_eq!(config.collections[0].webp_quality(), None);
+    }
+
+    #[test]
+    fn wms_webp_quality_accepts_1_to_100() {
+        for quality in [1u8, 80, 100] {
+            let cfg = collection_with(&format!("[collections.wms]\nwebp_quality = {quality}\n"));
+            cfg.validate().unwrap();
+            assert_eq!(cfg.collections[0].webp_quality(), Some(quality));
+        }
+        // No [wms] block at all: no default.
+        let bare = collection_with("");
+        bare.validate().unwrap();
+        assert_eq!(bare.collections[0].webp_quality(), None);
+    }
+
+    #[test]
+    fn wms_webp_quality_out_of_range_is_a_load_error() {
+        for quality in [0u8, 101, 255] {
+            let err = collection_with(&format!("[collections.wms]\nwebp_quality = {quality}\n"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[wms] webp_quality must be an integer from 1 to 100")
+                    && err.contains(&format!("got {quality}")),
+                "{err}"
+            );
+        }
+        // Beyond u8, negative, or not an integer: the TOML itself is rejected.
+        for bad in ["256", "-1", "80.5", "\"80\""] {
+            let toml = format!(
+                "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n[[collections]]\nid=\"c\"\n\
+                 title=\"t\"\ndescription=\"d\"\n[collections.wms]\nwebp_quality = {bad}\n"
+            );
+            assert!(toml::from_str::<ServerConfig>(&toml).is_err(), "{bad}");
+        }
     }
 
     // ---- postgis ------------------------------------------------------------
