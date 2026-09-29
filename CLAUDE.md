@@ -232,6 +232,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   encoders and codecs only: `png`, `jpeg-encoder`, `webp`, plus
   `serde_json` for the shared machine-readable legend document builder
   `legend_json`, kept in ds-render so WMS/Maps/Tiles can't drift apart).
+  RGB composites live in `ds_render::composite` (#819): per-channel range
+  with `min > max` = inverted, EUMETSAT gamma, band differences, and
+  colour-bar-free legends (`composite_legend_json`, `render_composite_legend`).
   `ds-mvt` and `ds-3dtiles` are likewise framework-free byte encoders,
   mirroring `ds-render`.
 - **Byte-bounded LRU caches go through `ds-cache`** (#480):
@@ -298,6 +301,16 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `get_raster_tile` uses. The API layers then advertise and default each
    parameter's own axis (WMS child-layer `time` dimension, Maps/Tiles
    `datetime`) and key the caches on its resolved timestep (#819).
+   Such an engine MUST also override `MapEngine::get_raster_tiles`, the
+   multi-band request an RGB composite renders: every band comes from the
+   one timestep `resolve_parameters_time` returns, or the latest shared one
+   for `None`, and a band without data then is an error, never a snap to
+   another timestep. Its default `resolve_parameters_time` is
+   `ds_core::map_engine::select_common_time` over the parameter axes:
+   latest-not-after among the timesteps every band has. Override it too if
+   the engine's own selection differs, and key a composite's caches on it.
+   Where it can, `get_raster_tiles` builds the output→source coordinate
+   map once per distinct source grid (engine-satellite, `render.rs`).
    **If the engine retains model runs** (non-empty
    `RasterInfo.reference_times`), it MUST likewise override
    `MapEngine::resolve_reference_time` with the SAME run selection

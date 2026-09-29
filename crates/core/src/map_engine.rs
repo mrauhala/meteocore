@@ -464,6 +464,51 @@ pub trait MapEngine: Send + Sync {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError>;
 
+    /// Several parameters' tiles for ONE request geometry and ONE timestep,
+    /// in the order of `parameters`: the bands of an RGB composite. The
+    /// other arguments are [`Self::get_raster_tile`]'s.
+    ///
+    /// `time` is the instant [`Self::resolve_parameters_time`] returned for
+    /// the same `parameters`; `None` renders the latest timestep they share.
+    /// Every tile comes from that one timestep. An engine whose parameters
+    /// have their own time axes ([`Self::parameter_times`]) MUST override
+    /// this: it renders every band from exactly `time` and fails when a band
+    /// has no data then, instead of snapping bands to different timesteps.
+    ///
+    /// Default: [`Self::get_raster_tile`] once per parameter with the same
+    /// arguments, which is correct when the parameters share one time axis.
+    /// An engine should still override it when it can build the
+    /// output→source coordinate map (Critical Rule 5) once per distinct
+    /// source grid and sample every band from it.
+    #[allow(clippy::too_many_arguments)] // mirrors get_raster_tile
+    fn get_raster_tiles(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        parameters: &[&str],
+        z: Option<f64>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Vec<RasterTile>, DataServerError> {
+        parameters
+            .iter()
+            .map(|parameter| {
+                self.get_raster_tile(
+                    bbox,
+                    width,
+                    height,
+                    time,
+                    output_crs,
+                    Some(parameter),
+                    z,
+                    reference_time,
+                )
+            })
+            .collect()
+    }
+
     /// Return metadata for capabilities documents.
     ///
     /// **Expected complexity: O(1) (or as close as practical).** Callers
@@ -580,6 +625,8 @@ pub trait MapEngine: Send + Sync {
     /// own axis, advertised per layer where a standard allows it (a WMS child
     /// layer's `time` dimension).
     ///
+    /// Ascending (oldest first), like `RasterInfo::times`.
+    ///
     /// Default `None`: the parameter has every time in `RasterInfo::times`.
     /// **O(1) from a snapshot** (Critical Rule 10): WMS GetCapabilities
     /// calls this for every parameter layer.
@@ -606,6 +653,71 @@ pub trait MapEngine: Send + Sync {
         let _ = parameter;
         self.resolve_time(time, reference_time)
     }
+
+    /// [`Self::resolve_parameter_time`] for parameters rendered together,
+    /// such as an RGB composite's bands: the one timestep
+    /// [`Self::get_raster_tiles`] renders them all from. The API layer must
+    /// key the rendered and meta-tile caches on it (#507) and pass it on as
+    /// `get_raster_tiles`' `time`, so no band is drawn from a timestep the
+    /// cache key does not name.
+    ///
+    /// Default: the selection [`select_common_time`] makes over the
+    /// parameters' own axes ([`Self::parameter_times`]): the latest shared
+    /// timestep at or before `time`, the earliest shared one when `time`
+    /// precedes them all, the latest shared one for `None`. It returns
+    /// `None` when the parameters share no timestep. When no parameter has
+    /// its own axis, it is [`Self::resolve_parameter_time`] of the first.
+    ///
+    /// An engine with per-parameter axes whose own selection differs MUST
+    /// override this with the selection its `get_raster_tiles` uses. Runs on
+    /// the hot render path before the cache lookup: from a snapshot, no I/O.
+    fn resolve_parameters_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let axes: Vec<Arc<[DateTime<Utc>]>> = parameters
+            .iter()
+            .filter_map(|parameter| self.parameter_times(parameter))
+            .collect();
+        if axes.is_empty() {
+            return self.resolve_parameter_time(parameters.first().copied(), time, reference_time);
+        }
+        let axes: Vec<&[DateTime<Utc>]> = axes.iter().map(|axis| &**axis).collect();
+        select_common_time(&axes, time)
+    }
+}
+
+/// The timestep a multi-parameter render uses, chosen among the times
+/// present in every one of `axes` (each ascending): the latest at or before
+/// `time`, the earliest when `time` precedes them all, the latest for
+/// `None`. `None` when the axes share no time, or there are none.
+///
+/// The default [`MapEngine::resolve_parameters_time`], and the selection an
+/// engine with per-parameter axes renders a composite with. It walks the
+/// shortest axis outward from `time` and binary-searches the others, so
+/// parameters that share their recent timesteps resolve in a few probes.
+pub fn select_common_time(
+    axes: &[&[DateTime<Utc>]],
+    time: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let shortest = (0..axes.len()).min_by_key(|&i| axes[i].len())?;
+    let candidates = axes[shortest];
+    let shared = |t: &&DateTime<Utc>| {
+        axes.iter()
+            .enumerate()
+            .all(|(i, axis)| i == shortest || axis.binary_search(t).is_ok())
+    };
+    let split = time.map_or(candidates.len(), |time| {
+        candidates.partition_point(|t| *t <= time)
+    });
+    candidates[..split]
+        .iter()
+        .rev()
+        .find(shared)
+        .or_else(|| candidates[split..].iter().find(shared))
+        .copied()
 }
 
 /// The instant a map request that omits `TIME`/`datetime` renders, before
@@ -691,6 +803,154 @@ mod tests {
         assert_eq!(
             plain.resolve_parameter_time(Some("late"), Some(at(2)), None),
             Some(at(2))
+        );
+    }
+
+    fn hour(hour: u32) -> DateTime<Utc> {
+        format!("2026-09-29T{hour:02}:00:00Z").parse().unwrap()
+    }
+
+    /// The default `get_raster_tiles` renders each parameter through
+    /// `get_raster_tile` with the request's arguments, in order, and fails
+    /// when one band fails.
+    #[test]
+    fn default_get_raster_tiles_loops_get_raster_tile() {
+        type Call = (Option<String>, Option<DateTime<Utc>>, Option<f64>);
+        struct Recorder(std::sync::Mutex<Vec<Call>>);
+        const BANDS: [&str; 3] = ["red", "green", "blue"];
+        impl MapEngine for Recorder {
+            fn get_raster_tile(
+                &self,
+                bbox: [f64; 4],
+                width: u32,
+                height: u32,
+                time: Option<DateTime<Utc>>,
+                output_crs: &OutputCrs,
+                parameter: Option<&str>,
+                z: Option<f64>,
+                reference_time: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                assert_eq!(bbox, [1.0, 2.0, 3.0, 4.0]);
+                assert_eq!(output_crs, &OutputCrs::WebMercator);
+                assert_eq!(reference_time, Some(hour(0)));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((parameter.map(String::from), time, z));
+                let band = BANDS
+                    .iter()
+                    .position(|b| Some(*b) == parameter)
+                    .ok_or_else(|| DataServerError::InvalidParameter("unknown".into()))?;
+                Ok(RasterTile {
+                    width,
+                    height,
+                    values: vec![Some(band as f64); (width * height) as usize].into(),
+                })
+            }
+            fn raster_info(&self) -> RasterInfo {
+                unreachable!()
+            }
+        }
+        let engine = Recorder(Default::default());
+        let render = |parameters: &[&str]| {
+            engine.get_raster_tiles(
+                [1.0, 2.0, 3.0, 4.0],
+                2,
+                3,
+                Some(hour(6)),
+                &OutputCrs::WebMercator,
+                parameters,
+                Some(500.0),
+                Some(hour(0)),
+            )
+        };
+        let tiles = render(&["blue", "red", "green", "red"]).unwrap();
+        let bands: Vec<Option<f64>> = tiles.iter().map(|t| t.values.value_at(0)).collect();
+        assert_eq!(bands, [Some(2.0), Some(0.0), Some(1.0), Some(0.0)]);
+        assert!(tiles.iter().all(|t| (t.width, t.height) == (2, 3)));
+        let calls = std::mem::take(&mut *engine.0.lock().unwrap());
+        assert_eq!(
+            calls,
+            ["blue", "red", "green", "red"].map(|p| (
+                Some(p.to_string()),
+                Some(hour(6)),
+                Some(500.0)
+            ))
+        );
+        assert!(render(&[]).unwrap().is_empty());
+        assert!(render(&["red", "nope"]).is_err());
+    }
+
+    /// The default `resolve_parameters_time` picks among the timesteps every
+    /// parameter has, with `resolve_parameter_time`'s latest-not-after rule.
+    #[test]
+    fn default_resolve_parameters_time_intersects_the_parameter_axes() {
+        struct Axes;
+        impl MapEngine for Axes {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unreachable!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                unreachable!()
+            }
+            /// Engines without per-parameter axes snap through this.
+            fn resolve_time(
+                &self,
+                _: Option<DateTime<Utc>>,
+                _: Option<DateTime<Utc>>,
+            ) -> Option<DateTime<Utc>> {
+                Some(hour(9))
+            }
+            fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+                let hours: &[u32] = match parameter {
+                    "ir" => &[1, 2, 3, 4],
+                    "wv" => &[2, 4],
+                    "late" => &[5],
+                    _ => return None,
+                };
+                Some(hours.iter().map(|&h| hour(h)).collect())
+            }
+        }
+        let resolve =
+            |parameters: &[&str], time| Axes.resolve_parameters_time(parameters, time, None);
+        // The latest shared timestep, at or before the request.
+        assert_eq!(resolve(&["ir", "wv"], None), Some(hour(4)));
+        assert_eq!(resolve(&["ir", "wv"], Some(hour(4))), Some(hour(4)));
+        assert_eq!(resolve(&["wv", "ir"], Some(hour(3))), Some(hour(2)));
+        assert_eq!(resolve(&["ir", "wv", "ir"], Some(hour(3))), Some(hour(2)));
+        // Before every shared timestep: the earliest, as a single parameter.
+        assert_eq!(resolve(&["ir", "wv"], Some(hour(0))), Some(hour(2)));
+        assert_eq!(resolve(&["ir"], Some(hour(0))), Some(hour(1)));
+        assert_eq!(resolve(&["ir"], Some(hour(3))), Some(hour(3)));
+        // No shared timestep.
+        assert_eq!(resolve(&["ir", "late"], None), None);
+        assert_eq!(resolve(&["ir", "late"], Some(hour(5))), None);
+        // A parameter without its own axis constrains nothing; with no axis
+        // at all the engine's own resolution applies.
+        assert_eq!(resolve(&["plain", "wv"], None), Some(hour(4)));
+        assert_eq!(resolve(&["plain"], Some(hour(1))), Some(hour(9)));
+        assert_eq!(resolve(&[], Some(hour(1))), Some(hour(9)));
+    }
+
+    #[test]
+    fn select_common_time_handles_empty_axes() {
+        assert_eq!(select_common_time(&[], None), None);
+        assert_eq!(select_common_time(&[&[]], Some(hour(1))), None);
+        let one = [hour(1)];
+        assert_eq!(select_common_time(&[&one, &[]], None), None);
+        assert_eq!(
+            select_common_time(&[&one, &one], Some(hour(0))),
+            Some(hour(1))
         );
     }
     use crate::geo::projected_output_crs;

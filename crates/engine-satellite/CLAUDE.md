@@ -103,8 +103,9 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   - Every column lookup in a render or an EDR query goes through
     `Frame::pixel`, and every bbox → pixel window through `Frame::windows`
     (two windows across the seam). `ProjectionGrid::build_2d_periodic` gets
-    the level's period, so cells across the seam or a projected output's
-    longitude cut (EPSG:3035 along 170°W) interpolate correctly.
+    the level's period (`render::CoordinateMaps::onto` for renders), so
+    cells across the seam or a projected output's longitude cut (EPSG:3035
+    along 170°W) interpolate correctly.
     `tests/gmgsi.rs` pins the seam (170°E → 170°W), wrapped world copies and
     that cut against the file's own lat/lon.
   - **Values are 8-bit display counts, not Kelvin**, despite
@@ -123,6 +124,20 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     Hourly, ~7.4 MB (WV ~3.4, VIS ~8.9), published ~35–45 min after the
     hour, so a bucket window must reach back past the latest published hour
     (the example uses `-PT3H`).
+- **Multi-band renders** (`get_raster_tiles`, for RGB composites) live in
+  `render.rs` next to the single-band path, and share `render_scan` with it.
+  - Every band comes from the scan `time` names exactly, with no per-band
+    snapping. A band without that scan fails with `InvalidParameter`. For
+    `None`, the latest scan every band has is used, and every tile is
+    empty when they share none.
+  - `resolve_parameters_time` and the `None` case both go through
+    `select_common`: `select`'s rule over the shared scans, via
+    `ds_core::map_engine::select_common_time`.
+  - `CoordinateMaps` builds one `ProjectionGrid` per distinct sampled grid,
+    full resolution or overview, compared field by field with its column
+    period (a global grid's). Bands of one resolution share it. `render::tests` counts the builds.
+  - Frames and blocks go through `frame()` and `PixelReader` exactly as in
+    a single-band render, so the refetch rules above hold unchanged.
 
 ## Config
 
