@@ -205,7 +205,8 @@ pub fn compose_rgb(
     let ramps = channels.each_ref().map(Ramp::new);
     let values: Vec<&RasterValues> = planes.iter().map(|p| &p.values).collect();
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
-    for (idx, px) in rgba.chunks_exact_mut(4).enumerate() {
+    let (pixels, _) = rgba.as_chunks_mut::<4>();
+    for (idx, px) in pixels.iter_mut().enumerate() {
         let Some(r) = ramps[0].sample(&values, idx) else {
             continue;
         };
@@ -215,7 +216,7 @@ pub fn compose_rgb(
         let Some(b) = ramps[2].sample(&values, idx) else {
             continue;
         };
-        px.copy_from_slice(&[r, g, b, 255]);
+        *px = [r, g, b, 255];
     }
     Ok(rgba)
 }
@@ -625,8 +626,8 @@ mod tests {
             compose_rgb(&refs, &channels).expect("compose f64")
         };
         // Sanity: the fixture has opaque and transparent pixels.
-        assert!(reference.chunks_exact(4).any(|p| p[3] == 255));
-        assert!(reference.chunks_exact(4).any(|p| p == [0, 0, 0, 0]));
+        assert!(reference.as_chunks::<4>().0.iter().any(|p| p[3] == 255));
+        assert!(reference.as_chunks::<4>().0.contains(&[0, 0, 0, 0]));
 
         // Plane i takes variant (i + shift) % 3, so every plane is tried as
         // every variant alongside the other two.
