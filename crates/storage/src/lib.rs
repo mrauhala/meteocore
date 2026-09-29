@@ -6,6 +6,8 @@
 mod admitted;
 pub mod discovery;
 mod error;
+#[cfg(test)]
+mod test_store;
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -303,6 +305,61 @@ impl DataStore {
                             Ok(r) => r,
                             Err(_) => Err(DataServerError::Storage(format!(
                                 "head of `{p}` timed out after {}s",
+                                Self::REQUEST_TIMEOUT.as_secs()
+                            ))),
+                        };
+                        (i, r)
+                    }))
+                    .buffer_unordered(conc)
+                    .collect()
+                    .await;
+                results.sort_by_key(|(i, _)| *i);
+                results
+            })?;
+
+        Ok(ordered.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// [`Self::list`] many prefixes concurrently, returning one result per
+    /// prefix **in input order**. A prefix that fails to list (a missing
+    /// partition on an HTTP store, a timeout) carries its error in its slot
+    /// and does not sink the batch. The outer `Err` is reserved for a
+    /// runtime-bridge failure or an already-expired request deadline.
+    ///
+    /// `concurrency` bounds the LISTs in flight (`buffer_unordered`). Each
+    /// LIST gets the budget [`Self::list`] has: the request deadline when
+    /// one is set, else 30 s of its own, so a long batch is never failed by
+    /// a batch-wide cap.
+    ///
+    /// Drives the whole batch on ONE bridge call, with the same
+    /// thread-context rules as [`Self::get_many`]. Catalog scans list their
+    /// date-expanded prefixes through this, via
+    /// [`discovery::list_prefixes`], instead of one blocking `list` after
+    /// another (Critical Rule 9).
+    #[allow(clippy::type_complexity)]
+    pub fn list_many(
+        &self,
+        prefixes: &[ObjectPath],
+        concurrency: usize,
+    ) -> Result<Vec<Result<Vec<ObjectMeta>, DataServerError>>, DataServerError> {
+        use futures::{StreamExt, TryStreamExt};
+
+        let conc = concurrency.max(1);
+        let deadline = ds_core::deadline::current();
+        ds_core::deadline::check()?;
+        let inner = &self.inner;
+        let ordered: Vec<(usize, Result<Vec<ObjectMeta>, DataServerError>)> = self
+            .block_on_untimed(async {
+                let mut results: Vec<(usize, Result<Vec<ObjectMeta>, DataServerError>)> =
+                    futures::stream::iter(prefixes.iter().enumerate().map(|(i, p)| async move {
+                        let end = deadline
+                            .unwrap_or_else(|| std::time::Instant::now() + Self::REQUEST_TIMEOUT);
+                        let listed = inner.list(Some(p)).try_collect::<Vec<_>>();
+                        let r = match tokio::time::timeout_at(end.into(), listed).await {
+                            Ok(r) => r.map_err(|e| DataServerError::from(StorageError::from(e))),
+                            Err(_) if deadline.is_some() => Err(DataServerError::DeadlineExceeded),
+                            Err(_) => Err(DataServerError::Storage(format!(
+                                "Request timed out after {}s",
                                 Self::REQUEST_TIMEOUT.as_secs()
                             ))),
                         };
@@ -768,6 +825,47 @@ mod tests {
             res[1]
         );
         assert_eq!(res[2].as_ref().unwrap().as_ref().unwrap().size, 4);
+    }
+
+    /// `list_many` keeps at most `concurrency` LISTs in flight, answers in
+    /// input order even when the first prefix finishes last, and isolates a
+    /// failing prefix in its own slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_many_bounds_lists_and_answers_in_input_order() {
+        use std::time::Duration;
+        let probe = crate::test_store::ListProbe {
+            delay: Duration::from_millis(20),
+            delays: [("p0".to_string(), Duration::from_millis(80))].into(),
+            failing: ["p3".to_string()].into(),
+            ..Default::default()
+        }
+        .with_objects(&["p0/a", "p1/b", "p2/c", "p3/d", "p4/e"])
+        .await;
+        let peak = probe.peak.clone();
+        let store = DataStore::new(Arc::new(probe));
+        let prefixes: Vec<ObjectPath> = (0..6).map(|i| ObjectPath::from(format!("p{i}"))).collect();
+
+        let listed = store.list_many(&prefixes, 3).unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        let slots: Vec<Option<Vec<String>>> = listed
+            .into_iter()
+            .map(|r| {
+                r.ok()
+                    .map(|objects| objects.iter().map(|o| o.location.to_string()).collect())
+            })
+            .collect();
+        let some = |key: &str| Some(vec![key.to_string()]);
+        assert_eq!(
+            slots,
+            [
+                some("p0/a"),
+                some("p1/b"),
+                some("p2/c"),
+                None,
+                some("p4/e"),
+                Some(vec![]),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -161,7 +161,8 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     (`not_a_band`). The API layer renders one by passing
     `CompositeDef::parameters()` to `get_raster_tiles` and composing the
     tiles with `ds_render::CompositeSpec::from(&def)`, whose planes follow
-    that order.
+    that order. WMS, Maps and Tiles do exactly that, keyed on
+    `resolve_parameter_time(Some(<composite>))`.
 
 ## Config
 
@@ -223,5 +224,6 @@ summed per product on its own grid (products may mix 0.5/1/2 km).
 
 Other providers (GK2A CGMS navigation, MTG) are phases 3 and 5. A
 regional (non-global) Mercator grid is refused: only GMGSI needs one, and
-it is global. Composite layers in WMS/Maps/Tiles (the API wiring from
-`composites()`) and built-in composite recipes are phase 4 follow-ups.
+it is global. Built-in composite recipes are a phase 4 follow-up. WMS,
+Maps and Tiles serve the composites from `composites()`: see "RGB
+composite layers" in `crates/api-wms/CLAUDE.md`.

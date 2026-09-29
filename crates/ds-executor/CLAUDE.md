@@ -6,6 +6,9 @@ thread-local deadline. Capture it explicitly when fanning out onto Rayon.
 
 The process-wide queue counts memory and CPU admission waiters; cache hits bypass it.
 Raster admission reserves memory before CPU, sharing one absolute deadline.
+`acquire_raster_planes` charges a render holding several value planes (an
+RGB composite's bands) 16 B per output pixel per plane past the first
+(`budget::raster_bytes`); `acquire_raster` is its one-plane case.
 No CPU slot is held while waiting for memory. CPU permits belong to workers,
 never HTTP futures awaiting a running worker. The handler and worker each hold
 an `Arc<RenderPermit>`: the worker's clone survives HTTP cancellation, while

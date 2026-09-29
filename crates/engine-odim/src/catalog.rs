@@ -7,15 +7,16 @@
 //! regex into a basename match plus a parsed timestamp.
 //!
 //! A scan — local-directory ([`scan_local_directory`]) or S3/HTTP
-//! object-store ([`scan_remote`]) — applies the matcher to each
-//! filename and returns a list of [`CatalogEntry`] values sorted by
-//! timestamp ascending.
+//! object-store ([`scan_remote`]) — runs the shared catalog scan
+//! (`ds_storage::discovery::{scan_local, scan_remote}`), which applies
+//! the matcher to each filename, and returns a list of [`CatalogEntry`]
+//! values sorted by timestamp ascending, one per timestamp.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
-use ds_storage::discovery::{FilenameError, FilenameMatcher};
+use ds_storage::discovery::{self, FilenameError, FilenameMatcher, ScanSpec, Symlinks};
 use tracing::warn;
 
 /// Errors from catalog construction and scanning.
@@ -72,62 +73,40 @@ impl Location {
     }
 }
 
-/// Walk a local directory, match each filename against `matcher`,
-/// and return the matched files sorted by timestamp ascending.
-/// `time_filter`, when set, drops entries whose timestamp falls outside
-/// the inclusive `(start, end)` range — the local analogue of
-/// [`scan_remote`]'s window filter (#465). `max_files` then caps the
-/// result at the most recent N; useful when the source directory holds
-/// years of history.
+/// Scan a local directory with the shared catalog scan
+/// ([`discovery::scan_local`]) and return the matched files sorted by
+/// timestamp ascending, one per timestamp. `time_filter`, when set, drops
+/// entries whose timestamp falls outside the inclusive `(start, end)`
+/// range, the local analogue of [`scan_remote`]'s window filter (#465).
+/// `max_files` then caps the result at the most recent N; useful when the
+/// source directory holds years of history.
 ///
-/// Non-recursive — only files directly in `dir`. Directories,
-/// symlinks to directories, and files whose names don't match the
-/// matcher are silently skipped.
+/// Non-recursive — only files directly in `dir`. A symlink to a file is
+/// followed; directories, symlinks to directories, and files whose names
+/// don't match the matcher are silently skipped.
 pub fn scan_local_directory(
     dir: &Path,
     matcher: &FilenameMatcher,
     time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
     max_files: Option<usize>,
 ) -> Result<Vec<CatalogEntry>, CatalogError> {
-    let read = std::fs::read_dir(dir).map_err(|e| CatalogError::ReadDir {
+    let spec = ScanSpec {
+        time_filter,
+        max_files,
+        symlinks: Symlinks::Follow,
+        ..ScanSpec::new(matcher, SCAN_LABEL)
+    };
+    let files = discovery::scan_local(dir, &spec).map_err(|source| CatalogError::ReadDir {
         dir: dir.to_path_buf(),
-        source: e,
+        source,
     })?;
-
-    let mut entries = Vec::new();
-    for raw in read {
-        let raw = match raw {
-            Ok(entry) => entry,
-            Err(e) => {
-                warn!("[catalog] failed to read entry in `{}`: {e}", dir.display());
-                continue;
-            }
-        };
-        let path = raw.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if let Some(time) = matcher.parse_timestamp(name) {
-            entries.push(CatalogEntry {
-                time,
-                location: Location::Local(path),
-            });
-        }
-    }
-    if let Some((start, end)) = time_filter {
-        entries.retain(|e| e.time >= start && e.time <= end);
-    }
-    entries.sort_by_key(|e| e.time);
-    if let Some(cap) = max_files {
-        if entries.len() > cap {
-            let start = entries.len() - cap;
-            entries.drain(..start);
-        }
-    }
-    Ok(entries)
+    Ok(files
+        .into_iter()
+        .map(|file| CatalogEntry {
+            time: file.time,
+            location: Location::Local(file.path),
+        })
+        .collect())
 }
 
 /// Skip remote objects larger than this — a guard against fetching a
@@ -138,17 +117,23 @@ pub fn scan_local_directory(
 /// `fetch_bytes`) so an object that grew after listing is still caught.
 pub(crate) const MAX_REMOTE_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Log prefix of the COMP catalog scans.
+const SCAN_LABEL: &str = "catalog";
+
 /// Scan an S3/HTTP object store for ODIM files under the given set of
-/// (already date-expanded) key prefixes.
+/// (already date-expanded) key prefixes, with the shared catalog scan
+/// ([`discovery::scan_remote`]): the prefixes are listed concurrently,
+/// at most [`discovery::MAX_CONCURRENT_LISTS`] at a time.
 ///
-/// Each prefix is `list`ed; object basenames are matched against
-/// `matcher`. Matched entries' `path` holds the full object key — not
-/// a filesystem path — which `OdimEngine` resolves back through the
-/// object store when loading composites.
+/// Object basenames are matched against `matcher`. Matched entries'
+/// `path` holds the full object key — not a filesystem path — which
+/// `OdimEngine` resolves back through the object store when loading
+/// composites.
 ///
 /// `time_filter`, when set, drops entries whose timestamp falls
 /// outside the `(start, end)` range. `max_files` caps the result to
-/// the most recent N. Returns entries sorted by timestamp ascending.
+/// the most recent N. Returns entries sorted by timestamp ascending,
+/// one per timestamp (the lexicographically-greatest key wins).
 ///
 /// A prefix that fails to `list` (e.g. a date partition that doesn't
 /// exist yet) is logged and skipped. If *every* prefix fails the call
@@ -162,81 +147,41 @@ pub fn scan_remote(
 ) -> Result<Vec<CatalogEntry>, DataServerError> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
-    let mut entries: Vec<CatalogEntry> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
+    let prefixes: Vec<ObjectPath> = prefixes
+        .iter()
+        .map(|prefix| ObjectPath::from(prefix.as_str()))
+        .collect();
+    let spec = ScanSpec {
+        time_filter,
+        max_files,
+        max_size: Some(MAX_REMOTE_FILE_SIZE),
+        ..ScanSpec::new(matcher, SCAN_LABEL)
+    };
+    let scan = discovery::scan_remote(store, &prefixes, &spec)?;
 
-    for prefix in prefixes {
-        let listed = match store.list(&ObjectPath::from(prefix.as_str())) {
-            Ok(objects) => objects,
-            Err(e) => {
-                errors.push(format!("'{prefix}': {e}"));
-                continue;
-            }
-        };
-        for obj in listed {
-            if obj.size > MAX_REMOTE_FILE_SIZE {
-                warn!(
-                    "[catalog] skipping oversized remote object `{}` ({} bytes)",
-                    obj.location, obj.size
-                );
-                continue;
-            }
-            let key = obj.location.to_string();
-            let name = key.rsplit('/').next().unwrap_or(key.as_str());
-            let Some(time) = matcher.parse_timestamp(name) else {
-                continue;
-            };
-            if let Some((start, end)) = time_filter {
-                if time < start || time > end {
-                    continue;
-                }
-            }
-            entries.push(CatalogEntry {
-                time,
-                location: Location::Remote {
-                    store: store.clone(),
-                    key,
-                },
-            });
+    if let Some((failed, summary)) = scan.failures() {
+        if scan.entries.is_empty() {
+            return Err(DataServerError::Engine(format!(
+                "all {failed} ODIM remote prefix scan(s) failed: {summary}"
+            )));
         }
-    }
-
-    if entries.is_empty() && !errors.is_empty() {
-        return Err(DataServerError::Engine(format!(
-            "all {} ODIM remote prefix scan(s) failed: {}",
-            errors.len(),
-            errors.join("; ")
-        )));
-    }
-    if !errors.is_empty() {
         warn!(
-            "[catalog] {} ODIM remote prefix scan(s) failed (kept {} entries from the rest): {}",
-            errors.len(),
-            entries.len(),
-            errors.join("; ")
+            "[catalog] {failed} ODIM remote prefix scan(s) failed (kept {} entries from the rest): {summary}",
+            scan.entries.len()
         );
     }
 
-    // Sort by timestamp ascending. Within an equal-timestamp run,
-    // order the key *descending* so the lexicographically-greatest key
-    // lands first (at the lower array index). `dedup_by` retains the
-    // first element of each run — so that greatest key is the one that
-    // survives. The sort direction (descending) and the dedup
-    // behaviour (keep-first) must stay consistent for this to hold.
-    entries.sort_by(|a, b| {
-        a.time
-            .cmp(&b.time)
-            .then_with(|| b.location.id().cmp(&a.location.id()))
-    });
-    entries.dedup_by(|a, b| a.time == b.time);
-
-    if let Some(cap) = max_files {
-        if entries.len() > cap {
-            let start = entries.len() - cap;
-            entries.drain(..start);
-        }
-    }
-    Ok(entries)
+    Ok(scan
+        .entries
+        .into_iter()
+        .map(|file| CatalogEntry {
+            time: file.time,
+            location: Location::Remote {
+                store: store.clone(),
+                key: file.object.location.to_string(),
+            },
+        })
+        .collect())
 }
 
 #[cfg(test)]

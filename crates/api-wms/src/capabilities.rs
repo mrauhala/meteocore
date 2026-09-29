@@ -8,7 +8,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use crate::params;
-use ds_render::StyleInfo;
+use ds_render::{CompositeSpec, StyleInfo};
 
 /// Generate WMS 1.3.0 GetCapabilities XML.
 ///
@@ -53,10 +53,11 @@ pub fn get_capabilities_xml(
         if let Some(engine) = engines.get(id) {
             let info = engine.raster_info_shared();
 
-            if info.parameters.len() > 1 {
+            if info.parameters.len() > 1 || !engine.composites().is_empty() {
                 // Multi-parameter engine: parent layer (not requestable) with
-                // nested child layers per parameter. Each child resolves its
-                // own style map, so pass the whole registry down.
+                // nested child layers per parameter, then one per RGB
+                // composite (#819). Each child resolves its own style map,
+                // so pass the whole registry down.
                 write_parent_layer(
                     &mut writer,
                     id,
@@ -211,6 +212,73 @@ fn write_parent_layer(
                 .map(|(times, default)| (&times[..], *default)),
         );
     }
+
+    // Child layers — one per RGB composite (#819), after the parameters. A
+    // composite has its own time axis, the scans every band has, and one
+    // style, `default`, whose legend is the channel list.
+    for composite in engine.composites().iter() {
+        let child_layer_name = format!("{id}/{}", composite.name);
+        let child_title = match &info.layer_subtitle {
+            Some(subtitle) => format!("{subtitle} — {}", composite.title),
+            None => composite.title.clone(),
+        };
+        let own_times = engine.parameter_times(&composite.name).map(|times| {
+            let default = default_request_time(engine, info, Some(&composite.name));
+            (times, default)
+        });
+        write_composite_layer(
+            writer,
+            &child_layer_name,
+            &child_title,
+            &CompositeSpec::from(composite),
+            base_url,
+            own_times
+                .as_ref()
+                .map(|(times, default)| (&times[..], *default)),
+        );
+    }
+
+    let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
+}
+
+/// Write an RGB composite's child layer: its name and title, an abstract
+/// naming what each channel reads, its own `time` dimension and its one
+/// style, `default`, with a LegendURL to the channel-list legend.
+fn write_composite_layer(
+    writer: &mut Writer<Vec<u8>>,
+    layer_name: &str,
+    title: &str,
+    spec: &CompositeSpec,
+    base_url: &str,
+    own_times: Option<OwnTimes<'_>>,
+) {
+    let mut layer = BytesStart::new("Layer");
+    layer.push_attribute(("queryable", "0"));
+    layer.push_attribute(("opaque", "1"));
+    let _ = writer.write_event(Event::Start(layer));
+
+    write_text_element(writer, "Name", layer_name);
+    write_text_element(writer, "Title", title);
+    let channels: Vec<String> = ["red", "green", "blue"]
+        .iter()
+        .enumerate()
+        .map(|(i, channel)| format!("{channel} {}", spec.channel_label(i)))
+        .collect();
+    write_text_element(
+        writer,
+        "Abstract",
+        &format!("RGB composite: {}", channels.join(", ")),
+    );
+    if let Some((times, default)) = own_times {
+        write_time_dimension(writer, times, default);
+    }
+    write_style(
+        writer,
+        layer_name,
+        ds_render::COMPOSITE_STYLE,
+        "Default",
+        base_url,
+    );
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
 }
@@ -405,27 +473,7 @@ fn write_layer_styles(
         });
         for name in style_names {
             if let Some(style) = styles.get(name) {
-                let _ = writer.write_event(Event::Start(BytesStart::new("Style")));
-                write_text_element(writer, "Name", &style.name);
-                write_text_element(writer, "Title", &style.title);
-
-                // LegendURL — the FULL layer name, including any "/param"
-                // segment. GetLegendGraphic resolves that key to the same
-                // per-parameter style this layer advertises; using the bare
-                // collection id would hand back the collection default's
-                // legend for a parameter layer rendered with its own palette.
-                let _ = writer.write_event(Event::Start(BytesStart::new("LegendURL")));
-                let legend_url = format!(
-                    "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={}&FORMAT=image/png",
-                    style.name
-                );
-                let mut or = BytesStart::new("OnlineResource");
-                or.push_attribute(("xlink:type", "simple"));
-                or.push_attribute(("xlink:href", legend_url.as_str()));
-                let _ = writer.write_event(Event::Empty(or));
-                let _ = writer.write_event(Event::End(BytesEnd::new("LegendURL")));
-
-                let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
+                write_style(writer, layer_name, &style.name, &style.title, base_url);
             }
         }
     } else {
@@ -434,6 +482,36 @@ fn write_layer_styles(
         write_text_element(writer, "Title", "Default");
         let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
     }
+}
+
+/// Write one `<Style>` with its LegendURL.
+fn write_style(
+    writer: &mut Writer<Vec<u8>>,
+    layer_name: &str,
+    name: &str,
+    title: &str,
+    base_url: &str,
+) {
+    let _ = writer.write_event(Event::Start(BytesStart::new("Style")));
+    write_text_element(writer, "Name", name);
+    write_text_element(writer, "Title", title);
+
+    // LegendURL — the FULL layer name, including any "/param" segment.
+    // GetLegendGraphic resolves that key to the same per-parameter style this
+    // layer advertises; using the bare collection id would hand back the
+    // collection default's legend for a parameter layer rendered with its own
+    // palette.
+    let _ = writer.write_event(Event::Start(BytesStart::new("LegendURL")));
+    let legend_url = format!(
+        "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={name}&FORMAT=image/png"
+    );
+    let mut or = BytesStart::new("OnlineResource");
+    or.push_attribute(("xlink:type", "simple"));
+    or.push_attribute(("xlink:href", legend_url.as_str()));
+    let _ = writer.write_event(Event::Empty(or));
+    let _ = writer.write_event(Event::End(BytesEnd::new("LegendURL")));
+
+    let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
 }
 
 /// Write a simple text element using quick-xml (auto-escapes content).

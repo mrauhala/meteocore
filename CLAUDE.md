@@ -7,7 +7,8 @@ weather data (radar, NWP models, observations, alerts).
 Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-storage` (S3/HTTP/local object store, directory `crates/storage`; its
 `discovery` module is the one home for time windows, strftime prefix
-expansion and the filename → timestamp matcher, #816/#817),
+expansion, the filename → timestamp matcher and the catalog scan with
+bounded concurrent prefix LISTs, #816/#817),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure),
@@ -317,7 +318,16 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    for a composite's name in `parameter_times` (the timesteps every band
    has, kept in the snapshot, never intersected per call) and
    `resolve_parameter_time` (through the same helper as
-   `resolve_parameters_time` over its bands).
+   `resolve_parameters_time` over its bands). The API layers then serve
+   each composite as its own layer with nothing more from the engine: a
+   WMS child layer `coll/<composite>` with that `time` dimension, Maps/Tiles
+   `parameter-name=<composite>` (listed in `parameter_names`, no unit), the
+   `default` style only (`ds_render::COMPOSITE_STYLE`), and a channel-list
+   legend. They key every cache on the composite's name and its resolved
+   time, pass that same time to `get_raster_tiles`, compose with
+   `ds_render::render_composite_tiles` (meta-tiles:
+   `render_metatiled_composite`), and render nothing when it is `None`
+   (no shared scan).
    **If the engine retains model runs** (non-empty
    `RasterInfo.reference_times`), it MUST likewise override
    `MapEngine::resolve_reference_time` with the SAME run selection
@@ -448,7 +458,7 @@ one never implies the other.
 |---|---|---|---|
 | `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms, api-maps `params.rs`) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps `BadRequest`): "… must not exceed 8000" |
 | `api_tiles::params::TILE_SIZE` | output, fixed | 256 × 256 | never |
-| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
+| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
 | `engine_geotiff::decode_budget::BUDGET` | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
 | engine-zarr `read_budget::BUDGET` | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
@@ -570,7 +580,7 @@ one never implies the other.
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
-| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters, and EDR skips them |
+| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
 
 ## Config Format

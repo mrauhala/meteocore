@@ -200,8 +200,10 @@ need no reload pruning.
   configured by `MC_RENDER_MEMORY_MB` (default 1024 MiB; restart to change).
   It deliberately survives reloads so old and new render tasks share one limit.
   The 32-byte/output-pixel estimate covers output buffers/scratch, not source
-  decoding or resident caches. At the default, the 8000×8000 format limit exceeds
-  the memory budget and returns 503; operators can raise the budget explicitly.
+  decoding or resident caches. An RGB composite render adds 16 bytes per
+  output pixel for each band past the first (`acquire_raster_planes`). At the
+  default, the 8000×8000 format limit exceeds the memory budget and returns
+  503; operators can raise the budget explicitly.
   Temporary memory exhaustion queues within the same deadline instead of failing
   immediately. Memory waiters consume queue capacity, not CPU slots.
 
@@ -215,6 +217,10 @@ need no reload pruning.
   viewed instant or the new axis's nearest — the collection axis is the
   union, and scrubbing a lagging parameter across it would request instants
   it doesn't have.
+- RGB composites (`MapEngine::composites`, #819) join `parameters[]` with
+  `"composite": true`, an empty unit and their own `temporal_extent`. The SPA
+  requests them on the unstyled tile route: a composite has only the
+  `default` style.
 - First enabling a preview collection fits its extent without animation,
   before setting its layers visible. Keep that order: a visible source during
   the initial flight requests intermediate zoom levels and can exhaust cold

@@ -9,6 +9,8 @@
 //! covered tiles into the client's exact viewport. The expensive per-source work
 //! (TIFF decode, reprojection, colorize) is cached at tile granularity
 //! and reused across overlapping viewports; the final crop/resample is cheap.
+//! An RGB composite layer ([`render_metatiled_composite`]) caches its
+//! composed RGBA tiles the same way, keyed on the composite's name.
 //!
 //! ## Resolution ladder
 //!
@@ -41,7 +43,7 @@ use ds_core::geo::{projected_output_crs, wgs84_envelope};
 use ds_core::map_engine::{OutputCrs, RasterTile};
 
 use crate::colorize;
-use crate::{ColorMap, ImageFormat};
+use crate::{ColorMap, CompositeSpec, ImageFormat};
 
 /// Tile edge length in pixels (WebMercatorQuad standard).
 const TILE_PX: u32 = 256;
@@ -342,6 +344,106 @@ pub fn render_metatiled<F>(
 where
     F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>,
 {
+    render_metatiled_with(
+        bbox_deg,
+        output_crs,
+        width,
+        height,
+        prefix,
+        format,
+        background,
+        cache,
+        |tbbox, tw, th, tile_output, times| {
+            let t_engine = Instant::now();
+            let tile = render_tile(tbbox, tw, th, tile_output)?;
+            times.engine += t_engine.elapsed();
+            if tile.is_empty() {
+                return Ok(None);
+            }
+            let t_colorize = Instant::now();
+            let rgba = colorize(&tile, colormap);
+            times.colorize += t_colorize.elapsed();
+            Ok(Some(rgba))
+        },
+    )
+}
+
+/// [`render_metatiled`] for an RGB composite layer: each uncached tile's
+/// band tiles, from `render_bands` in [`CompositeSpec::parameters`] order,
+/// are composed by [`crate::compose_tiles`] instead of colorized. The cached
+/// tiles are the composed RGBA, so the tile cache, the assembly and the
+/// `background` handling are the colormap path's. `prefix` must name the
+/// composite layer and the timestep every band is read from (#507).
+#[allow(clippy::too_many_arguments)]
+pub fn render_metatiled_composite<F>(
+    bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
+    width: u32,
+    height: u32,
+    prefix: &TileKeyPrefix,
+    spec: &CompositeSpec,
+    format: ImageFormat,
+    background: Option<[u8; 3]>,
+    cache: &TilePixelCache,
+    render_bands: F,
+) -> Result<MetaTile, DataServerError>
+where
+    F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<Vec<RasterTile>, DataServerError>,
+{
+    render_metatiled_with(
+        bbox_deg,
+        output_crs,
+        width,
+        height,
+        prefix,
+        format,
+        background,
+        cache,
+        |tbbox, tw, th, tile_output, times| {
+            let t_engine = Instant::now();
+            let tiles = render_bands(tbbox, tw, th, tile_output)?;
+            times.engine += t_engine.elapsed();
+            let t_colorize = Instant::now();
+            let rgba = crate::compose_tiles(&tiles, spec)?;
+            times.colorize += t_colorize.elapsed();
+            Ok(rgba)
+        },
+    )
+}
+
+/// Engine and colorize time of one meta-tiled view's uncached tiles, summed
+/// by the pixel closure of [`render_metatiled_with`].
+#[derive(Default)]
+struct TileTimes {
+    engine: Duration,
+    colorize: Duration,
+}
+
+/// The meta-tiling behind [`render_metatiled`] and
+/// [`render_metatiled_composite`]. `tile_pixels` renders one uncached tile
+/// to its `TILE_PX × TILE_PX` RGBA pixels, or `None` when all of them are
+/// nodata, adding its engine and colorize time to the [`TileTimes`].
+#[allow(clippy::too_many_arguments)]
+fn render_metatiled_with<F>(
+    bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
+    width: u32,
+    height: u32,
+    prefix: &TileKeyPrefix,
+    format: ImageFormat,
+    background: Option<[u8; 3]>,
+    cache: &TilePixelCache,
+    tile_pixels: F,
+) -> Result<MetaTile, DataServerError>
+where
+    F: Fn(
+        [f64; 4],
+        u32,
+        u32,
+        &OutputCrs,
+        &mut TileTimes,
+    ) -> Result<Option<Vec<u8>>, DataServerError>,
+{
     let [w, s, e, n] = bbox_deg;
     if width == 0
         || height == 0
@@ -429,7 +531,7 @@ where
     };
     let mut any_data = false;
     let mut misses: u32 = 0;
-    let (mut engine, mut colorize_time) = (Duration::ZERO, Duration::ZERO);
+    let mut times = TileTimes::default();
     let tiles_count = (ncols * nrows) as u32;
     let t_loop = Instant::now();
     for row in row0..=row1 {
@@ -483,20 +585,25 @@ where
                         OutputCrs::WebMercator,
                     ),
                 };
-                let t_engine = Instant::now();
-                let tile = render_tile(tbbox, TILE_PX, TILE_PX, &tile_output)?;
-                engine += t_engine.elapsed();
                 // All-nodata tiles are cached as a `None` marker: cheap to store
                 // (no 256 KB buffer) yet still a cache hit, so a sparse extent is
                 // not re-decoded every request nor crowds out real-data tiles.
-                let entry: Option<Arc<[u8]>> = if tile.is_empty() {
-                    None
-                } else {
-                    any_data = true;
-                    let t_colorize = Instant::now();
-                    let rgba = colorize(&tile, colormap).into_boxed_slice();
-                    colorize_time += t_colorize.elapsed();
-                    Some(Arc::<[u8]>::from(rgba))
+                let pixels = tile_pixels(tbbox, TILE_PX, TILE_PX, &tile_output, &mut times)?;
+                let entry: Option<Arc<[u8]>> = match pixels {
+                    None => None,
+                    Some(rgba) => {
+                        // The assembly indexes a full tile; a short buffer
+                        // would panic there instead of failing this render.
+                        let expected = TILE_PX as usize * TILE_PX as usize * 4;
+                        if rgba.len() != expected {
+                            return Err(DataServerError::Render(format!(
+                                "meta-tile render returned {} RGBA bytes, expected {expected}",
+                                rgba.len()
+                            )));
+                        }
+                        any_data = true;
+                        Some(Arc::<[u8]>::from(rgba.into_boxed_slice()))
+                    }
                 };
                 cache.cache.insert(
                     key,
@@ -517,8 +624,8 @@ where
                 tiles: tiles_count,
                 misses,
                 tile_loop,
-                engine,
-                colorize: colorize_time,
+                engine: times.engine,
+                colorize: times.colorize,
                 ..MetaTileStats::default()
             },
         });
@@ -560,8 +667,8 @@ where
             tiles: tiles_count,
             misses,
             tile_loop,
-            engine,
-            colorize: colorize_time,
+            engine: times.engine,
+            colorize: times.colorize,
             assemble,
             encode,
         },
@@ -1688,5 +1795,93 @@ mod tests {
             }
         }
         assert_eq!(cache.stats(), (0, 0));
+    }
+
+    /// A composite layer's meta-tiles hold the composed RGBA: the view shows
+    /// the channel intensities, a second view reuses every tile, and a band
+    /// with no data leaves the view empty.
+    #[test]
+    fn composite_meta_tiles_cache_the_composed_pixels() {
+        use crate::{ChannelSource, ChannelSpec};
+        let channel = |source, min, max| ChannelSpec {
+            source,
+            min,
+            max,
+            gamma: 1.0,
+        };
+        // Red 1 over 0..2 = 128; green 2 over 0..2 = 255; blue 2 - 1 over
+        // 0..4 = 63.75, rounded to 64.
+        let spec = CompositeSpec {
+            name: "rgb".into(),
+            title: "RGB".into(),
+            parameters: vec!["a".into(), "b".into()],
+            channels: [
+                channel(ChannelSource::Plane(0), 0.0, 2.0),
+                channel(ChannelSource::Plane(1), 0.0, 2.0),
+                channel(ChannelSource::Difference(1, 0), 0.0, 4.0),
+            ],
+        };
+        let planes = |b: Option<f64>| {
+            move |_: [f64; 4], w: u32, h: u32, _: &OutputCrs| {
+                let plane = |v: Option<f64>| RasterTile {
+                    width: w,
+                    height: h,
+                    values: vec![v; (w * h) as usize].into(),
+                };
+                Ok(vec![plane(Some(1.0)), plane(b)])
+            }
+        };
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "sat/rgb".into(),
+            parameter: Some("rgb".into()),
+            style: crate::COMPOSITE_STYLE.into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        let bbox = [20.0, 58.0, 30.0, 64.0];
+        let render = |prefix: &TileKeyPrefix, b: Option<f64>| {
+            render_metatiled_composite(
+                bbox,
+                &OutputCrs::WebMercator,
+                128,
+                128,
+                prefix,
+                &spec,
+                ImageFormat::Png,
+                None,
+                &cache,
+                planes(b),
+            )
+            .unwrap()
+        };
+        let MetaTile::Image { bytes, stats } = render(&prefix, Some(2.0)) else {
+            panic!("expected an image");
+        };
+        assert!(stats.misses > 0);
+        let (w, h, rgba) = decode_rgba(&bytes);
+        let centre = (((h / 2) * w + w / 2) * 4) as usize;
+        assert_eq!(rgba[centre..centre + 4], [128, 255, 64, 255]);
+
+        let MetaTile::Image {
+            bytes: again,
+            stats,
+        } = render(&prefix, Some(2.0))
+        else {
+            panic!("expected an image");
+        };
+        assert_eq!(stats.misses, 0, "every composed tile is cached");
+        assert_eq!(again, bytes);
+
+        // Another timestep keys its own tiles; a band without data there
+        // blanks the composite, cached as nodata markers.
+        let later = TileKeyPrefix {
+            time: Some(chrono::DateTime::UNIX_EPOCH),
+            ..prefix.clone()
+        };
+        assert!(matches!(render(&later, None), MetaTile::Empty { .. }));
+        assert!(matches!(render(&later, Some(2.0)), MetaTile::Empty { .. }));
     }
 }

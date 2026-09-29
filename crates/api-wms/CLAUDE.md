@@ -78,6 +78,35 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   instant is revised in place (engine-cap) bumps it, so an explicit
   `TIME=` render can't be served stale forever from the no-TTL caches.
 
+## RGB composite layers (#819)
+
+An engine's `MapEngine::composites()` are child layers `coll/<composite>`
+after the parameter layers (a collection with composites always gets the
+parent layer). They have no `StyleInfo`: `composite_layer` in
+`handlers.rs` spots one before the style lookup.
+
+- **Capabilities**: `write_composite_layer` gives each its title, an
+  `<Abstract>` of the channels, the `time` dimension from
+  `parameter_times(<composite>)` (the scans every band has) and one style,
+  `default` (`ds_render::COMPOSITE_STYLE`), with a LegendURL.
+- **Styles**: any other `STYLES` is `StyleNotDefined`, on GetMap and
+  GetLegendGraphic. An unknown `coll/<name>` lists composites among the
+  valid names.
+- **Time**: `resolve_parameter_time(Some(<composite>))` keys the rendered
+  and meta-tile caches and is the `time` passed to `get_raster_tiles`, so
+  no band is drawn from a scan the key does not name (#507). `None` (no
+  shared scan) renders the empty image without calling the engine, so
+  nothing is cached under a key naming no scan.
+- **Rendering**: the direct path composes with
+  `ds_render::render_composite_tiles`; the meta-tile path with
+  `ds_render::render_metatiled_composite`, which caches the composed RGBA
+  256×256 tiles in the same `TilePixelCache` as colormapped ones.
+  `TRANSPARENT`/`BGCOLOR` are applied at encode time on both, as for
+  parameter layers.
+- **Admission**: `RenderJob::acquire_raster_planes` with one plane per band.
+- **Legend**: the channel list (`composite_legend_json`,
+  `render_composite_legend`), with the bands' units; no colour bar.
+
 ## TRANSPARENT / BGCOLOR (#163)
 
 - `TRANSPARENT` is `TRUE`/`FALSE` (case-insensitive) and defaults to `TRUE`

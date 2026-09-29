@@ -43,7 +43,7 @@
 //! turns it into plane indices in the order the bands are requested.
 
 use ds_core::error::DataServerError;
-use ds_core::map_engine::{CompositeDef, RasterTile, RasterValues};
+use ds_core::map_engine::{CompositeDef, RasterInfo, RasterTile, RasterValues};
 
 use crate::{encode_rgba, font, format_tick, ImageFormat};
 
@@ -262,6 +262,67 @@ pub fn render_composite(
     encode_rgba(&mut rgba, width, height, format, background)
 }
 
+/// The one style a composite layer has. Its colours come from its channels,
+/// not a palette, so there is nothing to choose: a request naming another
+/// style on a composite layer gets each API's unknown-style error.
+pub const COMPOSITE_STYLE: &str = "default";
+
+/// [`compose_rgb`] over the band tiles `MapEngine::get_raster_tiles`
+/// returned for `spec`, in [`CompositeSpec::parameters`] order, or `None`
+/// when every pixel is nodata, as `RasterTile::is_empty` is for one plane:
+/// no pixel has data in every plane the channels read. A plane with no data
+/// anywhere skips the compose. Errors as [`compose_rgb`].
+pub fn compose_tiles(
+    tiles: &[RasterTile],
+    spec: &CompositeSpec,
+) -> Result<Option<Vec<u8>>, DataServerError> {
+    let planes: Vec<&RasterTile> = tiles.iter().collect();
+    let blank = spec
+        .channels
+        .iter()
+        .flat_map(|channel| channel.source.planes())
+        .any(|p| planes.get(p).is_some_and(|plane| plane.is_empty()));
+    if blank {
+        // Still reject malformed input rather than hide it as "no data".
+        check_planes(&planes)?;
+        validate_channels(&spec.channels, planes.len())?;
+        return Ok(None);
+    }
+    // Bands with data in different places: every pixel is transparent.
+    let rgba = compose_rgb(&planes, &spec.channels)?;
+    let (pixels, _) = rgba.as_chunks::<4>();
+    Ok(pixels.iter().any(|px| px[3] != 0).then_some(rgba))
+}
+
+/// [`compose_tiles`] encoded like [`render_composite`]: `Some(rgb)`
+/// composites the image over that opaque colour, `None` keeps the alpha
+/// channel. `Ok(None)` when every pixel is nodata, which the API layers serve
+/// as their shared empty tile, as for an all-nodata parameter tile.
+pub fn render_composite_tiles(
+    tiles: &[RasterTile],
+    spec: &CompositeSpec,
+    format: ImageFormat,
+    background: Option<[u8; 3]>,
+) -> Result<Option<Vec<u8>>, DataServerError> {
+    ds_core::deadline::check()?;
+    let Some(mut rgba) = compose_tiles(tiles, spec)? else {
+        return Ok(None);
+    };
+    // `compose_tiles` composed, so `tiles[0]` exists and sets the size.
+    let (width, height) = (tiles[0].width, tiles[0].height);
+    encode_rgba(&mut rgba, width, height, format, background).map(Some)
+}
+
+/// The unit of each of `spec`'s planes, from the engine's parameter
+/// metadata ([`RasterInfo::parameter_unit`]): the `units` argument of
+/// [`composite_legend_json`] and [`render_composite_legend`].
+pub fn composite_units<'a>(spec: &CompositeSpec, info: &'a RasterInfo) -> Vec<Option<&'a str>> {
+    spec.parameters
+        .iter()
+        .map(|parameter| info.parameter_unit(Some(parameter)))
+        .collect()
+}
+
 /// A named RGB composite over named input parameters: what a legend
 /// describes.
 #[derive(Debug, Clone, PartialEq)]
@@ -360,11 +421,15 @@ impl From<&CompositeDef> for CompositeSpec {
 
 /// Machine-readable legend for a composite: the composite variant of
 /// [`legend_json`](crate::legend_json), with `channels` in place of the
-/// colormap's `stops`, `min`, `max` and `interpolation`.
+/// colormap's `stops`, `min`, `max` and `interpolation`. `style` is the
+/// composite layer's one style, [`COMPOSITE_STYLE`], and `parameter` the
+/// composite's name, the `parameter-name` (Maps, Tiles) or layer segment
+/// (WMS) that selects it.
 ///
 /// ```json
 /// {
-///   "style": "airmass",
+///   "style": "default",
+///   "parameter": "airmass",
 ///   "title": "Airmass RGB",
 ///   "channels": [
 ///     { "channel": "red", "label": "C08 - C10", "parameters": ["C08", "C10"],
@@ -403,7 +468,8 @@ pub fn composite_legend_json(spec: &CompositeSpec, units: &[Option<&str>]) -> se
         })
         .collect();
     serde_json::json!({
-        "style": spec.name,
+        "style": COMPOSITE_STYLE,
+        "parameter": spec.name,
         "title": spec.title,
         "channels": channels,
     })
@@ -868,6 +934,87 @@ mod tests {
         );
     }
 
+    /// `compose_tiles` is `compose_rgb` over the tiles, or `None` when a
+    /// plane a channel reads is all nodata; a plane no channel reads never
+    /// blanks it. `render_composite_tiles` encodes the same pixels.
+    #[test]
+    fn compose_tiles_blank_when_a_read_plane_has_no_data() {
+        let spec = airmass();
+        let tile = |v: Option<f64>| f64_tile(2, 1, vec![v, Some(240.0)]);
+        let make = || {
+            vec![
+                tile(Some(233.0)),
+                tile(Some(243.0)),
+                tile(Some(250.0)),
+                tile(Some(260.0)),
+            ]
+        };
+        let tiles = make();
+        let planes: Vec<&RasterTile> = tiles.iter().collect();
+        let composed = compose_tiles(&tiles, &spec).unwrap().unwrap();
+        assert_eq!(composed, compose_rgb(&planes, &spec.channels).unwrap());
+        let png = render_composite_tiles(&tiles, &spec, ImageFormat::Png, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            png,
+            render_composite(&planes, &spec.channels, ImageFormat::Png, None).unwrap()
+        );
+
+        let mut blank = make();
+        blank[3] = f64_tile(2, 1, vec![None, None]);
+        assert_eq!(compose_tiles(&blank, &spec).unwrap(), None);
+        assert_eq!(
+            render_composite_tiles(&blank, &spec, ImageFormat::Png, None).unwrap(),
+            None
+        );
+
+        // A fifth plane no channel reads may be empty.
+        let mut extra = make();
+        extra.push(f64_tile(2, 1, vec![None, None]));
+        assert_eq!(compose_tiles(&extra, &spec).unwrap(), Some(composed));
+
+        // Every band has data, but never at the same pixel.
+        let mut apart = make();
+        apart[0] = f64_tile(2, 1, vec![Some(233.0), None]);
+        apart[1] = f64_tile(2, 1, vec![None, Some(243.0)]);
+        assert_eq!(compose_tiles(&apart, &spec).unwrap(), None);
+
+        // Malformed input is an error even when a plane is blank.
+        assert!(compose_tiles(&blank[..2], &spec).is_err());
+    }
+
+    /// Plane units come from the engine's parameter metadata, in plane
+    /// order, `None` where unknown.
+    #[test]
+    fn composite_units_follow_the_planes() {
+        let parameter = |name: &str, unit: &str| ds_core::map_engine::ParameterInfo {
+            name: name.into(),
+            title: name.into(),
+            unit: unit.into(),
+        };
+        let info = RasterInfo {
+            native_crs: "EPSG:4326".into(),
+            spatial_extent: None,
+            times: Vec::new(),
+            parameter: "C08".into(),
+            unit: "K".into(),
+            parameters: vec![
+                parameter("C08", "K"),
+                parameter("C10", "K"),
+                parameter("C12", ""),
+            ],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        };
+        assert_eq!(
+            composite_units(&airmass(), &info),
+            [Some("K"), Some("K"), None, None]
+        );
+    }
+
     #[test]
     fn composite_spec_validates_and_labels_channels() {
         let spec = airmass();
@@ -889,7 +1036,8 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "style": "airmass",
+                "style": "default",
+                "parameter": "airmass",
                 "title": "Airmass RGB",
                 "channels": [
                     { "channel": "red", "label": "C08 - C10", "parameters": ["C08", "C10"],

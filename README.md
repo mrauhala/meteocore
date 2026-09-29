@@ -186,6 +186,10 @@ is a reasonable starting point; leave headroom for source decoding, caches,
 nowcasting, the database and other services. Set it in the deployment's
 MeteoCore container environment and recreate that service; reload is not enough.
 
+An RGB composite render holds one value plane per band, so it charges
+`32 + 16 × (bands − 1)` bytes per output pixel: a three-band Airmass frame
+costs twice a single-parameter one.
+
 Short timeline bursts wait for memory without occupying CPU slots. Sustained
 load still has finite capacity: watch `render_queue_depth`,
 `render_queue_rejected_total`, `render_deadline_exceeded_total`, and host
@@ -625,14 +629,15 @@ Values are converted to `f64` internally. Physical values: `physical = raw * sca
 |------|--------|-------------|
 | Local directory | `data_path = "path/to/dir"` | Scans a local directory |
 | Fixed remote prefix | `data_path = "s3://bucket/prefix/"` | Scans a single S3/HTTP prefix |
-| Dynamic remote prefix | `endpoint` + `bucket` + `prefix_pattern` | Expands date-based prefixes on each poll cycle (one per day, or per hour when the template has `%H`) |
+| Dynamic remote prefix | `endpoint` + `bucket` + `prefix_pattern` | Expands date-based prefixes on each poll cycle (one per day, or per hour when the template has `%H`) and lists them concurrently, at most eight at a time |
 | STAC catalog | `stac_url` + `stac_asset_allowlist` | Discovers files via STAC API items endpoint |
 
 #### Polling and File Discovery
 
 The engine polls for new files at a configurable interval (`poll_interval_secs`, default 30s):
 
-- **Local files:** New files are held in a "pending" state for one poll cycle to confirm they are fully written (size stability check). Files matching `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped.
+- **Local files:** New files are held in a "pending" state for one poll cycle to confirm they are fully written (size stability check).
+- **Excluded files:** Local files and remote objects whose names match `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped before the filename is matched, so a partial upload never replaces the finished file of the same timestamp or counts toward `max_files`.
 - **Remote files:** Uses COG byte-range reads to fetch only the 64 KB IFD header for metadata. Falls back to full download if header-only parse fails.
 - **Metadata caching:** Files with unchanged size reuse their cached metadata across poll cycles.
 - **Failure handling:** If a poll cycle fails, the old catalog is preserved. Zero-file results when the old catalog had files are treated as transient failures.
@@ -1263,6 +1268,14 @@ blue = { parameter = "wv_6_2", min = 243.0, max = 208.0 }
 
 `red`, `green` and `blue` are all required. `min` and `max` must be finite and differ, and `gamma` must be finite and above 0. `recipe = "…"` is reserved for built-in recipes and is a load error for now. An unknown key in a composite is a load error too, so a misspelt `minus` or `gamma` cannot silently change the picture.
 
+Requesting a composite:
+
+- **WMS**: `LAYERS=goes19-fd/airmass`, a child layer of the collection next to the products, with its own `time` dimension and one style, `default`. `GetLegendGraphic&LAYER=goes19-fd/airmass` returns the channel list, as an image or as JSON.
+- **Maps and Tiles**: `parameter-name=airmass` on the map, map tile and legend routes, default style only. The collection's `parameter_names` lists the composite with no unit, a `description` of its channels and its own `extent.temporal`.
+- **`/preview`**: the parameter picker lists the composites, marked `"composite": true` in the manifest.
+
+`TIME`/`datetime` resolve to the latest scan every band has, at or before the requested instant, and all bands are read from that scan. A newer scan of one band does not change the frame until every band has it. A composite with no shared scan renders an empty image.
+
 EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
 
 Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` (GOES-East) and `collections.d/goes18-fd.toml` (GOES-West) are runnable examples. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
@@ -1428,8 +1441,9 @@ A layer name is either:
 
 - `{collection-id}` — for single-parameter engines (e.g. GeoTIFF)
 - `{collection-id}/{parameter}` — for multi-parameter engines (GRIB, multi-param QueryData)
+- `{collection-id}/{composite}` — an RGB composite of a satellite collection (see [RGB composites](#rgb-composites))
 
-For multi-parameter engines, GetCapabilities emits a non-requestable parent layer (no `<Name>`) wrapping one child layer per parameter. `LAYERS=ecmwf-ifs/2t` requests the `2t` parameter; `LAYERS=ecmwf-ifs` returns `LayerNotDefined` because the parent is not directly requestable. A parameter that the engine doesn't advertise also returns `LayerNotDefined` (rather than silently falling back to the default), so callers can't cache a wrong-parameter image under a typo.
+For multi-parameter engines, GetCapabilities emits a non-requestable parent layer (no `<Name>`) wrapping one child layer per parameter, then one per RGB composite. A composite's child layer carries its own `time` dimension, the scans every band it reads has, an `<Abstract>` naming what each channel reads, and a single `default` style whose LegendURL is the channel list. `LAYERS=ecmwf-ifs/2t` requests the `2t` parameter; `LAYERS=ecmwf-ifs` returns `LayerNotDefined` because the parent is not directly requestable. A parameter that the engine doesn't advertise also returns `LayerNotDefined` (rather than silently falling back to the default), so callers can't cache a wrong-parameter image under a typo.
 
 ### GetMap Parameters
 
@@ -1474,6 +1488,8 @@ Internally the handler normalizes everything to WGS84 `[west, south, east, north
 
 Legends are static — they always carry `Cache-Control: public, max-age=86400, immutable`.
 
+An RGB composite layer has no colour bar: its legend (`STYLE=default`, the only one) lists the red, green and blue channels, each with what it reads, its range, gamma and the bands' unit. `FORMAT=application/json` returns the same list as `{style, parameter, title, channels: [{channel, label, parameters, min, max, gamma, unit}]}`.
+
 ### Errors
 
 Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: `LayerNotDefined`, `StyleNotDefined`, `CRSNotDefined`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`. HTTP status is 400 for client errors, 503 when the render semaphore is saturated (`Server busy, try again later`), and 500 for internal errors (the message is redacted in the response body; the original detail is captured via `tracing::warn!` for operators).
@@ -1488,6 +1504,8 @@ Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: 
 6. Empty (all-nodata) tile: encode a transparent PNG with `Content-Type: image/png`. Error: render the red error tile (WMS only). Neither is inserted into the cache.
 7. Populated tile: colorize (LUT for discrete data, linear gradient for continuous), encode to PNG/JPEG/WebP, wrap in `CachedRendered` (which derives the ETag via FNV-1a over the bytes), and insert into the cache.
 8. Compare the freshly-computed ETag against `If-None-Match` — match → `304` carrying the same `X-Cache` label the 200 would have (`MISS`, `EMPTY`, or `ERROR`), otherwise return the body with `X-Cache: MISS | EMPTY | ERROR`. Revalidations stay categorised the same as initial fetches on dashboards.
+
+An RGB composite layer takes the same pipeline with two differences. The time is resolved once for all its bands, as the latest scan they share at or before `TIME`, and that scan keys the caches and is the one every band is read from. The engine returns all bands in one `get_raster_tiles` call, and `ds_render` composes them by the channels instead of colorizing. Bands that share no scan render the empty image without reading anything. `TRANSPARENT`/`BGCOLOR` apply as for a parameter layer, and EPSG:3857/3067/3035 go through meta-tiling, which caches the composed tiles.
 
 ### Styling (shared with Maps and Tiles)
 
@@ -1680,7 +1698,7 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 | `crs` | no | `CRS:84` | Output CRS: `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, or `EPSG:3035` |
 | `datetime` | no | latest | ISO 8601 instant; defaults to the latest timestep advertised by the engine |
 | `f` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp` |
-| `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData). Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
+| `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData), or an RGB composite of a satellite collection, which renders with the `default` style only (another style is 404). The valid names are the keys of the collection's `parameter_names`. Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
 | `transparent` | no | — | Accepted but currently a no-op |
 
 `width × height` is additionally capped at `MAX_MAP_PIXELS = 64,000,000` (= 8000²), so a request at the per-dimension cap never trips the pixel cap with a confusing second error.
@@ -1792,6 +1810,7 @@ A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the T
 
 - Default size: 1024 MB, configured server-wide via **`[server] metatile_cache_mb`** (it is a single global cache, not per-collection); **set to 0 to disable** meta-tiling (reverts to a direct single-shot render, reload-reversible). Consumed by the WMS GetMap path today; Maps/Tiles render directly and would share this cache when meta-tiling extends to them.
 - Cache key: grid CRS + layer + parameter + style + time + elevation + reference time + content version + ladder level + tile col/row.
+- An RGB composite layer caches its composed RGBA tiles the same way, keyed on the composite's name and the scan all its bands are read from.
 - Resolution ladder: half-octave steps, snapped to the coarsest step no coarser than the request. EPSG:3857 keeps its WebMercatorQuad alignment. EPSG:3067/3035 use internal metre grids with origin (0,0) and a base resolution of 128000 m/px, including exact 1000/500/250 m/px levels. These internal grids do not add new OGC API Tiles matrix sets.
 - Assembly uses nearest-neighbour sampling to preserve discrete palettes. Non-aligned resolutions may sample a finer intermediate grid, as on the Web Mercator path.
 - Geographic/unsupported CRSs, degenerate bounds, excessive tile counts, and over-zoomed requests fall back to direct rendering.
