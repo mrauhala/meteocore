@@ -28,15 +28,47 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   GMGSI's is 793 × 1322, a quarter of the width. The reader's own chunk
   cache is off because decoded blocks are cached in `cache::STRIPS`, which
   keeps its phase-2 name, env var and metric family.
-- **No request-time S3 in the steady state.** The poll loop downloads each
-  new scan whole and inserts it into `cache::FRAMES`. A scan the cache
-  evicted is fetched again by `Source::fetch` → `DataStore::get`, from a
-  render job (blocking worker) or an EDR query (async request worker). That
-  bridge serves both — the plain-Zarr exception to Critical Rule 7 — where
-  an explicit `get_on` handle panics on the async worker.
-  `tests/refetch.rs` runs both call sites with zero-size caches.
-- **Ingest is capped per poll** (`MAX_INGEST_PER_POLL`, newest first):
-  bootstrapping a window spreads over polls (Critical Rule 9).
+- **No request-time S3 in the steady state: the window stays in memory.**
+  The poll loop downloads each new scan whole into `cache::FRAMES`, which
+  every satellite collection shares (`MC_SATELLITE_FRAME_CACHE_MB`).
+  Production 2026-09-29: scans were never removed when they left the
+  window, the cache filled with dead scans, and its LRU evicted in-window
+  scans nobody had read yet. A 12-frame Himawari animation then refetched
+  10 scans of 88 tiles each inside the render deadline, and all 10 were 503.
+  - Each poll sweeps out of `FRAMES` its own scans the new catalog does not
+    hold, before ingesting new ones: those that left the window, and any a
+    request fetched again from an older snapshot. Their decoded blocks
+    leave `STRIPS` by key (the frame's block count). Blocks of a scan
+    already evicted age out.
+  - `FrameKey.engine` is the engine instance, not the collection. A
+    rebuilt engine and a rejected reload's candidate carry the same
+    collection id. `Drop` releases the instance's scans, blocks and window
+    record. A reused engine (unchanged config, #574) is not dropped, so a
+    reload keeps its scans.
+  - After ingest, `keep_resident` downloads again the in-window scans the
+    cache evicted, newest first, with what `MAX_INGEST_PER_POLL` left for
+    the product. It does so only while every live engine's window
+    (`cache::windows`) fits the capacity. Past that, each download would
+    evict another in-window scan and the polls would download in a loop:
+    it fills free room only, and logs one WARN per poll with every
+    collection's window. `FRAMES` is one shard so that "fits" is exact:
+    `quick_cache` otherwise gives each shard an equal slice of the budget.
+  - The re-download claims the fill guard untracked: it counts in
+    `satellite_frame_reingests_total`, and cache misses stay request-time
+    downloads. `/metrics` also has `satellite_frame_window_bytes` and
+    `satellite_frame_window_resident_bytes` per collection.
+  - A scan still evicted is fetched again by `Source::fetch` →
+    `DataStore::get`, from a render job (blocking worker) or an EDR query
+    (async request worker). That bridge serves both — the plain-Zarr
+    exception to Critical Rule 7 — where an explicit `get_on` handle panics
+    on the async worker. ISatSS tiles come `get_many`-concurrently.
+  - `tests/refetch.rs` runs both call sites with zero-size caches (`0` also
+    turns re-downloading off). `tests/window_capacity.rs`, on a 1 MB cache,
+    pins the thrash guard, its WARN and the recovery; `lib.rs` tests pin the
+    sweep, the re-download and instance-scoped keys.
+- **Downloads are capped per poll** (`MAX_INGEST_PER_POLL` per product: new
+  scans first, newest first, then re-downloads): bootstrapping a window
+  spreads over polls (Critical Rule 9).
 - **No footprint guard.** `Crs::Geostationary::forward` is NaN behind the
   Earth, so no coarse projection cell can alias far-away output onto the
   disk; `ProjectionGrid` refines cells on the limb (#821). The collection
@@ -211,7 +243,9 @@ Each scan is downloaded whole: GOES-19 band 13 ~24 MB, cloud top temperature
 mosaic ~7.4 MB per hour; startup ingests the whole window. A recipe
 multiplies it: `goes19-fd-rgb`'s six bands are ~135 MB per scan, ~810 MB an
 hour, and hold ~157 MB per scan in `MC_SATELLITE_FRAME_CACHE_MB`, which
-every satellite collection shares. The user is often
+every satellite collection shares. Size that cache above the windows of all
+satellite collections together: in production, `goes19-fd` and `goes18-fd`
+(C13 + ACHT) and `himawari9-fd` at `-PT2H` hold ~1.6 GB. The user is often
 on a metered connection — never run a bucket-backed collection for tests
 without asking; use the local fixtures.
 

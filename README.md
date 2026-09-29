@@ -169,7 +169,7 @@ not re-scan the auto roots.
 | `MC_PVOL_PIXEL_CACHE_MB` | `1024` | PVOL per-moment decoded-pixel cache size in MB. `0` disables. |
 | `MC_ODIM_COMPOSITE_CACHE_MB` | `2048` | ODIM decoded-composite (COMP) cache size in MB. `0` disables. |
 | `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | GeoTIFF decoded-chunk cache for local and remote sources, in MB. `0` disables. |
-| `MC_SATELLITE_FRAME_CACHE_MB` | `1024` | Satellite scans held in memory (the compressed NetCDF file plus its overview, ~30 MB per 2 km full disk), in MB. A scan evicted here is downloaded again when a render needs it. |
+| `MC_SATELLITE_FRAME_CACHE_MB` | `1024` | Satellite scans held in memory (the compressed NetCDF file plus its overview, ~30 MB per 2 km full disk), in MB, shared by every satellite collection. Size it above the scans in the `time_window` of **all** satellite collections together (see [Satellite](#satellite)). While they fit, a poll downloads back any in-window scan evicted here; when they do not, it logs a WARN with the sizes and requests download the missing scans themselves. |
 | `MC_SATELLITE_STRIP_CACHE_MB` | `256` | Satellite decoded blocks (GOES-R: strips of 24 full-width rows, ~260 KB each at 2 km; GMGSI: 793 × 1322 chunks, ~2 MB each), in MB. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool. Raise for high-latency object stores; value must be ≥ 1. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
@@ -1306,6 +1306,8 @@ Requesting a composite:
 EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
 
 Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` (GOES-East) and `collections.d/goes18-fd.toml` (GOES-West) are runnable examples, and `collections.d/goes19-fd-rgb.toml` adds the RGB composites. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
+
+Memory: every scan in a collection's `time_window` stays in memory, in the `MC_SATELLITE_FRAME_CACHE_MB` cache that all satellite collections share. Size it above their windows together: scan size × scans in the window × products, summed over the collections. `goes19-fd` and `goes18-fd` with band 13 and cloud top temperature over `-PT2H` hold ~650 MB each, and `himawari9-fd` with band 13 ~330 MB: ~1.6 GB for the three. A scan leaves memory when it leaves the window. While the windows fit, a scan the cache evicted is downloaded again by the next poll, a few per poll, before a request needs it. When they do not fit, re-downloading would only evict another scan in a window, so the poll logs a WARN naming every collection's window and the cache size and stops. A request for a scan not in memory then downloads it within its render deadline, a Himawari scan being 88 files, and an animation's older frames can return 503. `/metrics` reports `satellite_frame_window_bytes` and `satellite_frame_window_resident_bytes` per collection and `satellite_frame_reingests_total`.
 
 #### GMGSI global mosaic
 

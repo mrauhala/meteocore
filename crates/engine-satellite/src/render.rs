@@ -117,7 +117,7 @@ impl SatelliteEngine {
         let Some(time) = Self::select(&catalog, index, time) else {
             return Ok(empty_tile(width, height));
         };
-        let frame = self.frame(index, time, &catalog.frames[index][&time])?;
+        let frame = self.frame(index, time, &catalog.frames[index][&time].paths)?;
         let mut maps = CoordinateMaps::new(bbox, width, height, output_crs);
         self.render_scan(index, time, &frame, &mut maps)
     }
@@ -160,7 +160,7 @@ impl SatelliteEngine {
             .zip(scans)
             .map(|(&index, scan)| {
                 ds_core::deadline::check()?;
-                let frame = self.frame(index, time, scan)?;
+                let frame = self.frame(index, time, &scan.paths)?;
                 self.render_scan(index, time, &frame, &mut maps)
             })
             .collect()

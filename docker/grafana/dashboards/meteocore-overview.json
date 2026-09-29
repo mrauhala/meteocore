@@ -3621,6 +3621,109 @@
           "mode": "multi"
         }
       }
+    },
+    {
+      "id": 76,
+      "type": "timeseries",
+      "title": "Satellite scans — time windows vs scan cache",
+      "description": "Bytes of the scans in each satellite collection's time window, the part held in memory, and MC_SATELLITE_FRAME_CACHE_MB. Each poll drops the scans that left its window and downloads evicted in-window scans back while all windows fit. Bad: 'all windows' above capacity, where the poll logs a WARN and stops downloading back, or resident below window for more than a poll or two. Requests then download scans from the bucket within the render deadline, and an animation's older frames return 503.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 238
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(satellite_frame_window_bytes)",
+          "legendFormat": "all windows",
+          "refId": "A"
+        },
+        {
+          "expr": "satellite_frame_cache_capacity_bytes",
+          "legendFormat": "capacity",
+          "refId": "B"
+        },
+        {
+          "expr": "satellite_frame_window_bytes",
+          "legendFormat": "window {{collection}}",
+          "refId": "C"
+        },
+        {
+          "expr": "satellite_frame_window_resident_bytes",
+          "legendFormat": "resident {{collection}}",
+          "refId": "D"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 77,
+      "type": "timeseries",
+      "title": "Satellite scan downloads — poll re-downloads vs request fetches",
+      "description": "Scans per hour downloaded again by a poll after the scan cache evicted them, and scans a request had to download (scan-cache misses). Once the windows fit, request fetches should stay near 0. A steady re-download rate means the windows barely fit, so something keeps evicting them.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 238
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(satellite_frame_reingests_total[$__rate_interval]) * 3600",
+          "legendFormat": "re-downloaded by the poll /h",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(satellite_frame_cache_misses_total[$__rate_interval]) * 3600",
+          "legendFormat": "downloaded by requests /h",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     }
   ]
 }
