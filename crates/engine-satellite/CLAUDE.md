@@ -78,6 +78,20 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
 - **Overview**: a render whose source window spans ≥ `OVERVIEW_FACTOR`
   (4) source pixels per output pixel samples the ingest-time overview
   instead of decoding strips. A full-disk decode is ~160 ms.
+- **Multi-band renders** (`get_raster_tiles`, for RGB composites) live in
+  `render.rs` next to the single-band path, and share `render_scan` with it.
+  - Every band comes from the scan `time` names exactly, with no per-band
+    snapping. A band without that scan fails with `InvalidParameter`. For
+    `None`, the latest scan every band has is used, and every tile is
+    empty when they share none.
+  - `resolve_parameters_time` and the `None` case both go through
+    `select_common`: `select`'s rule over the shared scans, via
+    `ds_core::map_engine::select_common_time`.
+  - `CoordinateMaps` builds one `ProjectionGrid` per distinct sampled grid,
+    full resolution or overview, compared field by field. Bands of one
+    resolution share it. `render::tests` counts the builds.
+  - Frames and blocks go through `frame()` and `PixelReader` exactly as in
+    a single-band render, so the refetch rules above hold unchanged.
 
 ## Config
 
