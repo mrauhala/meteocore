@@ -1232,6 +1232,37 @@ product = "ABI-L2-ACHTF"
 variable = "TEMP"
 ```
 
+#### RGB composites
+
+An RGB composite is a layer of its own, next to the product parameters: each channel stretches one product, or the difference of two, over a range. Its time axis holds only the scans every product it reads has, and a composite always draws its channels from one scan. It has no numeric values of its own, so EDR does not serve it. A composite reads products of the same collection, so configure every band it needs under `[[satellite.products]]`. EUMETSAT's Airmass over GOES-19 ABI:
+
+```toml
+[[satellite.products]]
+parameter = "wv_6_2"                              # plus wv_7_3 (band 10) and ir_9_6 (band 12)
+title = "WV 6.2 µm brightness temperature"
+unit = "K"
+product = "ABI-L2-CMIPF"
+band = 8
+variable = "CMI"
+
+[[satellite.composites]]
+name = "airmass"                                  # ^[a-z0-9_]+$, not a product parameter
+title = "Airmass RGB"                             # optional, defaults to the name
+red = { parameter = "wv_6_2", minus = "wv_7_3", min = -25.0, max = 0.0 }
+green = { parameter = "ir_9_6", minus = "ir_10_3", min = -40.0, max = 5.0 }
+blue = { parameter = "wv_6_2", min = 243.0, max = 208.0 }
+```
+
+| Channel key | Required | Meaning |
+|---|---|---|
+| `parameter` | yes | Product parameter the channel reads |
+| `minus` | no | Product parameter subtracted from `parameter`, for a band difference |
+| `min` | yes | Value that gives intensity 0 |
+| `max` | yes | Value that gives full intensity; `min > max` inverts the channel, so colder is brighter |
+| `gamma` | no, `1.0` | `intensity = stretch ^ (1 / gamma)`: above 1 brightens the low end |
+
+`red`, `green` and `blue` are all required. `min` and `max` must be finite and differ, and `gamma` must be finite and above 0. `recipe = "…"` is reserved for built-in recipes and is a load error for now. An unknown key in a composite is a load error too, so a misspelt `minus` or `gamma` cannot silently change the picture.
+
 EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
 
 Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` (GOES-East) and `collections.d/goes18-fd.toml` (GOES-West) are runnable examples. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
