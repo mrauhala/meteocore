@@ -99,7 +99,10 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     columns fall 0.38 px short of a turn (NOAA cut the 5000th with
     `ncks -d xc,0,4998`). `Frame::pixel` reads that sliver as the nearer edge
     column: nearest-neighbour across the seam, so the seam renders
-    continuously.
+    continuously. The overview resolves a position on the full grid too,
+    then reads the cell holding that pixel: its 1250 cells span 5000
+    pixels, past the turn, so resolved at its own scale the sliver's
+    eastern half would read the last cell (#906 review).
   - Every column lookup in a render or an EDR query goes through
     `Frame::pixel`, and every bbox → pixel window through `Frame::windows`
     (two windows across the seam). `ProjectionGrid::build_2d_periodic` gets

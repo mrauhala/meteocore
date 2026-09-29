@@ -322,7 +322,8 @@ impl Frame {
         Ok(raw)
     }
 
-    /// Columns per 360° on the full grid or the overview, for a global grid.
+    /// Columns per 360° on the full grid or the overview, for a global
+    /// grid: what a `ProjectionGrid` over that level unwraps its columns by.
     pub fn period(&self, overview: bool) -> Option<f64> {
         let factor = if overview {
             OVERVIEW_FACTOR as f64
@@ -337,21 +338,35 @@ impl Frame {
     /// `ProjectionGrid` samples; `None` off the grid, or where the mapping
     /// is undefined (a geostationary point the satellite cannot see).
     ///
-    /// A global grid's columns wrap modulo [`Self::period`]. Where its
-    /// columns fall short of a whole turn (GMGSI's by 0.38 px), a position
-    /// in the sliver between the last column and the first reads the nearer
-    /// of the two: nearest-neighbour across the seam.
+    /// A global grid's columns wrap modulo its period. Where its columns
+    /// fall short of a whole turn (GMGSI's by 0.38 px), a position in the
+    /// sliver between the last column and the first reads the nearer of
+    /// the two: nearest-neighbour across the seam.
+    ///
+    /// Both levels resolve the position on the full grid, and the overview
+    /// then reads the cell holding that pixel. An overview cell spans
+    /// [`OVERVIEW_FACTOR`] pixels, so its last column or row can reach past
+    /// the grid's edge: GMGSI's 4999 columns make 1250 cells, 5000 pixels,
+    /// more than its 4999.378-pixel turn. Resolved at the overview's own
+    /// scale, the seam's sliver would fall inside that last cell, and the
+    /// half of it nearer the first column would read the last one.
     pub fn pixel(&self, overview: bool, c: f64, r: f64) -> Option<(u32, u32)> {
-        let gt = if overview {
-            &self.overview.gt
-        } else {
-            &self.gt
-        };
+        if !overview {
+            return self.full_pixel(c, r);
+        }
+        let factor = OVERVIEW_FACTOR as f64;
+        let (col, row) = self.full_pixel(c * factor, r * factor)?;
+        Some((col / OVERVIEW_FACTOR, row / OVERVIEW_FACTOR))
+    }
+
+    /// [`Self::pixel`] on the full grid.
+    fn full_pixel(&self, c: f64, r: f64) -> Option<(u32, u32)> {
+        let gt = &self.gt;
         if !(r.is_finite() && r >= 0.0 && r < gt.height as f64) {
             return None;
         }
         let width = gt.width as f64;
-        let c = match self.period(overview) {
+        let c = match self.col_period {
             Some(period) => {
                 let c = c.rem_euclid(period);
                 if c >= width {
@@ -1070,7 +1085,10 @@ mod tests {
         assert_eq!(gt.crs, ds_core::geo::Crs::WebMercator);
         assert_eq!((gt.width, gt.height), (102, 60));
         let period = frame.col_period.unwrap();
-        assert!((period - 4999.378 / 49.0).abs() < 1e-3, "{period}");
+        assert!(
+            (period - 4999.378 / 49.0).abs() < 1e-3,
+            "the period is 4999.378 / 49 columns"
+        );
         for (row, col, x, y) in [
             (0, 0, 20_037_466.041, 12_015_991.631),
             (0, 101, 19_633_635.664, 12_015_991.631),
@@ -1085,7 +1103,7 @@ mod tests {
             // 1e-4 px is ~40 m on this 393 km grid.
             assert!(
                 (c - (col as f64 + 0.5)).abs() < 1e-4 && (r - (row as f64 + 0.5)).abs() < 1e-4,
-                "pixel ({row}, {col}) at ({c}, {r})"
+                "pixel ({row}, {col})"
             );
         }
     }
@@ -1130,7 +1148,7 @@ mod tests {
         assert_eq!(frame.pixel(false, -0.5, 0.0), Some((101, 0)));
         // The sliver [102, period) splits at its middle.
         let sliver = period - 102.0;
-        assert!(sliver > 0.0 && sliver < 0.05, "{sliver}");
+        assert!(sliver > 0.0 && sliver < 0.05, "a sliver under 0.05 px");
         assert_eq!(
             frame.pixel(false, 102.0 + sliver * 0.4, 0.0),
             Some((101, 0))
@@ -1144,6 +1162,47 @@ mod tests {
         assert_eq!((o.width, o.height), (26, 15));
         assert_eq!(frame.pixel(true, -0.5, 0.0), Some((25, 0)));
         assert_eq!(frame.pixel(true, 25.5 + period / 4.0, 14.9), Some((25, 14)));
+    }
+
+    /// The overview resolves a position on the full grid, then reads the
+    /// cell holding that pixel. Its 26 cells span 104 pixels, past the
+    /// 102.028-pixel turn, so at its own scale the seam's sliver falls
+    /// inside the last cell (#906 review): the sliver's eastern half, where
+    /// the full grid reads the first column, read the last column's cell.
+    #[test]
+    fn gmgsi_overview_resolves_the_seam_on_the_full_grid() {
+        let frame = gmgsi();
+        let period = frame.col_period.unwrap();
+        let factor = OVERVIEW_FACTOR as f64;
+        assert_eq!(frame.overview.gt.width, 26);
+        assert!(
+            26.0 * factor > period,
+            "the last cell reaches past the turn"
+        );
+        let sliver = |f: f64| 102.0 + f * (period - 102.0);
+        // East of the sliver's middle: the first column, and its cell.
+        assert_eq!(frame.pixel(false, sliver(0.9), 7.0), Some((0, 7)));
+        assert_eq!(
+            frame.pixel(true, sliver(0.9) / factor, 7.0 / factor),
+            Some((0, 1))
+        );
+        // West of it: the last column, and its cell.
+        assert_eq!(frame.pixel(false, sliver(0.1), 7.0), Some((101, 7)));
+        assert_eq!(
+            frame.pixel(true, sliver(0.1) / factor, 7.0 / factor),
+            Some((25, 1))
+        );
+        // Across the seam and into the next turn, every overview lookup
+        // is the cell of the pixel the full grid reads.
+        for i in 0..=4000 {
+            let c = 95.0 + i as f64 * 0.003;
+            for r in [0.5, 30.2, 59.9] {
+                let full = frame
+                    .pixel(false, c, r)
+                    .map(|(col, row)| (col / OVERVIEW_FACTOR, row / OVERVIEW_FACTOR));
+                assert_eq!(frame.pixel(true, c / factor, r / factor), full, "step {i}");
+            }
+        }
     }
 
     /// A bbox's pixel windows on the global grid: one inside it, two across
@@ -1163,19 +1222,29 @@ mod tests {
         let inside = spans([20.0, 0.0, 40.0, 10.0]);
         assert_eq!(inside.len(), 1);
         let (c0, c1) = inside[0];
-        assert!(c0 >= 56 && c1 <= 64 && c1 - c0 >= 6, "{inside:?}");
-        for seam in [[170.0, 10.0, -170.0, 20.0], [170.0, 10.0, 190.0, 20.0]] {
+        assert!(
+            c0 >= 56 && c1 <= 64 && c1 - c0 >= 6,
+            "20°E–40°E is about columns 57 to 63"
+        );
+        // West > east, and east past 180°.
+        for (k, seam) in [[170.0, 10.0, -170.0, 20.0], [170.0, 10.0, 190.0, 20.0]]
+            .into_iter()
+            .enumerate()
+        {
             let windows = spans(seam);
-            assert_eq!(windows.len(), 2, "{seam:?}: {windows:?}");
-            assert_eq!(windows[0].1, 102, "{seam:?}: {windows:?}");
-            assert_eq!(windows[1].0, 0, "{seam:?}: {windows:?}");
+            assert_eq!(windows.len(), 2, "seam box {k}");
+            assert_eq!(windows[0].1, 102, "seam box {k}");
+            assert_eq!(windows[1].0, 0, "seam box {k}");
             let cols: u32 = windows.iter().map(|(a, b)| b - a).sum();
-            assert!((6..=9).contains(&cols), "{seam:?}: {windows:?}");
+            assert!((6..=9).contains(&cols), "seam box {k}");
         }
         assert_eq!(spans([-180.0, 0.0, 180.0, 10.0]), [(0, 102)]);
         assert_eq!(spans([-540.0, 0.0, 540.0, 10.0]), [(0, 102)]);
         let rows = frame.windows([0.0, -10.0, 10.0, 10.0]);
-        assert!(rows[0][1] < 30 && rows[0][3] > 30, "{rows:?}");
+        assert!(
+            rows[0][1] < 30 && rows[0][3] > 30,
+            "10°S–10°N holds the equator's row"
+        );
         assert!(frame.windows([0.0, 80.0, 10.0, 85.0]).is_empty());
         assert_eq!(frame.extent().map(|e| [e[0], e[2]]), Some([-180.0, 180.0]));
     }

@@ -19,6 +19,9 @@
 //! The grid spans the globe: its columns run a little short of or past one
 //! turn of longitude (GMGSI's 4999 columns reach 0.38 px short of 360°), so
 //! callers wrap columns modulo [`MercatorGrid::col_period`].
+//!
+//! Errors name where a check failed, a row or a column, but never print a
+//! coordinate: they reach the poll loop's log.
 
 use ds_core::geo::{Crs, GeoTransform};
 use ds_core::web_mercator::{lat_to_y, lon_to_x};
@@ -134,16 +137,12 @@ fn grid(longitudes: &[f64], northings: &[f64]) -> Result<MercatorGrid, String> {
     let dlon = regular_step(longitudes).ok_or("its longitudes are not regular")?;
     let dy = regular_step(northings).ok_or("its latitudes are not regular in Mercator northing")?;
     if dlon <= 0.0 || dy >= 0.0 {
-        return Err(format!(
-            "its columns must run west to east and rows north to south, \
-             got {dlon}° per column and {dy} m per row"
-        ));
+        return Err("its columns must run west to east and rows north to south".to_string());
     }
     let col_period = 360.0 / dlon;
     if (nx as f64) + 1.0 <= col_period {
         return Err(format!(
-            "its {nx} columns of {dlon}° do not span the globe; only a global Mercator \
-             mosaic is served"
+            "its {nx} columns do not span the globe; only a global Mercator mosaic is served"
         ));
     }
     let gt = GeoTransform::from_cell_centres(
@@ -182,7 +181,7 @@ fn longitudes<T: Copy + Into<f64>>(values: &[T], ny: usize, nx: usize) -> Result
     for c in 0..nx {
         let v = at(0, c);
         if !v.is_finite() || v.abs() > 360.0 {
-            return Err(format!("longitude {v} at column {c}"));
+            return Err(format!("its longitude at column {c} is not a longitude"));
         }
         lon += wrap_half_turn(v - previous);
         previous = v;
@@ -196,9 +195,7 @@ fn longitudes<T: Copy + Into<f64>>(values: &[T], ny: usize, nx: usize) -> Result
             // The same meridian may read 180° in one row and −180° in the next.
             if d.abs() > tol && wrap_half_turn(d).abs() > tol {
                 return Err(format!(
-                    "its longitudes are not separable: row {r} column {c} is {}°, row 0 {}°",
-                    at(r, c),
-                    at(0, c)
+                    "its longitudes are not separable: row {r} differs from row 0 at column {c}"
                 ));
             }
         }
@@ -214,7 +211,7 @@ fn northings<T: Copy + Into<f64>>(values: &[T], ny: usize, nx: usize) -> Result<
     for r in 0..ny {
         let lat = at(r, 0);
         if !(lat.is_finite() && lat.abs() < 90.0) {
-            return Err(format!("latitude {lat} at row {r}"));
+            return Err(format!("its latitude at row {r} is not a latitude"));
         }
         // The row's own spacing in degrees sets how far a column may stray.
         let neighbour = at(
@@ -228,8 +225,7 @@ fn northings<T: Copy + Into<f64>>(values: &[T], ny: usize, nx: usize) -> Result<
         let tol = TOLERANCE_PX * (neighbour - lat).abs();
         if let Some(c) = (1..nx).find(|&c| (at(r, c) - lat).abs() > tol) {
             return Err(format!(
-                "its latitudes are not separable: row {r} column {c} is {}°, column 0 {lat}°",
-                at(r, c)
+                "its latitudes are not separable: column {c} differs from column 0 at row {r}"
             ));
         }
         northings.push(lat_to_y(lat));
@@ -314,8 +310,7 @@ mod tests {
         assert_eq!((grid.gt.width, grid.gt.height), (4999, 3000));
         assert!(
             (grid.col_period - 4999.378).abs() < 1e-3,
-            "{}",
-            grid.col_period
+            "the period is 4999.378 columns"
         );
         // A square pixel of ~8016 m, the first centre at 179.99962°E.
         assert!((grid.gt.pixel_width - 8016.0).abs() < 1.0);
@@ -362,7 +357,10 @@ mod tests {
         let mut lon = [lon_row, lon_row].concat();
         lon[4] = -180.1; // 179.9 read the other way round
         let unwrapped = longitudes(&lon, 2, 4).unwrap();
-        assert!((unwrapped[3] - 180.5).abs() < 1e-4, "{unwrapped:?}");
+        assert!(
+            (unwrapped[3] - 180.5).abs() < 1e-4,
+            "the last column unwraps past 180°"
+        );
         lon[6] = -179.6;
         assert!(longitudes(&lon, 2, 4)
             .unwrap_err()

@@ -82,11 +82,27 @@ impl Reference {
         self.data[row * self.lon.len() + col]
     }
 
-    /// The value of the pixel whose centre is nearest `(lon, lat)`: by
-    /// longitude around the globe, by Mercator northing down the rows;
+    /// The value of the pixel whose centre is nearest `(lon, lat)`.
+    fn at(&self, lon: f64, lat: f64) -> Option<f64> {
+        let (row, col) = self.nearest(lon, lat)?;
+        Some(self.value(row, col))
+    }
+
+    /// The value a zoomed-out render reads at `(lon, lat)`: the overview
+    /// cell holding the nearest pixel keeps its centre pixel, every
+    /// `OVERVIEW_FACTOR` (4)th from pixel 2, clamped to the grid.
+    fn overview_at(&self, lon: f64, lat: f64) -> Option<f64> {
+        let (row, col) = self.nearest(lon, lat)?;
+        let centre = |i: usize, n: usize| (i / 4 * 4 + 2).min(n - 1);
+        Some(self.value(centre(row, self.lat.len()), centre(col, self.lon.len())))
+    }
+
+    /// `(row, col)` of the pixel whose centre is nearest `(lon, lat)`: by
+    /// longitude around the globe (so the seam's sliver splits between the
+    /// last column and the first), by Mercator northing down the rows;
     /// `None` past the first or last row's half pixel, or for no point (a
     /// projected output's corner outside its domain).
-    fn at(&self, lon: f64, lat: f64) -> Option<f64> {
+    fn nearest(&self, lon: f64, lat: f64) -> Option<(usize, usize)> {
         if !(lon.is_finite() && lat.is_finite()) {
             return None;
         }
@@ -107,7 +123,7 @@ impl Reference {
         let row = (0..rows.len())
             .min_by(|&a, &b| (rows[a] - y).abs().total_cmp(&(rows[b] - y).abs()))
             .unwrap();
-        Some(self.value(row, col))
+        Some((row, col))
     }
 }
 
@@ -125,12 +141,21 @@ fn mismatches(
     reference: &Reference,
     at: impl Fn(f64, f64) -> (f64, f64),
 ) -> (usize, usize, usize) {
+    mismatches_by(tile, |lon, lat| reference.at(lon, lat), at)
+}
+
+/// [`mismatches`] against any expected value: `expected(lon, lat)`.
+fn mismatches_by(
+    tile: &RasterTile,
+    expected: impl Fn(f64, f64) -> Option<f64>,
+    at: impl Fn(f64, f64) -> (f64, f64),
+) -> (usize, usize, usize) {
     let (w, h) = (tile.width as usize, tile.height as usize);
     let (mut covered, mut wrong, mut missing) = (0, 0, 0);
     for oy in 0..h {
         for ox in 0..w {
             let (lon, lat) = at((ox as f64 + 0.5) / w as f64, (oy as f64 + 0.5) / h as f64);
-            let Some(expected) = reference.at(lon, lat) else {
+            let Some(expected) = expected(lon, lat) else {
                 continue;
             };
             covered += 1;
@@ -159,8 +184,8 @@ fn discovers_the_hourly_mosaic_as_a_global_mercator_grid() {
     // Every longitude, between the first and last rows' outer edges.
     let [w, s, e, n] = info.spatial_extent.unwrap();
     assert_eq!((w, e), (-180.0, 180.0));
-    assert!((72.8..73.5).contains(&n), "north {n}");
-    assert!((-72.5..-71.7).contains(&s), "south {s}");
+    assert!((72.8..73.5).contains(&n), "north edge past the first row");
+    assert!((-72.5..-71.7).contains(&s), "south edge past the last row");
 }
 
 /// A 3×3 render centred on a pixel's centre (the file's lat/lon) returns
@@ -181,7 +206,7 @@ fn renders_the_file_counts_at_their_pixel_centres() {
     ] {
         let (lon, lat) = (reference.lon[col], reference.lat[row]);
         let expected = reference.value(row, col);
-        for lon in [lon, lon + 360.0] {
+        for (turn, lon) in [lon, lon + 360.0].into_iter().enumerate() {
             let d = 0.01;
             let tile = render(
                 &engine,
@@ -193,7 +218,7 @@ fn renders_the_file_counts_at_their_pixel_centres() {
             assert_eq!(
                 tile.values.value_at(4),
                 Some(expected),
-                "pixel ({row}, {col}) at {lon}, {lat}"
+                "pixel ({row}, {col}), turn {turn}"
             );
         }
     }
@@ -218,23 +243,150 @@ fn renders_continuously_across_the_seam() {
     }
 }
 
-/// The whole world, a turn wide and wider: every pixel on the mosaic's
-/// latitudes has a value, sampled from the overview (a zoomed-out view).
+/// The whole world, a turn wide and wider, at full resolution and zoomed
+/// out onto the overview: every pixel on the mosaic's latitudes has the
+/// file's value, none wrong at the seam or anywhere else. Web Mercator
+/// output maps linearly onto the grid, so the coarse projection grid is
+/// exact and every pixel must match.
 #[test]
 fn renders_the_world_and_its_wrapped_copies() {
     let (engine, _dir) = engine();
     let reference = Reference::read();
-    for bbox in [
+    for (k, bbox) in [
         [-180.0, -85.0, 180.0, 85.0],
         [0.0, -85.0, 360.0, 85.0],
         [-540.0, -85.0, 540.0, 85.0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // 64 px over 102 columns reads the grid; 16 px, the overview.
+        for (width, height, overview) in [(64, 32, false), (16, 8, true)] {
+            let tile = render(&engine, bbox, width, height, &OutputCrs::WebMercator);
+            let (covered, wrong, missing) = mismatches_by(
+                &tile,
+                |lon, lat| {
+                    if overview {
+                        reference.overview_at(lon, lat)
+                    } else {
+                        reference.at(lon, lat)
+                    }
+                },
+                |fx, fy| OutputCrs::WebMercator.project_node(bbox, fx, fy),
+            );
+            let label = format!("box {k}, overview {overview}");
+            // 72°S–72°N is 60 % of the Web Mercator square.
+            assert!(covered * 3 > (width * height) as usize, "{label}");
+            assert_eq!(missing, 0, "{label}");
+            assert_eq!(wrong, 0, "{label}");
+        }
+    }
+}
+
+/// Zoomed out, a pixel in the eastern half of the seam's sliver reads the
+/// first column's overview cell, as the full grid reads the first column
+/// there (#906 review). The overview's last cell reaches past the turn:
+/// resolved at the overview's own scale, that half read the last cell.
+#[test]
+fn a_zoomed_out_render_splits_the_seam_like_the_grid() {
+    let (engine, _dir) = engine();
+    let reference = Reference::read();
+    let (nx, ny) = (reference.lon.len(), reference.lat.len());
+    // The grid's spacing and turn, from the file's first and last columns.
+    let east = (reference.lon[nx - 1] - reference.lon[0]).rem_euclid(360.0);
+    let step = east / (nx - 1) as f64;
+    let period = 360.0 / step;
+    // Three quarters of the way across the sliver [nx, period), in
+    // pixels from the grid's west edge.
+    let at = nx as f64 + 0.75 * (period - nx as f64);
+    let lon = reference.lon[0] + (at - 0.5) * step - 360.0;
+    // A row whose first-column and last-column cells differ.
+    let row = (0..ny / 4)
+        .map(|j| j * 4 + 2)
+        .find(|&r| reference.value(r, 2) != reference.value(r, nx - 1))
+        .expect("the edge cells differ in some row");
+    let lat = reference.lat[row];
+    assert_eq!(reference.nearest(lon, lat), Some((row, 0)));
+    // Three pixels of 4.5 columns each: the overview, the middle pixel
+    // centred on `lon`.
+    let half = 1.5 * 4.5 * step;
+    let tile = render(
+        &engine,
+        [lon - half, lat - 0.01, lon + half, lat + 0.01],
+        3,
+        1,
+        &OutputCrs::Wgs84,
+    );
+    assert_eq!(tile.values.value_at(1), Some(reference.value(row, 2)));
+    assert_eq!(
+        tile.values.value_at(1),
+        reference.overview_at(lon, lat),
+        "the overview reference agrees"
+    );
+}
+
+/// Several products of one GMGSI collection render together (one grid,
+/// one coordinate map), each band exactly as its own render: across the
+/// seam, and zoomed out onto the overview.
+#[test]
+fn multi_band_renders_match_single_bands() {
+    let dir = tempfile::tempdir().unwrap();
+    for (product, band) in [("LW", "LIR"), ("WV", "WV")] {
+        let nested = dir.path().join(format!("GMGSI_{product}/2026/09/28/12"));
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::copy(fixture(), nested.join(LW.replace("LIR", band))).unwrap();
+    }
+    let mut config = config(dir.path());
+    config.products.push(SatelliteProductConfig {
+        parameter: "water_vapour".into(),
+        title: "Water vapour (display counts)".into(),
+        unit: "1".into(),
+        product: "WV".into(),
+        band: None,
+        variable: "data".into(),
+    });
+    let engine = SatelliteEngine::new("gmgsi-bands", &config).unwrap();
+    engine.poll_once();
+    let parameters = ["ir_longwave", "water_vapour"];
+    for (bbox, width, height) in [
+        ([170.0, 10.0, 190.0, 20.0], 128, 64),
+        ([-180.0, -85.0, 180.0, 85.0], 16, 8),
     ] {
-        let tile = render(&engine, bbox, 64, 32, &OutputCrs::WebMercator);
-        let (covered, _, missing) = mismatches(&tile, &reference, |fx, fy| {
-            OutputCrs::WebMercator.project_node(bbox, fx, fy)
-        });
-        assert!(covered > 64 * 16, "{bbox:?}: {covered}");
-        assert_eq!(missing, 0, "{bbox:?}");
+        let tiles = engine
+            .get_raster_tiles(
+                bbox,
+                width,
+                height,
+                None,
+                &OutputCrs::WebMercator,
+                &parameters,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(tiles.len(), 2);
+        for (tile, parameter) in tiles.iter().zip(parameters) {
+            let single = engine
+                .get_raster_tile(
+                    bbox,
+                    width,
+                    height,
+                    None,
+                    &OutputCrs::WebMercator,
+                    Some(parameter),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(
+                tile.values.iter_values().eq(single.values.iter_values()),
+                "{parameter}"
+            );
+            assert!(
+                tile.values.iter_values().any(|v| v.is_some()),
+                "{parameter}"
+            );
+        }
     }
 }
 
@@ -348,14 +500,14 @@ fn edr_area_across_the_seam() {
     let DomainDescription::Grid { x, y, .. } = &result.domain else {
         panic!("expected a grid");
     };
-    assert!(x.len() >= 5 && y.len() >= 2, "{} × {}", x.len(), y.len());
+    assert!(x.len() >= 5 && y.len() >= 2, "a grid of cells");
     let values = &result.ranges["ir_longwave"].values;
     assert_eq!(values.len(), x.len() * y.len());
     assert!(
         values
             .iter()
             .all(|v| v.is_some_and(|v| (0.0..=255.0).contains(&v))),
-        "{values:?}"
+        "a count in every cell"
     );
 }
 
