@@ -247,7 +247,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   defaults. Don't hand-roll a `quick_cache` byte-weighted cache — before
   extraction the same ~40 lines were copy-pasted 12×. In `server/src/
   admin.rs`, a global cache's `/metrics` family is one `CacheMetricSet`
-  static + one `update()` call in `metrics_handler`.
+  static + one `update()` call in `metrics_handler`. The budget is split
+  into equal per-shard slices, so entries that fit the total can still be
+  evicted: a caller that plans what stays resident uses
+  `new_single_shard` / `from_env_single_shard` (engine-satellite's scans).
 - **API crates depend on ds-core and api-common** (shared Common HTTP glue),
   plus ds-executor for bounded render execution,
   ds-render for

@@ -103,14 +103,48 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// is only a hash-map sizing hint (expected typical entry weight); the
     /// eviction budget is always `capacity_bytes`.
     pub fn new(capacity_bytes: u64, approx_entry_bytes: u64, weigh: fn(&K, &V) -> u64) -> Self {
+        Self::build(capacity_bytes, approx_entry_bytes, weigh, None)
+    }
+
+    /// Like [`Self::new`], but the whole budget is one LRU. `quick_cache`
+    /// otherwise splits a cache into shards by key hash, each holding an
+    /// equal slice of the budget, so entries that together fit the budget
+    /// can still overflow one shard and be evicted. With one shard, entries
+    /// whose weights sum to at most `capacity_bytes` are never evicted: a
+    /// caller can plan what stays resident. For caches of few, large entries
+    /// looked up at a low rate, where one lock costs nothing.
+    pub fn new_single_shard(
+        capacity_bytes: u64,
+        approx_entry_bytes: u64,
+        weigh: fn(&K, &V) -> u64,
+    ) -> Self {
+        Self::build(capacity_bytes, approx_entry_bytes, weigh, Some(1))
+    }
+
+    fn build(
+        capacity_bytes: u64,
+        approx_entry_bytes: u64,
+        weigh: fn(&K, &V) -> u64,
+        shards: Option<usize>,
+    ) -> Self {
         // `max(16)` keeps a small/zero capacity valid (a near-disabled cache
         // that holds nothing still needs a non-zero item estimate).
         let estimated_items = (capacity_bytes / approx_entry_bytes.max(1)).max(16) as usize;
+        let mut options = quick_cache::OptionsBuilder::new();
+        options
+            .estimated_items_capacity(estimated_items)
+            .weight_capacity(capacity_bytes.max(1));
+        if let Some(shards) = shards {
+            options.shards(shards);
+        }
         ByteBoundedCache {
-            cache: quick_cache::sync::Cache::with_weighter(
-                estimated_items,
-                capacity_bytes.max(1),
+            cache: quick_cache::sync::Cache::with_options(
+                options
+                    .build()
+                    .expect("item estimate and weight capacity are set"),
                 WeighFn { weigh },
+                Default::default(),
+                Default::default(),
             ),
             capacity_bytes,
             hits: AtomicU64::new(0),
@@ -127,6 +161,20 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         weigh: fn(&K, &V) -> u64,
     ) -> Self {
         Self::new(
+            env_mb(var, default_mb).saturating_mul(MIB),
+            approx_entry_bytes,
+            weigh,
+        )
+    }
+
+    /// [`Self::from_env`] with one shard ([`Self::new_single_shard`]).
+    pub fn from_env_single_shard(
+        var: &str,
+        default_mb: u64,
+        approx_entry_bytes: u64,
+        weigh: fn(&K, &V) -> u64,
+    ) -> Self {
+        Self::new_single_shard(
             env_mb(var, default_mb).saturating_mul(MIB),
             approx_entry_bytes,
             weigh,
@@ -169,6 +217,15 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// type-level docs), so this is effectively a no-op there.
     pub fn insert(&self, key: K, value: V) {
         self.cache.insert(key, value);
+    }
+
+    /// Remove `key`, returning its value if it was resident. No counter
+    /// change.
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.cache.remove(key).map(|(_, value)| value)
     }
 
     /// Keep only the entries for which `keep` returns `true`, dropping the
@@ -349,6 +406,36 @@ mod tests {
             .count();
         assert!(found < 20, "expected evictions, all {found} survived");
         assert!(found > 0, "expected some entries to survive");
+    }
+
+    /// One shard: entries that together weigh the whole budget all stay.
+    /// Sharded, each shard holds an equal slice, so the same entries could
+    /// overflow the shard most of them hash to.
+    #[test]
+    fn single_shard_keeps_everything_that_fits_the_budget() {
+        let cache = ByteBoundedCache::new_single_shard(64 * 100, 100, weigh_str);
+        let keys: Vec<String> = (0..64).map(|i| format!("{i:02}")).collect();
+        for key in &keys {
+            // 2 key bytes + 34 value bytes + 64 overhead = 100.
+            cache.insert(key.clone(), vec![0u8; 34]);
+        }
+        assert_eq!(cache.weight(), 64 * 100);
+        assert!(keys.iter().all(|key| cache.contains_key(key)));
+        // One more byte of anything evicts.
+        cache.insert("x".to_string(), vec![0u8; 35]);
+        assert!(cache.weight() <= 64 * 100);
+        assert!(keys.iter().any(|key| !cache.contains_key(key)));
+    }
+
+    #[test]
+    fn remove_returns_the_value_without_counting() {
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        cache.insert("a".to_string(), vec![1, 2]);
+        assert_eq!(cache.remove(&"a".to_string()), Some(vec![1, 2]));
+        assert_eq!(cache.remove(&"a".to_string()), None);
+        assert!(!cache.contains_key(&"a".to_string()));
+        assert_eq!(cache.weight(), 0);
+        assert_eq!(cache.stats(), (0, 0));
     }
 
     #[test]

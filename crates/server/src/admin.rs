@@ -466,6 +466,38 @@ static SATELLITE_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|
     )
 });
 
+// Whether each satellite collection's time window is held in the scan cache:
+// the poll keeps it resident while every window fits
+// MC_SATELLITE_FRAME_CACHE_MB, so resident below window means requests
+// download scans. Set per scrape from the live engines, reset first so a
+// removed collection's series goes too.
+fn collection_gauge(name: &str, help: &str) -> IntGaugeVec {
+    let gauge = IntGaugeVec::new(Opts::new(name, help), &["collection"]).unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+}
+
+static SATELLITE_FRAME_WINDOW_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "satellite_frame_window_bytes",
+        "Bytes of the scans in a satellite collection's time window",
+    )
+});
+
+static SATELLITE_FRAME_WINDOW_RESIDENT_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "satellite_frame_window_resident_bytes",
+        "Bytes of the scans in a satellite collection's time window held in the scan cache",
+    )
+});
+
+static SATELLITE_FRAME_REINGESTS: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "satellite_frame_reingests_total",
+        "Satellite scans downloaded again by a poll after the scan cache evicted them",
+    )
+});
+
 static SATELLITE_STRIP_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
     CacheMetricSet::new(
         "satellite_strip_cache",
@@ -5408,14 +5440,27 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
     }
-    if !state
+    let satellite_engines = state
         .satellite_engines
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .is_empty()
-    {
+        .clone();
+    SATELLITE_FRAME_WINDOW_BYTES.reset();
+    SATELLITE_FRAME_WINDOW_RESIDENT_BYTES.reset();
+    if !satellite_engines.is_empty() {
         SATELLITE_FRAME_CACHE_METRICS.update(engine_satellite::frame_metrics(), None);
         SATELLITE_STRIP_CACHE_METRICS.update(engine_satellite::strip_metrics(), None);
+        SATELLITE_FRAME_REINGESTS.feed(engine_satellite::frame_reingests());
+        for engine in &satellite_engines {
+            let window = engine.frame_window();
+            let collection = [engine.collection_id()];
+            SATELLITE_FRAME_WINDOW_BYTES
+                .with_label_values(&collection)
+                .set(window.bytes.min(i64::MAX as u64) as i64);
+            SATELLITE_FRAME_WINDOW_RESIDENT_BYTES
+                .with_label_values(&collection)
+                .set(window.resident_bytes.min(i64::MAX as u64) as i64);
+        }
     }
 
     // Lightning strike-window cache (#504): only meaningful once a postgis
@@ -6906,6 +6951,73 @@ mod tests {
             !Arc::ptr_eq(&second.nowcast_engines[0], &third.nowcast_engines[0]),
             "nowcast must rebuild when its source engine was rebuilt"
         );
+    }
+
+    /// A reload that keeps a satellite collection's config keeps its engine
+    /// and so the scans it holds in memory. A changed config gets a new
+    /// engine, and dropping the old one does not take the new one's scans.
+    #[test]
+    fn satellite_reload_keeps_the_scans_of_the_engine_it_keeps() {
+        const C13: &str =
+            "OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/goes19-abi")
+                .join(C13),
+            dir.path().join(C13),
+        )
+        .unwrap();
+        let mut collection = nowcast_test_collection("goes19-reload", "satellite", None);
+        collection.satellite = Some(ds_core::config::SatelliteConfig {
+            provider: "goes-r".into(),
+            data_path: Some(dir.path().to_string_lossy().into_owned()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            composites: Vec::new(),
+            products: vec![ds_core::config::SatelliteProductConfig {
+                parameter: "ir_10_3".into(),
+                title: "IR 10.3 µm brightness temperature".into(),
+                unit: "K".into(),
+                product: "ABI-L2-CMIPF".into(),
+                band: Some(13),
+                variable: "CMI".into(),
+            }],
+        });
+        let configs = vec![collection];
+        let first = load_with_reuse(&configs, super::EngineReuse::default());
+        let live = first.satellite_engines[0].clone();
+        live.poll_once();
+        let held = live.frame_window();
+        assert!(held.bytes > 0);
+        assert_eq!(held.resident_bytes, held.bytes);
+
+        // Unchanged: the same engine, and its scans stay in memory once the
+        // previous load's handles go.
+        let second = load_with_reuse(
+            &configs,
+            reuse_pool(&configs, &configs, &first.engines_by_id),
+        );
+        assert!(Arc::ptr_eq(&live, &second.satellite_engines[0]));
+        drop(first);
+        assert_eq!(live.frame_window(), held);
+
+        // Changed: a new engine ingests its own scans, and dropping the old
+        // engine leaves them.
+        let mut changed = configs.clone();
+        changed[0].title = "renamed".to_string();
+        let third = load_with_reuse(
+            &changed,
+            reuse_pool(&configs, &changed, &second.engines_by_id),
+        );
+        let rebuilt = third.satellite_engines[0].clone();
+        assert!(!Arc::ptr_eq(&live, &rebuilt));
+        rebuilt.poll_once();
+        drop(second);
+        drop(live);
+        assert_eq!(rebuilt.frame_window(), held);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

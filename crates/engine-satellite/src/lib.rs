@@ -6,8 +6,9 @@
 //! configured product (an ABI band, or an L2 field such as cloud top
 //! temperature) is a parameter with its own time axis. The poll loop lists
 //! the source, downloads each new scan whole and keeps it in memory
-//! ([`cache::FRAMES`]); renders decode only the blocks they touch
-//! ([`cache::STRIPS`]) or, zoomed out, sample the overview built at ingest.
+//! ([`cache::FRAMES`]) for as long as it is in the time window; renders
+//! decode only the blocks they touch ([`cache::STRIPS`]) or, zoomed out,
+//! sample the overview built at ingest.
 
 mod cache;
 mod frame;
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_cache::CacheEntry;
 use ds_core::config::SatelliteConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
@@ -39,16 +41,17 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::TimeWindow;
 use ds_storage::object_store::path::Path as ObjectPath;
 
-pub use cache::{frame_metrics, strip_metrics};
+pub use cache::{frame_metrics, frame_reingests, strip_metrics};
 
 use cache::{BlockKey, FrameKey, FRAMES, STRIPS};
 use frame::{Frame, FrameOptions};
 use naming::Naming;
 use source::Source;
 
-/// New scans ingested per product per poll, newest first. Bootstrapping a
-/// window of many scans spreads over a few polls instead of one long
-/// sequential download (Critical Rule 9).
+/// Scans downloaded per product per poll: new ones first, newest first,
+/// then in-window scans the cache evicted ([`SatelliteEngine::keep_resident`]).
+/// Bootstrapping a window of many scans spreads over a few polls instead of
+/// one long sequential download (Critical Rule 9).
 const MAX_INGEST_PER_POLL: usize = 4;
 
 /// Scans one EDR query may download because the cache evicted them (a
@@ -65,6 +68,22 @@ const MAX_QUERY_BLOCKS: usize = 1024;
 
 /// The files of one scan: one, or a mosaic's tiles.
 type Scan = Arc<[ObjectPath]>;
+
+/// A scan the catalog serves: its files, and the bytes its frame holds in
+/// [`FRAMES`], measured when it was ingested.
+#[derive(Debug, Clone)]
+struct Held {
+    paths: Scan,
+    weight: u64,
+}
+
+/// Bytes of the scans in a collection's time window, and of those held in
+/// memory, from [`SatelliteEngine::frame_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameWindow {
+    pub bytes: u64,
+    pub resident_bytes: u64,
+}
 
 /// How long after its start a tiled scan is ingested even if tiles are
 /// still missing: a Himawari full disk is published within ~9 minutes.
@@ -98,8 +117,10 @@ struct Product {
 
 /// A consistent snapshot of what is served, swapped whole by each poll.
 struct Catalog {
-    /// Per product (config order): scan start → file.
-    frames: Vec<BTreeMap<DateTime<Utc>, Scan>>,
+    /// Per product (config order): scan start → files.
+    frames: Vec<BTreeMap<DateTime<Utc>, Held>>,
+    /// Bytes of every scan in `frames`: what the collection needs resident.
+    window_bytes: u64,
     /// Per product: its scan starts, for `parameter_times` (O(1)).
     times: Vec<Arc<[DateTime<Utc>]>>,
     /// Per composite: the scans every one of its bands has, for
@@ -116,6 +137,8 @@ struct Catalog {
 }
 
 pub struct SatelliteEngine {
+    /// This instance's [`FrameKey::engine`]: the scans it ingested.
+    engine: u64,
     collection_id: Arc<str>,
     /// `RasterInfo.native_crs`: `"geos"`, or `"EPSG:3857"` for GMGSI.
     native_crs: &'static str,
@@ -224,6 +247,7 @@ impl SatelliteEngine {
             &composite_bands,
         );
         Ok(Self {
+            engine: cache::next_engine(),
             collection_id: collection_id.into(),
             native_crs,
             source,
@@ -308,8 +332,11 @@ impl SatelliteEngine {
         )
     }
 
-    /// List every product, drop scans that left the window, and ingest up
-    /// to [`MAX_INGEST_PER_POLL`] new scans per product, newest first.
+    /// List every product and drop the scans that left the window, from
+    /// the catalog and from memory. Then ingest up to
+    /// [`MAX_INGEST_PER_POLL`] new scans per product, newest first, and
+    /// spend what is left of that on in-window scans the cache evicted
+    /// ([`Self::keep_resident`]).
     pub fn poll_once(&self) {
         let now = Utc::now();
         let window = self.window.as_ref().map(|w| w.to_range(now));
@@ -317,8 +344,10 @@ impl SatelliteEngine {
         let mut frames = old.frames.clone();
         let mut extents = old.extents.clone();
         let mut grids = old.grids.clone();
-        let mut complete = true;
         let mut listings = source::Listings::new();
+        // Per product: the new scans to ingest, newest first, or `None`
+        // when listing it failed.
+        let mut pending: Vec<Option<Vec<source::Found>>> = Vec::new();
         for (index, product) in self.products.iter().enumerate() {
             let known = |time| frames[index].contains_key(&time);
             let found = match self
@@ -327,12 +356,12 @@ impl SatelliteEngine {
             {
                 Ok(found) => found,
                 Err(e) => {
-                    complete = false;
                     tracing::warn!(
                         "[{}] listing '{}' failed (keeping its scans): {e}",
                         self.collection_id,
                         product.parameter
                     );
+                    pending.push(None);
                     continue;
                 }
             };
@@ -344,7 +373,7 @@ impl SatelliteEngine {
             // those listed before the newest (which may still be arriving).
             let expected = known
                 .values()
-                .map(|scan| scan.len())
+                .map(|held| held.paths.len())
                 .chain(found.iter().rev().skip(1).map(|f| f.paths.len()))
                 .max();
             let newest = found.last().map(|f| f.time);
@@ -358,6 +387,17 @@ impl SatelliteEngine {
                 .collect();
             new.reverse();
             new.truncate(MAX_INGEST_PER_POLL);
+            pending.push(Some(new));
+        }
+        // Scans that left the window leave memory before new ones arrive,
+        // so the room a new scan takes comes from a dead scan, not a live one.
+        self.sweep(&frames);
+        let mut downloads = vec![0; self.products.len()];
+        for (index, new) in pending.iter().enumerate() {
+            let Some(new) = new else {
+                continue;
+            };
+            downloads[index] = new.len();
             for scan in new {
                 match self.ingest(index, scan.time, &scan.paths) {
                     Ok(frame) => {
@@ -365,12 +405,18 @@ impl SatelliteEngine {
                             extents[index] = frame.extent();
                         }
                         grids[index].get_or_insert([frame.gt.width, frame.gt.height]);
-                        frames[index].insert(scan.time, scan.paths);
+                        frames[index].insert(
+                            scan.time,
+                            Held {
+                                paths: scan.paths.clone(),
+                                weight: frame.weight,
+                            },
+                        );
                     }
                     Err(e) => tracing::warn!(
                         "[{}] skipping {} scan {} ({} file(s) from {}): {e}",
                         self.collection_id,
-                        product.parameter,
+                        self.products[index].parameter,
                         scan.time,
                         scan.paths.len(),
                         scan.paths[0]
@@ -378,7 +424,12 @@ impl SatelliteEngine {
                 }
             }
         }
-        let polled_at = if complete { Some(now) } else { old.polled_at };
+        let listed: Vec<bool> = pending.iter().map(Option::is_some).collect();
+        let polled_at = if listed.iter().all(|&l| l) {
+            Some(now)
+        } else {
+            old.polled_at
+        };
         let added: usize = frames
             .iter()
             .zip(&old.frames)
@@ -396,18 +447,140 @@ impl SatelliteEngine {
                     .join(", ")
             );
         }
-        let catalog = Catalog::build(
-            frames,
-            &self.parameters,
-            extents,
-            grids,
-            self.native_crs,
-            &self.composite_bands,
-        );
-        self.catalog.store(Arc::new(Catalog {
+        let catalog = Arc::new(Catalog {
             polled_at,
-            ..catalog
-        }));
+            ..Catalog::build(
+                frames,
+                &self.parameters,
+                extents,
+                grids,
+                self.native_crs,
+                &self.composite_bands,
+            )
+        });
+        self.catalog.store(catalog.clone());
+        cache::record_window(self.engine, &self.collection_id, catalog.window_bytes);
+        self.keep_resident(&catalog, &listed, &downloads);
+    }
+
+    /// Remove from memory this engine's scans that `frames` does not hold:
+    /// those that left the window, and any a request fetched again from an
+    /// older snapshot after the previous sweep.
+    fn sweep(&self, frames: &[BTreeMap<DateTime<Utc>, Held>]) {
+        cache::sweep(self.engine, |key| {
+            self.product_position(&key.parameter)
+                .zip(DateTime::from_timestamp(key.time, 0))
+                .is_some_and(|(index, time)| frames[index].contains_key(&time))
+        });
+    }
+
+    /// Download again the in-window scans the cache evicted, newest first,
+    /// within what each product's [`MAX_INGEST_PER_POLL`] has left after
+    /// its new scans (`downloads`), so no request waits on them. A product
+    /// whose listing just failed (`listed`) waits for the next poll.
+    ///
+    /// Only while the windows of every satellite collection fit
+    /// `MC_SATELLITE_FRAME_CACHE_MB` ([`FRAMES`] is one shard, so then
+    /// nothing in a window is evicted). Past that, a download would evict
+    /// another in-window scan and the next poll would fetch that one back,
+    /// forever. Then a scan is downloaded only into free room, and one WARN
+    /// per poll names the sizes.
+    fn keep_resident(&self, catalog: &Catalog, listed: &[bool], downloads: &[usize]) {
+        let capacity = FRAMES.capacity_bytes();
+        if capacity == 0 {
+            // Retention is off: nothing downloaded would stay.
+            return;
+        }
+        let windows = cache::windows();
+        let total: u64 = windows.iter().map(|(_, bytes)| bytes).sum();
+        let fits = total <= capacity;
+        let mut missing = 0usize;
+        for (index, scans) in catalog.frames.iter().enumerate() {
+            let mut budget = if listed[index] {
+                MAX_INGEST_PER_POLL.saturating_sub(downloads[index])
+            } else {
+                0
+            };
+            for (&time, held) in scans.iter().rev() {
+                if FRAMES.contains_key(&self.frame_key(index, time)) {
+                    continue;
+                }
+                if budget > 0 && (fits || FRAMES.weight() + held.weight <= capacity) {
+                    budget -= 1;
+                    if self.reingest(index, time, held) {
+                        continue;
+                    }
+                }
+                missing += 1;
+            }
+        }
+        if !fits && missing > 0 {
+            let mb = |bytes: u64| format!("{:.1}", bytes as f64 / ds_cache::MIB as f64);
+            tracing::warn!(
+                "[{}] {missing} scan(s) in the time window are not in memory and are not \
+                 downloaded again: the time windows of all satellite collections hold {} MB \
+                 of scans ({}), more than MC_SATELLITE_FRAME_CACHE_MB={}. Requests for them \
+                 download them from the source. Raise MC_SATELLITE_FRAME_CACHE_MB above the \
+                 total or shorten a time_window",
+                self.collection_id,
+                mb(total),
+                windows
+                    .iter()
+                    .map(|(collection, bytes)| format!("{collection} {} MB", mb(*bytes)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                capacity / ds_cache::MIB
+            );
+        }
+    }
+
+    /// Download one evicted scan again into the cache; whether it is held
+    /// now. The scan's single-flight fill is claimed without counting a
+    /// miss: a request fetching it at the same moment finishes that
+    /// download, and the poll does not start a second one.
+    fn reingest(&self, index: usize, time: DateTime<Utc>, held: &Held) -> bool {
+        let key = self.frame_key(index, time);
+        let guard = match FRAMES.get_value_or_guard_untracked(&key, Duration::ZERO) {
+            CacheEntry::Vacant(guard) => guard,
+            CacheEntry::Value(_) | CacheEntry::Timeout => return true,
+        };
+        match self.open(index, &held.paths) {
+            Ok(frame) => {
+                let _ = guard.insert(Arc::new(frame));
+                cache::count_reingest();
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] downloading evicted {} scan {time} again failed: {e}",
+                    self.collection_id,
+                    self.products[index].parameter
+                );
+                false
+            }
+        }
+    }
+
+    /// Bytes of the scans in the time window, and of those held in memory,
+    /// for `/metrics`: O(scans), from the snapshot. Resident below the
+    /// window means requests download scans.
+    pub fn frame_window(&self) -> FrameWindow {
+        let catalog = self.catalog.load();
+        let resident_bytes = catalog
+            .frames
+            .iter()
+            .enumerate()
+            .flat_map(|(index, scans)| {
+                scans
+                    .iter()
+                    .filter(move |(time, _)| FRAMES.contains_key(&self.frame_key(index, **time)))
+            })
+            .map(|(_, held)| held.weight)
+            .sum();
+        FrameWindow {
+            bytes: catalog.window_bytes,
+            resident_bytes,
+        }
     }
 
     /// Download one scan, parse it and cache it.
@@ -434,6 +607,7 @@ impl SatelliteEngine {
 
     fn frame_key(&self, index: usize, time: DateTime<Utc>) -> FrameKey {
         FrameKey {
+            engine: self.engine,
             collection: self.collection_id.clone(),
             parameter: self.products[index].parameter.clone(),
             time: time.timestamp(),
@@ -631,7 +805,7 @@ impl SatelliteEngine {
 impl Catalog {
     /// `composite_bands`: per composite, the product indices of its bands.
     fn build(
-        frames: Vec<BTreeMap<DateTime<Utc>, Scan>>,
+        frames: Vec<BTreeMap<DateTime<Utc>, Held>>,
         parameters: &[ParameterInfo],
         extents: Vec<Option<[f64; 4]>>,
         grids: Vec<Option<[u32; 2]>>,
@@ -657,6 +831,11 @@ impl Catalog {
             .iter()
             .map(|bands| shared_times(&times, bands))
             .collect();
+        let window_bytes = frames
+            .iter()
+            .flat_map(BTreeMap::values)
+            .map(|h| h.weight)
+            .sum();
         let info = RasterInfo {
             native_crs: native_crs.to_string(),
             spatial_extent,
@@ -671,6 +850,7 @@ impl Catalog {
         };
         Catalog {
             frames,
+            window_bytes,
             times,
             composite_times,
             extents,
@@ -846,7 +1026,7 @@ impl EdrEngine for SatelliteEngine {
             let mut values = vec![None; times.len()];
             for time in own {
                 ds_core::deadline::check()?;
-                let frame = self.frame(index, time, &catalog.frames[index][&time])?;
+                let frame = self.frame(index, time, &catalog.frames[index][&time].paths)?;
                 let (c, r) = frame.gt.world_to_pixel_f64(lon, lat);
                 let Some((col, row)) = frame.pixel(false, c, r) else {
                     continue;
@@ -919,7 +1099,7 @@ impl EdrEngine for SatelliteEngine {
             let Some(&first) = own.first() else {
                 continue;
             };
-            let probe = self.frame(*index, first, &catalog.frames[*index][&first])?;
+            let probe = self.frame(*index, first, &catalog.frames[*index][&first].paths)?;
             resolution = resolution.min(probe.gt.pixel_width / 111_320.0);
             let per_scan: usize = probe
                 .windows([b.west, b.south, b.east, b.north])
@@ -947,7 +1127,7 @@ impl EdrEngine for SatelliteEngine {
             let mut values = vec![None; times.len() * ny * nx];
             for time in own {
                 ds_core::deadline::check()?;
-                let frame = self.frame(index, time, &catalog.frames[index][&time])?;
+                let frame = self.frame(index, time, &catalog.frames[index][&time].paths)?;
                 let gt = &frame.gt;
                 // Output cells → source pixels on a coarse grid (the
                 // geostationary forward transform is the expensive step).
@@ -1102,6 +1282,17 @@ impl MapEngine for SatelliteEngine {
     }
 }
 
+/// A dropped engine gives back everything it holds in memory. A reload drops
+/// the engine it rebuilt or removed, or a rejected candidate, once the last
+/// request on it ends; a reload that keeps a collection's engine drops
+/// nothing. Its keys carry its own [`FrameKey::engine`], so a rebuilt engine
+/// of the same collection keeps its scans.
+impl Drop for SatelliteEngine {
+    fn drop(&mut self) {
+        cache::release(self.engine);
+    }
+}
+
 impl std::fmt::Debug for SatelliteEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SatelliteEngine")
@@ -1112,9 +1303,15 @@ impl std::fmt::Debug for SatelliteEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{union_extent, Catalog, TimeWindow};
-    use ds_core::map_engine::ParameterInfo;
+    use super::{
+        cache, union_extent, BlockKey, Catalog, FrameKey, FrameWindow, PixelReader, TimeWindow,
+        FRAMES, STRIPS,
+    };
+    use ds_core::config::{SatelliteConfig, SatelliteProductConfig};
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo};
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn tiled_scans_wait_for_their_tiles() {
@@ -1188,6 +1385,168 @@ mod tests {
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().unwrap()
+    }
+
+    const C13: &str =
+        "OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc";
+
+    /// A directory of GOES-19 band 13 scans on 2026-09-25, one per `HHMM`.
+    fn c13_scans(slots: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/goes19-abi")
+            .join(C13);
+        for slot in slots {
+            let name = C13.replace("_s20262681900199_", &format!("_s2026268{slot}199_"));
+            std::fs::copy(&fixture, dir.path().join(name)).unwrap();
+        }
+        dir
+    }
+
+    fn ir_engine(id: &str, dir: &Path) -> super::SatelliteEngine {
+        let config = SatelliteConfig {
+            provider: "goes-r".into(),
+            data_path: Some(dir.to_string_lossy().into_owned()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            composites: Vec::new(),
+            products: vec![SatelliteProductConfig {
+                parameter: "ir".into(),
+                title: "ir".into(),
+                unit: "K".into(),
+                product: "ABI-L2-CMIPF".into(),
+                band: Some(13),
+                variable: "CMI".into(),
+            }],
+        };
+        super::SatelliteEngine::new(id, &config).unwrap()
+    }
+
+    /// A window starting at `start`, as `now` sees it.
+    fn window_since(start: &str) -> TimeWindow {
+        let since = chrono::Utc::now() - at(start);
+        TimeWindow::parse(&format!("-PT{}S", since.num_seconds())).unwrap()
+    }
+
+    /// A scan that leaves the time window leaves memory with its decoded
+    /// blocks, and the scans still in the window stay.
+    #[test]
+    fn a_scan_leaving_the_window_leaves_memory() {
+        let dir = c13_scans(&["1900", "1910"]);
+        let mut engine = ir_engine("sat-window-leave", dir.path());
+        engine.poll_once();
+        let (t0, t1) = (at("2026-09-25T19:00:00Z"), at("2026-09-25T19:10:00Z"));
+        let (k0, k1) = (engine.frame_key(0, t0), engine.frame_key(0, t1));
+        let frame = FRAMES.get_untracked(&k0).expect("ingested");
+        let weight = frame.weight;
+        assert!(FRAMES.contains_key(&k1));
+        let both = FrameWindow {
+            bytes: 2 * weight,
+            resident_bytes: 2 * weight,
+        };
+        assert_eq!(engine.frame_window(), both);
+        // A render decoded one of its blocks.
+        PixelReader::new(k0.clone(), &frame).raw(0, 0).unwrap();
+        drop(frame);
+        let block = BlockKey {
+            frame: k0.clone(),
+            block: 0,
+        };
+        assert!(STRIPS.contains_key(&block));
+
+        // Time moves on: the window now starts between the two scans.
+        engine.window = Some(window_since("2026-09-25T19:05:00Z"));
+        engine.poll_once();
+        assert!(
+            !FRAMES.contains_key(&k0),
+            "out of the window, out of memory"
+        );
+        assert!(!STRIPS.contains_key(&block), "its decoded blocks go too");
+        assert!(FRAMES.contains_key(&k1));
+        let one = FrameWindow {
+            bytes: weight,
+            resident_bytes: weight,
+        };
+        assert_eq!(engine.frame_window(), one);
+    }
+
+    /// A reload that rebuilds a collection builds a second engine with the
+    /// same id, and so does a rejected reload. Dropping that engine leaves
+    /// the live one's scans in memory; dropping the live one frees them.
+    #[test]
+    fn dropping_another_engine_of_the_collection_keeps_the_live_scans() {
+        let dir = c13_scans(&["1900", "1910"]);
+        let live = ir_engine("sat-rebuilt", dir.path());
+        live.poll_once();
+        let keys: Vec<FrameKey> = ["2026-09-25T19:00:00Z", "2026-09-25T19:10:00Z"]
+            .into_iter()
+            .map(|t| live.frame_key(0, at(t)))
+            .collect();
+        let other = ir_engine("sat-rebuilt", dir.path());
+        other.poll_once();
+        drop(other);
+        assert!(keys.iter().all(|key| FRAMES.contains_key(key)));
+        let window = live.frame_window();
+        assert!(window.bytes > 0);
+        assert_eq!(window.resident_bytes, window.bytes);
+        assert!(cache::windows().iter().any(|(c, _)| &**c == "sat-rebuilt"));
+
+        drop(live);
+        assert!(keys.iter().all(|key| !FRAMES.contains_key(key)));
+        assert!(cache::windows().iter().all(|(c, _)| &**c != "sat-rebuilt"));
+    }
+
+    /// An in-window scan the cache evicted is downloaded again by the next
+    /// poll, so a request reads it from memory: here the source is gone by
+    /// then, and requests still answer. Evicted with no poll since, the
+    /// same request has to download it, and fails.
+    #[test]
+    fn the_poll_downloads_an_evicted_scan_again_before_a_request_needs_it() {
+        let dir = c13_scans(&["1900", "1910"]);
+        let engine = ir_engine("sat-reingest", dir.path());
+        engine.poll_once();
+        let t0 = at("2026-09-25T19:00:00Z");
+        let k0 = engine.frame_key(0, t0);
+        let reingests = cache::frame_reingests();
+        FRAMES.remove(&k0).expect("ingested"); // as an eviction would
+        let window = engine.frame_window();
+        assert!(window.resident_bytes < window.bytes);
+
+        engine.poll_once();
+        assert!(FRAMES.contains_key(&k0));
+        assert_eq!(engine.frame_window().resident_bytes, window.bytes);
+        assert!(cache::frame_reingests() > reingests);
+
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let extent = engine.raster_info().spatial_extent.unwrap();
+        let [w, s, e, n] = extent;
+        let point = format!("POINT({} {})", (w + e) / 2.0, (s + n) / 2.0);
+        let instant = Some((t0, t0));
+        engine
+            .query_position(&point, instant, None, None, None)
+            .expect("EDR reads the scan from memory");
+        let tile = engine
+            .get_raster_tile(
+                extent,
+                16,
+                16,
+                Some(t0),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            )
+            .expect("the render reads the scan from memory");
+        assert!((0..tile.values.len()).any(|i| tile.values.value_at(i).is_some()));
+
+        FRAMES.remove(&k0).expect("still held");
+        assert!(engine
+            .query_position(&point, instant, None, None, None)
+            .is_err());
     }
 
     #[test]
