@@ -31,10 +31,10 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_poll::Shutdown;
 use ds_storage::discovery::{
-    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, TimeWindow,
+    expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
+    TimeWindow,
 };
 use futures::StreamExt;
-use regex::Regex;
 use std::sync::Arc;
 
 use ds_core::config::GeoTiffConfig;
@@ -187,8 +187,9 @@ pub struct GeoTiffEngine {
     raster_info: ArcSwap<ds_core::map_engine::RasterInfo>,
     tile_cache: cache::TileCache,
     store_mode: StoreMode,
-    filename_pattern: Regex,
-    timestamp_format: String,
+    /// Matches data filenames and reads their timestamps. `None` for a STAC
+    /// source, whose timestamps come from item properties.
+    filename_matcher: Option<FilenameMatcher>,
     parameter: String,
     unit: String,
     poll_interval: Duration,
@@ -405,12 +406,8 @@ impl GeoTiffEngine {
         // Validate config early
         validate_config(collection_id, data_path, config)?;
 
-        // Derive filename_pattern and timestamp_format from template or explicit fields
-        let (pattern_str, timestamp_format) = resolve_filename_config(config)?;
-
-        let filename_pattern = Regex::new(&pattern_str).map_err(|e| {
-            DataServerError::Engine(format!("Invalid filename pattern '{}': {e}", pattern_str))
-        })?;
+        // Build the filename matcher from the template or the explicit fields
+        let filename_matcher = resolve_filename_config(config)?;
 
         // Determine store mode from config
         // Parse time_window if configured
@@ -517,8 +514,7 @@ impl GeoTiffEngine {
             }),
             tile_cache,
             store_mode,
-            filename_pattern,
-            timestamp_format,
+            filename_matcher,
             parameter: config.parameter.clone(),
             unit: config.unit.clone(),
             poll_interval: Duration::from_secs(config.poll_interval_secs),
@@ -600,6 +596,17 @@ impl GeoTiffEngine {
         Ok(engine)
     }
 
+    /// The filename matcher of a directory or prefix source. Only a STAC
+    /// source has none, and it never scans by filename.
+    fn filename_matcher(&self) -> Result<&FilenameMatcher, DataServerError> {
+        self.filename_matcher.as_ref().ok_or_else(|| {
+            DataServerError::Engine(format!(
+                "[{}] no filename matcher for a STAC source",
+                self.collection_id
+            ))
+        })
+    }
+
     /// Perform a scan appropriate to the store mode.
     /// Applies max_files limit if configured.
     /// `current` is the previous catalog, used to reuse metadata for unchanged files.
@@ -625,8 +632,7 @@ impl GeoTiffEngine {
                 };
                 scan_directory(
                     directory,
-                    &self.filename_pattern,
-                    &self.timestamp_format,
+                    self.filename_matcher()?,
                     &self.exclude_patterns,
                     &mut pending,
                     &path_index,
@@ -635,8 +641,7 @@ impl GeoTiffEngine {
             StoreMode::Remote { store, prefix } => scan_remote_with_limit(
                 store,
                 prefix,
-                &self.filename_pattern,
-                &self.timestamp_format,
+                self.filename_matcher()?,
                 &path_index,
                 self.max_files,
                 None,
@@ -658,6 +663,7 @@ impl GeoTiffEngine {
                 } else {
                     (expand_prefix_pattern(prefix_pattern, *scan_days)?, None)
                 };
+                let matcher = self.filename_matcher()?;
                 let mut merged = Catalog::empty();
                 let mut scan_errors: Vec<(String, DataServerError)> = Vec::new();
                 for prefix_str in &prefixes {
@@ -665,8 +671,7 @@ impl GeoTiffEngine {
                     match scan_remote_with_limit(
                         store,
                         &prefix,
-                        &self.filename_pattern,
-                        &self.timestamp_format,
+                        matcher,
                         &path_index,
                         None, // no per-prefix limit; apply max_files after merge
                         time_filter,
@@ -2131,150 +2136,38 @@ fn validate_config(
     Ok(())
 }
 
-/// Resolve filename_template or filename_pattern + timestamp_format from config.
-/// Returns (regex_pattern, timestamp_format).
+/// Build the collection's shared [`FilenameMatcher`] from
+/// `filename_template`, or from `filename_pattern` + `timestamp_format`.
 ///
-/// In STAC mode, filename patterns are not used (timestamps come from STAC properties),
-/// so dummy values are returned.
-fn resolve_filename_config(config: &GeoTiffConfig) -> Result<(String, String), DataServerError> {
+/// In STAC mode filenames are not matched (timestamps come from STAC
+/// properties), so there is no matcher.
+fn resolve_filename_config(
+    config: &GeoTiffConfig,
+) -> Result<Option<FilenameMatcher>, DataServerError> {
     // STAC mode: timestamps come from STAC item properties, not filenames
     if config.stac_url.is_some() {
-        return Ok(("unused".to_string(), "unused".to_string()));
+        return Ok(None);
     }
 
-    if let Some(template) = &config.filename_template {
-        let (regex, format) = expand_filename_template(template)?;
-        tracing::debug!(
-            "Expanded filename_template '{}' → regex='{}', format='{}'",
-            template,
-            regex,
-            format
-        );
-        Ok((regex, format))
+    let matcher = if let Some(template) = &config.filename_template {
+        FilenameMatcher::from_template(template)
     } else if let (Some(pattern), Some(format)) =
         (&config.filename_pattern, &config.timestamp_format)
     {
-        if !pattern.contains("(?P<timestamp>") {
-            return Err(DataServerError::Engine(
-                "filename_pattern must contain a named capture group (?P<timestamp>...)".into(),
-            ));
-        }
-        Ok((pattern.clone(), format.clone()))
+        FilenameMatcher::from_pattern(pattern, format)
     } else {
-        Err(DataServerError::Engine(
+        return Err(DataServerError::Engine(
             "Either filename_template or both filename_pattern + timestamp_format must be set"
                 .into(),
-        ))
+        ));
     }
-}
-
-/// Expand a filename template with strftime placeholders into a regex + timestamp format.
-///
-/// E.g. `"OPERA@%Y%m%dT%H%M@0@ACRR.tiff"` produces:
-/// - regex: `^OPERA@(?P<timestamp>\d{8}T\d{4})@0@ACRR\.tiff$`
-/// - format: `%Y%m%dT%H%M`
-fn expand_filename_template(template: &str) -> Result<(String, String), DataServerError> {
-    // Known strftime codes and their regex equivalents
-    let codes: &[(&str, &str)] = &[
-        ("%Y", r"\d{4}"),
-        ("%m", r"\d{2}"),
-        ("%d", r"\d{2}"),
-        ("%H", r"\d{2}"),
-        ("%M", r"\d{2}"),
-        ("%S", r"\d{2}"),
-        ("%j", r"\d{3}"),
-    ];
-
-    // Find the contiguous region of strftime codes in the template
-    // (the timestamp part) and build regex + format from it
-    let mut i = 0;
-    let bytes = template.as_bytes();
-    let mut regex = String::new();
-    let mut timestamp_format = String::new();
-    let mut in_timestamp = false;
-    let mut timestamp_started = false;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() {
-            // Check if this is a known strftime code
-            let mut matched = false;
-            for &(code, _regex_part) in codes {
-                if template[i..].starts_with(code) {
-                    if !in_timestamp {
-                        in_timestamp = true;
-                        regex.push_str("(?P<timestamp>");
-                    }
-                    timestamp_started = true;
-                    timestamp_format.push_str(code);
-                    regex.push_str(_regex_part);
-                    i += code.len();
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
-                return Err(DataServerError::Engine(format!(
-                    "Unknown strftime code '{}' in filename_template",
-                    &template[i..i + 2]
-                )));
-            }
-        } else {
-            // Literal character
-            if in_timestamp {
-                // Check if this is a separator within the timestamp (e.g., T, -, :)
-                // or the end of the timestamp region
-                let ch = bytes[i] as char;
-                let is_separator = matches!(ch, 'T' | '-' | ':' | '_' | 'Z');
-                // Peek ahead: is there another % code coming?
-                let next_has_code = (i + 1 < bytes.len()) && {
-                    let rest = &template[i + 1..];
-                    codes.iter().any(|&(code, _)| rest.starts_with(code))
-                };
-
-                if is_separator && next_has_code {
-                    // Separator within timestamp (e.g., the T in %Y%m%dT%H%M)
-                    timestamp_format.push(ch);
-                    regex.push_str(&regex::escape(&ch.to_string()));
-                    i += 1;
-                } else if ch == 'Z' && !next_has_code {
-                    // Trailing Z (UTC marker) is part of the timestamp
-                    timestamp_format.push('Z');
-                    regex.push('Z');
-                    i += 1;
-                    // Close timestamp group
-                    regex.push(')');
-                    in_timestamp = false;
-                } else {
-                    // End of timestamp region
-                    regex.push(')');
-                    in_timestamp = false;
-                    regex.push_str(&regex::escape(&(ch).to_string()));
-                    i += 1;
-                }
-            } else {
-                // Not in timestamp — escape for regex
-                regex.push_str(&regex::escape(&(bytes[i] as char).to_string()));
-                i += 1;
-            }
-        }
-    }
-
-    // Close timestamp group if template ends with strftime codes
-    if in_timestamp {
-        regex.push(')');
-    }
-
-    if !timestamp_started {
-        return Err(DataServerError::Engine(format!(
-            "filename_template '{}' contains no strftime codes (%%Y, %%m, etc.)",
-            template
-        )));
-    }
-
-    // Anchored: the whole basename must be the template, so a partial
-    // upload (`….tif.tmp`, `….tif.part`) or a longer name that merely
-    // contains a match is never read — engine-odim's rule (#817).
-    Ok((format!("^{regex}$"), timestamp_format))
+    .map_err(|e| DataServerError::Engine(e.to_string()))?;
+    tracing::debug!(
+        "Filename matcher: regex='{}', format='{}'",
+        matcher.pattern(),
+        matcher.timestamp_format()
+    );
+    Ok(Some(matcher))
 }
 
 /// Format byte count as human-readable string.
@@ -2593,46 +2486,59 @@ mod tests {
         assert!(ds_core::geo::native_crs_uri("stere").is_none());
     }
 
+    /// The shared matcher `resolve_filename_config` builds for `template`.
+    fn template_matcher(template: &str) -> FilenameMatcher {
+        let config = GeoTiffConfig {
+            filename_template: Some(template.to_string()),
+            ..tm35fin_test_config()
+        };
+        resolve_filename_config(&config)
+            .unwrap()
+            .expect("a directory source has a filename matcher")
+    }
+
+    fn utc(s: &str) -> Option<DateTime<Utc>> {
+        Some(s.parse().unwrap())
+    }
+
     #[test]
     fn template_opera_acrr() {
-        let (regex, fmt) = expand_filename_template("OPERA@%Y%m%dT%H%M@0@ACRR.tiff").unwrap();
-        assert_eq!(fmt, "%Y%m%dT%H%M");
-        // Verify the regex actually matches real filenames
-        let re = Regex::new(&regex).unwrap();
-        let caps = re.captures("OPERA@20260324T2040@0@ACRR.tiff").unwrap();
-        assert_eq!(caps.name("timestamp").unwrap().as_str(), "20260324T2040");
+        let m = template_matcher("OPERA@%Y%m%dT%H%M@0@ACRR.tiff");
+        assert_eq!(m.timestamp_format(), "%Y%m%dT%H%M");
+        // Verify the matcher actually reads real filenames
+        assert_eq!(
+            m.parse_timestamp("OPERA@20260324T2040@0@ACRR.tiff"),
+            utc("2026-03-24T20:40:00Z")
+        );
     }
 
     #[test]
     fn template_radar_with_trailing_z() {
-        let (regex, fmt) = expand_filename_template("radar_%Y%m%dT%H%MZ.tif").unwrap();
-        assert_eq!(fmt, "%Y%m%dT%H%MZ");
-        let re = Regex::new(&regex).unwrap();
-        let caps = re.captures("radar_20260324T2315Z.tif").unwrap();
-        assert_eq!(caps.name("timestamp").unwrap().as_str(), "20260324T2315Z");
+        let m = template_matcher("radar_%Y%m%dT%H%MZ.tif");
+        assert_eq!(m.timestamp_format(), "%Y%m%dT%H%MZ");
+        assert_eq!(
+            m.parse_timestamp("radar_20260324T2315Z.tif"),
+            utc("2026-03-24T23:15:00Z")
+        );
     }
 
     #[test]
     fn template_fmi_leading_timestamp() {
-        let (regex, fmt) =
-            expand_filename_template("%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif").unwrap();
-        assert_eq!(fmt, "%Y%m%d%H%M");
-        let re = Regex::new(&regex).unwrap();
-        let caps = re
-            .captures("202603251955_composite_cappi_600_dbzh_finrad_qc.tif")
-            .unwrap();
-        assert_eq!(caps.name("timestamp").unwrap().as_str(), "202603251955");
+        let m = template_matcher("%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif");
+        assert_eq!(m.timestamp_format(), "%Y%m%d%H%M");
+        assert_eq!(
+            m.parse_timestamp("202603251955_composite_cappi_600_dbzh_finrad_qc.tif"),
+            utc("2026-03-25T19:55:00Z")
+        );
     }
 
     #[test]
     fn template_with_dashes() {
-        let (regex, fmt) = expand_filename_template("data_%Y-%m-%dT%H:%M:%S.tif").unwrap();
-        assert_eq!(fmt, "%Y-%m-%dT%H:%M:%S");
-        let re = Regex::new(&regex).unwrap();
-        let caps = re.captures("data_2026-03-25T19:30:00.tif").unwrap();
+        let m = template_matcher("data_%Y-%m-%dT%H:%M:%S.tif");
+        assert_eq!(m.timestamp_format(), "%Y-%m-%dT%H:%M:%S");
         assert_eq!(
-            caps.name("timestamp").unwrap().as_str(),
-            "2026-03-25T19:30:00"
+            m.parse_timestamp("data_2026-03-25T19:30:00.tif"),
+            utc("2026-03-25T19:30:00Z")
         );
     }
 
@@ -2640,21 +2546,100 @@ mod tests {
     /// template (#817).
     #[test]
     fn template_matches_the_whole_name_only() {
-        let (regex, _) = expand_filename_template("radar_%Y%m%dT%H%MZ.tif").unwrap();
-        let re = Regex::new(&regex).unwrap();
-        assert!(re.is_match("radar_20260324T2315Z.tif"));
+        let m = template_matcher("radar_%Y%m%dT%H%MZ.tif");
+        assert!(m.parse_timestamp("radar_20260324T2315Z.tif").is_some());
         for partial in [
             "radar_20260324T2315Z.tif.tmp",
             "radar_20260324T2315Z.tif.part",
             "old_radar_20260324T2315Z.tif",
         ] {
-            assert!(!re.is_match(partial), "{partial}");
+            assert_eq!(m.parse_timestamp(partial), None, "{partial}");
         }
+        // The remote scan's name filter drops them too.
+        let names = [
+            ("radar_20260324T2315Z.tif", 1),
+            ("radar_20260324T2320Z.tif.tmp", 1),
+            ("radar_20260324T2325Z.tif.part", 1),
+        ];
+        let candidates = catalog::parse_candidates_from_names(names.into_iter(), &m);
+        let kept: Vec<_> = candidates
+            .iter()
+            .map(|(_, name, _)| name.as_str())
+            .collect();
+        assert_eq!(kept, ["radar_20260324T2315Z.tif"]);
+    }
+
+    /// A local scan never catalogues a partial upload next to its finished
+    /// file, even with `exclude_patterns` emptied: the template itself is
+    /// anchored (#817). The partial copies are real TIFFs, so only the
+    /// filename match keeps them out.
+    #[test]
+    fn local_scan_skips_partial_uploads_without_exclude_patterns() {
+        let src = ["testdata/radar", "../../testdata/radar"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture")
+            .join("radar_20260324T2315Z.tif");
+        let dir = std::env::temp_dir().join(format!(
+            "meteocore_partial_upload_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        for name in [
+            "radar_20260324T2315Z.tif",
+            "radar_20260324T2320Z.tif.tmp",
+            "radar_20260324T2325Z.tif.part",
+        ] {
+            std::fs::copy(&src, dir.join(name)).unwrap();
+        }
+
+        let config = GeoTiffConfig {
+            filename_template: Some("radar_%Y%m%dT%H%MZ.tif".to_string()),
+            exclude_patterns: vec![],
+            ..tm35fin_test_config()
+        };
+        let engine = GeoTiffEngine::new("radar", dir.to_str(), &config).unwrap();
+        let times: Vec<_> = engine.catalog.load().entries.keys().copied().collect();
+        assert_eq!(times, [utc("2026-03-24T23:15:00Z").unwrap()]);
     }
 
     #[test]
     fn template_no_codes_rejected() {
-        assert!(expand_filename_template("radar_data.tif").is_err());
+        let config = GeoTiffConfig {
+            filename_template: Some("radar_data.tif".to_string()),
+            ..tm35fin_test_config()
+        };
+        assert!(resolve_filename_config(&config).is_err());
+    }
+
+    #[test]
+    fn explicit_filename_pattern_needs_a_timestamp_capture() {
+        let explicit = |pattern: &str| GeoTiffConfig {
+            filename_template: None,
+            filename_pattern: Some(pattern.to_string()),
+            timestamp_format: Some("%Y%m%dT%H%MZ".to_string()),
+            ..tm35fin_test_config()
+        };
+        let m = resolve_filename_config(&explicit(r"^radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif$"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m.parse_timestamp("radar_20260324T2315Z.tif"),
+            utc("2026-03-24T23:15:00Z")
+        );
+        assert!(resolve_filename_config(&explicit(r"^radar_(\d{8}T\d{4}Z)\.tif$")).is_err());
     }
 
     /// The committed five-timestep WGS84 radar fixture: 3249 × 1750 pixels

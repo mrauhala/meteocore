@@ -19,6 +19,8 @@ futures = "0.3"
 url = "2"
 tracing = "0.1"
 thiserror = "2"
+# Filename → timestamp matching in `discovery::FilenameMatcher` (#817).
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
