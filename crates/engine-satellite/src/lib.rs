@@ -1,15 +1,17 @@
-//! Geostationary satellite imagery (#819): GOES-R ABI NetCDF-4 scans served
-//! through WMS, OGC API Maps and Tiles.
+//! Geostationary satellite imagery (#819): GOES-R ABI and Himawari ISatSS
+//! NetCDF-4 scans, and NOAA's GMGSI global mosaic, served through WMS, OGC
+//! API Maps, Tiles and EDR.
 //!
-//! One collection is one satellite and sector; each configured product (an
-//! ABI band, or an L2 field such as cloud top temperature) is a parameter
-//! with its own time axis. The poll loop lists the source, downloads each
-//! new scan whole and keeps it in memory ([`cache::FRAMES`]); renders
-//! decode only the blocks they touch ([`cache::STRIPS`]) or, zoomed out,
-//! sample the overview built at ingest.
+//! One collection is one satellite and sector (or one mosaic); each
+//! configured product (an ABI band, or an L2 field such as cloud top
+//! temperature) is a parameter with its own time axis. The poll loop lists
+//! the source, downloads each new scan whole and keeps it in memory
+//! ([`cache::FRAMES`]); renders decode only the blocks they touch
+//! ([`cache::STRIPS`]) or, zoomed out, sample the overview built at ingest.
 
 mod cache;
 mod frame;
+mod mercator;
 mod naming;
 mod source;
 
@@ -108,6 +110,8 @@ struct Catalog {
 
 pub struct SatelliteEngine {
     collection_id: Arc<str>,
+    /// `RasterInfo.native_crs`: `"geos"`, or `"EPSG:3857"` for GMGSI.
+    native_crs: &'static str,
     source: Source,
     products: Vec<Product>,
     parameters: Vec<ParameterInfo>,
@@ -138,6 +142,7 @@ impl SatelliteEngine {
                         &p.product,
                         p.band.expect("validate_satellite requires an ISatSS band"),
                     ),
+                    "gmgsi" => Naming::gmgsi(&p.product),
                     _ => Naming::goes_r(&p.product, p.band),
                 },
                 // ISatSS writes space as ~0 K and declares no fill or range:
@@ -169,15 +174,24 @@ impl SatelliteEngine {
                 unit: p.unit.clone(),
             })
             .collect();
+        // GMGSI's global mosaic is a spherical-Mercator grid; every other
+        // provider's is the satellite's view.
+        let native_crs = if config.provider == "gmgsi" {
+            "EPSG:3857"
+        } else {
+            "geos"
+        };
         let empty = vec![BTreeMap::new(); products.len()];
         let catalog = Catalog::build(
             empty,
             &parameters,
             vec![None; products.len()],
             vec![None; products.len()],
+            native_crs,
         );
         Ok(Self {
             collection_id: collection_id.into(),
+            native_crs,
             source,
             products,
             parameters,
@@ -312,7 +326,7 @@ impl SatelliteEngine {
                 match self.ingest(index, scan.time, &scan.paths) {
                     Ok(frame) => {
                         if extents[index].is_none() {
-                            extents[index] = ds_core::geo::crs84_extent(frame.gt.bbox());
+                            extents[index] = frame.extent();
                         }
                         grids[index].get_or_insert([frame.gt.width, frame.gt.height]);
                         frames[index].insert(scan.time, scan.paths);
@@ -346,7 +360,7 @@ impl SatelliteEngine {
                     .join(", ")
             );
         }
-        let catalog = Catalog::build(frames, &self.parameters, extents, grids);
+        let catalog = Catalog::build(frames, &self.parameters, extents, grids, self.native_crs);
         self.catalog.store(Arc::new(Catalog {
             polled_at,
             ..catalog
@@ -534,6 +548,7 @@ impl Catalog {
         parameters: &[ParameterInfo],
         extents: Vec<Option<[f64; 4]>>,
         grids: Vec<Option<[u32; 2]>>,
+        native_crs: &str,
     ) -> Catalog {
         // A grid size is advertised only when every product with a scan
         // shares it: a 0.5 km band next to 2 km products has no one grid.
@@ -551,7 +566,7 @@ impl Catalog {
         union.sort_unstable();
         union.dedup();
         let info = RasterInfo {
-            native_crs: "geos".to_string(),
+            native_crs: native_crs.to_string(),
             spatial_extent,
             times: union,
             parameter: parameters[0].name.clone(),
@@ -722,7 +737,8 @@ impl EdrEngine for SatelliteEngine {
             for time in own {
                 ds_core::deadline::check()?;
                 let frame = self.frame(index, time, &catalog.frames[index][&time])?;
-                let Some((col, row)) = frame.gt.world_to_pixel(lon, lat) else {
+                let (c, r) = frame.gt.world_to_pixel_f64(lon, lat);
+                let Some((col, row)) = frame.pixel(false, c, r) else {
                     continue;
                 };
                 on_disk = true;
@@ -743,7 +759,7 @@ impl EdrEngine for SatelliteEngine {
         }
         if !on_disk {
             return Err(DataServerError::LocationNotFound(format!(
-                "POINT({lon} {lat}) is not on the Earth disk '{}' sees",
+                "POINT({lon} {lat}) is outside the imagery '{}' covers",
                 self.collection_id
             )));
         }
@@ -777,7 +793,7 @@ impl EdrEngine for SatelliteEngine {
             .is_some_and(|extent| polygon.bbox.intersects_bbox(&extent));
         if !seen {
             return Err(DataServerError::LocationNotFound(format!(
-                "The polygon lies outside the Earth disk '{}' sees",
+                "The polygon lies outside the imagery '{}' covers",
                 self.collection_id
             )));
         }
@@ -795,12 +811,12 @@ impl EdrEngine for SatelliteEngine {
             };
             let probe = self.frame(*index, first, &catalog.frames[*index][&first])?;
             resolution = resolution.min(probe.gt.pixel_width / 111_320.0);
-            if let Some((c0, r0, c1, r1)) =
-                probe.gt.bbox_to_pixels(b.west, b.south, b.east, b.north)
-            {
-                let per_scan = probe.blocks_in(c0, r0, c1, r1);
-                blocks = blocks.saturating_add(per_scan.saturating_mul(own.len()));
-            }
+            let per_scan: usize = probe
+                .windows([b.west, b.south, b.east, b.north])
+                .iter()
+                .map(|&[c0, r0, c1, r1]| probe.blocks_in(c0, r0, c1, r1))
+                .sum();
+            blocks = blocks.saturating_add(per_scan.saturating_mul(own.len()));
         }
         Self::check_block_budget(blocks)?;
         let axes = polygon.sample_grid(resolution, resolution, MAX_AREA_DIM);
@@ -825,11 +841,12 @@ impl EdrEngine for SatelliteEngine {
                 let gt = &frame.gt;
                 // Output cells → source pixels on a coarse grid (the
                 // geostationary forward transform is the expensive step).
-                let grid = ProjectionGrid::build_2d(
+                let grid = ProjectionGrid::build_2d_periodic(
                     nx as u32,
                     ny as u32,
                     gt.width,
                     gt.height,
+                    frame.period(false),
                     |fx, fy| (b.west + fx * span, b.north - fy * (b.north - b.south)),
                     |lon, lat| gt.world_to_pixel_f64(lon, lat),
                 );
@@ -843,14 +860,8 @@ impl EdrEngine for SatelliteEngine {
                             continue;
                         }
                         let (c, r) = grid.sample(ix as u32, iy as u32);
-                        let inside = c.is_finite()
-                            && r.is_finite()
-                            && c >= 0.0
-                            && r >= 0.0
-                            && c < gt.width as f64
-                            && r < gt.height as f64;
-                        if inside {
-                            values[offset + cell] = reader.value(r as u32, c as u32)?;
+                        if let Some((col, row)) = frame.pixel(false, c, r) {
+                            values[offset + cell] = reader.value(row, col)?;
                         }
                     }
                 }
@@ -908,17 +919,21 @@ impl MapEngine for SatelliteEngine {
         };
         let frame = self.frame(index, time, &catalog.frames[index][&time])?;
 
-        // The part of the disk the request sees decides the level: sample
+        // The part of the grid the request sees decides the level: sample
         // the overview when a full-resolution read would take several
-        // source pixels per output pixel.
-        let [west, south, east, north] = bbox;
-        let Some((c0, r0, c1, r1)) = frame.gt.bbox_to_pixels(west, south, east, north) else {
+        // source pixels per output pixel. On a global grid a request across
+        // its seam sees two windows.
+        let windows = frame.windows(bbox);
+        if windows.is_empty() {
             return Ok(empty());
-        };
-        let density = f64::max(
-            (c1 - c0) as f64 / width as f64,
-            (r1 - r0) as f64 / height as f64,
-        );
+        }
+        let cols: u32 = windows.iter().map(|[c0, _, c1, _]| c1 - c0).sum();
+        let rows = windows
+            .iter()
+            .map(|[_, r0, _, r1]| r1 - r0)
+            .max()
+            .unwrap_or(0);
+        let density = f64::max(cols as f64 / width as f64, rows as f64 / height as f64);
         let overview = density >= OVERVIEW_FACTOR as f64;
         let gt = if overview {
             &frame.overview.gt
@@ -929,12 +944,15 @@ impl MapEngine for SatelliteEngine {
         // Output→source mapping on a coarse grid (Critical Rule 5). Points
         // the satellite cannot see project to NaN; the grid refines cells on
         // the limb, and no footprint guard is needed: there is no far side
-        // for a coarse cell to alias onto.
-        let grid = ProjectionGrid::build_2d(
+        // for a coarse cell to alias onto. A global grid's columns are
+        // periodic: the grid interpolates across its seam (and a projected
+        // output's longitude cut) and `Frame::pixel` wraps them.
+        let grid = ProjectionGrid::build_2d_periodic(
             width,
             height,
             gt.width,
             gt.height,
+            frame.period(overview),
             |fx, fy| output_crs.project_node(bbox, fx, fy),
             |lon, lat| gt.world_to_pixel_f64(lon, lat),
         );
@@ -944,21 +962,14 @@ impl MapEngine for SatelliteEngine {
         for oy in 0..height {
             for ox in 0..width {
                 let (c, r) = grid.sample(ox, oy);
-                let inside = c.is_finite()
-                    && r.is_finite()
-                    && c >= 0.0
-                    && r >= 0.0
-                    && c < gt.width as f64
-                    && r < gt.height as f64;
-                if !inside {
+                let Some((col, row)) = frame.pixel(overview, c, r) else {
                     values.push(None);
                     continue;
-                }
-                let (col, row) = (c as usize, r as u32);
+                };
                 let raw = if overview {
-                    frame.overview.raw[row as usize * gt.width as usize + col]
+                    frame.overview.raw[row as usize * gt.width as usize + col as usize]
                 } else {
-                    reader.raw(row, col as u32)?
+                    reader.raw(row, col)?
                 };
                 values.push(frame.packing.decode(raw));
             }
@@ -1053,9 +1064,15 @@ mod tests {
         };
         let parameters = [parameter("ir"), parameter("vis")];
         let build = |grids: Vec<Option<[u32; 2]>>| {
-            Catalog::build(vec![BTreeMap::new(); 2], &parameters, vec![None; 2], grids)
-                .info
-                .grid_size
+            Catalog::build(
+                vec![BTreeMap::new(); 2],
+                &parameters,
+                vec![None; 2],
+                grids,
+                "geos",
+            )
+            .info
+            .grid_size
         };
         assert_eq!(build(vec![Some([5424, 5424]), None]), Some([5424, 5424]));
         assert_eq!(

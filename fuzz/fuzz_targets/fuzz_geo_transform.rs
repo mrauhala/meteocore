@@ -59,7 +59,11 @@ fuzz_target!(|data: &[u8]| {
             false_n: 0.0,
             radius: Some(6_371_220.0),
         },
+        // A spherical-Mercator source grid (GMGSI): forward unbounded at
+        // the poles.
+        Crs::WebMercator,
         // Partial: forward is NaN on the far side, inverse None off the disk.
+        // Keep it last: the geostationary raster below takes `last()`.
         Crs::Geostationary {
             lon0: param1.clamp(-std::f64::consts::PI, std::f64::consts::PI),
             height: 35_786_023.0,
@@ -103,6 +107,16 @@ fuzz_target!(|data: &[u8]| {
     let _ = gt.bbox();
     let _ = gt.pixel_to_world(0, 0);
     let _ = gt.bbox_to_pixels(lon, lat, lon + 1.0, lat + 1.0);
+
+    // Nor on a spherical-Mercator raster, whose northing is unbounded at
+    // the poles.
+    let merc = GeoTransform {
+        crs: Crs::WebMercator,
+        ..gt.clone()
+    };
+    let _ = merc.world_to_pixel(lon, lat);
+    let _ = merc.bbox();
+    let _ = merc.bbox_to_pixels(lon, lat, lon + 1.0, lat + 1.0);
 
     // Nor on a geostationary raster, whose extent search bisects the limb.
     let geos = GeoTransform {

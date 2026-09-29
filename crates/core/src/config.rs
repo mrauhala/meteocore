@@ -1146,6 +1146,10 @@ pub struct SatelliteConfig {
     /// `"isatss"`: Himawari AHI ISatSS tiles as NOAA publishes them for
     /// Himawari-9, `AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/OR_<sector>-…-T<tile>_…`,
     /// one scan being 88 tile files.
+    /// `"gmgsi"`: NOAA's hourly Global Mosaic of Geostationary Satellite
+    /// Imagery, `GMGSI_<product>/%Y/%m/%d/%H/GLOBCOMP…_s<start>_…nc`, one
+    /// global spherical-Mercator file per hour. Its values are 8-bit display
+    /// counts, not physical units.
     #[serde(default = "default_satellite_provider")]
     pub provider: String,
     /// Local directory holding the files (listed recursively). Mutually
@@ -1183,10 +1187,11 @@ pub struct SatelliteProductConfig {
     pub unit: String,
     /// GOES-R product, e.g. `"ABI-L2-CMIPF"` (full-disk cloud and moisture
     /// imagery) or `"ABI-L2-ACHTF"` (full-disk cloud top temperature); for
-    /// ISatSS the sector, `"HFD"` (full disk).
+    /// ISatSS the sector, `"HFD"` (full disk); for GMGSI the mosaic, one of
+    /// [`GMGSI_PRODUCTS`] (`"LW"` is longwave IR).
     pub product: String,
     /// ABI or AHI band (1–16), for per-band products such as CMIP; required
-    /// for ISatSS.
+    /// for ISatSS; not taken by GMGSI, whose product is the band.
     #[serde(default)]
     pub band: Option<u8>,
     /// NetCDF variable holding the values, e.g. `"CMI"` or `"TEMP"`.
@@ -1196,6 +1201,12 @@ pub struct SatelliteProductConfig {
 fn default_satellite_provider() -> String {
     "goes-r".to_string()
 }
+
+/// The GMGSI mosaics NOAA publishes as `GMGSI_<product>/` (#819): longwave
+/// IR (~11 µm), shortwave IR (~3.9 µm), water vapour (~6.7 µm) and visible.
+/// `GMGSI_SSR` is left out: it stopped in 2025 and names its files
+/// differently.
+pub const GMGSI_PRODUCTS: [&str; 4] = ["LW", "SW", "WV", "VIS"];
 
 fn default_satellite_poll_interval_secs() -> u64 {
     60
@@ -1208,10 +1219,10 @@ pub fn validate_satellite(
 ) -> Result<(), crate::error::DataServerError> {
     use crate::error::DataServerError::Config;
 
-    if !matches!(cfg.provider.as_str(), "goes-r" | "isatss") {
+    if !matches!(cfg.provider.as_str(), "goes-r" | "isatss" | "gmgsi") {
         return Err(Config(format!(
             "Collection '{id}': [satellite].provider '{}' is not supported \
-             (supported: goes-r, isatss)",
+             (supported: goes-r, isatss, gmgsi)",
             cfg.provider
         )));
     }
@@ -1294,6 +1305,30 @@ pub fn validate_satellite(
             }
             _ => {}
         }
+        if cfg.provider == "gmgsi" {
+            validate_gmgsi_product(id, product)?;
+        }
+    }
+    Ok(())
+}
+
+/// A GMGSI product names its mosaic (`LW`, …), which is also its band.
+fn validate_gmgsi_product(
+    id: &str,
+    product: &SatelliteProductConfig,
+) -> Result<(), crate::error::DataServerError> {
+    let name = &product.parameter;
+    if product.band.is_some() {
+        return Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GMGSI parameter '{name}' takes no 'band': its product is the band"
+        )));
+    }
+    if !GMGSI_PRODUCTS.contains(&product.product.as_str()) {
+        return Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GMGSI product '{}' is not one of {}",
+            product.product,
+            GMGSI_PRODUCTS.join(", ")
+        )));
     }
     Ok(())
 }
@@ -6489,5 +6524,43 @@ unit = "C"
         assert!(validate_qualified_table(".bare").is_err());
         assert!(validate_qualified_table("bare.").is_err());
         assert!(validate_qualified_table("1schema.tbl").is_err());
+    }
+
+    /// A GMGSI product names its mosaic and takes no band.
+    #[test]
+    fn validate_satellite_gmgsi_products() {
+        let config = |product: &str, band: Option<u8>| SatelliteConfig {
+            provider: "gmgsi".into(),
+            data_path: Some("testdata/gmgsi".into()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            products: vec![SatelliteProductConfig {
+                parameter: "ir_longwave".into(),
+                title: "Longwave IR display counts".into(),
+                unit: "1".into(),
+                product: product.into(),
+                band,
+                variable: "data".into(),
+            }],
+        };
+        for product in GMGSI_PRODUCTS {
+            assert!(validate_satellite("g", &config(product, None)).is_ok());
+        }
+        let err = |product: &str, band| {
+            validate_satellite("g", &config(product, band))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("LW", Some(13)).contains("takes no 'band'"));
+        assert!(err("SSR", None).contains("not one of LW, SW, WV, VIS"));
+        assert!(err("ABI-L2-CMIPF", None).contains("not one of"));
+        let mut other = config("LW", None);
+        other.provider = "gk".into();
+        assert!(validate_satellite("g", &other)
+            .unwrap_err()
+            .to_string()
+            .contains("gmgsi"));
     }
 }
