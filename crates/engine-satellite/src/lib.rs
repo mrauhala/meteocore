@@ -20,14 +20,15 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use ds_core::config::SatelliteConfig;
+use ds_core::config::{SatelliteCompositeChannel, SatelliteCompositeConfig, SatelliteConfig};
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
     check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, MAX_AREA_DIM,
 };
 use ds_core::map_engine::{
-    select_common_time, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile,
+    select_common_time, CompositeChannel, CompositeDef, MapEngine, OutputCrs, ParameterInfo,
+    RasterInfo, RasterTile,
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -100,6 +101,10 @@ struct Catalog {
     frames: Vec<BTreeMap<DateTime<Utc>, Scan>>,
     /// Per product: its scan starts, for `parameter_times` (O(1)).
     times: Vec<Arc<[DateTime<Utc>]>>,
+    /// Per composite: the scans every one of its bands has, for
+    /// `parameter_times` (O(1)). Rebuilt with the snapshot, so it follows
+    /// every ingest and eviction.
+    composite_times: Vec<Arc<[DateTime<Utc>]>>,
     /// Per product: the CRS84 extent of its grid, from its first scan.
     extents: Vec<Option<[f64; 4]>>,
     /// Per product: its grid size, from its first scan.
@@ -114,6 +119,11 @@ pub struct SatelliteEngine {
     source: Source,
     products: Vec<Product>,
     parameters: Vec<ParameterInfo>,
+    /// RGB composites served as their own layers, in config order.
+    composites: Arc<[CompositeDef]>,
+    /// Per composite: the product indices of its bands, in
+    /// [`CompositeDef::parameters`] order.
+    composite_bands: Vec<Vec<usize>>,
     window: Option<TimeWindow>,
     poll_interval: Duration,
     catalog: ArcSwap<Catalog>,
@@ -172,18 +182,36 @@ impl SatelliteEngine {
                 unit: p.unit.clone(),
             })
             .collect();
+        let composites: Arc<[CompositeDef]> = config.composites.iter().map(composite_def).collect();
+        let composite_bands: Vec<Vec<usize>> = composites
+            .iter()
+            .map(|def| {
+                def.parameters()
+                    .into_iter()
+                    .map(|name| {
+                        products
+                            .iter()
+                            .position(|p| &*p.parameter == name)
+                            .expect("validate_satellite requires composites to read products")
+                    })
+                    .collect()
+            })
+            .collect();
         let empty = vec![BTreeMap::new(); products.len()];
         let catalog = Catalog::build(
             empty,
             &parameters,
             vec![None; products.len()],
             vec![None; products.len()],
+            &composite_bands,
         );
         Ok(Self {
             collection_id: collection_id.into(),
             source,
             products,
             parameters,
+            composites,
+            composite_bands,
             window,
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             catalog: ArcSwap::from_pointee(catalog),
@@ -349,7 +377,13 @@ impl SatelliteEngine {
                     .join(", ")
             );
         }
-        let catalog = Catalog::build(frames, &self.parameters, extents, grids);
+        let catalog = Catalog::build(
+            frames,
+            &self.parameters,
+            extents,
+            grids,
+            &self.composite_bands,
+        );
         self.catalog.store(Arc::new(Catalog {
             polled_at,
             ..catalog
@@ -391,16 +425,37 @@ impl SatelliteEngine {
         match parameter {
             None => Ok(0),
             Some(name) => self
-                .products
-                .iter()
-                .position(|p| &*p.parameter == name)
-                .ok_or_else(|| {
-                    DataServerError::InvalidParameter(format!(
-                        "parameter '{name}' is not served by '{}'",
-                        self.collection_id
-                    ))
-                }),
+                .product_position(name)
+                .ok_or_else(|| self.not_a_band(name)),
         }
+    }
+
+    /// The product named `name`, without building an error: for the
+    /// per-request time lookups.
+    fn product_position(&self, name: &str) -> Option<usize> {
+        self.products.iter().position(|p| &*p.parameter == name)
+    }
+
+    /// The composite named `name`.
+    fn composite_index(&self, name: &str) -> Option<usize> {
+        self.composites.iter().position(|c| c.name == name)
+    }
+
+    /// Why `name` cannot be read as one band. A composite has no values of
+    /// its own: the API layer renders its bands with `get_raster_tiles`.
+    fn not_a_band(&self, name: &str) -> DataServerError {
+        DataServerError::InvalidParameter(match self.composite_index(name) {
+            Some(c) => format!(
+                "'{name}' is an RGB composite of '{}', not a band: it has no values of its \
+                 own and renders from its bands {} together",
+                self.collection_id,
+                self.composites[c].parameters().join(", ")
+            ),
+            None => format!(
+                "parameter '{name}' is not served by '{}'",
+                self.collection_id
+            ),
+        })
     }
 
     /// The products a multi-band request names, in its order.
@@ -433,8 +488,9 @@ impl SatelliteEngine {
 
     /// The scan a multi-band render of the products `indices` uses:
     /// [`Self::select`]'s rule over the scans they all have
-    /// ([`select_common_time`]). The one selection `get_raster_tiles` and
-    /// [`MapEngine::resolve_parameters_time`] use (#507).
+    /// ([`select_common_time`]). The one selection `get_raster_tiles`,
+    /// [`MapEngine::resolve_parameters_time`] and
+    /// [`MapEngine::resolve_parameter_time`] of a composite use (#507).
     fn select_common(
         catalog: &Catalog,
         indices: &[usize],
@@ -553,11 +609,13 @@ impl SatelliteEngine {
 }
 
 impl Catalog {
+    /// `composite_bands`: per composite, the product indices of its bands.
     fn build(
         frames: Vec<BTreeMap<DateTime<Utc>, Scan>>,
         parameters: &[ParameterInfo],
         extents: Vec<Option<[f64; 4]>>,
         grids: Vec<Option<[u32; 2]>>,
+        composite_bands: &[Vec<usize>],
     ) -> Catalog {
         // A grid size is advertised only when every product with a scan
         // shares it: a 0.5 km band next to 2 km products has no one grid.
@@ -574,6 +632,10 @@ impl Catalog {
         let mut union: Vec<DateTime<Utc>> = times.iter().flat_map(|t| t.iter().copied()).collect();
         union.sort_unstable();
         union.dedup();
+        let composite_times = composite_bands
+            .iter()
+            .map(|bands| shared_times(&times, bands))
+            .collect();
         let info = RasterInfo {
             native_crs: "geos".to_string(),
             spatial_extent,
@@ -589,11 +651,56 @@ impl Catalog {
         Catalog {
             frames,
             times,
+            composite_times,
             extents,
             grids,
             info: Arc::new(info),
             polled_at: None,
         }
+    }
+}
+
+/// The scans every product in `bands` has, ascending: a composite's time
+/// axis, the scans [`SatelliteEngine::select_common`] can pick for it.
+fn shared_times(times: &[Arc<[DateTime<Utc>]>], bands: &[usize]) -> Arc<[DateTime<Utc>]> {
+    let Some(&shortest) = bands.iter().min_by_key(|&&band| times[band].len()) else {
+        return Arc::from([]);
+    };
+    times[shortest]
+        .iter()
+        .filter(|time| {
+            bands
+                .iter()
+                .all(|&band| times[band].binary_search(time).is_ok())
+        })
+        .copied()
+        .collect()
+}
+
+/// A `[[satellite.composites]]` entry as the layer definition the API layer
+/// renders. `validate_satellite` has checked it: recipes are rejected and
+/// every channel is present.
+fn composite_def(config: &SatelliteCompositeConfig) -> CompositeDef {
+    let channel = |channel: &Option<SatelliteCompositeChannel>| {
+        let channel = channel
+            .as_ref()
+            .expect("validate_satellite requires every composite channel");
+        CompositeChannel {
+            parameter: channel.parameter.clone(),
+            minus: channel.minus.clone(),
+            min: channel.min,
+            max: channel.max,
+            gamma: channel.gamma,
+        }
+    };
+    CompositeDef {
+        name: config.name.clone(),
+        title: config.title.clone().unwrap_or_else(|| config.name.clone()),
+        channels: [
+            channel(&config.red),
+            channel(&config.green),
+            channel(&config.blue),
+        ],
     }
 }
 
@@ -955,21 +1062,34 @@ impl MapEngine for SatelliteEngine {
         self.resolve_parameter_time(None, time, reference_time)
     }
 
+    /// A product's scans, or a composite's: the scans every band has, from
+    /// the snapshot.
     fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
-        let index = self.product_index(Some(parameter)).ok()?;
-        Some(self.catalog.load().times[index].clone())
+        let catalog = self.catalog.load();
+        match self.product_position(parameter) {
+            Some(index) => Some(catalog.times[index].clone()),
+            None => self
+                .composite_index(parameter)
+                .map(|c| catalog.composite_times[c].clone()),
+        }
     }
 
+    /// A composite resolves as `resolve_parameters_time` over its bands
+    /// does, through the same `select_common`.
     fn resolve_parameter_time(
         &self,
         parameter: Option<&str>,
         time: Option<DateTime<Utc>>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
-        let Ok(index) = self.product_index(parameter) else {
-            return time;
-        };
-        Self::select(&self.catalog.load(), index, time).or(time)
+        let catalog = self.catalog.load();
+        if let Some(c) = parameter.and_then(|name| self.composite_index(name)) {
+            return Self::select_common(&catalog, &self.composite_bands[c], time);
+        }
+        match parameter.map_or(Some(0), |name| self.product_position(name)) {
+            Some(index) => Self::select(&catalog, index, time).or(time),
+            None => time,
+        }
     }
 
     fn resolve_parameters_time(
@@ -986,6 +1106,10 @@ impl MapEngine for SatelliteEngine {
         };
         Self::select_common(&self.catalog.load(), &indices, time)
     }
+
+    fn composites(&self) -> Arc<[CompositeDef]> {
+        self.composites.clone()
+    }
 }
 
 impl std::fmt::Debug for SatelliteEngine {
@@ -998,7 +1122,7 @@ impl std::fmt::Debug for SatelliteEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{union_extent, Catalog};
+    use super::{union_extent, Catalog, TimeWindow};
     use ds_core::map_engine::ParameterInfo;
     use std::collections::BTreeMap;
 
@@ -1037,9 +1161,15 @@ mod tests {
         };
         let parameters = [parameter("ir"), parameter("vis")];
         let build = |grids: Vec<Option<[u32; 2]>>| {
-            Catalog::build(vec![BTreeMap::new(); 2], &parameters, vec![None; 2], grids)
-                .info
-                .grid_size
+            Catalog::build(
+                vec![BTreeMap::new(); 2],
+                &parameters,
+                vec![None; 2],
+                grids,
+                &[],
+            )
+            .info
+            .grid_size
         };
         assert_eq!(build(vec![Some([5424, 5424]), None]), Some([5424, 5424]));
         assert_eq!(
@@ -1063,5 +1193,120 @@ mod tests {
             Some([-10.0, 0.0, 30.0, 6.0])
         );
         assert_eq!(union_extent(std::iter::empty()), None);
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn shared_times_intersect_the_band_axes() {
+        let axis =
+            |times: &[&str]| -> std::sync::Arc<[_]> { times.iter().map(|t| at(t)).collect() };
+        let times = [
+            axis(&["2026-09-25T19:00:00Z", "2026-09-25T19:10:00Z"]),
+            axis(&[
+                "2026-09-25T19:00:00Z",
+                "2026-09-25T19:10:00Z",
+                "2026-09-25T19:20:00Z",
+            ]),
+            axis(&["2026-09-25T19:10:00Z", "2026-09-25T19:20:00Z"]),
+            axis(&[]),
+        ];
+        let shared = |bands: &[usize]| super::shared_times(&times, bands).to_vec();
+        assert_eq!(
+            shared(&[0, 1]),
+            [at("2026-09-25T19:00:00Z"), at("2026-09-25T19:10:00Z")]
+        );
+        assert_eq!(
+            shared(&[1, 2, 1]),
+            [at("2026-09-25T19:10:00Z"), at("2026-09-25T19:20:00Z")]
+        );
+        assert_eq!(shared(&[0, 1, 2]), [at("2026-09-25T19:10:00Z")]);
+        assert_eq!(shared(&[2]), times[2].to_vec());
+        assert!(shared(&[0, 3]).is_empty());
+        assert!(shared(&[]).is_empty());
+    }
+
+    /// A composite's axis is part of the snapshot each poll swaps in: a
+    /// scan leaving the time window leaves the composite too.
+    #[test]
+    fn composite_times_follow_eviction() {
+        use ds_core::config::{
+            SatelliteCompositeChannel, SatelliteCompositeConfig, SatelliteConfig,
+            SatelliteProductConfig,
+        };
+        use ds_core::map_engine::MapEngine;
+        use std::path::Path;
+
+        const C13: &str =
+            "OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc";
+        const ACHT: &str =
+            "OR_ABI-L2-ACHTF-M6_G19_s20262681900199_e20262681909507_c20262681912337.nc";
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/goes19-abi");
+        // Both bands at 19:00 and 19:10, republished under the later stamp.
+        for name in [C13, ACHT] {
+            std::fs::copy(fixtures.join(name), dir.path().join(name)).unwrap();
+            let later = name.replace("_s20262681900199_", "_s20262681910199_");
+            std::fs::copy(fixtures.join(name), dir.path().join(later)).unwrap();
+        }
+        let product =
+            |parameter: &str, product: &str, band, variable: &str| SatelliteProductConfig {
+                parameter: parameter.into(),
+                title: parameter.into(),
+                unit: "K".into(),
+                product: product.into(),
+                band,
+                variable: variable.into(),
+            };
+        let channel = |parameter: &str| {
+            Some(SatelliteCompositeChannel {
+                parameter: parameter.into(),
+                minus: None,
+                min: 180.0,
+                max: 330.0,
+                gamma: 1.0,
+            })
+        };
+        let config = SatelliteConfig {
+            provider: "goes-r".into(),
+            data_path: Some(dir.path().to_string_lossy().into_owned()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            products: vec![
+                product("ir", "ABI-L2-CMIPF", Some(13), "CMI"),
+                product("cloud", "ABI-L2-ACHTF", None, "TEMP"),
+            ],
+            composites: vec![SatelliteCompositeConfig {
+                name: "rgb".into(),
+                title: None,
+                recipe: None,
+                red: channel("ir"),
+                green: channel("cloud"),
+                blue: channel("ir"),
+            }],
+        };
+        let mut engine = super::SatelliteEngine::new("goes19-evict", &config).unwrap();
+        engine.poll_once();
+        let (t0, t1) = (at("2026-09-25T19:00:00Z"), at("2026-09-25T19:10:00Z"));
+        assert_eq!(&*engine.parameter_times("rgb").unwrap(), [t0, t1]);
+        assert_eq!(
+            engine.resolve_parameter_time(Some("rgb"), None, None),
+            Some(t1)
+        );
+
+        // Time moves on: the window now starts between the two scans.
+        let since = chrono::Utc::now() - at("2026-09-25T19:05:00Z");
+        engine.window = Some(TimeWindow::parse(&format!("-PT{}S", since.num_seconds())).unwrap());
+        engine.poll_once();
+        assert_eq!(&*engine.parameter_times("ir").unwrap(), [t1]);
+        assert_eq!(&*engine.parameter_times("rgb").unwrap(), [t1]);
+        assert_eq!(
+            engine.resolve_parameter_time(Some("rgb"), Some(t0), None),
+            Some(t1)
+        );
     }
 }

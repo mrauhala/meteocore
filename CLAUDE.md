@@ -311,6 +311,11 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    the engine's own selection differs, and key a composite's caches on it.
    Where it can, `get_raster_tiles` builds the output→source coordinate
    map once per distinct source grid (engine-satellite, `render.rs`).
+   An engine serving composites as layers (`MapEngine::composites`) answers
+   for a composite's name in `parameter_times` (the timesteps every band
+   has, kept in the snapshot, never intersected per call) and
+   `resolve_parameter_time` (through the same helper as
+   `resolve_parameters_time` over its bands).
    **If the engine retains model runs** (non-empty
    `RasterInfo.reference_times`), it MUST likewise override
    `MapEngine::resolve_reference_time` with the SAME run selection
@@ -560,7 +565,7 @@ one never implies the other.
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
-| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4 and Himawari-9 ISatSS tiles on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819) |
+| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4 and Himawari-9 ISatSS tiles on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819); RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters, and EDR skips them |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
 
 ## Config Format

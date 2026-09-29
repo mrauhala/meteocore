@@ -37,9 +37,13 @@
 //! [`composite_legend_json`] and [`render_composite_legend`] describe a
 //! composite without a colour bar: per channel, what it reads, its range and
 //! its gamma.
+//!
+//! An engine's composite layer (`MapEngine::composites`) is a
+//! [`CompositeDef`] with named parameters; [`CompositeSpec`]'s `From` impl
+//! turns it into plane indices in the order the bands are requested.
 
 use ds_core::error::DataServerError;
-use ds_core::map_engine::{RasterTile, RasterValues};
+use ds_core::map_engine::{CompositeDef, RasterTile, RasterValues};
 
 use crate::{encode_rgba, font, format_tick, ImageFormat};
 
@@ -318,6 +322,39 @@ impl CompositeSpec {
             shared = Some(unit);
         }
         shared
+    }
+}
+
+/// The spec that renders an engine's composite layer
+/// (`MapEngine::composites`). Planes follow [`CompositeDef::parameters`],
+/// the order the API layer requests the bands from
+/// `MapEngine::get_raster_tiles` in, so the tiles it returns are
+/// [`compose_rgb`]'s `planes` as they come. A band several channels read is
+/// one plane.
+impl From<&CompositeDef> for CompositeSpec {
+    fn from(def: &CompositeDef) -> Self {
+        let parameters = def.parameters();
+        let plane = |name: &str| {
+            parameters
+                .iter()
+                .position(|p| *p == name)
+                .expect("CompositeDef::parameters lists every parameter a channel reads")
+        };
+        let channels = def.channels.each_ref().map(|channel| ChannelSpec {
+            source: match &channel.minus {
+                None => ChannelSource::Plane(plane(&channel.parameter)),
+                Some(minus) => ChannelSource::Difference(plane(&channel.parameter), plane(minus)),
+            },
+            min: channel.min,
+            max: channel.max,
+            gamma: channel.gamma,
+        });
+        CompositeSpec {
+            name: def.name.clone(),
+            title: def.title.clone(),
+            parameters: parameters.into_iter().map(String::from).collect(),
+            channels,
+        }
     }
 }
 
@@ -753,6 +790,82 @@ mod tests {
                 channel(ChannelSource::Plane(0), 243.0, 208.0, 1.0),
             ],
         }
+    }
+
+    /// An engine's composite maps each channel onto plane indices in
+    /// `CompositeDef::parameters` order: a difference reads two planes, and
+    /// a band two channels read is one plane.
+    #[test]
+    fn composite_spec_from_def_maps_channels_to_planes() {
+        use ds_core::map_engine::CompositeChannel;
+        let def_channel =
+            |parameter: &str, minus: Option<&str>, min, max, gamma| CompositeChannel {
+                parameter: parameter.into(),
+                minus: minus.map(String::from),
+                min,
+                max,
+                gamma,
+            };
+        let def = CompositeDef {
+            name: "airmass".into(),
+            title: "Airmass RGB".into(),
+            channels: [
+                def_channel("C08", Some("C10"), -25.0, 0.0, 1.0),
+                def_channel("C12", Some("C13"), -40.0, 5.0, 1.0),
+                def_channel("C08", None, 243.0, 208.0, 1.0),
+            ],
+        };
+        let spec = CompositeSpec::from(&def);
+        assert_eq!(spec, airmass(), "the hand-built airmass spec");
+        spec.validate().unwrap();
+
+        // Planes follow first use: green's minuend is new, its subtrahend is
+        // red's band, and blue's band comes last.
+        let def = CompositeDef {
+            name: "mixed".into(),
+            title: "Mixed".into(),
+            channels: [
+                def_channel("ir", None, 180.0, 330.0, 1.0),
+                def_channel("wv", Some("ir"), -40.0, 5.0, 2.5),
+                def_channel("cloud", None, 330.0, 180.0, 0.5),
+            ],
+        };
+        let spec = CompositeSpec::from(&def);
+        assert_eq!(spec.parameters, ["ir", "wv", "cloud"]);
+        assert_eq!(
+            spec.channels.map(|c| c.source),
+            [
+                ChannelSource::Plane(0),
+                ChannelSource::Difference(1, 0),
+                ChannelSource::Plane(2),
+            ]
+        );
+        assert_eq!(
+            spec.channels.map(|c| (c.min, c.max, c.gamma)),
+            [(180.0, 330.0, 1.0), (-40.0, 5.0, 2.5), (330.0, 180.0, 0.5)]
+        );
+        assert_eq!(
+            (spec.name.as_str(), spec.title.as_str()),
+            ("mixed", "Mixed")
+        );
+        assert_eq!(spec.channel_label(1), "wv - ir");
+        spec.validate().unwrap();
+
+        // The tiles a render returns in that order compose as the channels
+        // say: green reads wv - ir = 250 - 260 = -10 K.
+        let ir = f64_tile(1, 1, vec![Some(260.0)]);
+        let wv = f64_tile(1, 1, vec![Some(250.0)]);
+        let cloud = f64_tile(1, 1, vec![Some(180.0)]);
+        let rgba = compose_rgb(&[&ir, &wv, &cloud], &spec.channels).unwrap();
+        assert_eq!(
+            rgba,
+            [
+                spec.channels[0].intensity(260.0),
+                spec.channels[1].intensity(-10.0),
+                255,
+                255
+            ]
+        );
     }
 
     #[test]

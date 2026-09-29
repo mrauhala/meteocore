@@ -364,6 +364,65 @@ pub struct ParameterInfo {
     pub unit: String,
 }
 
+/// One channel of an RGB composite ([`CompositeDef`]): the physical value of
+/// `parameter`, or the difference `parameter - minus`, stretched so `min`
+/// gives intensity 0 and `max` full intensity, then shaped by `gamma`. The
+/// API layer renders it with `ds_render::composite`, whose range, gamma and
+/// nodata conventions these fields follow: `min > max` inverts the channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeChannel {
+    /// The parameter read, or the minuend of a difference.
+    pub parameter: String,
+    /// The parameter subtracted from `parameter`, for a band difference.
+    pub minus: Option<String>,
+    /// Physical value that maps to intensity 0.
+    pub min: f64,
+    /// Physical value that maps to full intensity.
+    pub max: f64,
+    /// Gamma, finite and `> 0`. `1.0` is a linear stretch.
+    pub gamma: f64,
+}
+
+impl CompositeChannel {
+    /// The parameters this channel reads, minuend first.
+    pub fn parameters(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.parameter.as_str()).chain(self.minus.as_deref())
+    }
+}
+
+/// An RGB composite a multi-parameter collection serves as its own layer
+/// (#819): three channels computed from the collection's parameters, all
+/// read from one timestep every parameter has. It has no numeric values of
+/// its own, so it is not in [`RasterInfo::parameters`] and EDR does not
+/// serve it. See [`MapEngine::composites`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeDef {
+    /// Layer name, distinct from every parameter and other composite of the
+    /// collection.
+    pub name: String,
+    /// Human-readable layer title.
+    pub title: String,
+    /// Red, green and blue.
+    pub channels: [CompositeChannel; 3],
+}
+
+impl CompositeDef {
+    /// The distinct parameters the channels read, in first-use order: red's
+    /// minuend, red's subtrahend, then green's and blue's. This is the
+    /// `parameters` list to hand [`MapEngine::get_raster_tiles`] and
+    /// [`MapEngine::resolve_parameters_time`], and the plane order that
+    /// `ds_render`'s `CompositeSpec` built from this definition indexes.
+    pub fn parameters(&self) -> Vec<&str> {
+        let mut parameters: Vec<&str> = Vec::with_capacity(6);
+        for parameter in self.channels.iter().flat_map(CompositeChannel::parameters) {
+            if !parameters.contains(&parameter) {
+                parameters.push(parameter);
+            }
+        }
+        parameters
+    }
+}
+
 /// Metadata about a map-capable raster collection.
 #[derive(Debug, Clone)]
 pub struct RasterInfo {
@@ -687,6 +746,30 @@ pub trait MapEngine: Send + Sync {
         let axes: Vec<&[DateTime<Utc>]> = axes.iter().map(|axis| &**axis).collect();
         select_common_time(&axes, time)
     }
+
+    /// The RGB composites this collection serves as their own layers, each
+    /// rendered by passing [`CompositeDef::parameters`] to
+    /// [`Self::get_raster_tiles`]. Composite names are not in
+    /// [`RasterInfo::parameters`] and are not a `parameter` for
+    /// [`Self::get_raster_tile`].
+    ///
+    /// An engine that serves composites MUST also answer for a composite's
+    /// name in:
+    /// - [`Self::parameter_times`]: the timesteps every one of its
+    ///   parameters has, kept in the engine's snapshot, not intersected per
+    ///   call.
+    /// - [`Self::resolve_parameter_time`]: the timestep
+    ///   [`Self::resolve_parameters_time`] picks for its parameters, through
+    ///   the same helper, so the cache key names the timestep rendered
+    ///   (#507).
+    ///
+    /// Default: none. **O(1) from a snapshot** (Critical Rule 10): the API
+    /// layers read it per request and per capabilities layer.
+    fn composites(&self) -> Arc<[CompositeDef]> {
+        static NONE: std::sync::LazyLock<Arc<[CompositeDef]>> =
+            std::sync::LazyLock::new(|| Arc::from([]));
+        NONE.clone()
+    }
 }
 
 /// The timestep a multi-parameter render uses, chosen among the times
@@ -952,6 +1035,66 @@ mod tests {
             select_common_time(&[&one, &one], Some(hour(0))),
             Some(hour(1))
         );
+    }
+
+    /// A composite's parameters are the distinct ones its channels read, in
+    /// first-use order, minuend before subtrahend.
+    #[test]
+    fn composite_parameters_are_distinct_in_first_use_order() {
+        let channel = |parameter: &str, minus: Option<&str>| CompositeChannel {
+            parameter: parameter.into(),
+            minus: minus.map(String::from),
+            min: 0.0,
+            max: 1.0,
+            gamma: 1.0,
+        };
+        let def = CompositeDef {
+            name: "airmass".into(),
+            title: "Airmass RGB".into(),
+            channels: [
+                channel("wv_6_2", Some("wv_7_3")),
+                channel("ir_9_6", Some("ir_10_3")),
+                channel("wv_6_2", None),
+            ],
+        };
+        assert_eq!(def.parameters(), ["wv_6_2", "wv_7_3", "ir_9_6", "ir_10_3"]);
+        assert!(def.channels[0].parameters().eq(["wv_6_2", "wv_7_3"]));
+        let one_band = CompositeDef {
+            channels: [
+                channel("ir", None),
+                channel("ir", None),
+                channel("ir", Some("ir")),
+            ],
+            ..def
+        };
+        assert_eq!(one_band.parameters(), ["ir"]);
+    }
+
+    /// An engine serves no composites unless it says so, and the default
+    /// hands out one shared empty list rather than allocating per call.
+    #[test]
+    fn default_composites_are_none() {
+        struct Plain;
+        impl MapEngine for Plain {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unreachable!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                unreachable!()
+            }
+        }
+        assert!(Plain.composites().is_empty());
+        assert!(Arc::ptr_eq(&Plain.composites(), &Plain.composites()));
     }
     use crate::geo::projected_output_crs;
 

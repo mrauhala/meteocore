@@ -262,6 +262,7 @@ mod tests {
             bucket: None,
             time_window: None,
             poll_interval_secs: 60,
+            composites: Vec::new(),
             // Two parameters read the same C13 scan: two bands of one grid.
             products: vec![
                 product("ir_a", "ABI-L2-CMIPF", Some(13), "CMI"),
