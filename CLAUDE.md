@@ -232,6 +232,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   encoders and codecs only: `png`, `jpeg-encoder`, `webp`, plus
   `serde_json` for the shared machine-readable legend document builder
   `legend_json`, kept in ds-render so WMS/Maps/Tiles can't drift apart).
+  RGB composites live in `ds_render::composite` (#819): per-channel range
+  with `min > max` = inverted, EUMETSAT gamma, band differences, and
+  colour-bar-free legends (`composite_legend_json`, `render_composite_legend`).
   `ds-mvt` and `ds-3dtiles` are likewise framework-free byte encoders,
   mirroring `ds-render`.
 - **Byte-bounded LRU caches go through `ds-cache`** (#480):
