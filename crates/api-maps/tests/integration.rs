@@ -3194,7 +3194,7 @@ mod antimeridian {
         let engine = Arc::new(Engine::default());
         let app = build_router_with_engine(engine.clone());
         for bbox in [
-            "20037508,1000000,-20037508,2000000&bbox-crs=EPSG:3857",
+            "2000000,1000000,-2000000,2000000&bbox-crs=EPSG:3857",
             "170,20,-170,10",
             "170,10,-170,10",
             "190,10,-170,20",
