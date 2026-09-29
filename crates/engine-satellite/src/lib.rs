@@ -491,6 +491,12 @@ impl SatelliteEngine {
             // Retention is off: nothing downloaded would stay.
             return;
         }
+        // Best effort across collections: each satellite collection polls on
+        // its own task, and this check reads the shared totals without a
+        // lock. Two polls near the limit can both see room and overshoot
+        // it for a moment; the cache then evicts, and the next poll reads the
+        // real weight again and stops re-downloading, so it cannot turn into
+        // the fetch-evict loop this guard exists to prevent.
         let windows = cache::windows();
         let total: u64 = windows.iter().map(|(_, bytes)| bytes).sum();
         let fits = total <= capacity;
