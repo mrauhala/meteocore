@@ -187,8 +187,9 @@ nowcasting, the database and other services. Set it in the deployment's
 MeteoCore container environment and recreate that service; reload is not enough.
 
 An RGB composite render holds one value plane per band, so it charges
-`32 + 16 × (bands − 1)` bytes per output pixel: a three-band Airmass frame
-costs twice a single-parameter one.
+`32 + 16 × (bands − 1)` bytes per output pixel: a four-band Airmass frame
+costs 2.5 times a single-parameter one, and a three-band Night Microphysics
+frame twice.
 
 Short timeline bursts wait for memory without occupying CPU slots. Sustained
 load still has finite capacity: watch `render_queue_depth`,
@@ -1239,20 +1240,46 @@ variable = "TEMP"
 
 #### RGB composites
 
-An RGB composite is a layer of its own, next to the product parameters: each channel stretches one product, or the difference of two, over a range. Its time axis holds only the scans every product it reads has, and a composite always draws its channels from one scan. It has no numeric values of its own, so EDR does not serve it. A composite reads products of the same collection, so configure every band it needs under `[[satellite.products]]`. EUMETSAT's Airmass over GOES-19 ABI:
+An RGB composite is a layer of its own, next to the product parameters: each channel stretches one product, or the difference of two, over a range. Its time axis holds only the scans every product it reads has, and a composite always draws its channels from one scan. It has no numeric values of its own, so EDR does not serve it. A composite reads products of the same collection, so configure every band it needs under `[[satellite.products]]`.
+
+A composite is either a built-in recipe or its own red, green and blue channels. A recipe:
 
 ```toml
-[[satellite.products]]
-parameter = "wv_6_2"                              # plus wv_7_3 (band 10) and ir_9_6 (band 12)
-title = "WV 6.2 µm brightness temperature"
-unit = "K"
-product = "ABI-L2-CMIPF"
-band = 8
-variable = "CMI"
-
 [[satellite.composites]]
 name = "airmass"                                  # ^[a-z0-9_]+$, not a product parameter
-title = "Airmass RGB"                             # optional, defaults to the name
+recipe = "airmass"                                # or "night_microphysics"
+# title = "Airmass RGB"                           # optional, defaults to the recipe's title
+```
+
+A recipe reads bands by their number: every band it needs must be a `[[satellite.products]]` entry with that `band`, in `K`, and the parameter names are free. The recipes are satpy's ABI and AHI adaptations, and the provider picks the instrument, `goes-r` ABI and `isatss` AHI. Bands: 7 = 3.9 µm, 8 = 6.2 µm, 10 = 7.3 µm, 12 = 9.6 µm, 13 = 10.3/10.4 µm, 14 = 11.2 µm, 15 = 12.3/12.4 µm. Every channel has gamma 1, and a range whose first value is larger inverts the channel.
+
+| `recipe`, title | Instrument | Red | Green | Blue | Bands |
+|---|---|---|---|---|---|
+| `airmass`, Airmass RGB | ABI | 8 − 10, −26.2 to 0.6 K | 12 − 13, −43.2 to 6.7 K | 8, 243.9 to 208.5 K | 8, 10, 12, 13 |
+| `airmass`, Airmass RGB | AHI | 8 − 10, −26.2 to 0.6 K | 12 − 14, −43.2 to 6.7 K | 8, 243.9 to 208.5 K | 8, 10, 12, 14 |
+| `night_microphysics`, Night Microphysics RGB | ABI | 15 − 13, −6.7 to 2.6 K | 13 − 7, −3.1 to 5.2 K | 13, 243.55 to 292.65 K | 7, 13, 15 |
+| `night_microphysics`, Night Microphysics RGB | AHI | 15 − 13, −4 to 2 K | 14 − 7, 0 to 10 K | 13, 243 to 293 K | 7, 13, 14, 15 |
+
+Sources: satpy's [`composites/abi.yaml`](https://github.com/pytroll/satpy/blob/main/satpy/etc/composites/abi.yaml) and [`composites/ahi.yaml`](https://github.com/pytroll/satpy/blob/main/satpy/etc/composites/ahi.yaml) for the bands, and [`enhancements/abi.yaml`](https://github.com/pytroll/satpy/blob/main/satpy/etc/enhancements/abi.yaml), [`enhancements/ahi.yaml`](https://github.com/pytroll/satpy/blob/main/satpy/etc/enhancements/ahi.yaml) and [`enhancements/generic.yaml`](https://github.com/pytroll/satpy/blob/main/satpy/etc/enhancements/generic.yaml) for the ranges. The ABI values match the CIRA/RAMMB quick guides for the [Air Mass](https://rammb.cira.colostate.edu/training/visit/quick_guides/QuickGuide_GOESR_AirMassRGB_final.pdf) and [Nighttime Microphysics](https://rammb.cira.colostate.edu/training/visit/quick_guides/QuickGuide_GOESR_NtMicroRGB_Final_20191206.pdf) RGBs. For AHI, satpy reads band 14 where JMA's Himawari quick guides for [Airmass](https://www.jma.go.jp/jma/jma-eng/satellite/VLab/QG/RGB_QG_Airmass_en.pdf) and [Night Microphysics](https://www.jma.go.jp/jma/jma-eng/satellite/VLab/QG/RGB_QG_NightMicrophysics_en.pdf) read band 13 with ranges of their own; MeteoCore follows satpy. The table lives in `ds_core::satellite_recipes`.
+
+A recipe composite fails the load, and the message names the fix, when:
+
+- it also sets `red`, `green` or `blue`;
+- a band it reads has no product, or two;
+- a band's product declares a unit other than `K`, such as an L1b radiance;
+- the recipe name is unknown; the message lists the known ones;
+- the provider serves no ABI or AHI brightness temperatures.
+
+`collections.d/goes19-fd-rgb.toml` is a runnable GOES-19 example with both recipes over bands 7, 8, 10, 12, 13 and 15. Six bands are a lot of data: ~135 MB per scan, ~810 MB an hour. In memory each scan takes ~157 MB of the `MC_SATELLITE_FRAME_CACHE_MB` cache that every satellite collection shares, so next to the other satellite examples raise it to 2048. Its window is 30 minutes.
+
+To add the recipes to `goes19-fd` or `goes18-fd` instead, add `ABI-L2-CMIPF` products for bands 7, 8, 10, 12 and 15 next to band 13, with `variable = "CMI"`, and the two `[[satellite.composites]]` entries. For `himawari9-fd`, add `HFD` products for bands 7, 8, 10, 12, 14 and 15 next to band 13, with `variable = "Sectorized_CMI"`: satpy's AHI recipes read band 14 too. Each added band is another whole download per scan, ~20–26 MB.
+
+Or write the channels out. Here is Airmass with EUMETSAT's original SEVIRI ranges:
+
+```toml
+[[satellite.composites]]
+name = "airmass_eum"                              # ^[a-z0-9_]+$, not a product parameter
+title = "Airmass RGB, EUMETSAT ranges"            # optional, defaults to the name
 red = { parameter = "wv_6_2", minus = "wv_7_3", min = -25.0, max = 0.0 }
 green = { parameter = "ir_9_6", minus = "ir_10_3", min = -40.0, max = 5.0 }
 blue = { parameter = "wv_6_2", min = 243.0, max = 208.0 }
@@ -1266,7 +1293,7 @@ blue = { parameter = "wv_6_2", min = 243.0, max = 208.0 }
 | `max` | yes | Value that gives full intensity; `min > max` inverts the channel, so colder is brighter |
 | `gamma` | no, `1.0` | `intensity = stretch ^ (1 / gamma)`: above 1 brightens the low end |
 
-`red`, `green` and `blue` are all required. `min` and `max` must be finite and differ, and `gamma` must be finite and above 0. `recipe = "…"` is reserved for built-in recipes and is a load error for now. An unknown key in a composite is a load error too, so a misspelt `minus` or `gamma` cannot silently change the picture.
+Without a `recipe`, `red`, `green` and `blue` are all required. `min` and `max` must be finite and differ, and `gamma` must be finite and above 0. An unknown key in a composite is a load error too, so a misspelt `minus` or `gamma` cannot silently change the picture.
 
 Requesting a composite:
 
@@ -1278,7 +1305,7 @@ Requesting a composite:
 
 EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
 
-Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` (GOES-East) and `collections.d/goes18-fd.toml` (GOES-West) are runnable examples. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
+Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` (GOES-East) and `collections.d/goes18-fd.toml` (GOES-West) are runnable examples, and `collections.d/goes19-fd-rgb.toml` adds the RGB composites. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
 
 #### GMGSI global mosaic
 

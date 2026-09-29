@@ -22,15 +22,14 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use ds_core::config::{SatelliteCompositeChannel, SatelliteCompositeConfig, SatelliteConfig};
+use ds_core::config::SatelliteConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
     check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, MAX_AREA_DIM,
 };
 use ds_core::map_engine::{
-    select_common_time, CompositeChannel, CompositeDef, MapEngine, OutputCrs, ParameterInfo,
-    RasterInfo, RasterTile,
+    select_common_time, CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile,
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -194,7 +193,13 @@ impl SatelliteEngine {
         } else {
             "geos"
         };
-        let composites: Arc<[CompositeDef]> = config.composites.iter().map(composite_def).collect();
+        // A recipe resolves to the channels it stands for here, through the
+        // same call `validate_satellite` checked it with.
+        let composites: Arc<[CompositeDef]> = config
+            .composites
+            .iter()
+            .map(|c| ds_core::config::satellite_composite_def(collection_id, config, c))
+            .collect::<Result<_, _>>()?;
         let composite_bands: Vec<Vec<usize>> = composites
             .iter()
             .map(|def| {
@@ -691,33 +696,6 @@ fn shared_times(times: &[Arc<[DateTime<Utc>]>], bands: &[usize]) -> Arc<[DateTim
         })
         .copied()
         .collect()
-}
-
-/// A `[[satellite.composites]]` entry as the layer definition the API layer
-/// renders. `validate_satellite` has checked it: recipes are rejected and
-/// every channel is present.
-fn composite_def(config: &SatelliteCompositeConfig) -> CompositeDef {
-    let channel = |channel: &Option<SatelliteCompositeChannel>| {
-        let channel = channel
-            .as_ref()
-            .expect("validate_satellite requires every composite channel");
-        CompositeChannel {
-            parameter: channel.parameter.clone(),
-            minus: channel.minus.clone(),
-            min: channel.min,
-            max: channel.max,
-            gamma: channel.gamma,
-        }
-    };
-    CompositeDef {
-        name: config.name.clone(),
-        title: config.title.clone().unwrap_or_else(|| config.name.clone()),
-        channels: [
-            channel(&config.red),
-            channel(&config.green),
-            channel(&config.blue),
-        ],
-    }
 }
 
 /// The CRS84 box covering every product's extent. Longitudes are measured
