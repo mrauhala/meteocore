@@ -350,12 +350,32 @@ impl Frame {
     /// more than its 4999.378-pixel turn. Resolved at the overview's own
     /// scale, the seam's sliver would fall inside that last cell, and the
     /// half of it nearer the first column would read the last one.
+    ///
+    /// Everywhere else the overview's own extent bounds it: a position in
+    /// the outer slice of its last row, or of its last column on an axis
+    /// that does not wrap, reads that cell (whose sample the overview
+    /// clamps to the grid's last pixel), and one past the extent reads
+    /// nothing.
     pub fn pixel(&self, overview: bool, c: f64, r: f64) -> Option<(u32, u32)> {
         if !overview {
             return self.full_pixel(c, r);
         }
-        let factor = OVERVIEW_FACTOR as f64;
-        let (col, row) = self.full_pixel(c * factor, r * factor)?;
+        let (o, factor) = (&self.overview.gt, OVERVIEW_FACTOR as f64);
+        let inside = |v: f64, n: u32| v.is_finite() && v >= 0.0 && v < n as f64;
+        // The grid's last pixel, for a position past it in the last cell.
+        let last = |n: u32| (n - 1) as f64;
+        if !inside(r, o.height) {
+            return None;
+        }
+        let r = (r * factor).min(last(self.gt.height));
+        let c = if self.col_period.is_some() {
+            c * factor
+        } else if inside(c, o.width) {
+            (c * factor).min(last(self.gt.width))
+        } else {
+            return None;
+        };
+        let (col, row) = self.full_pixel(c, r)?;
         Some((col / OVERVIEW_FACTOR, row / OVERVIEW_FACTOR))
     }
 
@@ -1162,6 +1182,55 @@ mod tests {
         assert_eq!((o.width, o.height), (26, 15));
         assert_eq!(frame.pixel(true, -0.5, 0.0), Some((25, 0)));
         assert_eq!(frame.pixel(true, 25.5 + period / 4.0, 14.9), Some((25, 14)));
+    }
+
+    /// A grid whose sides are not a multiple of the overview factor: the
+    /// outer slice of the overview's last column and last row lies past the
+    /// grid's edge but inside the cell, and reads that cell; past the
+    /// overview's extent is nothing (#906 review). The C13 crop cut to
+    /// 318 × 237 pixels: 80 × 60 cells spanning 320 × 240.
+    #[test]
+    fn overview_edge_cells_read_their_outer_slice() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../testdata/goes19-abi/\
+             OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc",
+        );
+        let cmi = FrameOptions {
+            variable: "CMI",
+            valid_fallback: None,
+        };
+        let mut frame = Frame::open(vec![std::fs::read(path).unwrap()], cmi).unwrap();
+        (frame.gt.width, frame.gt.height) = (318, 237);
+        frame.overview = frame.build_overview().unwrap();
+        let o = &frame.overview.gt;
+        assert_eq!((o.width, o.height), (80, 60));
+        // The last column's and last row's outer slices: 79.7 × 4 = 318.8
+        // and 59.5 × 4 = 238 lie past the grid, inside the last cells.
+        assert_eq!(frame.pixel(true, 79.7, 10.2), Some((79, 10)));
+        assert_eq!(frame.pixel(true, 10.2, 59.5), Some((10, 59)));
+        assert_eq!(frame.pixel(true, 79.99, 59.99), Some((79, 59)));
+        // Their inner parts, and the rest of the overview, as before.
+        assert_eq!(frame.pixel(true, 79.2, 10.2), Some((79, 10)));
+        assert_eq!(frame.pixel(true, 10.2, 59.1), Some((10, 59)));
+        // Past the overview's extent, or before it: nothing.
+        for (c, r) in [(80.0, 10.0), (10.0, 60.0), (-0.1, 10.0), (10.0, -0.1)] {
+            assert_eq!(frame.pixel(true, c, r), None, "overview ({c}, {r})");
+        }
+        // The full grid keeps its own edge.
+        assert_eq!(frame.pixel(false, 317.9, 236.9), Some((317, 236)));
+        assert_eq!(frame.pixel(false, 318.0, 10.0), None);
+        assert_eq!(frame.pixel(false, 10.0, 237.0), None);
+
+        // A global grid's rows likewise, its columns still wrapping at the
+        // seam: GMGSI's fixture cut to 58 rows makes 15 cells of 60.
+        let mut global = gmgsi();
+        global.gt.height = 58;
+        global.overview = global.build_overview().unwrap();
+        assert_eq!(global.overview.gt.height, 15);
+        assert_eq!(global.pixel(true, 5.2, 14.8), Some((5, 14)));
+        assert_eq!(global.pixel(true, 5.2, 15.0), None);
+        let period = global.col_period.unwrap();
+        assert_eq!(global.pixel(true, 5.2 + period / 4.0, 14.8), Some((5, 14)));
     }
 
     /// The overview resolves a position on the full grid, then reads the

@@ -102,7 +102,9 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     continuously. The overview resolves a position on the full grid too,
     then reads the cell holding that pixel: its 1250 cells span 5000
     pixels, past the turn, so resolved at its own scale the sliver's
-    eastern half would read the last cell (#906 review).
+    eastern half would read the last cell (#906 review). Off the seam, the
+    overview's own extent bounds it: the outer slice of its last row, or of
+    its last column on an axis that does not wrap, reads that cell.
   - Every column lookup in a render or an EDR query goes through
     `Frame::pixel`, and every bbox → pixel window through `Frame::windows`
     (two windows across the seam). `ProjectionGrid::build_2d_periodic` gets
