@@ -2,7 +2,7 @@
 name = "engine-satellite"
 version = "0.1.0"
 edition = "2021"
-description = "Geostationary satellite imagery engine (GOES-R ABI NetCDF-4 -> WMS/Maps/Tiles)"
+description = "Geostationary satellite imagery engine (GOES-R ABI, Himawari ISatSS and GK2A AMI NetCDF-4 -> WMS/Maps/Tiles/EDR)"
 
 [dependencies]
 ds-core = { path = "../core" }

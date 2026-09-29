@@ -10,7 +10,7 @@
 //! A block is a rectangle of the grid decoded at once: `block_rows` by
 //! `block_cols` pixels, row-major, the last row and column of blocks
 //! clipped to the grid. A GOES-R block is a strip of chunk rows across the
-//! full width.
+//! full width; a GK2A AMI block is one of its 1375 × 1375 chunks.
 
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ use ds_core::cf::{coordinate_scale, crs_from_grid_mapping, CfAttr};
 use ds_core::geo::{Crs, GeoTransform};
 use hdf5_reader::storage::{BytesStorage, DynStorage};
 use netcdf_reader::{NcAttrValue, NcFile, NcOpenOptions, NcSliceInfo, NcSliceInfoElem, NcType};
+
+use crate::ami;
 
 /// Decimation of the overview grid built at ingest. A render whose source
 /// window spans at least this many source pixels per output pixel samples
@@ -47,8 +49,10 @@ pub(crate) struct Frame {
     /// inflates each chunk once; a mosaic's tile height.
     pub block_rows: u32,
     /// Columns per decoded block: the full width, so a block is a strip; a
-    /// mosaic's tile width.
+    /// mosaic's tile width; an AMI file's chunk width.
     pub block_cols: u32,
+    /// AMI words → stored centi-kelvin, applied as blocks are read.
+    counts: Option<ami::Counts>,
     pub overview: Overview,
     /// Bytes this frame holds (the files plus the overview), for the cache.
     pub weight: u64,
@@ -67,12 +71,25 @@ enum Files {
 /// How to read a product's files.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FrameOptions<'a> {
+    /// How the files describe their grid and values.
+    pub format: Format,
     /// The 2-D `(y, x)` field to serve.
     pub variable: &'a str,
     /// Packed validity for a file that declares no `valid_range`: ISatSS
     /// encodes space as ~0 K (packed −1076 with offset 69) with neither a
     /// `_FillValue` nor a range.
     pub valid_fallback: Option<(i32, i32)>,
+}
+
+/// How a product's files describe their grid and values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Format {
+    /// CF: a grid mapping with 1-D x/y coordinates, packed integers
+    /// (GOES-R, Himawari ISatSS).
+    Cf,
+    /// KMA GK2A AMI L1B: CGMS navigation attributes, counts with quality
+    /// flags calibrated per scan ([`ami`]).
+    AmiL1b,
 }
 
 /// One parsed file of a scan.
@@ -82,6 +99,8 @@ struct Part {
     packing: Packing,
     gt: GeoTransform,
     chunk_rows: u32,
+    chunk_cols: u32,
+    counts: Option<ami::Counts>,
 }
 
 /// Every [`OVERVIEW_FACTOR`]-th pixel of the full grid, as stored integers.
@@ -164,13 +183,15 @@ impl Frame {
         };
         // A mosaic's tiles must agree with the first (checked in `mosaic`).
         let (packing, stored_signed) = (first.packing, first.stored_signed);
-        let (files, gt, block_rows, block_cols) = if parts.len() == 1 {
+        let (files, gt, block_rows, block_cols, counts) = if parts.len() == 1 {
             let part = parts.pop().expect("one part");
-            let width = part.gt.width;
-            (Files::Single(part.nc), part.gt, part.chunk_rows, width)
+            let (rows, cols) = (part.chunk_rows, part.chunk_cols);
+            (Files::Single(part.nc), part.gt, rows, cols, part.counts)
         } else {
-            mosaic(parts)?
+            let (files, gt, rows, cols) = mosaic(parts)?;
+            (files, gt, rows, cols, None)
         };
+        let file_bytes = file_bytes + counts.as_ref().map_or(0, ami::Counts::weight);
         let placeholder = GeoTransform {
             width: 0,
             height: 0,
@@ -184,6 +205,7 @@ impl Frame {
             gt,
             block_rows,
             block_cols,
+            counts,
             overview: Overview {
                 gt: placeholder,
                 raw: Vec::new(),
@@ -198,6 +220,11 @@ impl Frame {
     /// Blocks per row of blocks.
     fn blocks_across(&self) -> u32 {
         self.gt.width.div_ceil(self.block_cols)
+    }
+
+    /// Pixels in a full block (edge blocks are clipped smaller).
+    pub fn block_pixels(&self) -> u64 {
+        self.block_rows as u64 * self.block_cols as u64
     }
 
     pub fn block_count(&self) -> u32 {
@@ -270,7 +297,10 @@ impl Frame {
             let values = nc
                 .read_variable_slice::<u16>(&self.variable, &selection)
                 .map_err(read)?;
-            values.iter().copied().collect()
+            match &self.counts {
+                Some(counts) => values.iter().map(|&word| counts.stored(word)).collect(),
+                None => values.iter().copied().collect(),
+            }
         };
         Ok(raw)
     }
@@ -327,6 +357,9 @@ impl Part {
     /// Parse one file's NetCDF-4 bytes: the field's packing, its grid from
     /// the CF grid mapping and 1-D coordinates, and its chunk height.
     fn open(bytes: Vec<u8>, options: FrameOptions) -> Result<Part, String> {
+        if options.format == Format::AmiL1b {
+            return Part::open_ami(bytes, options.variable);
+        }
         let variable = options.variable;
         let storage: DynStorage = Arc::new(BytesStorage::new(bytes));
         let nc_options = NcOpenOptions {
@@ -436,6 +469,56 @@ impl Part {
             packing,
             gt,
             chunk_rows,
+            chunk_cols: nx,
+            counts: None,
+        })
+    }
+
+    /// Parse a GK2A AMI L1B file ([`ami`]): its grid from the CGMS
+    /// navigation, its counts calibrated to centi-kelvin, and its chunk as
+    /// the block (1375 × 1375 in a 2 km full disk: a full-width strip of
+    /// them would decode 15 MB).
+    fn open_ami(bytes: Vec<u8>, variable: &str) -> Result<Part, String> {
+        let storage: DynStorage = Arc::new(BytesStorage::new(bytes));
+        let nc_options = NcOpenOptions {
+            chunk_cache_bytes: 0,
+            ..NcOpenOptions::default()
+        };
+        let nc = NcFile::from_storage_with_options(storage.clone(), nc_options)
+            .map_err(|e| format!("not a readable NetCDF file: {e}"))?;
+        let dtype = nc
+            .variable(variable)
+            .map_err(|e| format!("variable '{variable}': {e}"))?
+            .dtype();
+        if *dtype != NcType::UShort {
+            return Err(format!("AMI field '{variable}' is {dtype:?}, not ushort"));
+        }
+        let (gt, counts) = ami::open(&nc, variable)?;
+        let chunks = hdf5_reader::Hdf5File::from_storage(storage)
+            .ok()
+            .and_then(|h5| h5.dataset(variable).ok()?.chunks());
+        let chunk = |axis: usize, size: u32| {
+            chunks
+                .as_ref()
+                .and_then(|c| c.get(axis).copied())
+                .filter(|&n| n > 0)
+                .unwrap_or(size)
+                .min(size)
+        };
+        Ok(Part {
+            nc,
+            stored_signed: false,
+            packing: Packing {
+                signed: false,
+                scale: ami::KELVIN_SCALE,
+                offset: 0.0,
+                fill: Some(ami::MISSING),
+                valid: None,
+            },
+            chunk_rows: chunk(0, gt.height),
+            chunk_cols: chunk(1, gt.width),
+            gt,
+            counts: Some(counts),
         })
     }
 }
@@ -445,6 +528,9 @@ impl Part {
 /// The grid is the lattice's bounding box; a lattice cell with no tile
 /// reads as missing.
 fn mosaic(parts: Vec<Part>) -> Result<(Files, GeoTransform, u32, u32), String> {
+    if parts.iter().any(|p| p.counts.is_some()) {
+        return Err("an AMI scan is one file, not tiles".to_string());
+    }
     let first = &parts[0];
     let template = first.gt.clone();
     let (w, h) = (first.gt.width, first.gt.height);
@@ -678,6 +764,7 @@ mod tests {
         );
         let bytes = std::fs::read(path).unwrap();
         let cmi = FrameOptions {
+            format: super::Format::Cf,
             variable: "CMI",
             valid_fallback: None,
         };
@@ -729,6 +816,7 @@ mod tests {
             std::fs::read(name).unwrap()
         };
         let options = FrameOptions {
+            format: super::Format::Cf,
             variable: "Sectorized_CMI",
             valid_fallback: Some((0, i16::MAX as i32)),
         };
@@ -780,6 +868,55 @@ mod tests {
         assert!(kept > 0 && masked > 0, "kept {kept}, masked {masked}");
     }
 
+    /// A GK2A AMI file's block is its chunk (32 × 48 in the fixture, so
+    /// the last column of blocks is clipped to 16), its words are served as
+    /// calibrated centi-kelvin, and the overview holds the same values.
+    #[test]
+    fn ami_blocks_are_chunks_of_calibrated_counts() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/gk2a-ami/gk2a_ami_le1b_ir105_fd020ge_202609281200.nc");
+        let options = FrameOptions {
+            format: super::Format::AmiL1b,
+            variable: "image_pixel_values",
+            valid_fallback: None,
+        };
+        let frame = Frame::open(vec![std::fs::read(path).unwrap()], options).unwrap();
+        assert_eq!((frame.gt.width, frame.gt.height), (160, 96));
+        assert_eq!((frame.block_rows, frame.block_cols), (32, 48));
+        assert_eq!(frame.block_count(), 12);
+        assert_eq!(frame.read_block(11).unwrap().len(), 32 * 16);
+        // Pixel (0, 0) is count 3286: 294.396639 K (independent Python
+        // calibration of the file's coefficients).
+        let (index, offset) = frame.locate(0, 0);
+        let first = frame
+            .packing
+            .decode(frame.read_block(index).unwrap()[offset]);
+        assert!(
+            (first.unwrap() - 294.396_639).abs() <= 0.005 + 1e-9,
+            "{first:?}"
+        );
+        let o = &frame.overview;
+        for j in 0..o.gt.height {
+            for i in 0..o.gt.width {
+                let (row, col) = (
+                    (j * OVERVIEW_FACTOR + 2).min(95),
+                    (i * OVERVIEW_FACTOR + 2).min(159),
+                );
+                let (index, offset) = frame.locate(row, col);
+                let full = frame.read_block(index).unwrap()[offset];
+                assert_eq!(o.raw[(j * o.gt.width + i) as usize], full, "({i}, {j})");
+                assert!(frame.packing.decode(full).is_some());
+            }
+        }
+        // AMI words come one file per scan, never as a mosaic's tiles.
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/gk2a-ami/gk2a_ami_le1b_ir105_fd020ge_202609281200.nc"),
+        )
+        .unwrap();
+        assert!(Frame::open(vec![bytes.clone(), bytes], options).is_err());
+    }
+
     /// A tile with corrupt coordinates fails its scan: off the lattice, or
     /// so far away that the lattice would be enormous, never an allocation
     /// sized by the bad offset.
@@ -788,6 +925,7 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata/himawari9-isatss");
         let options = FrameOptions {
+            format: super::Format::Cf,
             variable: "Sectorized_CMI",
             valid_fallback: Some((0, i16::MAX as i32)),
         };

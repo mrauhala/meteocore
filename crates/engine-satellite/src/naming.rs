@@ -8,6 +8,10 @@
 //!   `AHI-L2-FLDK-ISatSS/<year>/<month>/<day>/<hour><minute>/OR_<sector>-<res>-B<bits>-M<mode>C<band>-T<tile>_G<satellite>_s<start>_c<created>.nc`,
 //!   one file per tile (88 for a full disk), `<start>` `%Y%j%H%M%S` plus a
 //!   tenths digit.
+//! - GK2A AMI L1B (`gk2a`), as NOAA republishes KMA's files:
+//!   `AMI/L1B/<sector>/<year><month>/<day>/<hour>/gk2a_ami_le1b_<channel>_<sector><res>ge_<slot>.nc`,
+//!   one file per channel and scan, `<slot>` the nominal `%Y%m%d%H%M` (the
+//!   scan itself starts ~30 s later).
 
 use chrono::{DateTime, Duration, DurationRound, NaiveDateTime, Utc};
 use ds_core::error::DataServerError;
@@ -39,6 +43,27 @@ pub(crate) struct Naming {
     /// `start` captures the scan start stamp; `tile`, when present, the
     /// tile number.
     file: Regex,
+    /// How the first digits of `start` read, to the minute.
+    stamp: Stamp,
+}
+
+/// The minute-precision prefix of a file's scan start stamp.
+#[derive(Clone, Copy)]
+enum Stamp {
+    /// `%Y%j%H%M` (GOES-R, ISatSS: day of year).
+    DayOfYear,
+    /// `%Y%m%d%H%M` (GK2A).
+    Calendar,
+}
+
+impl Stamp {
+    /// The digits read and their format.
+    fn format(self) -> (usize, &'static str) {
+        match self {
+            Stamp::DayOfYear => (11, "%Y%j%H%M"),
+            Stamp::Calendar => (12, "%Y%m%d%H%M"),
+        }
+    }
 }
 
 impl Naming {
@@ -54,6 +79,7 @@ impl Naming {
         Naming {
             layout: Layout::Hourly(format!("{product}/%Y/%j/%H/")),
             file,
+            stamp: Stamp::DayOfYear,
         }
     }
 
@@ -68,6 +94,24 @@ impl Naming {
         Naming {
             layout: Layout::IsatssSlots,
             file,
+            stamp: Stamp::DayOfYear,
+        }
+    }
+
+    /// The GK2A AMI L1B files of one `sector` (`FD`, the full disk) and
+    /// `channel` (`ir105`) at its resolution code (`020`, 2 km).
+    pub fn gk2a(sector: &str, channel: &str, resolution: &str) -> Self {
+        let file = Regex::new(&format!(
+            r"^gk2a_ami_le1b_{}_{}{}ge_(?P<start>\d{{12}})\.nc$",
+            regex::escape(channel),
+            regex::escape(&sector.to_ascii_lowercase()),
+            regex::escape(resolution),
+        ))
+        .expect("the channel table and config validation restrict the parts");
+        Naming {
+            layout: Layout::Hourly(format!("AMI/L1B/{sector}/%Y%m/%d/%H/")),
+            file,
+            stamp: Stamp::Calendar,
         }
     }
 
@@ -137,7 +181,8 @@ impl Naming {
     /// scan per minute, so the minute still identifies the scan.
     pub fn scan_start(&self, basename: &str) -> Option<DateTime<Utc>> {
         let digits = self.file.captures(basename)?.name("start")?.as_str();
-        NaiveDateTime::parse_from_str(&format!("{}00", &digits[..11]), "%Y%j%H%M%S")
+        let (len, format) = self.stamp.format();
+        NaiveDateTime::parse_from_str(&format!("{}00", digits.get(..len)?), &format!("{format}%S"))
             .ok()
             .map(|t| t.and_utc())
     }
@@ -192,6 +237,37 @@ mod tests {
             ),
             Some("2026-09-25T19:10:00Z".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn gk2a_names_select_sector_channel_and_slot() {
+        let ir105 = Naming::gk2a("FD", "ir105", "020");
+        assert!(!ir105.tiled());
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            ir105
+                .prefixes(
+                    at("2026-09-28T23:30:00Z"),
+                    at("2026-09-29T00:10:00Z"),
+                    |_| false
+                )
+                .unwrap(),
+            ["AMI/L1B/FD/202609/28/23", "AMI/L1B/FD/202609/29/00"]
+        );
+        let name = "gk2a_ami_le1b_ir105_fd020ge_202609281200.nc";
+        assert_eq!(ir105.scan_start(name), Some(at("2026-09-28T12:00:00Z")));
+        for other in [
+            // Another channel, resolution, sector; a partial upload; a
+            // malformed stamp.
+            "gk2a_ami_le1b_ir112_fd020ge_202609281200.nc",
+            "gk2a_ami_le1b_ir105_fd010ge_202609281200.nc",
+            "gk2a_ami_le1b_ir105_la020ge_202609281200.nc",
+            "gk2a_ami_le1b_ir105_fd020ge_202609281200.nc.tmp",
+            "gk2a_ami_le1b_ir105_fd020ge_20260928120.nc",
+            "gk2a_ami_le1b_ir105_fd020ge_202613281200.nc",
+        ] {
+            assert_eq!(ir105.scan_start(other), None, "{other}");
+        }
     }
 
     #[test]
