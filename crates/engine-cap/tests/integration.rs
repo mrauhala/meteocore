@@ -409,6 +409,45 @@ fn degenerate_request_bbox_renders_empty_tile() {
     assert_eq!(tile.values.len(), 32 * 32);
 }
 
+/// #828: a viewport reaching past ±180°, which is how OGC API Maps passes a
+/// bbox crossing the antimeridian, draws the areas on both sides of the seam
+/// where they fall in view, instead of an empty tile.
+#[test]
+fn renders_both_sides_of_the_antimeridian_in_a_viewport_past_180() {
+    let dir = tempfile::tempdir().unwrap();
+    let xml = include_str!("fixtures/helsinki-flood.xml");
+    // CAP polygons are `lat,lon`: one area just west of 180°, one just east.
+    for (name, polygon) in [
+        ("east", "15,175 15,176 16,176 16,175 15,175"),
+        ("west", "15,-176 15,-175 16,-175 16,-176 15,-176"),
+    ] {
+        let a = xml.find("<polygon>").unwrap() + "<polygon>".len();
+        let b = xml.find("</polygon>").unwrap();
+        let moved = xml
+            .replace(&xml[a..b], polygon)
+            .replace("urn:test:helsinki-flood-1", name);
+        std::fs::write(dir.path().join(name).with_extension("xml"), moved).unwrap();
+    }
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap").unwrap();
+
+    // The seam test box 170,10,-170,20, unwrapped either way round, at 1°
+    // per pixel: 175..176°E is column 5, and 176..175°W is column 14, at
+    // 184..185° or equally at −176..−175°. Row 4 is 15..16°N.
+    for bbox in [[170.0, 10.0, 190.0, 20.0], [-190.0, 10.0, -170.0, 20.0]] {
+        for output_crs in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
+            let tile = eng
+                .get_raster_tile(bbox, 20, 10, None, &output_crs, None, None, None)
+                .unwrap();
+            let filled: Vec<(usize, usize)> = (0..200)
+                .filter(|&i| tile.values.value_at(i).is_some())
+                .map(|i| (i % 20, i / 20))
+                .collect();
+            assert_eq!(filled, vec![(5, 4), (14, 4)], "{bbox:?} {output_crs:?}");
+            assert_eq!(tile.values.value_at(4 * 20 + 14), Some(3.0));
+        }
+    }
+}
+
 #[test]
 fn raster_info_advertises_layer_time_and_extent() {
     let eng = engine(None);

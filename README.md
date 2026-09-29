@@ -1206,7 +1206,7 @@ Geostationary satellite imagery (`engine_type = "satellite"`, epic #819). One co
 
 Providers: `isatss` reads Himawari-9 AHI as the ISatSS tiles NOAA publishes on AWS (`s3://noaa-himawari9`, `AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/OR_HFD-…-M1C<band>-T<tile>_…nc`). There a scan is 88 tile files, mosaicked on ingest once all have arrived, and `product` is the sector, `HFD`. A bucket window may span at most 6 h of ten-minute scans; `collections.d/himawari9-fd.toml` is a runnable example. `goes-r` reads NOAA GOES-R ABI NetCDF-4 files as published on AWS (`s3://noaa-goes19`, `s3://noaa-goes18`), `<product>/%Y/%j/%H/OR_<product>-M<mode>[C<band>]_G<sat>_s<start>_….nc`. The engine lists one hourly prefix per hour of `time_window` (at most 24 h), downloads each new scan whole (newest first, a few per poll), and keeps it compressed in memory. Renders decode only the 24-row strips they touch, or sample a 4× overview built at ingest when zoomed out. Scan times are keyed on the scan's start **minute** (a full-disk scan starts ~20 s past its ten-minute slot), and a request snaps to the latest scan at or before it.
 
-The projection is `Crs::Geostationary` (PROJ `geos`): points behind the Earth have no projection, so the rendered disk ends at the limb, and extents come from the limb. GOES-West's crosses the antimeridian and is advertised `west > east` (about 142°E → 56°W). WMS keeps that in `EX_GeographicBoundingBox`, and its CRS:84 `BoundingBox` spans every longitude. Tiles `tileMatrixSetLimits` take every column. OGC API Maps does not yet accept a `bbox` with west > east (#828); WMS and Tiles render across the seam.
+The projection is `Crs::Geostationary` (PROJ `geos`): points behind the Earth have no projection, so the rendered disk ends at the limb, and extents come from the limb. GOES-West's crosses the antimeridian and is advertised `west > east` (about 142°E → 56°W). WMS keeps that in `EX_GeographicBoundingBox`, and its CRS:84 `BoundingBox` spans every longitude. Tiles `tileMatrixSetLimits` take every column. WMS, Tiles and OGC API Maps render across the seam; Maps reads a `bbox` with west > east as a box crossing the antimeridian (#828).
 
 ```toml
 [satellite]
@@ -1611,7 +1611,7 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `bbox` | yes | — | `west,south,east,north`, always lon/lat order |
+| `bbox` | yes | — | `west,south,east,north`, always lon/lat order. West > east is a box crossing the antimeridian: `170,10,-170,20` renders the 20° across 180°, as `170,10,190,20` does. Both longitudes of such a box must be within ±180. South must be less than north. GeoTIFF and Zarr sources stored in −180…180 do not yet render past 180° and show nodata there. |
 | `bbox-crs` | no | `CRS:84` | Only `CRS:84` (or `http://www.opengis.net/def/crs/OGC/1.3/CRS84`) is accepted — every other value returns 400 |
 | `width` | no | `256` | Image width in pixels, max 8000 |
 | `height` | no | `256` | Image height in pixels, max 8000 |

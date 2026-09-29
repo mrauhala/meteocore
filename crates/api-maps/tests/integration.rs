@@ -3074,3 +3074,137 @@ mod per_parameter_times {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Antimeridian-crossing bbox (#828)
+// ---------------------------------------------------------------------------
+
+mod antimeridian {
+    use super::*;
+
+    /// Records the `(bbox, output_crs)` of every render.
+    #[derive(Default)]
+    struct Engine {
+        renders: std::sync::Mutex<Vec<([f64; 4], OutputCrs)>>,
+    }
+
+    impl MapEngine for Engine {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.renders
+                .lock()
+                .unwrap()
+                .push((bbox, output_crs.clone()));
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![Some(0.5); (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                // GOES-West's fixture extent: it crosses the antimeridian.
+                spatial_extent: Some([173.9, 11.2, -174.8, 16.3]),
+                grid_size: None,
+                ..MockMapEngine::make_info()
+            }
+        }
+    }
+
+    async fn request(app: &axum::Router, uri: &str) -> (StatusCode, Option<String>) {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let x_cache = resp
+            .headers()
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string());
+        (resp.status(), x_cache)
+    }
+
+    /// The seam test box `170,10,-170,20` renders (200) instead of a 400,
+    /// and the engine receives it unwrapped to a continuous viewport past
+    /// 180°, on both map routes and in CRS:84 and Web Mercator output.
+    #[tokio::test]
+    async fn crossing_bbox_renders_unwrapped_past_180() {
+        let engine = Arc::new(Engine::default());
+        let app = build_router_with_engine(engine.clone());
+        let last = || engine.renders.lock().unwrap().last().cloned().unwrap();
+
+        for (uri, output_crs) in [
+            (
+                "/collections/radar/map?bbox=170,10,-170,20&width=64&height=32",
+                OutputCrs::Wgs84,
+            ),
+            (
+                "/collections/radar/styles/default/map?bbox=170,10,-170,20&width=32&height=32",
+                OutputCrs::Wgs84,
+            ),
+            (
+                "/collections/radar/map?bbox=170,10,-170,20&bbox-crs=CRS:84&crs=EPSG:3857&width=64&height=64",
+                OutputCrs::WebMercator,
+            ),
+            (
+                "/collections/radar/map?bbox=170,10,-170,20&bbox-crs=http://www.opengis.net/def/crs/OGC/1.3/CRS84&width=16&height=16",
+                OutputCrs::Wgs84,
+            ),
+        ] {
+            let (status, _) = request(&app, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(last(), ([170.0, 10.0, 190.0, 20.0], output_crs), "{uri}");
+        }
+    }
+
+    /// A crossing box is the same viewport as its unwrapped spelling, so
+    /// the two share one cached render.
+    #[tokio::test]
+    async fn crossing_bbox_and_its_unwrapped_spelling_share_the_cache() {
+        let engine = Arc::new(Engine::default());
+        let app = build_router_with_engine(engine.clone());
+        let uri = |bbox: &str| format!("/collections/radar/map?bbox={bbox}&width=64&height=32");
+
+        assert_eq!(
+            request(&app, &uri("170,10,-170,20")).await,
+            (StatusCode::OK, Some("MISS".to_string()))
+        );
+        assert_eq!(
+            request(&app, &uri("170,10,190,20")).await,
+            (StatusCode::OK, Some("HIT".to_string()))
+        );
+        assert_eq!(engine.renders.lock().unwrap().len(), 1);
+    }
+
+    /// Still 400, and never reaching the engine: `west > east` in a
+    /// projected `bbox-crs`, south >= north across the seam, a crossing
+    /// with a longitude outside [-180, 180], and a box of no width.
+    #[tokio::test]
+    async fn invalid_boxes_are_still_rejected() {
+        let engine = Arc::new(Engine::default());
+        let app = build_router_with_engine(engine.clone());
+        for bbox in [
+            "20037508,1000000,-20037508,2000000&bbox-crs=EPSG:3857",
+            "170,20,-170,10",
+            "170,10,-170,10",
+            "190,10,-170,20",
+            "180,10,-180,20",
+            "170,10,170,20",
+        ] {
+            let uri = format!("/collections/radar/map?bbox={bbox}");
+            let (status, _) = request(&app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(engine.renders.lock().unwrap().is_empty());
+    }
+}

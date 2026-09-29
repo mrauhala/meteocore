@@ -507,12 +507,35 @@ impl MapEngine for QueryDataEngine {
         let per_pixel = matches!(output_crs, OutputCrs::Wgs84 | OutputCrs::WebMercator)
             && matches!(gt.crs, ds_core::geo::Crs::Wgs84);
         if per_pixel {
+            // The lat/lon grid is sampled in its own longitude frame, one
+            // turn from a cell west of its first column (as far west as
+            // `sample_grid_bilinear` reaches). A viewport may reach past
+            // ±180° (OGC API Maps unwraps a bbox crossing the antimeridian,
+            // #828), and such a pixel shows the meridian a turn away: 185°
+            // is 175°W. A longitude already in the frame is used as is.
+            let frame = (gt.pixel_width > 0.0).then(|| {
+                let west = gt.origin_x - 0.5 * gt.pixel_width;
+                west..west + 360.0
+            });
+            let in_frame = |lon: f64| match &frame {
+                Some(frame) if !frame.contains(&lon) => {
+                    frame.start + (lon - frame.start).rem_euclid(360.0)
+                }
+                _ => lon,
+            };
             for row in 0..height {
                 let fy = (row as f64 + 0.5) / height as f64;
                 for col in 0..width {
                     let fx = (col as f64 + 0.5) / width as f64;
                     let (lon, lat) = output_crs.project_node(bbox, fx, fy);
-                    values.push(interpolate(&data, lon, lat, param_idx, 0, time_idx));
+                    values.push(interpolate(
+                        &data,
+                        in_frame(lon),
+                        lat,
+                        param_idx,
+                        0,
+                        time_idx,
+                    ));
                 }
             }
         } else {
@@ -1284,6 +1307,53 @@ mod tests {
 
         assert_eq!(result.parameters.len(), 1);
         assert!(result.parameters.contains_key("2 Metre Temperature (2t)"));
+    }
+
+    /// #828: a map viewport reaching past ±180°, as OGC API Maps sends a bbox
+    /// crossing the antimeridian, samples a lat/lon grid at the meridian
+    /// each pixel shows: the Kenya grid a turn east or west renders the
+    /// same pixels as in place.
+    #[test]
+    fn map_viewport_a_turn_away_renders_the_same_lat_lon_grid() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine =
+            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30, 4)
+                .unwrap();
+        let render = |west: f64, east: f64| {
+            let tile = engine
+                .get_raster_tile(
+                    [west, -5.0, east, 5.0],
+                    16,
+                    16,
+                    None,
+                    &OutputCrs::Wgs84,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            tile.values.iter_values().collect::<Vec<_>>()
+        };
+        let in_place = render(33.0, 42.0);
+        let filled = in_place.iter().filter(|v| v.is_some()).count();
+        assert!(
+            filled > in_place.len() / 2,
+            "{filled} of {}",
+            in_place.len()
+        );
+        for (west, east) in [(393.0, 402.0), (-327.0, -318.0)] {
+            let shifted = render(west, east);
+            assert_eq!(shifted.len(), in_place.len());
+            for (i, (a, b)) in in_place.iter().zip(&shifted).enumerate() {
+                match (a, b) {
+                    (Some(a), Some(b)) => {
+                        assert!((a - b).abs() < 1e-9, "{west}..{east} #{i}: {a} vs {b}")
+                    }
+                    (None, None) => {}
+                    _ => panic!("{west}..{east} #{i}: {a:?} vs {b:?}"),
+                }
+            }
+        }
     }
 
     #[test]
