@@ -12,9 +12,9 @@ use serde_json::json;
 use api_common::workbench::Surface;
 use api_common::{mounts, rel, Mount};
 use ds_core::config::CollectionConfig;
-use ds_core::map_engine::MapEngine;
+use ds_core::map_engine::{MapEngine, RasterInfo};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
-use ds_render::{CacheKey, RenderedCache, StyleInfo};
+use ds_render::{CacheKey, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
 
 use crate::error::MapsError;
 use crate::params::{self, LegendFormat, LegendQueryParams, MapQueryParams};
@@ -92,6 +92,72 @@ fn layer_style_map<'a>(
     styles
         .get(collection_id)
         .map(|m| (collection_id.to_string(), m))
+}
+
+/// How a map render turns engine output into pixels.
+enum Paint {
+    /// One parameter through its style's colormap.
+    Colormap(Arc<dyn ColorMap>),
+    /// An RGB composite (#819): its bands from `get_raster_tiles`, composed
+    /// by its channels. It has one style, `default`.
+    Composite(Arc<CompositeSpec>),
+}
+
+/// The RGB composite `parameter-name` names, when the engine serves one
+/// (#819).
+fn composite_parameter(
+    engine: &dyn MapEngine,
+    parameter: Option<&str>,
+) -> Option<Arc<CompositeSpec>> {
+    let name = parameter?;
+    engine
+        .composites()
+        .iter()
+        .find(|c| c.name == name)
+        .map(|def| Arc::new(CompositeSpec::from(def)))
+}
+
+/// Reject a `parameter-name` the collection does not serve: neither a
+/// parameter nor an RGB composite. A collection without a parameter list
+/// has one parameter and ignores the name, matching `get_raster_tile`.
+/// The message lists the valid names in order, so it is deterministic.
+fn check_parameter_name(
+    engine: &dyn MapEngine,
+    info: &RasterInfo,
+    collection_id: &str,
+    parameter: Option<&str>,
+) -> Result<(), MapsError> {
+    let Some(pname) = parameter else {
+        return Ok(());
+    };
+    if info.parameters.is_empty() || info.parameters.iter().any(|p| p.name == pname) {
+        return Ok(());
+    }
+    let composites = engine.composites();
+    if composites.iter().any(|c| c.name == pname) {
+        return Ok(());
+    }
+    let mut supported: Vec<&str> = info
+        .parameters
+        .iter()
+        .map(|p| p.name.as_str())
+        .chain(composites.iter().map(|c| c.name.as_str()))
+        .collect();
+    supported.sort_unstable();
+    Err(MapsError::BadRequest(format!(
+        "parameter-name '{pname}' is not available for collection '{collection_id}'. \
+         Available: {}",
+        supported.join(", ")
+    )))
+}
+
+/// The 404 for a style other than `default` on an RGB composite.
+fn composite_style_not_found(collection_id: &str, composite: &str, style: &str) -> MapsError {
+    MapsError::NotFound(format!(
+        "Style '{style}' not found for parameter '{composite}' of collection \
+         '{collection_id}'. Available: {}",
+        ds_render::COMPOSITE_STYLE
+    ))
 }
 
 /// Map CRS identifier to OGC URI for Content-Crs header.
@@ -229,7 +295,9 @@ pub(crate) fn collection_parts(
     fields.insert("crs".into(), json!(crs_uris));
     fields.insert("styles".into(), json!(style_list));
     // The valid `parameter-name` values of the map routes (#279).
-    if let Some(parameters) = api_common::parameter_names(info, |p| engine.parameter_times(p)) {
+    if let Some(parameters) =
+        api_common::parameter_names(info, &engine.composites(), |p| engine.parameter_times(p))
+    {
         fields.insert(api_common::PARAMETER_NAMES.into(), parameters);
     }
     // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
@@ -702,33 +770,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                     "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
                 }
             },
-            "legend": {
-                "type": "object",
-                "required": ["style", "title", "min", "max", "interpolation", "stops"],
-                "properties": {
-                    "style": {"type": "string", "description": "Style identifier"},
-                    "title": {"type": "string", "description": "Human-readable style title"},
-                    "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
-                    "unit": {"type": "string", "description": "Unit of the rendered values. Omitted when unknown."},
-                    "min": {"type": "number", "description": "Low end of the value range the colours span"},
-                    "max": {"type": "number", "description": "High end of the value range the colours span"},
-                    "interpolation": {"type": "string", "enum": ["linear", "step"],
-                                      "description": "How colours are produced between stops"},
-                    "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
-                    "stops": {
-                        "type": "array",
-                        "description": "Palette colour stops, ascending by value",
-                        "items": {
-                            "type": "object",
-                            "required": ["value", "color"],
-                            "properties": {
-                                "value": {"type": "number"},
-                                "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"}
-                            }
-                        }
-                    }
-                }
-            },
+            "legend": api_common::legend_schema(),
             "link": {
                 "type": "object",
                 "required": ["href"],
@@ -1054,6 +1096,14 @@ pub async fn style_legend(
     let (engine, _config) = lookup_engine(&state, &id)?;
     let format = params.validate()?;
 
+    // An RGB composite's legend is its channel list (#819).
+    if let Some(spec) = composite_parameter(engine.as_ref(), params.parameter_name.as_deref()) {
+        if style_id != ds_render::COMPOSITE_STYLE {
+            return Err(composite_style_not_found(&id, &spec.name, &style_id));
+        }
+        return composite_legend(engine.as_ref(), spec, format).await;
+    }
+
     // `?parameter-name=` selects the per-parameter style layer, so the legend
     // a client draws matches the pixels the map/tile routes render for that
     // same parameter.
@@ -1071,18 +1121,12 @@ pub async fn style_legend(
     // Mirror the render path's validation: an unknown `parameter-name` must
     // 400 with the available list, not fall back to the collection style and
     // emit a legend labelled with a parameter that doesn't exist.
-    if let Some(pname) = params.parameter_name.as_deref() {
-        if !info.parameters.is_empty() && !info.parameters.iter().any(|p| p.name == pname) {
-            let mut supported: Vec<&str> =
-                info.parameters.iter().map(|p| p.name.as_str()).collect();
-            supported.sort_unstable();
-            return Err(MapsError::BadRequest(format!(
-                "parameter-name '{pname}' is not available for collection '{id}'. \
-                 Available: {}",
-                supported.join(", ")
-            )));
-        }
-    }
+    check_parameter_name(
+        engine.as_ref(),
+        &info,
+        &id,
+        params.parameter_name.as_deref(),
+    )?;
     let (parameter, unit) =
         ds_render::legend_parameter_unit(style_info, &info, params.parameter_name.as_deref());
 
@@ -1135,6 +1179,65 @@ pub async fn style_legend(
     }
 }
 
+/// The legend of an RGB composite (#819): its channel list, each channel's
+/// bands, range, gamma and unit, with no colour bar. The units are the
+/// bands' own.
+async fn composite_legend(
+    engine: &dyn MapEngine,
+    spec: Arc<CompositeSpec>,
+    format: LegendFormat,
+) -> Result<Response, MapsError> {
+    let info = engine.raster_info_shared();
+    let units: Vec<Option<String>> = ds_render::composite_units(&spec, &info)
+        .into_iter()
+        .map(|unit| unit.map(str::to_string))
+        .collect();
+    let (content_type, body) = match format {
+        LegendFormat::Json => {
+            let units: Vec<Option<&str>> = units.iter().map(Option::as_deref).collect();
+            let mut response =
+                Json(ds_render::composite_legend_json(&spec, &units)).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(ds_render::LEGEND_CACHE_CONTROL),
+            );
+            response.headers_mut().insert(
+                header::HeaderName::from_static("x-content-type-options"),
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            return Ok(response);
+        }
+        LegendFormat::Png => {
+            let bytes = tokio::task::spawn_blocking(move || {
+                let units: Vec<Option<&str>> = units.iter().map(Option::as_deref).collect();
+                ds_render::render_composite_legend(
+                    &spec,
+                    &units,
+                    ds_render::LEGEND_DEFAULT_WIDTH,
+                    ds_render::LEGEND_DEFAULT_HEIGHT,
+                    ds_render::ImageFormat::Png,
+                )
+            })
+            .await
+            .map_err(|e| MapsError::Internal(format!("Legend render failed: {e}")))?
+            .map_err(|e| MapsError::Internal(format!("Legend render error: {e}")))?;
+            ("image/png", bytes)
+        }
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, ds_render::LEGEND_CACHE_CONTROL),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 /// GET {mount}/collections/{id}/map — render map with default style
 pub async fn get_map(
     headers: HeaderMap,
@@ -1168,25 +1271,53 @@ async fn render_map(
 
     let validated = params.validate()?;
 
+    // An RGB composite (#819) has no style map: its colours come from its
+    // channels, and its one style is `default`.
+    let composite = composite_parameter(engine.as_ref(), validated.parameter_name.as_deref());
+
     // Look up style. A `?parameter-name=` request styles from that
     // parameter's own layer when the collection registers one — otherwise a
     // per-parameter colormap would be unreachable through Maps and every
     // parameter would render with the collection-level default.
-    let (style_layer_key, layer_styles) = layer_style_map(
-        &state.styles,
-        collection_id,
-        validated.parameter_name.as_deref(),
-    )
-    .ok_or_else(|| MapsError::NotFound(format!("Collection '{collection_id}' not found")))?;
+    let (style_layer_key, paint, style_parameter) = match &composite {
+        Some(spec) => {
+            if style_name != ds_render::COMPOSITE_STYLE {
+                return Err(composite_style_not_found(
+                    collection_id,
+                    &spec.name,
+                    style_name,
+                ));
+            }
+            (
+                format!("{collection_id}/{}", spec.name),
+                Paint::Composite(spec.clone()),
+                None,
+            )
+        }
+        None => {
+            let (style_layer_key, layer_styles) = layer_style_map(
+                &state.styles,
+                collection_id,
+                validated.parameter_name.as_deref(),
+            )
+            .ok_or_else(|| {
+                MapsError::NotFound(format!("Collection '{collection_id}' not found"))
+            })?;
 
-    let style_info = layer_styles.get(style_name).ok_or_else(|| {
-        MapsError::NotFound(format!(
-            "Style '{style_name}' not found for collection '{collection_id}'. Available: {}",
-            layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))
-    })?;
+            let style_info = layer_styles.get(style_name).ok_or_else(|| {
+                MapsError::NotFound(format!(
+                    "Style '{style_name}' not found for collection '{collection_id}'. Available: {}",
+                    layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
+                ))
+            })?;
+            (
+                style_layer_key,
+                Paint::Colormap(style_info.colormap.clone()),
+                style_info.parameter.clone(),
+            )
+        }
+    };
 
-    let colormap = style_info.colormap.clone();
     let content_type = validated.format.content_type();
     let has_explicit_time = validated.time.is_some();
     let content_crs = crs_to_uri(&validated.crs);
@@ -1196,38 +1327,19 @@ async fn render_map(
     let raster_info = engine.raster_info_shared();
 
     // Parameter selection precedence: ?parameter-name= wins over style.parameter.
-    // Validate against the engine's advertised list when the query supplied one
-    // — passing through unrecognised names produces a confusing "default
-    // parameter rendered with wrong colormap" rather than a clear 400.
-    // `raster_info().parameters` is empty for single-parameter engines (GeoTIFF);
-    // in that case we just accept the query value and let the engine ignore it,
-    // matching `get_raster_tile`'s documented behavior.
-    if let Some(pname) = validated.parameter_name.as_deref() {
-        if !raster_info.parameters.is_empty()
-            && !raster_info.parameters.iter().any(|p| p.name == pname)
-        {
-            let mut supported: Vec<&str> = raster_info
-                .parameters
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect();
-            // Sort so the error message is deterministic. `raster_info()`
-            // returns parameters in engine-defined order — fine for GRIB
-            // today but a future HashMap-backed engine would surface a
-            // different ordering per request, confusing both log greppers
-            // and clients that try to match against the hint.
-            supported.sort_unstable();
-            return Err(MapsError::BadRequest(format!(
-                "parameter-name '{pname}' is not available for collection '{collection_id}'. \
-                 Available: {}",
-                supported.join(", ")
-            )));
-        }
-    }
-    let effective_parameter = validated
-        .parameter_name
-        .clone()
-        .or_else(|| style_info.parameter.clone());
+    // Validate against the engine's advertised parameters and composites
+    // when the query supplied one — passing through unrecognised names
+    // produces a confusing "default parameter rendered with wrong colormap"
+    // rather than a clear 400.
+    check_parameter_name(
+        engine.as_ref(),
+        &raster_info,
+        collection_id,
+        validated.parameter_name.as_deref(),
+    )?;
+    // For a composite, its name: the engine resolves its time axis, the
+    // scans every band has, like a parameter's.
+    let effective_parameter = validated.parameter_name.clone().or(style_parameter);
 
     // Omitted `datetime`: the engine's default, else the parameter's (else
     // the collection's) latest time.
@@ -1359,12 +1471,18 @@ async fn render_map(
             .into_response());
     }
 
-    // Acquire render semaphore (with timeout to shed load under pressure)
+    // Acquire render semaphore (with timeout to shed load under pressure).
+    // A composite holds one value plane per band.
     let queue_start = std::time::Instant::now();
-    let (job, memory_permit) = ds_executor::RenderJob::acquire_raster(
+    let planes = match &paint {
+        Paint::Colormap(_) => 1,
+        Paint::Composite(spec) => spec.parameters.len(),
+    };
+    let (job, memory_permit) = ds_executor::RenderJob::acquire_raster_planes(
         state.render_semaphore.clone(),
         validated.width,
         validated.height,
+        planes,
     )
     .await
     .map_err(MapsError::from)?;
@@ -1390,6 +1508,38 @@ async fn render_map(
         .run(move || {
             let _memory_permit = worker_memory;
             let mut phases = phases;
+
+            let colormap = match &paint {
+                Paint::Colormap(colormap) => colormap,
+                Paint::Composite(spec) => {
+                    // Bands that share no scan resolve no time: nothing to
+                    // draw, and nothing to cache under a key naming none.
+                    if time.is_none() {
+                        return Ok((None, phases));
+                    }
+                    // Every band from the one timestep the cache key names
+                    // (#507), in the plane order the spec reads.
+                    let bands: Vec<&str> = spec.parameters.iter().map(String::as_str).collect();
+                    let engine_start = std::time::Instant::now();
+                    let tiles = engine.get_raster_tiles(
+                        bbox,
+                        width,
+                        height,
+                        time,
+                        &output_crs,
+                        &bands,
+                        render_z,
+                        reference_time,
+                    )?;
+                    phases.add(RenderPhase::Engine, engine_start.elapsed());
+                    let encode_start = std::time::Instant::now();
+                    let bytes = ds_render::render_composite_tiles(&tiles, spec, format, None)?;
+                    if bytes.is_some() {
+                        phases.add(RenderPhase::Encode, encode_start.elapsed());
+                    }
+                    return Ok((bytes, phases));
+                }
+            };
 
             let engine_start = std::time::Instant::now();
             let tile = engine.get_raster_tile(

@@ -11,12 +11,33 @@ use tokio::sync::Notify;
 /// never source pixels) against [`RENDER_MEMORY`].
 pub const BYTES_PER_PIXEL: u64 = 32;
 
+/// Extra bytes per output pixel for each value plane a render holds beyond
+/// the first: one boxed `Option<f64>` sample, the widest plane an engine
+/// returns. An RGB composite holds one plane per band (#819).
+pub const PLANE_BYTES_PER_PIXEL: u64 = 16;
+
+/// Bytes a raster render of `width × height` output pixels charges while it
+/// holds `planes` value planes at once: [`BYTES_PER_PIXEL`], which covers
+/// one plane, the RGBA output and encoding scratch, plus
+/// [`PLANE_BYTES_PER_PIXEL`] per further plane. `planes` of 0 counts as 1.
+/// `None` when the product overflows, which never fits.
+pub fn raster_bytes(width: u32, height: u32, planes: usize) -> Option<u64> {
+    let extra = u64::try_from(planes.saturating_sub(1))
+        .ok()?
+        .checked_mul(PLANE_BYTES_PER_PIXEL)?;
+    u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(BYTES_PER_PIXEL.checked_add(extra)?)
+}
+
 /// An environment setting, like the other process-wide render/cache budgets.
 /// A single instance survives collection reloads and spans all raster APIs.
 ///
 /// Output-allocation budget in bytes: `MC_RENDER_MEMORY_MB` (default 1024 MiB,
 /// i.e. 33 554 432 output pixels at [`BYTES_PER_PIXEL`]), charged by
-/// `RenderJob::acquire_raster` for every WMS/Maps/Tiles cache miss. At the
+/// `RenderJob::acquire_raster` for every WMS/Maps/Tiles cache miss, and by
+/// `RenderJob::acquire_raster_planes` with [`raster_bytes`] for a render that
+/// holds several value planes (an RGB composite's bands). At the
 /// default it is tighter than the APIs' own 64 M-pixel `MAX_MAP_PIXELS`.
 /// Temporary exhaustion waits in the bounded queue, at most until the render
 /// deadline;
@@ -74,11 +95,9 @@ impl RenderBudget {
         self.expired.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn fits(&self, width: u32, height: u32) -> bool {
-        u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
-            .is_some_and(|bytes| bytes <= self.capacity)
+    /// Whether a charge of `bytes` (from [`raster_bytes`]) can ever fit.
+    pub(crate) fn fits(&self, bytes: Option<u64>) -> bool {
+        bytes.is_some_and(|bytes| bytes <= self.capacity)
     }
 
     pub(crate) fn reject_oversize(&self) {
@@ -89,23 +108,20 @@ impl RenderBudget {
         self.expired.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) async fn reserve(self: &Arc<Self>, width: u32, height: u32) -> RenderPermit {
+    pub(crate) async fn reserve(self: &Arc<Self>, bytes: Option<u64>) -> RenderPermit {
         loop {
             let released = self.released.notified();
             tokio::pin!(released);
             // Register before checking availability so a concurrent release cannot be lost.
             released.as_mut().enable();
-            if let Some(permit) = self.try_reserve(width, height) {
+            if let Some(permit) = self.try_reserve(bytes) {
                 return permit;
             }
             released.await;
         }
     }
 
-    pub(crate) fn try_reserve(self: &Arc<Self>, width: u32, height: u32) -> Option<RenderPermit> {
-        let bytes = u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL));
+    pub(crate) fn try_reserve(self: &Arc<Self>, bytes: Option<u64>) -> Option<RenderPermit> {
         if let Some(bytes) = bytes {
             if self
                 .used
@@ -145,27 +161,50 @@ mod tests {
     #[test]
     fn mixed_size_admission_and_release() {
         let budget = Arc::new(RenderBudget::new(100 * BYTES_PER_PIXEL));
-        let small = budget.try_reserve(2, 5).unwrap();
-        let large = budget.try_reserve(9, 10).unwrap();
+        let small = budget.try_reserve(raster_bytes(2, 5, 1)).unwrap();
+        let large = budget.try_reserve(raster_bytes(9, 10, 1)).unwrap();
         assert_eq!(budget.available(), 0);
-        assert!(budget.try_reserve(1, 1).is_none());
+        assert!(budget.try_reserve(raster_bytes(1, 1, 1)).is_none());
         drop(small);
         assert_eq!(budget.available(), 10 * BYTES_PER_PIXEL);
-        assert!(budget.try_reserve(11, 10).is_none());
+        assert!(budget.try_reserve(raster_bytes(11, 10, 1)).is_none());
         drop(large);
         assert_eq!(budget.available(), budget.capacity());
-        assert!(budget.try_reserve(u32::MAX, u32::MAX).is_none());
+        assert!(budget
+            .try_reserve(raster_bytes(u32::MAX, u32::MAX, 1))
+            .is_none());
+    }
+
+    /// Each value plane past the first adds `PLANE_BYTES_PER_PIXEL`: a
+    /// three-band composite charges twice a single-band render.
+    #[test]
+    fn planes_add_to_the_single_plane_charge() {
+        assert_eq!(raster_bytes(10, 10, 1), Some(100 * BYTES_PER_PIXEL));
+        assert_eq!(raster_bytes(10, 10, 0), raster_bytes(10, 10, 1));
+        assert_eq!(raster_bytes(10, 10, 3), Some(200 * BYTES_PER_PIXEL));
+        assert_eq!(
+            raster_bytes(10, 10, 4),
+            Some(100 * (BYTES_PER_PIXEL + 3 * PLANE_BYTES_PER_PIXEL))
+        );
+        assert_eq!(raster_bytes(u32::MAX, u32::MAX, 2), None);
+        let budget = Arc::new(RenderBudget::new(2 * BYTES_PER_PIXEL));
+        assert!(budget.fits(raster_bytes(1, 1, 3)));
+        assert!(!budget.fits(raster_bytes(1, 1, 4)));
+        let composite = budget.try_reserve(raster_bytes(1, 1, 3)).unwrap();
+        assert!(budget.try_reserve(raster_bytes(1, 1, 1)).is_none());
+        drop(composite);
+        assert_eq!(budget.available(), budget.capacity());
     }
 
     #[test]
     fn worker_retains_reservation_after_request_is_dropped() {
         let budget = Arc::new(RenderBudget::new(BYTES_PER_PIXEL));
-        let request = Arc::new(budget.try_reserve(1, 1).unwrap());
+        let request = Arc::new(budget.try_reserve(raster_bytes(1, 1, 1)).unwrap());
         let worker = request.clone();
         drop(request);
-        assert!(budget.try_reserve(1, 1).is_none());
+        assert!(budget.try_reserve(raster_bytes(1, 1, 1)).is_none());
         drop(worker);
-        assert!(budget.try_reserve(1, 1).is_some());
+        assert!(budget.try_reserve(raster_bytes(1, 1, 1)).is_some());
     }
 
     #[test]
@@ -178,7 +217,7 @@ mod tests {
                     let budget = budget.clone();
                     let barrier = barrier.clone();
                     scope.spawn(move || {
-                        let permit = budget.try_reserve(1, 1);
+                        let permit = budget.try_reserve(raster_bytes(1, 1, 1));
                         barrier.wait();
                         permit
                     })

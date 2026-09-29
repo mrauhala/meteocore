@@ -17,11 +17,15 @@ pub use colormap::{
     LutColorMap, OverlayColorMap,
 };
 pub use composite::{
-    compose_rgb, composite_legend_json, render_composite, render_composite_legend, ChannelSource,
-    ChannelSpec, CompositeSpec,
+    compose_rgb, compose_tiles, composite_legend_json, composite_units, render_composite,
+    render_composite_legend, render_composite_tiles, ChannelSource, ChannelSpec, CompositeSpec,
+    COMPOSITE_STYLE,
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp, flatten_onto};
-pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
+pub use metatile::{
+    render_metatiled, render_metatiled_composite, MetaTile, MetaTileStats, TileKeyPrefix,
+    TilePixelCache,
+};
 pub use palette::{
     builtin_palette, builtin_palette_arc, builtin_palettes, Interpolation, Palette, PaletteInsert,
     PaletteRegistry,
