@@ -11,6 +11,7 @@
 mod cache;
 mod frame;
 mod naming;
+mod render;
 mod source;
 
 use std::collections::{BTreeMap, HashMap};
@@ -25,7 +26,9 @@ use ds_core::error::DataServerError;
 use ds_core::feature::{
     check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, MAX_AREA_DIM,
 };
-use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
+use ds_core::map_engine::{
+    select_common_time, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile,
+};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
@@ -37,7 +40,7 @@ use ds_storage::object_store::path::Path as ObjectPath;
 pub use cache::{frame_metrics, strip_metrics};
 
 use cache::{BlockKey, FrameKey, FRAMES, STRIPS};
-use frame::{Frame, FrameOptions, OVERVIEW_FACTOR};
+use frame::{Frame, FrameOptions};
 use naming::Naming;
 use source::Source;
 
@@ -400,6 +403,14 @@ impl SatelliteEngine {
         }
     }
 
+    /// The products a multi-band request names, in its order.
+    fn product_indices(&self, parameters: &[&str]) -> Result<Vec<usize>, DataServerError> {
+        parameters
+            .iter()
+            .map(|name| self.product_index(Some(name)))
+            .collect()
+    }
+
     /// The scan `get_raster_tile` renders for a product at `time`: the
     /// latest at or before it, the first when `time` precedes every scan,
     /// the newest when `time` is `None`. The one selection both rendering
@@ -418,6 +429,19 @@ impl SatelliteEngine {
                 .map(|(t, _)| *t),
             None => frames.keys().next_back().copied(),
         }
+    }
+
+    /// The scan a multi-band render of the products `indices` uses:
+    /// [`Self::select`]'s rule over the scans they all have
+    /// ([`select_common_time`]). The one selection `get_raster_tiles` and
+    /// [`MapEngine::resolve_parameters_time`] use (#507).
+    fn select_common(
+        catalog: &Catalog,
+        indices: &[usize],
+        time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let axes: Vec<&[DateTime<Utc>]> = indices.iter().map(|&i| &*catalog.times[i]).collect();
+        select_common_time(&axes, time)
     }
 
     /// The scans an EDR query addresses for one product: every scan for no
@@ -896,78 +920,23 @@ impl MapEngine for SatelliteEngine {
         _z: Option<f64>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
-        let index = self.product_index(parameter)?;
-        let catalog = self.catalog.load();
-        let empty = || RasterTile {
-            width,
-            height,
-            values: vec![None; width as usize * height as usize].into(),
-        };
-        let Some(time) = Self::select(&catalog, index, time) else {
-            return Ok(empty());
-        };
-        let frame = self.frame(index, time, &catalog.frames[index][&time])?;
+        self.render(bbox, width, height, time, output_crs, parameter)
+    }
 
-        // The part of the disk the request sees decides the level: sample
-        // the overview when a full-resolution read would take several
-        // source pixels per output pixel.
-        let [west, south, east, north] = bbox;
-        let Some((c0, r0, c1, r1)) = frame.gt.bbox_to_pixels(west, south, east, north) else {
-            return Ok(empty());
-        };
-        let density = f64::max(
-            (c1 - c0) as f64 / width as f64,
-            (r1 - r0) as f64 / height as f64,
-        );
-        let overview = density >= OVERVIEW_FACTOR as f64;
-        let gt = if overview {
-            &frame.overview.gt
-        } else {
-            &frame.gt
-        };
-
-        // Output→source mapping on a coarse grid (Critical Rule 5). Points
-        // the satellite cannot see project to NaN; the grid refines cells on
-        // the limb, and no footprint guard is needed: there is no far side
-        // for a coarse cell to alias onto.
-        let grid = ProjectionGrid::build_2d(
-            width,
-            height,
-            gt.width,
-            gt.height,
-            |fx, fy| output_crs.project_node(bbox, fx, fy),
-            |lon, lat| gt.world_to_pixel_f64(lon, lat),
-        );
-
-        let mut reader = PixelReader::new(self.frame_key(index, time), &frame);
-        let mut values = Vec::with_capacity(width as usize * height as usize);
-        for oy in 0..height {
-            for ox in 0..width {
-                let (c, r) = grid.sample(ox, oy);
-                let inside = c.is_finite()
-                    && r.is_finite()
-                    && c >= 0.0
-                    && r >= 0.0
-                    && c < gt.width as f64
-                    && r < gt.height as f64;
-                if !inside {
-                    values.push(None);
-                    continue;
-                }
-                let (col, row) = (c as usize, r as u32);
-                let raw = if overview {
-                    frame.overview.raw[row as usize * gt.width as usize + col]
-                } else {
-                    reader.raw(row, col as u32)?
-                };
-                values.push(frame.packing.decode(raw));
-            }
-        }
-        Ok(RasterTile {
-            width,
-            height,
-            values: values.into(),
-        })
+    /// Every band from one scan, sharing the coordinate map between bands
+    /// on the same grid (`render.rs`).
+    fn get_raster_tiles(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        parameters: &[&str],
+        _z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Vec<RasterTile>, DataServerError> {
+        self.render_bands(bbox, width, height, time, output_crs, parameters)
     }
 
     fn raster_info(&self) -> RasterInfo {
@@ -1001,6 +970,21 @@ impl MapEngine for SatelliteEngine {
             return time;
         };
         Self::select(&self.catalog.load(), index, time).or(time)
+    }
+
+    fn resolve_parameters_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        if parameters.is_empty() {
+            return self.resolve_parameter_time(None, time, reference_time);
+        }
+        let Ok(indices) = self.product_indices(parameters) else {
+            return time;
+        };
+        Self::select_common(&self.catalog.load(), &indices, time)
     }
 }
 
