@@ -297,6 +297,23 @@ pub fn encode_jpeg(
 /// such frames, and the encode runs on the render path, so speed wins.
 const WEBP_LOSSY_METHOD: i32 = 0;
 
+/// libwebp's lossless effort (`WebPConfig::quality` with `lossless = 1`,
+/// method 0). 25 instead of the earlier 75: measured on 2310×1734 RGBA
+/// frames, a release build on an M2 Max, it encodes 1.6–3.2× faster for
+/// 6–8% more bytes on continuous-tone satellite IR:
+///
+/// | frame | effort 75 | effort 25 |
+/// |---|---|---|
+/// | IR, 1×1 source px | 1,486,936 B, 696 ms | 1,582,630 B, 216 ms |
+/// | IR, 2×2 source px | 575,300 B, 184 ms | 615,196 B, 77 ms |
+/// | IR, 4×4 source px | 212,102 B, 63 ms | 228,418 B, 39 ms |
+/// | radar-like, 11 classes | 36,414 B, 25 ms | 35,154 B, 16 ms |
+///
+/// Palette imagery such as radar even comes out smaller. Methods 1–4 would
+/// be 25–30% smaller but 5–9× slower, and lossy WebP (`QUALITY` < 100) is the
+/// way to make continuous-tone frames small.
+const WEBP_LOSSLESS_EFFORT: f32 = 25.0;
+
 /// Encode an RGBA buffer to WebP bytes at `quality`.
 ///
 /// `quality` [`MAX_QUALITY`](crate::MAX_QUALITY) (100, the default) is
@@ -347,14 +364,13 @@ pub fn encode_webp(
         .map_err(|()| DataServerError::Render("WebP config init failed".to_string()))?;
     if quality >= crate::MAX_QUALITY {
         // Lossless, with `exact` to keep transparent pixels' RGB intact.
-        // `method = 0` is the fastest lossless effort (`WebPConfig::new()`
-        // defaults to 4); `quality` is the effort within it, and 75 is
-        // unchanged since lossless WebP first shipped so its bytes and
-        // ETags stay stable.
+        // `method = 0` is the fastest lossless method (`WebPConfig::new()`
+        // defaults to 4); `quality` is the effort within it, see
+        // [`WEBP_LOSSLESS_EFFORT`].
         config.lossless = 1;
         config.method = 0;
         config.alpha_compression = 0;
-        config.quality = 75.0;
+        config.quality = WEBP_LOSSLESS_EFFORT;
         config.exact = 1;
     } else {
         config.lossless = 0;
