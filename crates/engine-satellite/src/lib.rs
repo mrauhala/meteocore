@@ -1,15 +1,17 @@
-//! Geostationary satellite imagery (#819): GOES-R ABI NetCDF-4 scans served
-//! through WMS, OGC API Maps and Tiles.
+//! Geostationary satellite imagery (#819): GOES-R ABI and Himawari ISatSS
+//! NetCDF-4 scans, and NOAA's GMGSI global mosaic, served through WMS, OGC
+//! API Maps, Tiles and EDR.
 //!
-//! One collection is one satellite and sector; each configured product (an
-//! ABI band, or an L2 field such as cloud top temperature) is a parameter
-//! with its own time axis. The poll loop lists the source, downloads each
-//! new scan whole and keeps it in memory ([`cache::FRAMES`]); renders
-//! decode only the blocks they touch ([`cache::STRIPS`]) or, zoomed out,
-//! sample the overview built at ingest.
+//! One collection is one satellite and sector (or one mosaic); each
+//! configured product (an ABI band, or an L2 field such as cloud top
+//! temperature) is a parameter with its own time axis. The poll loop lists
+//! the source, downloads each new scan whole and keeps it in memory
+//! ([`cache::FRAMES`]); renders decode only the blocks they touch
+//! ([`cache::STRIPS`]) or, zoomed out, sample the overview built at ingest.
 
 mod cache;
 mod frame;
+mod mercator;
 mod naming;
 mod render;
 mod source;
@@ -116,6 +118,8 @@ struct Catalog {
 
 pub struct SatelliteEngine {
     collection_id: Arc<str>,
+    /// `RasterInfo.native_crs`: `"geos"`, or `"EPSG:3857"` for GMGSI.
+    native_crs: &'static str,
     source: Source,
     products: Vec<Product>,
     parameters: Vec<ParameterInfo>,
@@ -151,6 +155,7 @@ impl SatelliteEngine {
                         &p.product,
                         p.band.expect("validate_satellite requires an ISatSS band"),
                     ),
+                    "gmgsi" => Naming::gmgsi(&p.product),
                     _ => Naming::goes_r(&p.product, p.band),
                 },
                 // ISatSS writes space as ~0 K and declares no fill or range:
@@ -182,6 +187,13 @@ impl SatelliteEngine {
                 unit: p.unit.clone(),
             })
             .collect();
+        // GMGSI's global mosaic is a spherical-Mercator grid; every other
+        // provider's is the satellite's view.
+        let native_crs = if config.provider == "gmgsi" {
+            "EPSG:3857"
+        } else {
+            "geos"
+        };
         let composites: Arc<[CompositeDef]> = config.composites.iter().map(composite_def).collect();
         let composite_bands: Vec<Vec<usize>> = composites
             .iter()
@@ -203,10 +215,12 @@ impl SatelliteEngine {
             &parameters,
             vec![None; products.len()],
             vec![None; products.len()],
+            native_crs,
             &composite_bands,
         );
         Ok(Self {
             collection_id: collection_id.into(),
+            native_crs,
             source,
             products,
             parameters,
@@ -343,7 +357,7 @@ impl SatelliteEngine {
                 match self.ingest(index, scan.time, &scan.paths) {
                     Ok(frame) => {
                         if extents[index].is_none() {
-                            extents[index] = ds_core::geo::crs84_extent(frame.gt.bbox());
+                            extents[index] = frame.extent();
                         }
                         grids[index].get_or_insert([frame.gt.width, frame.gt.height]);
                         frames[index].insert(scan.time, scan.paths);
@@ -382,6 +396,7 @@ impl SatelliteEngine {
             &self.parameters,
             extents,
             grids,
+            self.native_crs,
             &self.composite_bands,
         );
         self.catalog.store(Arc::new(Catalog {
@@ -615,6 +630,7 @@ impl Catalog {
         parameters: &[ParameterInfo],
         extents: Vec<Option<[f64; 4]>>,
         grids: Vec<Option<[u32; 2]>>,
+        native_crs: &str,
         composite_bands: &[Vec<usize>],
     ) -> Catalog {
         // A grid size is advertised only when every product with a scan
@@ -637,7 +653,7 @@ impl Catalog {
             .map(|bands| shared_times(&times, bands))
             .collect();
         let info = RasterInfo {
-            native_crs: "geos".to_string(),
+            native_crs: native_crs.to_string(),
             spatial_extent,
             times: union,
             parameter: parameters[0].name.clone(),
@@ -853,7 +869,8 @@ impl EdrEngine for SatelliteEngine {
             for time in own {
                 ds_core::deadline::check()?;
                 let frame = self.frame(index, time, &catalog.frames[index][&time])?;
-                let Some((col, row)) = frame.gt.world_to_pixel(lon, lat) else {
+                let (c, r) = frame.gt.world_to_pixel_f64(lon, lat);
+                let Some((col, row)) = frame.pixel(false, c, r) else {
                     continue;
                 };
                 on_disk = true;
@@ -874,7 +891,7 @@ impl EdrEngine for SatelliteEngine {
         }
         if !on_disk {
             return Err(DataServerError::LocationNotFound(format!(
-                "POINT({lon} {lat}) is not on the Earth disk '{}' sees",
+                "POINT({lon} {lat}) is outside the imagery '{}' covers",
                 self.collection_id
             )));
         }
@@ -908,7 +925,7 @@ impl EdrEngine for SatelliteEngine {
             .is_some_and(|extent| polygon.bbox.intersects_bbox(&extent));
         if !seen {
             return Err(DataServerError::LocationNotFound(format!(
-                "The polygon lies outside the Earth disk '{}' sees",
+                "The polygon lies outside the imagery '{}' covers",
                 self.collection_id
             )));
         }
@@ -926,12 +943,12 @@ impl EdrEngine for SatelliteEngine {
             };
             let probe = self.frame(*index, first, &catalog.frames[*index][&first])?;
             resolution = resolution.min(probe.gt.pixel_width / 111_320.0);
-            if let Some((c0, r0, c1, r1)) =
-                probe.gt.bbox_to_pixels(b.west, b.south, b.east, b.north)
-            {
-                let per_scan = probe.blocks_in(c0, r0, c1, r1);
-                blocks = blocks.saturating_add(per_scan.saturating_mul(own.len()));
-            }
+            let per_scan: usize = probe
+                .windows([b.west, b.south, b.east, b.north])
+                .iter()
+                .map(|&[c0, r0, c1, r1]| probe.blocks_in(c0, r0, c1, r1))
+                .sum();
+            blocks = blocks.saturating_add(per_scan.saturating_mul(own.len()));
         }
         Self::check_block_budget(blocks)?;
         let axes = polygon.sample_grid(resolution, resolution, MAX_AREA_DIM);
@@ -956,11 +973,12 @@ impl EdrEngine for SatelliteEngine {
                 let gt = &frame.gt;
                 // Output cells → source pixels on a coarse grid (the
                 // geostationary forward transform is the expensive step).
-                let grid = ProjectionGrid::build_2d(
+                let grid = ProjectionGrid::build_2d_periodic(
                     nx as u32,
                     ny as u32,
                     gt.width,
                     gt.height,
+                    frame.period(false),
                     |fx, fy| (b.west + fx * span, b.north - fy * (b.north - b.south)),
                     |lon, lat| gt.world_to_pixel_f64(lon, lat),
                 );
@@ -974,14 +992,8 @@ impl EdrEngine for SatelliteEngine {
                             continue;
                         }
                         let (c, r) = grid.sample(ix as u32, iy as u32);
-                        let inside = c.is_finite()
-                            && r.is_finite()
-                            && c >= 0.0
-                            && r >= 0.0
-                            && c < gt.width as f64
-                            && r < gt.height as f64;
-                        if inside {
-                            values[offset + cell] = reader.value(r as u32, c as u32)?;
+                        if let Some((col, row)) = frame.pixel(false, c, r) {
+                            values[offset + cell] = reader.value(row, col)?;
                         }
                     }
                 }
@@ -1166,6 +1178,7 @@ mod tests {
                 &parameters,
                 vec![None; 2],
                 grids,
+                "geos",
                 &[],
             )
             .info

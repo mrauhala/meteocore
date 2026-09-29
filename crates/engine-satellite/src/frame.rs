@@ -9,13 +9,14 @@
 //!
 //! A block is a rectangle of the grid decoded at once: `block_rows` by
 //! `block_cols` pixels, row-major, the last row and column of blocks
-//! clipped to the grid. A GOES-R block is a strip of chunk rows across the
-//! full width.
+//! clipped to the grid. A single file's block is one chunk: a GOES-R chunk
+//! (so a block) is a strip of rows across the full width, a GMGSI chunk a
+//! quarter of its width.
 
 use std::sync::Arc;
 
 use ds_core::cf::{coordinate_scale, crs_from_grid_mapping, CfAttr};
-use ds_core::geo::{Crs, GeoTransform};
+use ds_core::geo::{crs84_extent, Crs, GeoTransform};
 use hdf5_reader::storage::{BytesStorage, DynStorage};
 use netcdf_reader::{NcAttrValue, NcFile, NcOpenOptions, NcSliceInfo, NcSliceInfoElem, NcType};
 
@@ -34,24 +35,51 @@ const MAX_MOSAIC_CELLS: u64 = 4_096;
 /// Block height when the variable is not chunked.
 const DEFAULT_BLOCK_ROWS: u32 = 24;
 
+/// The stored integer a `float` field's missing value is carried as.
+const FLOAT_MISSING: u16 = u16::MAX;
+
 pub(crate) struct Frame {
     files: Files,
     variable: String,
-    /// Whether the variable is stored as `short` (read as `i16`); the
-    /// values may still be unsigned (`_Unsigned = "true"`, as GOES-R CMI).
-    stored_signed: bool,
+    stored: Stored,
+    /// Leading dimensions before `(y, x)`, each of size 1 (GMGSI's `time`),
+    /// read at index 0.
+    leading: usize,
     pub packing: Packing,
     /// Full-resolution grid.
     pub gt: GeoTransform,
+    /// Columns per 360° of longitude when the grid wraps around the globe
+    /// (GMGSI): its columns are then read modulo this ([`Frame::pixel`]).
+    pub col_period: Option<f64>,
     /// Rows per decoded block: the variable's chunk height, so a block read
     /// inflates each chunk once; a mosaic's tile height.
     pub block_rows: u32,
-    /// Columns per decoded block: the full width, so a block is a strip; a
-    /// mosaic's tile width.
+    /// Columns per decoded block: the variable's chunk width (a GOES-R
+    /// chunk spans the full width, so its block is a strip); a mosaic's
+    /// tile width.
     pub block_cols: u32,
     pub overview: Overview,
     /// Bytes this frame holds (the files plus the overview), for the cache.
     pub weight: u64,
+}
+
+/// How a field's values are stored, and so read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stored {
+    /// `short`, read as `i16`; the values may still be unsigned
+    /// (`_Unsigned = "true"`, as GOES-R CMI).
+    Short,
+    /// `ushort`, read as `u16`.
+    UShort,
+    /// `float` holding whole-number counts, as GMGSI's 0–255 display
+    /// counts: each is carried as its `u16`, its `_FillValue`, NaN and any
+    /// value outside `valid_range` as [`FLOAT_MISSING`]. A value that is not
+    /// a whole count in `0..FLOAT_MISSING` fails the block, and so the scan
+    /// (its overview reads every block at ingest).
+    FloatCounts {
+        fill: Option<f32>,
+        valid: Option<(f32, f32)>,
+    },
 }
 
 /// Where a scan's pixels are.
@@ -78,10 +106,13 @@ pub(crate) struct FrameOptions<'a> {
 /// One parsed file of a scan.
 struct Part {
     nc: NcFile,
-    stored_signed: bool,
+    stored: Stored,
+    leading: usize,
     packing: Packing,
     gt: GeoTransform,
+    col_period: Option<f64>,
     chunk_rows: u32,
+    chunk_cols: u32,
 }
 
 /// Every [`OVERVIEW_FACTOR`]-th pixel of the full grid, as stored integers.
@@ -163,13 +194,14 @@ impl Frame {
             return Err("a scan with no files".to_string());
         };
         // A mosaic's tiles must agree with the first (checked in `mosaic`).
-        let (packing, stored_signed) = (first.packing, first.stored_signed);
-        let (files, gt, block_rows, block_cols) = if parts.len() == 1 {
+        let (packing, stored, leading) = (first.packing, first.stored, first.leading);
+        let (files, gt, col_period, block_rows, block_cols) = if parts.len() == 1 {
             let part = parts.pop().expect("one part");
-            let width = part.gt.width;
-            (Files::Single(part.nc), part.gt, part.chunk_rows, width)
+            let (rows, cols) = (part.chunk_rows, part.chunk_cols);
+            (Files::Single(part.nc), part.gt, part.col_period, rows, cols)
         } else {
-            mosaic(parts)?
+            let (files, gt, rows, cols) = mosaic(parts)?;
+            (files, gt, None, rows, cols)
         };
         let placeholder = GeoTransform {
             width: 0,
@@ -179,9 +211,11 @@ impl Frame {
         let mut frame = Frame {
             files,
             variable: options.variable.to_string(),
-            stored_signed,
+            stored,
+            leading,
             packing,
             gt,
+            col_period,
             block_rows,
             block_cols,
             overview: Overview {
@@ -257,22 +291,183 @@ impl Frame {
             end: range.end as u64,
             step: 1,
         };
-        let selection = NcSliceInfo {
-            selections: vec![slice(rows), slice(cols)],
-        };
+        let mut selections = vec![NcSliceInfoElem::Index(0); self.leading];
+        selections.extend([slice(rows), slice(cols)]);
+        let selection = NcSliceInfo { selections };
         let read = |e: netcdf_reader::Error| format!("block {index} of '{}': {e}", self.variable);
-        let raw: Arc<[u16]> = if self.stored_signed {
-            let values = nc
-                .read_variable_slice::<i16>(&self.variable, &selection)
-                .map_err(read)?;
-            values.iter().map(|&v| v as u16).collect()
-        } else {
-            let values = nc
-                .read_variable_slice::<u16>(&self.variable, &selection)
-                .map_err(read)?;
-            values.iter().copied().collect()
+        let raw: Arc<[u16]> = match self.stored {
+            Stored::Short => {
+                let values = nc
+                    .read_variable_slice::<i16>(&self.variable, &selection)
+                    .map_err(read)?;
+                values.iter().map(|&v| v as u16).collect()
+            }
+            Stored::UShort => {
+                let values = nc
+                    .read_variable_slice::<u16>(&self.variable, &selection)
+                    .map_err(read)?;
+                values.iter().copied().collect()
+            }
+            Stored::FloatCounts { fill, valid } => {
+                let values = nc
+                    .read_variable_slice::<f32>(&self.variable, &selection)
+                    .map_err(read)?;
+                values
+                    .iter()
+                    .map(|&v| float_count(v, fill, valid))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("block {index} of '{}': {e}", self.variable))?
+            }
         };
         Ok(raw)
+    }
+
+    /// Columns per 360° on the full grid or the overview, for a global
+    /// grid: what a `ProjectionGrid` over that level unwraps its columns by.
+    pub fn period(&self, overview: bool) -> Option<f64> {
+        let factor = if overview {
+            OVERVIEW_FACTOR as f64
+        } else {
+            1.0
+        };
+        self.col_period.map(|p| p / factor)
+    }
+
+    /// The pixel `(col, row)` of the full grid (or the overview) holding
+    /// the fractional source position `(c, r)`, such as a
+    /// `ProjectionGrid` samples; `None` off the grid, or where the mapping
+    /// is undefined (a geostationary point the satellite cannot see).
+    ///
+    /// A global grid's columns wrap modulo its period. Where its columns
+    /// fall short of a whole turn (GMGSI's by 0.38 px), a position in the
+    /// sliver between the last column and the first reads the nearer of
+    /// the two: nearest-neighbour across the seam.
+    ///
+    /// Both levels resolve the position on the full grid, and the overview
+    /// then reads the cell holding that pixel. An overview cell spans
+    /// [`OVERVIEW_FACTOR`] pixels, so its last column or row can reach past
+    /// the grid's edge: GMGSI's 4999 columns make 1250 cells, 5000 pixels,
+    /// more than its 4999.378-pixel turn. Resolved at the overview's own
+    /// scale, the seam's sliver would fall inside that last cell, and the
+    /// half of it nearer the first column would read the last one.
+    ///
+    /// Everywhere else the overview's own extent bounds it: a position in
+    /// the outer slice of its last row, or of its last column on an axis
+    /// that does not wrap, reads that cell (whose sample the overview
+    /// clamps to the grid's last pixel), and one past the extent reads
+    /// nothing.
+    pub fn pixel(&self, overview: bool, c: f64, r: f64) -> Option<(u32, u32)> {
+        if !overview {
+            return self.full_pixel(c, r);
+        }
+        let (o, factor) = (&self.overview.gt, OVERVIEW_FACTOR as f64);
+        let inside = |v: f64, n: u32| v.is_finite() && v >= 0.0 && v < n as f64;
+        // The grid's last pixel, for a position past it in the last cell.
+        let last = |n: u32| (n - 1) as f64;
+        if !inside(r, o.height) {
+            return None;
+        }
+        let r = (r * factor).min(last(self.gt.height));
+        let c = if self.col_period.is_some() {
+            c * factor
+        } else if inside(c, o.width) {
+            (c * factor).min(last(self.gt.width))
+        } else {
+            return None;
+        };
+        let (col, row) = self.full_pixel(c, r)?;
+        Some((col / OVERVIEW_FACTOR, row / OVERVIEW_FACTOR))
+    }
+
+    /// [`Self::pixel`] on the full grid.
+    fn full_pixel(&self, c: f64, r: f64) -> Option<(u32, u32)> {
+        let gt = &self.gt;
+        if !(r.is_finite() && r >= 0.0 && r < gt.height as f64) {
+            return None;
+        }
+        let width = gt.width as f64;
+        let c = match self.col_period {
+            Some(period) => {
+                let c = c.rem_euclid(period);
+                if c >= width {
+                    if c - width < (period - width) / 2.0 {
+                        width - 1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    c
+                }
+            }
+            None => c,
+        };
+        (c.is_finite() && c >= 0.0 && c < width).then_some((c as u32, r as u32))
+    }
+
+    /// The full-grid pixel windows `[c0, r0, c1, r1]` (exclusive ends) a
+    /// CRS84 bbox covers: none when it misses the grid, one on a regional
+    /// grid, and on a global grid two when it crosses the grid's seam (the
+    /// bbox's longitudes read modulo 360°; one wider than a turn covers
+    /// every column).
+    pub fn windows(&self, bbox: [f64; 4]) -> Vec<[u32; 4]> {
+        let [west, south, east, north] = bbox;
+        let Some(period) = self.col_period else {
+            return self
+                .gt
+                .bbox_to_pixels(west, south, east, north)
+                .map(|(c0, r0, c1, r1)| vec![[c0, r0, c1, r1]])
+                .unwrap_or_default();
+        };
+        let gt = &self.gt;
+        // A global grid's CRS is separable (x from longitude alone, y from
+        // latitude alone): rows from the latitudes, columns from the
+        // longitudes.
+        let row = |lat: f64| (gt.origin_y - gt.crs.forward(0.0, lat).1) / gt.pixel_height;
+        let col = |lon: f64| (gt.crs.forward(lon, 0.0).0 - gt.origin_x) / gt.pixel_width;
+        let (r0, r1) = (
+            row(north).floor().max(0.0),
+            row(south).ceil().min(gt.height as f64),
+        );
+        let span = if east >= west {
+            east - west
+        } else {
+            east + 360.0 - west
+        };
+        let (width, start) = (gt.width as f64, col(west));
+        let (a, b) = (
+            start.rem_euclid(period),
+            start.rem_euclid(period) + col(west + span) - start,
+        );
+        if !(r0 < r1 && a.is_finite() && b.is_finite()) {
+            return Vec::new();
+        }
+        let (r0, r1) = (r0 as u32, r1 as u32);
+        if b - a >= period {
+            return vec![[0, r0, gt.width, r1]];
+        }
+        // From `a` to the end of the turn (a start past the last column,
+        // in the seam's sliver, reads the last column) …
+        let c0 = a.floor().min(width - 1.0);
+        let c1 = b.min(width).ceil().max(c0 + 1.0);
+        let mut windows = vec![[c0 as u32, r0, c1 as u32, r1]];
+        // … and on from the first column into the next turn.
+        if b > period {
+            windows.push([0, r0, (b - period).ceil().clamp(1.0, width) as u32, r1]);
+        }
+        windows
+    }
+
+    /// The CRS84 extent of the grid: every longitude for a global grid,
+    /// with west > east when a regional grid crosses the antimeridian.
+    pub fn extent(&self) -> Option<[f64; 4]> {
+        if self.col_period.is_none() {
+            return crs84_extent(self.gt.bbox());
+        }
+        let gt = &self.gt;
+        let lat = |y: f64| gt.crs.inverse(gt.origin_x, y).map(|(_, lat)| lat);
+        let north = lat(gt.origin_y)?;
+        let south = lat(gt.origin_y - gt.height as f64 * gt.pixel_height)?;
+        crs84_extent([-180.0, south, 180.0, north])
     }
 
     /// Every [`OVERVIEW_FACTOR`]-th pixel (the centre of each factor²
@@ -324,8 +519,9 @@ impl Frame {
 }
 
 impl Part {
-    /// Parse one file's NetCDF-4 bytes: the field's packing, its grid from
-    /// the CF grid mapping and 1-D coordinates, and its chunk height.
+    /// Parse one file's NetCDF-4 bytes: the field's packing, its grid (from
+    /// a CF grid mapping and 1-D coordinates, or 2-D lat/lon arrays) and
+    /// its chunk shape.
     fn open(bytes: Vec<u8>, options: FrameOptions) -> Result<Part, String> {
         let variable = options.variable;
         let storage: DynStorage = Arc::new(BytesStorage::new(bytes));
@@ -341,27 +537,40 @@ impl Part {
             .variable(variable)
             .map_err(|e| format!("variable '{variable}': {e}"))?;
         let dims = var.dimensions();
-        if dims.len() != 2 {
+        // (y, x), after leading dimensions of size 1 (GMGSI's `time`).
+        let leading = dims.len().saturating_sub(2);
+        if dims.len() < 2 || dims[..leading].iter().any(|d| d.size != 1) {
             return Err(format!(
-                "variable '{variable}' has {} dimensions, expected (y, x)",
-                dims.len()
+                "variable '{variable}' has dimensions {:?}, expected (y, x) after any of size 1",
+                dims.iter().map(|d| (&d.name, d.size)).collect::<Vec<_>>()
             ));
         }
-        let (y_name, x_name) = (dims[0].name.clone(), dims[1].name.clone());
-        let (ny, nx) = (to_u32(dims[0].size)?, to_u32(dims[1].size)?);
+        let (y_dim, x_dim) = (&dims[leading], &dims[leading + 1]);
+        let (y_name, x_name) = (y_dim.name.clone(), x_dim.name.clone());
+        let (ny, nx) = (to_u32(y_dim.size)?, to_u32(x_dim.size)?);
         let unsigned_attr = text_attr(var.attribute("_Unsigned").map(|a| &a.value))
             .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-        let stored_signed = match var.dtype() {
-            NcType::Short => true,
-            NcType::UShort => false,
+        let number = |name: &str| var.attribute(name).and_then(|a| a.value.as_f64());
+        let valid_range = var
+            .attribute("valid_range")
+            .and_then(|a| a.value.as_f64_vec())
+            .filter(|v| v.len() == 2);
+        let stored = match var.dtype() {
+            NcType::Short => Stored::Short,
+            NcType::UShort => Stored::UShort,
+            NcType::Float => Stored::FloatCounts {
+                fill: number("_FillValue").map(|v| v as f32),
+                valid: valid_range.as_ref().map(|v| (v[0] as f32, v[1] as f32)),
+            },
             other => {
                 return Err(format!(
-                    "variable '{variable}' is {other:?}; only packed short/ushort fields are served"
+                    "variable '{variable}' is {other:?}; only packed short/ushort fields and \
+                     float counts are served"
                 ))
             }
         };
+        let stored_signed = stored == Stored::Short;
         let signed = stored_signed && !unsigned_attr;
-        let number = |name: &str| var.attribute(name).and_then(|a| a.value.as_f64());
         // Attributes are stored in the variable's own type: a `short` fill
         // of -1 is the bit pattern 0xFFFF even when `_Unsigned` reads it as
         // 65535.
@@ -372,72 +581,114 @@ impl Part {
                 v as u16
             }
         };
-        let packing = Packing {
-            signed,
-            scale: number("scale_factor").unwrap_or(1.0),
-            offset: number("add_offset").unwrap_or(0.0),
-            fill: number("_FillValue").map(as_raw),
-            valid: var
-                .attribute("valid_range")
-                .and_then(|a| a.value.as_f64_vec())
-                .filter(|v| v.len() == 2)
-                .map(|v| {
-                    let bound = |b: f64| {
-                        let raw = as_raw(b);
-                        if signed {
-                            raw as i16 as i32
-                        } else {
-                            raw as i32
-                        }
-                    };
-                    (bound(v[0]), bound(v[1]))
-                })
-                .or(options.valid_fallback),
+        let packing = match stored {
+            // Carried as whole counts; the missing ones as FLOAT_MISSING.
+            Stored::FloatCounts { .. } => Packing {
+                signed: false,
+                scale: number("scale_factor").unwrap_or(1.0),
+                offset: number("add_offset").unwrap_or(0.0),
+                fill: Some(FLOAT_MISSING),
+                valid: None,
+            },
+            Stored::Short | Stored::UShort => Packing {
+                signed,
+                scale: number("scale_factor").unwrap_or(1.0),
+                offset: number("add_offset").unwrap_or(0.0),
+                fill: number("_FillValue").map(as_raw),
+                valid: valid_range
+                    .map(|v| {
+                        let bound = |b: f64| {
+                            let raw = as_raw(b);
+                            if signed {
+                                raw as i16 as i32
+                            } else {
+                                raw as i32
+                            }
+                        };
+                        (bound(v[0]), bound(v[1]))
+                    })
+                    .or(options.valid_fallback),
+            },
         };
 
-        let mapping = text_attr(var.attribute("grid_mapping").map(|a| &a.value))
-            .ok_or_else(|| format!("variable '{variable}' has no grid_mapping"))?;
-        let mapping_var = nc
-            .variable(mapping.trim())
-            .map_err(|e| format!("grid mapping '{mapping}': {e}"))?;
-        let attr = |name: &str| mapping_var.attribute(name).and_then(|a| cf_attr(&a.value));
-        let crs = crs_from_grid_mapping(|name| {
-            attr(name).or_else(|| match name {
-                // ISatSS names the earth figure without CF's `_axis`.
-                "semi_major_axis" => attr("semi_major"),
-                "semi_minor_axis" => attr("semi_minor"),
-                _ => None,
-            })
-        })?;
-        let (x0, dx, x_units) = coordinate_axis(&nc, &x_name)?;
-        let (y0, dy, _) = coordinate_axis(&nc, &y_name)?;
-        let scale = coordinate_scale(&x_units, &crs)
-            .ok_or_else(|| format!("coordinate '{x_name}' has unusable units '{x_units}'"))?;
-        let gt = GeoTransform::from_cell_centres(
-            x0 * scale,
-            dx * scale,
-            y0 * scale,
-            dy * scale,
-            nx,
-            ny,
-            crs,
-        )?;
+        // A CF grid mapping with 1-D x/y coordinates (GOES-R, ISatSS), or
+        // 2-D lat/lon arrays forming a global Mercator grid (GMGSI).
+        let (gt, col_period) = match text_attr(var.attribute("grid_mapping").map(|a| &a.value)) {
+            Some(mapping) => (cf_grid(&nc, &mapping, &x_name, &y_name, nx, ny)?, None),
+            None => {
+                let grid = crate::mercator::from_lat_lon(&nc, var, &y_name, &x_name)
+                    .map_err(|e| format!("variable '{variable}' has no grid_mapping, and {e}"))?;
+                (grid.gt, Some(grid.col_period))
+            }
+        };
 
-        let chunk_rows = hdf5_reader::Hdf5File::from_storage(storage)
+        // The chunk's extent over (y, x): a block inflates each chunk once.
+        let chunks = hdf5_reader::Hdf5File::from_storage(storage)
             .ok()
-            .and_then(|h5| h5.dataset(variable).ok()?.chunks())
-            .and_then(|chunks| chunks.first().copied())
-            .filter(|&rows| rows > 0)
-            .unwrap_or(DEFAULT_BLOCK_ROWS)
-            .min(ny);
+            .and_then(|h5| h5.dataset(variable).ok()?.chunks());
+        let chunk = |axis: usize| {
+            chunks
+                .as_ref()
+                .and_then(|c| c.get(leading + axis).copied())
+                .filter(|&n| n > 0)
+        };
+        let chunk_rows = chunk(0).unwrap_or(DEFAULT_BLOCK_ROWS).min(ny);
+        let chunk_cols = chunk(1).unwrap_or(nx).min(nx);
         Ok(Part {
             nc,
-            stored_signed,
+            stored,
+            leading,
             packing,
             gt,
+            col_period,
             chunk_rows,
+            chunk_cols,
         })
     }
+}
+
+/// The grid of a field with a CF grid mapping and regular 1-D x/y
+/// coordinates.
+fn cf_grid(
+    nc: &NcFile,
+    mapping: &str,
+    x_name: &str,
+    y_name: &str,
+    nx: u32,
+    ny: u32,
+) -> Result<GeoTransform, String> {
+    let mapping_var = nc
+        .variable(mapping.trim())
+        .map_err(|e| format!("grid mapping '{mapping}': {e}"))?;
+    let attr = |name: &str| mapping_var.attribute(name).and_then(|a| cf_attr(&a.value));
+    let crs = crs_from_grid_mapping(|name| {
+        attr(name).or_else(|| match name {
+            // ISatSS names the earth figure without CF's `_axis`.
+            "semi_major_axis" => attr("semi_major"),
+            "semi_minor_axis" => attr("semi_minor"),
+            _ => None,
+        })
+    })?;
+    let (x0, dx, x_units) = coordinate_axis(nc, x_name)?;
+    let (y0, dy, _) = coordinate_axis(nc, y_name)?;
+    let scale = coordinate_scale(&x_units, &crs)
+        .ok_or_else(|| format!("coordinate '{x_name}' has unusable units '{x_units}'"))?;
+    GeoTransform::from_cell_centres(x0 * scale, dx * scale, y0 * scale, dy * scale, nx, ny, crs)
+}
+
+/// A `float` field's value `v` as its whole count: missing (its fill, NaN,
+/// outside its valid range) as [`FLOAT_MISSING`].
+fn float_count(v: f32, fill: Option<f32>, valid: Option<(f32, f32)>) -> Result<u16, String> {
+    if v.is_nan() || Some(v) == fill || valid.is_some_and(|(lo, hi)| v < lo || v > hi) {
+        return Ok(FLOAT_MISSING);
+    }
+    if v.fract() != 0.0 || !(0.0..FLOAT_MISSING as f32).contains(&v) {
+        return Err(format!(
+            "value {v} is not a whole count in 0..{FLOAT_MISSING}; float fields are served \
+             only as display counts"
+        ));
+    }
+    Ok(v as u16)
 }
 
 /// Place a scan's tiles on one lattice: equal tiles in one CRS, pixel size
@@ -445,13 +696,19 @@ impl Part {
 /// The grid is the lattice's bounding box; a lattice cell with no tile
 /// reads as missing.
 fn mosaic(parts: Vec<Part>) -> Result<(Files, GeoTransform, u32, u32), String> {
+    if parts.iter().any(|p| p.col_period.is_some()) {
+        return Err("a global grid is a whole scan, not a tile of one".to_string());
+    }
     let first = &parts[0];
     let template = first.gt.clone();
     let (w, h) = (first.gt.width, first.gt.height);
     let (pw, ph) = (first.gt.pixel_width, first.gt.pixel_height);
     let same = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs());
     for part in &parts[1..] {
-        if part.packing != first.packing || part.stored_signed != first.stored_signed {
+        if part.packing != first.packing
+            || part.stored != first.stored
+            || part.leading != first.leading
+        {
             return Err("the tiles of a scan are packed differently".to_string());
         }
         if part.gt.crs != first.gt.crs
@@ -640,7 +897,7 @@ fn to_u32(size: u64) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mosaic, Frame, FrameOptions, Packing, Part, OVERVIEW_FACTOR};
+    use super::{float_count, mosaic, Frame, FrameOptions, Packing, Part, OVERVIEW_FACTOR};
 
     /// GOES-R CMI: stored `short`, `_Unsigned = "true"`, fill `-1s`,
     /// `valid_range = 0s, 4095s`, 12-bit brightness temperatures.
@@ -820,5 +1077,244 @@ mod tests {
                 .unwrap_or_else(|| panic!("shift ({dx}, {dy}) accepted"));
             assert!(err.contains("lattice"), "shift ({dx}, {dy}): {err}");
         }
+    }
+
+    /// The decimated GMGSI fixture (`testdata/gmgsi`): 60 × 102 pixels of
+    /// a global spherical-Mercator mosaic, float counts.
+    fn gmgsi() -> Frame {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../testdata/gmgsi/\
+             GLOBCOMPLIR_v3r0_blend_s202609281200000_e202609281209599_c202609281234509.nc",
+        );
+        let options = FrameOptions {
+            variable: "data",
+            valid_fallback: None,
+        };
+        Frame::open(vec![std::fs::read(path).unwrap()], options).unwrap()
+    }
+
+    /// The grid recognised from the fixture's lat/lon arrays puts each
+    /// pixel's centre where PROJ puts the latitude and longitude the file
+    /// gives it: `cs2cs -d 3 EPSG:4326 EPSG:3857` (PROJ 9.8.1) of the
+    /// `lat`/`lon` values at pixel (row, col). Columns wrap modulo the
+    /// period, the grid starting at 178.2°E.
+    #[test]
+    fn gmgsi_grid_matches_cs2cs() {
+        let frame = gmgsi();
+        let gt = &frame.gt;
+        assert_eq!(gt.crs, ds_core::geo::Crs::WebMercator);
+        assert_eq!((gt.width, gt.height), (102, 60));
+        let period = frame.col_period.unwrap();
+        assert!(
+            (period - 4999.378 / 49.0).abs() < 1e-3,
+            "the period is 4999.378 / 49 columns"
+        );
+        for (row, col, x, y) in [
+            (0, 0, 20_037_466.041, 12_015_991.631),
+            (0, 101, 19_633_635.664, 12_015_991.631),
+            (59, 0, 20_037_466.041, -11_631_215.643),
+            (59, 101, 19_633_635.664, -11_631_215.643),
+            (30, 51, -5_565.975, -8_014.849),
+            (10, 30, -8_254_030.774, 8_007_985.343),
+            (45, 80, 11_385_170.865, -6_020_015.024),
+        ] {
+            let c = ((x - gt.origin_x) / gt.pixel_width).rem_euclid(period);
+            let r = (gt.origin_y - y) / gt.pixel_height;
+            // 1e-4 px is ~40 m on this 393 km grid.
+            assert!(
+                (c - (col as f64 + 0.5)).abs() < 1e-4 && (r - (row as f64 + 0.5)).abs() < 1e-4,
+                "pixel ({row}, {col})"
+            );
+        }
+    }
+
+    /// Float counts are carried whole; the fill is no value; the chunk
+    /// (1 × 16 × 27) is the block, clipped at the edges.
+    #[test]
+    fn gmgsi_blocks_are_chunks_of_whole_counts() {
+        let frame = gmgsi();
+        assert_eq!((frame.block_rows, frame.block_cols), (16, 27));
+        assert_eq!(frame.block_count(), 16);
+        let last = frame.read_block(15).unwrap();
+        assert_eq!(last.len(), 12 * 21);
+        let (index, offset) = frame.locate(0, 0);
+        let first = frame
+            .packing
+            .decode(frame.read_block(index).unwrap()[offset]);
+        assert_eq!(first, Some(160.0));
+        assert!(frame.overview.raw.iter().all(|&raw| {
+            let v = frame.packing.decode(raw).unwrap();
+            (13.0..=255.0).contains(&v)
+        }));
+
+        assert_eq!(float_count(160.0, Some(-9999.0), None), Ok(160));
+        assert_eq!(float_count(-9999.0, Some(-9999.0), None), Ok(u16::MAX));
+        assert_eq!(float_count(f32::NAN, None, None), Ok(u16::MAX));
+        assert_eq!(float_count(300.0, None, Some((0.0, 255.0))), Ok(u16::MAX));
+        assert!(float_count(271.5, None, None).is_err());
+        assert!(float_count(-3.0, None, None).is_err());
+        assert!(frame.packing.decode(u16::MAX).is_none());
+    }
+
+    /// Columns wrap modulo the period on the grid and the overview; the
+    /// sliver of the turn past the last column reads the nearer edge
+    /// column; rows do not wrap.
+    #[test]
+    fn gmgsi_columns_wrap_and_the_seam_sliver_reads_the_nearer_column() {
+        let frame = gmgsi();
+        let period = frame.col_period.unwrap();
+        assert_eq!(frame.pixel(false, 5.5, 3.2), Some((5, 3)));
+        assert_eq!(frame.pixel(false, 5.5 + period, 3.2), Some((5, 3)));
+        assert_eq!(frame.pixel(false, -0.5, 0.0), Some((101, 0)));
+        // The sliver [102, period) splits at its middle.
+        let sliver = period - 102.0;
+        assert!(sliver > 0.0 && sliver < 0.05, "a sliver under 0.05 px");
+        assert_eq!(
+            frame.pixel(false, 102.0 + sliver * 0.4, 0.0),
+            Some((101, 0))
+        );
+        assert_eq!(frame.pixel(false, 102.0 + sliver * 0.6, 0.0), Some((0, 0)));
+        assert_eq!(frame.pixel(false, 5.0, -0.1), None);
+        assert_eq!(frame.pixel(false, 5.0, 60.0), None);
+        assert_eq!(frame.pixel(false, f64::NAN, 1.0), None);
+        // The overview: 26 × 15 cells, a period of a quarter.
+        let o = &frame.overview.gt;
+        assert_eq!((o.width, o.height), (26, 15));
+        assert_eq!(frame.pixel(true, -0.5, 0.0), Some((25, 0)));
+        assert_eq!(frame.pixel(true, 25.5 + period / 4.0, 14.9), Some((25, 14)));
+    }
+
+    /// A grid whose sides are not a multiple of the overview factor: the
+    /// outer slice of the overview's last column and last row lies past the
+    /// grid's edge but inside the cell, and reads that cell; past the
+    /// overview's extent is nothing (#906 review). The C13 crop cut to
+    /// 318 × 237 pixels: 80 × 60 cells spanning 320 × 240.
+    #[test]
+    fn overview_edge_cells_read_their_outer_slice() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../testdata/goes19-abi/\
+             OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc",
+        );
+        let cmi = FrameOptions {
+            variable: "CMI",
+            valid_fallback: None,
+        };
+        let mut frame = Frame::open(vec![std::fs::read(path).unwrap()], cmi).unwrap();
+        (frame.gt.width, frame.gt.height) = (318, 237);
+        frame.overview = frame.build_overview().unwrap();
+        let o = &frame.overview.gt;
+        assert_eq!((o.width, o.height), (80, 60));
+        // The last column's and last row's outer slices: 79.7 × 4 = 318.8
+        // and 59.5 × 4 = 238 lie past the grid, inside the last cells.
+        assert_eq!(frame.pixel(true, 79.7, 10.2), Some((79, 10)));
+        assert_eq!(frame.pixel(true, 10.2, 59.5), Some((10, 59)));
+        assert_eq!(frame.pixel(true, 79.99, 59.99), Some((79, 59)));
+        // Their inner parts, and the rest of the overview, as before.
+        assert_eq!(frame.pixel(true, 79.2, 10.2), Some((79, 10)));
+        assert_eq!(frame.pixel(true, 10.2, 59.1), Some((10, 59)));
+        // Past the overview's extent, or before it: nothing.
+        for (c, r) in [(80.0, 10.0), (10.0, 60.0), (-0.1, 10.0), (10.0, -0.1)] {
+            assert_eq!(frame.pixel(true, c, r), None, "overview ({c}, {r})");
+        }
+        // The full grid keeps its own edge.
+        assert_eq!(frame.pixel(false, 317.9, 236.9), Some((317, 236)));
+        assert_eq!(frame.pixel(false, 318.0, 10.0), None);
+        assert_eq!(frame.pixel(false, 10.0, 237.0), None);
+
+        // A global grid's rows likewise, its columns still wrapping at the
+        // seam: GMGSI's fixture cut to 58 rows makes 15 cells of 60.
+        let mut global = gmgsi();
+        global.gt.height = 58;
+        global.overview = global.build_overview().unwrap();
+        assert_eq!(global.overview.gt.height, 15);
+        assert_eq!(global.pixel(true, 5.2, 14.8), Some((5, 14)));
+        assert_eq!(global.pixel(true, 5.2, 15.0), None);
+        let period = global.col_period.unwrap();
+        assert_eq!(global.pixel(true, 5.2 + period / 4.0, 14.8), Some((5, 14)));
+    }
+
+    /// The overview resolves a position on the full grid, then reads the
+    /// cell holding that pixel. Its 26 cells span 104 pixels, past the
+    /// 102.028-pixel turn, so at its own scale the seam's sliver falls
+    /// inside the last cell (#906 review): the sliver's eastern half, where
+    /// the full grid reads the first column, read the last column's cell.
+    #[test]
+    fn gmgsi_overview_resolves_the_seam_on_the_full_grid() {
+        let frame = gmgsi();
+        let period = frame.col_period.unwrap();
+        let factor = OVERVIEW_FACTOR as f64;
+        assert_eq!(frame.overview.gt.width, 26);
+        assert!(
+            26.0 * factor > period,
+            "the last cell reaches past the turn"
+        );
+        let sliver = |f: f64| 102.0 + f * (period - 102.0);
+        // East of the sliver's middle: the first column, and its cell.
+        assert_eq!(frame.pixel(false, sliver(0.9), 7.0), Some((0, 7)));
+        assert_eq!(
+            frame.pixel(true, sliver(0.9) / factor, 7.0 / factor),
+            Some((0, 1))
+        );
+        // West of it: the last column, and its cell.
+        assert_eq!(frame.pixel(false, sliver(0.1), 7.0), Some((101, 7)));
+        assert_eq!(
+            frame.pixel(true, sliver(0.1) / factor, 7.0 / factor),
+            Some((25, 1))
+        );
+        // Across the seam and into the next turn, every overview lookup
+        // is the cell of the pixel the full grid reads.
+        for i in 0..=4000 {
+            let c = 95.0 + i as f64 * 0.003;
+            for r in [0.5, 30.2, 59.9] {
+                let full = frame
+                    .pixel(false, c, r)
+                    .map(|(col, row)| (col / OVERVIEW_FACTOR, row / OVERVIEW_FACTOR));
+                assert_eq!(frame.pixel(true, c / factor, r / factor), full, "step {i}");
+            }
+        }
+    }
+
+    /// A bbox's pixel windows on the global grid: one inside it, two across
+    /// its seam (170°E → 170°W, given either way), the whole width for a
+    /// turn or more, none off its rows.
+    #[test]
+    fn gmgsi_windows_split_at_the_seam() {
+        let frame = gmgsi();
+        let spans = |bbox: [f64; 4]| {
+            frame
+                .windows(bbox)
+                .iter()
+                .map(|w| (w[0], w[2]))
+                .collect::<Vec<_>>()
+        };
+        // 20°E–40°E: 5.7 columns of 3.53°, from column 57.
+        let inside = spans([20.0, 0.0, 40.0, 10.0]);
+        assert_eq!(inside.len(), 1);
+        let (c0, c1) = inside[0];
+        assert!(
+            c0 >= 56 && c1 <= 64 && c1 - c0 >= 6,
+            "20°E–40°E is about columns 57 to 63"
+        );
+        // West > east, and east past 180°.
+        for (k, seam) in [[170.0, 10.0, -170.0, 20.0], [170.0, 10.0, 190.0, 20.0]]
+            .into_iter()
+            .enumerate()
+        {
+            let windows = spans(seam);
+            assert_eq!(windows.len(), 2, "seam box {k}");
+            assert_eq!(windows[0].1, 102, "seam box {k}");
+            assert_eq!(windows[1].0, 0, "seam box {k}");
+            let cols: u32 = windows.iter().map(|(a, b)| b - a).sum();
+            assert!((6..=9).contains(&cols), "seam box {k}");
+        }
+        assert_eq!(spans([-180.0, 0.0, 180.0, 10.0]), [(0, 102)]);
+        assert_eq!(spans([-540.0, 0.0, 540.0, 10.0]), [(0, 102)]);
+        let rows = frame.windows([0.0, -10.0, 10.0, 10.0]);
+        assert!(
+            rows[0][1] < 30 && rows[0][3] > 30,
+            "10°S–10°N holds the equator's row"
+        );
+        assert!(frame.windows([0.0, 80.0, 10.0, 85.0]).is_empty());
+        assert_eq!(frame.extent().map(|e| [e[0], e[2]]), Some([-180.0, 180.0]));
     }
 }

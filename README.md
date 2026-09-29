@@ -28,7 +28,7 @@ Each engine implements one or more of the core traits.
 | `engine-odim` | `EdrEngine` + `MapEngine` (composites); `EdrEngine` + `MapEngine` + `VolumeEngine` + `FeatureEngine` (polar volumes) | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
-| `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans and Himawari-9 AHI ISatSS tiles (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
+| `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans, Himawari-9 AHI ISatSS tiles and NOAA's hourly GMGSI global mosaic (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
@@ -170,7 +170,7 @@ not re-scan the auto roots.
 | `MC_ODIM_COMPOSITE_CACHE_MB` | `2048` | ODIM decoded-composite (COMP) cache size in MB. `0` disables. |
 | `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | GeoTIFF decoded-chunk cache for local and remote sources, in MB. `0` disables. |
 | `MC_SATELLITE_FRAME_CACHE_MB` | `1024` | Satellite scans held in memory (the compressed NetCDF file plus its overview, ~30 MB per 2 km full disk), in MB. A scan evicted here is downloaded again when a render needs it. |
-| `MC_SATELLITE_STRIP_CACHE_MB` | `256` | Satellite decoded blocks (GOES-R: strips of 24 full-width rows, ~260 KB each at 2 km), in MB. |
+| `MC_SATELLITE_STRIP_CACHE_MB` | `256` | Satellite decoded blocks (GOES-R: strips of 24 full-width rows, ~260 KB each at 2 km; GMGSI: 793 × 1322 chunks, ~2 MB each), in MB. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool. Raise for high-latency object stores; value must be ≥ 1. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
 
@@ -1279,6 +1279,37 @@ Requesting a composite:
 EDR serves position (the pixel's time series), area and radius. A response's time axis is the union of the selected products' scans, null where a product has none, and `parameter_names` gives each product its own `extent.temporal`.
 
 Bandwidth: each scan is downloaded whole (band 13 ~24 MB, cloud top temperature ~30 MB per 10 minutes), and startup ingests the whole window. `collections.d/goes19-fd.toml` (GOES-East) and `collections.d/goes18-fd.toml` (GOES-West) are runnable examples. Brightness temperature and cloud top temperature (unit K) take the `ir_bt_enhanced` palette by default.
+
+#### GMGSI global mosaic
+
+`gmgsi` reads NOAA's Global Mosaic of Geostationary Satellite Imagery (`s3://noaa-gmgsi-pds`, `GMGSI_<product>/%Y/%m/%d/%H/GLOBCOMP…_s<start>_….nc`): one global file per hour, ~8 km, 72°S to 72°N at every longitude, composited from GOES-East, GOES-West, Meteosat-10, Meteosat-9 and Himawari-9. It is the quickest worldwide layer that includes Europe. `product` is the mosaic: `LW` (longwave IR, ~7.4 MB), `SW` (shortwave IR), `WV` (water vapour, ~3.4 MB) or `VIS`; it takes no `band`, and `variable` is `data`. Files are published ~35–45 minutes after the hour, so a bucket window must reach back past the latest published hour.
+
+- **Values are 8-bit display counts, not physical units.** The file says `units = "K"`, but its values are the mosaic's 0–255 grey levels: high is cold (IR) or moist (water vapour). Declare `unit = "1"` and style them on a grey ramp over 0–255. They are for display, not for measurement or composites. EDR serves the counts.
+- **The grid** is spherical Web Mercator (EPSG:3857, `native_crs` `"EPSG:3857"`). The file has no grid mapping, only 2-D lat/lon arrays, so the engine recognises a regular global Mercator grid from them when it ingests a file, and refuses the file otherwise.
+- **The seam at 180°** renders continuously, including views that wrap the world and projected views. The 4999 columns fall 0.38 px short of 360°, and that sliver reads the nearer edge column.
+
+```toml
+[satellite]
+provider = "gmgsi"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "noaa-gmgsi-pds"
+time_window = "-PT3H"                             # past the latest published hour
+poll_interval_secs = 300
+
+[[satellite.products]]
+parameter = "ir_longwave"
+title = "Longwave IR (display counts)"
+unit = "1"
+product = "LW"
+variable = "data"
+
+[wms]
+colormap = "grayscale"                            # 0 black … 255 white
+min = 0.0
+max = 255.0
+```
+
+`collections.d/gmgsi-global.toml` is a runnable example with longwave IR and water vapour.
 
 ## OGC 3D Tiles
 

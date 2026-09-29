@@ -21,12 +21,13 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   storage type: a `short` fill of −1 is `0xFFFF` (`frame.rs` `as_raw`).
 - **Reads go by blocks** (`Frame::{locate, read_block, blocks_in}`): a
   rectangle of `block_rows` × `block_cols` pixels, row-major, clipped at
-  the grid's edges. A GOES-R block is a strip: the chunk rows
+  the grid's edges. A single file's block is one chunk over (y, x)
   (`Dataset::chunks()`, via hdf5-reader on the same in-memory storage as
-  netcdf-reader, so no second copy) across the full width, so a block read
-  inflates each chunk once. The reader's own chunk cache is off because
-  decoded blocks are cached in `cache::STRIPS`, which keeps its phase-2
-  name, env var and metric family.
+  netcdf-reader, so no second copy), so a block read inflates each chunk
+  once. A GOES-R chunk spans the full width, so its block is a strip;
+  GMGSI's is 793 × 1322, a quarter of the width. The reader's own chunk
+  cache is off because decoded blocks are cached in `cache::STRIPS`, which
+  keeps its phase-2 name, env var and metric family.
 - **No request-time S3 in the steady state.** The poll loop downloads each
   new scan whole and inserts it into `cache::FRAMES`. A scan the cache
   evicted is fetched again by `Source::fetch` → `DataStore::get`, from a
@@ -78,6 +79,56 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
 - **Overview**: a render whose source window spans ≥ `OVERVIEW_FACTOR`
   (4) source pixels per output pixel samples the ingest-time overview
   instead of decoding strips. A full-disk decode is ~160 ms.
+- **GMGSI is a global spherical-Mercator mosaic** (`provider = "gmgsi"`,
+  NOAA's hourly Global Mosaic of Geostationary Satellite Imagery).
+  - The file has no `grid_mapping`, only 2-D `lat`/`lon` arrays.
+    `mercator::from_lat_lon` recognises the grid from them at ingest:
+    separable (checked on the first and last rows and columns), longitude
+    linear in the column, latitude linear in the row in Mercator northing
+    (`ds_core::web_mercator`), all to 0.01 px, rows north to south, and
+    columns spanning 360° to within a pixel. Anything else fails the scan.
+    No pixel's lat/lon is ever looked up at render time (Critical Rule 5).
+  - Each array is one deflated chunk of 15 M floats. Reading its first and
+    last rows or columns still inflates the whole chunk: ~55 ms and a
+    ~120 MB transient per array. A whole scan ingests in ~240 ms (release).
+  - The CRS is `Crs::WebMercator` (EPSG:3857, via `ds_core::web_mercator`
+    only), `RasterInfo.native_crs` `"EPSG:3857"`.
+  - The grid starts at 179.99962°E and its x runs on past 180° unwrapped.
+    Columns wrap modulo `Frame::col_period`, 4999.378 columns per 360°:
+    8016 m square pixels on the 3857 sphere, 0.072009°, not 0.072°. The 4999
+    columns fall 0.38 px short of a turn (NOAA cut the 5000th with
+    `ncks -d xc,0,4998`). `Frame::pixel` reads that sliver as the nearer edge
+    column: nearest-neighbour across the seam, so the seam renders
+    continuously. The overview resolves a position on the full grid too,
+    then reads the cell holding that pixel: its 1250 cells span 5000
+    pixels, past the turn, so resolved at its own scale the sliver's
+    eastern half would read the last cell (#906 review). Off the seam, the
+    overview's own extent bounds it: the outer slice of its last row, or of
+    its last column on an axis that does not wrap, reads that cell.
+  - Every column lookup in a render or an EDR query goes through
+    `Frame::pixel`, and every bbox → pixel window through `Frame::windows`
+    (two windows across the seam). `ProjectionGrid::build_2d_periodic` gets
+    the level's period (`render::CoordinateMaps::onto` for renders), so
+    cells across the seam or a projected output's longitude cut (EPSG:3035
+    along 170°W) interpolate correctly.
+    `tests/gmgsi.rs` pins the seam (170°E → 170°W), wrapped world copies and
+    that cut against the file's own lat/lon.
+  - **Values are 8-bit display counts, not Kelvin**, despite
+    `units = "K"`: `long_name` "0-255 Brightness Temperature", range 3–255,
+    cold/moist high. Serve them with unit `"1"` and a grey palette, never as
+    an input to physical composites.
+  - They are stored `float`: `Stored::FloatCounts` carries each as its
+    whole `u16`, the fill and NaN as `FLOAT_MISSING`. A value that is not a
+    whole count fails its block, and so the scan: the overview reads every
+    block at ingest.
+  - The field is `data(time, yc, xc)`. Leading dimensions of size 1 are
+    read at index 0.
+  - Products `LW`, `SW`, `WV`, `VIS` (`GMGSI_<product>/%Y/%m/%d/%H/`, files
+    `GLOBCOMP{LIR,SIR,WV,VIS}_v3r0_blend_s%Y%m%d%H%M%S<tenths>_…nc`); `band`
+    is refused. `GMGSI_SSR` stopped in 2025 and names its files otherwise.
+    Hourly, ~7.4 MB (WV ~3.4, VIS ~8.9), published ~35–45 min after the
+    hour, so a bucket window must reach back past the latest published hour
+    (the example uses `-PT3H`).
 - **Multi-band renders** (`get_raster_tiles`, for RGB composites) live in
   `render.rs` next to the single-band path, and share `render_scan` with it.
   - Every band comes from the scan `time` names exactly, with no per-band
@@ -88,8 +139,8 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     `select_common`: `select`'s rule over the shared scans, via
     `ds_core::map_engine::select_common_time`.
   - `CoordinateMaps` builds one `ProjectionGrid` per distinct sampled grid,
-    full resolution or overview, compared field by field. Bands of one
-    resolution share it. `render::tests` counts the builds.
+    full resolution or overview, compared field by field with its column
+    period (a global grid's). Bands of one resolution share it. `render::tests` counts the builds.
   - Frames and blocks go through `frame()` and `PixelReader` exactly as in
     a single-band render, so the refetch rules above hold unchanged.
 - **RGB composites are layers, not parameters** (`[[satellite.composites]]`,
@@ -115,26 +166,28 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
 
 ## Config
 
-`[satellite]`: `provider = "goes-r" | "isatss"`, `data_path` XOR
+`[satellite]`: `provider = "goes-r" | "isatss" | "gmgsi"`, `data_path` XOR
 `endpoint`+`bucket`, `time_window` (required for a bucket: ≤ 24 h of GOES-R
-hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
+or GMGSI hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
 `Naming::validate_window`),
 `poll_interval_secs`, and `[[satellite.products]]` with `parameter`, `title`,
 `unit` (declared: styles resolve at load, before any scan), `product`,
-`band` (required for ISatSS, whose `product` is the sector, `HFD`),
-`variable`. `[[satellite.composites]]` with `name` (`^[a-z0-9_]+$`, not a
-product parameter), `title` (defaults to the name) and `red`, `green`,
-`blue`, each `{ parameter, minus, min, max, gamma }`: `minus` makes a band
-difference, `min > max` inverts, `gamma` defaults to 1. `parameter` and
-`minus` name product parameters. `recipe` is reserved and a load error until built-in recipes
-land; unknown keys in a composite are a load error. Validation:
+`band` (required for ISatSS, whose `product` is the sector, `HFD`; refused
+for GMGSI, whose `product` is the mosaic, `ds_core::config::GMGSI_PRODUCTS`),
+`variable` (`data` for GMGSI). `[[satellite.composites]]` with `name`
+(`^[a-z0-9_]+$`, not a product parameter), `title` (defaults to the name)
+and `red`, `green`, `blue`, each `{ parameter, minus, min, max, gamma }`:
+`minus` makes a band difference, `min > max` inverts, `gamma` defaults to 1.
+`parameter` and `minus` name product parameters. `recipe` is reserved and a
+load error until built-in recipes land; unknown keys in a composite are a
+load error. Validation:
 `ds_core::config::validate_satellite`.
 
 ## Bandwidth
 
 Each scan is downloaded whole: GOES-19 band 13 ~24 MB, cloud top temperature
-~30 MB per 10 minutes, Himawari-9 band 13 ~26 MB in 88 tiles; startup
-ingests the whole window. The user is often
+~30 MB per 10 minutes, Himawari-9 band 13 ~26 MB in 88 tiles, a GMGSI
+mosaic ~7.4 MB per hour; startup ingests the whole window. The user is often
 on a metered connection — never run a bucket-backed collection for tests
 without asking; use the local fixtures.
 
@@ -150,10 +203,14 @@ straddling 180° at 11–16°N (`lon_0` −137.0, read from the file).
 `testdata/himawari9-isatss/`: three real Himawari-9 band 13 tiles of one
 scan, cropped to 64 × 64 around a lattice corner on the NW limb whose fourth
 cell has no tile (its README has the layout).
+`testdata/gmgsi/`: a real GMGSI longwave-IR mosaic decimated to every 50th
+row and 49th column (60 × 102), still a global Mercator grid with a seam
+sliver, plus the CDL it is built from (its README has the details).
 
 ## EDR
 
-Position, area and radius (radius via area). A response's time axis is the
+Position, area and radius (radius via area). GMGSI serves its display
+counts with unit `"1"`, like any product. A response's time axis is the
 union of the selected products' scans, null where a product has none; an
 instant snaps per product through `select`. `get_parameter_available_times`
 feeds each product's own `extent.temporal` in `parameter_names`. Area grids
@@ -165,7 +222,8 @@ summed per product on its own grid (products may mix 0.5/1/2 km).
 
 ## Not yet
 
-Other providers (GMGSI lat/lon mosaics, GK2A CGMS navigation, MTG) are
-phases 3 and 5. Built-in composite recipes are a phase 4 follow-up. WMS,
+Other providers (GK2A CGMS navigation, MTG) are phases 3 and 5. A
+regional (non-global) Mercator grid is refused: only GMGSI needs one, and
+it is global. Built-in composite recipes are a phase 4 follow-up. WMS,
 Maps and Tiles serve the composites from `composites()`: see "RGB
 composite layers" in `crates/api-wms/CLAUDE.md`.
