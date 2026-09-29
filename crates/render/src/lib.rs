@@ -1,4 +1,5 @@
 pub mod colormap;
+pub mod composite;
 pub mod defaults;
 mod encode;
 /// 5×7 bitmap font for in-image text (legend labels). Crate-internal — an
@@ -14,6 +15,10 @@ pub mod style;
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
     LutColorMap, OverlayColorMap,
+};
+pub use composite::{
+    compose_rgb, composite_legend_json, render_composite, render_composite_legend, ChannelSource,
+    ChannelSpec, CompositeSpec,
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp, flatten_onto};
 pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
@@ -589,6 +594,7 @@ pub const LEGEND_CACHE_CONTROL: &str = "public, max-age=86400";
 /// own layer-name conventions and holds the engine's `RasterInfo`); empty or
 /// absent values are omitted from the payload rather than emitted as `""`.
 /// `nodataColor` appears only when the palette carries an explicit one.
+/// An RGB composite has no stops; [`composite_legend_json`] is its variant.
 pub fn legend_json(
     style: &StyleInfo,
     parameter: Option<&str>,

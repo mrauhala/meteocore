@@ -11,7 +11,7 @@ A high-performance modular meteorological data server built in Rust. Implements 
 | `ds-core` | Domain traits (`EdrEngine`, `FeatureEngine`, `MapEngine`, `VolumeEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
 | `api-common` | Shared Common collection validation, responses, navigation, metadata and OpenAPI for EDR/Maps/Tiles/Features; [supported discovery controls](crates/api-common/README.md). |
 | `ds-storage` | Unified S3 / HTTP / local-filesystem object store, used by every engine that fetches remote data. |
-| `ds-render` | Raster colorization (LUT + linear gradient) and PNG encoding. No framework deps. |
+| `ds-render` | Raster colorization (LUT + linear gradient), RGB composites and PNG encoding. No framework deps. |
 | `ds-mvt` | Mapbox Vector Tile encoder + weighted LRU cache. Used by `api-tiles` to serve `?f=mvt` from `FeatureEngine` collections. |
 | `ds-3dtiles` | Framework-free OGC 3D Tiles encoder — `.pnts` point clouds, glTF `.glb` isosurfaces (marching tetrahedra), echo-top column meshes, and cylindrical voxel grids. No framework deps. |
 
