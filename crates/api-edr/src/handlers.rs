@@ -25,6 +25,7 @@ use crate::params::{
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
     collection_parameter_json, coverage_response_to_json, locations_to_writer, LocationsContext,
+    COVERAGE_JSON_MEDIA_TYPE,
 };
 
 /// Converting through [`JsonError`] is what attaches the `ErrorReason` the
@@ -57,6 +58,21 @@ fn query_timeout() -> HandlerError {
     )
 }
 
+/// Serialise a data-query result as a CoverageJSON response, typed
+/// [`COVERAGE_JSON_MEDIA_TYPE`] (EDR 1.2, #920). Every data query's
+/// CoverageJSON goes through here, so the media type cannot drift per
+/// query type. `label` names the query in the (server-side only) log line.
+fn coverage_json_response(
+    result: &CoverageResponse,
+    label: &str,
+) -> Result<Response, HandlerError> {
+    let body = serde_json::to_string(&coverage_response_to_json(result)).map_err(|e| {
+        tracing::error!("{label} CoverageJSON serialise error: {e}");
+        server_error()
+    })?;
+    Ok(([(header::CONTENT_TYPE, COVERAGE_JSON_MEDIA_TYPE)], body).into_response())
+}
+
 /// Serialise an EDR coverage response in the requested output format.
 ///
 /// `CoverageJSON` is the default; `PNG` renders a vertical-profile or
@@ -69,17 +85,7 @@ fn render_coverage_response(
     height: Option<u32>,
 ) -> Result<Response, HandlerError> {
     match format {
-        EdrFormat::CoverageJson => {
-            let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
-                tracing::error!("EDR CoverageJSON serialise error: {e}");
-                server_error()
-            })?;
-            Ok((
-                [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-                body,
-            )
-                .into_response())
-        }
+        EdrFormat::CoverageJson => coverage_json_response(&result, "EDR"),
         EdrFormat::Png => {
             let panels = coverage_response_to_panels(&result).map_err(|e| bad_request(&e))?;
             let (w, h) = plot_dimensions(width, height);
@@ -501,7 +507,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "200": {
                         "description": "Coverage data",
                         "content": {
-                            "application/prs.coverage+json": {
+                            COVERAGE_JSON_MEDIA_TYPE: {
                                 "schema": {"$ref": "#/components/schemas/coverageJSON"}
                             },
                             "image/png": {
@@ -541,7 +547,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "200": {
                             "description": "Coverage data",
                             "content": {
-                                "application/prs.coverage+json": {
+                                COVERAGE_JSON_MEDIA_TYPE: {
                                     "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                 },
                                 "image/png": {
@@ -575,7 +581,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "200": {
                             "description": "Coverage data",
                             "content": {
-                                "application/prs.coverage+json": {
+                                COVERAGE_JSON_MEDIA_TYPE: {
                                     "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                 }
                             }
@@ -610,7 +616,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "200": {
                             "description": "Coverage data",
                             "content": {
-                                "application/prs.coverage+json": {
+                                COVERAGE_JSON_MEDIA_TYPE: {
                                     "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                 }
                             }
@@ -654,7 +660,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "200": {
                             "description": "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
                             "content": {
-                                "application/prs.coverage+json": {
+                                COVERAGE_JSON_MEDIA_TYPE: {
                                     "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                 },
                                 "image/png": {
@@ -736,7 +742,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             "200": {
                                 "description": "Coverage data",
                                 "content": {
-                                    "application/prs.coverage+json": {
+                                    COVERAGE_JSON_MEDIA_TYPE: {
                                         "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                     },
                                     "image/png": {"schema": {"type": "string", "format": "binary"}}
@@ -769,7 +775,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             "200": {
                                 "description": "Coverage data",
                                 "content": {
-                                    "application/prs.coverage+json": {
+                                    COVERAGE_JSON_MEDIA_TYPE: {
                                         "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                     }
                                 }
@@ -799,7 +805,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             "200": {
                                 "description": "Coverage data",
                                 "content": {
-                                    "application/prs.coverage+json": {
+                                    COVERAGE_JSON_MEDIA_TYPE: {
                                         "schema": {"$ref": "#/components/schemas/coverageJSON"}
                                     }
                                 }
@@ -1598,16 +1604,8 @@ async fn run_area_query(
     })
     .await?;
 
-    let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
-        tracing::error!("Area CoverageJSON serialise error: {e}");
-        server_error()
-    })?;
     Ok(with_data_cache_control(
-        (
-            [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-            body,
-        )
-            .into_response(),
+        coverage_json_response(&result, "Area")?,
         datetime,
     ))
 }
@@ -1693,16 +1691,8 @@ async fn run_radius_query(
     })
     .await?;
 
-    let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
-        tracing::error!("Radius CoverageJSON serialise error: {e}");
-        server_error()
-    })?;
     Ok(with_data_cache_control(
-        (
-            [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-            body,
-        )
-            .into_response(),
+        coverage_json_response(&result, "Radius")?,
         datetime,
     ))
 }
@@ -1765,20 +1755,10 @@ pub async fn trajectory_query(
     .await?;
 
     match format {
-        EdrFormat::CoverageJson => {
-            let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
-                tracing::error!("Trajectory CoverageJSON serialise error: {e}");
-                server_error()
-            })?;
-            Ok(with_data_cache_control(
-                (
-                    [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-                    body,
-                )
-                    .into_response(),
-                datetime,
-            ))
-        }
+        EdrFormat::CoverageJson => Ok(with_data_cache_control(
+            coverage_json_response(&result, "Trajectory")?,
+            datetime,
+        )),
         EdrFormat::Png => {
             // Render the cross-section as a colour-mapped heatmap using
             // the collection's resolved default style (or a data-scaled

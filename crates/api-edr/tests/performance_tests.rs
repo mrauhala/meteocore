@@ -552,7 +552,7 @@ async fn locations_response_has_geojson_content_type() {
 }
 
 /// Verify that the location query (CoverageJSON) endpoint returns
-/// Content-Type: application/prs.coverage+json.
+/// Content-Type: application/vnd.cov+json (EDR 1.2, #920).
 #[tokio::test]
 async fn location_query_response_has_covjson_content_type() {
     let app = build_app(ScalableEngine {
@@ -579,8 +579,8 @@ async fn location_query_response_has_covjson_content_type() {
         .to_str()
         .unwrap();
     assert!(
-        content_type.contains("application/prs.coverage+json"),
-        "expected application/prs.coverage+json, got: {content_type}"
+        content_type == "application/vnd.cov+json",
+        "expected application/vnd.cov+json, got: {content_type}"
     );
 }
 

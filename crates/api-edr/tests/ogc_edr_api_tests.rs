@@ -1762,7 +1762,7 @@ mod unimplemented_queries {
             resp.headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok()),
-            Some("application/prs.coverage+json")
+            Some("application/vnd.cov+json")
         );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap();

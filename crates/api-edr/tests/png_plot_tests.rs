@@ -256,7 +256,7 @@ async fn default_format_is_still_coveragejson() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(ct.contains("coverage+json"), "content-type was {ct}");
+    assert_eq!(ct, "application/vnd.cov+json");
 }
 
 #[tokio::test]
