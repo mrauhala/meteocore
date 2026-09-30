@@ -529,9 +529,12 @@ one never implies the other.
   on `RasterInfo.vertical` and `EdrEngine::get_vertical_extent`.
   `MapEngine::get_raster_tile` takes `z: Option<f64>` (one rendered layer);
   EDR query methods take `z: Option<&[f64]>` (one or more levels). WMS
-  exposes it as `ELEVATION`, Maps/Tiles as `elevation`, EDR as `z`. The API
-  layer rejects z/elevation against a collection with no vertical extent
-  (HTTP 400). The ODIM PVOL engine uses it for radar elevation angle.
+  exposes it as `ELEVATION`, Maps/Tiles as `elevation`, EDR as `z`. Against
+  a collection with no vertical extent the rule is per API: EDR ignores a
+  well-formed `z` (EDR 1.2 `/req/edr/z-response` A makes that a SHALL;
+  a malformed one is still a 400), while WMS `ELEVATION` and Maps/Tiles
+  `elevation` reject it with HTTP 400. The ODIM PVOL engine uses it for
+  radar elevation angle.
 - **`ds_core::radar_sites`** — `RadarSiteInfo` + the data-only
   `RadarSiteSource` trait (one catalog snapshot per call, never I/O) that a
   polar-volume engine implements and the nowcast's per-cell beam-geometry

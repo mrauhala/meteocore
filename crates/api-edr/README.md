@@ -79,9 +79,9 @@ A query type a collection's engine does not support (not in its `supported_query
 | Parameter | Status | Notes |
 |---|---|---|
 | `coords` | ✓ | WKT per query type (see above) |
-| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..` |
+| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`, and the EDR 1.2 list of instants `T1,T2,T3` (`/req/core/datetime-response` D). A list names at most 64 instants (`params::MAX_DATETIME_INSTANTS`) and no intervals; repeats collapse. Each instant is its own engine query with the window `(t, t)`, so it is matched exactly as a request for that instant alone; the answers merge (`src/datetime_list.rs`): series and `t`-axis grids at the same place join into one coverage with every instant's steps, ascending and each once, and other coverages are listed. An instant with no data (the engine's 404) contributes nothing; none with data is that 404, and any other engine error fails the request. The merged response is bounded to 1 million values; the deadline is checked before every instant. The repeating-interval form `R[n]/date-time/interval` is not accepted (400) |
 | `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData and Nowcast (#666); GRIB keeps its own equivalent check |
-| `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent |
+| `z` | ✓ | EDR 1.2 grammar (`/req/edr/z-response`): a level, a list, a closed `min/max` interval, the open intervals `../max` and `min/..` (an open end reaches the lowest or highest advertised level), and the recurring interval `Rn/min/step` (`n` levels from `min`, `step` apart, as in the standard's `R20/100/50` = 20 levels; at most 1000, non-zero step). An interval selects the advertised levels inside it (none is a 400). A level, a list and a recurring interval go to the engine as a list, which it matches its own way: ODIM snaps to the nearest sweep, GRIB requires exact levels. A collection with no vertical extent **ignores** a well-formed `z` on every query route, instance routes included (clause A, a SHALL in 1.2); a malformed `z` is still a 400 everywhere |
 | `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
 | `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
@@ -320,8 +320,9 @@ are registered automatically from the accepted config.
 
 Pressure/model position queries return a `PointSeries` when one level is
 selected, or a `CoverageCollection` of `VerticalProfile` coverages (one per
-step) for multiple levels. `z` omitted selects all levels; single/list/interval
-selectors are supported. Area/radius queries return a `[z,y,x]` Grid at one
+step) for multiple levels. `z` omitted selects all levels; single, list,
+closed/open interval and recurring (`Rn/min/step`) selectors are supported — a
+recurring interval is a list, so each of its levels must exist. Area/radius queries return a `[z,y,x]` Grid at one
 forecast step; the 1M-value budget includes every selected level and parameter.
 A missing field at an available level is null; an unavailable level is 400.
 Levels are exact discrete coordinates, not interpolated. Model levels are not
@@ -354,7 +355,7 @@ sampling, coordinates, unit conversion and response values remain `f64`.
 Without `level_types`, the existing collection ID and canonical-level behavior
 are preserved. Single-level and legacy parameter names select a canonical level
 per run, shared by metadata, position, area and Maps. Missing canonical fields
-are null in position and errors in area; `z` is rejected. A temperature
+are null in position and errors in area; `z` is ignored (no vertical extent). A temperature
 difference such as dewpoint depression stays in K. Area longitude axes remain
 continuous between grid nodes, and global interpolation wraps the grid seam.
 Wgrib2 ground, MSL, whole-atmosphere and other named surfaces/layers retain
