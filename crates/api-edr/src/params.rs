@@ -9,12 +9,9 @@ use crate::response::{COVERAGE_JSON_MEDIA_TYPE, LEGACY_COVERAGE_JSON_MEDIA_TYPE}
 /// The `crs` query parameter that would select another one is #84.
 pub const DATA_QUERY_CRS: &str = "CRS84";
 
-/// WKT of [`DATA_QUERY_CRS`]: OGC:CRS84, WGS 84 with longitude as the first
-/// axis, in ISO 19162:2019 (WKT2) form with an explicit axis `ORDER`. The
-/// standard's own examples pair `CRS84` with EPSG:4326's WKT, whose axes are
-/// latitude first, so this is not copied from them. PROJ 9.8 identifies it:
-/// `projinfo '<wkt>' --identify` → `OGC:CRS84: 100 %`.
-pub const CRS84_WKT: &str = r#"GEOGCRS["WGS 84 (CRS84)",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,2],AXIS["geodetic longitude (Lon)",east,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic latitude (Lat)",north,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],ID["OGC","CRS84"]]"#;
+/// WKT of [`DATA_QUERY_CRS`], advertised in every `crs_details`. Its home is
+/// `ds_core::geo`, next to the other WGS 84 constants.
+pub use ds_core::geo::CRS84_WKT;
 
 #[derive(Debug, Deserialize)]
 pub struct LocationQueryParams {
