@@ -3245,6 +3245,35 @@ mod per_parameter_times {
             .status()
     }
 
+    /// A datetime the parameter has nothing for yet resolves to `None` (a
+    /// satellite product before its first scan): the response is revalidated
+    /// rather than pinned `immutable` for a day. A resolved one stays pinned.
+    #[tokio::test]
+    async fn unresolved_datetime_is_not_immutable() {
+        let app = build_router_with_engine(Arc::new(Engine::default()));
+        let cache_control = |uri: String| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                resp.headers()["cache-control"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let cc = cache_control(URI("a", 0, Some(T1))).await;
+        assert!(cc.contains("immutable"), "{cc}");
+        let cc = cache_control(URI("a", 0, Some("2026-09-25T18:50:00Z"))).await;
+        assert!(
+            cc.contains("must-revalidate") && !cc.contains("immutable"),
+            "{cc}"
+        );
+    }
+
     /// An omitted `datetime` renders the requested parameter's latest time,
     /// and a time it lacks snaps on its own axis before the cache key is
     /// built — so the snapped request hits what the default one cached.

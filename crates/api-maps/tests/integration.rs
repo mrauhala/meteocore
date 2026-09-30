@@ -3059,6 +3059,35 @@ mod per_parameter_times {
         assert_eq!(last(&engine), (Some("b".into()), Some(t(T1))));
     }
 
+    /// A datetime the parameter has nothing for yet resolves to `None` (a
+    /// satellite product before its first scan): the response is revalidated
+    /// rather than pinned `immutable` for a day. A resolved one stays pinned.
+    #[tokio::test]
+    async fn unresolved_datetime_is_not_immutable() {
+        let app = build_router_with_engine(Arc::new(Engine::default()));
+        let cache_control = |uri: String| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                resp.headers()["cache-control"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let cc = cache_control(URI("a", 0, Some(T1))).await;
+        assert!(cc.contains("immutable"), "{cc}");
+        let cc = cache_control(URI("a", 0, Some("2026-09-25T18:50:00Z"))).await;
+        assert!(
+            cc.contains("must-revalidate") && !cc.contains("immutable"),
+            "{cc}"
+        );
+    }
+
     /// Each parameter advertises its own time axis next to the collection's
     /// union (#279), so a client knows `b` ends a timestep earlier.
     #[tokio::test]

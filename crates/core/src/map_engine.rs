@@ -604,6 +604,15 @@ pub trait MapEngine: Send + Sync {
     /// means "whatever the engine treats as latest"; the override should
     /// return that concrete timestep so caches pin it too.
     ///
+    /// With nothing to render yet (the catalog is still empty after a start
+    /// or reload), falling back to the requested time is safe only when the
+    /// render then *errors*, since errors are never cached. An engine that
+    /// renders an empty tile instead MUST return `None`: an empty render
+    /// keyed on T is served blank from the no-TTL meta-tile cache once T's
+    /// data lands. The API layers also send an explicit `time` that resolves
+    /// to `None` with a short, revalidating `Cache-Control` rather than
+    /// `immutable`.
+    ///
     /// `reference_time` selects a forecast model run, mirroring
     /// [`Self::get_raster_tile`]; non-forecast engines ignore it.
     ///

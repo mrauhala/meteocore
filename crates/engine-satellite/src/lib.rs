@@ -1263,7 +1263,12 @@ impl MapEngine for SatelliteEngine {
             return Self::select_common(&catalog, &self.composite_bands[c], time);
         }
         match parameter.map_or(Some(0), |name| self.product_position(name)) {
-            Some(index) => Self::select(&catalog, index, time).or(time),
+            // `None` before the product's first scan, as `render` then
+            // renders an empty tile rather than failing. Keying that on the
+            // requested time would serve it blank from the meta-tile cache
+            // once the scan lands (a reload's backfill, 2026-09-30).
+            Some(index) => Self::select(&catalog, index, time),
+            // An unknown parameter fails the render, which caches nothing.
             None => time,
         }
     }
