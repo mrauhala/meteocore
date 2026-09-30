@@ -151,16 +151,18 @@ fn render_error_tile(
 
 /// Cache-Control header value for a WMS response.
 ///
-/// - Explicit TIME over immutable content (`content_version == 0`): the
-///   pixels for that instant never change — cache for 24 hours, `immutable`
-///   (no revalidation at all).
-/// - Otherwise — no TIME ("latest" moves), or content the engine revises in
-///   place under a fixed instant (`content_version != 0`, e.g. a push-fed
-///   alert set): short cache (60 s) and revalidate, so a browser/CDN that
-///   holds a pre-revision tile for the same URL asks again (the ETag is
-///   content-derived, so an unchanged tile is a cheap 304).
-fn cache_control_value(has_explicit_time: bool, content_version: u64) -> &'static str {
-    if has_explicit_time && content_version == 0 {
+/// - An explicit TIME that resolved to a timestep, over immutable content
+///   (`content_version == 0`): the pixels for that instant never change —
+///   cache for 24 hours, `immutable` (no revalidation at all).
+/// - Otherwise — no TIME ("latest" moves), a TIME the engine has nothing to
+///   render for yet (resolved to `None`: its catalog is still empty after a
+///   start or reload), or content the engine revises in place under a fixed
+///   instant (`content_version != 0`, e.g. a push-fed alert set): short
+///   cache (60 s) and revalidate, so a browser/CDN that holds a pre-revision
+///   tile for the same URL asks again (the ETag is content-derived, so an
+///   unchanged tile is a cheap 304). The red error tile is always short too.
+fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
+    if pinned_time && content_version == 0 {
         "public, max-age=86400, immutable"
     } else {
         "public, max-age=60, must-revalidate"
@@ -425,7 +427,8 @@ pub async fn wms_handler(
                 background: params.background,
             };
 
-            let cache_control = cache_control_value(has_explicit_time, content_version);
+            let cache_control =
+                cache_control_value(has_explicit_time && time.is_some(), content_version);
             // Read If-None-Match into an owned String so it survives the move
             // into spawn_blocking and the cache-hit/miss branches below.
             let if_none_match = headers
@@ -823,6 +826,13 @@ pub async fn wms_handler(
                     let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
                     (cached, "ERROR", "image/png")
                 }
+            };
+            // A failed render is transient: never pin its error tile for a
+            // day under an explicit TIME.
+            let cache_control = if x_cache == "ERROR" {
+                cache_control_value(false, content_version)
+            } else {
+                cache_control
             };
 
             // Now that we have the content-derived ETag, do the

@@ -173,11 +173,14 @@ fn crs_to_uri(crs: &str) -> &'static str {
 }
 
 /// Cache-Control header value: `immutable` (24 h) only for an explicit
-/// `time` over content the engine never revises (`content_version == 0`);
-/// "latest" and in-place-revised content (a push-fed alert set) get 60 s +
-/// revalidation so a browser/CDN holding a pre-revision image asks again.
-fn cache_control_value(has_explicit_time: bool, content_version: u64) -> &'static str {
-    if has_explicit_time && content_version == 0 {
+/// `time` that resolved to a timestep, over content the engine never revises
+/// (`content_version == 0`); "latest", a `time` the engine has nothing to
+/// render for yet (resolved to `None`: its catalog is still empty after a
+/// start or reload) and in-place-revised content (a push-fed alert set) get
+/// 60 s + revalidation so a browser/CDN holding a pre-revision image asks
+/// again.
+fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
+    if pinned_time && content_version == 0 {
         "public, max-age=86400, immutable"
     } else {
         "public, max-age=60, must-revalidate"
@@ -1420,7 +1423,10 @@ async fn render_map(
         background: None,
     };
 
-    let cache_control = cache_control_value(has_explicit_time, cache_key.content_version);
+    let cache_control = cache_control_value(
+        has_explicit_time && time.is_some(),
+        cache_key.content_version,
+    );
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())

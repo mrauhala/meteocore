@@ -275,6 +275,46 @@ fn unknown_parameter_is_an_error_and_empty_catalog_renders_nothing() {
     assert_eq!(engine.status().0, 1);
 }
 
+/// Before a product's first scan the render is empty rather than an error,
+/// so the scan it resolves to must be `None` as well. Resolved to the
+/// requested time, those empty tiles would be cached under the scan the
+/// next poll brings and served for it.
+#[test]
+fn resolves_nothing_before_the_first_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SatelliteEngine::new("goes19-fd", &config(dir.path())).unwrap();
+    engine.poll_once();
+    let t0 = at("2026-09-25T19:00:00Z");
+    assert_eq!(
+        engine.resolve_parameter_time(Some("ir_10_3"), Some(t0), None),
+        None
+    );
+    assert_eq!(engine.resolve_time(Some(t0), None), None);
+    let tile = engine
+        .get_raster_tile(
+            [-80.0, 30.0, -70.0, 40.0],
+            4,
+            4,
+            Some(t0),
+            &OutputCrs::Wgs84,
+            Some("ir_10_3"),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!((0..16).all(|i| tile.values.value_at(i).is_none()));
+
+    // The scan lands: the same request now resolves to it.
+    let nested = dir.path().join("ABI-L2/2026/268/19");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::copy(fixture(C13), nested.join(C13)).unwrap();
+    engine.poll_once();
+    assert_eq!(
+        engine.resolve_parameter_time(Some("ir_10_3"), Some(t0), None),
+        Some(t0)
+    );
+}
+
 /// The shipped example collection parses, validates and builds an engine
 /// (construction does no I/O; the first poll would download).
 #[test]

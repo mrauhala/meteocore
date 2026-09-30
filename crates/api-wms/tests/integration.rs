@@ -350,6 +350,29 @@ async fn error_tile_forces_png_content_type_even_when_jpeg_requested() {
     );
 }
 
+/// A failed render is transient: its error tile under an explicit TIME must
+/// be revalidated, not pinned `immutable` in browsers for a day.
+#[tokio::test]
+async fn error_tile_is_never_immutable() {
+    let app = build_failing_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken\
+             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
+             &FORMAT=image/png&TIME=2024-01-01T00:00:00Z",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-cache"], "ERROR");
+    let cc = resp.headers()["cache-control"].to_str().unwrap();
+    assert!(
+        cc.contains("must-revalidate") && !cc.contains("immutable"),
+        "{cc}"
+    );
+}
+
 /// Mock engine that returns a populated `RasterTile` so the regular
 /// `Ok(Some(bytes))` render+encode path runs (the EMPTY/ERROR paths
 /// have separate coverage above). Used by the #145 ETag regression
@@ -967,6 +990,9 @@ struct SnappingMockMapEngine {
     /// finishing ingestion between requests.
     catalog: Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Satellite-style: an empty catalog renders an all-nodata tile instead
+    /// of failing, so `resolve_time` must then be `None`, not the request.
+    empty_renders_nothing: bool,
 }
 
 impl SnappingMockMapEngine {
@@ -1001,9 +1027,16 @@ impl MapEngine for SnappingMockMapEngine {
     ) -> Result<RasterTile, DataServerError> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let resolved = self
-            .select(time)
-            .ok_or_else(|| DataServerError::Engine("no data".into()))?;
+        let Some(resolved) = self.select(time) else {
+            if self.empty_renders_nothing {
+                return Ok(RasterTile {
+                    width,
+                    height,
+                    values: vec![None; (width * height) as usize].into(),
+                });
+            }
+            return Err(DataServerError::Engine("no data".into()));
+        };
         let cat = self.catalog.read().unwrap();
         let idx = cat.iter().position(|&ts| ts == resolved).unwrap_or(0);
         // Distinct pixel value per timestep so stale tiles are detectable.
@@ -1035,7 +1068,11 @@ impl MapEngine for SnappingMockMapEngine {
         time: Option<chrono::DateTime<chrono::Utc>>,
         _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.select(time).or(time)
+        if self.empty_renders_nothing {
+            self.select(time)
+        } else {
+            self.select(time).or(time)
+        }
     }
 }
 
@@ -1046,6 +1083,13 @@ type SnappingRouter = (
 );
 
 fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
+    build_snapping_router_with(initial_times, false)
+}
+
+fn build_snapping_router_with(
+    initial_times: &[&str],
+    empty_renders_nothing: bool,
+) -> SnappingRouter {
     let catalog = Arc::new(std::sync::RwLock::new(
         initial_times
             .iter()
@@ -1056,6 +1100,7 @@ fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
     let engine: Arc<dyn MapEngine> = Arc::new(SnappingMockMapEngine {
         catalog: catalog.clone(),
         calls: calls.clone(),
+        empty_renders_nothing,
     });
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -1176,6 +1221,54 @@ async fn requested_time_ahead_of_catalog_does_not_poison_the_frame() {
         "post-ingest TIME=T must miss every cached T−5 tile and render fresh (got {} fresh renders, expected {})",
         calls_after - calls_cold,
         calls_cold
+    );
+}
+
+/// A satellite-style engine before its first scan (a start or reload still
+/// backfilling) renders nothing and resolves every TIME to `None`. A
+/// `TIME=T` request then must neither pin its empty image in browsers for a
+/// day nor leave empty meta-tiles under T's key: once T lands, the same
+/// request renders T. On nexus the tutka loop asked for the next scan during
+/// a reload's backfill and the frame stayed blank after it arrived.
+#[tokio::test]
+async fn time_requested_before_the_first_timestep_is_not_pinned() {
+    const T: &str = "2026-09-30T04:30:00Z";
+    const BBOX: &str = "2000000,8000000,3000000,9000000"; // meta-tiled
+    let (app, catalog, calls) = build_snapping_router_with(&[], true);
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS=EPSG:3857&BBOX={BBOX}&WIDTH=512&HEIGHT=512&TIME={T}"
+    );
+    // Returns (x-cache, cache-control).
+    let get = || async {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = |name: &str| resp.headers()[name].to_str().unwrap().to_string();
+        (h("x-cache"), h("cache-control"))
+    };
+
+    let (x, cc) = get().await;
+    assert_eq!(x, "EMPTY");
+    assert!(
+        cc.contains("must-revalidate") && !cc.contains("immutable"),
+        "nothing rendered for T yet: {cc}"
+    );
+    let calls_empty = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(calls_empty > 0);
+
+    catalog.write().unwrap().push(T.parse().unwrap());
+
+    let (x, cc) = get().await;
+    assert_eq!(x, "MISS", "T landed: its pixels, not the pre-scan empties");
+    assert!(cc.contains("immutable"), "{cc}");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed) - calls_empty,
+        calls_empty,
+        "every meta-tile renders fresh once T exists"
     );
 }
 

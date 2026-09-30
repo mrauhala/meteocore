@@ -10,6 +10,11 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   MUST go through `SatelliteEngine::select`, the same selection
   `get_raster_tile` renders with (latest scan at or before, first when
   earlier, newest for `None`). Drift reintroduces the #507 cache poisoning.
+  Before a product's first scan, `select` is `None` and the render is an
+  empty tile, not an error, so `resolve_parameter_time` must stay `None`
+  too. Falling back to the requested time, as the error-rendering engines
+  do, keyed a reload's backfill-window empties on a scan that landed
+  minutes later, and the meta-tile cache served that frame blank.
   `RasterInfo.times` is the union over products.
 - **Scan time = scan start truncated to the minute** (`naming.rs`). A
   full-disk scan starts ~20 s past its ten-minute slot; keying on the
