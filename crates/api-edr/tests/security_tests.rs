@@ -680,7 +680,7 @@ async fn content_type_is_set_for_success_responses() {
         ("/collections/weather/locations", "application/geo+json"),
         (
             "/collections/weather/locations/helsinki",
-            "application/prs.coverage+json",
+            "application/vnd.cov+json",
         ),
     ];
     for (uri, expected_ct) in &uris_and_types {

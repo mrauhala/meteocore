@@ -1,6 +1,8 @@
 use ds_core::error::DataServerError;
 use serde::Deserialize;
 
+use crate::response::{COVERAGE_JSON_MEDIA_TYPE, LEGACY_COVERAGE_JSON_MEDIA_TYPE};
+
 #[derive(Debug, Deserialize)]
 pub struct LocationQueryParams {
     pub datetime: Option<String>,
@@ -31,7 +33,8 @@ pub struct PositionQueryParams {
 /// EDR response output format selected by the `f` query parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdrFormat {
-    /// OGC CoverageJSON (the default).
+    /// OGC CoverageJSON (the default), served as
+    /// [`COVERAGE_JSON_MEDIA_TYPE`].
     CoverageJson,
     /// A rendered PNG plot (vertical profile or time series).
     Png,
@@ -39,8 +42,9 @@ pub enum EdrFormat {
 
 /// Parse the `f` query parameter. Absent/blank → CoverageJSON. `coveragejson`
 /// and `png` are accepted case-insensitively, and so are their media types
-/// (#510): `application/prs.coverage+json` (what the responses carry),
-/// `application/vnd.cov+json` (the registered CoverageJSON type) and
+/// (#510): `application/vnd.cov+json` (what the responses carry, EDR 1.2,
+/// #920), `application/prs.coverage+json` (EDR 1.1's type, still accepted;
+/// the response is the same CoverageJSON under the 1.2 type) and
 /// `image/png`. A `+` sent unencoded arrives as a space, so a space inside
 /// a media type reads as `+`. Anything else is a 400.
 pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
@@ -50,7 +54,7 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
         .map(|s| s.to_ascii_lowercase().replace(' ', "+"));
     match f.as_deref() {
         None => Ok(EdrFormat::CoverageJson),
-        Some("coveragejson" | "application/prs.coverage+json" | "application/vnd.cov+json") => {
+        Some("coveragejson" | COVERAGE_JSON_MEDIA_TYPE | LEGACY_COVERAGE_JSON_MEDIA_TYPE) => {
             Ok(EdrFormat::CoverageJson)
         }
         Some("png" | "image/png") => Ok(EdrFormat::Png),

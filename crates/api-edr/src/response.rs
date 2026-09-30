@@ -7,6 +7,16 @@ use ds_core::model::{
 use ds_core::units::qudt_unit;
 use serde_json::{json, Map, Number, Value};
 
+/// The media type every CoverageJSON response carries (#920): the
+/// registered CoverageJSON type, which OGC API - EDR 1.2 uses throughout.
+/// The one home for it: the data-query `Content-Type`, the `/locations`
+/// data links and the `/api` response content keys all read this constant.
+pub const COVERAGE_JSON_MEDIA_TYPE: &str = "application/vnd.cov+json";
+
+/// EDR 1.1's CoverageJSON media type. No longer sent; still accepted as an
+/// `f` value ([`crate::params::parse_edr_format`]) so 1.1 clients keep working.
+pub const LEGACY_COVERAGE_JSON_MEDIA_TYPE: &str = "application/prs.coverage+json";
+
 /// Pre-built reference system objects (shared across all responses).
 fn spatial_ref() -> Value {
     json!({
@@ -563,7 +573,7 @@ impl serde::Serialize for LocationFeatures<'_> {
                     href: &endpoint,
                     rel: "data",
                     title: &title,
-                    kind: "application/prs.coverage+json",
+                    kind: COVERAGE_JSON_MEDIA_TYPE,
                 }],
                 properties: LocationProperties {
                     datetime: self.datetime,
@@ -605,7 +615,7 @@ mod location_tests {
                 "type": "Feature", "id": "station-1",
                 "geometry": { "type": "Point", "coordinates": [24.0, 60.0] },
                 "properties": { "label": label, "datetime": "2026-01-01T00:00:00Z/2026-01-02T00:00:00Z", "parameter-name": params, "edrqueryendpoint": endpoint },
-                "links": [{ "href": endpoint, "rel": "data", "type": "application/prs.coverage+json", "title": format!("Data for {label}") }]
+                "links": [{ "href": endpoint, "rel": "data", "type": "application/vnd.cov+json", "title": format!("Data for {label}") }]
             }],
             "links": [{ "href": "https://example.org/prefix/edr/collections/weather/locations", "rel": "self", "type": "application/geo+json", "title": "Locations" }]
         });

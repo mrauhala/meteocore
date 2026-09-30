@@ -347,7 +347,8 @@ async fn f_accepts_media_type_aliases() {
 // Spec: Responses should include appropriate Content-Type headers:
 //   - application/json for JSON
 //   - application/geo+json for GeoJSON (locations)
-//   - application/prs.coverage+json for CoverageJSON
+//   - application/vnd.cov+json for CoverageJSON (EDR 1.2; 1.1 used
+//     application/prs.coverage+json, #920)
 // Implementation: axum's Json() extractor sets application/json for ALL
 //   responses, even GeoJSON and CoverageJSON.
 // Impact: Clients expecting proper media type detection fail.
@@ -399,8 +400,8 @@ async fn finding_07b_coverage_returns_covjson_content_type() {
         .unwrap_or("");
 
     assert!(
-        content_type.contains("application/prs.coverage+json"),
-        "CoverageJSON response should have Content-Type: application/prs.coverage+json, got: {content_type}"
+        content_type == "application/vnd.cov+json",
+        "CoverageJSON response should have Content-Type: application/vnd.cov+json, got: {content_type}"
     );
 }
 
@@ -433,7 +434,7 @@ async fn finding_08_locations_geojson_has_links() {
 // Implementation: Features have no "links" in properties.
 // Fix: Add to each feature properties:
 //   "links": [{ "href": "/edr/collections/weather/locations/{id}",
-//               "rel": "data", "type": "application/prs.coverage+json" }]
+//               "rel": "data", "type": "application/vnd.cov+json" }]
 
 #[tokio::test]
 async fn finding_09_location_features_have_data_links() {
@@ -858,7 +859,7 @@ async fn finding_22b_collection_self_link_has_title() {
 // ===========================================================================
 // Spec: The EDR /locations endpoint returns GeoJSON by default.
 //   The response should have Content-Type: application/geo+json.
-//   When CoverageJSON is requested, Content-Type: application/prs.coverage+json.
+//   When CoverageJSON is requested, Content-Type: application/vnd.cov+json.
 // Implementation: Always returns application/json regardless of content.
 // (See also Finding 7 - duplicated here for emphasis on the /locations endpoint)
 
