@@ -701,6 +701,187 @@ async fn data_queries_default_output_format_set_for_all_query_types() {
 }
 
 // ===========================================================================
+// EDR 1.2: every data query link carries the required variables (#918)
+// ===========================================================================
+// EDR 1.2's `*DataQuery` schemas require `title`, `description`,
+// `query_type`, `output_formats`, `default_output_format` and `crs_details`
+// (an array of `{crs, wkt}`) in every `data_queries.<type>.link.variables`;
+// 1.1 left all of them optional. The `instances` link has its own schema
+// (`instancesDataQuery`, nothing required) and is left as it is.
+
+/// An engine advertising a chosen set of query types, with two model runs
+/// when `runs`, so every document the metadata builder serves is reachable.
+struct QueryTypesEngine {
+    types: &'static [&'static str],
+    runs: bool,
+}
+
+impl EdrEngine for QueryTypesEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(vec![])
+    }
+    fn query_location(
+        &self,
+        location_id: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::LocationNotFound(location_id.into()))
+    }
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["t".to_string()]
+    }
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((
+            "2024-01-01T12:00:00Z".parse().unwrap(),
+            "2024-01-01T14:00:00Z".parse().unwrap(),
+        ))
+    }
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([19.0, 59.0, 32.0, 71.0])
+    }
+    fn supported_query_types(&self) -> Vec<String> {
+        self.types.iter().map(|t| t.to_string()).collect()
+    }
+    fn get_instances(&self) -> Vec<ds_core::instances::RunInfo> {
+        if !self.runs {
+            return Vec::new();
+        }
+        ["2024-01-01T00:00:00Z", "2024-01-01T12:00:00Z"]
+            .into_iter()
+            .map(|rt| {
+                let reference_time: DateTime<Utc> = rt.parse().unwrap();
+                ds_core::instances::RunInfo {
+                    reference_time,
+                    valid_times: (0..3)
+                        .map(|h| reference_time + chrono::Duration::hours(h))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+}
+
+async fn get_json_from(engine: Arc<dyn EdrEngine>, uri: &str) -> Value {
+    let resp = api_edr::router(make_edr_state(engine))
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+/// Checks every data query link of one collection or instance document
+/// against EDR 1.2's required variables, and returns the query types it
+/// advertises (sorted, `instances` left out).
+fn checked_data_query_types(doc: &Value, what: &str) -> Vec<String> {
+    let queries = doc["data_queries"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: no data_queries"));
+    let mut titles = Vec::new();
+    let mut types = Vec::new();
+    for (qt, query) in queries {
+        if qt == "instances" {
+            continue;
+        }
+        let vars = &query["link"]["variables"];
+        for field in ["title", "description"] {
+            let text = vars[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{what} {qt}: {field} must be a string: {vars}"));
+            assert!(!text.trim().is_empty(), "{what} {qt}: empty {field}");
+        }
+        titles.push(vars["title"].as_str().unwrap().to_string());
+        assert_eq!(vars["query_type"], qt.as_str(), "{what} {qt}: query_type");
+        let formats: Vec<&str> = vars["output_formats"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{what} {qt}: output_formats must be an array"))
+            .iter()
+            .map(|f| f.as_str().expect("output format strings"))
+            .collect();
+        let default = vars["default_output_format"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what} {qt}: default_output_format must be a string"));
+        assert!(
+            formats.contains(&default),
+            "{what} {qt}: default_output_format {default} not in {formats:?}"
+        );
+        assert_eq!(
+            vars["crs_details"],
+            serde_json::json!([{ "crs": "CRS84", "wkt": api_edr::params::CRS84_WKT }]),
+            "{what} {qt}: crs_details"
+        );
+        types.push(qt.clone());
+    }
+    titles.sort();
+    titles.dedup();
+    assert_eq!(
+        titles.len(),
+        types.len(),
+        "{what}: one title per query type"
+    );
+    types.sort();
+    types
+}
+
+#[tokio::test]
+async fn data_query_links_carry_edr_1_2_required_variables() {
+    let cases: [(&'static [&'static str], bool); 4] = [
+        (
+            &["locations", "position", "area", "radius", "trajectory"],
+            true,
+        ),
+        // A forecast grid (GRIB, Zarr, QueryData).
+        (&["position", "area", "radius"], true),
+        // A station network (CSV).
+        (&["locations", "area", "radius"], false),
+        // The trait default.
+        (&["locations"], false),
+    ];
+    for (types, runs) in cases {
+        let engine: Arc<dyn EdrEngine> = Arc::new(QueryTypesEngine { types, runs });
+        let mut want: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        want.sort();
+
+        let list = get_json_from(engine.clone(), "/collections").await;
+        let listed = checked_data_query_types(&list["collections"][0], "/collections");
+        assert_eq!(listed, want, "/collections {types:?}");
+        let doc = get_json_from(engine.clone(), "/collections/weather").await;
+        assert_eq!(
+            checked_data_query_types(&doc, "/collections/weather"),
+            want,
+            "/collections/weather {types:?}"
+        );
+        assert_eq!(doc["data_queries"].get("instances").is_some(), runs);
+
+        if !runs {
+            continue;
+        }
+        // An instance serves only the run-queryable types.
+        let want_run: Vec<String> = want
+            .iter()
+            .filter(|t| matches!(t.as_str(), "area" | "position" | "radius"))
+            .cloned()
+            .collect();
+        let list = get_json_from(engine.clone(), "/collections/weather/instances").await;
+        let instances = list["instances"].as_array().expect("instances array");
+        assert_eq!(instances.len(), 2);
+        for instance in instances {
+            let what = format!("/instances item {}", instance["id"]);
+            assert_eq!(checked_data_query_types(instance, &what), want_run);
+        }
+        let doc = get_json_from(engine, "/collections/weather/instances/20240101T0000Z").await;
+        assert_eq!(
+            checked_data_query_types(&doc, "/instances/20240101T0000Z"),
+            want_run,
+            "{types:?}"
+        );
+    }
+}
+
+// ===========================================================================
 // FINDING 17: Collections list missing numberMatched / numberReturned
 // ===========================================================================
 // Spec: GET /collections response SHOULD include numberMatched and
