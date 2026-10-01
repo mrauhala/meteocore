@@ -153,6 +153,19 @@ and never under an instance.
   `temporal_extent_json`, the same builder as the collection extent;
   `per_parameter_temporal_extent_validates` pins it against the schema.
 
+## `z` and `datetime` grammar (EDR 1.2, #921)
+
+- `z` is parsed by `params::parse_z` (level, list, closed and open
+  intervals, recurring `Rn/min/step` → a list) and resolved by the
+  handlers' `resolve_request_z`: a collection with no vertical extent
+  **ignores** a well-formed `z` (`/req/edr/z-response` A, a SHALL); a
+  malformed one is a 400. Do not reintroduce the old 400 — WMS/Maps/Tiles
+  `ELEVATION`/`elevation` keep theirs, EDR does not.
+- A `datetime` list `T1,T2,T3` (`params::parse_datetime`) is one engine
+  query per instant `(t, t)`, merged by `src/datetime_list.rs`. Every data
+  query handler calls the engine through `datetime_list::run`; a new one
+  must too, rather than converting the selector to one engine window itself.
+
 ## Caching headers (#499)
 
 Every 200 carries `Cache-Control` + a strong content-derived ETag, and a
