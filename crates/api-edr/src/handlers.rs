@@ -19,10 +19,12 @@ use ds_core::trajectory::{TrajectoryPath, MAX_TRAJECTORY_NODES, MAX_TRAJECTORY_S
 use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
-    parse_datetime, parse_edr_format, parse_limit, parse_locations_paging, parse_within_metres,
-    parse_z, plot_dimensions, resolve_z_levels, split_position_coords, AreaQueryParams,
+    check_crs, parse_cube_bbox, parse_datetime, parse_edr_format, parse_limit,
+    parse_locations_paging, parse_resolution, parse_within_metres, parse_z, plot_dimensions,
+    resolve_z_levels, split_location_ids, split_position_coords, AreaQueryParams, CubeQueryParams,
     DatetimeSelector, EdrFormat, LocationQueryParams, PositionQueryParams, RadiusQueryParams,
-    TrajectoryQueryParams, CRS84_WKT, DATA_QUERY_CRS, MAX_LIMIT, WITHIN_UNITS,
+    TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, MAX_LIMIT, MAX_LOCATION_IDS,
+    MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -340,10 +342,20 @@ fn resolve_request_z(
     let Some(sel) = parse_z(z).map_err(|e| bad_request(&e))? else {
         return Ok(None);
     };
+    resolve_z_selector(engine, &sel)
+}
+
+/// [`resolve_request_z`] for an already parsed selector — also the vertical
+/// pair of a cube's six-number `bbox`, which is ignored the same way on a
+/// collection without a vertical dimension.
+fn resolve_z_selector(
+    engine: &Arc<dyn EdrEngine>,
+    sel: &ZSelector,
+) -> Result<Option<Vec<f64>>, HandlerError> {
     let Some(extent) = engine.get_vertical_extent() else {
         return Ok(None);
     };
-    let levels = resolve_z_levels(&sel, Some(&extent)).map_err(|e| bad_request(&e))?;
+    let levels = resolve_z_levels(sel, Some(&extent)).map_err(|e| bad_request(&e))?;
     Ok(Some(levels))
 }
 
@@ -453,6 +465,72 @@ fn format_parameter() -> serde_json::Value {
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
+/// The OpenAPI operation of a cube query (#925), on the collection or, with
+/// `instance_id_param`, on one of its model runs. The parameters are the
+/// EDR 1.2 cube parameters; the description states what MeteoCore accepts
+/// of each.
+fn cube_operation(
+    summary: String,
+    operation_id: String,
+    tag: &str,
+    instance_id_param: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut parameters: Vec<serde_json::Value> = instance_id_param.into_iter().collect();
+    parameters.extend([
+        json!({"$ref": "#/components/parameters/cube-bbox"}),
+        json!({"$ref": "#/components/parameters/cube-z"}),
+        json!({"$ref": "#/components/parameters/datetime"}),
+        json!({"$ref": "#/components/parameters/parameter-name"}),
+        json!({"$ref": "#/components/parameters/resolution-x"}),
+        json!({"$ref": "#/components/parameters/resolution-y"}),
+        json!({"$ref": "#/components/parameters/resolution-z"}),
+        json!({"$ref": "#/components/parameters/crs"}),
+        json!({
+            "name": "f",
+            "in": "query",
+            "description": "format to return the data response in. Cube queries return CoverageJSON only.",
+            "required": false,
+            "schema": {"type": "string"}
+        }),
+    ]);
+    json!({
+        "get": {
+            "summary": summary,
+            "description": format!(
+                "Return the data values for the data cube defined by the query parameters, as a \
+                 CoverageJSON Grid with x, y, z and t axes. bbox is CRS84: four numbers, or six \
+                 whose vertical pair is a z interval that an explicit z overrides. z takes a \
+                 level, a list, a closed or open interval or a recurring Rn/min/step sequence of \
+                 the advertised levels; without it every level is returned. A datetime list runs \
+                 the cube once per instant and joins the grids along t. resolution-x, \
+                 resolution-y and resolution-z ask for that many evenly spaced positions from the \
+                 bbox edges (the lowest and highest selected level for z), both included, each \
+                 taking the nearest native value; 0 or absent is the native resolution, and the \
+                 largest accepted value is {max}. A response holds at most {max} values across \
+                 timesteps, levels, cells and parameters. crs accepts CRS84 only. Unknown or \
+                 repeated query parameters return 400.",
+                max = crate::params::MAX_RESOLUTION
+            ),
+            "operationId": operation_id,
+            "tags": [tag],
+            "parameters": parameters,
+            "responses": {
+                "200": {
+                    "description": "Coverage data",
+                    "content": {
+                        COVERAGE_JSON_MEDIA_TYPE: {
+                            "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                        }
+                    }
+                },
+                "400": {"description": "Bad request"},
+                "404": {"description": "Not found"},
+                "500": {"description": "Server error"}
+            }
+        }
+    })
+}
+
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
@@ -515,11 +593,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // Location data query
+        // Location data query. `locationId` per EDR 1.2
+        // `/req/edr/REQ_rc-locationid-definition` (#923), as the 1.2 bundle
+        // writes it: the requirement's fragment puts `style`/`explode` in the
+        // schema and says `required: false`, neither valid for an OpenAPI path
+        // parameter.
         let location_path = format!("/edr/collections/{id}/locations/{{locationId}}");
         collection_paths[&location_path] = json!({
             "get": {
-                "summary": format!("Get data for a location in {}", config.title),
+                "summary": format!("Get data for one or more locations in {}", config.title),
                 "operationId": format!("getLocationData_{id}"),
                 "tags": [id],
                 "parameters": [
@@ -527,7 +609,10 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "name": "locationId",
                         "in": "path",
                         "required": true,
-                        "schema": {"type": "string"}
+                        "description": format!("Comma-delimited list of location ids (EGLL or EGLL,EFHK), from the /locations inventory. At most {MAX_LOCATION_IDS}, and with a datetime list at most {MAX_LOCATION_LOOKUPS} ids × instants; a repeated id is answered once. A literal comma separates ids, so a comma inside an id is sent encoded as %2C. One id answers as before: a Coverage or CoverageCollection, 404 when it has no data in the window. A list answers one CoverageCollection with every id's coverages in request order, an id without data in the window contributing none; any unknown id is a 404 naming it."),
+                        "schema": {"type": "string"},
+                        "style": "simple",
+                        "explode": false
                     },
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/parameter-name"},
@@ -535,7 +620,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {
                         "name": "f",
                         "in": "query",
-                        "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
+                        "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot of one location; a list of locations is 400).",
                         "required": false,
                         "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
                     },
@@ -553,8 +638,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             }
                         }
                     },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Location not found"},
+                    "204": {"description": "A list of locations, none of which has data in the requested window"},
+                    "400": {"description": format!("Bad request, including an empty element in or more than {MAX_LOCATION_IDS} ids in locationId, more than {MAX_LOCATION_LOOKUPS} ids × datetime instants, and PNG for a list")},
+                    "404": {"description": "Location not found: an unknown id, or one id without data in the requested window"},
                     "500": {"description": "Server error"}
                 }
             }
@@ -668,6 +754,18 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     }
                 }
             });
+        }
+
+        // Cube query (#925). Gated like every data query: only engines
+        // advertising `cube` get the path (#668).
+        if supported.contains("cube") {
+            let cube_path = format!("/edr/collections/{id}/cube");
+            collection_paths[&cube_path] = cube_operation(
+                format!("Cube query for {}", config.title),
+                format!("getCube_{id}"),
+                id,
+                None,
+            );
         }
 
         // Trajectory query. Only advertised for engines that report
@@ -871,6 +969,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     }
                 });
             }
+            if supported.contains("cube") {
+                let p = format!("/edr/collections/{id}/instances/{{instanceId}}/cube");
+                collection_paths[&p] = cube_operation(
+                    format!("Cube query against a model run for {}", config.title),
+                    format!("getInstanceCube_{id}"),
+                    id,
+                    Some(instance_id_param.clone()),
+                );
+            }
             if supported.contains("area") {
                 let p = format!("/edr/collections/{id}/instances/{{instanceId}}/area");
                 collection_paths[&p] = json!({
@@ -963,6 +1070,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": false,
                     "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false,
                     "description": "Comma-separated list of parameter names to include"
                 },
                 "z": {
@@ -1022,6 +1131,67 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": true,
                     "schema": {"type": "string"},
                     "description": format!("WKT LINESTRING, LINESTRING Z, LINESTRING M or LINESTRING ZM (also written LINESTRINGZ, LINESTRINGM, LINESTRINGZM), CRS84 lon/lat. Z is each vertex's level in the collection's vertical coordinate (`extent.vertical`), snapped to the nearest advertised level; outside the advertised range → 400; ignored by a collection without a vertical extent. M is each vertex's time in seconds since the Unix epoch; each sample, interpolated along the path, takes the nearest available timestep; a time outside the available range → 400. Z cannot be combined with `z`, nor M with `datetime`. At most {MAX_TRAJECTORY_SAMPLES} samples at the source grid spacing, {MAX_TRAJECTORY_NODES} nodes (coverages × samples) and {MAX_AREA_VALUES} values (× parameters) per response; MULTILINESTRING is not supported. Examples: LINESTRING(24 60, 25 61), LINESTRING Z(24 60 850, 25 61 500), LINESTRING M(24 60 1767225600, 25 61 1767247200).")
+                },
+                // The cube parameters, copied from the OGC API - EDR 1.2
+                // OpenAPI (`cube-bbox`, `cube-z`, `resolution-x/-y/-z`,
+                // `crs`). The resolution parameters add the `style`/`explode`
+                // their requirement classes declare; `crs` gives CRS84, the
+                // one accepted value, as its example instead of `native`.
+                "cube-bbox": {
+                    "name": "bbox",
+                    "in": "query",
+                    "description": "Only features that have a geometry that intersects the bounding box are selected.\nThe bounding box is provided as four numbers:\n* Lower left corner, coordinate axis 1\n* Lower left corner, coordinate axis 2\n* Upper right corner, coordinate axis 1\n* Upper right corner, coordinate axis 2\n\nFor WGS 84 longitude/latitude the values are in most cases the sequence of\nminimum longitude, minimum latitude, maximum longitude and maximum latitude.\nHowever, in cases where the box spans the antimeridian the first value\n(west-most box edge) is larger than the third value (east-most box edge).\nIf a feature has multiple spatial geometry properties, it is the decision of the\nserver whether only a single spatial geometry property is used to determine\nthe extent or all relevant geometries.",
+                    "required": true,
+                    "schema": {
+                        "oneOf": [
+                            {"items": {"type": "number"}, "type": "array", "minItems": 4, "maxItems": 4},
+                            {"items": {"type": "number"}, "type": "array", "minItems": 6, "maxItems": 6}
+                        ]
+                    },
+                    "style": "form",
+                    "explode": false
+                },
+                "cube-z": {
+                    "name": "z",
+                    "in": "query",
+                    "description": "Define the vertical levels to return data from \n\nThe value will override any vertical values defined in the BBOX query parameter \n\nA range to return data for all levels between and including 2 defined levels\n\ni.e. z=minimum value/maximum value\n\nfor instance if all values between and including 10m and 100m\n\nz=10/100\n\nA list of height values can be specified\ni.e. z=value1,value2,value3\n\nfor instance if values at 2m, 10m and 80m are required\n\nz=2,10,80\n\nAn Arithmetic sequence using Recurring height intervals, the difference is the number of recurrences is defined at the start \nand the amount to increment the height by is defined at the end\n\ni.e. z=Rn/min height/height interval\n\nso if the request was for 20 height levels 50m apart starting at 100m:\n\nz=R20/100/50\n\nWhen not specified data from all available heights SHOULD be returned\n",
+                    "required": false,
+                    "schema": {"type": "string"}
+                },
+                "resolution-x": {
+                    "name": "resolution-x",
+                    "in": "query",
+                    "description": "Defined if the user requires data at a different resolution from the native resolution of the data along the x-axis\n\nThis is a single value it denotes the number of intervals to retrieve data for along the x-axis\n  \n  i.e. resolution-x=10 \n  \nwould retrieve 10 values along the x-axis from the minimum x coordinate to maximum x coordinate (i.e. a value at both the minimum x and maximum x coordinates and 8 values between).\n",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
+                "resolution-y": {
+                    "name": "resolution-y",
+                    "in": "query",
+                    "description": "Defined if the user requires data at a different resolution from the native resolution of the data along the y-axis\n\nThis is a single value it denotes the number of intervals to retrieve data for along the y-axis\n  \n  i.e. resolution-y=10 \n  \nwould retrieve 10 values along the y-axis from the minimum y coordinate to maximum y coordinate (i.e. a value at both the minimum y and maximum y coordinates and 8 values between).\n",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
+                "resolution-z": {
+                    "name": "resolution-z",
+                    "in": "query",
+                    "description": "Defined if the user requires data at a different resolution from the native resolution of the data along the z-axis\n\nThis is a single value it denotes the number of intervals to retrieve data for along the z-axis\n  \n  i.e. resolution-z=10 \n  \nwould retrieve 10 values along the z-axis from the minimum z coordinate to maximum z  coordinate (i.e. a value at both the minimum z and maximum z coordinates and 8 values between).\n",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
+                "crs": {
+                    "name": "crs",
+                    "in": "query",
+                    "description": "identifier (id) of the coordinate system to return data in list of valid crs identifiers for the chosen collection are defined in the metadata responses.  If not supplied the coordinate reference system will default to WGS84.",
+                    "required": false,
+                    "example": crate::params::CRS84,
+                    "schema": {"type": "string"}
                 },
                 // EDR 1.2 `/req/edr/rc-limit-definition`, with the schema
                 // describing this server: no default (absent = no limit, not
@@ -1543,16 +1713,43 @@ pub async fn locations(
     ))
 }
 
+/// `GET /collections/{id}/locations/{locationId}`: the data at one named
+/// location or, EDR 1.2 (#923), at each of a comma-delimited list of them,
+/// answered by `query_location_list`.
 pub async fn location_query(
     Path((id, loc_id)): Path<(String, String)>,
     Query(params): Query<LocationQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, HandlerError> {
+    uri: axum::http::Uri,
+) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
+    // Split the segment as it arrived: a literal comma separates ids, `%2C`
+    // belongs to one. The decoded `loc_id` can no longer tell them apart.
+    // `{locationId}` is the route's last segment.
+    let segment = uri.path().rsplit('/').next().unwrap_or_default();
+    let mut ids = if segment.contains(',') {
+        split_location_ids(segment).map_err(|e| bad_request(&e))?
+    } else {
+        vec![loc_id]
+    };
+
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
+    // Every listed instant re-queries every listed id: cap the product
+    // before any engine call, as MULTIPOINT points × instants is.
+    if let Some(DatetimeSelector::Instants(instants)) = &datetime {
+        let lookups = ids.len().saturating_mul(instants.len());
+        if lookups > MAX_LOCATION_LOOKUPS {
+            return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                "{} locations × {} datetime instants is {lookups} location lookups; \
+                 the limit is {MAX_LOCATION_LOOKUPS} — name fewer locations or instants",
+                ids.len(),
+                instants.len(),
+            ))));
+        }
+    }
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -1561,34 +1758,162 @@ pub async fn location_query(
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
     let limit = request_limit(params.limit.as_deref())?;
+    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
 
     let engine = engine.clone();
-    let result = execute_query(false, move |budget| {
-        crate::datetime_list::run(
-            datetime.as_ref(),
-            || budget.expired(),
-            |datetime| {
-                engine.query_location(
-                    &loc_id,
-                    datetime,
-                    param_names.as_deref(),
-                    z.as_deref(),
-                    None,
-                )
-            },
+    if ids.len() == 1 {
+        // One id, a repeat-only list included: the response it always was.
+        let loc_id = ids.pop().unwrap_or_default();
+        let result = execute_query(false, move |budget| {
+            crate::datetime_list::run(
+                datetime.as_ref(),
+                || budget.expired(),
+                |datetime| {
+                    engine.query_location(
+                        &loc_id,
+                        datetime,
+                        param_names.as_deref(),
+                        z.as_deref(),
+                        None,
+                    )
+                },
+            )
+            .map_err(|e| map_query_error(&e, "Location"))
+        })
+        .await?;
+        return render_coverage_response(
+            limit_coverages(result, limit),
+            format,
+            params.width,
+            params.height,
         )
-        .map_err(|e| map_query_error(&e, "Location"))
-    })
-    .await?;
+        .map(|r| with_data_cache_control(r, window));
+    }
 
-    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
-    render_coverage_response(
-        limit_coverages(result, limit),
-        format,
-        params.width,
-        params.height,
-    )
-    .map(|r| with_data_cache_control(r, window))
+    // The plot labels series by index, which says nothing about which
+    // location each one is: no PNG for a list.
+    if format == EdrFormat::Png {
+        return Err(bad_request_msg(
+            "PNG output plots one location: request a single location id, or CoverageJSON for a list",
+        ));
+    }
+    let limit = limit.unwrap_or(usize::MAX);
+    execute_query(false, move |budget| {
+        let expired = || budget.expired();
+        let response = match query_location_list(
+            engine.as_ref(),
+            &ids,
+            datetime.as_ref(),
+            param_names.as_deref(),
+            z.as_deref(),
+            limit,
+            &expired,
+        )? {
+            Some(coverages) => {
+                coverage_json_response(&CoverageResponse::Collection(coverages), "Location")?
+            }
+            // `/req/edr/REQ_rc-locationid-response` C.
+            None => StatusCode::NO_CONTENT.into_response(),
+        };
+        Ok(with_data_cache_control(response, window))
+    })
+    .await
+}
+
+/// The locations query over a list of ids (EDR 1.2
+/// `/req/edr/REQ_rc-locationid-response`, #923): every id's coverages in
+/// request order, flattened into one CoverageCollection. Each id goes
+/// through the engine's own `query_location`, one at a time, and a
+/// `datetime` list through `datetime_list::run` per id, exactly as that id
+/// alone: at most [`MAX_LOCATION_IDS`] ids and [`MAX_LOCATION_LOOKUPS`]
+/// engine calls, the deadline checked before each one as between
+/// MULTIPOINT points. `limit` counts the flattened coverages, and once it is
+/// reached the remaining ids are not queried. [`MAX_LOCATION_VALUES`] caps
+/// the values combined.
+///
+/// Engines answer `LocationNotFound` both for an id they do not have and for
+/// one with no data in the window, at any listed instant. The collection's
+/// inventory tells them apart, read only when some id needs it: an unknown
+/// id fails the whole list with a 404 naming it, ids past `limit` included.
+/// `Ok(None)` means every id is known and none has data, the 204.
+fn query_location_list(
+    engine: &dyn EdrEngine,
+    ids: &[String],
+    datetime: Option<&DatetimeSelector>,
+    parameters: Option<&[String]>,
+    z: Option<&[f64]>,
+    limit: usize,
+    expired: &dyn Fn() -> bool,
+) -> Result<Option<Vec<ds_core::model::QueryResult>>, HandlerError> {
+    let mut known = None;
+    let mut coverages = Vec::new();
+    let mut values = 0usize;
+    for id in ids {
+        if expired() {
+            return Err(query_timeout());
+        }
+        if coverages.len() >= limit {
+            require_known_location(engine, &mut known, id)?;
+            continue;
+        }
+        let response = crate::datetime_list::run(datetime, expired, |window| {
+            engine.query_location(id, window, parameters, z, None)
+        });
+        let response = match response {
+            Ok(response) => response,
+            Err(DataServerError::LocationNotFound(_)) => {
+                require_known_location(engine, &mut known, id)?;
+                continue;
+            }
+            Err(e) => return Err(map_query_error(&e, "Location")),
+        };
+        let mut batch = match response {
+            CoverageResponse::Single(q) => vec![q],
+            CoverageResponse::Collection(v) => v,
+        };
+        // Drop what `limit` excludes before it counts against the budget.
+        batch.truncate(limit - coverages.len());
+        for q in &batch {
+            for range in q.ranges.values() {
+                values = values.saturating_add(range.values.len());
+            }
+        }
+        if values > MAX_LOCATION_VALUES {
+            return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                "Locations response exceeds {MAX_LOCATION_VALUES} values combined; \
+                 list fewer locations or narrow datetime"
+            ))));
+        }
+        coverages.extend(batch);
+    }
+    if expired() {
+        return Err(query_timeout());
+    }
+    Ok((!coverages.is_empty()).then_some(coverages))
+}
+
+/// The 404 for a listed location id the collection does not have. `known`
+/// caches the inventory's ids across one list. An engine whose inventory is
+/// itself not found (a radar site that dropped out) knows no ids.
+fn require_known_location(
+    engine: &dyn EdrEngine,
+    known: &mut Option<std::collections::HashSet<String>>,
+    id: &str,
+) -> Result<(), HandlerError> {
+    if known.is_none() {
+        *known = Some(match engine.get_locations() {
+            Ok(locations) => locations.into_iter().map(|l| l.id).collect(),
+            Err(DataServerError::LocationNotFound(_)) => Default::default(),
+            Err(e) => return Err(map_query_error(&e, "Location")),
+        });
+    }
+    if known.as_ref().is_some_and(|known| known.contains(id)) {
+        return Ok(());
+    }
+    Err(map_query_error(
+        &DataServerError::LocationNotFound(id.to_string()),
+        "Location",
+    ))
 }
 
 /// The 404 for a data query the collection's engine does not support:
@@ -1919,6 +2244,119 @@ async fn run_radius_query(
     ))
 }
 
+/// The raw query pairs of a data query whose parameters are validated by
+/// name ([`CubeQueryParams::from_pairs`]); a malformed query string is the
+/// same JSON 400 as any other invalid parameter.
+type QueryPairs = Result<Query<Vec<(String, String)>>, axum::extract::rejection::QueryRejection>;
+
+pub async fn cube_query(
+    Path(id): Path<String>,
+    query: QueryPairs,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, HandlerError> {
+    run_cube_query(id, None, query, state).await
+}
+
+/// `GET /collections/{id}/instances/{instanceId}/cube` — cube query against
+/// a specific forecast model run.
+pub async fn instance_cube_query(
+    Path((id, instance_id)): Path<(String, String)>,
+    query: QueryPairs,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, HandlerError> {
+    run_cube_query(id, Some(instance_id), query, state).await
+}
+
+/// OGC API - EDR `cube` (#925): the parameters over a CRS84 `bbox`, at the
+/// `z` levels, over the `datetime` window, optionally resampled to
+/// `resolution-x`/`-y`/`-z` positions per axis. Every request parameter is
+/// validated here — an unknown, repeated or unsupported one (`crs` other
+/// than CRS84, `f=PNG`) is a 400 — before the engine runs.
+async fn run_cube_query(
+    id: String,
+    instance_id: Option<String>,
+    query: QueryPairs,
+    state: AppState,
+) -> Result<impl IntoResponse, HandlerError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup_collection(&state, &id)?;
+    require_query_type(engine, &id, "cube", "cube")?;
+
+    let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid cube query string"))?;
+    let params = CubeQueryParams::from_pairs(pairs).map_err(|e| bad_request(&e))?;
+    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
+        return Err(bad_request(&DataServerError::InvalidParameter(
+            "PNG output is not available for cube queries".into(),
+        )));
+    }
+    check_crs(params.crs.as_deref()).map_err(|e| bad_request(&e))?;
+    // EDR `/req/edr/rc-cube` D: a cube without a bbox is a 400.
+    let raw_bbox = params
+        .bbox
+        .as_deref()
+        .ok_or_else(|| bad_request_msg("Cube queries require a bbox"))?;
+    let (bbox, bbox_z) = parse_cube_bbox(raw_bbox).map_err(|e| bad_request(&e))?;
+    let resolution = ds_core::cube::CubeResolution {
+        x: parse_resolution("resolution-x", params.resolution_x.as_deref())
+            .map_err(|e| bad_request(&e))?,
+        y: parse_resolution("resolution-y", params.resolution_y.as_deref())
+            .map_err(|e| bad_request(&e))?,
+        z: parse_resolution("resolution-z", params.resolution_z.as_deref())
+            .map_err(|e| bad_request(&e))?,
+    };
+    if resolution.z.is_some() && engine.get_vertical_extent().is_none() {
+        return Err(bad_request_msg(
+            "This collection has no vertical dimension; resolution-z is not supported",
+        ));
+    }
+
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+
+    // A datetime list runs the cube once per instant; the per-instant
+    // `[t, z, y, x]` grids share x, y and z, so the merge joins them along t.
+    let datetime = request_datetime(params.datetime.as_deref())?;
+    let window = datetime.as_ref().map(DatetimeSelector::envelope);
+
+    let param_names: Option<Vec<String>> = params
+        .parameter_name
+        .as_deref()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+
+    // An explicit `z` overrides the vertical pair of a six-number bbox; on
+    // a collection without a vertical dimension both are ignored, as `z`
+    // is on every query (EDR 1.2 `/req/edr/z-response` A).
+    let z = match (params.z.as_deref(), bbox_z) {
+        (Some(z), _) => resolve_request_z(engine, Some(z))?,
+        (None, Some(sel)) => resolve_z_selector(engine, &sel)?,
+        (None, None) => None,
+    };
+
+    let engine = engine.clone();
+    let result = execute_query(false, move |budget| {
+        crate::datetime_list::run(
+            datetime.as_ref(),
+            || budget.expired(),
+            |datetime| {
+                engine.query_cube(
+                    &bbox,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    resolution,
+                    reference_time,
+                )
+            },
+        )
+        .map_err(|e| map_query_error(&e, "Cube"))
+    })
+    .await?;
+
+    Ok(with_data_cache_control(
+        coverage_json_response(&result, "Cube")?,
+        window,
+    ))
+}
+
 pub async fn trajectory_query(
     Path(id): Path<String>,
     Query(params): Query<TrajectoryQueryParams>,
@@ -2047,6 +2485,10 @@ pub async fn trajectory_query(
     }
 }
 
+/// The data queries with an `/instances/{instanceId}/…` route, so the only
+/// ones an instance document advertises.
+const INSTANCE_QUERY_TYPES: [&str; 4] = ["position", "area", "radius", "cube"];
+
 /// An EDR `extent.temporal` object: the interval, the Gregorian TRS and,
 /// when known, the individual timesteps.
 fn temporal_extent_json(
@@ -2077,7 +2519,8 @@ fn temporal_extent_json(
 /// `default_output_format` and `crs_details` in every one (the `*DataQuery`
 /// schemas; all but `query_type` were optional in 1.1). `crs_details` lists
 /// the one CRS data queries accept ([`DATA_QUERY_CRS`], until #84), radius
-/// adds its accepted `within_units`. `output_formats` are the formats the
+/// adds its accepted `within_units`, locations `multiple_locations` (EDR
+/// 1.2's optional boolean, #923). `output_formats` are the formats the
 /// route answers: area and radius results are gridded or multi-coverage, so
 /// they have no PNG plot. `trajectory` is the engine's
 /// [`EdrEngine::trajectory_shape`]: an along-path trajectory (#926) is
@@ -2090,7 +2533,8 @@ fn data_query_variables(
         "locations" => (
             "Locations query",
             "Lists the collection's named locations as GeoJSON; \
-             /locations/{locationId} returns the data at one of them.",
+             /locations/{locationId} returns the data at one of them, \
+             or at each of a comma-delimited list of them.",
             &["CoverageJSON", "PNG"],
         ),
         "position" => (
@@ -2125,6 +2569,12 @@ fn data_query_variables(
                 &["CoverageJSON", "PNG"],
             ),
         },
+        "cube" => (
+            "Cube query",
+            "Data inside the bbox given as west,south,east,north in CRS84 longitude and \
+             latitude, at the levels z selects; resolution-x, -y and -z resample it.",
+            &["CoverageJSON"],
+        ),
         _ => return None,
     };
     let mut variables = json!({
@@ -2138,6 +2588,13 @@ fn data_query_variables(
     if query_type == "radius" {
         // EDR radius link variables carry the accepted `within-units`.
         variables["within_units"] = json!(WITHIN_UNITS);
+    }
+    if query_type == "locations" {
+        // EDR 1.2 `/req/edr/rc-locations-variables` B: `locationId` may list
+        // several ids (#923). The handler fans the list out over the
+        // engine's own `query_location`, so every engine serving locations
+        // supports it. Absent, clients must assume it is not supported.
+        variables["multiple_locations"] = json!(true);
     }
     Some(variables)
 }
@@ -2217,7 +2674,8 @@ fn build_collection_metadata(
     // parse them back when needed. `vrs` is taken from the kind's
     // built-in WKT/URI so a radar collection still validates against
     // the EDR schema.
-    if let Some(vertical) = engine.get_vertical_extent() {
+    let vertical_extent = engine.get_vertical_extent();
+    if let Some(vertical) = &vertical_extent {
         let mut vertical_obj = serde_json::Map::new();
         if let Some((lo, hi)) = vertical.extent() {
             vertical_obj.insert(
@@ -2260,12 +2718,12 @@ fn build_collection_metadata(
         .collect();
 
     // Data queries hang off `query_base` (instance-scoped when applicable).
-    // Under an instance only the run-queryable types (position/area) get routes.
+    // Under an instance only the run-queryable types get routes.
     let query_types: Vec<String> = if instance.is_some() {
         engine
             .supported_query_types()
             .into_iter()
-            .filter(|qt| qt == "position" || qt == "area" || qt == "radius")
+            .filter(|qt| INSTANCE_QUERY_TYPES.contains(&qt.as_str()))
             .collect()
     } else {
         engine.supported_query_types()
@@ -2273,9 +2731,15 @@ fn build_collection_metadata(
     let mut data_queries = serde_json::Map::new();
     for qt in &query_types {
         // Every routed query type's path segment is its name.
-        let Some(variables) = data_query_variables(qt, engine.trajectory_shape()) else {
+        let Some(mut variables) = data_query_variables(qt, engine.trajectory_shape()) else {
             continue;
         };
+        if qt == "cube" {
+            // EDR 1.2 `/req/edr/rc-cube-variables` B: the units `z` is given
+            // in — the collection's vertical axis unit.
+            let units: Vec<&str> = vertical_extent.iter().map(|v| v.unit()).collect();
+            variables["height_units"] = json!(units);
+        }
         data_queries.insert(
             qt.clone(),
             json!({

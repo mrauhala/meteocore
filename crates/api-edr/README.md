@@ -9,8 +9,9 @@ engine. It is written for integrators and for anyone planning EDR work.
 implementation / `supported_query_types` — must update the tables below in
 the same PR.** The `crates/api-edr/CLAUDE.md` rule points here.
 
-Spec: OGC API - EDR 1.1 (OGC 19-086r6), plus EDR 1.2's `limit` and
-locations paging (#922). Base route: `/edr`.
+Spec: OGC API - EDR 1.1 (OGC 19-086r6), plus EDR 1.2's `limit`,
+locations paging (#922), several location ids in one locations query
+(#923) and the cube query with `resolution-z` (#925). Base route: `/edr`.
 
 ## Conformance classes
 
@@ -50,21 +51,58 @@ requires `sd` and `resolution`, which are not implemented. Existing
 basic search remains supported. See the [Common Parts 1–4 matrix](../../docs/ogc-api-common-matrix.md)
 for the specification baselines and remaining gaps.
 
+### Schema validation
+
+Tests validate real router responses against both vendored EDR OpenAPI 3.0
+bundles, 1.1 and 1.2 (#919). 1.1 stays declared, so both must pass. Covered:
+the landing page, `/conformance`, `/collections`, collection documents (with
+locations, position, area and radius queries, a vertical extent, and a
+satellite collection's per-parameter time axes), the instances list, one
+instance document, and the `/locations` GeoJSON. A negative control drops one
+data query link's `title`, which only 1.2 requires, and expects 1.2 to reject
+it. Both bundles' own `parameter_names` schema constrains no entry, so the
+helper also checks each entry against their parameter schema; a second
+negative control drops an entry's `observedProperty`. CoverageJSON data
+responses validate against `schemas/coveragejson.json` instead: the 1.2 OpenAPI 3.0 bundle's NdArray schema rejects valid float
+arrays. The shared helper is `tests/support/edr_schema.rs`;
+[`schemas/README.md`](../../schemas/README.md) records the pinned upstream
+commit and why the 3.0 bundle rather than the 3.1 one.
+
 ## Query types
 
 | Query type | Route | Status | Notes |
 |---|---|---|---|
-| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list, complete without `limit` and paged with it (see below), + CoverageJSON/PNG series per location |
+| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list, complete without `limit` and paged with it (see below), + CoverageJSON/PNG series per location; `{locId}` may be a comma-delimited list of up to 64 ids, answered as one CoverageCollection in request order, CoverageJSON only, and with a `datetime` list at most 256 ids × instants (see [Location lists](#location-lists)) |
 | `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined, and with a `datetime` list at most 256 points × instants; all coordinates finite and within CRS84 bounds) |
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667) |
 | `trajectory` | `/collections/{id}/trajectory` | ✓ | gridded engines (GRIB, QueryData, Zarr): values sampled along a WKT `LINESTRING`, `LINESTRING Z`, `M` or `ZM` (Z = level, M = Unix epoch seconds), CoverageJSON `Trajectory`, see [Trajectory](#trajectory-926); PVOL sites: a 2-D `LINESTRING` is a *vertical cross-section* (`Section`, also PNG). `MULTILINESTRING` not supported |
 | `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); instance-scoped queries: position, area, radius only |
-| `cube` | — | ✗ | not in the trait or the router |
+| `cube` | `/collections/{id}/cube` | ✓ | `bbox` required: CRS84, four numbers, or six whose vertical pair is a `z` interval that an explicit `z` overrides. `z` optional, in the full `z` grammar below: absent → every level; ignored, like the six-number pair, on a collection without a vertical extent. `datetime` as on every query, a list included: one cube per instant, joined along `t` into one `Grid`. `resolution-x`/`-y`/`-z` (`resolution-z` without a vertical extent is a 400), `crs` (CRS84 only), `f` (CoverageJSON only). An unknown or repeated query parameter is a 400 naming the accepted ones. Response: a `Grid` with `t`, `z`, `y`, `x` axes, ≤ 1M values across timesteps × levels × cells × parameters → 400. `data_queries.cube.link.variables.height_units` is the vertical axis unit. Only collections with vertical levels offer it: GRIB pressure and model-level views (#925) |
 | `corridor` | — | ✗ | not in the trait or the router (`corridor-width`/`-height` documented as follow-up on trajectory) |
 | `items` | `/collections/{id}/items`, `/items/{itemId}` | ✓ | GeoJSON features of the collection's `FeatureEngine`, for EDR collections whose engine has one (see [Items](#items)); `bbox`, `datetime`, `limit` + `offset` paging |
 
-A query type a collection's engine does not support (not in its `supported_query_types`, so not in `data_queries`) has no resource: position, area, radius and trajectory all answer 404 `NotFound`, and `/api` omits the path (#668). Items follows the same rule: a collection without a feature engine has no `items` in `data_queries`, no path in `/api`, and a 404 on `/items`.
+A query type a collection's engine does not support (not in its `supported_query_types`, so not in `data_queries`) has no resource: position, area, radius, cube and trajectory all answer 404 `NotFound`, and `/api` omits the path (#668). Items follows the same rule: a collection without a feature engine has no `items` in `data_queries`, no path in `/api`, and a 404 on `/items`.
+
+### Location lists
+
+EDR 1.2 lets `/locations/{locationId}` name several locations
+(`/req/edr/REQ_rc-locationid-definition` and `-response`, #923), as in
+`/locations/EGLL,EFHK`. Every collection that advertises `locations` says so
+with `multiple_locations: true` in its locations link variables
+(`/req/edr/rc-locations-variables`): the handler fans the list out over the
+engine's own `query_location`, so no engine needs code for it.
+
+| | Behaviour |
+|---|---|
+| one id | exactly as before: a Coverage, or the engine's CoverageCollection; 404 when it has no data in the window. A list that repeats one id is one id |
+| separator | a literal comma; `%2C` is a comma inside an id, as OpenAPI `style: simple` sends one, so such an id is addressable alone or in a list. Before #923 a literal comma was part of the id. Elements are not trimmed |
+| list | one CoverageCollection, even with one coverage left: each id's coverages in request order, flattened like a MULTIPOINT, so the coverages carry no id and are told apart by their domain's x and y. A repeated id is answered once |
+| no data | a known id without data in the window contributes nothing; when no listed id has data, 204 with no body, carrying the data-query `Cache-Control` |
+| unknown id | 404 naming it, failing the whole list. Engines answer an unknown id and one without data alike, so the inventory (`get_locations`) tells them apart, read only when some id is not answered |
+| limits | at most 64 ids, counted before repeats collapse, and an empty element (`a,,b`, a leading or trailing comma) are 400; with a `datetime` list at most 256 ids × instants (`MAX_LOCATION_LOOKUPS`, as MULTIPOINT points × instants), a 400 naming both counts before any engine call; 1 million values combined, as MULTIPOINT; `limit` keeps the first coverages, and the ids past it are not queried but must still exist |
+| execution | one `query_location` per id in turn on the bounded EDR executor, the deadline checked before each, as between MULTIPOINT points. A `datetime` list runs per id exactly as for that id alone (`datetime_list::run`): one query per instant, merged, and an id with no data at any instant counts as an id without data |
+| PNG | 400: the plot labels series by index, not by location |
 
 ### Items
 
@@ -104,12 +142,13 @@ along-path trajectory is CoverageJSON only, and its description names the
 Z/M forms), `default_output_format`
 (`CoverageJSON`) and `crs_details`, which lists the one CRS data queries
 accept: `CRS84` with the WKT2 of OGC:CRS84, longitude first. Radius adds
-`within_units`. The same builder serves collection documents, the
-`/collections` list and instance documents; the `data_queries.instances`
-link carries only `query_type`, which is all 1.2's `instancesLink` asks for.
-`multiple_locations` on the locations link is not emitted yet (#923).
-`parameter_names` entries carry no `dataType`: engines do not report a
-value type, every CoverageJSON range is encoded as `float`.
+`within_units`, locations `multiple_locations: true` (#923, see
+[Location lists](#location-lists)). The same builder serves collection
+documents, the `/collections` list and instance documents; the
+`data_queries.instances` link carries only `query_type`, which is all 1.2's
+`instancesLink` asks for. `parameter_names` entries carry no `dataType`:
+engines do not report a value type, every CoverageJSON range is encoded as
+`float`.
 
 ### Instance-scoped routes
 
@@ -118,6 +157,7 @@ value type, every CoverageJSON range is encoded as `float`.
 | `/instances/{instanceId}/position` | ✓ |
 | `/instances/{instanceId}/area` | ✓ |
 | `/instances/{instanceId}/radius` | ✓ |
+| `/instances/{instanceId}/cube` | ✓ |
 | `/instances/{instanceId}/locations`, `/trajectory` | ✗ |
 
 ## Parameters
@@ -125,15 +165,15 @@ value type, every CoverageJSON range is encoded as `float`.
 | Parameter | Status | Notes |
 |---|---|---|
 | `coords` | ✓ | WKT per query type (see above) |
-| `bbox` | ✓ | `items` only (CRS84); `/collections` discovery also takes one |
+| `bbox` | ✓ | `items` (CRS84) and cube: four or six comma-separated numbers (EDR 1.2 `cube-bbox`, `style: form`, `explode: false`), `west > east` crossing the antimeridian; `/collections` discovery also takes one |
 | `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`, and the EDR 1.2 list of instants `T1,T2,T3` (`/req/core/datetime-response` D). A list names at most 16 instants (`params::MAX_DATETIME_INSTANTS`), since each is a sequential engine query and no intervals; repeats collapse. Each instant is its own engine query with the window `(t, t)`, so it is matched exactly as a request for that instant alone; the answers merge (`src/datetime_list.rs`): series and `t`-axis grids at the same place join into one coverage with every instant's steps, ascending and each once, and other coverages are listed. An instant with no data (the engine's 404) contributes nothing; none with data is that 404, and any other engine error fails the request. The merged response is bounded to 1 million values; the deadline is checked before every instant. The repeating-interval form `R[n]/date-time/interval` is not accepted (400). On an along-path trajectory a 2-D or Z path takes each listed instant (one coverage per instant), and any `datetime`, a list included, with a `LINESTRING M`/`ZM` is a 400: that path carries its own times |
 | `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData and Nowcast (#666); GRIB keeps its own equivalent check |
-| `z` | ✓ | EDR 1.2 grammar (`/req/edr/z-response`): a level, a list, a closed `min/max` interval, the open intervals `../max` and `min/..` (an open end reaches the lowest or highest advertised level), and the recurring interval `Rn/min/step` (`n` levels from `min`, `step` apart, as in the standard's `R20/100/50` = 20 levels; at most 1000, non-zero step). An interval selects the advertised levels inside it (none is a 400). A level, a list and a recurring interval go to the engine as a list, which it matches its own way: ODIM snaps to the nearest sweep, GRIB requires exact levels. A collection with no vertical extent **ignores** a well-formed `z` on every query route, instance routes included (clause A, a SHALL in 1.2); a malformed `z` is still a 400 everywhere. On an along-path trajectory: the levels a 2-D or M path is sampled on; `z` with a `LINESTRING Z`/`ZM` is a 400 on every collection, since that path carries its own levels |
-| `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations plots, radar cross-section trajectories) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
-| `crs` | ✗ | data queries accept CRS84 only, which every `data_queries` link advertises in `crs_details` (#918); the `crs` parameter itself is not parsed (#84); `bbox-crs` on `/collections` is CRS84 only |
+| `z` | ✓ | EDR 1.2 grammar (`/req/edr/z-response`): a level, a list, a closed `min/max` interval, the open intervals `../max` and `min/..` (an open end reaches the lowest or highest advertised level), and the recurring interval `Rn/min/step` (`n` levels from `min`, `step` apart, as in the standard's `R20/100/50` = 20 levels; at most 1000, non-zero step). An interval selects the advertised levels inside it (none is a 400). A level, a list and a recurring interval go to the engine as a list, which it matches its own way: ODIM snaps to the nearest sweep, GRIB requires exact levels. A collection with no vertical extent **ignores** a well-formed `z` on every query route, instance routes included (clause A, a SHALL in 1.2); a malformed `z` is still a 400 everywhere. Cube also takes the interval from a six-number `bbox` when `z` is absent, ignored the same way without a vertical extent. On an along-path trajectory: the levels a 2-D or M path is sampled on; `z` with a `LINESTRING Z`/`ZM` is a 400 on every collection, since that path carries its own levels |
+| `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations plots, one location, not a list; radar cross-section trajectories) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
+| `crs` | partial | data queries serve CRS84 only, which every `data_queries` link advertises in `crs_details` (#918). Cube validates it: the CRS84 URI, `CRS84` or `OGC:CRS84` are accepted, anything else is a 400; the other data queries do not read it (#84). `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
-| `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
-| `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. On `/locations` it pages the list, below. Not on trajectory, where it is a 400: EDR 1.2 does not list it there. `items` (#928) pages with the Features default of 10. `/collections` pages with Common's default and maximum of 1000 |
+| `resolution-x`/`-y`/`-z` | partial | cube only: `n` evenly spaced positions from the bbox's west/south edge to its east/north edge (for `z`, from the lowest to the highest selected level), both ends included, each taking the nearest native value; a position more than half a cell off the grid is null. `0` or absent is the native resolution; a whole number up to 1 000 000, else 400 stating that range. Area does not take `resolution-x`/`-y` |
+| `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. A list of location ids does the same in id order; the ids past the limit are not queried, but an unknown one is still a 404. On `/locations` it pages the list, below. Not on trajectory or cube, where it is a 400: EDR 1.2 does not list it for either, and cube returns a single Grid coverage. `items` (#928) pages with the Features default of 10. `/collections` pages with Common's default and maximum of 1000 |
 | `offset` | ✓ | `/locations` with `limit`, as on `/collections`: the offset pagination extension. `offset` without `limit` on `/locations` is a 400. `/locations` takes only `limit`, `offset`, `bbox`, `datetime` and `f`; any other parameter is a 400 naming them. `bbox` and `datetime` are accepted but not applied yet (#932) |
 
 Data queries execute on a dedicated, bounded runtime, including radius and
@@ -141,7 +181,7 @@ instance routes. Admission is capped at 2–8 concurrent queries (available CPUs
 clamped), with room for 32 additional admitted requests waiting for a slot;
 further requests receive 503 immediately. A 30-second deadline (including queue time) returns
 504. Synchronous work already in progress retains its slot until it finishes;
-a cancelled/timed-out MULTIPOINT stops before its next engine call. This bounds
+a cancelled/timed-out MULTIPOINT or location list stops before its next engine call. This bounds
 concurrency without claiming that synchronous engine I/O is preemptible.
 
 For `/locations`, the same permit covers retrieval, metadata, direct JSON
@@ -301,26 +341,31 @@ transforms retain serial retrieval.
 
 ✓ implemented · – not implemented · n/a not applicable (no model runs).
 
-| Engine | locations | position | area | radius | trajectory | instances | items | Area semantics |
-|---|---|---|---|---|---|---|---|---|
-| CSV | ✓ | – | ✓ | ✓ | – | n/a | ✓ stations | stations whose point is inside the polygon (≤ 500) |
-| GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | – | Grid over the polygon's bbox at native resolution, no 256-cell coarsening (≤ 1M values across timesteps → 400, checked before any read, #858), pixels outside the polygon masked; `t` axis when several steps; a file that cannot be read is a timestep of nulls, any other error fails the query |
-| GRIB | – | ✓ | ✓ | ✓ | ✓ | ✓ | – | Grid over the polygon's bbox at native resolution (≤ 1M values across levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
-| QueryData | – | ✓ | ✓ | ✓ | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Lat/lon, rotated, stereographic and LCC grids (including the tangent-cone MEPS grid, on the sphere its file declares); a projected grid's extent is its projected rectangle's edges, not its corners' lon/lat box |
-| Zarr | – | ✓ | ✓ | ✓ | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, one subset retrieval per variable for the whole time span (each may read multiple chunks) (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
-| ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | – | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
-| ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | – (the site inventory is the network's Features collection) | polar sampling; trajectory = RHI cross-section |
-| PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | n/a | ✓ stations, no `datetime` | stations-only `location_source`: exact `ST_Within` in SQL; observations-derived: exact point-in-polygon on the cached station set |
-| PostGIS events | – | – | ✓ | ✓ | – | n/a | – (events as features = #503) | events in the polygon (exact, in SQL) as a `Point` CoverageCollection |
-| BUFR | ✓ | ✓ | ✓ | ✓ | – | n/a | ✓ stations | stations whose point is inside the polygon (exact, in memory; ≤ 10 001 stations, ≤ 500 000 values per response → 400); position = nearest station within `position_radius_km` (25 km) else 404; one `PointSeries` per station over the in-memory `retention` window; same semantics for the polled-directory and WIS2 (push) sources; units are the BUFR units mechanically converted for display (K → °C, Pa → hPa, kg m-2 → mm) like GRIB |
-| Nowcast | – | – | ✓ (motion field) | ✓ | – | ✓ | ✓ tracked cells | motion blocks over the polygon's bbox, blocks outside the polygon masked; reflectivity via EDR = #523 |
-| Satellite | – | ✓ | ✓ | ✓ | – | n/a | – | GOES-R, Himawari-9 (ISatSS) and the GMGSI global mosaic, whose values are 8-bit display counts (unit `1`), not brightness temperatures; its grid wraps at 180°, so a position either side of the seam, or an area given west > east across it, reads the pixels there. Each product is a parameter on its own time axis: the time axis of a response is the union of the selected products' scans (null where a product has none), an instant snaps per product to its latest scan at or before it, and `parameter_names` carries each product's own `extent.temporal`. RGB composites (`[[satellite.composites]]`) are map layers, not EDR parameters: naming one in `parameter-name` → 400. Position = the pixel under the point per scan; behind the Earth or off the mosaic's 72°S–72°N → 404. Area = grid over the bbox at the nadir pixel size (≤ 256 cells/axis), sampled through a coarse projection grid, masked to the polygon; polygon outside the imagery → 404; `t` axis when several scans. A query may download at most 8 scans the cache evicted and decode at most 1024 image blocks (summed per product grid; a GOES-R block is a strip of 24 full-width rows, a GMGSI block a 793 × 1322 chunk) → 400 |
-| CAP, GeoJSON | — no `EdrEngine` (Features/Maps only) — | | | | | | | |
+| Engine | locations | position | area | radius | cube | trajectory | instances | items | Area semantics |
+|---|---|---|---|---|---|---|---|---|---|
+| CSV | ✓ | – | ✓ | ✓ | – | – | n/a | ✓ stations | stations whose point is inside the polygon (≤ 500) |
+| GeoTIFF | – | ✓ | ✓ | ✓ | – | – | n/a | – | Grid over the polygon's bbox at native resolution, no 256-cell coarsening (≤ 1M values across timesteps → 400, checked before any read, #858), pixels outside the polygon masked; `t` axis when several steps; a file that cannot be read is a timestep of nulls, any other error fails the query |
+| GRIB | – | ✓ | ✓ | ✓ | ✓ pressure/model views | ✓ | ✓ | – | Grid over the polygon's bbox at native resolution (≤ 1M values across levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
+| QueryData | – | ✓ | ✓ | ✓ | – | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Lat/lon, rotated, stereographic and LCC grids (including the tangent-cone MEPS grid, on the sphere its file declares); a projected grid's extent is its projected rectangle's edges, not its corners' lon/lat box |
+| Zarr | – | ✓ | ✓ | ✓ | – | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, one subset retrieval per variable for the whole time span (each may read multiple chunks) (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
+| ODIM composite | – | ✓ | ✓ | ✓ | – | – | n/a | – | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
+| ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | – | ✓ | n/a | – (the site inventory is the network's Features collection) | polar sampling; trajectory = RHI cross-section |
+| PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | – | n/a | ✓ stations, no `datetime` | stations-only `location_source`: exact `ST_Within` in SQL; observations-derived: exact point-in-polygon on the cached station set |
+| PostGIS events | – | – | ✓ | ✓ | – | – | n/a | – (events as features = #503) | events in the polygon (exact, in SQL) as a `Point` CoverageCollection |
+| BUFR | ✓ | ✓ | ✓ | ✓ | – | – | n/a | ✓ stations | stations whose point is inside the polygon (exact, in memory; ≤ 10 001 stations, ≤ 500 000 values per response → 400); position = nearest station within `position_radius_km` (25 km) else 404; one `PointSeries` per station over the in-memory `retention` window; same semantics for the polled-directory and WIS2 (push) sources; units are the BUFR units mechanically converted for display (K → °C, Pa → hPa, kg m-2 → mm) like GRIB |
+| Nowcast | – | – | ✓ (motion field) | ✓ | – | – | ✓ | ✓ tracked cells | motion blocks over the polygon's bbox, blocks outside the polygon masked; reflectivity via EDR = #523 |
+| Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – | GOES-R, Himawari-9 (ISatSS) and the GMGSI global mosaic, whose values are 8-bit display counts (unit `1`), not brightness temperatures; its grid wraps at 180°, so a position either side of the seam, or an area given west > east across it, reads the pixels there. Each product is a parameter on its own time axis: the time axis of a response is the union of the selected products' scans (null where a product has none), an instant snaps per product to its latest scan at or before it, and `parameter_names` carries each product's own `extent.temporal`. RGB composites (`[[satellite.composites]]`) are map layers, not EDR parameters: naming one in `parameter-name` → 400. Position = the pixel under the point per scan; behind the Earth or off the mosaic's 72°S–72°N → 404. Area = grid over the bbox at the nadir pixel size (≤ 256 cells/axis), sampled through a coarse projection grid, masked to the polygon; polygon outside the imagery → 404; `t` axis when several scans. A query may download at most 8 scans the cache evicted and decode at most 1024 image blocks (summed per product grid; a GOES-R block is a strip of 24 full-width rows, a GMGSI block a 793 × 1322 chunk) → 400 |
+| CAP, GeoJSON | — no `EdrEngine` (Features/Maps only) — | | | | | | | | |
 
-Radius, cube, corridor and items have no engine-specific code: radius is
-answered by every engine that answers area, items by every engine that
-implements `FeatureEngine` for its EDR collection (the Features engine matrix
-describes each one's features), and cube and corridor do not exist.
+Radius, corridor, items and location lists have no engine-specific code:
+radius is answered by every engine that answers area, items by every engine
+that implements `FeatureEngine` for its EDR collection (the Features engine
+matrix describes each one's features), a list of location ids by every
+engine that answers locations, one `query_location` per id, and corridor
+does not exist. Cube needs a vertical axis, so only the GRIB pressure and
+model-level views offer it: Zarr exposes no vertical dimension yet (a
+variable's extra axes are read at index 0), ODIM PVOL's axis is elevation
+angle, not a grid level, and the other gridded engines have no levels.
 Trajectory is along-path sampling on GRIB, QueryData and Zarr (see
 [Trajectory](#trajectory-926)) and a vertical cross-section on PVOL sites;
 GeoTIFF, ODIM composite, Satellite, Nowcast and the station engines do not
@@ -397,7 +442,8 @@ generations, not already-published instances.
 ## Known gaps, in suggested order
 
 1. `locations` and `trajectory` under `/instances/{id}/`.
-2. `cube` and `corridor` (derivable from area / trajectory).
+2. `corridor` (derivable from trajectory); cube on Zarr once it exposes
+   vertical levels; `resolution-x`/`-y` on area.
 3. `crs` on data queries, adding its CRSs to `crs_details` (#84); EDR GeoJSON output for point results (then declare `edr-geojson`).
 4. `items` for more collections: PostGIS events (with #503), and CAP/GeoJSON if they become EDR collections.
 
@@ -460,6 +506,23 @@ A missing field at an available level is null; an unavailable level is 400.
 Levels are exact discrete coordinates, not interpolated. Model levels are not
 converted to geometric heights. Soil-depth/isentropic axes and fractional index
 level values remain unsupported by this split.
+
+GRIB cube queries (#925) answer on the pressure and model-level views. The
+time axis follows area and position: no `datetime` is the run's last step,
+an instant the nearest step, and an interval every step of the run inside
+it, the run being the latest that covers the interval start, else the
+latest with any step inside it (so `../end` works). A pinned instance never
+falls back. A datetime list is one cube per instant (the nearest step each),
+joined along `t`; instants snapping to the same step give it once. Without `parameter-name` every parameter of the view is
+returned; `z` levels are exact, as for area. The response budget is checked
+before any read when `resolution-x` and `-y` are both given, else after the
+first field supplies the grid geometry and before the output is allocated
+or any other field fetched. Fields are read with the area query's
+four-worker limit, and a level no `resolution-z` position samples is not
+read. Resampling reads the decoded grid in place, never allocating the
+native subset. A 360° grid wraps: with `bbox=-180,…,180,…` the 180° column
+samples the −180° meridian. A bbox crossing the antimeridian (`west > east`)
+is a 400, as for area (#667); a bbox off the grid is a 404.
 
 Pressure/model parameter labels and units can use a probed or decoded level of the same
 parameter and level type while another level is unprobed; exact-level metadata

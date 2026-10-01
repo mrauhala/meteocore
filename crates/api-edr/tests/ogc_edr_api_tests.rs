@@ -15,6 +15,10 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
+#[path = "support/edr_schema.rs"]
+mod edr_schema;
+use edr_schema::{GEOJSON, JSON};
+
 // ---------------------------------------------------------------------------
 // Mock engine
 // ---------------------------------------------------------------------------
@@ -423,6 +427,12 @@ mod landing_page {
             "Landing page should include a 'data' link relation for collections"
         );
     }
+
+    #[tokio::test]
+    async fn validates_against_edr_bundles() {
+        let (_, json) = get("/").await;
+        edr_schema::assert_valid("/", JSON, &json, "landing page");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +486,12 @@ mod conformance {
             .iter()
             .any(|v| v.as_str().unwrap().contains("covjson"));
         assert!(has_covjson, "Must declare CoverageJSON conformance class");
+    }
+
+    #[tokio::test]
+    async fn validates_against_edr_bundles() {
+        let (_, json) = get("/conformance").await;
+        edr_schema::assert_valid("/conformance", JSON, &json, "conformance");
     }
 }
 
@@ -533,8 +549,8 @@ mod collections {
         }
     }
 
-    /// `/collections` validates against the OGC EDR 1.1 bundled OpenAPI
-    /// schema for `GET /collections` 200 `application/json`. The
+    /// `/collections` validates against the OGC EDR 1.1 and 1.2 bundled
+    /// OpenAPI schemas for `GET /collections` 200 `application/json`. The
     /// `extent.vertical` block in particular requires `vrs` and typed
     /// strings for `interval` / `values` — this test guards against the
     /// regressions that broke a real radar collection. A dedicated
@@ -591,37 +607,13 @@ mod collections {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
-        let schema_str = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../schemas/ogcapi-edr-1.1-bundled.json"
-        ))
-        .expect("read bundled OGC EDR schema");
-        let bundle: Value = serde_json::from_str(&schema_str).expect("parse schema");
-        let collections_schema = &bundle["paths"]["/collections"]["get"]["responses"]["200"]
-            ["content"]["application/json"]["schema"];
-        assert!(
-            !collections_schema.is_null(),
-            "Schema path /collections.get.responses.200 must resolve in the bundled spec"
-        );
-
-        let validator =
-            jsonschema::Validator::new(collections_schema).expect("compile collections schema");
-        let errors: Vec<String> = validator
-            .iter_errors(&json)
-            .map(|e| format!("- {} (at {})", e, e.instance_path()))
-            .collect();
-        assert!(
-            errors.is_empty(),
-            "OGC EDR /collections schema violations:\n{}\n\nResponse:\n{}",
-            errors.join("\n"),
-            serde_json::to_string_pretty(&json).unwrap()
-        );
+        edr_schema::assert_valid("/collections", JSON, &json, "vertical collection listing");
     }
 
     /// A parameter on its own time axis (a satellite product, #819) carries
     /// its own `extent.temporal` in `parameter_names`; the collection keeps
-    /// the union. Both documents still validate against EDR 1.1, whose
-    /// parameter schema allows an `extent`.
+    /// the union. Both documents still validate against EDR 1.1 and 1.2,
+    /// whose parameter schemas allow an `extent`.
     #[tokio::test]
     async fn per_parameter_temporal_extent_validates() {
         struct OwnTimesEngine(MockEngine);
@@ -663,14 +655,6 @@ mod collections {
         }
 
         let engine: Arc<dyn EdrEngine> = Arc::new(OwnTimesEngine(MockEngine));
-        let schema: Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../schemas/ogcapi-edr-1.1-bundled.json"
-            ))
-            .unwrap(),
-        )
-        .unwrap();
         for (uri, path) in [
             ("/collections", "/collections"),
             ("/collections/weather", "/collections/{collectionId}"),
@@ -701,16 +685,7 @@ mod collections {
                     .map(Vec::len),
                 Some(2)
             );
-            let validator = jsonschema::Validator::new(
-                &schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
-                    ["schema"],
-            )
-            .unwrap();
-            let errors: Vec<String> = validator
-                .iter_errors(&json)
-                .map(|e| format!("- {} (at {})", e, e.instance_path()))
-                .collect();
-            assert!(errors.is_empty(), "{uri}:\n{}", errors.join("\n"));
+            edr_schema::assert_valid(path, JSON, &json, uri);
         }
     }
 
@@ -718,7 +693,8 @@ mod collections {
     /// (#273) as far as the engine's metadata goes: a `label` of at most 50
     /// characters, a `description` that is not just the label, a QUDT
     /// `unit.symbol` for units QUDT has, and the CF standard name URI as
-    /// `observedProperty.id` when the engine knows one. Still EDR 1.1-valid.
+    /// `observedProperty.id` when the engine knows one. Still EDR 1.1- and
+    /// 1.2-valid.
     #[tokio::test]
     async fn parameter_names_follow_metocean_profile() {
         struct DescribedEngine(MockEngine);
@@ -780,14 +756,6 @@ mod collections {
         }
 
         let engine: Arc<dyn EdrEngine> = Arc::new(DescribedEngine(MockEngine));
-        let schema: Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../schemas/ogcapi-edr-1.1-bundled.json"
-            ))
-            .unwrap(),
-        )
-        .unwrap();
         for (uri, path) in [
             ("/collections", "/collections"),
             ("/collections/weather", "/collections/{collectionId}"),
@@ -866,16 +834,7 @@ mod collections {
             );
             assert!(names["t_err"]["observedProperty"].get("id").is_none());
 
-            let validator = jsonschema::Validator::new(
-                &schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
-                    ["schema"],
-            )
-            .unwrap();
-            let errors: Vec<String> = validator
-                .iter_errors(&json)
-                .map(|e| format!("- {} (at {})", e, e.instance_path()))
-                .collect();
-            assert!(errors.is_empty(), "{uri}:\n{}", errors.join("\n"));
+            edr_schema::assert_valid(path, JSON, &json, uri);
         }
     }
 
@@ -1030,6 +989,74 @@ mod collections {
         );
     }
 
+    /// The collection document, with locations, position, area and radius
+    /// queries, validates against EDR 1.1 and 1.2. 1.2 requires each data
+    /// query link's `variables` to carry a title, description, output
+    /// formats and CRS details (#918).
+    #[tokio::test]
+    async fn detail_validates_against_edr_bundles() {
+        let (_, json) = get("/collections/weather").await;
+        let mut query_types: Vec<&str> = json["data_queries"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        query_types.sort_unstable();
+        assert_eq!(query_types, ["area", "locations", "position", "radius"]);
+        edr_schema::assert_valid("/collections/{collectionId}", JSON, &json, "collection");
+    }
+
+    /// Negative control, so the 1.2 check is not vacuous: a data query link
+    /// whose `variables` lack the `title` passes EDR 1.1, which does not
+    /// require it, and fails EDR 1.2.
+    #[tokio::test]
+    async fn detail_without_a_link_variable_title_fails_edr_1_2() {
+        use edr_schema::Edr;
+
+        let path = "/collections/{collectionId}";
+        let (_, mut json) = get("/collections/weather").await;
+        assert!(edr_schema::errors(Edr::V1_2, path, JSON, &json).is_empty());
+        let variables = json["data_queries"]["radius"]["link"]["variables"]
+            .as_object_mut()
+            .unwrap();
+        assert!(variables.remove("title").is_some());
+
+        assert!(edr_schema::errors(Edr::V1_1, path, JSON, &json).is_empty());
+        let errors = edr_schema::errors(Edr::V1_2, path, JSON, &json);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("\"title\" is a required property")),
+            "{errors:#?}"
+        );
+    }
+
+    /// Negative control for the `parameter_names` entry check: the bundles'
+    /// own `parameter_names` schema constrains no entry, so the helper checks
+    /// each entry against the parameter schema the bundles intend. An entry
+    /// without its required `observedProperty` fails both versions.
+    #[tokio::test]
+    async fn detail_with_a_parameter_without_observed_property_fails() {
+        let path = "/collections/{collectionId}";
+        let (_, mut json) = get("/collections/weather").await;
+        let parameter = json["parameter_names"]["temperature"]
+            .as_object_mut()
+            .unwrap();
+        assert!(parameter.remove("observedProperty").is_some());
+
+        for version in edr_schema::VERSIONS {
+            let errors = edr_schema::errors(version, path, JSON, &json);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("- parameter_names.temperature:")
+                        && e.contains("\"observedProperty\" is a required property")),
+                "{version:?}: {errors:#?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn collection_omits_nonstandard_apis_field() {
         // `apis` is a vendor extension with no OGC schema; it must not leak
@@ -1175,6 +1202,17 @@ mod locations {
                 serde_json::to_string_pretty(&json).unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn validates_against_edr_bundles() {
+        let (_, json) = get("/collections/weather/locations").await;
+        edr_schema::assert_valid(
+            "/collections/{collectionId}/locations",
+            GEOJSON,
+            &json,
+            "locations",
+        );
     }
 }
 

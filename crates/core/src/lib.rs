@@ -3,6 +3,7 @@ pub mod cells;
 pub mod cf;
 pub mod collection_search;
 pub mod config;
+pub mod cube;
 pub mod datetime;
 pub mod edr_engine;
 pub mod error;

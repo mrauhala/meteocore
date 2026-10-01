@@ -52,6 +52,71 @@ schemas or dropping response fields for validation. Update the implementation
 matrix's evidence separately; a bundle refresh does not establish full class
 conformance or replace its historical specification assessment.
 
+## OGC API - EDR 1.2
+
+This OpenAPI 3.0.4 bundle (`info.version` 1.2.0) is an unmodified upstream
+file, retrieved on 2026-09-30 from commit
+[`24cad825144b6441b8876342c96d480938e3a1c4`](https://github.com/opengeospatial/ogcapi-environmental-data-retrieval/tree/24cad825144b6441b8876342c96d480938e3a1c4).
+It identifies the OGC License in `info.license`. The upstream file ends
+without a newline; keep it that way, or the hash changes.
+
+| File | Pinned source | SHA-256 |
+|---|---|---|
+| `ogcapi-edr-1.2-oas30-bundled.json` | [`ogcapi-environmental-data-retrieval-1-oas30.bundled.json`](https://raw.githubusercontent.com/opengeospatial/ogcapi-environmental-data-retrieval/24cad825144b6441b8876342c96d480938e3a1c4/ogcapi-environmental-data-retrieval-1-oas30.bundled.json) | `8c706b79e9319b36ff630a3206705d1bf135e2a9d2a32d29cc45b89b722d089d` |
+
+Why this bundle:
+
+- **OpenAPI 3.0, not 3.1.** At this commit the upstream OpenAPI 3.1 bundle
+  has 76 unresolvable `$ref`s, all in its CoverageJSON schemas. They point at
+  `#/definitions/…` axis schemas that the bundle does not contain, so a
+  resolving validator fails on any document that reaches them. The 3.0
+  bundle has none. An upstream fix for the 3.1 bundle is in progress; once it
+  is merged, switch to the 3.1 bundle, which needs the test helper's JSON
+  Schema 2020-12 mode.
+- **Discovery documents only.** Data responses keep validating against
+  `coveragejson.json`. The 3.0 bundle flattens the CoverageJSON NdArray
+  `dataType` conditions into one `oneOf`, and a float NdArray with `shape`
+  and `axisNames` matches two of its branches, so valid CoverageJSON fails it.
+
+Run the checks with:
+
+```sh
+cargo test --locked -p api-edr --test ogc_edr_api_tests --test instances_tests
+cargo test --locked -p server --test satellite_edr
+```
+
+They validate real router responses against the 1.1 and 1.2 bundles: the
+landing page, `/conformance`, `/collections`, collection documents (with
+locations, position, area and radius queries, vertical extents and
+per-parameter time axes), the instances list, one instance document, and
+the `/locations` GeoJSON. Neither bundle has an `/instances/{instanceId}`
+path; an instance document is validated against the instances list's item
+schema. A negative control removes one data query link's `title`, which 1.2
+requires and 1.1 does not, and expects 1.2 to reject the document.
+
+The helper (`crates/api-edr/tests/support/edr_schema.rs`) works like the
+Common one above. It selects the `200` schema by the bundle's resource path
+and media type and compiles it next to the bundle's whole `components`
+object, because 1.2 puts every schema there behind `$ref`. It fails on missing
+or external references, enables format validation, and uses JSON Schema
+Draft 4 with OpenAPI `nullable: true` converted to a nullable type in memory.
+The checked-in bytes are never rewritten.
+
+Both EDR bundles describe `parameter_names` as an object whose
+`additionalProperties` holds the parameter schema under `items`. `items` is
+an array keyword, so on an object it constrains nothing, and the response
+schema alone checks no parameter. The helper therefore also validates each
+`parameter_names` entry against that parameter schema, as the Common helper
+validates extent dimensions against the UAD schema. A second negative control
+drops one entry's required `observedProperty` and expects both versions to
+reject the document.
+
+These are response-shape checks, not a conformance assessment, and both EDR
+versions stay checked while 1.1 conformance is declared. To update the
+baseline, download the bundle at an explicit upstream commit, record the new
+source link, date and hash here, and run the checks. Review failures rather
+than relaxing the schema or dropping response fields for validation.
+
 ## OGC 2D Tile Matrix Set 2.0 (`tms-2.0/`)
 
 The JSON schemas of [OGC 17-083r4](https://docs.ogc.org/is/17-083r4/17-083r4.html),
@@ -88,7 +153,8 @@ record the date and hashes here, and run the contract suite.
 
 ## Other schemas
 
-- `ogcapi-edr-1.1-bundled.json`: EDR collection response validation.
+- `ogcapi-edr-1.1-bundled.json`: EDR 1.1 discovery response validation,
+  next to the 1.2 bundle above, through the same helper.
 - `coveragejson.json`: CoverageJSON output validation.
 - `edr-locations-geojson.json`: EDR location GeoJSON validation.
 - `openapi-3.0.json`: generic OpenAPI document validation (Features `/api`).
