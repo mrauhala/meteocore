@@ -183,6 +183,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
     );
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),

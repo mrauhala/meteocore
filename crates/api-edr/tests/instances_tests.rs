@@ -235,6 +235,7 @@ fn state() -> api_edr::handlers::AppState {
     collections.insert("obs".to_string(), config("obs", "geotiff"));
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),

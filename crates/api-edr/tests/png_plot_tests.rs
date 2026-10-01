@@ -180,6 +180,7 @@ fn router_with(engine: Arc<dyn EdrEngine>) -> axum::Router {
     );
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),

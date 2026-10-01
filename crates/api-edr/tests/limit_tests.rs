@@ -219,6 +219,7 @@ fn app(per_point: usize) -> App {
         engines: HashMap::from([("obs".to_string(), engine)]),
         collections: HashMap::from([("obs".to_string(), config)]),
         styles: HashMap::new(),
+        feature_engines: HashMap::new(),
         base_url: "https://example.test".into(),
         trust_proxy_headers: false,
     }));
