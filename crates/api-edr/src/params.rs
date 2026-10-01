@@ -149,10 +149,17 @@ impl LocationsPaging {
     }
 }
 
+/// Query parameters `/locations` accepts. `bbox` and `datetime` are the
+/// list's EDR filters: accepted but not applied yet (#932), and repeated in
+/// paging links; `f` selects the representation.
+pub const LOCATIONS_PARAMETERS: [&str; 5] = ["limit", "offset", "bbox", "datetime", "f"];
+
 /// Split the `/locations` query into its paging request. `Ok(None)` when no
 /// `limit` is given: the complete inventory. A repeated `limit`/`offset`, an
-/// invalid value, or an `offset` without a `limit` (there is no page to
-/// offset into) is a 400; other parameters are kept for the links.
+/// invalid value, an `offset` without a `limit` (there is no page to offset
+/// into), or a parameter outside [`LOCATIONS_PARAMETERS`] is a 400, so a typo
+/// such as `limti` cannot return the unpaged list as if it worked (#605).
+/// The other accepted parameters are kept for the links.
 pub fn parse_locations_paging(
     pairs: Vec<(String, String)>,
 ) -> Result<Option<LocationsPaging>, DataServerError> {
@@ -162,9 +169,15 @@ pub fn parse_locations_paging(
         let slot = match name.as_str() {
             "limit" => &mut limit,
             "offset" => &mut offset,
-            _ => {
+            known if LOCATIONS_PARAMETERS.contains(&known) => {
                 preserved.push((name, value));
                 continue;
+            }
+            _ => {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "Unknown query parameter '{name}' for /locations; valid parameters: {}",
+                    LOCATIONS_PARAMETERS.join(", ")
+                )));
             }
         };
         if slot.replace(value).is_some() {
@@ -713,6 +726,29 @@ mod tests {
         for bad in ["-1", "+1", "1.0", "x", "99999999999999999999999999"] {
             assert!(parse_offset(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    /// An unknown parameter is a 400 naming the valid ones; the accepted
+    /// filters pass through to the links (#605, #932).
+    #[test]
+    fn locations_paging_rejects_unknown_parameters() {
+        let pairs = |q: &[(&str, &str)]| {
+            q.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let err = parse_locations_paging(pairs(&[("limti", "5")])).unwrap_err();
+        assert!(err.to_string().contains("limti"), "{err}");
+        assert!(err.to_string().contains("limit, offset"), "{err}");
+        assert!(parse_locations_paging(pairs(&[("sortby", "id")])).is_err());
+        assert_eq!(
+            parse_locations_paging(pairs(&[("bbox", "0,0,1,1"), ("datetime", "..")])).unwrap(),
+            None
+        );
+        let page = parse_locations_paging(pairs(&[("bbox", "0,0,1,1"), ("limit", "2")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.limit, 2);
     }
 
     #[test]
