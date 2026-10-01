@@ -255,7 +255,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   plus ds-executor for bounded render execution,
   ds-render for
   api-wms/api-maps, and api-edr for its `f=png` time-series plots — never on
-  engine crates. API state is a registry of engines keyed by collection ID.
+  engine crates. The one API-to-API edge is api-edr → api-features: EDR
+  `items` is the Features encoding and paging over the collection's
+  `FeatureEngine` (#928). API state is a registry of engines keyed by
+  collection ID.
 - **The shared OGC API root at `/` (#789)** composes OGC API standards as
   `api_common::shared::BuildingBlock`s — Maps, Tiles and Features — over one
   landing page, conformance, OpenAPI document and collection catalog. Blocks
