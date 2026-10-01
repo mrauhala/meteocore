@@ -15,6 +15,7 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
+use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 
 use crate::parse::QueryData;
 
@@ -277,7 +278,90 @@ impl EdrEngine for QueryDataEngine {
             "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
+            "trajectory".to_string(),
         ]
+    }
+
+    /// Trajectory query (#926): values along a WKT `LINESTRING` / `Z` / `M`
+    /// / `ZM` path, densified to about one sample per grid cell crossed and
+    /// bilinearly interpolated like position. The run's grid is memory
+    /// mapped, so sampling does no I/O; each sample is projected once and
+    /// reused by every parameter and timestep. No vertical axis: a Z
+    /// coordinate is ignored.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let path = TrajectoryPath::parse(coords)?;
+        let data = self.select_data(reference_time)?;
+        // A 2-D path takes the position query's steps; an M path snaps to
+        // any step of the run.
+        let time_indices = find_time_range(&data, datetime.filter(|_| !path.has_m));
+        let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
+        let param_indices = select_param_indices(&data, parameters)?;
+        // The native cell size the area query samples at: exact for lat-lon
+        // grids, a fair mean for projected ones.
+        let extent = data.grid.lonlat_extent();
+        let spacing =
+            GridSpacing::from_extent(extent, [data.grid.nx as usize, data.grid.ny as usize])
+                .ok_or_else(|| DataServerError::Engine("QueryData grid has no extent".into()))?;
+        let plan = TrajectoryPlan::new(
+            &path,
+            spacing,
+            TrajectoryAxes {
+                times: &times,
+                vertical: None,
+                z: None,
+            },
+            param_indices.len(),
+        )?;
+        plan.require_extent(Some(extent))?;
+
+        // Project each sample once (per vertex, never per output pixel).
+        let gt = data.grid.geo_transform();
+        let pixels: Vec<(f64, f64)> = plan
+            .points()
+            .iter()
+            .map(|&(lon, lat)| world_to_grid_px(gt, lon, lat))
+            .collect();
+        let values: Vec<Vec<Vec<Option<f64>>>> = param_indices
+            .iter()
+            .map(|(pi, _)| {
+                plan.fields()
+                    .iter()
+                    .map(|field| {
+                        let ti = time_indices[field.time].0;
+                        field
+                            .points
+                            .iter()
+                            .map(|&p| {
+                                let (col_f, row_f) = pixels[p];
+                                sample_grid_bilinear(&data, col_f, row_f, *pi, 0, ti)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let descriptions: Vec<(String, ParameterDescription)> = param_indices
+            .iter()
+            .map(|(_, param)| {
+                (
+                    param.name.clone(),
+                    ParameterDescription {
+                        label: param.name.clone(),
+                        unit: String::new(),
+                        observed_property: param.name.clone(),
+                        standard_name: None,
+                    },
+                )
+            })
+            .collect();
+        plan.into_response(&descriptions, &values)
     }
 
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the source's
@@ -1175,6 +1259,139 @@ mod tests {
         let temp = result.ranges.get("2 Metre Temperature (2t)").unwrap();
         let has_values = temp.values.iter().any(|v| v.is_some());
         assert!(has_values, "Temperature should have some values");
+    }
+
+    /// A `Trajectory` node `(t, lon, lat)` and one parameter's value there.
+    type TrajectorySample = ((DateTime<Utc>, f64, f64), Option<f64>);
+
+    /// The `(node, value)` pairs of one parameter of a `Trajectory` coverage.
+    fn trajectory_samples(qr: &QueryResult, param: &str) -> Vec<TrajectorySample> {
+        let DomainDescription::Trajectory { nodes, .. } = &qr.domain else {
+            panic!("expected a Trajectory domain")
+        };
+        let range = &qr.ranges[param];
+        assert_eq!(range.axis_names, ["composite"]);
+        assert_eq!(range.shape, [nodes.len()]);
+        nodes
+            .iter()
+            .copied()
+            .zip(range.values.iter().copied())
+            .collect()
+    }
+
+    /// Every trajectory sample equals a position query at its node and
+    /// timestep: the same projection and bilinear interpolation (#926).
+    fn assert_matches_position(engine: &QueryDataEngine, qr: &QueryResult, param: &str) {
+        for ((t, lon, lat), value) in trajectory_samples(qr, param) {
+            let CoverageResponse::Single(position) = engine
+                .query_position(
+                    &format!("POINT({lon} {lat})"),
+                    Some((t, t)),
+                    Some(&[param.to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap()
+            else {
+                panic!("expected Single")
+            };
+            assert_eq!(
+                value, position.ranges[param].values[0],
+                "{param} at {lon},{lat} {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn trajectory_samples_the_run_along_the_path() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        assert!(engine
+            .supported_query_types()
+            .contains(&"trajectory".to_string()));
+        let param = "2 Metre Temperature (2t)";
+        let (first, last) = engine.get_temporal_extent().unwrap();
+
+        // A 2-D path at one step: a single coverage densified on the
+        // fixture's grid, every sample a real value inside the extent.
+        let CoverageResponse::Single(qr) = engine
+            .query_trajectory(
+                "LINESTRING(35 -2, 37 0, 39 1)",
+                Some((first, first)),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("one step → one coverage")
+        };
+        assert_eq!(qr.parameters.len(), 3);
+        let samples = trajectory_samples(&qr, param);
+        assert!(samples.len() > 3, "densified: {}", samples.len());
+        assert!(samples.iter().all(|(n, v)| n.0 == first && v.is_some()));
+        assert_matches_position(&engine, &qr, param);
+
+        // An M path over the whole run: samples snap to the run's steps.
+        let coords = format!(
+            "LINESTRING M(35 -2 {}, 39 1 {})",
+            first.timestamp(),
+            last.timestamp()
+        );
+        let CoverageResponse::Single(qr) = engine
+            .query_trajectory(&coords, None, Some(&[param.to_string()]), None, None)
+            .unwrap()
+        else {
+            panic!("an M path is one coverage")
+        };
+        let samples = trajectory_samples(&qr, param);
+        assert_eq!(samples.first().unwrap().0 .0, first);
+        assert_eq!(samples.last().unwrap().0 .0, last);
+        assert!(samples.windows(2).all(|w| w[0].0 .0 <= w[1].0 .0));
+        assert_matches_position(&engine, &qr, param);
+
+        // Outside the run's time range → 400; outside the grid → 404.
+        let late = format!(
+            "LINESTRING M(35 -2 {}, 39 1 {})",
+            first.timestamp(),
+            last.timestamp() + 86_400
+        );
+        assert!(matches!(
+            engine.query_trajectory(&late, None, None, None, None),
+            Err(DataServerError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            engine.query_trajectory("LINESTRING(10 50, 11 51)", None, None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// The projected (LCC) MEPS crop (9–20°E, 60–65°N): samples along a
+    /// path across Sweden at its few-km cell size, projected per sample
+    /// like position.
+    #[test]
+    fn trajectory_on_a_projected_grid_matches_position() {
+        let engine = meps_engine();
+        let (first, _) = engine.get_temporal_extent().unwrap();
+        let param = engine.get_parameters()[0].clone();
+        let CoverageResponse::Single(qr) = engine
+            .query_trajectory(
+                "LINESTRING(12 61, 17 63.5)",
+                Some((first, first)),
+                Some(std::slice::from_ref(&param)),
+                None,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("one step → one coverage")
+        };
+        let samples = trajectory_samples(&qr, &param);
+        // ~380 km at a few-km mean cell size: densified well past the two
+        // vertices, and inside the domain.
+        assert!(samples.len() > 20, "{}", samples.len());
+        assert!(samples.iter().any(|(_, v)| v.is_some()));
+        assert_matches_position(&engine, &qr, &param);
     }
 
     #[test]

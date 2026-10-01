@@ -1,8 +1,9 @@
 //! Bounded execution of synchronous EDR engines away from HTTP workers.
 //!
 //! Normal queries run on a dedicated multi-thread runtime: storage engines
-//! may use `block_in_place` there. Trajectory engines explicitly expect a
-//! blocking thread, so that path uses the same runtime's blocking pool.
+//! may use `block_in_place` there. Cross-section trajectory engines
+//! (`TrajectoryShape::CrossSection`) explicitly expect a blocking thread, so
+//! that path uses the same runtime's blocking pool.
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 

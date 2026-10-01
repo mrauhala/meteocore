@@ -193,6 +193,9 @@ pub fn write_station_series<'a, W: Write>(
             DomainDescription::Section { .. } => {
                 return Err(GeoJsonError::NotStationSeries("Section"))
             }
+            DomainDescription::Trajectory { .. } => {
+                return Err(GeoJsonError::NotStationSeries("Trajectory"))
+            }
         };
         for name in q.ranges.keys().chain(q.parameters.keys()) {
             if RESERVED_PROPERTIES.contains(&name.as_str()) {

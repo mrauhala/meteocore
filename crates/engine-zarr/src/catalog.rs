@@ -198,6 +198,20 @@ impl Catalog {
             .and_then(|mut w| w.pop()))
     }
 
+    /// Mean native cell size in degrees, from the coordinate axes: the
+    /// spacing a trajectory densifies its path at (#926). A single-cell
+    /// axis borrows the other axis's spacing (1° when both are single).
+    pub fn native_spacing(&self) -> ds_core::trajectory::GridSpacing {
+        let step = |axis: &[f64]| {
+            (axis.len() > 1)
+                .then(|| (axis[axis.len() - 1] - axis[0]).abs() / (axis.len() - 1) as f64)
+                .filter(|s| s.is_finite() && *s > 0.0)
+        };
+        let (dx, dy) = (step(&self.lons), step(&self.lats));
+        ds_core::trajectory::GridSpacing::new(dx.or(dy).unwrap_or(1.0), dy.or(dx).unwrap_or(1.0))
+            .expect("finite positive spacing")
+    }
+
     /// Native cells `(ncols, nrows)` a [`Self::read_window_span`] of `bbox`
     /// would fetch (including the one-cell margin), or `None` off-grid —
     /// so a caller can budget the *read*, not just its output.

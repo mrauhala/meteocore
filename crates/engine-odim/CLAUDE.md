@@ -95,7 +95,11 @@ around `ds-storage` calls (Critical Rules 6–7).
 - **Cross-sections:** `query_trajectory` returns a CoverageJSON `Section`
   (composite `[t,x,y]` axis + numeric `z` = height above antenna via the
   4/3-Earth beam model). `z` selects the elevation-angle band. Vertical axis
-  is elevation angle (`VerticalKind::ElevationAngle`).
+  is elevation angle (`VerticalKind::ElevationAngle`). The per-site view
+  declares `TrajectoryShape::CrossSection` (#926): api-edr then accepts a
+  2-D `LINESTRING` only, offers the PNG heatmap, and dispatches on the
+  blocking pool that `blocking_pixel_handle` expects. Not the gridded
+  engines' along-path `Trajectory`.
 - **Coverage floor (#514):** every `Section` carries `coverage_floor` — per
   node, the height of the *effective* lowest surveyed beam (`window ∩` the
   volume's sweep envelope, so a `z`-narrowed request gets the floor of the

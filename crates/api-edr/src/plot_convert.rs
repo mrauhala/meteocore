@@ -138,6 +138,9 @@ fn build_panel(param: &str, coverages: &[QueryResult]) -> Result<Panel, DataServ
         DomainDescription::Point { .. } => Err(DataServerError::InvalidParameter(
             "PNG output is not available for point-event responses".into(),
         )),
+        DomainDescription::Trajectory { .. } => Err(DataServerError::InvalidParameter(
+            "PNG output is not available for along-path trajectory responses".into(),
+        )),
     }
 }
 
@@ -149,6 +152,7 @@ fn domain_kind(d: &DomainDescription) -> &'static str {
         DomainDescription::Grid { .. } => "Grid",
         DomainDescription::Section { .. } => "Section",
         DomainDescription::Point { .. } => "Point",
+        DomainDescription::Trajectory { .. } => "Trajectory",
     }
 }
 

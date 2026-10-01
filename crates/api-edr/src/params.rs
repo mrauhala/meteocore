@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use ds_core::datetime::parse_datetime_interval;
+use ds_core::edr_engine::TrajectoryShape;
 use ds_core::error::DataServerError;
 use serde::Deserialize;
 
@@ -198,17 +199,29 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
 }
 
 /// The output formats a data query offers, default first, in the order they
-/// are advertised in `data_queries.*.link.variables.output_formats`. GeoJSON
+/// are advertised in `data_queries.*.link.variables.output_formats`: the
+/// one list the handlers negotiate over and the metadata advertises. GeoJSON
 /// is offered for the point-shaped queries (`locations`, `position`,
 /// `radius`) of an engine that serves station series
 /// (`EdrEngine::serves_station_series`); gridded results, `area` and `cube`
 /// keep CoverageJSON only (#929). PNG plots a single series or profile, so area and
-/// radius results are not offered as PNG.
-pub fn query_formats(query_type: &str, station_series: bool) -> &'static [EdrFormat] {
+/// radius results are not offered as PNG. A trajectory is never GeoJSON; it
+/// is a PNG heatmap only as a radar cross-section
+/// (`EdrEngine::trajectory_shape`), an along-path trajectory (#926) being
+/// CoverageJSON only.
+pub fn query_formats(
+    query_type: &str,
+    station_series: bool,
+    trajectory: TrajectoryShape,
+) -> &'static [EdrFormat] {
     use EdrFormat::{CoverageJson, GeoJson, Png};
     match (query_type, station_series) {
         ("locations" | "position", true) => &[CoverageJson, GeoJson, Png],
-        ("locations" | "position" | "trajectory", _) => &[CoverageJson, Png],
+        ("locations" | "position", false) => &[CoverageJson, Png],
+        ("trajectory", _) => match trajectory {
+            TrajectoryShape::CrossSection => &[CoverageJson, Png],
+            TrajectoryShape::AlongPath => &[CoverageJson],
+        },
         ("radius", true) => &[CoverageJson, GeoJson],
         _ => &[CoverageJson],
     }
@@ -665,12 +678,14 @@ pub fn parse_within_metres(within: &str, units: &str) -> Result<f64, DataServerE
     Ok(metres)
 }
 
-/// Trajectory (vertical cross-section) query parameters. Accepts a WKT
-/// `LINESTRING(lon lat, lon lat, …)` and the standard EDR filters; `z`
-/// selects *elevation angles* from the collection's advertised vertical
-/// extent (a list or a `min/max` interval), bounding which sweeps build
-/// the cross-section — whose own axis is derived height. The corridor
-/// variant (`corridor-width` / `corridor-height`) ships in a follow-up.
+/// Trajectory query parameters. `coords` is a WKT `LINESTRING`; a
+/// gridded (along-path) collection also takes `LINESTRING Z`, `M` and `ZM`,
+/// where Z is each vertex's level and M its time in Unix epoch seconds.
+/// `z` selects levels from the collection's advertised vertical extent (a
+/// list or a `min/max` interval): the levels a 2-D or M path is sampled on,
+/// or, for a radar cross-section, the *elevation angles* bounding which
+/// sweeps build it — whose own axis is derived height. The corridor query
+/// (`corridor-width` / `corridor-height`) is a separate follow-up.
 #[derive(Debug, Deserialize)]
 pub struct TrajectoryQueryParams {
     pub coords: String,
@@ -678,8 +693,8 @@ pub struct TrajectoryQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
-    /// Output format: `CoverageJSON` (default) or `PNG` — a colour-mapped
-    /// cross-section heatmap (distance × height).
+    /// Output format: `CoverageJSON` (default) or, for a radar
+    /// cross-section, `PNG` — a colour-mapped heatmap (distance × height).
     pub f: Option<String>,
     /// PNG image dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
@@ -1078,23 +1093,76 @@ mod tests {
     #[test]
     fn geojson_is_offered_for_point_queries_of_station_series_only() {
         use EdrFormat::{CoverageJson, GeoJson, Png};
+        let along = TrajectoryShape::AlongPath;
         assert_eq!(
-            query_formats("position", true),
+            query_formats("position", true, along),
             [CoverageJson, GeoJson, Png]
         );
         assert_eq!(
-            query_formats("locations", true),
+            query_formats("locations", true, along),
             [CoverageJson, GeoJson, Png]
         );
-        assert_eq!(query_formats("radius", true), [CoverageJson, GeoJson]);
-        assert_eq!(query_formats("area", true), [CoverageJson]);
-        assert_eq!(query_formats("cube", true), [CoverageJson]);
-        for qt in ["locations", "position", "trajectory"] {
-            assert_eq!(query_formats(qt, false), [CoverageJson, Png], "{qt}");
+        assert_eq!(
+            query_formats("radius", true, along),
+            [CoverageJson, GeoJson]
+        );
+        assert_eq!(query_formats("area", true, along), [CoverageJson]);
+        assert_eq!(query_formats("cube", true, along), [CoverageJson]);
+        for qt in ["locations", "position"] {
+            assert_eq!(query_formats(qt, false, along), [CoverageJson, Png], "{qt}");
         }
         for qt in ["area", "radius", "cube"] {
-            assert_eq!(query_formats(qt, false), [CoverageJson], "{qt}");
+            assert_eq!(query_formats(qt, false, along), [CoverageJson], "{qt}");
         }
+    }
+
+    /// A trajectory's formats follow its shape (#926), never GeoJSON: a
+    /// radar cross-section is also a PNG heatmap, an along-path trajectory
+    /// CoverageJSON only — whatever the engine's station-series flag.
+    #[test]
+    fn trajectory_formats_follow_the_shape() {
+        use EdrFormat::{CoverageJson, Png};
+        for station_series in [false, true] {
+            assert_eq!(
+                query_formats("trajectory", station_series, TrajectoryShape::CrossSection),
+                [CoverageJson, Png]
+            );
+            assert_eq!(
+                query_formats("trajectory", station_series, TrajectoryShape::AlongPath),
+                [CoverageJson]
+            );
+        }
+        // Along a path: PNG and GeoJSON are 400s, `Accept: image/png` falls
+        // back to CoverageJSON without `Vary` (one format offered).
+        let along = query_formats("trajectory", false, TrajectoryShape::AlongPath);
+        for f in ["PNG", "GeoJSON"] {
+            assert!(negotiate_edr_format(Some(f), None, along, "trajectory queries").is_err());
+        }
+        assert_eq!(
+            negotiate_edr_format(None, Some("image/png"), along, "trajectory queries").unwrap(),
+            NegotiatedFormat {
+                format: CoverageJson,
+                vary_accept: false
+            }
+        );
+        // A cross-section: PNG by `f` or by `Accept` (then with `Vary`).
+        let section = query_formats("trajectory", false, TrajectoryShape::CrossSection);
+        assert!(
+            negotiate_edr_format(Some("GeoJSON"), None, section, "trajectory queries").is_err()
+        );
+        assert_eq!(
+            negotiate_edr_format(Some("png"), None, section, "trajectory queries")
+                .unwrap()
+                .format,
+            Png
+        );
+        assert_eq!(
+            negotiate_edr_format(None, Some("image/png"), section, "trajectory queries").unwrap(),
+            NegotiatedFormat {
+                format: Png,
+                vary_accept: true
+            }
+        );
     }
 
     #[test]

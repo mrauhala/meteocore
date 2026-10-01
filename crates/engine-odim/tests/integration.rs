@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use ds_core::config::OdimConfig;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 use ds_core::feature::{Bbox, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
@@ -1613,6 +1613,10 @@ fn pvol_edr_query_trajectory_returns_section() {
         eprintln!("skipping pvol_edr_query_trajectory_returns_section: fixture absent");
         return;
     };
+    // A radar volume answers with a cross-section, not the gridded
+    // engines' along-path sampling (#926): the API layer keeps its 2-D
+    // LINESTRING, PNG heatmap and blocking-pool dispatch on this.
+    assert_eq!(view.trajectory_shape(), TrajectoryShape::CrossSection);
     // A ~65 km north-bound leg through Vihti (~24.50°E, 60.56°N), so the
     // path crosses the radar's lowest sweep coverage along its length.
     // `z` here selects the 0.5°–5° elevation angle band (the

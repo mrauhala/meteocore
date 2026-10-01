@@ -545,6 +545,14 @@ one never implies the other.
   (`geo::{slant_to_ground_height, beam_height_at_ground,
   FOUR_THIRDS_EARTH_M}`) and `geo::great_circle_distance_m` live in
   `ds_core::geo` — one home; engine-odim re-exports them.
+- **`ds_core::trajectory`** — the EDR along-path trajectory (#926): WKT
+  `LINESTRING` / `Z` / `M` / `ZM` parsing, great-circle densification at the
+  source grid spacing (≤ 2000 samples), the M-time and Z-level snapping and
+  range rules, and the CoverageJSON `Trajectory` layout (`TrajectoryPlan`).
+  A gridded engine selects its run/steps/levels like its position query and
+  samples `plan.fields()` grouped per field or window — never re-implement
+  these rules per engine, never read per sample. A radar volume instead
+  declares `TrajectoryShape::CrossSection` (see `crates/api-edr/CLAUDE.md`).
 - **`ds_core::cells`** — storm-cell segmentation and tracking over
   `VoxelGrid` (see `crates/engine-odim/CLAUDE.md`).
 - **`ds_core::significance`** — domain-agnostic scoring/ranking: normalized
@@ -582,11 +590,11 @@ one never implies the other.
 | CSV | `EdrEngine` + `FeatureEngine` | EDR (locations, area, radius), Features |
 | GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
+| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
-| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
+| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |

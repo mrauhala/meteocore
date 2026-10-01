@@ -55,7 +55,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::config::ResamplingMethod;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 use ds_core::error::DataServerError;
 use ds_core::feature::{
     parse_area_coords, parse_linestring_coords, parse_point_coords, Bbox, DatetimeInterval,
@@ -4630,6 +4630,13 @@ impl EdrEngine for PolarVolumeSiteView {
             ));
         }
         Ok(CoverageResponse::Collection(covs))
+    }
+
+    /// A radar volume answers a trajectory with the vertical cross-section
+    /// under a 2-D path (a `Section`), not the along-path sampling of the
+    /// gridded engines.
+    fn trajectory_shape(&self) -> TrajectoryShape {
+        TrajectoryShape::CrossSection
     }
 
     /// Trajectory cross-section along a WKT `LINESTRING`, always against

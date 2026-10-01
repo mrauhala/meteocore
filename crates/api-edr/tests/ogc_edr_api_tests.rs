@@ -1741,6 +1741,9 @@ mod unimplemented_queries {
             fn supported_query_types(&self) -> Vec<String> {
                 vec!["trajectory".into()]
             }
+            fn trajectory_shape(&self) -> ds_core::edr_engine::TrajectoryShape {
+                ds_core::edr_engine::TrajectoryShape::CrossSection
+            }
             fn query_trajectory(
                 &self,
                 _coords: &str,
@@ -1817,7 +1820,7 @@ mod unimplemented_queries {
             .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)&f=PNG")
             .body(Body::empty())
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -1827,6 +1830,244 @@ mod unimplemented_queries {
         );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+
+        // `Accept: image/png` chooses the heatmap among the two offered
+        // formats, so the response varies on Accept.
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)")
+            .header("accept", "image/png")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+        assert!(resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .any(|v| v.to_str().unwrap().eq_ignore_ascii_case("accept")));
+
+        // A trajectory is never GeoJSON (#929).
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)&f=GeoJSON")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An along-path (gridded) engine, #926: the handler validates the
+    /// whole path and the EDR 1.2 Z/`z` and M/`datetime` exclusions before
+    /// dispatch, refuses PNG, and serves the `Trajectory` domain; metadata
+    /// and `/api` advertise CoverageJSON only and the Z/M/ZM `coords`.
+    #[tokio::test]
+    async fn along_path_trajectory_validates_before_dispatch() {
+        use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
+        use ds_core::vertical::{VerticalDimension, VerticalKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlongPathMock(Arc<AtomicUsize>);
+        fn levels() -> VerticalDimension {
+            VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0, 500.0])
+        }
+        impl EdrEngine for AlongPathMock {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(vec![])
+            }
+            fn query_location(
+                &self,
+                _id: &str,
+                _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _p: Option<&[String]>,
+                _z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                Err(DataServerError::LocationNotFound("n/a".into()))
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["TMP".into()]
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                Some((
+                    "2024-01-01T00:00:00Z".parse().unwrap(),
+                    "2024-01-01T06:00:00Z".parse().unwrap(),
+                ))
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                Some([20.0, 55.0, 30.0, 65.0])
+            }
+            fn get_vertical_extent(&self) -> Option<VerticalDimension> {
+                Some(levels())
+            }
+            fn supported_query_types(&self) -> Vec<String> {
+                vec!["trajectory".into()]
+            }
+            fn query_trajectory(
+                &self,
+                coords: &str,
+                datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _p: Option<&[String]>,
+                z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let path = TrajectoryPath::parse(coords)?;
+                // The position-style step selection: every step, or those
+                // inside the window (an instant matches exactly).
+                let times: Vec<DateTime<Utc>> = [
+                    "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    "2024-01-01T06:00:00Z".parse().unwrap(),
+                ]
+                .into_iter()
+                .filter(|t| datetime.is_none_or(|(start, end)| *t >= start && *t <= end))
+                .collect();
+                let vertical = levels();
+                let plan = TrajectoryPlan::new(
+                    &path,
+                    GridSpacing::new(0.5, 0.5).unwrap(),
+                    TrajectoryAxes {
+                        times: &times,
+                        vertical: Some(&vertical),
+                        z,
+                    },
+                    1,
+                )?;
+                let values = vec![plan
+                    .fields()
+                    .iter()
+                    .map(|f| vec![Some(1.0); f.points.len()])
+                    .collect()];
+                let parameters = [(
+                    "TMP".to_string(),
+                    ParameterDescription {
+                        label: "Temperature".into(),
+                        unit: "°C".into(),
+                        observed_property: "TMP".into(),
+                        standard_name: None,
+                    },
+                )];
+                plan.into_response(&parameters, &values)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine: Arc<dyn EdrEngine> = Arc::new(AlongPathMock(calls.clone()));
+        let router = api_edr::router(make_edr_state(engine));
+        let fetch = |uri: String| {
+            let router = router.clone();
+            async move {
+                let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+                let resp = router.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = resp.into_body().collect().await.unwrap().to_bytes();
+                (status, serde_json::from_slice::<Value>(&body).unwrap())
+            }
+        };
+        let base = "/collections/weather/trajectory?coords=";
+
+        for query in [
+            // A Z path carries its levels: `z` too is an error (EDR 1.2).
+            "LINESTRING%20Z(24%2060%20850,25%2061%20500)&z=850",
+            "LINESTRING%20ZM(24%2060%20850%201704067200,25%2061%20500%201704088800)&z=850",
+            // An M path carries its times: `datetime` too is an error.
+            "LINESTRINGM(24%2060%201704067200,25%2061%201704088800)&datetime=2024-01-01T00:00:00Z",
+            "LINESTRING%20ZM(24%2060%20850%201704067200,25%2061%20500%201704088800)&datetime=2024-01-01T00:00:00Z",
+            // A `datetime` list is a `datetime` too.
+            "LINESTRINGM(24%2060%201704067200,25%2061%201704088800)&datetime=2024-01-01T00:00:00Z,2024-01-01T06:00:00Z",
+            // Malformed paths never reach the engine.
+            "LINESTRING(24%2060)",
+            "LINESTRING%20Z(24%2060,25%2061)",
+            "MULTILINESTRING((24%2060,25%2061))",
+            // Only a radar cross-section renders as a PNG; no trajectory is
+            // GeoJSON.
+            "LINESTRING(24%2060,25%2061)&f=PNG",
+            "LINESTRING(24%2060,25%2061)&f=GeoJSON",
+        ] {
+            let (status, json) = fetch(format!("{base}{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "rejected before dispatch");
+
+        let (status, json) = fetch(format!(
+            "{base}LINESTRING%20Z(24%2060%201000,25%2061%20500)"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["domainType"], "Trajectory");
+        let domain = &json["coverages"][0]["domain"];
+        assert_eq!(
+            domain["axes"]["composite"]["coordinates"],
+            serde_json::json!(["t", "x", "y", "z"])
+        );
+        // An M path on one level: a single coverage with a `z` axis.
+        let (status, json) = fetch(format!(
+            "{base}LINESTRING%20M(24%2060%201704067200,25%2061%201704088800)&z=850"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["type"], "Coverage");
+        assert_eq!(
+            json["domain"]["axes"]["z"]["values"],
+            serde_json::json!([850.0])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // A 2-D path with a `datetime` list: one engine query per instant,
+        // one coverage per instant (EDR 1.2 /req/core/datetime-response D).
+        let (status, json) = fetch(format!(
+            "{base}LINESTRING(24%2060,25%2061)&z=850\
+             &datetime=2024-01-01T00:00:00Z,2024-01-01T06:00:00Z"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["type"], "CoverageCollection");
+        let steps: Vec<&str> = json["coverages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                c["domain"]["axes"]["composite"]["values"][0][0]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            ["2024-01-01T00:00:00+00:00", "2024-01-01T06:00:00+00:00"]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // `Accept: image/png` is not a failure: CoverageJSON, the only
+        // format offered along a path, so nothing varies on Accept.
+        let req = Request::builder()
+            .uri(format!("{base}LINESTRING(24%2060,25%2061)&z=850"))
+            .header("accept", "image/png")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/vnd.cov+json");
+        assert!(resp.headers().get("vary").is_none_or(|v| !v
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("accept")));
+
+        let (_, meta) = fetch("/collections/weather".into()).await;
+        assert_eq!(
+            meta["data_queries"]["trajectory"]["link"]["variables"]["output_formats"],
+            serde_json::json!(["CoverageJSON"])
+        );
+        let (_, api) = fetch("/api".into()).await;
+        let op = &api["paths"]["/edr/collections/weather/trajectory"]["get"];
+        assert_eq!(
+            op["parameters"][0]["$ref"],
+            "#/components/parameters/coords-trajectory"
+        );
+        let coords_doc = api["components"]["parameters"]["coords-trajectory"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(coords_doc.contains("Unix epoch"), "{coords_doc}");
     }
 
     #[tokio::test]

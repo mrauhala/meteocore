@@ -44,28 +44,7 @@ impl GribEngine {
                     .then_some((time, file))
             })
             .collect();
-        let params: Vec<String> = match parameters {
-            Some(params) => params.to_vec(),
-            None if self.vertical_kind().is_some() => keys.keys().cloned().collect(),
-            None => {
-                let mut seen = HashSet::new();
-                steps
-                    .iter()
-                    .flat_map(|(_, file)| &file.messages)
-                    .filter(|m| self.family == Some(GribLevelType::Single) || m.is_near_surface())
-                    .filter(|m| seen.insert(m.param.clone()))
-                    .map(|m| m.param.clone())
-                    .collect()
-            }
-        };
-        if self.family.is_some() {
-            self.validate_parameters(&keys, &params)?;
-        }
-        if steps.is_empty() || (params.is_empty() && self.vertical_kind().is_some()) {
-            return Err(DataServerError::InvalidParameter(
-                "No forecast data matches the query".into(),
-            ));
-        }
+        let params = self.position_parameters(parameters, &steps, &keys)?;
         // Reject the complete batch before allocating samples or fetching any
         // field. The API also enforces the budget for other engines via emit.
         ds_core::feature::check_area_budget(steps.len(), levels.len(), coords.len(), params.len())?;
@@ -85,20 +64,9 @@ impl GribEngine {
                 point.insert(name.clone(), samples);
             }
         }
-        let descriptions: HashMap<_, _> = params
-            .iter()
-            .map(|name| {
-                let meta = self.param_metadata_for(&keys, name);
-                (
-                    name.clone(),
-                    ParameterDescription {
-                        label: meta.label(),
-                        unit: meta.display.display_unit.into(),
-                        observed_property: name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
+        let descriptions: HashMap<_, _> = self
+            .position_descriptions(&params, &keys)
+            .into_iter()
             .collect();
         let vertical = self.vertical_kind().map(|kind| VerticalCoord {
             kind,
@@ -163,6 +131,65 @@ impl GribEngine {
             emit(response)?;
         }
         Ok(())
+    }
+
+    /// The parameters a point-sampling query (position, trajectory) returns:
+    /// the requested ones (checked against the run on level views), else
+    /// every parameter of a pressure/model view, else the near-surface
+    /// products of the selected steps. `steps` empty, or no parameter on a
+    /// vertical view, is a 400.
+    pub(crate) fn position_parameters(
+        &self,
+        parameters: Option<&[String]>,
+        steps: &[(DateTime<Utc>, &StepFile)],
+        keys: &ParameterKeys,
+    ) -> Result<Vec<String>, DataServerError> {
+        let params: Vec<String> = match parameters {
+            Some(params) => params.to_vec(),
+            None if self.vertical_kind().is_some() => keys.keys().cloned().collect(),
+            None => {
+                let mut seen = HashSet::new();
+                steps
+                    .iter()
+                    .flat_map(|(_, file)| &file.messages)
+                    .filter(|m| self.family == Some(GribLevelType::Single) || m.is_near_surface())
+                    .filter(|m| seen.insert(m.param.clone()))
+                    .map(|m| m.param.clone())
+                    .collect()
+            }
+        };
+        if self.family.is_some() {
+            self.validate_parameters(keys, &params)?;
+        }
+        if steps.is_empty() || (params.is_empty() && self.vertical_kind().is_some()) {
+            return Err(DataServerError::InvalidParameter(
+                "No forecast data matches the query".into(),
+            ));
+        }
+        Ok(params)
+    }
+
+    /// Label and display unit of each parameter, in `params` order.
+    pub(crate) fn position_descriptions(
+        &self,
+        params: &[String],
+        keys: &ParameterKeys,
+    ) -> Vec<(String, ParameterDescription)> {
+        params
+            .iter()
+            .map(|name| {
+                let meta = self.param_metadata_for(keys, name);
+                (
+                    name.clone(),
+                    ParameterDescription {
+                        label: meta.label(),
+                        unit: meta.display.display_unit.into(),
+                        observed_property: name.clone(),
+                        standard_name: None,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Results are small point samples, not retained global grids. Completion

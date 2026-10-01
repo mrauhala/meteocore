@@ -238,6 +238,22 @@ rendering share `StepFile::default_message` so default labels/units agree.
   with 150 ms simulated per-read latency and the grid cache disabled. It checks
   equal samples and prints timings/bytes; wall-clock times are not CI gates.
 
+## Trajectory queries (#926)
+
+- `trajectory.rs` selects the run (an M path's time window selects it like
+  a `datetime` window), steps, levels and parameters with the position
+  query's helpers (`resolve_run`, `position_parameters`, `selected_levels`)
+  and leaves the path, time/level rules and layout to
+  `ds_core::trajectory::TrajectoryPlan`. Densify at the published
+  representative geometry's spacing (`RasterInfo` extent / grid cells;
+  0.1° before the probe has run).
+- One `run_field_jobs` job per (parameter, planned field = step × level):
+  fetch/decode once, sample every point that reads it with the position
+  query's `bilinear_value` + display conversion. Missing or unreadable
+  fields stay null; deadlines stay fatal. Never a job per sample.
+- Z snaps to the run's available levels (`catalog.levels`), so a Z path
+  never asks for a level the run lacks; `z` stays exact, like position.
+
 ## Area and radius queries
 
 - Reuse the first geometry field's values even when the decoded cache is
