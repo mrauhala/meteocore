@@ -23,6 +23,9 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::instances::RunInfo;
 use ds_core::model::{CoverageResponse, Location};
 
+#[path = "support/edr_schema.rs"]
+mod edr_schema;
+
 /// 25 stations on a line from (20, 60) eastwards, one per 0.5°, each
 /// reporting at `T0 + i hours`. Implements both traits, like the station
 /// engines EDR items serves (CSV, BUFR, PostGIS, nowcast cells).
@@ -452,26 +455,18 @@ async fn items_is_advertised_in_data_queries_with_the_edr_1_2_link_variables() {
     );
 }
 
-/// The collection documents carrying `data_queries.items` still validate
-/// against the bundled EDR 1.1 schema, whose `items` link it defines.
+/// The collection documents carrying `data_queries.items` validate against
+/// the bundled EDR 1.1 and 1.2 schemas, both of which define the `items`
+/// link; 1.2 also requires its link variables.
 #[tokio::test]
 async fn collection_documents_with_items_validate_against_edr() {
-    let bundle: Value =
-        serde_json::from_str(include_str!("../../../schemas/ogcapi-edr-1.1-bundled.json")).unwrap();
     for (uri, path) in [
         ("/collections", "/collections"),
         ("/collections/stations", "/collections/{collectionId}"),
     ] {
         let (status, doc) = get(uri).await;
         assert_eq!(status, StatusCode::OK);
-        let schema = &bundle["paths"][path]["get"]["responses"]["200"]["content"]
-            ["application/json"]["schema"];
-        let validator = jsonschema::Validator::new(schema).unwrap();
-        let errors: Vec<String> = validator
-            .iter_errors(&doc)
-            .map(|e| format!("{e} at {}", e.instance_path()))
-            .collect();
-        assert!(errors.is_empty(), "{uri}: {}", errors.join("\n"));
+        edr_schema::assert_valid(path, edr_schema::JSON, &doc, uri);
     }
 }
 
