@@ -22,6 +22,9 @@ use ds_core::error::DataServerError;
 use ds_core::instances::RunInfo;
 use ds_core::model::*;
 
+#[path = "support/edr_schema.rs"]
+mod edr_schema;
+
 fn dt(h: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 6, 7, h, 0, 0).unwrap()
 }
@@ -409,6 +412,27 @@ async fn instance_query_on_non_forecast_collection_is_404() {
             .0,
         StatusCode::OK
     );
+}
+
+/// The forecast collection, its instances list and one instance validate
+/// against EDR 1.1 and 1.2 (#919).
+#[tokio::test]
+async fn instance_documents_validate_against_edr_bundles() {
+    for (uri, path) in [
+        ("/collections/fc", "/collections/{collectionId}"),
+        (
+            "/collections/fc/instances",
+            "/collections/{collectionId}/instances",
+        ),
+        (
+            "/collections/fc/instances/20260607T0000Z",
+            edr_schema::INSTANCE,
+        ),
+    ] {
+        let (status, body) = get(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        edr_schema::assert_valid(path, edr_schema::JSON, &body, uri);
+    }
 }
 
 #[tokio::test]

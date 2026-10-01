@@ -2,7 +2,7 @@
 //! fixtures: the CoverageJSON of position and area queries validates against
 //! `schemas/coveragejson.json` (Critical Rule 12), and the collection
 //! metadata — each product with its own `extent.temporal` — against the EDR
-//! 1.1 schema.
+//! 1.1 and 1.2 schemas.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,6 +18,9 @@ use tower::ServiceExt;
 use ds_core::config::{CollectionConfig, SatelliteConfig, SatelliteProductConfig};
 use ds_core::edr_engine::EdrEngine;
 use engine_satellite::SatelliteEngine;
+
+#[path = "../../api-edr/tests/support/edr_schema.rs"]
+mod edr_schema;
 
 const C13: &str = "OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc";
 const ACHT: &str = "OR_ABI-L2-ACHTF-M6_G19_s20262681900199_e20262681909507_c20262681912337.nc";
@@ -223,10 +226,9 @@ async fn satellite_edr_responses_validate() {
             .map(Vec::len),
         Some(2)
     );
-    let edr = schema("ogcapi-edr-1.1-bundled.json");
-    assert_valid(
-        &edr["paths"]["/collections/{collectionId}"]["get"]["responses"]["200"]["content"]
-            ["application/json"]["schema"],
+    edr_schema::assert_valid(
+        "/collections/{collectionId}",
+        edr_schema::JSON,
         &collection,
         "EDR collection",
     );
