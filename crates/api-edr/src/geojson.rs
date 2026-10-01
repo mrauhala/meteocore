@@ -25,9 +25,11 @@
 //! The collection carries the parameters' metadata as the `parameters`
 //! foreign member (EDR's parameter objects with their `id`), and the
 //! `links` `/req/edr-geojson/content` B names: `self`, an `alternate` per
-//! other format and the collection. Serialization streams into the writer
-//! with every map in sorted order, so identical queries are byte-identical
-//! and the content-derived ETag revalidates (#499).
+//! other format and the collection. `numberReturned` counts the features;
+//! `numberMatched` the ones before `limit`, when the handler counted them.
+//! Serialization streams into the writer with every map in sorted order, so
+//! identical queries are byte-identical and the content-derived ETag
+//! revalidates (#499).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -159,12 +161,15 @@ struct Series<'a> {
 /// coverage it cannot name is labelled by its coordinates and points at the
 /// collection's location list. `collection_url` is
 /// `{base}/edr/collections/{id}`; `links` become the collection's `links`.
-/// Every coverage is checked before any byte is written.
+/// `number_matched` is how many features matched before `limit` (`None`:
+/// not counted, the member is left out); `numberReturned` is the features
+/// written. Every coverage is checked before any byte is written.
 pub fn write_station_series<'a, W: Write>(
     result: &'a CoverageResponse,
     identify: impl Fn(usize, &QueryResult) -> Option<FeatureIdentity<'a>>,
     collection_url: &str,
     links: &[GeoJsonLink],
+    number_matched: Option<usize>,
     writer: W,
 ) -> Result<(), GeoJsonError> {
     let coverages: &[QueryResult] = match result {
@@ -221,7 +226,7 @@ pub fn write_station_series<'a, W: Write>(
         features,
         parameters: parameters.into_values().collect(),
         links,
-        number_matched: series.len(),
+        number_matched,
         number_returned: series.len(),
     };
     serde_json::to_writer(writer, &collection)?;
@@ -235,8 +240,8 @@ struct FeatureCollection<'a> {
     features: Features<'a>,
     parameters: Vec<Value>,
     links: &'a [GeoJsonLink],
-    #[serde(rename = "numberMatched")]
-    number_matched: usize,
+    #[serde(rename = "numberMatched", skip_serializing_if = "Option::is_none")]
+    number_matched: Option<usize>,
     #[serde(rename = "numberReturned")]
     number_returned: usize,
 }
@@ -409,9 +414,17 @@ mod tests {
             },
             "https://example.org/edr/collections/obs",
             &[],
+            Some(result_len(result)),
             &mut out,
         )?;
         Ok(serde_json::from_slice(&out).unwrap())
+    }
+
+    fn result_len(result: &CoverageResponse) -> usize {
+        match result {
+            CoverageResponse::Single(_) => 1,
+            CoverageResponse::Collection(v) => v.len(),
+        }
     }
 
     fn loc(id: &str, label: &str, lon: f64, lat: f64) -> Location {

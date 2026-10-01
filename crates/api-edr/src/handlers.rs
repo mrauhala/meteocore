@@ -144,6 +144,7 @@ impl GeoJsonRequest {
 /// the one location at the coverage's exact coordinates.
 fn render_station_geojson(
     result: &CoverageResponse,
+    number_matched: Option<usize>,
     req: &GeoJsonRequest,
 ) -> Result<Response, HandlerError> {
     let index = LocationIndex::new(
@@ -171,6 +172,7 @@ fn render_station_geojson(
         },
         &format!("{}/edr/collections/{}", req.base, req.collection_id),
         &req.links(),
+        number_matched,
         &mut body,
     )
     .map_err(|e| match e {
@@ -201,11 +203,14 @@ fn render_station_geojson(
 /// Serialise an EDR coverage response in the requested output format.
 ///
 /// `CoverageJSON` is the default; `GeoJSON` encodes station series (only
-/// offered where the engine serves them); `PNG` renders a vertical-profile
-/// or time-series plot (one stacked panel per parameter). A response that
-/// can't be plotted (a gridded/area result) maps to 400.
+/// offered where the engine serves them), with `number_matched` (the
+/// top-level coverages before `limit`, `None` when uncounted) as its
+/// `numberMatched`; `PNG` renders a vertical-profile or time-series plot
+/// (one stacked panel per parameter). A response that can't be plotted (a
+/// gridded/area result) maps to 400.
 fn render_coverage_response(
     result: CoverageResponse,
+    number_matched: Option<usize>,
     format: EdrFormat,
     width: Option<u32>,
     height: Option<u32>,
@@ -213,7 +218,7 @@ fn render_coverage_response(
 ) -> Result<Response, HandlerError> {
     match format {
         EdrFormat::CoverageJson => coverage_json_response(&result, "EDR"),
-        EdrFormat::GeoJson => render_station_geojson(&result, geojson),
+        EdrFormat::GeoJson => render_station_geojson(&result, number_matched, geojson),
         EdrFormat::Png => {
             let panels = coverage_response_to_panels(&result).map_err(|e| bad_request(&e))?;
             let (w, h) = plot_dimensions(width, height);
@@ -271,6 +276,15 @@ pub(crate) fn bad_request(e: &DataServerError) -> HandlerError {
 /// The request's EDR 1.2 `limit` (`None` = no limit), or its 400.
 fn request_limit(raw: Option<&str>) -> Result<Option<usize>, HandlerError> {
     parse_limit(raw).map_err(|e| bad_request(&e))
+}
+
+/// The number of top-level coverages a result has before `limit`: the
+/// `numberMatched` of its GeoJSON representation (#929).
+fn coverage_count(result: &CoverageResponse) -> usize {
+    match result {
+        CoverageResponse::Single(_) => 1,
+        CoverageResponse::Collection(coverages) => coverages.len(),
+    }
 }
 
 /// Apply `limit` to a data query's result (`/req/edr/REQ_rc-limit-response`):
@@ -1749,8 +1763,10 @@ pub async fn location_query(
                 None,
             )
             .map_err(|e| map_query_error(&e, "Location"))?;
+        let matched = coverage_count(&result);
         render_coverage_response(
             limit_coverages(result, limit),
+            Some(matched),
             format.format,
             params.width,
             params.height,
@@ -1910,12 +1926,16 @@ async fn run_position_query(
     let single = points.len() == 1;
     // A point the engine answers yields at least one coverage (none is a
     // 404), so the points past the first `limit` cannot reach the response:
-    // never query them.
+    // never query them. Their coverages are then uncounted, so a GeoJSON
+    // response omits `numberMatched`.
+    let skipped_points = points.len() > limit;
     points.truncate(limit);
     let geojson = request.geojson(&state, engine, config, "position");
     let engine = engine.clone();
     let response = execute_query(false, move |budget| {
         let mut coverages = Vec::with_capacity(points.len());
+        // Coverages the queried points produced, before `limit`.
+        let mut produced = 0usize;
         let mut values = 0usize;
         let mut collection_response = !single;
         let mut emit = |response| {
@@ -1927,6 +1947,7 @@ async fn run_position_query(
                 CoverageResponse::Single(q) => vec![q],
                 CoverageResponse::Collection(v) => v,
             };
+            produced += batch.len();
             // Drop what `limit` excludes before it counts against the budget.
             batch.truncate(limit.saturating_sub(coverages.len()));
             for q in &batch {
@@ -1964,7 +1985,14 @@ async fn run_position_query(
         } else {
             CoverageResponse::Collection(coverages)
         };
-        render_coverage_response(result, format.format, params.width, params.height, &geojson)
+        render_coverage_response(
+            result,
+            (!skipped_points).then_some(produced),
+            format.format,
+            params.width,
+            params.height,
+            &geojson,
+        )
     })
     .await?;
     Ok(with_format_vary(
@@ -2157,8 +2185,10 @@ async fn run_radius_query(
                 reference_time,
             )
             .map_err(|e| map_query_error(&e, "Radius"))?;
+        let matched = coverage_count(&result);
         render_coverage_response(
             limit_coverages(result, limit),
+            Some(matched),
             format.format,
             None,
             None,

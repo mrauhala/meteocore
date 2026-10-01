@@ -535,6 +535,60 @@ async fn radius_geojson_lists_the_stations_in_the_circle() {
     assert_valid_edr_geojson("/collections/{collectionId}/radius", &json);
 }
 
+/// `limit` (#922) caps GeoJSON features as it caps CoverageJSON coverages,
+/// one per station; `numberMatched` counts them before the cap and is left
+/// out when points past the cap were never queried.
+#[tokio::test]
+async fn limit_caps_features_and_counts_the_matches() {
+    let radius =
+        "/collections/obs/radius?coords=POINT(24.94%2060.17)&within=200&within-units=km&f=GeoJSON";
+    let (status, _, json) = get_json(&format!("{radius}&limit=1"), None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_valid_edr_geojson("/collections/{collectionId}/radius", &json);
+    let ids: Vec<&str> = json["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["helsinki"]);
+    assert_eq!(json["numberReturned"], 1);
+    assert_eq!(json["numberMatched"], 2);
+    // The links repeat the request, limit included.
+    assert!(link(&json, "self", "application/geo+json").contains("&limit=1&f=GeoJSON"));
+
+    // A limit above the match count changes nothing.
+    let (_, _, json) = get_json(&format!("{radius}&limit=5"), None).await;
+    assert_eq!(json["numberReturned"], 2);
+    assert_eq!(json["numberMatched"], 2);
+
+    // MULTIPOINT: the points past the limit are never queried, so the
+    // matches are unknown and numberMatched is left out.
+    let multipoint =
+        "/collections/obs/position?coords=MULTIPOINT((24.94%2060.17),(23.76%2061.5))&f=GeoJSON";
+    let (status, _, json) = get_json(&format!("{multipoint}&limit=1"), None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_valid_edr_geojson("/collections/{collectionId}/position", &json);
+    assert_eq!(json["features"].as_array().unwrap().len(), 1);
+    assert_eq!(json["features"][0]["id"], "helsinki");
+    assert_eq!(json["numberReturned"], 1);
+    assert!(json.get("numberMatched").is_none(), "{json}");
+    let (_, _, json) = get_json(&format!("{multipoint}&limit=2"), None).await;
+    assert_eq!(json["numberReturned"], 2);
+    assert_eq!(json["numberMatched"], 2);
+
+    // One location is one feature, whatever the limit.
+    let (status, _, json) =
+        get_json("/collections/obs/locations/tampere?f=GeoJSON&limit=1", None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["numberReturned"], 1);
+    assert_eq!(json["numberMatched"], 1);
+
+    // An invalid limit is the same 400 as for CoverageJSON.
+    let (status, _, _) = request(&format!("{radius}&limit=0"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn f_accepts_the_token_and_media_type_case_insensitively() {
     for f in [

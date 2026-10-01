@@ -201,8 +201,11 @@ MULTIPOINT position has one per point):
   CoverageJSON).
 - `parameters`: the parameter objects of the CoverageJSON twin, each with its
   `id`, as an array. `links`: `self`, an `alternate` per other offered format,
-  and the collection. `numberMatched` = `numberReturned` = the feature count
-  (no paging).
+  and the collection. `limit` caps the features as it caps CoverageJSON's
+  top-level coverages (one per station); `numberReturned` is the feature
+  count and `numberMatched` the count before `limit`. A MULTIPOINT
+  position whose points past `limit` were never queried has no
+  `numberMatched`. There are no paging links.
 
 Each coverage is named by the one location of `get_locations()` at its exact
 coordinates (the `serves_station_series` contract, pinned per engine by
