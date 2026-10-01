@@ -876,9 +876,13 @@ async fn data_query_links_carry_edr_1_2_required_variables() {
             let what = format!("/instances item {}", instance["id"]);
             assert_eq!(checked_data_query_types(instance, &what), want_run);
         }
-        let doc = get_json_from(engine, "/collections/weather/instances/20240101T0000Z").await;
+        let doc = get_json_from(
+            engine,
+            "/collections/weather/instances/2024-01-01T00:00:00Z",
+        )
+        .await;
         assert_eq!(
-            checked_data_query_types(&doc, "/instances/20240101T0000Z"),
+            checked_data_query_types(&doc, "/instances/2024-01-01T00:00:00Z"),
             want_run,
             "{types:?}"
         );

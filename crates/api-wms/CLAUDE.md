@@ -64,8 +64,9 @@ path can leave the WMS symptom unchanged (#448 vs #452).
 - **`reference_time` (forecast model run, #337/#345):** forecast layers
   (non-empty `RasterInfo.reference_times`) advertise a custom
   `<Dimension name="reference_time">` alongside `time`, defaulting to the
-  latest run. GetMap accepts `DIM_REFERENCE_TIME=<run>` (RFC 3339 or the
-  compact `%Y%m%dT%H%MZ` stamp), validated against the advertised runs —
+  latest run. GetMap accepts `DIM_REFERENCE_TIME=<run>` (RFC 3339, which is
+  also the EDR instance id, or the pre-#947 compact `%Y%m%dT%H%MZ` instance
+  id), validated against the advertised runs —
   unknown run or non-forecast layer → `InvalidDimensionValue` (HTTP 400), no
   `nearestValue` (engines require an exact match). The run flows through
   `get_raster_tile` and into the rendered + meta-tile cache keys

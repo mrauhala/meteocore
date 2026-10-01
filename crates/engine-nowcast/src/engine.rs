@@ -2235,9 +2235,8 @@ impl NowcastEngine {
                 let anchor = generation.reference_time;
                 if anchor < start || anchor > end {
                     return Err(DataServerError::InvalidDatetime(format!(
-                        "instance {} has a single valid time, {}, outside the requested {} / {}",
+                        "instance {} is valid only at that instant, outside the requested {} / {}",
                         format_instance_id(anchor),
-                        anchor.to_rfc3339(),
                         start.to_rfc3339(),
                         end.to_rfc3339()
                     )));
@@ -2272,10 +2271,11 @@ impl NowcastEngine {
         })
     }
 
-    /// Instance lookup: exact, then to the minute. The EDR instance id is
-    /// minute-precision (`ds_core::instances::format_instance_id`), so a
-    /// generation anchored on a source frame with a seconds component would
-    /// otherwise be advertised under an id that can never be resolved.
+    /// Instance lookup: exact, then to the minute. The EDR instance id
+    /// (`ds_core::instances::format_instance_id`) is exact since #947, but
+    /// the compact id served before it is minute-precision: without the
+    /// fallback, a link to a generation anchored on a source frame with a
+    /// seconds component would no longer resolve.
     fn generation_by_instance(state: &NowcastState, rt: DateTime<Utc>) -> Option<Arc<Generation>> {
         if let Some(g) = state.generations.get(&rt) {
             return Some(g.clone());

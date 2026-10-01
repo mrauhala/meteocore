@@ -77,7 +77,7 @@ commit and why the 3.0 bundle rather than the 3.1 one.
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG and GeoJSON rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667); PNG rejected; EDR GeoJSON too on station collections |
 | `trajectory` | `/collections/{id}/trajectory` | ✓ | gridded engines (GRIB, QueryData, Zarr): values sampled along a WKT `LINESTRING`, `LINESTRING Z`, `M` or `ZM` (Z = level, M = Unix epoch seconds), CoverageJSON `Trajectory` only (PNG and GeoJSON → 400), see [Trajectory](#trajectory-926); PVOL sites: a 2-D `LINESTRING` is a *vertical cross-section* (`Section`, also PNG, never GeoJSON). `MULTILINESTRING` not supported |
-| `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); instance-scoped queries: position, area, radius only |
+| `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); the id is the run's RFC 3339 reference time, e.g. `2026-06-07T06:00:00Z` (see [Instance ids](#instance-ids)); instance-scoped queries: position, area, radius, cube |
 | `cube` | `/collections/{id}/cube` | ✓ | `bbox` required: CRS84, four numbers, or six whose vertical pair is a `z` interval that an explicit `z` overrides. `z` optional, in the full `z` grammar below: absent → every level; ignored, like the six-number pair, on a collection without a vertical extent. `datetime` as on every query, a list included: one cube per instant, joined along `t` into one `Grid`. `resolution-x`/`-y`/`-z` (`resolution-z` without a vertical extent is a 400), `crs` (CRS84 only), `f` (CoverageJSON only: `PNG` and `GeoJSON` are 400, and `Accept` cannot choose another format). An unknown or repeated query parameter is a 400 naming the accepted ones. Response: a `Grid` with `t`, `z`, `y`, `x` axes, ≤ 1M values across timesteps × levels × cells × parameters → 400. `data_queries.cube.link.variables.height_units` is the vertical axis unit. Only collections with vertical levels offer it: GRIB pressure and model-level views (#925) |
 | `corridor` | — | ✗ | not in the trait or the router (`corridor-width`/`-height` documented as follow-up on trajectory) |
 | `items` | `/collections/{id}/items`, `/items/{itemId}` | ✓ | GeoJSON features of the collection's `FeatureEngine`, for EDR collections whose engine has one (see [Items](#items)); `bbox`, `datetime`, `limit` + `offset` paging |
@@ -162,6 +162,25 @@ engines do not report a value type, every CoverageJSON range is encoded as
 | `/instances/{instanceId}/radius` | ✓ |
 | `/instances/{instanceId}/cube` | ✓ |
 | `/instances/{instanceId}/locations`, `/trajectory` | ✗ |
+
+### Instance ids
+
+An instance `id` is its run's reference time in RFC 3339 UTC,
+`2026-06-07T06:00:00Z`, as the MetOcean EDR profile requires
+(`/req/nwp/collection_granularity` C, #947): whole seconds always, a
+fraction only when the run has one. The instance title says `run
+2026-06-07T06:00:00Z`. Links carry the colons unencoded, which RFC 3986
+`pchar` allows: `/collections/{id}/instances/2026-06-07T06:00:00Z/position`.
+`{instanceId}` accepts:
+
+- the id itself, percent-encoded or not (`2026-06-07T06%3A00%3A00Z`);
+- any RFC 3339 offset naming the same instant (`2026-06-07T09:00:00+03:00`);
+- the compact `20260607T0600Z` and `20260607T060000Z` stamps that were the
+  id before #947, so existing links keep resolving.
+
+Links in a response always use the canonical id, whichever form the request
+named. Anything else is a 400; a well-formed id with no such run is a 404,
+and so is every id on a collection without instances.
 
 ## Parameters
 

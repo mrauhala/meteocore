@@ -490,7 +490,7 @@ fn forecast_runs_are_instances_and_selectable() {
         vec![run0, run1],
         "ascending by reference time"
     );
-    assert_eq!(inst[0].instance_id(), "20260101T0000Z");
+    assert_eq!(inst[0].instance_id(), "2026-01-01T00:00:00Z");
     assert_eq!(
         inst[0].valid_times,
         vec![

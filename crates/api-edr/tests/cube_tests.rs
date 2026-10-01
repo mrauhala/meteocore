@@ -280,11 +280,12 @@ async fn cube_is_a_data_query_with_height_units_on_the_collection_and_its_runs()
         &doc,
     );
 
-    let (status, _, instance) = get(&app, "/collections/model/instances/20260607T0000Z").await;
+    let (status, _, instance) =
+        get(&app, "/collections/model/instances/2026-06-07T00:00:00Z").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         instance["data_queries"]["cube"]["link"]["href"],
-        "/edr/collections/model/instances/20260607T0000Z/cube"
+        "/edr/collections/model/instances/2026-06-07T00:00:00Z/cube"
     );
 }
 

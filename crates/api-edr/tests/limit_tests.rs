@@ -29,7 +29,7 @@ use ds_core::model::*;
 const LOCATIONS: usize = 5;
 /// Coverages the mock's area query returns.
 const AREA_COVERAGES: usize = 4;
-const RUN: &str = "20260607T0600Z";
+const RUN: &str = "2026-06-07T06:00:00Z";
 
 fn run_time() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 6, 7, 6, 0, 0).unwrap()
