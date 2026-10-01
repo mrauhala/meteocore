@@ -12,6 +12,9 @@ ds-core = { path = "../core" }
 ds-render = { path = "../render" }
 arc-swap = "1"
 axum = "0.8"
+# Splits a `{locationId}` list on the segment as sent: a literal comma
+# separates ids, `%2C` belongs to one (#923). The decoder axum's `Path` uses.
+percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

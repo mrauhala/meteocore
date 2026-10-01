@@ -20,11 +20,12 @@ use crate::geojson::{
     encode_path_segment, FeatureIdentity, GeoJsonError, GeoJsonLink, LocationIndex,
 };
 use crate::params::{
-    negotiate_edr_format, parse_datetime, parse_limit, parse_locations_paging, parse_within_metres,
-    parse_z, plot_dimensions, query_formats, resolve_z_levels, split_position_coords,
-    AreaQueryParams, DatetimeSelector, EdrFormat, LocationQueryParams, NegotiatedFormat,
-    PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, CRS84_WKT, DATA_QUERY_CRS,
-    MAX_LIMIT, WITHIN_UNITS,
+    negotiate_edr_format, parse_datetime, parse_edr_format, parse_limit, parse_locations_paging,
+    parse_within_metres, parse_z, plot_dimensions, query_formats, resolve_z_levels,
+    split_location_ids, split_position_coords, AreaQueryParams, DatetimeSelector, EdrFormat,
+    LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
+    TrajectoryQueryParams, CRS84_WKT, DATA_QUERY_CRS, MAX_LIMIT, MAX_LOCATION_IDS,
+    MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -88,9 +89,11 @@ struct GeoJsonRequest {
     path: String,
     raw_query: Option<String>,
     /// The formats this query offers: one `alternate` link each.
-    offered: &'static [EdrFormat],
-    /// The `/locations/{locationId}` id: names every coverage.
-    location_id: Option<String>,
+    offered: Vec<EdrFormat>,
+    /// The `/locations/{locationId}` ids the coverages belong to: one names
+    /// every coverage, a list's names coverage `i` by entry `i` (#923).
+    /// Empty: each coverage is named by its coordinates.
+    location_ids: Vec<String>,
 }
 
 impl GeoJsonRequest {
@@ -119,7 +122,7 @@ impl GeoJsonRequest {
             kind: EdrFormat::GeoJson.media_type(),
             title: "This document".into(),
         }];
-        for &format in self.offered {
+        for &format in &self.offered {
             if format != EdrFormat::GeoJson {
                 links.push(GeoJsonLink {
                     href: self.url(format),
@@ -152,15 +155,22 @@ fn render_station_geojson(
             .get_locations()
             .map_err(|e| map_query_error(&e, "GeoJSON locations"))?,
     );
-    let named = req.location_id.as_deref().map(|id| FeatureIdentity {
-        id,
-        label: index.by_id(id).map_or(id, |l| l.label.as_str()),
-    });
+    let named = |i: usize| {
+        let id = match req.location_ids.as_slice() {
+            [] => return None,
+            [only] => only,
+            each => each.get(i)?,
+        };
+        Some(FeatureIdentity {
+            id,
+            label: index.by_id(id).map_or(id.as_str(), |l| l.label.as_str()),
+        })
+    };
     let mut body = Vec::new();
     crate::geojson::write_station_series(
         result,
-        |_, q| {
-            named.or_else(|| match q.domain {
+        |i, q| {
+            named(i).or_else(|| match q.domain {
                 ds_core::model::DomainDescription::PointSeries { x, y, .. } => {
                     index.at(x, y).map(|l| FeatureIdentity {
                         id: &l.id,
@@ -643,6 +653,19 @@ fn data_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
     })
 }
 
+/// OpenAPI `f` parameter of `/locations/{locationId}`: a list of ids
+/// answers every format but PNG.
+fn locations_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
+    let mut param = data_format_parameter(formats);
+    if let Some(description) = param["description"].as_str() {
+        param["description"] = json!(format!(
+            "{description} PNG plots one location: for a list of locations it is a 400, \
+             and every other format, GeoJSON included, answers the whole list."
+        ));
+    }
+    param
+}
+
 /// OpenAPI `200` content of a data query offering `formats`.
 fn data_response_content(formats: &[EdrFormat]) -> serde_json::Value {
     let mut content = serde_json::Map::new();
@@ -726,11 +749,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // Location data query
+        // Location data query. `locationId` per EDR 1.2
+        // `/req/edr/REQ_rc-locationid-definition` (#923), as the 1.2 bundle
+        // writes it: the requirement's fragment puts `style`/`explode` in the
+        // schema and says `required: false`, neither valid for an OpenAPI path
+        // parameter.
         let location_path = format!("/edr/collections/{id}/locations/{{locationId}}");
         collection_paths[&location_path] = json!({
             "get": {
-                "summary": format!("Get data for a location in {}", config.title),
+                "summary": format!("Get data for one or more locations in {}", config.title),
                 "operationId": format!("getLocationData_{id}"),
                 "tags": [id],
                 "parameters": [
@@ -738,12 +765,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "name": "locationId",
                         "in": "path",
                         "required": true,
-                        "schema": {"type": "string"}
+                        "description": format!("Comma-delimited list of location ids (EGLL or EGLL,EFHK), from the /locations inventory. At most {MAX_LOCATION_IDS}, and with a datetime list at most {MAX_LOCATION_LOOKUPS} ids × instants; a repeated id is answered once. A literal comma separates ids, so a comma inside an id is sent encoded as %2C. One id answers as before: a Coverage or CoverageCollection, 404 when it has no data in the window. A list answers one CoverageCollection with every id's coverages in request order, an id without data in the window contributing none; any unknown id is a 404 naming it."),
+                        "schema": {"type": "string"},
+                        "style": "simple",
+                        "explode": false
                     },
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/parameter-name"},
                     {"$ref": "#/components/parameters/z"},
-                    data_format_parameter(formats("locations")),
+                    locations_format_parameter(formats("locations")),
                     {"$ref": "#/components/parameters/limit"}
                 ],
                 "responses": {
@@ -751,8 +781,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "description": "Coverage data",
                         "content": data_response_content(formats("locations"))
                     },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Location not found"},
+                    "204": {"description": "A list of locations, none of which has data in the requested window"},
+                    "400": {"description": format!("Bad request, including an empty element in or more than {MAX_LOCATION_IDS} ids in locationId, more than {MAX_LOCATION_LOOKUPS} ids × datetime instants, and PNG for a list")},
+                    "404": {"description": "Location not found: an unknown id, or one id without data in the requested window"},
                     "500": {"description": "Server error"}
                 }
             }
@@ -1710,25 +1741,67 @@ pub async fn locations(
     ))
 }
 
+/// `GET /collections/{id}/locations/{locationId}`: the data at one named
+/// location or, EDR 1.2 (#923), at each of a comma-delimited list of them,
+/// answered by `query_location_list`. A station collection answers both as
+/// EDR GeoJSON too (#929): a list is one FeatureCollection, its features in
+/// request order, each named by its own id.
 pub async fn location_query(
     Path((id, loc_id)): Path<(String, String)>,
     Query(params): Query<LocationQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, HandlerError> {
+    uri: axum::http::Uri,
+) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
-    let format = data_query_format(
-        engine,
-        "locations",
-        params.f.as_deref(),
-        &headers,
-        "location queries",
-    )?;
+
+    // Split the segment as it arrived: a literal comma separates ids, `%2C`
+    // belongs to one. The decoded `loc_id` can no longer tell them apart.
+    // `{locationId}` is the route's last segment.
+    let segment = uri.path().rsplit('/').next().unwrap_or_default();
+    let mut ids = if segment.contains(',') {
+        split_location_ids(segment).map_err(|e| bad_request(&e))?
+    } else {
+        vec![loc_id]
+    };
+    let list = ids.len() > 1;
+
+    // The plot labels series by index, which says nothing about which
+    // location each one is: no PNG for a list. Its other formats stay
+    // offered, GeoJSON included on a station collection, so `Accept` never
+    // picks PNG for a list.
+    if list && parse_edr_format(params.f.as_deref()).is_ok_and(|f| f == EdrFormat::Png) {
+        return Err(bad_request_msg(
+            "PNG output plots one location: request a single location id, or CoverageJSON \
+             (GeoJSON on a station collection) for a list",
+        ));
+    }
+    let offered: Vec<EdrFormat> = query_formats("locations", engine.serves_station_series())
+        .iter()
+        .copied()
+        .filter(|f| !(list && *f == EdrFormat::Png))
+        .collect();
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format = negotiate_edr_format(params.f.as_deref(), accept, &offered, "location queries")
+        .map_err(|e| bad_request(&e))?;
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
+    // Every listed instant re-queries every listed id: cap the product
+    // before any engine call, as MULTIPOINT points × instants is.
+    if let Some(DatetimeSelector::Instants(instants)) = &datetime {
+        let lookups = ids.len().saturating_mul(instants.len());
+        if lookups > MAX_LOCATION_LOOKUPS {
+            return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                "{} locations × {} datetime instants is {lookups} location lookups; \
+                 the limit is {MAX_LOCATION_LOOKUPS} — name fewer locations or instants",
+                ids.len(),
+                instants.len(),
+            ))));
+        }
+    }
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -1738,41 +1811,82 @@ pub async fn location_query(
     let z = resolve_request_z(engine, params.z.as_deref())?;
     let limit = request_limit(params.limit.as_deref())?;
 
-    let geojson = GeoJsonRequest {
+    let mut geojson = GeoJsonRequest {
         engine: engine.clone(),
         base: request_base_url(&state, &headers),
         collection_id: id.clone(),
         collection_title: config.title.clone(),
-        path: format!(
-            "/collections/{id}/locations/{}",
-            encode_path_segment(&loc_id)
-        ),
+        // A list's links repeat its segment as the client sent it.
+        path: match &ids[..] {
+            [one] => format!("/collections/{id}/locations/{}", encode_path_segment(one)),
+            _ => format!("/collections/{id}/locations/{segment}"),
+        },
         raw_query,
-        offered: query_formats("locations", engine.serves_station_series()),
-        location_id: Some(loc_id.clone()),
+        offered,
+        location_ids: Vec::new(),
     };
     let engine = engine.clone();
-    // Rendering stays on the query executor: GeoJSON reads the engine's
-    // location inventory to label the station.
+    if !list {
+        // One id, a repeat-only list included: the response it always was.
+        let loc_id = ids.pop().unwrap_or_default();
+        geojson.location_ids = vec![loc_id.clone()];
+        // Rendering stays on the query executor: GeoJSON reads the engine's
+        // location inventory to label the station.
+        let response = execute_query(false, move |budget| {
+            let result = crate::datetime_list::run(
+                datetime.as_ref(),
+                || budget.expired(),
+                |datetime| {
+                    engine.query_location(
+                        &loc_id,
+                        datetime,
+                        param_names.as_deref(),
+                        z.as_deref(),
+                        None,
+                    )
+                },
+            )
+            .map_err(|e| map_query_error(&e, "Location"))?;
+            let matched = coverage_count(&result);
+            render_coverage_response(
+                limit_coverages(result, limit),
+                Some(matched),
+                format.format,
+                params.width,
+                params.height,
+                &geojson,
+            )
+        })
+        .await?;
+        return Ok(with_format_vary(
+            with_data_cache_control(response, window),
+            format,
+        ));
+    }
+
+    let limit = limit.unwrap_or(usize::MAX);
     let response = execute_query(false, move |budget| {
-        let result = crate::datetime_list::run(
+        let expired = || budget.expired();
+        let found = query_location_list(
+            engine.as_ref(),
+            &ids,
             datetime.as_ref(),
-            || budget.expired(),
-            |datetime| {
-                engine.query_location(
-                    &loc_id,
-                    datetime,
-                    param_names.as_deref(),
-                    z.as_deref(),
-                    None,
-                )
-            },
-        )
-        .map_err(|e| map_query_error(&e, "Location"))?;
-        let matched = coverage_count(&result);
+            param_names.as_deref(),
+            z.as_deref(),
+            limit,
+            &expired,
+        )?;
+        if found.coverages.is_empty() {
+            // `/req/edr/REQ_rc-locationid-response` C.
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        // `limit` hid coverages it never counted (ids past it are not
+        // queried): GeoJSON then leaves `numberMatched` out.
+        let matched = (!found.dropped).then_some(found.coverages.len());
+        geojson.location_ids = found.owners.iter().map(|&i| ids[i].clone()).collect();
         render_coverage_response(
-            limit_coverages(result, limit),
-            Some(matched),
+            CoverageResponse::Collection(found.coverages),
+            matched,
             format.format,
             params.width,
             params.height,
@@ -1783,6 +1897,119 @@ pub async fn location_query(
     Ok(with_format_vary(
         with_data_cache_control(response, window),
         format,
+    ))
+}
+
+/// What [`query_location_list`] found: every id's coverages in request
+/// order, the index in `ids` of the location each belongs to, and whether
+/// `limit` left any coverage out before it could be counted.
+struct LocationList {
+    coverages: Vec<ds_core::model::QueryResult>,
+    owners: Vec<usize>,
+    dropped: bool,
+}
+
+/// The locations query over a list of ids (EDR 1.2
+/// `/req/edr/REQ_rc-locationid-response`, #923): every id's coverages in
+/// request order, flattened into one CoverageCollection. Each id goes
+/// through the engine's own `query_location`, one at a time, and a
+/// `datetime` list through `datetime_list::run` per id, exactly as that id
+/// alone: at most [`MAX_LOCATION_IDS`] ids and [`MAX_LOCATION_LOOKUPS`]
+/// engine calls, the deadline checked before each one as between
+/// MULTIPOINT points. `limit` counts the flattened coverages, and once it is
+/// reached the remaining ids are not queried. [`MAX_LOCATION_VALUES`] caps
+/// the values combined.
+///
+/// Engines answer `LocationNotFound` both for an id they do not have and for
+/// one with no data in the window, at any listed instant. The collection's
+/// inventory tells them apart, read only when some id needs it: an unknown
+/// id fails the whole list with a 404 naming it, ids past `limit` included.
+/// No coverages means every id is known and none has data, the 204.
+fn query_location_list(
+    engine: &dyn EdrEngine,
+    ids: &[String],
+    datetime: Option<&DatetimeSelector>,
+    parameters: Option<&[String]>,
+    z: Option<&[f64]>,
+    limit: usize,
+    expired: &dyn Fn() -> bool,
+) -> Result<LocationList, HandlerError> {
+    let mut known = None;
+    let mut found = LocationList {
+        coverages: Vec::new(),
+        owners: Vec::new(),
+        dropped: false,
+    };
+    let mut values = 0usize;
+    for (i, id) in ids.iter().enumerate() {
+        if expired() {
+            return Err(query_timeout());
+        }
+        if found.coverages.len() >= limit {
+            require_known_location(engine, &mut known, id)?;
+            found.dropped = true;
+            continue;
+        }
+        let response = crate::datetime_list::run(datetime, expired, |window| {
+            engine.query_location(id, window, parameters, z, None)
+        });
+        let response = match response {
+            Ok(response) => response,
+            Err(DataServerError::LocationNotFound(_)) => {
+                require_known_location(engine, &mut known, id)?;
+                continue;
+            }
+            Err(e) => return Err(map_query_error(&e, "Location")),
+        };
+        let mut batch = match response {
+            CoverageResponse::Single(q) => vec![q],
+            CoverageResponse::Collection(v) => v,
+        };
+        // Drop what `limit` excludes before it counts against the budget.
+        let produced = batch.len();
+        batch.truncate(limit - found.coverages.len());
+        found.dropped |= batch.len() < produced;
+        for q in &batch {
+            for range in q.ranges.values() {
+                values = values.saturating_add(range.values.len());
+            }
+        }
+        if values > MAX_LOCATION_VALUES {
+            return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                "Locations response exceeds {MAX_LOCATION_VALUES} values combined; \
+                 list fewer locations or narrow datetime"
+            ))));
+        }
+        found.owners.extend(std::iter::repeat_n(i, batch.len()));
+        found.coverages.extend(batch);
+    }
+    if expired() {
+        return Err(query_timeout());
+    }
+    Ok(found)
+}
+
+/// The 404 for a listed location id the collection does not have. `known`
+/// caches the inventory's ids across one list. An engine whose inventory is
+/// itself not found (a radar site that dropped out) knows no ids.
+fn require_known_location(
+    engine: &dyn EdrEngine,
+    known: &mut Option<std::collections::HashSet<String>>,
+    id: &str,
+) -> Result<(), HandlerError> {
+    if known.is_none() {
+        *known = Some(match engine.get_locations() {
+            Ok(locations) => locations.into_iter().map(|l| l.id).collect(),
+            Err(DataServerError::LocationNotFound(_)) => Default::default(),
+            Err(e) => return Err(map_query_error(&e, "Location")),
+        });
+    }
+    if known.as_ref().is_some_and(|known| known.contains(id)) {
+        return Ok(());
+    }
+    Err(map_query_error(
+        &DataServerError::LocationNotFound(id.to_string()),
+        "Location",
     ))
 }
 
@@ -1871,8 +2098,8 @@ impl DataRequest {
             collection_title: config.title.clone(),
             path,
             raw_query: self.raw_query,
-            offered: query_formats(query_type, engine.serves_station_series()),
-            location_id: None,
+            offered: query_formats(query_type, engine.serves_station_series()).to_vec(),
+            location_ids: Vec::new(),
         }
     }
 }
@@ -2357,7 +2584,8 @@ fn temporal_extent_json(
 /// `default_output_format` and `crs_details` in every one (the `*DataQuery`
 /// schemas; all but `query_type` were optional in 1.1). `crs_details` lists
 /// the one CRS data queries accept ([`DATA_QUERY_CRS`], until #84), radius
-/// adds its accepted `within_units`. `output_formats` are the formats the
+/// adds its accepted `within_units`, locations `multiple_locations` (EDR
+/// 1.2's optional boolean, #923). `output_formats` are the formats the
 /// route answers, [`query_formats`] for the engine (`station_series`:
 /// `EdrEngine::serves_station_series`): area and radius results are gridded
 /// or multi-coverage, so they have no PNG plot, and the point queries of a
@@ -2367,7 +2595,8 @@ fn data_query_variables(query_type: &str, station_series: bool) -> Option<serde_
         "locations" => (
             "Locations query",
             "Lists the collection's named locations as GeoJSON; \
-             /locations/{locationId} returns the data at one of them.",
+             /locations/{locationId} returns the data at one of them, \
+             or at each of a comma-delimited list of them.",
         ),
         "position" => (
             "Position query",
@@ -2406,6 +2635,13 @@ fn data_query_variables(query_type: &str, station_series: bool) -> Option<serde_
     if query_type == "radius" {
         // EDR radius link variables carry the accepted `within-units`.
         variables["within_units"] = json!(WITHIN_UNITS);
+    }
+    if query_type == "locations" {
+        // EDR 1.2 `/req/edr/rc-locations-variables` B: `locationId` may list
+        // several ids (#923). The handler fans the list out over the
+        // engine's own `query_location`, so every engine serving locations
+        // supports it. Absent, clients must assume it is not supported.
+        variables["multiple_locations"] = json!(true);
     }
     Some(variables)
 }

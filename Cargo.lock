@@ -155,6 +155,7 @@ dependencies = [
  "ds-render",
  "http-body-util",
  "jsonschema",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tokio",
