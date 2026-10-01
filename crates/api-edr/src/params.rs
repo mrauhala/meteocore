@@ -464,6 +464,163 @@ pub struct RadiusQueryParams {
     pub limit: Option<String>,
 }
 
+/// Cube query parameters (OGC API - EDR 1.2 `cube`, #925). Built from the
+/// raw query pairs by [`CubeQueryParams::from_pairs`], so an unknown or
+/// repeated parameter is a 400 naming the accepted ones rather than being
+/// dropped by serde.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct CubeQueryParams {
+    pub bbox: Option<String>,
+    pub z: Option<String>,
+    pub datetime: Option<String>,
+    pub parameter_name: Option<String>,
+    pub resolution_x: Option<String>,
+    pub resolution_y: Option<String>,
+    pub resolution_z: Option<String>,
+    pub crs: Option<String>,
+    pub f: Option<String>,
+}
+
+/// The query parameters a cube request accepts, in the order the 1.2
+/// OpenAPI lists them.
+pub const CUBE_PARAMETERS: [&str; 9] = [
+    "bbox",
+    "z",
+    "datetime",
+    "parameter-name",
+    "resolution-x",
+    "resolution-y",
+    "resolution-z",
+    "crs",
+    "f",
+];
+
+impl CubeQueryParams {
+    /// Collect the cube parameters from the query pairs, rejecting a name
+    /// outside [`CUBE_PARAMETERS`] and a parameter given twice.
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, DataServerError> {
+        let mut params = Self::default();
+        for (name, value) in pairs {
+            let slot = match name.as_str() {
+                "bbox" => &mut params.bbox,
+                "z" => &mut params.z,
+                "datetime" => &mut params.datetime,
+                "parameter-name" => &mut params.parameter_name,
+                "resolution-x" => &mut params.resolution_x,
+                "resolution-y" => &mut params.resolution_y,
+                "resolution-z" => &mut params.resolution_z,
+                "crs" => &mut params.crs,
+                "f" => &mut params.f,
+                other => {
+                    return Err(DataServerError::InvalidParameter(format!(
+                        "Unknown cube query parameter '{other}'; accepted: {}",
+                        CUBE_PARAMETERS.join(", ")
+                    )))
+                }
+            };
+            if slot.replace(value).is_some() {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "Cube query parameter '{name}' is given more than once"
+                )));
+            }
+        }
+        Ok(params)
+    }
+}
+
+/// The cube `bbox`: `minx,miny,maxx,maxy`, or six numbers
+/// `minx,miny,minz,maxx,maxy,maxz` whose vertical pair becomes a `z`
+/// interval (overridden by an explicit `z`, EDR `/req/edr/rc-cube` C).
+/// CRS84 only; `minx > maxx` crosses the antimeridian.
+pub fn parse_cube_bbox(
+    raw: &str,
+) -> Result<(ds_core::feature::Bbox, Option<ZSelector>), DataServerError> {
+    let values: Vec<f64> = raw
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    DataServerError::InvalidBbox(format!(
+                        "bbox value '{}' is not a finite number",
+                        part.trim()
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let (horizontal, vertical) = match *values.as_slice() {
+        [w, s, e, n] => ([w, s, e, n], None),
+        [w, s, lo, e, n, hi] => (
+            [w, s, e, n],
+            Some(ZSelector::Interval {
+                min: lo.min(hi),
+                max: lo.max(hi),
+            }),
+        ),
+        _ => {
+            return Err(DataServerError::InvalidBbox(format!(
+                "bbox must be 4 numbers (minx,miny,maxx,maxy) or 6 \
+                 (minx,miny,minz,maxx,maxy,maxz), got {}",
+                values.len()
+            )))
+        }
+    };
+    let [w, s, e, n] = horizontal;
+    let bbox = ds_core::feature::Bbox::new(w, s, e, n).map_err(DataServerError::InvalidBbox)?;
+    Ok((bbox, vertical))
+}
+
+/// Largest accepted `resolution-x`/`-y`/`-z`: no larger count can pass the
+/// shared response budget ([`ds_core::feature::MAX_AREA_VALUES`]).
+pub const MAX_RESOLUTION: usize = ds_core::feature::MAX_AREA_VALUES;
+
+/// Parse a `resolution-x`/`-y`/`-z` value (`name` is the parameter): a
+/// whole number of positions along the axis from 0 to [`MAX_RESOLUTION`].
+/// `0` asks for the native resolution, the same as leaving it out, so both
+/// are `None`. Anything else is a 400 stating the valid range (EDR
+/// `/req/edr/resolution-x-response` D).
+pub fn parse_resolution(name: &str, raw: Option<&str>) -> Result<Option<usize>, DataServerError> {
+    let Some(raw) = raw.map(str::trim) else {
+        return Ok(None);
+    };
+    match raw.parse::<usize>() {
+        Ok(0) => Ok(None),
+        Ok(n) if n <= MAX_RESOLUTION => Ok(Some(n)),
+        _ => Err(DataServerError::InvalidParameter(format!(
+            "{name} must be a whole number from 0 (native resolution) to {MAX_RESOLUTION}, \
+             got '{raw}'"
+        ))),
+    }
+}
+
+/// The one CRS the data queries serve, as the collection metadata lists it.
+pub const CRS84: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+
+/// Accept a data-query `crs` naming CRS84 (its OGC URI over http or https,
+/// `CRS84` or `OGC:CRS84`, bracketed or not, case-insensitively); anything
+/// else is a 400 naming the supported CRS.
+pub fn check_crs(crs: Option<&str>) -> Result<(), DataServerError> {
+    let Some(crs) = crs.map(str::trim) else {
+        return Ok(());
+    };
+    let lower = crs.to_ascii_lowercase();
+    let name = lower.trim_start_matches('[').trim_end_matches(']');
+    let accepted = [
+        "http://www.opengis.net/def/crs/ogc/1.3/crs84",
+        "https://www.opengis.net/def/crs/ogc/1.3/crs84",
+        "crs84",
+        "ogc:crs84",
+    ];
+    if accepted.contains(&name) {
+        return Ok(());
+    }
+    Err(DataServerError::InvalidParameter(format!(
+        "crs '{crs}' is not supported; data queries are served in {CRS84} only"
+    )))
+}
+
 /// `within-units` values the radius query accepts, in the order they are
 /// advertised in `data_queries.radius.link.variables.within_units`.
 pub const WITHIN_UNITS: [&str; 3] = ["km", "m", "mi"];
@@ -1411,6 +1568,118 @@ mod tests {
     #[test]
     fn rejects_polygon() {
         assert!(split_position_coords("POLYGON((0 0,1 0,1 1,0 1,0 0))").is_err());
+    }
+
+    #[test]
+    fn cube_parameters_are_known_and_given_once() {
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let params = CubeQueryParams::from_pairs(pairs(&[
+            ("bbox", "0,0,1,1"),
+            ("z", "850"),
+            ("resolution-x", "10"),
+            ("parameter-name", "t"),
+        ]))
+        .unwrap();
+        assert_eq!(params.bbox.as_deref(), Some("0,0,1,1"));
+        assert_eq!(params.z.as_deref(), Some("850"));
+        assert_eq!(params.resolution_x.as_deref(), Some("10"));
+        assert_eq!(params.parameter_name.as_deref(), Some("t"));
+        assert_eq!(params.resolution_y, None);
+        let unknown = CubeQueryParams::from_pairs(pairs(&[("coords", "POINT(0 0)")]))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("'coords'"), "{unknown}");
+        assert!(unknown.contains(&CUBE_PARAMETERS.join(", ")), "{unknown}");
+        let repeated = CubeQueryParams::from_pairs(pairs(&[("z", "850"), ("z", "500")]))
+            .unwrap_err()
+            .to_string();
+        assert!(repeated.contains("'z'"), "{repeated}");
+    }
+
+    #[test]
+    fn cube_bbox_is_four_or_six_numbers() {
+        let (bbox, z) = parse_cube_bbox("20, 55,30,65").unwrap();
+        assert_eq!(
+            (bbox.west, bbox.south, bbox.east, bbox.north),
+            (20.0, 55.0, 30.0, 65.0)
+        );
+        assert_eq!(z, None);
+        // The vertical pair of six numbers is an interval, in either order.
+        let (bbox, z) = parse_cube_bbox("20,55,1000,30,65,500").unwrap();
+        assert_eq!((bbox.east, bbox.north), (30.0, 65.0));
+        assert_eq!(
+            z,
+            Some(ZSelector::Interval {
+                min: 500.0,
+                max: 1000.0
+            })
+        );
+        // Across the antimeridian: west > east is kept as given.
+        let (bbox, _) = parse_cube_bbox("170,10,-170,20").unwrap();
+        assert!(bbox.crosses_antimeridian());
+        for bad in [
+            "",
+            "1,2,3",
+            "1,2,3,4,5",
+            "a,0,1,1",
+            "0,0,1,inf",
+            "0,0,200,1",
+            "0,10,1,5",
+        ] {
+            assert!(
+                matches!(parse_cube_bbox(bad), Err(DataServerError::InvalidBbox(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_is_a_count_from_zero_to_the_budget() {
+        assert_eq!(parse_resolution("resolution-x", None).unwrap(), None);
+        assert_eq!(parse_resolution("resolution-x", Some("0")).unwrap(), None);
+        assert_eq!(
+            parse_resolution("resolution-x", Some(" 10 ")).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            parse_resolution("resolution-z", Some("1000000")).unwrap(),
+            Some(MAX_RESOLUTION)
+        );
+        for bad in ["-1", "1.5", "ten", "", "1000001"] {
+            let err = parse_resolution("resolution-y", Some(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("resolution-y") && err.contains("from 0") && err.contains("1000000"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn crs_is_crs84_only() {
+        for ok in [
+            None,
+            Some(CRS84),
+            Some("https://www.opengis.net/def/crs/OGC/1.3/CRS84"),
+            Some("CRS84"),
+            Some("ogc:crs84"),
+            Some("[OGC:CRS84]"),
+        ] {
+            assert!(check_crs(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "EPSG:4326",
+            "native",
+            "http://www.opengis.net/def/crs/EPSG/0/3067",
+        ] {
+            let err = check_crs(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains(CRS84), "{bad}: {err}");
+        }
     }
 
     #[test]

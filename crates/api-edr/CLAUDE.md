@@ -57,8 +57,9 @@ The shared machinery is `ds_core::instances` (see root CLAUDE.md). This crate
 owns the instance-id string form:
 
 - Routes: `GET /collections/{id}/instances`, `/instances/{instanceId}`,
-  `/instances/{instanceId}/{position,area}`. No-instance routes default to
-  the latest run.
+  `/instances/{instanceId}/{position,area,radius,cube}`
+  (`handlers::INSTANCE_QUERY_TYPES`). No-instance routes default to the
+  latest run.
 - Collection metadata gains an `instances` data_query, and the OpenAPI spec
   advertises the instance paths — both gated on `get_instances()` being
   non-empty.
@@ -100,6 +101,31 @@ variables.within_units` advertises the accepted units (`params::WITHIN_UNITS`).
 The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
 containing a pole or crossing the antimeridian is a 400 (#667). Engine
 errors from all data-query handlers map through `map_query_error`.
+
+## Cube queries (#925)
+
+`GET /collections/{id}/cube` (and the `/instances/{id}/cube` twin) calls
+`EdrEngine::query_cube` with a parsed `ds_core::feature::Bbox`, the resolved
+`z` levels and a `ds_core::cube::CubeResolution`. The handler reads the raw
+query pairs through `params::CubeQueryParams::from_pairs`, so an unknown or
+repeated parameter is a 400 listing `params::CUBE_PARAMETERS` — keep that
+list, the OpenAPI operation (`cube_operation`) and the README in step. It
+404s a collection that does not advertise `cube` before validating anything,
+rejects `PNG` and any `crs` but CRS84 (`params::check_crs`), requires `bbox`
+(four numbers, or six whose vertical pair is a `z` interval an explicit `z`
+overrides), and maps `resolution-*=0` to `None` (native). On a
+collection without a vertical axis `z` and a six-number bbox's vertical pair
+are ignored (EDR 1.2 `/req/edr/z-response` A, via `resolve_z_selector`) but
+`resolution-z` is a 400. A `datetime` list goes through `datetime_list::run`
+like the other data queries: each instant's `[t, z, y, x]` grid shares x, y
+and z, so the merge joins them along `t`. `data_queries.cube.link.variables.height_units` (required by EDR 1.2)
+is the vertical axis unit. The OpenAPI parameters are the EDR 1.2
+`cube-bbox`, `cube-z`, `resolution-x/-y/-z` and `crs` components, copied
+verbatim (only `crs`'s example is CRS84 instead of `native`).
+`ds_core::cube` holds the shared pieces engines use: `axis_positions`
+(both ends included), `nearest_indices` (half-cell tolerance, a position off
+the grid is missing) and `check_cube_budget` (`MAX_AREA_VALUES` across
+timesteps × levels × cells × parameters).
 
 ## Items (#928)
 
@@ -220,7 +246,8 @@ that returns CoverageJSON passes its result through `limit_coverages` (top-level
 coverages only); position also truncates the point list before dispatch, which
 is safe because an answered point always yields at least one coverage. A new
 data-query route must do the same and list `#/components/parameters/limit` in
-`api_definition()`. `/locations` without `limit` must stay byte-identical to
+`api_definition()` — unless EDR 1.2 defines no `limit` for its query type
+(trajectory, cube): then a `limit` is a 400, never silently ignored. `/locations` without `limit` must stay byte-identical to
 the unpaged inventory (clients and ETags rely on it); with `limit` it pages
 through `ds_core::collection_search::page_window`, the `/collections`
 arithmetic, under the same `location_budget` writer.

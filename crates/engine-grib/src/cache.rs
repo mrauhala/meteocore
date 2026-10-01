@@ -367,6 +367,41 @@ impl DecodedGrid {
         values
     }
 
+    /// Values of the subset at `(ys[j], xs[i])`, indices into its ascending
+    /// `y`/`x` axes, row-major `[y][x]` — the nearest-neighbour resampling of
+    /// a cube query (#925); identity maps reproduce [`Self::subset_values`].
+    /// Reads the decoded grid in place, so a resampled request never
+    /// allocates the native subset. `None` indices and NaN are missing.
+    pub(crate) fn sample_subset(
+        &self,
+        subset: &GridSubset,
+        ys: &[Option<usize>],
+        xs: &[Option<usize>],
+    ) -> Vec<Option<f64>> {
+        let mut values = Vec::with_capacity(ys.len() * xs.len());
+        for iy in ys {
+            // Storage rows run north to south when `lat_inc < 0`; the axis
+            // (like `subset_values`) ascends south to north.
+            let row = iy.filter(|&iy| iy < subset.rows.len()).map(|iy| {
+                if self.lat_inc < 0.0 {
+                    subset.rows.end - 1 - iy
+                } else {
+                    subset.rows.start + iy
+                }
+            });
+            for ix in xs {
+                let column = ix.and_then(|ix| subset.cols.get(ix));
+                values.push(match (row, column) {
+                    (Some(row), Some(&column)) => {
+                        Some(f64::from(self.values[row * self.ni + column])).filter(|v| !v.is_nan())
+                    }
+                    _ => None,
+                });
+            }
+        }
+        values
+    }
+
     /// Resample grid to output dimensions for map rendering.
     ///
     /// `bbox` is the WGS84 bounding box `[west, south, east, north]`. Each output
