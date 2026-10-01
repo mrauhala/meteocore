@@ -20,11 +20,11 @@ use crate::geojson::{
     encode_path_segment, FeatureIdentity, GeoJsonError, GeoJsonLink, LocationIndex,
 };
 use crate::params::{
-    negotiate_edr_format, parse_datetime, parse_limit, parse_locations_paging,
-    parse_within_metres, parse_z, plot_dimensions, query_formats, resolve_z_levels,
-    split_position_coords, AreaQueryParams, DatetimeSelector, EdrFormat, LocationQueryParams,
-    NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
-    TrajectoryQueryParams, CRS84_WKT, DATA_QUERY_CRS, MAX_LIMIT, WITHIN_UNITS,
+    negotiate_edr_format, parse_datetime, parse_limit, parse_locations_paging, parse_within_metres,
+    parse_z, plot_dimensions, query_formats, resolve_z_levels, split_position_coords,
+    AreaQueryParams, DatetimeSelector, EdrFormat, LocationQueryParams, NegotiatedFormat,
+    PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, CRS84_WKT, DATA_QUERY_CRS,
+    MAX_LIMIT, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
