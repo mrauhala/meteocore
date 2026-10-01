@@ -613,10 +613,12 @@ mod conformance {
 
     #[tokio::test]
     async fn omits_map_tilesets_conformance_class() {
-        // We link to map tilesets (tilesets-map rel) but do NOT implement the
-        // Map Tilesets class's /map/tiles endpoints, so the class must not be
-        // declared — that would be a false conformance claim. (Tiles are
-        // served by the standalone OGC API Tiles service.)
+        // The per-API Maps service links map tilesets (tilesets-map rel) in
+        // the separate /tiles service but has no `{map}/tiles` of its own,
+        // which Map Tilesets requires (its tiles-parameters must reach the
+        // map's tiles), so declaring the class here would be a false claim.
+        // The shared OGC API root serves `/collections/{id}/map/tiles` and
+        // declares it there (#946; pinned in server's common_discovery).
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
         assert!(!classes

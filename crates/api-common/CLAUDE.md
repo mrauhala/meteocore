@@ -38,6 +38,13 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   fields may override id/title for instances; do not override shared links.
 - Conformance declarations are deliberate. Part 4 searchable-collections is absent
   until all mandatory requirements of the recorded draft are implemented/tested.
+  A class that holds only in the shared layout goes in the block's
+  `shared_conformance`, never in its per-API list: Maps "Map Tilesets" needs
+  `{map}/tiles`, which only the shared root has (Tiles declares it there, #946).
+  `common_discovery` pins each declaration against the links and OpenAPI
+  parameters it requires. Tiles DateTime covers map and vector tiles; both
+  parse time through `subset`, and vector tiles hand it to the engine as
+  `FeatureQuery::datetime`.
 - Update README.md here, affected API READMEs and docs/ogc-api-common-matrix.md.
   Run cross-API contracts (`cargo test -p server --test common_discovery`) and the
   affected API suites. Do not require identical real production catalogs.

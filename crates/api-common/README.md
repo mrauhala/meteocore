@@ -14,15 +14,16 @@ and API-specific fields.
 | `collection_operation` | OpenAPI discovery operation, supported parameters, JSON/HTML responses and structured 400 errors |
 | `parameter_names`, `parameter_name_parameter` | Maps/Tiles parameter discovery: a multi-parameter raster's EDR-shaped `parameter_names` member, with label, unit and a parameter's own time axis, and the render routes' `parameter-name` OpenAPI component, one definition for every block. RGB composites (`MapEngine::composites`, #819) are entries too, with no unit and a `description` of their channels |
 | `legend_schema` | The Maps/Tiles legend routes' `legend` OpenAPI schema: a palette legend or an RGB composite's channel list, one definition for every block |
-| `subset` | The OGC 20-058 `subset` grammar (repeatable, comma-separated `axis(low:high)` / `axis(value)` expressions), axis assignment against a caller's axis table (aliases, case-insensitive; an unknown axis is an error), and `TimeSelection`: `datetime` instants and intervals, and time subsets with partial dates and `*` |
-| `map_frame` | Map output CRSs (`MapCrs`: codes, URIs, safe CURIEs, axis order, storage-CRS mapping), the frame a map covers and its `Content-Bbox`, and the Scaling class' `scale-denominator` ↔ resolution conversion and default sizes |
+| `subset` | The OGC 20-058 `subset` grammar (repeatable, comma-separated `axis(low:high)` / `axis(value)` expressions), axis assignment against a caller's axis table (aliases, case-insensitive; an unknown axis is an error), and `TimeSelection`: `datetime` instants and intervals, and time subsets with partial dates and `*`. `render_time` resolves a `RequestedTime` to the instant a map or map tile renders, one rule for both (Maps answers a selection with no time step 404, map tiles 204); `unknown_parameter` names a query parameter outside a route's list |
+| `map_frame` | Map output CRSs (`MapCrs`: codes, URIs, safe CURIEs, axis order, storage-CRS mapping), the frame a map covers and its `Content-Bbox`, the Scaling class' `scale-denominator` ↔ resolution conversion and default sizes, and the size rules Maps and map tiles share: `width`/`height` and `scale-denominator` parsing and the `MAX_MAP_DIMENSION`/`MAX_MAP_PIXELS` caps |
 | `CONFORMANCE_CLASSES` | One Common class inventory, combined with each API's own declarations |
 
 ## Shared OGC API root
 
 `shared` composes OGC API standards as building blocks under one root
 ([#789](https://github.com/mrauhala/meteocore/issues/789)), mounted by the server
-at `/`. A `BuildingBlock` contributes its conformance classes, landing links,
+at `/`. A `BuildingBlock` contributes its conformance classes (plus, through
+`shared_conformance`, classes that hold only in the shared layout), landing links,
 OpenAPI paths/components, data-access routes and, per collection, a
 `Contribution` of standard fields and access links. The composer serves the
 Common resources — landing page, `/api` (one merged OpenAPI 3.0 document),
@@ -43,6 +44,9 @@ The blocks are Maps, Tiles and Features, in that order — the order is field
 precedence. Tiles uses the Tiles Table 8 layout at the shared root: map tiles
 under `…/map/tiles`, styled map tiles under `…/styles/{styleId}/map/tiles`,
 vector tiles (MVT) under `…/tiles`, each list with its own tileset resources.
+Because map tiles sit under the map resource there, `{map}/tiles`, the Tiles
+block declares OGC API - Maps "Map Tilesets" at the shared root only
+(`shared_conformance`, #946); neither per-API service has that layout.
 Features serves `…/items[/{featureId}]` (with the conditional-GET middleware),
 adds `itemType: "feature"` and one `items` link per encoding to feature
 collections only, and namespaces its OpenAPI components (`features-bbox`, …)

@@ -923,6 +923,14 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
 }
 
 /// OGC API - Maps classes this implementation declares, on either surface.
+///
+/// "Map Tilesets" (`…/conf/tilesets`) is deliberately absent. It needs map
+/// tiles under the map resource, `{map}/tiles`, honouring the Scaling
+/// parameters (`/req/tilesets/tiles-parameters`). The per-API `/maps`
+/// service has none: its `tilesets-map` link points at the separate `/tiles`
+/// service. At the shared root the Tiles block serves exactly that layout
+/// and declares the class there (`api_tiles::handlers::SHARED_CONFORMANCE`,
+/// #259, #946).
 pub(crate) const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
@@ -1304,52 +1312,17 @@ pub async fn get_styled_map(
     render_map(&id, &style_id, params, &subsets, headers, state).await
 }
 
-/// The instant a map renders for, before the engine snaps it (#507).
-///
-/// - No time: the engine's default, else the parameter's (else the
-///   collection's) latest time.
-/// - An instant: as given; the engine snaps it to a timestep
-///   (`/per/datetime/closest`). From `subset=time(…)`, one outside the
-///   time axis is a 404 (`/req/datetime/subset-definition` D).
-/// - An interval (`datetime=a/b`, `subset=time("a":"b")`, a partial date,
-///   `*`): the latest time inside it; none inside is a 404. On a collection
-///   with no time axis it selects nothing, like the instant it ignores.
+/// The instant a map renders for, before the engine snaps it (#507):
+/// [`subset::render_time`], shared with map tiles. A time that selects no
+/// time step is a 404 here (`/req/datetime/subset-definition` D).
 fn requested_time(
     request: &MapRequest,
     engine: &dyn MapEngine,
     info: &RasterInfo,
     parameter: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MapsError> {
-    let parameter_axis = parameter.and_then(|p| engine.parameter_times(p));
-    let axis: &[chrono::DateTime<chrono::Utc>] = parameter_axis.as_deref().unwrap_or(&info.times);
-    let outside = |what: String| {
-        MapsError::NotFound(format!(
-            "No data for {what}: the collection's time axis has none"
-        ))
-    };
-    match request.time {
-        None => Ok(ds_core::map_engine::default_request_time(
-            engine, info, parameter,
-        )),
-        Some(MapTime {
-            selection: TimeSelection::Instant(t),
-            from_subset,
-        }) => {
-            if let (true, Some(first), Some(last)) = (from_subset, axis.first(), axis.last()) {
-                if t < *first || t > *last {
-                    return Err(outside(format!("subset time {}", subset::rfc3339(t))));
-                }
-            }
-            Ok(Some(t))
-        }
-        Some(_) if axis.is_empty() => Ok(ds_core::map_engine::default_request_time(
-            engine, info, parameter,
-        )),
-        Some(MapTime { selection, .. }) => selection
-            .latest_in(axis)
-            .map(Some)
-            .ok_or_else(|| outside("the requested time interval".to_string())),
-    }
+    subset::render_time(request.time.as_ref(), engine, info, parameter)
+        .map_err(|none| MapsError::NotFound(none.0))
 }
 
 /// Shared rendering logic for get_map and get_styled_map.

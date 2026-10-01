@@ -40,6 +40,85 @@ pub const STANDARD_PIXEL_SIZE_M: f64 = 0.000_28;
 /// `/rec/scaling/dimensions`: "around 1000 x 1000 pixels").
 pub const DEFAULT_MAP_SIZE: u32 = 1024;
 
+/// Output-pixel cap of one map or map tile: `width × height` of the
+/// returned image.
+///
+/// It bounds the output only, so passing it guarantees neither of the budgets
+/// behind it ("Pixel budgets" in the root CLAUDE.md, #120): engine-geotiff's
+/// `reader::MAX_MAP_PIXELS` has the same value but counts native *source*
+/// pixels, and render admission charges 32 B per output pixel against
+/// `MC_RENDER_MEMORY_MB`, whose 1024 MiB default admits at most 33 554 432.
+///
+/// Enforced by [`whole_pixels`] on the given or derived size: HTTP 400
+/// "width * height (N) exceeds maximum of 64000000". [`MAX_MAP_DIMENSION`]²
+/// equals this cap, so the per-side check always fires first today; this
+/// one only guards a future per-side increase.
+pub const MAX_MAP_PIXELS: u64 = 64_000_000;
+
+/// Output-pixel cap per side (width or height). 8000 chosen so 8000 × 8000
+/// equals [`MAX_MAP_PIXELS`] — a square at the per-dim cap doesn't trip the
+/// pixel cap with a confusing second error. Tripping it is HTTP 400
+/// "width and height must not exceed 8000".
+pub const MAX_MAP_DIMENSION: u32 = 8000;
+
+/// `width` or `height`: a positive integer up to [`MAX_MAP_DIMENSION`]
+/// (`/req/scaling/width-definition` C, `height-definition` C). `None` when
+/// the parameter is absent; the error is the 400 message.
+pub fn parse_dimension(name: &str, value: Option<&str>) -> Result<Option<u32>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let n = raw
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| format!("{name} '{raw}' must be a positive integer"))?;
+    if n > MAX_MAP_DIMENSION {
+        return Err(format!(
+            "width and height must not exceed {MAX_MAP_DIMENSION}"
+        ));
+    }
+    Ok(Some(n))
+}
+
+/// `scale-denominator`: a positive number
+/// (`/req/scaling/scale-denominator-definition`). `None` when absent; the
+/// error is the 400 message.
+pub fn parse_scale_denominator(value: Option<&str>) -> Result<Option<f64>, String> {
+    value
+        .map(|raw| {
+            raw.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or_else(|| format!("scale-denominator '{raw}' must be a positive number"))
+        })
+        .transpose()
+}
+
+/// Round a size to whole pixels and hold it to [`MAX_MAP_DIMENSION`] and
+/// [`MAX_MAP_PIXELS`]: `cause` names what set it, for the 400 message when a
+/// derived size is too large.
+pub fn whole_pixels((width, height): (f64, f64), cause: &str) -> Result<(u32, u32), String> {
+    let (width, height) = (width.round().max(1.0), height.round().max(1.0));
+    if !(width.is_finite() && height.is_finite()) {
+        return Err(format!("{cause} gives no finite map size"));
+    }
+    if width > f64::from(MAX_MAP_DIMENSION) || height > f64::from(MAX_MAP_DIMENSION) {
+        return Err(format!(
+            "width and height must not exceed {MAX_MAP_DIMENSION}: {cause} gives a \
+             {width}x{height} map"
+        ));
+    }
+    let (width, height) = (width as u32, height as u32);
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_MAP_PIXELS {
+        return Err(format!(
+            "width * height ({pixels}) exceeds maximum of {MAX_MAP_PIXELS}"
+        ));
+    }
+    Ok((width, height))
+}
+
 impl MapCrs {
     /// Every CRS, in the order collections advertise them.
     pub const ALL: [MapCrs; 5] = [
@@ -576,5 +655,40 @@ mod tests {
         assert_eq!(size_for_resolution(&frame, 0.01, 0.01), (200.0, 100.0));
         let around = frame_around(MapCrs::Crs84, (10.0, 50.0), (0.1, 0.05), 20, 40);
         assert_eq!(around.rect(), [9.0, 49.0, 11.0, 51.0]);
+    }
+
+    /// The size rules Maps and map tiles share: positive integer sides,
+    /// positive scales, and the output caps on every given or derived size.
+    #[test]
+    fn sizes_are_validated_against_the_caps() {
+        assert_eq!(parse_dimension("width", None), Ok(None));
+        assert_eq!(parse_dimension("width", Some("8000")), Ok(Some(8000)));
+        for bad in ["0", "-1", "1.5", "x"] {
+            assert_eq!(
+                parse_dimension("height", Some(bad)),
+                Err(format!("height '{bad}' must be a positive integer"))
+            );
+        }
+        assert_eq!(
+            parse_dimension("width", Some("8001")),
+            Err("width and height must not exceed 8000".to_string())
+        );
+        assert_eq!(parse_scale_denominator(Some("1e6")), Ok(Some(1e6)));
+        assert_eq!(parse_scale_denominator(None), Ok(None));
+        for bad in ["0", "-5", "inf", "NaN", "x"] {
+            assert!(parse_scale_denominator(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(whole_pixels((255.6, 0.2), "it"), Ok((256, 1)));
+        assert_eq!(
+            whole_pixels((8000.4, 10.0), "it"),
+            Ok((MAX_MAP_DIMENSION, 10))
+        );
+        let err = whole_pixels((8001.0, 10.0), "scale-denominator over this tile").unwrap_err();
+        assert_eq!(
+            err,
+            "width and height must not exceed 8000: scale-denominator over this tile gives a \
+             8001x10 map"
+        );
+        assert!(whole_pixels((f64::INFINITY, 1.0), "it").is_err());
     }
 }

@@ -388,6 +388,29 @@ mod conformance {
             .any(|c| c == "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets"));
     }
 
+    /// Map tiles take `datetime` instants and intervals and
+    /// `subset=datetime(…)` (#946; `map_tile_parameters` pins the behaviour).
+    #[tokio::test]
+    async fn declares_datetime() {
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(classes
+            .iter()
+            .any(|c| c == "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/datetime"));
+    }
+
+    /// Map Tilesets is a Maps class, declared at the shared root where map
+    /// tiles sit under the map resource; the per-API Tiles service serves no
+    /// map resource.
+    #[tokio::test]
+    async fn omits_the_maps_tilesets_class() {
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(!classes
+            .iter()
+            .any(|c| c.as_str().unwrap().contains("ogcapi-maps-1")));
+    }
+
     #[tokio::test]
     async fn declares_mvt() {
         let (_, json) = get("/conformance").await;
@@ -1672,6 +1695,57 @@ mod mvt {
         }
     }
 
+    /// The map tile parameters are map tiles' alone: vector tiles reject
+    /// each, and any unknown parameter, rather than ignore it (#605, #946).
+    /// A time subset on another axis is a 400 too. Both routes.
+    #[tokio::test]
+    async fn map_tile_and_unknown_parameters_are_rejected_on_vector_tiles() {
+        for (query, expected) in [
+            ("width=512", "'width' is not supported for vector tiles"),
+            ("height=512", "'height' is not supported for vector tiles"),
+            (
+                "scale-denominator=1e6",
+                "'scale-denominator' is not supported for vector tiles",
+            ),
+            (
+                "elevation=1",
+                "'elevation' is not supported for vector tiles",
+            ),
+            (
+                "parameter-name=x",
+                "'parameter-name' is not supported for vector tiles",
+            ),
+            (
+                "foo=1",
+                "Unknown query parameter 'foo'. Supported: f, datetime, subset",
+            ),
+            (
+                "subset=time(%222024-01-01T00:00:00Z%22)",
+                "subset axis 'time' is not supported; valid axes: datetime",
+            ),
+        ] {
+            for (app, uri) in [
+                (
+                    build_mvt_router(),
+                    format!("/collections/places/tiles/WebMercatorQuad/0/0/0?f=mvt&{query}"),
+                ),
+                (
+                    super::shared_router(build_mvt_state()),
+                    format!("/collections/places/tiles/WebMercatorQuad/0/0/0?{query}"),
+                ),
+            ] {
+                let resp = app
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+                let body = resp.into_body().collect().await.unwrap().to_bytes();
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["description"], expected, "{uri}");
+            }
+        }
+    }
+
     fn build_mvt_state() -> api_tiles::AppState {
         let engine: Arc<dyn FeatureEngine> = Arc::new(PointFeatureEngine::three_points());
         let mut feature_engines = HashMap::new();
@@ -1825,7 +1899,8 @@ mod mvt {
     }
 
     /// Shared-root vector tiles (`…/tiles`, no `?f=mvt`) are the per-API
-    /// service's MVT bytes; raster selectors are rejected, not ignored.
+    /// service's MVT bytes; raster selectors are rejected, not ignored. A
+    /// time is a vector tile's too (`vector_tile_time`).
     #[tokio::test]
     async fn shared_root_vector_tiles_match_the_per_api_service() {
         let state = build_mvt_state();
@@ -1848,12 +1923,7 @@ mod mvt {
             shared_headers["content-type"],
             "application/vnd.mapbox-vector-tile"
         );
-        for query in [
-            "f=image/png",
-            "datetime=2024-01-01T00:00:00Z",
-            "elevation=0.5",
-            "parameter-name=x",
-        ] {
+        for query in ["f=image/png", "elevation=0.5", "parameter-name=x"] {
             let (status, _, _) = get_raw_on(
                 shared.clone(),
                 &format!("/collections/places/tiles/WebMercatorQuad/0/0/0?{query}"),
@@ -3862,5 +3932,793 @@ mod quality {
             api["components"]["parameters"]["quality"],
             api_common::quality_parameter(ds_render::DEFAULT_JPEG_QUALITY)
         );
+    }
+}
+
+/// Map tile parameters (#946): OGC API - Tiles DateTime (`datetime`
+/// instants and intervals, `subset=datetime(…)`) and the OGC API - Maps
+/// Scaling parameters Map Tilesets requires on map tiles (`width`, `height`,
+/// `scale-denominator`), on the per-API and the shared-root routes alike.
+mod map_tile_parameters {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    const T0: &str = "2026-09-25T18:00:00Z";
+    const T1: &str = "2026-09-25T19:00:00Z";
+    const T2: &str = "2026-09-25T20:00:00Z";
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// One render's `(time, width, height, bbox)`.
+    type Render = (Option<DateTime<Utc>>, u32, u32, [f64; 4]);
+
+    /// Hourly time steps T0, T1, T2; an instant snaps to the last step at
+    /// or before it. Records every render; `empty` renders all-nodata.
+    #[derive(Default)]
+    struct Engine {
+        renders: std::sync::Mutex<Vec<Render>>,
+        empty: bool,
+    }
+
+    impl MapEngine for Engine {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.renders
+                .lock()
+                .unwrap()
+                .push((time, width, height, bbox));
+            let value = if self.empty { None } else { Some(0.5) };
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![value; (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([-180.0, -90.0, 180.0, 90.0]),
+                times: vec![t(T0), t(T1), t(T2)],
+                parameter: "t".into(),
+                unit: "K".into(),
+                parameters: Vec::new(),
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+
+        fn resolve_parameter_time(
+            &self,
+            _parameter: Option<&str>,
+            time: Option<DateTime<Utc>>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let times = self.raster_info().times;
+            match time {
+                Some(time) => times.into_iter().rev().find(|&ts| ts <= time),
+                None => times.last().copied(),
+            }
+        }
+    }
+
+    fn state(engine: Arc<Engine>) -> api_tiles::AppState {
+        let state = build_state();
+        let mut tiles = (**state.load()).clone();
+        tiles.map_engines.insert("radar".into(), engine);
+        Arc::new(ArcSwap::from_pointee(tiles))
+    }
+
+    /// The per-API and the shared-root router over one engine, with the
+    /// map tile path prefix each serves (the default and a named style).
+    fn surfaces(engine: Arc<Engine>) -> Vec<(axum::Router, &'static str)> {
+        let state = state(engine);
+        vec![
+            (
+                api_tiles::router(state.clone()),
+                "/collections/radar/tiles/WebMercatorQuad",
+            ),
+            (
+                api_tiles::router(state.clone()),
+                "/collections/radar/styles/grayscale/tiles/WebMercatorQuad",
+            ),
+            (
+                super::shared_router(state.clone()),
+                "/collections/radar/map/tiles/WebMercatorQuad",
+            ),
+            (
+                super::shared_router(state),
+                "/collections/radar/styles/grayscale/map/tiles/WebMercatorQuad",
+            ),
+        ]
+    }
+
+    /// GET `uri`, its double quotes percent-encoded as a client sends them.
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        super::get_raw_on(app.clone(), &uri.replace('"', "%22")).await
+    }
+
+    fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).map(|v| v.to_str().unwrap())
+    }
+
+    fn last_render(engine: &Engine) -> Render {
+        *engine.renders.lock().unwrap().last().unwrap()
+    }
+
+    fn render_count(engine: &Engine) -> usize {
+        engine.renders.lock().unwrap().len()
+    }
+
+    /// Width and height from a PNG's IHDR chunk.
+    fn png_size(bytes: &[u8]) -> (u32, u32) {
+        assert_eq!(&bytes[1..4], b"PNG");
+        let be = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        (be(16), be(20))
+    }
+
+    /// `/req/collections/rc-datetime-definition` B–D on map tiles: an
+    /// interval renders the latest time step inside it, reported in
+    /// `OGCAPI-datetime` (`/rec/datetime/actual-datetime`), and is not pinned
+    /// `immutable`: new data may land inside an open interval.
+    #[tokio::test]
+    async fn datetime_interval_renders_its_latest_time_step() {
+        for (query, expected) in [
+            (format!("{T0}/{T1}"), T1),
+            (format!("../{T1}"), T1),
+            (format!("/{T1}"), T1),
+            (format!("{T1}/.."), T2),
+            (format!("{T0}/"), T2),
+            ("2026-09-25T18:30:00Z/2026-09-25T19:30:00Z".to_string(), T1),
+        ] {
+            let engine = Arc::new(Engine::default());
+            for (app, prefix) in surfaces(engine.clone()) {
+                let uri = format!("{prefix}/1/0/1?datetime={query}");
+                let (status, headers, _) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(header(&headers, "ogcapi-datetime"), Some(expected), "{uri}");
+                let cache_control = header(&headers, "cache-control").unwrap();
+                assert!(
+                    !cache_control.contains("immutable"),
+                    "{uri}: {cache_control}"
+                );
+            }
+            assert_eq!(last_render(&engine).0, Some(t(expected)), "{query}");
+        }
+    }
+
+    /// An instant still snaps to the last step at or before it
+    /// (`/per/datetime/closest`), keeps its `immutable` pin, and reports the
+    /// step rendered.
+    #[tokio::test]
+    async fn datetime_instant_snaps_as_before() {
+        let engine = Arc::new(Engine::default());
+        for (app, prefix) in surfaces(engine.clone()) {
+            let uri = format!("{prefix}/1/0/1?datetime=2026-09-25T19:40:00Z");
+            let (status, headers, _) = fetch(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(header(&headers, "ogcapi-datetime"), Some(T1), "{uri}");
+            assert!(header(&headers, "cache-control")
+                .unwrap()
+                .contains("immutable"));
+        }
+        assert_eq!(last_render(&engine).0, Some(t(T1)));
+        // Without a time, the latest step, reported too.
+        let engine = Arc::new(Engine::default());
+        for (app, prefix) in surfaces(engine.clone()) {
+            let (status, headers, _) = fetch(&app, &format!("{prefix}/1/0/1")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(header(&headers, "ogcapi-datetime"), Some(T2));
+        }
+    }
+
+    /// `/req/datetime/axis`: `subset=datetime(…)` selects the time as
+    /// `datetime` does, repeated or not, with partial values and `*`.
+    #[tokio::test]
+    async fn subset_datetime_selects_the_time() {
+        for (subset, expected, immutable) in [
+            (format!(r#"datetime("{T1}")"#), T1, true),
+            (r#"datetime("2026-09-25T19:59:00Z")"#.to_string(), T1, true),
+            (format!(r#"datetime("{T0}":"{T1}")"#), T1, false),
+            (format!(r#"datetime(*:"{T1}")"#), T1, false),
+            (format!(r#"datetime("{T0}":*)"#), T2, false),
+            ("datetime(*)".to_string(), T2, false),
+            (r#"datetime("2026-09-25T18Z")"#.to_string(), T0, false),
+            (r#"datetime("2026-09-25")"#.to_string(), T2, false),
+        ] {
+            let engine = Arc::new(Engine::default());
+            for (app, prefix) in surfaces(engine.clone()) {
+                let uri = format!("{prefix}/1/0/1?subset={subset}");
+                let (status, headers, _) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(header(&headers, "ogcapi-datetime"), Some(expected), "{uri}");
+                let pinned = header(&headers, "cache-control")
+                    .unwrap()
+                    .contains("immutable");
+                assert_eq!(pinned, immutable, "{uri}");
+            }
+            assert_eq!(last_render(&engine).0, Some(t(expected)), "{subset}");
+        }
+    }
+
+    /// A time selection with no time step is an empty tile, 204, never
+    /// rendered and never pinned: a subset entirely outside the time axis
+    /// (`/req/collections/rc-subset-definition` C) or an interval holding no
+    /// step (`/req/core/tc-error` B).
+    #[tokio::test]
+    async fn a_time_selection_without_a_time_step_is_204() {
+        let engine = Arc::new(Engine::default());
+        for query in [
+            "datetime=2026-09-25T18:10:00Z/2026-09-25T18:50:00Z".to_string(),
+            "datetime=../2026-09-25T17:00:00Z".to_string(),
+            "datetime=2026-09-26T00:00:00Z/..".to_string(),
+            r#"subset=datetime("2026-09-25T17:00:00Z")"#.to_string(),
+            r#"subset=datetime("2026-09-25T21:00:00Z")"#.to_string(),
+            r#"subset=datetime("2030":"2031")"#.to_string(),
+        ] {
+            for (app, prefix) in surfaces(engine.clone()) {
+                let uri = format!("{prefix}/1/0/1?{query}");
+                let (status, headers, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{uri}");
+                assert!(body.is_empty(), "{uri}");
+                assert!(header(&headers, "ogcapi-datetime").is_none(), "{uri}");
+                assert!(
+                    !header(&headers, "cache-control")
+                        .unwrap()
+                        .contains("immutable"),
+                    "{uri}"
+                );
+            }
+        }
+        assert_eq!(render_count(&engine), 0);
+        // A `datetime` instant before the axis still snaps as it always has.
+        let (app, prefix) = surfaces(engine.clone()).remove(0);
+        let uri = format!("{prefix}/1/0/1?datetime=2026-09-25T17:00:00Z");
+        assert_eq!(fetch(&app, &uri).await.0, StatusCode::OK);
+    }
+
+    /// `datetime` and a time subset together, any axis but `datetime`
+    /// (`/req/collections/rc-subset-definition` B) and malformed values are
+    /// 400s that never reach the engine.
+    #[tokio::test]
+    async fn conflicting_or_unknown_time_selections_are_400() {
+        let engine = Arc::new(Engine::default());
+        for (query, needle) in [
+            (
+                format!(r#"datetime={T1}&subset=datetime("{T1}")"#),
+                "cannot be used together",
+            ),
+            (format!(r#"subset=time("{T1}")"#), "valid axes: datetime"),
+            ("subset=Lat(60:61)".to_string(), "valid axes: datetime"),
+            ("subset=h(100)".to_string(), "valid axes: datetime"),
+            ("subset=foo(1)".to_string(), "valid axes: datetime"),
+            (
+                format!(r#"subset=datetime("{T0}")&subset=datetime("{T1}")"#),
+                "more than once",
+            ),
+            ("subset=datetime(2026)".to_string(), "double-quoted"),
+            ("datetime=yesterday".to_string(), "Cannot parse datetime"),
+            (format!("datetime={T2}/{T0}"), "is after its end"),
+        ] {
+            for (app, prefix) in surfaces(engine.clone()) {
+                let uri = format!("{prefix}/1/0/1?{query}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                let description = json["description"].as_str().unwrap();
+                assert!(description.contains(needle), "{uri}: {description}");
+            }
+        }
+        assert_eq!(render_count(&engine), 0);
+    }
+
+    /// #507: the rendered cache keys on the time step the engine renders,
+    /// so every selection resolving to T1 shares one cached tile.
+    #[tokio::test]
+    async fn the_cache_keys_on_the_resolved_time_step() {
+        let engine = Arc::new(Engine::default());
+        let (app, prefix) = surfaces(engine.clone()).remove(2);
+        let uri = |query: &str| format!("{prefix}/2/1/2?{query}");
+        let (_, headers, first) = fetch(&app, &uri(&format!("datetime={T0}/{T1}"))).await;
+        assert_eq!(header(&headers, "x-cache"), Some("MISS"));
+        assert_eq!(render_count(&engine), 1);
+        for query in [
+            format!("datetime={T1}"),
+            "datetime=2026-09-25T19:30:00Z".to_string(),
+            format!(r#"subset=datetime("{T1}")"#),
+            format!(r#"subset=datetime(*:"{T1}")"#),
+            format!("datetime=../{T1}"),
+        ] {
+            let (status, headers, body) = fetch(&app, &uri(&query)).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(header(&headers, "x-cache"), Some("HIT"), "{query}");
+            assert_eq!(header(&headers, "ogcapi-datetime"), Some(T1), "{query}");
+            assert_eq!(body, first, "{query}");
+        }
+        assert_eq!(render_count(&engine), 1);
+        // The latest step is another tile.
+        let (_, headers, _) = fetch(&app, &uri(&format!("datetime={T1}/.."))).await;
+        assert_eq!(header(&headers, "x-cache"), Some("MISS"));
+        assert_eq!(last_render(&engine).0, Some(t(T2)));
+    }
+
+    /// Maps Scaling on map tiles (Map Tilesets
+    /// `/req/tilesets/tiles-parameters`): `width` and `height` override the
+    /// tile matrix's 256 × 256 over the same tile area; one side alone keeps
+    /// square pixels. Each size is its own cache entry.
+    #[tokio::test]
+    async fn width_and_height_resize_the_tile_over_its_area() {
+        for surface in 0..4 {
+            // A fresh cache per surface: they share one when they share state.
+            let engine = Arc::new(Engine::default());
+            let (app, prefix) = surfaces(engine.clone()).remove(surface);
+            let (status, _, body) = fetch(&app, &format!("{prefix}/2/1/2")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(png_size(&body), (256, 256));
+            let area = last_render(&engine).3;
+            for (query, size) in [
+                ("width=512", (512, 512)),
+                ("height=100", (100, 100)),
+                ("width=300&height=200", (300, 200)),
+            ] {
+                let uri = format!("{prefix}/2/1/2?{query}");
+                let (status, headers, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(png_size(&body), size, "{uri}");
+                let (_, width, height, bbox) = last_render(&engine);
+                assert_eq!((width, height), size, "{uri}");
+                assert_eq!(bbox, area, "{uri}: the tile matrix sets the area");
+                assert_ne!(header(&headers, "x-cache"), Some("HIT"), "{uri}");
+            }
+        }
+    }
+
+    /// `scale-denominator` sizes the tile: a WebMercatorQuad tile at its
+    /// own tile matrix's scale denominator is 256 pixels at the equator
+    /// (zoom 0's tile is centred there), half the scale twice the pixels.
+    #[tokio::test]
+    async fn scale_denominator_sizes_the_tile() {
+        let engine = Arc::new(Engine::default());
+        let zoom0 = 559_082_264.028_717_8;
+        for (app, prefix) in surfaces(engine.clone()) {
+            for (scale, side) in [(zoom0, 256), (zoom0 / 2.0, 512)] {
+                let uri = format!("{prefix}/0/0/0?scale-denominator={scale}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                let (width, height) = png_size(&body);
+                assert!(
+                    width.abs_diff(side) <= 1 && height.abs_diff(side) <= 1,
+                    "{uri}: {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scaling_errors_are_400() {
+        let engine = Arc::new(Engine::default());
+        for (query, needle) in [
+            ("width=0", "width '0' must be a positive integer"),
+            ("height=abc", "height 'abc' must be a positive integer"),
+            ("width=8001", "must not exceed 8000"),
+            ("scale-denominator=0", "must be a positive number"),
+            (
+                "scale-denominator=1e6&width=256",
+                "scale-denominator cannot be combined with width or height",
+            ),
+            // 1:1000 over a whole-world tile is millions of pixels a side.
+            ("scale-denominator=1000", "must not exceed 8000"),
+        ] {
+            for (app, prefix) in surfaces(engine.clone()) {
+                let uri = format!("{prefix}/0/0/0?{query}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                let description = json["description"].as_str().unwrap();
+                assert!(description.contains(needle), "{uri}: {description}");
+            }
+        }
+        assert_eq!(render_count(&engine), 0);
+    }
+
+    /// An all-nodata tile sized by `width`/`height` is a transparent image of
+    /// that size, not the 256 × 256 default.
+    #[tokio::test]
+    async fn an_empty_resized_tile_has_the_requested_size() {
+        let engine = Arc::new(Engine {
+            empty: true,
+            ..Default::default()
+        });
+        for (app, prefix) in surfaces(engine) {
+            let (status, headers, body) =
+                fetch(&app, &format!("{prefix}/2/1/2?width=300&height=200")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(header(&headers, "x-cache"), Some("EMPTY"));
+            assert_eq!(png_size(&body), (300, 200));
+            let (_, _, body) = fetch(&app, &format!("{prefix}/2/1/2")).await;
+            assert_eq!(png_size(&body), (256, 256));
+        }
+    }
+
+    /// A query parameter a map tile does not take is a 400 naming the ones
+    /// it does, never silently ignored (root CLAUDE.md, #605).
+    #[tokio::test]
+    async fn unknown_parameters_are_400() {
+        let engine = Arc::new(Engine::default());
+        for query in [
+            "bbox=0,0,1,1",
+            "crs=EPSG:4326",
+            "reference_time=x",
+            "foo=1&datetime=x",
+        ] {
+            for (app, prefix) in surfaces(engine.clone()) {
+                let uri = format!("{prefix}/1/0/1?{query}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                let description = json["description"].as_str().unwrap();
+                assert!(
+                    description.starts_with("Unknown query parameter '")
+                        && description.ends_with(
+                            "Supported: f, datetime, subset, width, height, scale-denominator, \
+                             parameter-name, elevation, quality"
+                        ),
+                    "{uri}: {description}"
+                );
+            }
+        }
+        assert_eq!(render_count(&engine), 0);
+        // Every parameter the workbench and the preview send is accepted.
+        for (app, prefix) in surfaces(engine.clone()) {
+            let uri =
+                format!("{prefix}/1/0/1?f=image/webp&quality=80&datetime={T1}&parameter-name=t");
+            assert_ne!(fetch(&app, &uri).await.0, StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+}
+
+/// Vector tiles honour time (#794, #946): OGC API - Tiles DateTime on
+/// `datetime` and `subset=datetime(…)`, on the per-API `?f=mvt` route and the
+/// shared root's vector route alike. Only features whose temporal geometry
+/// intersects the selection are encoded (`/req/collections/rc-datetime-response`
+/// A), and features without one always are (B).
+mod vector_tile_time {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use ds_core::feature::{
+        DatetimeInterval, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
+    };
+    use ds_core::feature_engine::FeatureEngine;
+
+    const T0: &str = "2026-10-01T00:00:00Z";
+    const T1: &str = "2026-10-01T06:00:00Z";
+    const T2: &str = "2026-10-01T12:00:00Z";
+    const T3: &str = "2026-10-01T18:00:00Z";
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// Points with validity intervals, like alerts: `early` [T0, T1],
+    /// `late` [T2, T3], and `always`, which has no time. Applies `datetime`
+    /// as an inclusive intersection, records every query's `datetime`.
+    /// A feature's validity interval, `None` for one without a time.
+    type Window = Option<(DateTime<Utc>, DateTime<Utc>)>;
+
+    struct Alerts {
+        features: Vec<(Feature, Window)>,
+        timed: bool,
+        queries: std::sync::Mutex<Vec<Option<DatetimeInterval>>>,
+    }
+
+    impl Alerts {
+        fn new(timed: bool) -> Self {
+            let feature = |name: &str, x: f64| Feature {
+                id: name.into(),
+                geometry: Arc::new(Geometry::Point { x, y: 10.0 }),
+                properties: Arc::new(
+                    [("name".to_string(), PropertyValue::String(name.into()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            };
+            Self {
+                features: vec![
+                    (feature("early-alert", 10.0), Some((t(T0), t(T1)))),
+                    (feature("late-alert", 20.0), Some((t(T2), t(T3)))),
+                    (feature("always-alert", 30.0), None),
+                ],
+                timed,
+                queries: Default::default(),
+            }
+        }
+
+        fn queries(&self) -> Vec<Option<DatetimeInterval>> {
+            self.queries.lock().unwrap().clone()
+        }
+    }
+
+    impl FeatureEngine for Alerts {
+        fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            self.queries.lock().unwrap().push(query.datetime.clone());
+            let features: Vec<Feature> = self
+                .features
+                .iter()
+                .filter(|(_, window)| match (&query.datetime, window) {
+                    (Some(dt), Some((start, end))) => {
+                        dt.end.is_none_or(|e| *start <= e) && dt.start.is_none_or(|s| s <= *end)
+                    }
+                    _ => true,
+                })
+                .map(|(f, _)| f.clone())
+                .collect();
+            let n = features.len();
+            Ok(FeaturePage {
+                features,
+                number_matched: n,
+                number_returned: n,
+                next_offset: None,
+            })
+        }
+
+        fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+            Err(DataServerError::FeatureNotFound(id.to_string()))
+        }
+
+        fn feature_count(&self) -> usize {
+            self.features.len()
+        }
+
+        fn spatial_extent(&self) -> Option<[f64; 4]> {
+            Some([10.0, 10.0, 30.0, 10.0])
+        }
+
+        fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+            self.timed.then(|| (t(T0), t(T3)))
+        }
+
+        fn has_time_dimension(&self) -> bool {
+            self.timed
+        }
+    }
+
+    fn state(engine: Arc<Alerts>) -> api_tiles::AppState {
+        let mut feature_engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
+        feature_engines.insert("alerts".to_string(), engine);
+        let config: CollectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "alerts", "title": "Alerts", "description": "Timed alerts",
+            "apis": ["tiles"], "engine_type": "cap"
+        }))
+        .unwrap();
+        Arc::new(ArcSwap::from_pointee(TilesState {
+            map_engines: HashMap::new(),
+            collections: HashMap::new(),
+            styles: HashMap::new(),
+            feature_engines,
+            feature_collections: [("alerts".to_string(), config)].into_iter().collect(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+            base_url: String::new(),
+            trust_proxy_headers: false,
+        }))
+    }
+
+    /// Both vector tile routes over one engine and one cache, as a URI
+    /// builder taking the query (without `?`).
+    /// A route and its tile URI for a query.
+    type Route = (axum::Router, fn(&str) -> String);
+
+    fn routes(engine: Arc<Alerts>) -> Vec<Route> {
+        let state = state(engine);
+        vec![
+            (api_tiles::router(state.clone()), |q| {
+                format!("/collections/alerts/tiles/WebMercatorQuad/0/0/0?f=mvt&{q}")
+            }),
+            (super::shared_router(state), |q| {
+                format!("/collections/alerts/tiles/WebMercatorQuad/0/0/0?{q}")
+            }),
+        ]
+    }
+
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        super::get_raw_on(app.clone(), &uri.replace('"', "%22")).await
+    }
+
+    /// The `name`s an MVT holds: MVT stores string values in plaintext.
+    fn names(bytes: &[u8]) -> Vec<&'static str> {
+        ["early-alert", "late-alert", "always-alert"]
+            .into_iter()
+            .filter(|name| {
+                bytes
+                    .windows(name.len())
+                    .any(|window| window == name.as_bytes())
+            })
+            .collect()
+    }
+
+    fn interval(start: Option<&str>, end: Option<&str>) -> Option<DatetimeInterval> {
+        Some(DatetimeInterval {
+            start: start.map(t),
+            end: end.map(t),
+        })
+    }
+
+    /// An instant and intervals select the features they intersect, and
+    /// the timeless one always; the engine gets Features' interval.
+    #[tokio::test]
+    async fn time_selects_the_intersecting_features() {
+        for (query, expected, sent) in [
+            (
+                format!("datetime={T1}"),
+                vec!["early-alert", "always-alert"],
+                interval(Some(T1), Some(T1)),
+            ),
+            (
+                "datetime=2026-10-01T09:00:00Z".to_string(),
+                vec!["always-alert"],
+                interval(Some("2026-10-01T09:00:00Z"), Some("2026-10-01T09:00:00Z")),
+            ),
+            (
+                format!("datetime={T1}/{T2}"),
+                vec!["early-alert", "late-alert", "always-alert"],
+                interval(Some(T1), Some(T2)),
+            ),
+            (
+                format!("datetime={T2}/.."),
+                vec!["late-alert", "always-alert"],
+                interval(Some(T2), None),
+            ),
+            (
+                format!("datetime=../{T0}"),
+                vec!["early-alert", "always-alert"],
+                interval(None, Some(T0)),
+            ),
+            (
+                format!(r#"subset=datetime("{T3}")"#),
+                vec!["late-alert", "always-alert"],
+                interval(Some(T3), Some(T3)),
+            ),
+            (
+                r#"subset=datetime("2026-10-01T1":*)"#.replace("T1\"", "T13Z\""),
+                vec!["late-alert", "always-alert"],
+                interval(Some("2026-10-01T13:00:00Z"), None),
+            ),
+            (
+                "".to_string(),
+                vec!["early-alert", "late-alert", "always-alert"],
+                None,
+            ),
+        ] {
+            let engine = Arc::new(Alerts::new(true));
+            for (app, uri) in routes(engine.clone()) {
+                let uri = uri(&query);
+                let (status, headers, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(headers["content-type"], MVT_CONTENT_TYPE_STR, "{uri}");
+                assert_eq!(names(&body), expected, "{uri}");
+            }
+            // The first route encoded it; the second hit the shared cache.
+            assert_eq!(engine.queries(), vec![sent], "{query}");
+        }
+    }
+
+    const MVT_CONTENT_TYPE_STR: &str = "application/vnd.mapbox-vector-tile";
+
+    /// The vector tile cache keys on the selection: a tile for one time is
+    /// never served for another or for no time, and equal selections
+    /// (`datetime=t` and `subset=datetime("t")`) share an entry.
+    #[tokio::test]
+    async fn the_cache_keys_on_the_time_selection() {
+        let engine = Arc::new(Alerts::new(true));
+        let (app, uri) = routes(engine.clone()).remove(1);
+        let x_cache =
+            |headers: &axum::http::HeaderMap| headers["x-cache"].to_str().unwrap().to_owned();
+        let (_, headers, early) = fetch(&app, &uri(&format!("datetime={T0}"))).await;
+        assert_eq!(x_cache(&headers), "MISS");
+        assert_eq!(names(&early), ["early-alert", "always-alert"]);
+        let (_, headers, late) = fetch(&app, &uri(&format!("datetime={T3}"))).await;
+        assert_eq!(x_cache(&headers), "MISS");
+        assert_eq!(names(&late), ["late-alert", "always-alert"]);
+        let (_, headers, all) = fetch(&app, &uri("")).await;
+        assert_eq!(x_cache(&headers), "MISS");
+        assert_eq!(names(&all).len(), 3);
+        for query in [
+            format!("datetime={T0}"),
+            format!(r#"subset=datetime("{T0}")"#),
+            format!(r#"subset=datetime("{T0}":"{T0}")"#),
+            format!("datetime={T0}/{T0}"),
+        ] {
+            let (status, headers, body) = fetch(&app, &uri(&query)).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(x_cache(&headers), "HIT", "{query}");
+            assert_eq!(body, early, "{query}");
+        }
+        assert_eq!(engine.queries().len(), 3);
+    }
+
+    /// A time subset entirely outside the collection's temporal extent is a
+    /// 204 without a query (`/req/collections/rc-subset-definition` C); a
+    /// `datetime` outside it filters as usual, leaving the timeless feature
+    /// in the same 200 an empty selection gets.
+    #[tokio::test]
+    async fn a_subset_outside_the_temporal_extent_is_204() {
+        let engine = Arc::new(Alerts::new(true));
+        for (app, uri) in routes(engine.clone()) {
+            for query in [
+                r#"subset=datetime("2026-09-30T23:00:00Z")"#,
+                r#"subset=datetime("2026-10-02")"#,
+                r#"subset=datetime(*:"2026-09-30T00:00:00Z")"#,
+            ] {
+                let (status, _, body) = fetch(&app, &uri(query)).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{query}");
+                assert!(body.is_empty(), "{query}");
+            }
+        }
+        assert!(engine.queries().is_empty());
+        let (app, uri) = routes(engine.clone()).remove(1);
+        let (status, _, body) = fetch(&app, &uri("datetime=2026-10-02T00:00:00Z")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(names(&body), ["always-alert"]);
+    }
+
+    /// A collection without a time dimension has no temporal geometry: every
+    /// feature matches, the engine gets no filter, and the tile is the
+    /// timeless one (`/req/collections/rc-datetime-response` B).
+    #[tokio::test]
+    async fn a_collection_without_time_matches_every_time() {
+        let engine = Arc::new(Alerts::new(false));
+        let (app, uri) = routes(engine.clone()).remove(1);
+        let (_, _, all) = fetch(&app, &uri("")).await;
+        for query in [
+            format!("datetime={T1}"),
+            format!(r#"subset=datetime("{T1}")"#),
+            "datetime=2030-01-01T00:00:00Z/..".to_string(),
+        ] {
+            let (status, headers, body) = fetch(&app, &uri(&query)).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(headers["x-cache"], "HIT", "{query}");
+            assert_eq!(body, all, "{query}");
+        }
+        assert_eq!(engine.queries(), vec![None]);
+    }
+
+    /// `datetime` with a time subset, and malformed times, are 400s on both
+    /// routes.
+    #[tokio::test]
+    async fn conflicting_or_malformed_times_are_400() {
+        let engine = Arc::new(Alerts::new(true));
+        for (query, needle) in [
+            (
+                format!(r#"datetime={T1}&subset=datetime("{T1}")"#),
+                "cannot be used together",
+            ),
+            ("datetime=yesterday".to_string(), "Cannot parse datetime"),
+            (format!("datetime={T2}/{T0}"), "is after its end"),
+            ("subset=datetime(2026)".to_string(), "double-quoted"),
+        ] {
+            for (app, uri) in routes(engine.clone()) {
+                let uri = uri(&query);
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                let description = json["description"].as_str().unwrap();
+                assert!(description.contains(needle), "{uri}: {description}");
+            }
+        }
+        assert!(engine.queries().is_empty());
     }
 }

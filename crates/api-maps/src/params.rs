@@ -35,25 +35,10 @@ use serde::Deserialize;
 
 use crate::error::MapsError;
 
-/// Output-pixel cap of one map: `width × height` of the returned image.
-///
-/// It bounds the output only, so passing it guarantees neither of the budgets
-/// behind it ("Pixel budgets" in the root CLAUDE.md, #120): engine-geotiff's
-/// `reader::MAX_MAP_PIXELS` has the same value but counts native *source*
-/// pixels, and render admission charges 32 B per output pixel against
-/// `MC_RENDER_MEMORY_MB`, whose 1024 MiB default admits at most 33 554 432.
-///
-/// Enforced in [`MapRequest::view`] on the given or derived size: HTTP 400
-/// `BadRequest` "width * height (N) exceeds maximum of 64000000".
-/// [`MAX_MAP_DIMENSION`]² equals this cap, so the per-side check always fires
-/// first today; this one only guards a future per-side increase.
-pub const MAX_MAP_PIXELS: u64 = 64_000_000;
-
-/// Output-pixel cap per side (width or height). 8000 chosen so 8000 × 8000
-/// equals MAX_MAP_PIXELS — a square at the per-dim cap doesn't trip the
-/// pixel cap with a confusing second error. Tripping it is HTTP 400
-/// `BadRequest` "width and height must not exceed 8000".
-pub const MAX_MAP_DIMENSION: u32 = 8000;
+/// The output-pixel caps of a map, shared with map tiles (their home is
+/// `api_common::map_frame`). Enforced in [`MapRequest::view`] on the given or
+/// derived size: HTTP 400 `BadRequest`.
+pub use api_common::map_frame::{MAX_MAP_DIMENSION, MAX_MAP_PIXELS};
 
 /// Supported output formats.
 ///
@@ -188,14 +173,10 @@ pub enum Area {
     Center { crs: MapCrs, x: f64, y: f64 },
 }
 
-/// The time a map request selects.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MapTime {
-    pub selection: TimeSelection,
-    /// From `subset=time(…)`, where an instant outside the time axis is a
-    /// 404 (`/req/datetime/subset-definition` D) instead of snapping.
-    pub from_subset: bool,
-}
+/// The time a map request selects: `datetime` or `subset=time(…)`. Shared
+/// with map tiles, which resolve it the same way
+/// ([`subset::render_time`]).
+pub use api_common::subset::RequestedTime as MapTime;
 
 /// A validated map request: everything but what needs the collection.
 #[derive(Debug)]
@@ -252,25 +233,6 @@ fn present(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// `width`/`height`: a positive integer up to [`MAX_MAP_DIMENSION`]
-/// (`/req/scaling/width-definition` C).
-fn parse_dimension(name: &str, value: Option<&str>) -> Result<Option<u32>, MapsError> {
-    let Some(raw) = value else {
-        return Ok(None);
-    };
-    let n = raw
-        .parse::<u32>()
-        .ok()
-        .filter(|n| *n > 0)
-        .ok_or_else(|| bad(format!("{name} '{raw}' must be a positive integer")))?;
-    if n > MAX_MAP_DIMENSION {
-        return Err(bad(format!(
-            "width and height must not exceed {MAX_MAP_DIMENSION}"
-        )));
-    }
-    Ok(Some(n))
-}
-
 /// Comma-separated finite numbers.
 fn numbers(name: &str, value: &str) -> Result<Vec<f64>, MapsError> {
     value
@@ -309,20 +271,10 @@ impl MapQueryParams {
         let crs = present(&self.crs)
             .map(|value| parse_crs("CRS", value))
             .transpose()?;
-        let width = parse_dimension("width", present(&self.width))?;
-        let height = parse_dimension("height", present(&self.height))?;
-        let scale_denominator = present(&self.scale_denominator)
-            .map(|raw| {
-                raw.parse::<f64>()
-                    .ok()
-                    .filter(|v| v.is_finite() && *v > 0.0)
-                    .ok_or_else(|| {
-                        bad(format!(
-                            "scale-denominator '{raw}' must be a positive number"
-                        ))
-                    })
-            })
-            .transpose()?;
+        let width = map_frame::parse_dimension("width", present(&self.width)).map_err(bad)?;
+        let height = map_frame::parse_dimension("height", present(&self.height)).map_err(bad)?;
+        let scale_denominator =
+            map_frame::parse_scale_denominator(present(&self.scale_denominator)).map_err(bad)?;
 
         // SUBSET — spatial axes and `time`; any other axis is a 400.
         let ranges = subset::by_axis(
@@ -617,27 +569,10 @@ fn extent_frame(extent: [f64; 4], crs: MapCrs) -> Result<Frame, MapsError> {
     })
 }
 
-/// Round a size to whole pixels and hold it to the caps: `cause` names what
-/// set it, for the message when a derived size is too large.
-fn pixels((width, height): (f64, f64), cause: &str) -> Result<(u32, u32), MapsError> {
-    let (width, height) = (width.round().max(1.0), height.round().max(1.0));
-    if !(width.is_finite() && height.is_finite()) {
-        return Err(bad(format!("{cause} gives no finite map size")));
-    }
-    if width > f64::from(MAX_MAP_DIMENSION) || height > f64::from(MAX_MAP_DIMENSION) {
-        return Err(bad(format!(
-            "width and height must not exceed {MAX_MAP_DIMENSION}: {cause} gives a \
-             {width}x{height} map"
-        )));
-    }
-    let (width, height) = (width as u32, height as u32);
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_MAP_PIXELS {
-        return Err(bad(format!(
-            "width * height ({pixels}) exceeds maximum of {MAX_MAP_PIXELS}"
-        )));
-    }
-    Ok((width, height))
+/// Round a size to whole pixels and hold it to the caps
+/// ([`map_frame::whole_pixels`]): `cause` names what set it.
+fn pixels(size: (f64, f64), cause: &str) -> Result<(u32, u32), MapsError> {
+    map_frame::whole_pixels(size, cause).map_err(bad)
 }
 
 /// The size of a map whose area follows from its size: the given sides, a

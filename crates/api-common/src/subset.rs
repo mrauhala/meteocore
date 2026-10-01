@@ -21,10 +21,16 @@
 //! The axes a route accepts are the caller's ([`by_axis`]): Maps takes
 //! `Lon`/`Lat` or `E`/`N` and `time`, while OGC API - Tiles names its time
 //! axis `datetime`. An axis outside that list is an error, never ignored.
+//!
+//! [`render_time`] turns a [`RequestedTime`] into the instant a map or map
+//! tile renders, so both select the same time step; each API maps a
+//! selection with none ([`NoTimeStep`]) to its own status.
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
+use ds_core::feature::DatetimeInterval;
+use ds_core::map_engine::{default_request_time, MapEngine, RasterInfo};
 
 /// One value of a subset expression.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +59,18 @@ pub struct Subset {
     /// The axis name as the request spelled it.
     pub axis: String,
     pub range: SubsetRange,
+}
+
+/// The first query parameter of `raw_query` whose name is not in
+/// `accepted`, for the 400 that names the accepted ones: a struct-shaped
+/// query extractor drops unknown names, and a parameter silently ignored
+/// is indistinguishable from one honoured (root CLAUDE.md, #605).
+pub fn unknown_parameter(raw_query: Option<&str>, accepted: &[&str]) -> Option<String> {
+    let query = raw_query?;
+    form_urlencoded::parse(query.as_bytes())
+        .map(|(key, _)| key)
+        .find(|key| !accepted.contains(&key.as_ref()))
+        .map(|key| key.into_owned())
 }
 
 /// Every value of the query parameter `name` in `raw_query`, in request
@@ -305,6 +323,28 @@ impl TimeSelection {
         Ok(Self::Range { start, end })
     }
 
+    /// The selection as a feature query's interval, the form OGC API -
+    /// Features' `datetime` takes: an instant is `start == end`, an open end
+    /// `None`. Features intersecting it match; features without a time
+    /// always do.
+    pub fn interval(&self) -> DatetimeInterval {
+        match *self {
+            Self::Instant(t) => DatetimeInterval {
+                start: Some(t),
+                end: Some(t),
+            },
+            Self::Range { start, end } => DatetimeInterval { start, end },
+        }
+    }
+
+    /// Whether the selection lies entirely outside `[first, last]`, the
+    /// range of an axis' valid values: a time subset that does is a 204 on
+    /// a tile (`/req/collections/rc-subset-definition` C).
+    pub fn outside(&self, first: DateTime<Utc>, last: DateTime<Utc>) -> bool {
+        let DatetimeInterval { start, end } = self.interval();
+        end.is_some_and(|e| e < first) || start.is_some_and(|s| s > last)
+    }
+
     /// The latest of `times` this selection contains: for a range, the
     /// latest time inside it, `None` when it holds none; for an instant, the
     /// instant itself when listed.
@@ -318,6 +358,70 @@ impl TimeSelection {
             .copied()
             .filter(|t| start.is_none_or(|s| *t >= s) && end.is_none_or(|e| *t <= e))
             .max()
+    }
+}
+
+/// The time a render request selects, and where the selection came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequestedTime {
+    pub selection: TimeSelection,
+    /// From a time `subset`, where an instant outside the time axis selects
+    /// nothing instead of snapping (Maps `/req/datetime/subset-definition` D;
+    /// Common `/req/collections/rc-subset-definition` C, which OGC API -
+    /// Tiles' DateTime class imports).
+    pub from_subset: bool,
+}
+
+/// A requested time that selects no time step of the collection's axis.
+/// The message says why; each API maps it to its status (Maps 404, map
+/// tiles 204).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoTimeStep(pub String);
+
+/// The instant a map or map tile renders for, before the engine snaps it
+/// with `MapEngine::resolve_parameter_time` (#507). The axis is the
+/// parameter's own when it has one (#819), else the collection's.
+///
+/// - No time: the engine's default, else the parameter's (else the
+///   collection's) latest time.
+/// - An instant: as given; the engine snaps it to a time step
+///   (`/per/datetime/closest`). From a time `subset`, an instant outside
+///   the time axis selects nothing.
+/// - An interval (a `datetime` interval, a subset interval, a partial date,
+///   `*`): the latest time step inside it; none inside selects nothing. On a
+///   collection with no time axis it is ignored, like an instant: a resource
+///   without a temporal geometry matches every time.
+pub fn render_time(
+    requested: Option<&RequestedTime>,
+    engine: &dyn MapEngine,
+    info: &RasterInfo,
+    parameter: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, NoTimeStep> {
+    let parameter_axis = parameter.and_then(|p| engine.parameter_times(p));
+    let axis: &[DateTime<Utc>] = parameter_axis.as_deref().unwrap_or(&info.times);
+    let outside = |what: String| {
+        NoTimeStep(format!(
+            "No data for {what}: the collection's time axis has none"
+        ))
+    };
+    match requested {
+        None => Ok(default_request_time(engine, info, parameter)),
+        Some(RequestedTime {
+            selection: TimeSelection::Instant(t),
+            from_subset,
+        }) => {
+            if let (true, Some(first), Some(last)) = (*from_subset, axis.first(), axis.last()) {
+                if t < first || t > last {
+                    return Err(outside(format!("subset time {}", rfc3339(*t))));
+                }
+            }
+            Ok(Some(*t))
+        }
+        Some(_) if axis.is_empty() => Ok(default_request_time(engine, info, parameter)),
+        Some(RequestedTime { selection, .. }) => selection
+            .latest_in(axis)
+            .map(Some)
+            .ok_or_else(|| outside("the requested time interval".to_string())),
     }
 }
 
@@ -346,7 +450,7 @@ fn subset_time(value: &SubsetValue) -> Result<TimeText, String> {
     let SubsetValue::Text(text) = value else {
         return Err(
             "time subset values are double-quoted RFC 3339 times or '*', \
-             e.g. time(\"2026-10-01T12:00:00Z\")"
+             e.g. \"2026-10-01T12:00:00Z\""
                 .to_string(),
         );
     };
@@ -706,5 +810,160 @@ mod tests {
             rfc3339(at("2024-01-01T01:00:00.5Z")),
             "2024-01-01T01:00:00.500Z"
         );
+    }
+
+    /// Vector tiles filter features by the selection as Features does.
+    #[test]
+    fn selections_become_feature_intervals() {
+        let t = at("2024-01-01T01:00:00Z");
+        assert_eq!(
+            TimeSelection::Instant(t).interval(),
+            DatetimeInterval {
+                start: Some(t),
+                end: Some(t)
+            }
+        );
+        let open = TimeSelection::from_datetime("2024-01-01T01:00:00Z/..").unwrap();
+        assert_eq!(
+            open.interval(),
+            DatetimeInterval {
+                start: Some(t),
+                end: None
+            }
+        );
+        // `datetime=t` and `subset=datetime("t")` are one interval, so a
+        // cache keyed on it shares their entry.
+        let subset = TimeSelection::from_subset(&one(r#"datetime("2024-01-01T01:00:00Z")"#).range);
+        assert_eq!(
+            subset.unwrap().interval(),
+            TimeSelection::Instant(t).interval()
+        );
+
+        let (first, last) = (at("2024-01-01T00:00:00Z"), at("2024-01-01T02:00:00Z"));
+        let outside = |value: &str| {
+            TimeSelection::from_datetime(value)
+                .unwrap()
+                .outside(first, last)
+        };
+        assert!(outside("2023-12-31T23:00:00Z"));
+        assert!(outside("2024-01-01T03:00:00Z/.."));
+        assert!(outside("../2023-12-31T23:59:59Z"));
+        assert!(!outside("2024-01-01T00:00:00Z"));
+        assert!(!outside("2024-01-01T02:00:00Z"));
+        assert!(!outside("2023-01-01T00:00:00Z/2024-01-01T00:00:00Z"));
+        assert!(!outside("../.."));
+    }
+
+    #[test]
+    fn unknown_parameter_names_the_first_outside_the_list() {
+        let accepted = ["datetime", "subset"];
+        assert_eq!(unknown_parameter(None, &accepted), None);
+        assert_eq!(
+            unknown_parameter(Some("subset=a&datetime=b&subset=c"), &accepted),
+            None
+        );
+        assert_eq!(
+            unknown_parameter(Some("datetime=b&bbox=1&foo=2"), &accepted),
+            Some("bbox".to_string())
+        );
+        // Names are compared decoded.
+        assert_eq!(
+            unknown_parameter(Some("date%74ime=b&sub+set=c"), &accepted),
+            Some("sub set".to_string())
+        );
+    }
+
+    /// Hourly steps 00:00–02:00 on the collection; the parameter `p` has
+    /// only the first two.
+    struct Axis3;
+
+    impl MapEngine for Axis3 {
+        fn get_raster_tile(
+            &self,
+            _: [f64; 4],
+            _: u32,
+            _: u32,
+            _: Option<DateTime<Utc>>,
+            _: &ds_core::map_engine::OutputCrs,
+            _: Option<&str>,
+            _: Option<f64>,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
+            unreachable!("time resolution never renders")
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: None,
+                times: (0..3).map(hour).collect(),
+                parameter: "p".into(),
+                unit: "1".into(),
+                parameters: Vec::new(),
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+
+        fn parameter_times(&self, parameter: &str) -> Option<std::sync::Arc<[DateTime<Utc>]>> {
+            (parameter == "p").then(|| (0..2).map(hour).collect())
+        }
+    }
+
+    fn hour(h: u32) -> DateTime<Utc> {
+        at(&format!("2024-01-01T{h:02}:00:00Z"))
+    }
+
+    /// The selection rules Maps and map tiles share.
+    #[test]
+    fn render_time_selects_on_the_parameter_or_collection_axis() {
+        let engine = Axis3;
+        let info = engine.raster_info();
+        let time = |selection, from_subset, parameter| {
+            render_time(
+                Some(&RequestedTime {
+                    selection,
+                    from_subset,
+                }),
+                &engine,
+                &info,
+                parameter,
+            )
+        };
+        let range = |start: Option<u32>, end: Option<u32>| TimeSelection::Range {
+            start: start.map(hour),
+            end: end.map(hour),
+        };
+        // Omitted: the latest step, of the parameter's own axis if it has one.
+        assert_eq!(render_time(None, &engine, &info, None), Ok(Some(hour(2))));
+        assert_eq!(
+            render_time(None, &engine, &info, Some("p")),
+            Ok(Some(hour(1)))
+        );
+        // An instant passes through for the engine to snap; from a subset,
+        // one outside the axis selects nothing.
+        let late = at("2024-01-01T05:00:00Z");
+        assert_eq!(
+            time(TimeSelection::Instant(late), false, None),
+            Ok(Some(late))
+        );
+        assert!(time(TimeSelection::Instant(late), true, None).is_err());
+        assert_eq!(
+            time(TimeSelection::Instant(hour(1)), true, None),
+            Ok(Some(hour(1)))
+        );
+        // An interval: its latest step, on the parameter's axis; none inside
+        // selects nothing.
+        assert_eq!(time(range(None, None), false, None), Ok(Some(hour(2))));
+        assert_eq!(time(range(None, None), true, Some("p")), Ok(Some(hour(1))));
+        assert_eq!(time(range(Some(1), None), false, None), Ok(Some(hour(2))));
+        let between = TimeSelection::Range {
+            start: Some(at("2024-01-01T00:10:00Z")),
+            end: Some(at("2024-01-01T00:50:00Z")),
+        };
+        let err = time(between, false, None).unwrap_err();
+        assert!(err.0.contains("the requested time interval"), "{}", err.0);
     }
 }

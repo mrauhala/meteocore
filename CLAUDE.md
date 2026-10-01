@@ -349,6 +349,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    meta-tile caches key on it, and explicit-`TIME` responses then carry a
    short, revalidating `Cache-Control` instead of `immutable`.
    Immutable-timestep engines keep the default `0`.
+   **If a `FeatureEngine`'s features carry time**, apply
+   `FeatureQuery::datetime` as OGC `datetime`: keep the features whose
+   temporal geometry intersects the interval (an instant is `start == end`,
+   ends inclusive) and those without one. Features `/items` and vector tiles
+   (Tiles DateTime, #946) both pass it; the vector tile cache keys on it.
+   Without time, return `false` from `has_time_dimension`.
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.
@@ -462,8 +468,8 @@ one never implies the other.
 
 | Budget (home) | Bounds | Value | When it trips |
 |---|---|---|---|
-| `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms, api-maps `params.rs`) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps `BadRequest`): "… must not exceed 8000" |
-| `api_tiles::params::TILE_SIZE` | output, fixed | 256 × 256 | never |
+| `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms `params.rs`; `api_common::map_frame` for Maps and map tiles) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps/Tiles `BadRequest`): "… must not exceed 8000" |
+| `api_tiles::params::TILE_SIZE` | output, a map tile's default (`width`/`height`/`scale-denominator` resize it within the caps above) | 256 × 256 | never |
 | `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
 | `engine_geotiff::decode_budget::BUDGET` | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |

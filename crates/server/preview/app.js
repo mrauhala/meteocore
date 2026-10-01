@@ -632,8 +632,9 @@
                     map.setLayoutProperty(id, 'visibility', v);
                 });
             },
-            // Vector tiles have no time axis: the server encodes the
-            // collection's current features and rejects `datetime`.
+            // The preview draws vector tiles without a time: the server
+            // encodes the collection's default features. (It filters them
+            // by `datetime` when a request gives one, #794.)
             refreshForTime: function () {}
         };
     }
@@ -663,7 +664,8 @@
     function appendTimeParam(template, time) {
         if (!time) return template;
         // Map tiles honour `datetime`; including it also keys MapLibre's
-        // per-source HTTP cache by time. Vector tiles take no time.
+        // per-source HTTP cache by time. The preview sends none to vector
+        // tiles, which then hold the collection's default features.
         const sep = template.indexOf('?') === -1 ? '?' : '&';
         return template + sep + 'datetime=' + encodeURIComponent(time);
     }
