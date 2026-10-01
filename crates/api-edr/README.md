@@ -65,6 +65,19 @@ for the specification baselines and remaining gaps.
 
 A query type a collection's engine does not support (not in its `supported_query_types`, so not in `data_queries`) has no resource: position, area, radius and trajectory all answer 404 `NotFound`, and `/api` omits the path (#668).
 
+Every advertised query type's `data_queries.<type>.link.variables` carries
+the six fields EDR 1.2 requires (#918): `title` (`Position query`, …), a
+`description` naming what `coords` takes, `query_type`, `output_formats`
+(PNG only for locations, position and trajectory), `default_output_format`
+(`CoverageJSON`) and `crs_details`, which lists the one CRS data queries
+accept: `CRS84` with the WKT2 of OGC:CRS84, longitude first. Radius adds
+`within_units`. The same builder serves collection documents, the
+`/collections` list and instance documents; the `data_queries.instances`
+link carries only `query_type`, which is all 1.2's `instancesLink` asks for.
+`multiple_locations` on the locations link is not emitted yet (#923).
+`parameter_names` entries carry no `dataType`: engines do not report a
+value type, every CoverageJSON range is encoded as `float`.
+
 ### Instance-scoped routes
 
 | Route | Status |
@@ -83,7 +96,7 @@ A query type a collection's engine does not support (not in its `supported_query
 | `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData and Nowcast (#666); GRIB keeps its own equivalent check |
 | `z` | ✓ | EDR 1.2 grammar (`/req/edr/z-response`): a level, a list, a closed `min/max` interval, the open intervals `../max` and `min/..` (an open end reaches the lowest or highest advertised level), and the recurring interval `Rn/min/step` (`n` levels from `min`, `step` apart, as in the standard's `R20/100/50` = 20 levels; at most 1000, non-zero step). An interval selects the advertised levels inside it (none is a 400). A level, a list and a recurring interval go to the engine as a list, which it matches its own way: ODIM snaps to the nearest sweep, GRIB requires exact levels. A collection with no vertical extent **ignores** a well-formed `z` on every query route, instance routes included (clause A, a SHALL in 1.2); a malformed `z` is still a 400 everywhere |
 | `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
-| `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
+| `crs` | ✗ | data queries accept CRS84 only, which every `data_queries` link advertises in `crs_details` (#918); the `crs` parameter itself is not parsed (#84); `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
 | `limit` | partial | `/collections` pagination only; `/locations` returns the full inventory (EDR 1.1 does not define locations paging) |
@@ -266,7 +279,7 @@ generations, not already-published instances.
 
 1. `locations` and `trajectory` under `/instances/{id}/`.
 2. `cube` and `corridor` (derivable from area / trajectory).
-3. `crs` on data queries + `crs_details`; EDR GeoJSON output for point results (then declare `edr-geojson`).
+3. `crs` on data queries, adding its CRSs to `crs_details` (#84); EDR GeoJSON output for point results (then declare `edr-geojson`).
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
 
 Related issues: #585 MULTIPOINT fan-out bound · #667
