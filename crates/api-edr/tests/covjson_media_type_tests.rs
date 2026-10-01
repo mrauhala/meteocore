@@ -213,7 +213,7 @@ async fn get(uri: &str, accept: Option<&str>) -> (StatusCode, String, Value) {
 
 const POINT: &str = "POINT(25%2060)";
 const POLYGON: &str = "POLYGON((24%2059,26%2059,26%2061,24%2061,24%2059))";
-const INSTANCE: &str = "20260607T0000Z";
+const INSTANCE: &str = "2026-06-07T00:00:00Z";
 
 /// Every route that produces CoverageJSON, instance-scoped ones included.
 fn coverage_routes() -> Vec<String> {

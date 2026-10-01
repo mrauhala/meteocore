@@ -512,9 +512,10 @@ fn parse_time(s: &str) -> Result<DateTime<Utc>, WmsError> {
 /// Parse a `DIM_REFERENCE_TIME` value (the forecast model run / reference time).
 ///
 /// Accepts the same ISO 8601 forms as `TIME` (the values GetCapabilities
-/// advertises for the `reference_time` dimension are RFC 3339) and, as a
-/// convenience, the compact EDR instance-id stamp (`20260607T0600Z`) so a
-/// client can echo either the WMS dimension value or an EDR instance id.
+/// advertises for the `reference_time` dimension are RFC 3339, as is an EDR
+/// instance id) and, through the EDR instance-id codec, the compact stamp
+/// EDR served as instance id before #947 (`20260607T0600Z`), so a client can
+/// echo either the WMS dimension value or an EDR instance id.
 fn parse_reference_time(s: &str) -> Result<DateTime<Utc>, WmsError> {
     if let Ok(dt) = parse_time(s) {
         return Ok(dt);

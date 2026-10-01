@@ -508,10 +508,12 @@ one never implies the other.
 - **`ds_core::instances`** — model-run (forecast reference time) machinery
   shared by ALL forecast engines (#337), so run selection, instance lists and
   instance-id encoding are identical everywhere:
-  - `RunInfo { reference_time, valid_times }`; `instance_id()` = compact
-    `%Y%m%dT%H%MZ` stamp.
+  - `RunInfo { reference_time, valid_times }`; `instance_id()` = the RFC 3339
+    UTC timestamp `2026-06-07T06:00:00Z` (MetOcean EDR profile, #947).
   - `format_instance_id` / `parse_instance_id` — URL ↔ reference-time codec
-    (parse also accepts RFC 3339). The API layer owns the string form;
+    (parse also accepts any RFC 3339 offset and the pre-#947 compact
+    `20260607T0600Z` stamp, so old links resolve). Links carry the id's
+    colons unencoded (RFC 3986 `pchar`). The API layer owns the string form;
     engines only see `Option<DateTime<Utc>>`.
   - `select_run(&BTreeMap<..>, Option<DateTime<Utc>>)` — `None` ⇒ latest,
     `Some(rt)` ⇒ exact run, absent ⇒ `None` → 404.

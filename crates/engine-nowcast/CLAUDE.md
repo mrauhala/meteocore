@@ -189,7 +189,8 @@ coasting, joins, or raw-byte forecast encoding. See
   WMS advertises), but an instance's `valid_times` is `[anchor]` — the
   product has one valid time, NOT the forecast leads the WMS layer renders.
   Selection: an instance pin resolves exactly or to the minute (the EDR id
-  is minute-precision; 404 otherwise) and a `datetime` excluding the
+  is the exact RFC 3339 anchor, but the compact id served before #947 was
+  minute-precision; 404 otherwise) and a `datetime` excluding the
   anchor is a 400; with no pin, `datetime` picks the NEWEST generation
   anchored INSIDE the interval (the #548 cell-history rule, start bound
   included); neither ⇒ latest. `Generation.interval_secs` is what turns

@@ -65,6 +65,13 @@ owns the instance-id string form:
   advertises the instance paths — both gated on `get_instances()` being
   non-empty.
 - Unknown instance id → 404 (`select_run` returns `None`).
+- The id is `ds_core::instances::format_instance_id`: RFC 3339 UTC,
+  `2026-06-07T06:00:00Z` (MetOcean EDR profile, #947). Links carry its
+  colons unencoded (RFC 3986 `pchar`): never pass it through
+  `encode_path_segment`, which encodes `:`. A link echoing a request's id
+  re-emits the canonical form (`handlers::instance_path_segment`), since
+  `{instanceId}` also accepts other RFC 3339 offsets and the pre-#947
+  compact `20260607T0600Z` stamp.
 
 ## Output formats and GeoJSON (#929)
 

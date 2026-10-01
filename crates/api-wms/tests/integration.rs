@@ -2173,8 +2173,8 @@ async fn getmap_selects_pinned_reference_time() {
     );
 }
 
-/// The compact EDR instance-id form (`20260607T0000Z`) is also accepted as a
-/// `DIM_REFERENCE_TIME` value, resolving to the same run.
+/// The compact EDR instance-id form served before #947 (`20260607T0000Z`) is
+/// also accepted as a `DIM_REFERENCE_TIME` value, resolving to the same run.
 #[tokio::test]
 async fn getmap_accepts_compact_instance_id_reference_time() {
     let (app, calls) = build_forecast_router();

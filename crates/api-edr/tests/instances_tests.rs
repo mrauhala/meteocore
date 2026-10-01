@@ -133,6 +133,60 @@ impl EdrEngine for ForecastMock {
     }
 }
 
+/// [`ForecastMock`] as a station collection: its position series sit at the
+/// one location it lists, so the point queries also offer EDR GeoJSON, whose
+/// `self` link names the instance the request pinned.
+struct StationForecastMock;
+
+impl EdrEngine for StationForecastMock {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(vec![Location {
+            id: "station".to_string(),
+            label: "Station".to_string(),
+            latitude: 60.0,
+            longitude: 25.0,
+        }])
+    }
+    fn serves_station_series(&self) -> bool {
+        true
+    }
+    fn get_instances(&self) -> Vec<RunInfo> {
+        ForecastMock.get_instances()
+    }
+    fn query_location(
+        &self,
+        location_id: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        ForecastMock.query_location(location_id, datetime, parameters, z, reference_time)
+    }
+    fn get_parameters(&self) -> Vec<String> {
+        ForecastMock.get_parameters()
+    }
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        ForecastMock.get_temporal_extent()
+    }
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        ForecastMock.get_spatial_extent()
+    }
+    fn supported_query_types(&self) -> Vec<String> {
+        ForecastMock.supported_query_types()
+    }
+    fn query_position(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        ForecastMock.query_position(coords, datetime, parameters, z, reference_time)
+    }
+}
+
 /// A non-forecast engine: no instances, and `query_position` IGNORES
 /// `reference_time` (returns latest data). Proves the API rejects instance
 /// queries on such a collection rather than silently serving 200.
@@ -236,6 +290,8 @@ fn state() -> api_edr::handlers::AppState {
     collections.insert("fc".to_string(), config("fc", "grib"));
     engines.insert("obs".to_string(), Arc::new(NonForecastMock));
     collections.insert("obs".to_string(), config("obs", "geotiff"));
+    engines.insert("st".to_string(), Arc::new(StationForecastMock));
+    collections.insert("st".to_string(), config("st", "csv"));
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         feature_engines: HashMap::new(),
@@ -287,12 +343,15 @@ async fn get_raw(uri: &str, accept: Option<&str>) -> (StatusCode, String, String
 async fn instances_negotiate_html() {
     for uri in [
         "/collections/fc/instances?f=html",
-        "/collections/fc/instances/20260607T0000Z?f=html",
+        "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
     ] {
         let (status, ctype, body) = get_raw(uri, None).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert!(ctype.starts_with("text/html"), "{uri}: {ctype}");
-        assert!(body.contains("20260607T0000Z"), "{uri} must name the run");
+        assert!(
+            body.contains("2026-06-07T00:00:00Z"),
+            "{uri} must name the run"
+        );
         assert!(
             body.contains("?f=json"),
             "{uri} must link the JSON alternate"
@@ -321,14 +380,136 @@ async fn instances_list_has_both_runs() {
         .map(|c| c["id"].as_str().unwrap())
         .collect();
     // Ascending by reference time, latest last (the build_instances contract).
-    assert_eq!(ids, ["20260607T0000Z", "20260607T1200Z"], "order: {ids:?}");
+    assert_eq!(
+        ids,
+        ["2026-06-07T00:00:00Z", "2026-06-07T12:00:00Z"],
+        "order: {ids:?}"
+    );
+}
+
+/// The `self` link of an instance document.
+fn self_href(doc: &Value) -> &str {
+    doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "self")
+        .and_then(|l| l["href"].as_str())
+        .unwrap_or_else(|| panic!("no self link: {doc}"))
+}
+
+/// MetOcean EDR profile `/req/nwp/collection_granularity` C: an instance id
+/// is an RFC 3339 datestamp, and the instance's title and every link use the
+/// same string with the colons unencoded (#947).
+#[tokio::test]
+async fn instance_ids_are_rfc3339_in_ids_titles_and_links() {
+    let (status, body) = get("/collections/fc/instances").await;
+    assert_eq!(status, StatusCode::OK);
+    for (instance, id) in body["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(["2026-06-07T00:00:00Z", "2026-06-07T12:00:00Z"])
+    {
+        assert_eq!(instance["id"], id);
+        assert_eq!(instance["title"], format!("fc — run {id}"));
+        assert_eq!(
+            self_href(instance),
+            format!("/edr/collections/fc/instances/{id}")
+        );
+        assert_eq!(
+            instance["data_queries"]["position"]["link"]["href"],
+            format!("/edr/collections/fc/instances/{id}/position")
+        );
+    }
+
+    // The HTML list links each run by the same id, colons unencoded.
+    let (status, _, html) = get_raw("/collections/fc/instances?f=html", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("href=\"/edr/collections/fc/instances/2026-06-07T12:00:00Z?f=html\""),
+        "{html}"
+    );
+    assert!(html.contains("Run 2026-06-07T12:00:00Z"), "{html}");
+    assert!(!html.contains("%3A"), "{html}");
+}
+
+/// The id a link carries, percent-encoded by a client, resolves to the same
+/// run on the instance document and on its query routes: axum decodes the
+/// path segment before it reaches the parser.
+#[tokio::test]
+async fn percent_encoded_instance_id_resolves() {
+    for encoded in ["2026-06-07T00%3A00%3A00Z", "2026-06-07T00%3a00%3a00Z"] {
+        let uri = format!("/collections/fc/instances/{encoded}");
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body["id"], "2026-06-07T00:00:00Z", "{uri}");
+        assert_eq!(
+            self_href(&body),
+            "/edr/collections/fc/instances/2026-06-07T00:00:00Z",
+            "{uri}"
+        );
+
+        let uri = format!("/collections/fc/instances/{encoded}/position?coords=POINT(25%2060)");
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body["ranges"]["temperature"]["values"][0], 0.0, "{uri}");
+    }
+}
+
+/// The compact id served before #947 keeps resolving, as does any RFC 3339
+/// offset naming the same instant; the document still answers with the
+/// canonical id and links.
+#[tokio::test]
+async fn compact_and_offset_instance_ids_still_resolve() {
+    for id in [
+        "20260607T0000Z",
+        "20260607T000000Z",
+        "2026-06-07T03:00:00+03:00",
+    ] {
+        let uri = format!("/collections/fc/instances/{id}");
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body["id"], "2026-06-07T00:00:00Z", "{uri}");
+        assert_eq!(
+            self_href(&body),
+            "/edr/collections/fc/instances/2026-06-07T00:00:00Z",
+            "{uri}"
+        );
+
+        let uri = format!("/collections/fc/instances/{id}/position?coords=POINT(25%2060)");
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body["ranges"]["temperature"]["values"][0], 0.0, "{uri}");
+    }
+}
+
+/// A data query's EDR GeoJSON links name the pinned run by its canonical id,
+/// colons unencoded, whichever accepted form the request used.
+#[tokio::test]
+async fn geojson_links_name_the_canonical_instance_id() {
+    for id in [
+        "2026-06-07T00:00:00Z",
+        "2026-06-07T00%3A00%3A00Z",
+        "20260607T0000Z",
+    ] {
+        let uri =
+            format!("/collections/st/instances/{id}/position?coords=POINT(25%2060)&f=GeoJSON");
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(
+            self_href(&body),
+            "/edr/collections/st/instances/2026-06-07T00:00:00Z/position?coords=POINT(25%2060)&f=GeoJSON",
+            "{uri}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn instance_metadata_scopes_extent_and_links() {
-    let (status, body) = get("/collections/fc/instances/20260607T0000Z").await;
+    let (status, body) = get("/collections/fc/instances/2026-06-07T00:00:00Z").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["id"], "20260607T0000Z");
+    assert_eq!(body["id"], "2026-06-07T00:00:00Z");
     // Temporal extent is the 00Z run's valid times (00:00..02:00), NOT the
     // collection's latest-run (12Z) extent.
     let interval = &body["extent"]["temporal"]["interval"][0];
@@ -339,7 +520,7 @@ async fn instance_metadata_scopes_extent_and_links() {
         .as_str()
         .unwrap();
     assert!(
-        pos.ends_with("/collections/fc/instances/20260607T0000Z/position"),
+        pos.ends_with("/collections/fc/instances/2026-06-07T00:00:00Z/position"),
         "{pos}"
     );
 }
@@ -348,7 +529,7 @@ async fn instance_metadata_scopes_extent_and_links() {
 async fn instance_position_query_hits_the_pinned_run() {
     // Pinned 00Z run → marker 0.
     let (status, body) =
-        get("/collections/fc/instances/20260607T0000Z/position?coords=POINT(25%2060)").await;
+        get("/collections/fc/instances/2026-06-07T00:00:00Z/position?coords=POINT(25%2060)").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ranges"]["temperature"]["values"][0], 0.0);
 
@@ -360,17 +541,24 @@ async fn instance_position_query_hits_the_pinned_run() {
 
 #[tokio::test]
 async fn unknown_instance_is_404_bad_id_is_400() {
-    // A well-formed but absent run → 404 (both metadata and query).
-    assert_eq!(
-        get("/collections/fc/instances/20260607T0600Z").await.0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        get("/collections/fc/instances/20260607T0600Z/position?coords=POINT(25%2060)")
+    // A well-formed but absent run → 404 (both metadata and query), in the
+    // RFC 3339 id form and the pre-#947 compact one.
+    for id in ["2026-06-07T06:00:00Z", "20260607T0600Z"] {
+        assert_eq!(
+            get(&format!("/collections/fc/instances/{id}")).await.0,
+            StatusCode::NOT_FOUND,
+            "{id}"
+        );
+        assert_eq!(
+            get(&format!(
+                "/collections/fc/instances/{id}/position?coords=POINT(25%2060)"
+            ))
             .await
             .0,
-        StatusCode::NOT_FOUND
-    );
+            StatusCode::NOT_FOUND,
+            "{id}"
+        );
+    }
     // An unparseable instance id → 400.
     assert_eq!(
         get("/collections/fc/instances/not-a-time").await.0,
@@ -425,7 +613,7 @@ async fn instance_documents_validate_against_edr_bundles() {
             "/collections/{collectionId}/instances",
         ),
         (
-            "/collections/fc/instances/20260607T0000Z",
+            "/collections/fc/instances/2026-06-07T00:00:00Z",
             edr_schema::INSTANCE,
         ),
     ] {

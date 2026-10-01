@@ -499,11 +499,22 @@ fn resolve_instance(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": "BadRequest",
-                "description": format!("Invalid instance id '{iid}' (expected a reference time like 20260607T0600Z)")
+                "description": format!("Invalid instance id '{iid}' (expected an RFC 3339 reference time like 2026-06-07T06:00:00Z)")
             })),
         )
     })?;
     Ok(Some(rt))
+}
+
+/// The `{instanceId}` segment of a link to an instance resource: the
+/// canonical RFC 3339 id of the run the request named, whichever accepted
+/// form it used (#947). Its colons stay unencoded, as RFC 3986 `pchar`
+/// allows; an id that does not parse is percent-encoded verbatim.
+fn instance_path_segment(iid: &str) -> String {
+    match ds_core::instances::parse_instance_id(iid) {
+        Some(rt) => ds_core::instances::format_instance_id(rt),
+        None => encode_path_segment(iid),
+    }
 }
 
 /// Parse and resolve the request `z` parameter into the concrete level
@@ -1080,8 +1091,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "name": "instanceId",
                 "in": "path",
                 "required": true,
-                "description": "Forecast model run (reference time), e.g. 20260607T0600Z.",
-                "schema": {"type": "string"}
+                "description": "Forecast model run: its reference time in RFC 3339, e.g. 2026-06-07T06:00:00Z. The compact form 20260607T0600Z is also accepted.",
+                "schema": {"type": "string"},
+                "example": "2026-06-07T06:00:00Z"
             });
             let instances_path = format!("/edr/collections/{id}/instances");
             collection_paths[&instances_path] = json!({
@@ -1743,8 +1755,9 @@ pub async fn instances(
     }))
 }
 
-/// The HTML card for one model run: id = the instance id, title = the
-/// reference time, description = the valid-time span.
+/// The HTML card for one model run: id = the instance id, title = the run's
+/// reference time (the same RFC 3339 string), description = the valid-time
+/// span.
 fn instance_card(
     config: &CollectionConfig,
     base: &str,
@@ -1761,17 +1774,14 @@ fn instance_card(
         _ => "no valid times".to_string(),
     };
     ds_core::html::CollectionCard {
-        id: instance_id.clone(),
-        title: format!(
-            "Run {}",
-            run.reference_time
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        ),
+        title: format!("Run {instance_id}"),
         description,
+        // The id's colons stay unencoded: RFC 3986 `pchar` allows `:`.
         self_href: format!(
             "{base}/edr/collections/{}/instances/{instance_id}",
             config.id
         ),
+        id: instance_id,
         keywords: Vec::new(),
         license: None,
     }
@@ -1806,7 +1816,7 @@ pub async fn instance(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": "BadRequest",
-                "description": format!("Invalid instance id '{instance_id}' (expected a reference time like 20260607T0600Z)")
+                "description": format!("Invalid instance id '{instance_id}' (expected an RFC 3339 reference time like 2026-06-07T06:00:00Z)")
             })),
         )
     })?;
@@ -2295,7 +2305,7 @@ impl DataRequest {
             Some(iid) => format!(
                 "/collections/{}/instances/{}/{query_type}",
                 config.id,
-                encode_path_segment(iid)
+                instance_path_segment(iid)
             ),
             None => format!("/collections/{}/{query_type}", config.id),
         };
@@ -3056,6 +3066,8 @@ fn build_collection_metadata(
     // the instance when one is given.
     let (self_id, query_base) = match instance {
         Some(run) => {
+            // RFC 3339 (#947); its colons are valid in a path segment (RFC 3986
+            // `pchar`), so the hrefs carry them unencoded.
             let iid = run.instance_id();
             let base = format!("{base_url}/edr/collections/{coll_id}/instances/{iid}");
             (iid, base)
@@ -3203,7 +3215,7 @@ fn build_collection_metadata(
     }
 
     let self_title = match instance {
-        Some(run) => format!("{} — run {}", config.title, run.reference_time.to_rfc3339()),
+        Some(_) => format!("{} — run {self_id}", config.title),
         None => config.title.clone(),
     };
     let mut links = vec![json!({

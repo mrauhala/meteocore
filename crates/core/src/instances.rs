@@ -20,10 +20,16 @@
 //! The API layer (`api-edr`) parses the `{instanceId}` path segment to a
 //! reference time with [`parse_instance_id`] and formats instance ids with
 //! [`format_instance_id`]; engines never touch the string form.
+//!
+//! The id is the run's RFC 3339 UTC timestamp, `2026-06-07T06:00:00Z`: the
+//! MetOcean EDR profile requires it (`/req/nwp/collection_granularity` C), and
+//! it is the same string a client passes back as a `reference_time` (#947).
+//! The compact `20260607T0600Z` stamp served before stays accepted, so
+//! existing links keep resolving.
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 
 /// One forecast model run, surfaced as an OGC API - EDR *instance*.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +41,9 @@ pub struct RunInfo {
 }
 
 impl RunInfo {
-    /// The instance id used in EDR URLs (the canonical compact UTC stamp, e.g.
-    /// `20260607T0600Z`). Round-trips through [`parse_instance_id`].
+    /// The instance id used in EDR URLs: the reference time in RFC 3339 UTC,
+    /// e.g. `2026-06-07T06:00:00Z` ([`format_instance_id`]). Round-trips
+    /// through [`parse_instance_id`].
     pub fn instance_id(&self) -> String {
         format_instance_id(self.reference_time)
     }
@@ -51,29 +58,34 @@ impl RunInfo {
     }
 }
 
-/// The canonical EDR instance id for a model run: a compact UTC stamp
-/// `%Y%m%dT%H%MZ` (e.g. `20260607T0600Z`). URL- and filesystem-safe (no
-/// colons), and stable across engines.
+/// The canonical EDR instance id for a model run: its reference time in
+/// RFC 3339 §5.6 form, UTC with a `Z` suffix, e.g. `2026-06-07T06:00:00Z`.
+///
+/// The MetOcean EDR profile requires an RFC 3339 datestamp
+/// (`/req/nwp/collection_granularity` C), and RFC 3339 has only the extended
+/// form. Whole seconds are always written; a fraction only when the time has
+/// one, so every id resolves back to exactly its run. The colons are valid
+/// in a URL path segment (RFC 3986 `pchar`), so links carry them unencoded.
 pub fn format_instance_id(reference_time: DateTime<Utc>) -> String {
-    reference_time.format("%Y%m%dT%H%MZ").to_string()
+    reference_time.to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }
 
 /// Parse an EDR instance id back to a run reference time.
 ///
-/// Accepts the canonical compact form emitted by [`format_instance_id`]
-/// (`20260607T0600Z`, and the seconds variant `20260607T060000Z`) as well as
-/// full RFC 3339 (`2026-06-07T06:00:00Z`), so clients that echo a run's
-/// reference time verbatim still resolve. Returns `None` for anything else.
+/// Accepts RFC 3339 (`2026-06-07T06:00:00Z`, the form [`format_instance_id`]
+/// emits, or any offset) and the compact UTC stamp served before #947
+/// (`20260607T0600Z`, and its seconds variant `20260607T060000Z`), so
+/// existing links keep resolving. Returns `None` for anything else.
 pub fn parse_instance_id(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%MZ") {
         return Some(dt.and_utc());
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ") {
-        return Some(dt.and_utc());
-    }
-    DateTime::parse_from_rfc3339(s)
+    NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ")
         .ok()
-        .map(|d| d.with_timezone(&Utc))
+        .map(|dt| dt.and_utc())
 }
 
 /// Select the run to serve from a reference-time-keyed map.
@@ -120,18 +132,39 @@ mod tests {
     }
 
     #[test]
-    fn instance_id_round_trips_compact() {
+    fn instance_id_is_rfc3339_and_round_trips() {
         let rt = dt(2026, 6, 7, 6);
         let id = format_instance_id(rt);
-        assert_eq!(id, "20260607T0600Z");
+        // RFC 3339 §5.6 extended form, UTC as `Z` (#947).
+        assert_eq!(id, "2026-06-07T06:00:00Z");
         assert_eq!(parse_instance_id(&id), Some(rt));
     }
 
     #[test]
-    fn parse_accepts_rfc3339_and_seconds_variant() {
+    fn instance_id_keeps_seconds_and_fractions_exact() {
+        // A nowcast generation anchored on a frame time with seconds, or a
+        // fraction, must still resolve to exactly its run.
+        let rt = Utc.with_ymd_and_hms(2026, 6, 7, 6, 5, 23).unwrap();
+        assert_eq!(format_instance_id(rt), "2026-06-07T06:05:23Z");
+        assert_eq!(parse_instance_id(&format_instance_id(rt)), Some(rt));
+        let frac = rt + chrono::Duration::milliseconds(250);
+        assert_eq!(format_instance_id(frac), "2026-06-07T06:05:23.250Z");
+        assert_eq!(parse_instance_id(&format_instance_id(frac)), Some(frac));
+    }
+
+    #[test]
+    fn parse_keeps_accepting_the_compact_form() {
+        // Links built from the pre-#947 ids keep resolving.
         let rt = dt(2026, 6, 7, 6);
-        assert_eq!(parse_instance_id("2026-06-07T06:00:00Z"), Some(rt));
+        assert_eq!(parse_instance_id("20260607T0600Z"), Some(rt));
         assert_eq!(parse_instance_id("20260607T060000Z"), Some(rt));
+    }
+
+    #[test]
+    fn parse_accepts_rfc3339_offsets() {
+        let rt = dt(2026, 6, 7, 6);
+        assert_eq!(parse_instance_id("2026-06-07T09:00:00+03:00"), Some(rt));
+        assert_eq!(parse_instance_id("2026-06-07T06:00:00.000Z"), Some(rt));
     }
 
     #[test]
@@ -189,6 +222,6 @@ mod tests {
             instances[1].temporal_extent(),
             Some((dt(2026, 6, 7, 12), dt(2026, 6, 7, 13)))
         );
-        assert_eq!(instances[1].instance_id(), "20260607T1200Z");
+        assert_eq!(instances[1].instance_id(), "2026-06-07T12:00:00Z");
     }
 }
