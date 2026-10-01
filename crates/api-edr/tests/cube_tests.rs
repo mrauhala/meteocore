@@ -260,15 +260,17 @@ async fn cube_is_a_data_query_with_height_units_on_the_collection_and_its_runs()
     let link = &doc["data_queries"]["cube"]["link"];
     assert_eq!(link["href"], "/edr/collections/model/cube");
     assert_eq!(link["rel"], "data");
-    assert_eq!(
-        link["variables"],
-        json!({
-            "query_type": "cube",
-            "output_formats": ["CoverageJSON"],
-            "default_output_format": "CoverageJSON",
-            "height_units": ["hPa"]
-        })
-    );
+    let variables = &link["variables"];
+    assert_eq!(variables["query_type"], "cube");
+    assert_eq!(variables["output_formats"], json!(["CoverageJSON"]));
+    assert_eq!(variables["default_output_format"], "CoverageJSON");
+    assert_eq!(variables["height_units"], json!(["hPa"]));
+    // EDR 1.2 link variables every query carries (#918).
+    assert_eq!(variables["title"], "Cube query");
+    assert!(variables["description"]
+        .as_str()
+        .is_some_and(|d| !d.is_empty()));
+    assert_eq!(variables["crs_details"][0]["crs"], "CRS84");
     let bundle = schema("ogcapi-edr-1.1-bundled.json");
     assert_valid(
         &bundle["paths"]["/collections/{collectionId}"]["get"]["responses"]["200"]["content"]
@@ -382,10 +384,7 @@ async fn cube_passes_the_validated_request_and_serves_valid_coveragejson() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        content_type.as_deref(),
-        Some("application/prs.coverage+json")
-    );
+    assert_eq!(content_type.as_deref(), Some("application/vnd.cov+json"));
     assert_eq!(
         engine.calls(),
         [Call {
