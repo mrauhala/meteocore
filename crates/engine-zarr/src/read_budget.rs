@@ -49,10 +49,6 @@ impl Budget {
 
     /// Probe another batch slot without counting reduced fan-out as a rejected
     /// request. The caller must reject if even the first slot cannot fit.
-    // `fetch_update` is deprecated since Rust 1.99 in favour of `try_update`,
-    // which is still unstable on the Docker image's Rust 1.94: switch once
-    // the image moves to 1.98 or later.
-    #[allow(deprecated)]
     pub(crate) fn try_reserve_bytes(
         self: &Arc<Self>,
         bytes: u64,
@@ -60,7 +56,7 @@ impl Budget {
         deadline::check()?;
         let reserved = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|&n| n <= self.capacity)
             })
             .is_ok();
@@ -80,10 +76,6 @@ impl Budget {
 
     /// Fail fast: callers already own an executor slot, and may hold another
     /// window (e.g. across the antimeridian). Waiting here can deadlock them.
-    // `fetch_update` is deprecated since Rust 1.99 in favour of `try_update`,
-    // which is still unstable on the Docker image's Rust 1.94: switch once
-    // the image moves to 1.98 or later.
-    #[allow(deprecated)]
     pub(crate) fn reserve(
         self: &Arc<Self>,
         array: &Array<EngineStore>,
@@ -106,7 +98,7 @@ impl Budget {
                 .checked_add(plan.workspace)
                 .ok_or(DataServerError::ResourceExhausted)?;
             self.used
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                     used.checked_add(bytes).filter(|&n| n <= self.capacity)
                 })
                 .map_err(|_| DataServerError::ResourceExhausted)?;
