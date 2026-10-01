@@ -50,6 +50,23 @@ requires `sd` and `resolution`, which are not implemented. Existing
 basic search remains supported. See the [Common Parts 1–4 matrix](../../docs/ogc-api-common-matrix.md)
 for the specification baselines and remaining gaps.
 
+### Schema validation
+
+Tests validate real router responses against both vendored EDR OpenAPI 3.0
+bundles, 1.1 and 1.2 (#919). 1.1 stays declared, so both must pass. Covered:
+the landing page, `/conformance`, `/collections`, collection documents (with
+locations, position, area and radius queries, a vertical extent, and a
+satellite collection's per-parameter time axes), the instances list, one
+instance document, and the `/locations` GeoJSON. A negative control drops one
+data query link's `title`, which only 1.2 requires, and expects 1.2 to reject
+it. Both bundles' own `parameter_names` schema constrains no entry, so the
+helper also checks each entry against their parameter schema; a second
+negative control drops an entry's `observedProperty`. CoverageJSON data
+responses validate against `schemas/coveragejson.json` instead: the 1.2 OpenAPI 3.0 bundle's NdArray schema rejects valid float
+arrays. The shared helper is `tests/support/edr_schema.rs`;
+[`schemas/README.md`](../../schemas/README.md) records the pinned upstream
+commit and why the 3.0 bundle rather than the 3.1 one.
+
 ## Query types
 
 | Query type | Route | Status | Notes |
