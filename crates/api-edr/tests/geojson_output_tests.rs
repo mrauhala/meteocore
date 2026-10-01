@@ -689,6 +689,97 @@ async fn datetime_lists_merge_into_one_feature_per_station() {
     assert_eq!(json["features"][0]["properties"]["humidity"], json!([null]));
 }
 
+/// A list of location ids (EDR 1.2 multiple_locations, #923) is one
+/// FeatureCollection on a station collection: every id's feature in request
+/// order, each named by its own id; an unknown id is still the 404.
+#[tokio::test]
+async fn a_location_list_is_one_feature_collection_in_request_order() {
+    let uri = "/collections/obs/locations/tampere,oulu%20airport?f=GeoJSON";
+    let (status, headers, json) = get_json(uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(content_type(&headers), "application/geo+json");
+    assert_valid_edr_geojson("/collections/{collectionId}/locations/{locId}", &json);
+    let features = json["features"].as_array().unwrap();
+    let ids: Vec<&str> = features.iter().map(|f| f["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["tampere", "oulu airport"]);
+    assert_eq!(features[0]["properties"]["label"], "Tampere Härmälä");
+    assert_eq!(
+        features[1]["properties"]["edrqueryendpoint"],
+        format!("{BASE}/edr/collections/obs/locations/oulu%20airport")
+    );
+    assert_eq!(
+        features[1]["geometry"]["coordinates"],
+        json!([25.3546, 64.9301])
+    );
+    assert_eq!(json["numberMatched"], 2);
+    assert_eq!(json["numberReturned"], 2);
+    // The links repeat the list as it was sent; a list has no PNG twin.
+    assert_eq!(
+        link(&json, "self", "application/geo+json"),
+        format!("{BASE}/edr/collections/obs/locations/tampere,oulu%20airport?f=GeoJSON")
+    );
+    let alternates: Vec<&str> = json["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["rel"] == "alternate")
+        .map(|l| l["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(alternates, ["application/vnd.cov+json"]);
+
+    // Accept negotiates a list too, and never picks PNG for it.
+    let (status, headers, _) = request(
+        "/collections/obs/locations/helsinki,tampere",
+        Some("application/geo+json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type(&headers), "application/geo+json");
+    assert!(varies_on_accept(&headers));
+    let (status, headers, _) = request(
+        "/collections/obs/locations/helsinki,tampere",
+        Some("image/png"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type(&headers), "application/vnd.cov+json");
+    let (status, _, json) =
+        get_json("/collections/obs/locations/helsinki,tampere?f=PNG", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["description"].as_str().unwrap().contains("PNG"),
+        "{json}"
+    );
+
+    // `limit` keeps the first ids' features; the rest are never queried,
+    // so their matches are uncounted.
+    let (status, _, json) = get_json(
+        "/collections/obs/locations/tampere,helsinki?f=GeoJSON&limit=1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["features"][0]["id"], "tampere");
+    assert_eq!(json["numberReturned"], 1);
+    assert!(json.get("numberMatched").is_none(), "{json}");
+
+    // One known and one unknown id: the 404 naming the unknown one.
+    let (status, _, json) = get_json(
+        "/collections/obs/locations/helsinki,nowhere?f=GeoJSON",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert!(
+        json["description"].as_str().unwrap().contains("nowhere"),
+        "{json}"
+    );
+
+    // A gridded collection offers no GeoJSON for a list either.
+    let (status, _, _) = request("/collections/grid/locations/a,b?f=GeoJSON", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn f_accepts_the_token_and_media_type_case_insensitively() {
     for f in [

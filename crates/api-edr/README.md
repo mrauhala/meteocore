@@ -85,7 +85,8 @@ engine's own `query_location`, so no engine needs code for it.
 | unknown id | 404 naming it, failing the whole list. Engines answer an unknown id and one without data alike, so the inventory (`get_locations`) tells them apart, read only when some id is not answered |
 | limits | at most 64 ids, counted before repeats collapse, and an empty element (`a,,b`, a leading or trailing comma) are 400; with a `datetime` list at most 256 ids × instants (`MAX_LOCATION_LOOKUPS`, as MULTIPOINT points × instants), a 400 naming both counts before any engine call; 1 million values combined, as MULTIPOINT; `limit` keeps the first coverages, and the ids past it are not queried but must still exist |
 | execution | one `query_location` per id in turn on the bounded EDR executor, the deadline checked before each, as between MULTIPOINT points. A `datetime` list runs per id exactly as for that id alone (`datetime_list::run`): one query per instant, merged, and an id with no data at any instant counts as an id without data |
-| PNG | 400: the plot labels series by index, not by location |
+| GeoJSON | on a station collection, one EDR GeoJSON FeatureCollection: every id's features in request order, each with its own id, label and `edrqueryendpoint`, so unlike the CoverageCollection the features say which location they are. `f=GeoJSON` or `Accept: application/geo+json`; `numberReturned` is the feature count and `numberMatched` the count before `limit`, left out when `limit` stopped the list before the last id. A gridded collection answers 400, as for one id |
+| PNG | 400: the plot labels series by index, not by location. `Accept` never picks PNG for a list |
 
 ### Items
 
@@ -230,7 +231,8 @@ MULTIPOINT position has one per point):
   `numberMatched`. There are no paging links. A `datetime` list merges
   each station's series along `time` as it does for CoverageJSON, so it is
   still one feature per station, and `numberMatched` counts the merged
-  features.
+  features. A location list is one FeatureCollection too (see
+  [Location lists](#location-lists)).
 
 Each coverage is named by the one location of `get_locations()` at its exact
 coordinates (the `serves_station_series` contract, pinned per engine by

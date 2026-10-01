@@ -765,7 +765,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "name": "locationId",
                         "in": "path",
                         "required": true,
-                        "description": format!("Comma-delimited list of location ids (EGLL or EGLL,EFHK), from the /locations inventory. At most {MAX_LOCATION_IDS}, and with a datetime list at most {MAX_LOCATION_LOOKUPS} ids × instants; a repeated id is answered once. A literal comma separates ids, so a comma inside an id is sent encoded as %2C. One id answers as before: a Coverage or CoverageCollection, 404 when it has no data in the window. A list answers one CoverageCollection with every id's coverages in request order, an id without data in the window contributing none; any unknown id is a 404 naming it."),
+                        "description": format!("Comma-delimited list of location ids (EGLL or EGLL,EFHK), from the /locations inventory. At most {MAX_LOCATION_IDS}, and with a datetime list at most {MAX_LOCATION_LOOKUPS} ids × instants; a repeated id is answered once. A literal comma separates ids, so a comma inside an id is sent encoded as %2C. One id answers as before: a Coverage or CoverageCollection, 404 when it has no data in the window. A list answers one CoverageCollection with every id's coverages in request order, or on a station collection one EDR GeoJSON FeatureCollection with every id's features in request order, each named by its id; an id without data in the window contributes none; any unknown id is a 404 naming it; PNG is a 400 for a list."),
                         "schema": {"type": "string"},
                         "style": "simple",
                         "explode": false

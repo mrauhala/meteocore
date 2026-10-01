@@ -77,6 +77,9 @@ owns the instance-id string form:
   coverage by the one `get_locations()` entry at its exact coordinates: that
   is what `EdrEngine::serves_station_series` promises. An engine opting in
   must pin it with a test (`station_series_sit_at_listed_locations`).
+  `/locations/{id}` names its coverages by the requested id instead, and a
+  list by each coverage's own id: `query_location_list` returns the owner
+  of every coverage (`GeoJsonRequest::location_ids`).
 - GeoJSON rendering reads `get_locations()`, so it runs inside the query
   executor with the query, never on an HTTP worker.
 
@@ -230,7 +233,8 @@ extractor: a literal comma separates, `%2C` belongs to an id. Never split the
 decoded `Path` value, which cannot tell them apart. One id, a repeat-only list
 included, keeps the single-id path byte for byte. A list goes through
 `query_location_list`: one engine `query_location` per id in request order,
-flattened into one CoverageCollection, CoverageJSON only, capped at
+flattened into one CoverageCollection (or, on a station collection, one EDR
+GeoJSON FeatureCollection, never PNG), capped at
 `MAX_LOCATION_IDS` ids and `MAX_LOCATION_VALUES` values. A `datetime` list
 runs per id through `datetime_list::run`, and ids × instants is capped at
 `MAX_LOCATION_LOOKUPS` before any engine call. Engines return
