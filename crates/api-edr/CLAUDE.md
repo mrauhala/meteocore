@@ -227,6 +227,12 @@ and never under an instance.
   query per instant `(t, t)`, merged by `src/datetime_list.rs`. Every data
   query handler calls the engine through `datetime_list::run`; a new one
   must too, rather than converting the selector to one engine window itself.
+- A repeating interval `Rn/date-time/duration` (#933) expands inside
+  `parse_datetime` to the same `DatetimeSelector::Instants`, so handlers
+  never see it. `n` counts instants, like `z`'s `Rn` (the informative
+  annex's "repetitions" reading is the outlier); the duration goes through
+  `ds_core::datetime::parse_iso8601_duration`, which rejects years and
+  months and must stay overflow-safe, since request input reaches it.
 
 ## Caching headers (#499)
 

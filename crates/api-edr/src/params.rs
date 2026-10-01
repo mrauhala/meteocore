@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use ds_core::datetime::parse_datetime_interval;
+use ds_core::datetime::{parse_datetime_interval, parse_iso8601_duration};
 use ds_core::edr_engine::TrajectoryShape;
 use ds_core::error::DataServerError;
 use serde::Deserialize;
@@ -19,7 +19,8 @@ pub enum DatetimeSelector {
     /// An instant `(t, t)` or an interval. An open end is the
     /// `parse_datetime_interval` sentinel (`MIN_UTC` / `MAX_UTC`).
     Window(DateTime<Utc>, DateTime<Utc>),
-    /// A list `T1,T2,T3` of two or more distinct instants, ascending. Each
+    /// A list `T1,T2,T3` of two or more distinct instants, ascending, or the
+    /// instants a repeating interval `Rn/date-time/duration` expands to. Each
     /// is queried as the single instant `(t, t)`, so it is matched exactly
     /// as a request naming that instant alone would be.
     Instants(Vec<DateTime<Utc>>),
@@ -38,15 +39,24 @@ impl DatetimeSelector {
 }
 
 /// Parse the EDR `datetime` query parameter: an RFC 3339 instant, an
-/// interval (`start/end`, `../end`, `start/..`), or — EDR 1.2's
-/// `list of datetimes` — a comma-separated list of instants, at most
-/// [`MAX_DATETIME_INSTANTS`]. A list element must be an instant, not an
-/// interval. Repeated instants collapse; a list that collapses to one
-/// instant is that instant.
+/// interval (`start/end`, `../end`, `start/..`), or one of EDR 1.2's two
+/// multi-instant forms, at most [`MAX_DATETIME_INSTANTS`] instants each:
+///
+/// - `list of datetimes`: a comma-separated list of instants. A list element
+///   must be an instant, not an interval. Repeated instants collapse; a list
+///   that collapses to one instant is that instant.
+/// - `repeating interval`: `Rn/date-time/duration`, the `n` instants
+///   `start + i × duration` for `i` in `0..n`, `n` counting instants as
+///   `z=Rn/min/step` counts levels. `R1` is the start alone.
 pub fn parse_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, DataServerError> {
     let Some(raw) = raw else {
         return Ok(None);
     };
+    // An RFC 3339 date-time starts with a digit, so a leading `R` is
+    // unambiguous.
+    if let Some(rest) = raw.strip_prefix(['R', 'r']) {
+        return parse_datetime_repeating(raw, rest).map(Some);
+    }
     if !raw.contains(',') {
         let (start, end) = parse_datetime_interval(raw)?;
         return Ok(Some(DatetimeSelector::Window(start, end)));
@@ -81,6 +91,87 @@ pub fn parse_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, Dat
         [only] => DatetimeSelector::Window(only, only),
         _ => DatetimeSelector::Instants(instants),
     }))
+}
+
+/// Expand the EDR 1.2 repeating interval `Rn/date-time/duration`
+/// (`/req/core/datetime-response` D) after its `R`; `raw` is the whole
+/// value, for messages.
+///
+/// `n` counts instants, not repetitions after the first: `R4/T/PT6H` is `T`,
+/// `T+6h`, `T+12h`, `T+18h`. The grammar ("R[number of repetitions]") has no
+/// example, so this follows the standard's one query-parameter example of
+/// the form, `z=R20/100/50` = "20 height levels" (mirrored by [`parse_z`]);
+/// the 1.2 OpenAPI temporal extent example `R12/…09:00Z/PT1H`,
+/// `R4/…21:00Z/PT3H`, `R4/…09:00Z/PT6H`, whose runs abut without overlap
+/// only when `n` counts instants; and ISO 8601 parsers such as aniso8601
+/// (`R3/1981-04-05/P1D` is three dates). The informative collection-response
+/// annex reads it the other way (`R4/100/5` as `[100, …, 120]`, five values).
+///
+/// `n` is 1…[`MAX_DATETIME_INSTANTS`]; `R0`, a missing (unbounded) `n` and
+/// ISO's `R-1` are 400s, as no request can expand an unbounded series. The
+/// duration is [`parse_iso8601_duration`]'s: positive, in weeks or days,
+/// hours, minutes and whole seconds. Calendar years and months are a 400,
+/// since a month's length depends on the instant it is added to.
+fn parse_datetime_repeating(raw: &str, rest: &str) -> Result<DatetimeSelector, DataServerError> {
+    let invalid = |detail: String| DataServerError::InvalidDatetime(format!("'{raw}': {detail}"));
+    if raw.contains(',') {
+        return Err(invalid(
+            "a repeating interval cannot be part of a datetime list".into(),
+        ));
+    }
+    let parts: Vec<&str> = rest.split('/').map(str::trim).collect();
+    let [count, start, duration] = parts[..] else {
+        return Err(invalid(
+            "a repeating interval must be `Rn/date-time/duration`, e.g. \
+             R4/2026-10-01T00:00:00Z/PT6H"
+                .into(),
+        ));
+    };
+    if count.is_empty() || count == "-1" {
+        return Err(invalid(format!(
+            "an unbounded repeating interval is not supported; give the number of \
+             instants, at most {MAX_DATETIME_INSTANTS}"
+        )));
+    }
+    if !count.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid(format!(
+            "repeating interval count 'R{count}' must be a positive whole number of instants"
+        )));
+    }
+    // All digits: a parse failure can only be an overflow, past any cap.
+    let n = count.parse::<usize>().unwrap_or(usize::MAX);
+    if n == 0 {
+        return Err(invalid(
+            "a repeating interval names at least one instant; R0 names none".into(),
+        ));
+    }
+    if n > MAX_DATETIME_INSTANTS {
+        return Err(invalid(format!(
+            "a repeating interval names {count} instants; the maximum is {MAX_DATETIME_INSTANTS}"
+        )));
+    }
+    let start = start.parse::<DateTime<Utc>>().map_err(|e| {
+        invalid(format!(
+            "repeating interval start '{start}' is not an RFC 3339 date-time: {e}"
+        ))
+    })?;
+    let step = parse_iso8601_duration(duration).map_err(|e| match e {
+        DataServerError::Config(msg) => invalid(msg),
+        other => other,
+    })?;
+    let mut instants = Vec::with_capacity(n);
+    let mut t = start;
+    instants.push(t);
+    for _ in 1..n {
+        t = t.checked_add_signed(step).ok_or_else(|| {
+            invalid("the repeating interval runs past the supported date range".into())
+        })?;
+        instants.push(t);
+    }
+    Ok(match instants[..] {
+        [only] => DatetimeSelector::Window(only, only),
+        _ => DatetimeSelector::Instants(instants),
+    })
 }
 
 /// The one CRS data queries accept: `coords` are read, and results written,
@@ -1530,6 +1621,165 @@ mod tests {
         let over = vec!["2018-02-12T00:00:00Z"; MAX_DATETIME_INSTANTS + 1].join(",");
         let err = parse_datetime(Some(&over)).unwrap_err().to_string();
         assert!(err.contains(&MAX_DATETIME_INSTANTS.to_string()), "{err}");
+    }
+
+    fn utc(rfc3339: &str) -> DateTime<Utc> {
+        rfc3339.parse().unwrap()
+    }
+
+    /// The instants a `datetime` value selects, whichever variant holds them.
+    fn instants(raw: &str) -> Vec<DateTime<Utc>> {
+        match parse_datetime(Some(raw)).unwrap() {
+            Some(DatetimeSelector::Instants(v)) => v,
+            Some(DatetimeSelector::Window(a, b)) if a == b => vec![a],
+            other => panic!("{raw}: not instants: {other:?}"),
+        }
+    }
+
+    /// `Rn` counts instants (#933): `R4/T/PT6H` is T, T+6h, T+12h, T+18h, as
+    /// `z=R20/100/50` is 20 levels.
+    #[test]
+    fn parse_datetime_repeating_counts_instants() {
+        assert_eq!(
+            parse_datetime(Some("R4/2026-10-01T00:00:00Z/PT6H")).unwrap(),
+            Some(DatetimeSelector::Instants(vec![
+                utc("2026-10-01T00:00:00Z"),
+                utc("2026-10-01T06:00:00Z"),
+                utc("2026-10-01T12:00:00Z"),
+                utc("2026-10-01T18:00:00Z"),
+            ]))
+        );
+        // The same selector the equivalent list parses to.
+        assert_eq!(
+            parse_datetime(Some("R3/2024-01-01T01:00:00Z/PT1H")).unwrap(),
+            parse_datetime(Some(
+                "2024-01-01T01:00:00Z,2024-01-01T02:00:00Z,2024-01-01T03:00:00Z"
+            ))
+            .unwrap()
+        );
+        // `R1` is the start alone, like a one-instant list; `r` is accepted
+        // as `z` accepts it.
+        let at = utc("2026-10-01T00:00:00Z");
+        assert_eq!(
+            parse_datetime(Some("R1/2026-10-01T00:00:00Z/PT6H")).unwrap(),
+            Some(DatetimeSelector::Window(at, at))
+        );
+        assert_eq!(instants("r2/2026-10-01T00:00:00Z/PT6H").len(), 2);
+        // At the cap.
+        let full = instants(&format!(
+            "R{MAX_DATETIME_INSTANTS}/2026-10-01T00:00:00Z/PT1H"
+        ));
+        assert_eq!(full.len(), MAX_DATETIME_INSTANTS);
+        assert_eq!(full.last(), Some(&utc("2026-10-01T15:00:00Z")));
+    }
+
+    /// Durations are fixed lengths added to the UTC start: days across a
+    /// leap day and a year end, weeks, minutes past 60, mixed units, and a
+    /// start with an offset.
+    #[test]
+    fn parse_datetime_repeating_expands_durations() {
+        let cases: [(&str, &[&str]); 7] = [
+            (
+                "R3/2024-02-28T12:00:00Z/P1D",
+                &[
+                    "2024-02-28T12:00:00Z",
+                    "2024-02-29T12:00:00Z",
+                    "2024-03-01T12:00:00Z",
+                ],
+            ),
+            (
+                "R2/2026-12-31T23:30:00Z/PT1H",
+                &["2026-12-31T23:30:00Z", "2027-01-01T00:30:00Z"],
+            ),
+            (
+                "R3/2026-10-01T00:00:00Z/P1W",
+                &[
+                    "2026-10-01T00:00:00Z",
+                    "2026-10-08T00:00:00Z",
+                    "2026-10-15T00:00:00Z",
+                ],
+            ),
+            (
+                "R3/2026-10-01T00:00:00Z/PT90M",
+                &[
+                    "2026-10-01T00:00:00Z",
+                    "2026-10-01T01:30:00Z",
+                    "2026-10-01T03:00:00Z",
+                ],
+            ),
+            (
+                "R2/2026-10-01T00:00:00Z/P1DT1H30M15S",
+                &["2026-10-01T00:00:00Z", "2026-10-02T01:30:15Z"],
+            ),
+            (
+                // The offset normalises to UTC before the steps are added.
+                "R2/2026-10-01T02:00:00+02:00/PT1H",
+                &["2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z"],
+            ),
+            (
+                // A fractional start keeps its fraction on every step.
+                "R2/2026-10-01T00:00:00.5Z/PT10S",
+                &["2026-10-01T00:00:00.5Z", "2026-10-01T00:00:10.5Z"],
+            ),
+        ];
+        for (raw, expected) in cases {
+            let expected: Vec<_> = expected.iter().map(|s| utc(s)).collect();
+            assert_eq!(instants(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_datetime_rejects_bad_repeating_intervals() {
+        let t = "2026-10-01T00:00:00Z";
+        // (value, a fragment the 400 must name)
+        let cases = [
+            (format!("R0/{t}/PT1H"), "R0 names none"),
+            (format!("R/{t}/PT1H"), "unbounded"),
+            (format!("R-1/{t}/PT1H"), "unbounded"),
+            (format!("R+4/{t}/PT1H"), "positive whole number"),
+            (format!("R4.0/{t}/PT1H"), "positive whole number"),
+            (format!("Rx/{t}/PT1H"), "positive whole number"),
+            (
+                format!("R{}/{t}/PT1H", MAX_DATETIME_INSTANTS + 1),
+                "the maximum is 16",
+            ),
+            (
+                format!("R99999999999999999999999/{t}/PT1H"),
+                "the maximum is 16",
+            ),
+            (format!("R4/{t}"), "Rn/date-time/duration"),
+            ("R4".to_string(), "Rn/date-time/duration"),
+            (format!("R4/{t}/PT1H/PT1H"), "Rn/date-time/duration"),
+            ("R4/../PT1H".to_string(), "not an RFC 3339 date-time"),
+            (format!("R4/PT1H/{t}"), "not an RFC 3339 date-time"),
+            (format!("R4/{t}/{t}"), "must start with 'P'"),
+            (format!("R4/{t}/PT0H"), "zero or negative"),
+            (format!("R4/{t}/P0D"), "zero or negative"),
+            (format!("R4/{t}/-PT1H"), "must start with 'P'"),
+            (format!("R4/{t}/P1M"), "months ('M')"),
+            (format!("R4/{t}/P1Y"), "years ('Y')"),
+            (format!("R4/{t}/PT1.5S"), "seconds"),
+            (format!("R4/{t}/P99999999999999999D"), "too long"),
+            (
+                "R2/9999-12-31T00:00:00Z/P100000000D".to_string(),
+                "supported date range",
+            ),
+            (
+                format!("R2/{t}/PT1H,{t}"),
+                "cannot be part of a datetime list",
+            ),
+            (format!("{t},R2/{t}/PT1H"), "instants only"),
+        ];
+        for (raw, fragment) in cases {
+            let err = parse_datetime(Some(&raw)).unwrap_err();
+            assert!(
+                matches!(err, DataServerError::InvalidDatetime(_)),
+                "{raw}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(fragment), "{raw}: {msg}");
+            assert!(!msg.contains("Config"), "{raw}: {msg}");
+        }
     }
 
     #[test]
