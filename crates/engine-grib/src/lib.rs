@@ -1,6 +1,7 @@
 mod area;
 pub mod cache;
 pub mod catalog;
+mod cube;
 mod diagnostics;
 mod discovery;
 pub mod index;
@@ -1251,12 +1252,18 @@ impl EdrEngine for GribEngine {
         self.vertical_extent(&self.catalog())
     }
 
+    /// Cube only on the pressure and model-level views: a cube is a
+    /// bbox × vertical levels query (#925).
     fn supported_query_types(&self) -> Vec<String> {
-        vec![
+        let mut types = vec![
             "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
-        ]
+        ];
+        if self.vertical_kind().is_some() {
+            types.push("cube".to_string());
+        }
+        types
     }
 
     fn query_position(
@@ -1303,6 +1310,18 @@ impl EdrEngine for GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         self.query_batched_area(coords, datetime, parameters, z, reference_time)
+    }
+
+    fn query_cube(
+        &self,
+        bbox: &ds_core::feature::Bbox,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        resolution: ds_core::cube::CubeResolution,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.query_batched_cube(bbox, datetime, parameters, z, resolution, reference_time)
     }
 }
 

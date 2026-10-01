@@ -18,9 +18,10 @@ use ds_core::model::CoverageResponse;
 use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
-    parse_edr_format, parse_within_metres, parse_z, plot_dimensions, resolve_z_levels,
-    split_position_coords, AreaQueryParams, EdrFormat, LocationQueryParams, PositionQueryParams,
-    RadiusQueryParams, TrajectoryQueryParams, WITHIN_UNITS,
+    check_crs, parse_cube_bbox, parse_edr_format, parse_resolution, parse_within_metres, parse_z,
+    plot_dimensions, resolve_z_levels, split_position_coords, AreaQueryParams, CubeQueryParams,
+    EdrFormat, LocationQueryParams, PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams,
+    ZSelector, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -307,19 +308,23 @@ fn resolve_request_z(
     let Some(sel) = parse_z(z).map_err(|e| bad_request(&e))? else {
         return Ok(None);
     };
+    resolve_z_selector(engine, &sel, "the `z` query parameter").map(Some)
+}
+
+/// [`resolve_request_z`] for an already parsed selector; `what` names its
+/// source in the 400 a collection without a vertical dimension answers.
+fn resolve_z_selector(
+    engine: &Arc<dyn EdrEngine>,
+    sel: &ZSelector,
+    what: &str,
+) -> Result<Vec<f64>, HandlerError> {
     let extent = engine.get_vertical_extent();
     if extent.is_none() {
-        return Err(JsonError(
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "code": "BadRequest",
-                "description": "This collection has no vertical dimension; \
-                                the `z` query parameter is not supported"
-            })),
-        ));
+        return Err(bad_request_msg(&format!(
+            "This collection has no vertical dimension; {what} is not supported"
+        )));
     }
-    let levels = resolve_z_levels(&sel, extent.as_ref()).map_err(|e| bad_request(&e))?;
-    Ok(Some(levels))
+    resolve_z_levels(sel, extent.as_ref()).map_err(|e| bad_request(&e))
 }
 
 pub async fn landing_page(
@@ -420,6 +425,71 @@ pub async fn landing_page(
 fn format_parameter() -> serde_json::Value {
     json!({"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
+}
+
+/// The OpenAPI operation of a cube query (#925), on the collection or, with
+/// `instance_id_param`, on one of its model runs. The parameters are the
+/// EDR 1.2 cube parameters; the description states what MeteoCore accepts
+/// of each.
+fn cube_operation(
+    summary: String,
+    operation_id: String,
+    tag: &str,
+    instance_id_param: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut parameters: Vec<serde_json::Value> = instance_id_param.into_iter().collect();
+    parameters.extend([
+        json!({"$ref": "#/components/parameters/cube-bbox"}),
+        json!({"$ref": "#/components/parameters/cube-z"}),
+        json!({"$ref": "#/components/parameters/datetime"}),
+        json!({"$ref": "#/components/parameters/parameter-name"}),
+        json!({"$ref": "#/components/parameters/resolution-x"}),
+        json!({"$ref": "#/components/parameters/resolution-y"}),
+        json!({"$ref": "#/components/parameters/resolution-z"}),
+        json!({"$ref": "#/components/parameters/crs"}),
+        json!({
+            "name": "f",
+            "in": "query",
+            "description": "format to return the data response in. Cube queries return CoverageJSON only.",
+            "required": false,
+            "schema": {"type": "string"}
+        }),
+    ]);
+    json!({
+        "get": {
+            "summary": summary,
+            "description": format!(
+                "Return the data values for the data cube defined by the query parameters, as a \
+                 CoverageJSON Grid with x, y, z and t axes. bbox is CRS84: four numbers, or six \
+                 whose vertical pair is a z interval that an explicit z overrides. z takes a \
+                 level, a list or a min/max interval of the advertised levels (the Rn/min/interval \
+                 form is not supported); without it every level is returned. resolution-x, \
+                 resolution-y and resolution-z ask for that many evenly spaced positions from the \
+                 bbox edges (the lowest and highest selected level for z), both included, each \
+                 taking the nearest native value; 0 or absent is the native resolution, and the \
+                 largest accepted value is {max}. A response holds at most {max} values across \
+                 timesteps, levels, cells and parameters. crs accepts CRS84 only. Unknown or \
+                 repeated query parameters return 400.",
+                max = crate::params::MAX_RESOLUTION
+            ),
+            "operationId": operation_id,
+            "tags": [tag],
+            "parameters": parameters,
+            "responses": {
+                "200": {
+                    "description": "Coverage data",
+                    "content": {
+                        COVERAGE_JSON_MEDIA_TYPE: {
+                            "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                        }
+                    }
+                },
+                "400": {"description": "Bad request"},
+                "404": {"description": "Not found"},
+                "500": {"description": "Server error"}
+            }
+        }
+    })
 }
 
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
@@ -629,6 +699,18 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             });
         }
 
+        // Cube query (#925). Gated like every data query: only engines
+        // advertising `cube` get the path (#668).
+        if supported.contains("cube") {
+            let cube_path = format!("/edr/collections/{id}/cube");
+            collection_paths[&cube_path] = cube_operation(
+                format!("Cube query for {}", config.title),
+                format!("getCube_{id}"),
+                id,
+                None,
+            );
+        }
+
         // Trajectory query (vertical cross-section). Only advertised
         // for engines that report `trajectory` in
         // `supported_query_types` — keeps the OpenAPI spec consistent
@@ -787,6 +869,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     }
                 });
             }
+            if supported.contains("cube") {
+                let p = format!("/edr/collections/{id}/instances/{{instanceId}}/cube");
+                collection_paths[&p] = cube_operation(
+                    format!("Cube query against a model run for {}", config.title),
+                    format!("getInstanceCube_{id}"),
+                    id,
+                    Some(instance_id_param.clone()),
+                );
+            }
             if supported.contains("area") {
                 let p = format!("/edr/collections/{id}/instances/{{instanceId}}/area");
                 collection_paths[&p] = json!({
@@ -869,6 +960,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": false,
                     "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false,
                     "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
                 },
                 "parameter-name": {
@@ -876,6 +969,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": false,
                     "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false,
                     "description": "Comma-separated list of parameter names to include"
                 },
                 "z": {
@@ -926,6 +1021,67 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": true,
                     "schema": {"type": "string"},
                     "description": "WKT LINESTRING geometry (lon lat, lon lat, …). LINESTRINGZ/M variants are not accepted — per-node z and time will arrive in a follow-up."
+                },
+                // The cube parameters, copied from the OGC API - EDR 1.2
+                // OpenAPI (`cube-bbox`, `cube-z`, `resolution-x/-y/-z`,
+                // `crs`). The resolution parameters add the `style`/`explode`
+                // their requirement classes declare; `crs` gives CRS84, the
+                // one accepted value, as its example instead of `native`.
+                "cube-bbox": {
+                    "name": "bbox",
+                    "in": "query",
+                    "description": "Only features that have a geometry that intersects the bounding box are selected.\nThe bounding box is provided as four numbers:\n* Lower left corner, coordinate axis 1\n* Lower left corner, coordinate axis 2\n* Upper right corner, coordinate axis 1\n* Upper right corner, coordinate axis 2\n\nFor WGS 84 longitude/latitude the values are in most cases the sequence of\nminimum longitude, minimum latitude, maximum longitude and maximum latitude.\nHowever, in cases where the box spans the antimeridian the first value\n(west-most box edge) is larger than the third value (east-most box edge).\nIf a feature has multiple spatial geometry properties, it is the decision of the\nserver whether only a single spatial geometry property is used to determine\nthe extent or all relevant geometries.",
+                    "required": true,
+                    "schema": {
+                        "oneOf": [
+                            {"items": {"type": "number"}, "type": "array", "minItems": 4, "maxItems": 4},
+                            {"items": {"type": "number"}, "type": "array", "minItems": 6, "maxItems": 6}
+                        ]
+                    },
+                    "style": "form",
+                    "explode": false
+                },
+                "cube-z": {
+                    "name": "z",
+                    "in": "query",
+                    "description": "Define the vertical levels to return data from \n\nThe value will override any vertical values defined in the BBOX query parameter \n\nA range to return data for all levels between and including 2 defined levels\n\ni.e. z=minimum value/maximum value\n\nfor instance if all values between and including 10m and 100m\n\nz=10/100\n\nA list of height values can be specified\ni.e. z=value1,value2,value3\n\nfor instance if values at 2m, 10m and 80m are required\n\nz=2,10,80\n\nAn Arithmetic sequence using Recurring height intervals, the difference is the number of recurrences is defined at the start \nand the amount to increment the height by is defined at the end\n\ni.e. z=Rn/min height/height interval\n\nso if the request was for 20 height levels 50m apart starting at 100m:\n\nz=R20/100/50\n\nWhen not specified data from all available heights SHOULD be returned\n",
+                    "required": false,
+                    "schema": {"type": "string"}
+                },
+                "resolution-x": {
+                    "name": "resolution-x",
+                    "in": "query",
+                    "description": "Defined if the user requires data at a different resolution from the native resolution of the data along the x-axis\n\nThis is a single value it denotes the number of intervals to retrieve data for along the x-axis\n  \n  i.e. resolution-x=10 \n  \nwould retrieve 10 values along the x-axis from the minimum x coordinate to maximum x coordinate (i.e. a value at both the minimum x and maximum x coordinates and 8 values between).\n",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
+                "resolution-y": {
+                    "name": "resolution-y",
+                    "in": "query",
+                    "description": "Defined if the user requires data at a different resolution from the native resolution of the data along the y-axis\n\nThis is a single value it denotes the number of intervals to retrieve data for along the y-axis\n  \n  i.e. resolution-y=10 \n  \nwould retrieve 10 values along the y-axis from the minimum y coordinate to maximum y coordinate (i.e. a value at both the minimum y and maximum y coordinates and 8 values between).\n",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
+                "resolution-z": {
+                    "name": "resolution-z",
+                    "in": "query",
+                    "description": "Defined if the user requires data at a different resolution from the native resolution of the data along the z-axis\n\nThis is a single value it denotes the number of intervals to retrieve data for along the z-axis\n  \n  i.e. resolution-z=10 \n  \nwould retrieve 10 values along the z-axis from the minimum z coordinate to maximum z  coordinate (i.e. a value at both the minimum z and maximum z coordinates and 8 values between).\n",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
+                "crs": {
+                    "name": "crs",
+                    "in": "query",
+                    "description": "identifier (id) of the coordinate system to return data in list of valid crs identifiers for the chosen collection are defined in the metadata responses.  If not supplied the coordinate reference system will default to WGS84.",
+                    "required": false,
+                    "example": crate::params::CRS84,
+                    "schema": {"type": "string"}
                 },
                 "z-trajectory": {
                     "name": "z",
@@ -1697,6 +1853,114 @@ async fn run_radius_query(
     ))
 }
 
+/// The raw query pairs of a data query whose parameters are validated by
+/// name ([`CubeQueryParams::from_pairs`]); a malformed query string is the
+/// same JSON 400 as any other invalid parameter.
+type QueryPairs = Result<Query<Vec<(String, String)>>, axum::extract::rejection::QueryRejection>;
+
+pub async fn cube_query(
+    Path(id): Path<String>,
+    query: QueryPairs,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, HandlerError> {
+    run_cube_query(id, None, query, state).await
+}
+
+/// `GET /collections/{id}/instances/{instanceId}/cube` — cube query against
+/// a specific forecast model run.
+pub async fn instance_cube_query(
+    Path((id, instance_id)): Path<(String, String)>,
+    query: QueryPairs,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, HandlerError> {
+    run_cube_query(id, Some(instance_id), query, state).await
+}
+
+/// OGC API - EDR `cube` (#925): the parameters over a CRS84 `bbox`, at the
+/// `z` levels, over the `datetime` window, optionally resampled to
+/// `resolution-x`/`-y`/`-z` positions per axis. Every request parameter is
+/// validated here — an unknown, repeated or unsupported one (`crs` other
+/// than CRS84, `f=PNG`) is a 400 — before the engine runs.
+async fn run_cube_query(
+    id: String,
+    instance_id: Option<String>,
+    query: QueryPairs,
+    state: AppState,
+) -> Result<impl IntoResponse, HandlerError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup_collection(&state, &id)?;
+    require_query_type(engine, &id, "cube", "cube")?;
+
+    let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid cube query string"))?;
+    let params = CubeQueryParams::from_pairs(pairs).map_err(|e| bad_request(&e))?;
+    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
+        return Err(bad_request(&DataServerError::InvalidParameter(
+            "PNG output is not available for cube queries".into(),
+        )));
+    }
+    check_crs(params.crs.as_deref()).map_err(|e| bad_request(&e))?;
+    // EDR `/req/edr/rc-cube` D: a cube without a bbox is a 400.
+    let raw_bbox = params
+        .bbox
+        .as_deref()
+        .ok_or_else(|| bad_request_msg("Cube queries require a bbox"))?;
+    let (bbox, bbox_z) = parse_cube_bbox(raw_bbox).map_err(|e| bad_request(&e))?;
+    let resolution = ds_core::cube::CubeResolution {
+        x: parse_resolution("resolution-x", params.resolution_x.as_deref())
+            .map_err(|e| bad_request(&e))?,
+        y: parse_resolution("resolution-y", params.resolution_y.as_deref())
+            .map_err(|e| bad_request(&e))?,
+        z: parse_resolution("resolution-z", params.resolution_z.as_deref())
+            .map_err(|e| bad_request(&e))?,
+    };
+    if resolution.z.is_some() && engine.get_vertical_extent().is_none() {
+        return Err(bad_request_msg(
+            "This collection has no vertical dimension; resolution-z is not supported",
+        ));
+    }
+
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+
+    let datetime = params
+        .datetime
+        .as_deref()
+        .map(parse_datetime_interval)
+        .transpose()
+        .map_err(|e| bad_request_msg(&e.to_string()))?;
+
+    let param_names: Option<Vec<String>> = params
+        .parameter_name
+        .as_deref()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+
+    // An explicit `z` overrides the vertical pair of a six-number bbox.
+    let z = match (params.z.as_deref(), bbox_z) {
+        (Some(z), _) => resolve_request_z(engine, Some(z))?,
+        (None, Some(sel)) => Some(resolve_z_selector(engine, &sel, "a six-number bbox")?),
+        (None, None) => None,
+    };
+
+    let engine = engine.clone();
+    let result = execute_query(false, move |_budget| {
+        engine
+            .query_cube(
+                &bbox,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                resolution,
+                reference_time,
+            )
+            .map_err(|e| map_query_error(&e, "Cube"))
+    })
+    .await?;
+
+    Ok(with_data_cache_control(
+        coverage_json_response(&result, "Cube")?,
+        datetime,
+    ))
+}
+
 pub async fn trajectory_query(
     Path(id): Path<String>,
     Query(params): Query<TrajectoryQueryParams>,
@@ -1785,6 +2049,10 @@ pub async fn trajectory_query(
         }
     }
 }
+
+/// The data queries with an `/instances/{instanceId}/…` route, so the only
+/// ones an instance document advertises.
+const INSTANCE_QUERY_TYPES: [&str; 4] = ["position", "area", "radius", "cube"];
 
 /// An EDR `extent.temporal` object: the interval, the Gregorian TRS and,
 /// when known, the individual timesteps.
@@ -1880,7 +2148,8 @@ fn build_collection_metadata(
     // parse them back when needed. `vrs` is taken from the kind's
     // built-in WKT/URI so a radar collection still validates against
     // the EDR schema.
-    if let Some(vertical) = engine.get_vertical_extent() {
+    let vertical_extent = engine.get_vertical_extent();
+    if let Some(vertical) = &vertical_extent {
         let mut vertical_obj = serde_json::Map::new();
         if let Some((lo, hi)) = vertical.extent() {
             vertical_obj.insert(
@@ -1923,12 +2192,12 @@ fn build_collection_metadata(
         .collect();
 
     // Data queries hang off `query_base` (instance-scoped when applicable).
-    // Under an instance only the run-queryable types (position/area) get routes.
+    // Under an instance only the run-queryable types get routes.
     let query_types: Vec<String> = if instance.is_some() {
         engine
             .supported_query_types()
             .into_iter()
-            .filter(|qt| qt == "position" || qt == "area" || qt == "radius")
+            .filter(|qt| INSTANCE_QUERY_TYPES.contains(&qt.as_str()))
             .collect()
     } else {
         engine.supported_query_types()
@@ -1946,6 +2215,7 @@ fn build_collection_metadata(
             ),
             "area" => (format!("{query_base}/area"), json!(["CoverageJSON"])),
             "radius" => (format!("{query_base}/radius"), json!(["CoverageJSON"])),
+            "cube" => (format!("{query_base}/cube"), json!(["CoverageJSON"])),
             "trajectory" => (
                 format!("{query_base}/trajectory"),
                 json!(["CoverageJSON", "PNG"]),
@@ -1960,6 +2230,12 @@ fn build_collection_metadata(
         if qt == "radius" {
             // EDR 1.1 radius link variables carry the accepted `within-units`.
             variables["within_units"] = json!(WITHIN_UNITS);
+        }
+        if qt == "cube" {
+            // EDR 1.2 `/req/edr/rc-cube-variables` B: the units `z` is given
+            // in — the collection's vertical axis unit.
+            let units: Vec<&str> = vertical_extent.iter().map(|v| v.unit()).collect();
+            variables["height_units"] = json!(units);
         }
         data_queries.insert(
             qt.clone(),

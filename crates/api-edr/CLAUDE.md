@@ -57,8 +57,9 @@ The shared machinery is `ds_core::instances` (see root CLAUDE.md). This crate
 owns the instance-id string form:
 
 - Routes: `GET /collections/{id}/instances`, `/instances/{instanceId}`,
-  `/instances/{instanceId}/{position,area}`. No-instance routes default to
-  the latest run.
+  `/instances/{instanceId}/{position,area,radius,cube}`
+  (`handlers::INSTANCE_QUERY_TYPES`). No-instance routes default to the
+  latest run.
 - Collection metadata gains an `instances` data_query, and the OpenAPI spec
   advertises the instance paths — both gated on `get_instances()` being
   non-empty.
@@ -81,6 +82,28 @@ variables.within_units` advertises the accepted units (`params::WITHIN_UNITS`).
 The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
 containing a pole or crossing the antimeridian is a 400 (#667). Engine
 errors from all data-query handlers map through `map_query_error`.
+
+## Cube queries (#925)
+
+`GET /collections/{id}/cube` (and the `/instances/{id}/cube` twin) calls
+`EdrEngine::query_cube` with a parsed `ds_core::feature::Bbox`, the resolved
+`z` levels and a `ds_core::cube::CubeResolution`. The handler reads the raw
+query pairs through `params::CubeQueryParams::from_pairs`, so an unknown or
+repeated parameter is a 400 listing `params::CUBE_PARAMETERS` — keep that
+list, the OpenAPI operation (`cube_operation`) and the README in step. It
+404s a collection that does not advertise `cube` before validating anything,
+rejects `PNG` and any `crs` but CRS84 (`params::check_crs`), requires `bbox`
+(four numbers, or six whose vertical pair is a `z` interval an explicit `z`
+overrides), and maps `resolution-*=0` to `None` (native). A
+`resolution-z` or six-number bbox on a collection without a vertical axis is
+a 400. `data_queries.cube.link.variables.height_units` (required by EDR 1.2)
+is the vertical axis unit. The OpenAPI parameters are the EDR 1.2
+`cube-bbox`, `cube-z`, `resolution-x/-y/-z` and `crs` components, copied
+verbatim (only `crs`'s example is CRS84 instead of `native`).
+`ds_core::cube` holds the shared pieces engines use: `axis_positions`
+(both ends included), `nearest_indices` (half-cell tolerance, a position off
+the grid is missing) and `check_cube_budget` (`MAX_AREA_VALUES` across
+timesteps × levels × cells × parameters).
 
 ## Misc
 

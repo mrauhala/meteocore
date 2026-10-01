@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         .route("/collections/{id}/position", get(handlers::position_query))
         .route("/collections/{id}/area", get(handlers::area_query))
         .route("/collections/{id}/radius", get(handlers::radius_query))
+        .route("/collections/{id}/cube", get(handlers::cube_query))
         .route(
             "/collections/{id}/trajectory",
             get(handlers::trajectory_query),
@@ -50,6 +51,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/collections/{id}/instances/{instanceId}/radius",
             get(handlers::instance_radius_query),
+        )
+        .route(
+            "/collections/{id}/instances/{instanceId}/cube",
+            get(handlers::instance_cube_query),
         )
         // Cache-Control + ETag/If-None-Match on every 200 (#499).
         .layer(axum::middleware::from_fn(caching::conditional_get))
