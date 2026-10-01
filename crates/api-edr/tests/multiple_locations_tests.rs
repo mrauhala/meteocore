@@ -17,13 +17,15 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Timelike, Utc};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
 use api_edr::handlers::EdrState;
-use api_edr::params::{MAX_LOCATION_IDS, MAX_LOCATION_VALUES};
+use api_edr::params::{
+    MAX_DATETIME_INSTANTS, MAX_LOCATION_IDS, MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES,
+};
 use ds_core::config::CollectionConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
@@ -41,6 +43,19 @@ fn time(hour: u32) -> DateTime<Utc> {
 /// A two-step PointSeries coverage at `x`, which identifies it in assertions.
 fn coverage(x: f64) -> QueryResult {
     coverage_with_values(x, vec![Some(1.0), Some(2.0)])
+}
+
+/// The one step at `t` of the series [`coverage`] at `x`, valued `t`'s hour:
+/// what an instant window `(t, t)` selects.
+fn step(x: f64, t: DateTime<Utc>) -> QueryResult {
+    let mut q = coverage_with_values(x, vec![Some(f64::from(t.hour()))]);
+    q.domain = DomainDescription::PointSeries {
+        x,
+        y: 60.0,
+        t: vec![t],
+        z: None,
+    };
+    q
 }
 
 fn coverage_with_values(x: f64, values: Vec<Option<f64>>) -> QueryResult {
@@ -76,7 +91,7 @@ fn coverage_with_values(x: f64, values: Vec<Option<f64>>) -> QueryResult {
 }
 
 /// A station network: `s0` has three coverages (one per level, say), `s1`
-/// and the comma id one each, `s2`/`s3` none in any window, `big0`/`big1`
+/// and the comma id one each (`s1` only the step an instant window names), `s2`/`s3` none in any window, `big0`/`big1`
 /// half the value budget each. Records every engine call.
 #[derive(Default)]
 struct Stations {
@@ -101,7 +116,7 @@ impl EdrEngine for Stations {
     fn query_location(
         &self,
         location_id: &str,
-        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _: Option<&[String]>,
         _: Option<&[f64]>,
         _: Option<DateTime<Utc>>,
@@ -111,7 +126,10 @@ impl EdrEngine for Stations {
             "s0" => Ok(CoverageResponse::Collection(
                 (0..3).map(|i| coverage(i as f64)).collect(),
             )),
-            "s1" => Ok(CoverageResponse::Single(coverage(10.0))),
+            "s1" => Ok(CoverageResponse::Single(match datetime {
+                Some((start, end)) if start == end => step(10.0, start),
+                _ => coverage(10.0),
+            })),
             COMMA_ID => Ok(CoverageResponse::Single(coverage(20.0))),
             // Half the combined budget plus one; the domain is not sized to
             // match, which nothing here validates.
@@ -459,4 +477,86 @@ async fn openapi_declares_a_location_id_list() {
     assert!(text.starts_with("Comma-delimited list"), "{text}");
     assert!(text.contains("%2C"), "{text}");
     assert!(operation["responses"].get("204").is_some());
+}
+
+/// `datetime=T1,…,Tn`: instants written out for a query string.
+fn instants(n: usize) -> String {
+    (0..n as u32)
+        .map(|h| time(h).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A datetime list runs per id exactly as for that id alone: one engine
+/// call per instant, merged into one series, and an id with no data at any
+/// instant contributes nothing.
+#[tokio::test]
+async fn a_datetime_list_runs_per_id() {
+    let app = app();
+    let uri = format!("{}?datetime={}", locations("s1,s2"), instants(2));
+    let (status, json) = app.get(&uri).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(xs(&json), [10.0]);
+    let series = &json["coverages"][0];
+    assert_eq!(
+        series["domain"]["axes"]["t"]["values"],
+        serde_json::json!([time(0).to_rfc3339(), time(1).to_rfc3339()])
+    );
+    assert_eq!(
+        series["ranges"]["temperature"]["values"],
+        serde_json::json!([0.0, 1.0])
+    );
+    validate("coveragejson.json", &json);
+    assert_eq!(app.queried(), ["s1", "s1", "s2", "s2"]);
+
+    let uri = format!("{}?datetime={}", locations("s2,s3"), instants(2));
+    let (status, _, body) = app.send(&uri).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(body.is_empty());
+
+    let uri = format!("{}?datetime={}", locations("s1,nope"), instants(2));
+    let (status, json) = app.get(&uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert!(description(&json).contains("nope"), "{json}");
+}
+
+/// Ids × datetime instants is capped jointly, before any engine call, with
+/// a 400 naming both counts.
+#[tokio::test]
+async fn ids_times_instants_are_capped_jointly() {
+    let app = app();
+    let n = MAX_DATETIME_INSTANTS;
+    let ids_at = MAX_LOCATION_LOOKUPS / n;
+    let list = |count: usize| {
+        std::iter::once("s1".to_string())
+            .chain((1..count).map(|i| format!("x{i}")))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let uri = format!("{}?datetime={}", locations(&list(ids_at + 1)), instants(n));
+    let (status, json) = app.get(&uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    let text = description(&json);
+    let named = format!("{} locations × {n} datetime instants", ids_at + 1);
+    assert!(text.contains(&named), "{text}");
+    assert!(text.contains(&MAX_LOCATION_LOOKUPS.to_string()), "{text}");
+    assert!(
+        app.queried().is_empty(),
+        "the cap precedes every engine call"
+    );
+
+    // At the cap the list runs: `s1` at every instant, then the first unknown id.
+    let uri = format!("{}?datetime={}", locations(&list(ids_at)), instants(n));
+    let (status, json) = app.get(&uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert!(description(&json).contains("x1"), "{json}");
+    let queried = app.queried();
+    assert_eq!(queried.iter().filter(|id| *id == "s1").count(), n);
+
+    // A single id with a full list is far below the cap.
+    let uri = format!("{}?datetime={}", locations("s1"), instants(n));
+    let (status, json) = app.get(&uri).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["type"], "Coverage");
 }
