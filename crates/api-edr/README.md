@@ -205,7 +205,10 @@ MULTIPOINT position has one per point):
   top-level coverages (one per station); `numberReturned` is the feature
   count and `numberMatched` the count before `limit`. A MULTIPOINT
   position whose points past `limit` were never queried has no
-  `numberMatched`. There are no paging links.
+  `numberMatched`. There are no paging links. A `datetime` list merges
+  each station's series along `time` as it does for CoverageJSON, so it is
+  still one feature per station, and `numberMatched` counts the merged
+  features.
 
 Each coverage is named by the one location of `get_locations()` at its exact
 coordinates (the `serves_station_series` contract, pinned per engine by
