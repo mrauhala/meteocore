@@ -145,7 +145,8 @@ impl EdrEngine for CubeMock {
             domain: DomainDescription::Grid {
                 x: ds_core::cube::axis_positions(bbox.west, bbox.east, nx),
                 y: ds_core::cube::axis_positions(bbox.south, bbox.north, ny),
-                t: Some(vec![run()]),
+                // The window's start, so a datetime list's grids differ in t.
+                t: Some(vec![datetime.map_or(run(), |(start, _)| start)]),
                 z: Some(VerticalCoord {
                     kind: VerticalKind::Pressure,
                     values: levels.clone(),
@@ -426,11 +427,52 @@ async fn z_comes_from_the_parameter_or_a_six_number_bbox() {
         // An explicit z overrides it.
         ("bbox=0,0,500,1,1,1000&z=250", Some(vec![250.0])),
         ("bbox=0,0,1,1&z=700/300", Some(vec![700.0, 500.0])),
+        // The EDR 1.2 z grammar: open and recurring intervals.
+        ("bbox=0,0,1,1&z=../700", Some(vec![700.0, 500.0, 250.0])),
+        ("bbox=0,0,1,1&z=R2/500/350", Some(vec![500.0, 850.0])),
     ] {
         let (status, _, body) = get(&app, &format!("/collections/model/cube?{query}")).await;
         assert_eq!(status, StatusCode::OK, "{query}: {body}");
         assert_eq!(engine.calls().last().unwrap().z, z, "{query}");
     }
+    // Without a vertical extent a well-formed z, or a six-number bbox's
+    // vertical pair, is ignored (EDR 1.2 `/req/edr/z-response` A).
+    let flat = CubeMock::new(true, false);
+    let app = self::app(&[("flat", flat.clone())]);
+    for query in ["bbox=0,0,1,1&z=850", "bbox=0,0,850,1,1,500"] {
+        let (status, _, body) = get(&app, &format!("/collections/flat/cube?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(flat.calls().last().unwrap().z, None, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn a_datetime_list_is_one_cube_per_instant_joined_along_t() {
+    let engine = CubeMock::new(true, true);
+    let app = app(&[("model", engine.clone())]);
+    let later = run() + chrono::Duration::hours(6);
+    let (status, _, body) = get(
+        &app,
+        "/collections/model/cube?bbox=0,0,1,1&z=850,500\
+         &datetime=2026-06-07T06:00:00Z,2026-06-07T00:00:00Z",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let windows: Vec<_> = engine.calls().iter().map(|c| c.datetime).collect();
+    assert_eq!(windows, [Some((run(), run())), Some((later, later))]);
+    assert_eq!(body["type"], "Coverage");
+    assert_eq!(
+        body["domain"]["axes"]["t"]["values"],
+        json!(["2026-06-07T00:00:00+00:00", "2026-06-07T06:00:00+00:00"])
+    );
+    assert_eq!(body["ranges"]["temperature"]["shape"], json!([2, 2, 2, 2]));
+    assert_eq!(
+        body["ranges"]["temperature"]["values"]
+            .as_array()
+            .map(Vec::len),
+        Some(16)
+    );
+    assert_valid(&schema("coveragejson.json"), &body);
 }
 
 #[tokio::test]
@@ -491,14 +533,7 @@ async fn invalid_cube_requests_are_400_before_the_engine_runs() {
             "/collections/model/cube?bbox=0,0,1,1&datetime=yesterday",
             "",
         ),
-        (
-            "/collections/flat/cube?bbox=0,0,1,1&z=850",
-            "no vertical dimension",
-        ),
-        (
-            "/collections/flat/cube?bbox=0,0,850,1,1,500",
-            "six-number bbox",
-        ),
+        ("/collections/model/cube?bbox=0,0,1,1&z=R2/500", "z"),
         (
             "/collections/flat/cube?bbox=0,0,1,1&resolution-z=3",
             "resolution-z",

@@ -94,9 +94,12 @@ list, the OpenAPI operation (`cube_operation`) and the README in step. It
 404s a collection that does not advertise `cube` before validating anything,
 rejects `PNG` and any `crs` but CRS84 (`params::check_crs`), requires `bbox`
 (four numbers, or six whose vertical pair is a `z` interval an explicit `z`
-overrides), and maps `resolution-*=0` to `None` (native). A
-`resolution-z` or six-number bbox on a collection without a vertical axis is
-a 400. `data_queries.cube.link.variables.height_units` (required by EDR 1.2)
+overrides), and maps `resolution-*=0` to `None` (native). On a
+collection without a vertical axis `z` and a six-number bbox's vertical pair
+are ignored (EDR 1.2 `/req/edr/z-response` A, via `resolve_z_selector`) but
+`resolution-z` is a 400. A `datetime` list goes through `datetime_list::run`
+like the other data queries: each instant's `[t, z, y, x]` grid shares x, y
+and z, so the merge joins them along `t`. `data_queries.cube.link.variables.height_units` (required by EDR 1.2)
 is the vertical axis unit. The OpenAPI parameters are the EDR 1.2
 `cube-bbox`, `cube-z`, `resolution-x/-y/-z` and `crs` components, copied
 verbatim (only `crs`'s example is CRS84 instead of `native`).
