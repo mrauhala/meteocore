@@ -514,10 +514,14 @@ impl TrajectoryPlan {
                 )]
             }
             Some(vertical) => {
-                // One coverage per distinct level, in request order.
+                // One coverage per distinct level, in request order. `z` is
+                // an uncapped request list and the budgets below come after
+                // this, so dedup in O(n): `+ 0.0` folds -0.0 into 0.0 so the
+                // key agrees with `==` (non-finite levels never get here).
                 let mut levels: Vec<f64> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
                 for &l in axes.z.unwrap_or(&vertical.levels) {
-                    if !levels.contains(&l) {
+                    if seen.insert((l + 0.0).to_bits()) {
                         levels.push(l);
                     }
                 }
@@ -1081,6 +1085,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A huge `z` list is rejected by the node budget quickly: level dedup
+    /// runs before the budget, so it must stay linear in the list length.
+    #[test]
+    fn a_huge_z_list_hits_the_budget_without_quadratic_dedup() {
+        let vertical = VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0]);
+        let path = TrajectoryPath::parse("LINESTRING(0 0, 1 0)").unwrap();
+        let times = [hour(0)];
+        let z: Vec<f64> = (0..200_000).map(f64::from).collect();
+        let axes = TrajectoryAxes {
+            times: &times,
+            vertical: Some(&vertical),
+            z: Some(&z),
+        };
+        let started = std::time::Instant::now();
+        let err = TrajectoryPlan::new(&path, deg(1.0), axes, 1).unwrap_err();
+        assert!(matches!(err, DataServerError::QueryTooLarge(_)), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "dedup took {:?}",
+            started.elapsed()
+        );
+        // -0.0 and 0.0 are one level, as `==` says.
+        let signed = [0.0, -0.0];
+        let axes = TrajectoryAxes {
+            times: &times,
+            vertical: Some(&vertical),
+            z: Some(&signed),
+        };
+        assert_eq!(
+            TrajectoryPlan::new(&path, deg(1.0), axes, 1)
+                .unwrap()
+                .fields()
+                .len(),
+            1
+        );
     }
 
     #[test]
