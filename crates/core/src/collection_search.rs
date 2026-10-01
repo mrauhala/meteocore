@@ -232,26 +232,54 @@ pub fn search(items: &[CollectionMatch], p: &SearchParams) -> SearchResult {
         .map(|(i, _)| i)
         .collect();
 
-    let number_matched = matched.len();
-    let end = p.offset.saturating_add(p.limit).min(number_matched);
-    let page: Vec<usize> = if p.offset < number_matched {
-        matched[p.offset..end].to_vec()
-    } else {
-        Vec::new()
-    };
-
+    let window = page_window(matched.len(), p.offset, p.limit);
     SearchResult {
-        number_matched,
-        page,
+        number_matched: matched.len(),
+        page: matched[window.range()].to_vec(),
+        has_next: window.has_next,
+        next_offset: window.next_offset,
+        has_prev: window.has_prev,
+        prev_offset: window.prev_offset,
+    }
+}
+
+/// One `offset`/`limit` page over `number_matched` ordered items: the
+/// arithmetic behind `/collections` paging, shared with every other
+/// offset-paged list (EDR `/locations`, #922) so their links agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageWindow {
+    /// First item on the page (`number_matched` when `offset` is past the end).
+    pub start: usize,
+    /// One past the last item on the page.
+    pub end: usize,
+    pub has_next: bool,
+    pub next_offset: usize,
+    pub has_prev: bool,
+    pub prev_offset: usize,
+}
+
+impl PageWindow {
+    /// The page's item indices; empty when `offset` is past the end.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+}
+
+/// Page `number_matched` ordered items at `offset`, at most `limit` per page.
+pub fn page_window(number_matched: usize, offset: usize, limit: usize) -> PageWindow {
+    let end = offset.saturating_add(limit).min(number_matched);
+    PageWindow {
+        start: offset.min(number_matched),
+        end,
         has_next: end < number_matched,
-        next_offset: p.offset.saturating_add(p.limit),
-        // Offer `prev` only from a non-empty result page (`offset < number_matched`,
-        // matching the page-population guard above). An out-of-range or
-        // exactly-off-the-end `offset` yields an empty page with no `prev`,
-        // since `prev` implies a preceding result page. A `next` link never
-        // produces `offset == number_matched`, so normal paging is unaffected.
-        has_prev: p.offset > 0 && p.offset < number_matched,
-        prev_offset: p.offset.saturating_sub(p.limit),
+        next_offset: offset.saturating_add(limit),
+        // Offer `prev` only from a non-empty result page (`offset <
+        // number_matched`). An out-of-range or exactly-off-the-end `offset`
+        // yields an empty page with no `prev`, since `prev` implies a
+        // preceding result page. A `next` link never produces `offset ==
+        // number_matched`, so normal paging is unaffected.
+        has_prev: offset > 0 && offset < number_matched,
+        prev_offset: offset.saturating_sub(limit),
     }
 }
 
@@ -540,7 +568,7 @@ impl SearchQueryParams {
         if let Some(query) = &self.query {
             result.push(if result.is_empty() { '?' } else { '&' });
             result.push_str("query=");
-            result.push_str(&encode_qval(query));
+            result.push_str(&encode_query_value(query));
         }
         result
     }
@@ -562,7 +590,7 @@ pub fn page_query_string(
     let mut parts: Vec<String> = Vec::new();
     let mut push = |key: &str, val: Option<&str>| {
         if let Some(v) = val.map(str::trim).filter(|s| !s.is_empty()) {
-            parts.push(format!("{key}={}", encode_qval(v)));
+            parts.push(format!("{key}={}", encode_query_value(v)));
         }
     };
     push("bbox", bbox);
@@ -583,9 +611,10 @@ pub fn page_query_string(
     }
 }
 
-/// Percent-encode a query-parameter value, leaving unreserved characters and
-/// the query-safe sub-delims `,` `:` `/` intact for readability.
-fn encode_qval(s: &str) -> String {
+/// Percent-encode a query-parameter name or value for a paging link, leaving
+/// unreserved characters and the query-safe sub-delims `,` `:` `/` intact for
+/// readability.
+pub fn encode_query_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -1075,6 +1104,22 @@ mod tests {
         assert_eq!(r.page, vec![2, 3]);
         assert!(r.has_next && r.next_offset == 4);
         assert!(r.has_prev && r.prev_offset == 0);
+    }
+
+    #[test]
+    fn page_window_edges() {
+        // Last, partial page: no next, prev one full page back.
+        let w = page_window(5, 4, 2);
+        assert_eq!((w.range(), w.has_next, w.has_prev), (4..5, false, true));
+        assert_eq!(w.prev_offset, 2);
+        // Exactly off the end and far past it: empty, no links.
+        for offset in [5, usize::MAX] {
+            let w = page_window(5, offset, 2);
+            assert!(w.range().is_empty() && !w.has_next && !w.has_prev);
+        }
+        // A limit larger than the list: one page, nothing to navigate.
+        let w = page_window(3, 0, usize::MAX);
+        assert_eq!((w.range(), w.has_next, w.has_prev), (0..3, false, false));
     }
 
     #[test]

@@ -9,8 +9,9 @@ engine. It is written for integrators and for anyone planning EDR work.
 implementation / `supported_query_types` — must update the tables below in
 the same PR.** The `crates/api-edr/CLAUDE.md` rule points here.
 
-Spec: OGC API - EDR 1.1 (OGC 19-086r6). Base route: `/edr`. The cube query
-follows EDR 1.2, which adds `resolution-z` to it.
+Spec: OGC API - EDR 1.1 (OGC 19-086r6), plus EDR 1.2's `limit` and
+locations paging (#922) and the cube query with `resolution-z` (#925).
+Base route: `/edr`.
 
 ## Conformance classes
 
@@ -54,8 +55,8 @@ for the specification baselines and remaining gaps.
 
 | Query type | Route | Status | Notes |
 |---|---|---|---|
-| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list + CoverageJSON/PNG series per location |
-| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined; all coordinates finite and within CRS84 bounds) |
+| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list, complete without `limit` and paged with it (see below), + CoverageJSON/PNG series per location |
+| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined; all coordinates finite and within CRS84 bounds; `limit` keeps the first coverages of the flattened collection) |
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667) |
 | `trajectory` | `/collections/{id}/trajectory` | partial | 2-D `LINESTRING` only, meaning a *vertical cross-section* (PVOL sites). `LINESTRINGZ/M` (per-node z/time) not accepted; no along-path sampling on gridded engines |
@@ -133,7 +134,8 @@ value type, every CoverageJSON range is encoded as `float`.
 | `crs` | partial | data queries serve CRS84 only, which every `data_queries` link advertises in `crs_details` (#918). Cube validates it: the CRS84 URI, `CRS84` or `OGC:CRS84` are accepted, anything else is a 400; the other data queries do not read it (#84). `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | partial | cube only: `n` evenly spaced positions from the bbox's west/south edge to its east/north edge (for `z`, from the lowest to the highest selected level), both ends included, each taking the nearest native value; a position more than half a cell off the grid is null. `0` or absent is the native resolution; a whole number up to 1 000 000, else 400 stating that range. Area does not take `resolution-x`/`-y` |
-| `limit` | partial | `/collections` pagination and `items` (default 10, maximum 10 000, clamped; invalid → 400); `/locations` returns the full inventory (EDR 1.1 does not define locations paging) |
+| `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. On `/locations` it pages the list, below. Not on trajectory, where it is a 400: EDR 1.2 does not list it there. `items` (#928) pages with the Features default of 10. `/collections` pages with Common's default and maximum of 1000 |
+| `offset` | ✓ | `/locations` with `limit`, as on `/collections`: the offset pagination extension. `offset` without `limit` on `/locations` is a 400. `/locations` takes only `limit`, `offset`, `bbox`, `datetime` and `f`; any other parameter is a 400 naming them. `bbox` and `datetime` are accepted but not applied yet (#932) |
 
 Data queries execute on a dedicated, bounded runtime, including radius and
 instance routes. Admission is capped at 2–8 concurrent queries (available CPUs,
@@ -144,17 +146,32 @@ a cancelled/timed-out MULTIPOINT stops before its next engine call. This bounds
 concurrency without claiming that synchronous engine I/O is preemptible.
 
 For `/locations`, the same permit covers retrieval, metadata, direct JSON
-serialization and ETag hashing (#533). The response still contains the full
-EDR 1.1 inventory, but no intermediate JSON tree duplicates every location and
-its parameter metadata. Encoded location buffers are bounded by
-`MC_EDR_LOCATIONS_MAX_BYTES` (default 16 MiB per complete inventory) and `MC_EDR_LOCATIONS_MEMORY_MB` (default 128
-MiB process-wide). Memory reservations cover buffer growth, including the old
-and new allocations during copying, and remain with response bytes through
-middleware and client delivery. Exhaustion returns 503 without partial JSON or
-truncation; cancellation/deadlines stop serialization. Engine-owned inventory
-snapshots and the `get_locations()` result are separate from this encoded-buffer
-budget; retrieval remains under the bounded query executor. EDR 1.1's complete
-inventory contract remains unchanged: there is no implicit pagination.
+serialization and ETag hashing (#533). Without `limit` the response is the
+complete inventory, byte for byte what it was before paging existed: no
+counts, one `self` link, no implicit pagination. With `limit` (EDR 1.2,
+#922) it is one page of the inventory in the engine's order, which is stable
+within one inventory snapshot: CSV first-seen order, PostGIS and BUFR by
+station id. A page adds `numberMatched` and `numberReturned`, and `self`,
+`next` and `prev` links built like `/collections` paging: the resolved,
+clamped `limit`, `offset` omitted at 0, `prev` only from a non-empty page,
+and every other query parameter of the request repeated. The arithmetic is
+`ds_core::collection_search::page_window`, the one `/collections` uses. An
+`offset` past the end is an empty page without `next` or `prev`. A page
+refreshed between requests can shift, as with any offset paging.
+
+No intermediate JSON tree duplicates every location and its parameter
+metadata. Encoded location buffers, a complete inventory or a page alike, are
+bounded by `MC_EDR_LOCATIONS_MAX_BYTES` (default 16 MiB per response) and
+`MC_EDR_LOCATIONS_MEMORY_MB` (default 128 MiB process-wide). Memory
+reservations cover buffer growth, including the old and new allocations
+during copying, and remain with response bytes through middleware and client
+delivery. Exhaustion returns 503 without partial JSON or truncation: a
+complete inventory over the per-response cap is a `ResponseLimit` whose
+description suggests paging it with `limit`, a page over it one that
+suggests a smaller `limit`. Cancellation/deadlines stop serialization.
+Engine-owned inventory snapshots and the `get_locations()` result are
+separate from this encoded-buffer budget and are the whole inventory for a
+page too; retrieval remains under the bounded query executor.
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499).
 

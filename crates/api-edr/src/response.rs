@@ -454,7 +454,15 @@ pub struct LocationsContext<'a> {
     pub base_url: &'a str,
 }
 
-/// Serialize the complete EDR 1.1 location inventory directly into response
+/// One page of a `/locations` list requested with `limit` (EDR 1.2, #922).
+pub struct LocationsPage<'a> {
+    /// Size of the whole inventory the page was cut from.
+    pub number_matched: usize,
+    /// `self`, then `next`/`prev` when they exist: `(href, rel, title)`.
+    pub links: &'a [(String, &'static str, &'static str)],
+}
+
+/// Serialize the complete EDR location inventory directly into response
 /// bytes. Only one feature's links are allocated at a time; parameter and
 /// temporal metadata are borrowed instead of cloned into a full JSON tree.
 pub fn locations_to_json(
@@ -462,15 +470,19 @@ pub fn locations_to_json(
     ctx: &LocationsContext,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = Vec::new();
-    locations_to_writer(locations, ctx, &mut bytes)?;
+    locations_to_writer(locations, ctx, None, &mut bytes)?;
     Ok(bytes)
 }
 
 /// Serialize into an admitted writer so size/deadline/memory failures stop
 /// construction before an unbounded response buffer has been allocated.
+/// `page` is `None` for the complete inventory, whose body stays exactly the
+/// pre-paging one (no counts, one `self` link); a page adds `numberMatched`,
+/// `numberReturned` and its navigation links.
 pub(crate) fn locations_to_writer(
     locations: &[Location],
     ctx: &LocationsContext,
+    page: Option<&LocationsPage>,
     writer: impl std::io::Write,
 ) -> Result<(), serde_json::Error> {
     let datetime = ctx
@@ -482,6 +494,24 @@ pub(crate) fn locations_to_writer(
         "{}/edr/collections/{}/locations",
         ctx.base_url, ctx.collection_id
     );
+    let links: Vec<LocationLink> = match page {
+        None => vec![LocationLink {
+            href: &href,
+            rel: "self",
+            title: "Locations",
+            kind: "application/geo+json",
+        }],
+        Some(page) => page
+            .links
+            .iter()
+            .map(|(href, rel, title)| LocationLink {
+                href,
+                rel,
+                title,
+                kind: "application/geo+json",
+            })
+            .collect(),
+    };
     serde_json::to_writer(
         writer,
         &LocationCollection {
@@ -490,12 +520,9 @@ pub(crate) fn locations_to_writer(
                 ctx,
                 datetime: &datetime,
             },
-            links: [LocationLink {
-                href: &href,
-                rel: "self",
-                title: "Locations",
-                kind: "application/geo+json",
-            }],
+            links,
+            number_matched: page.map(|p| p.number_matched),
+            number_returned: page.map(|_| locations.len()),
             kind: "FeatureCollection",
         },
     )
@@ -504,7 +531,11 @@ pub(crate) fn locations_to_writer(
 #[derive(serde::Serialize)]
 struct LocationCollection<'a> {
     features: LocationFeatures<'a>,
-    links: [LocationLink<'a>; 1],
+    links: Vec<LocationLink<'a>>,
+    #[serde(rename = "numberMatched", skip_serializing_if = "Option::is_none")]
+    number_matched: Option<usize>,
+    #[serde(rename = "numberReturned", skip_serializing_if = "Option::is_none")]
+    number_returned: Option<usize>,
     #[serde(rename = "type")]
     kind: &'static str,
 }
@@ -547,7 +578,7 @@ struct LocationProperties<'a> {
 #[derive(serde::Serialize)]
 struct LocationLink<'a> {
     href: &'a str,
-    rel: &'static str,
+    rel: &'a str,
     title: &'a str,
     #[serde(rename = "type")]
     kind: &'static str,
@@ -627,5 +658,33 @@ mod location_tests {
         let empty: Value = serde_json::from_slice(&locations_to_json(&[], &ctx).unwrap()).unwrap();
         assert_eq!(empty["features"], json!([]));
         assert_eq!(empty["links"], expected["links"]);
+
+        // A page carries its counts and navigation links instead.
+        let links = [
+            (format!("{endpoint}?limit=1"), "self", "This page"),
+            (format!("{endpoint}?limit=1&offset=1"), "next", "Next page"),
+        ];
+        let mut bytes = Vec::new();
+        let page = LocationsPage {
+            number_matched: 7,
+            links: &links,
+        };
+        locations_to_writer(
+            &[Location {
+                id: "station-1".into(),
+                label: "x".into(),
+                latitude: 60.0,
+                longitude: 24.0,
+            }],
+            &ctx,
+            Some(&page),
+            &mut bytes,
+        )
+        .unwrap();
+        let paged: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(paged["numberMatched"], 7);
+        assert_eq!(paged["numberReturned"], 1);
+        assert_eq!(paged["links"][1]["rel"], "next");
+        assert_eq!(paged["links"][1]["type"], "application/geo+json");
     }
 }
