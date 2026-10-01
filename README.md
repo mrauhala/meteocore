@@ -42,7 +42,7 @@ baselines, with implementation gaps and evidence for standards experimentation.
 | `api-edr` | [OGC API - EDR 1.1](https://docs.ogc.org/is/19-086r6/19-086r6.html) | ogcapi-common-1: core, landing-page, oas30; ogcapi-edr-1: core, collections, json, edr-geojson, covjson |
 | `api-features` | [OGC API - Features 1.0](https://docs.ogc.org/is/17-069r4/17-069r4.html) | core, oas30, geojson |
 | `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, spatial-subsetting, scaling, datetime, crs, png, jpeg |
-| `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | ogcapi-tiles-1: core, tileset, tilesets-list, png, jpeg, mvt; tms 2.0: tilematrixset, json-tilematrixset |
+| `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | ogcapi-tiles-1: core, tileset, tilesets-list, geodata-tilesets, datetime, png, jpeg, mvt; tms 2.0: tilematrixset, json-tilematrixset; at the shared root also ogcapi-maps-1: tilesets |
 | `api-wms` | [OGC WMS 1.3.0](https://portal.ogc.org/files/?artifact_id=14416) | GetCapabilities, GetMap, GetLegendGraphic |
 | `api-3dtiles` | [OGC 3D Tiles 1.1](https://docs.ogc.org/cs/22-025r4/22-025r4.html) | point clouds (`.pnts`), glTF mesh content (`.glb` — isosurface + echo-top), cylindrical voxels (`.glb`, `EXT_primitive_voxels` draft); bundled CesiumJS viewer SPA |
 
@@ -386,6 +386,38 @@ Maps Part 1 core, spatial subsetting, scaling, date-time and CRS parameters
 - **Headers**: every map carries `Content-Crs`, `Content-Bbox` (the rendered
   corners, in the CRS's axis order) and, on a collection with a temporal
   extent, `Content-Datetime` (the instant rendered).
+
+### Map tile requests (OGC API - Tiles, Maps Map Tilesets)
+
+Map tiles, `/collections/{id}/map/tiles/{tms}/{z}/{row}/{col}` and the styled
+form at the shared root, and `/tiles/collections/{id}/tiles/…` on the per-API
+service, take (#946):
+
+- **Time** (Tiles DateTime): `datetime` (an instant or an interval, `a/b`,
+  `../b`, `a/..`) or `subset=datetime(…)` (double-quoted RFC 3339 values,
+  partial dates, `*`). An instant snaps to an available time step as before;
+  an interval renders the latest one inside it. A selection with no time step,
+  or a subset entirely outside the time axis, is an empty tile: `204 No
+  Content`. `datetime` with a time subset, or any other subset axis, is a 400.
+  `OGCAPI-datetime` names the instant rendered. Only an instant marks a tile
+  `immutable`.
+- **Size** (Maps Scaling, which Map Tilesets requires on map tiles):
+  `width` and `height` override the tile matrix's 256 × 256 over the same tile
+  area (one alone keeps square pixels); `scale-denominator` derives the size
+  from the scale at the tile's centre, and is a 400 with `width` or `height`.
+  Sizes are capped as for maps: 8000 a side, 64 000 000 in all.
+- **Anything else** is a 400 naming the accepted parameters: `f`, `datetime`,
+  `subset`, `width`, `height`, `scale-denominator`, `parameter-name`,
+  `elevation`, `quality`.
+
+Vector tiles, `/collections/{id}/tiles/{tms}/{z}/{row}/{col}` at the shared
+root and `?f=mvt` on the per-API service, take the same `datetime` and
+`subset=datetime(…)` (#794): only features whose temporal geometry intersects
+the instant or interval are encoded, as Features' `datetime` selects them, and
+features without one always are. A time subset entirely outside the
+collection's temporal extent is `204`; a collection without a time dimension
+matches every time. Without a time, a tile holds the collection's default
+features. The map tile parameters and unknown ones are 400s.
 
 ## Configuration
 
@@ -1755,18 +1787,23 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `bbox` | yes | — | `west,south,east,north`, always lon/lat order. West > east is a box crossing the antimeridian: `170,10,-170,20` renders the 20° across 180°, as `170,10,190,20` does. Both longitudes of such a box must be within ±180. South must be less than north. GeoTIFF and Zarr sources stored in −180…180 do not yet render past 180° and show nodata there. |
-| `bbox-crs` | no | `CRS:84` | Only `CRS:84` (or `http://www.opengis.net/def/crs/OGC/1.3/CRS84`) is accepted — every other value returns 400 |
-| `width` | no | `256` | Image width in pixels, max 8000 |
-| `height` | no | `256` | Image height in pixels, max 8000 |
-| `crs` | no | `CRS:84` | Output CRS: `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, or `EPSG:3035` |
-| `datetime` | no | latest | ISO 8601 instant; defaults to the latest timestep advertised by the engine |
+| `bbox` | no | the collection's spatial extent | Four values in the `bbox-crs` axis order: `west,south,east,north` for CRS84, latitude first for EPSG:4326, northing first for EPSG:3035. A geographic west > east is a box crossing the antimeridian: `170,10,-170,20` renders the 20° across 180°, as `170,10,190,20` does; both longitudes of such a box must be within ±180. A projected box's lower corner must lie below and left of its upper corner. Six values (a 3D box) are a 400. GeoTIFF and Zarr sources stored in −180…180 do not yet render past 180° and show nodata there. Not with `center` or a spatial `subset` (400). |
+| `bbox-crs` | no | CRS84 | Any CRS the collection lists in `crs`, as a URI, its `https` form, a safe CURIE (`[EPSG:3857]`) or a short code (`CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, `EPSG:3035`). Ignored without `bbox`. |
+| `subset` | no | — | Repeatable or comma-separated `axis(low:high)` / `axis(value)`. Spatial: `Lon`/`Lat` (also `Long`, `Longitude`, `Latitude`) in a geographic `subset-crs`, `E`/`N` (also `X`, `Easting`, `Y`, `Northing`) in a projected one, each an interval; an axis left out, or `*`, keeps the extent's edge; a `Lon` low above its high crosses the antimeridian; an interval entirely outside its axis is a 404. Time: `time` (also `t`) with double-quoted RFC 3339 values, partial dates or `*`, selecting as `datetime` does; an instant outside the time axis is a 404. Any other axis is a 400. |
+| `subset-crs` | no | CRS84 | The CRS of a spatial `subset`, in the forms `bbox-crs` takes. Ignored without one. |
+| `center` | no | — | Two coordinates in the `center-crs` axis order. `width` and `height` then set the size, and the extent follows at the collection's native resolution or `scale-denominator`. Not with `bbox` or a spatial `subset` (400). |
+| `center-crs` | no | CRS84 | The CRS of `center`, in the forms `bbox-crs` takes. Ignored without `center`. |
+| `width` | no | see description | Image width: a positive integer up to 8000. Over an area (`bbox`, a spatial `subset` or the default extent), an omitted side keeps square pixels and with both omitted the longer side is 1024. With `center`, or `scale-denominator` and no area, it sizes the map around the point: omitted, it is `height`'s value, else 1024. |
+| `height` | no | see description | Image height, as `width`. |
+| `scale-denominator` | no | — | A positive number on the standard 0.28 mm pixel: one pixel spans scale × 0.28 mm on the ground at the map centre. With `bbox` or a spatial `subset` it derives the size, and is a 400 with `width` or `height`; otherwise it sets the extent around `center`, or the extent's centre. |
+| `crs` | no | the collection's `storageCrs`, else CRS84 | Output CRS: CRS84, EPSG:4326, EPSG:3857, EPSG:3067 or EPSG:3035, in the forms `bbox-crs` takes. The storage CRS is the default when it is one of these. |
+| `datetime` | no | latest | An RFC 3339 instant, snapped to an available time step, or an interval (`a/b`, `../b`, `a/..`), rendering the latest time step inside it; an interval holding none is a 404. Not with `subset=time(…)` (400). |
 | `f` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp` |
 | `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData), or an RGB composite of a satellite collection, which renders with the `default` style only (another style is 404). The valid names are the keys of the collection's `parameter_names`. Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
 | `transparent` | no | — | Accepted but currently a no-op |
 | `quality` | no | see description | MeteoCore extension: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range: 400. |
 
-`width × height` is additionally capped at `MAX_MAP_PIXELS = 64,000,000` (= 8000²), so a request at the per-dimension cap never trips the pixel cap with a confusing second error.
+`width × height`, given or derived, is additionally capped at `MAX_MAP_PIXELS = 64,000,000` (= 8000²), so a request at the per-dimension cap never trips the pixel cap with a confusing second error. A derived size over a cap is a 400 naming what set it. See also [Map requests](#map-requests-ogc-api---maps).
 
 ### Responses
 
@@ -1774,8 +1811,10 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 
 - `Content-Type: image/png|image/jpeg|image/webp`
 - `Content-Crs:` OGC URI of the output CRS
+- `Content-Bbox:` the rendered frame's corners, in the output CRS's axis order
+- `Content-Datetime:` the instant rendered, on a collection with a temporal extent
 - `ETag:` FNV-1a hash of the encoded response body — changes whenever the rendered pixels change, regardless of whether the cache key changed. This is what makes a server-side fix (e.g. colormap correction) invalidate stale browser caches instead of letting them serve infinite `304`s.
-- `Cache-Control: public, max-age=86400, immutable` when `datetime` is set; `public, max-age=60, must-revalidate` otherwise
+- `Cache-Control: public, max-age=86400, immutable` when a time instant is requested; `public, max-age=60, must-revalidate` otherwise, intervals and `*` included
 - `X-Cache: HIT | MISS | EMPTY | ERROR` for observability. Set on every 200 and 304 response: `HIT` for cache-hit revalidations, `MISS` for post-render revalidations, `EMPTY` for transparent-tile fast-paths, `ERROR` for the WMS error-tile fallback. The 304 carries the same label the 200 would, so revalidations stay in their original dashboard category. Operators can grep by value rather than reasoning about header absence.
 
 `If-None-Match` is evaluated against the content-derived ETag from the cache hit or the freshly-rendered bytes — not before the cache lookup. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
@@ -1783,13 +1822,13 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 ### Differences from WMS
 
 - REST paths instead of `REQUEST=`/`LAYERS=` query parameters
-- `bbox` is always lon/lat (no CRS-dependent axis swap)
+- `bbox` follows `bbox-crs` (CRS84, lon/lat, by default), not the output `crs`; a CRS's own axis order applies, so EPSG:4326 is latitude first in both
 - Multi-parameter selection uses `?parameter-name=`, not `LAYERS=collection/param`
 - Errors are JSON, not `ServiceExceptionReport` XML
 
 ### Conformance Classes
 
-`core`, `collection-map`, `styled-map`, `spatial-subsetting`, `scaling`, `datetime`, `crs`, `png`, `jpeg`. WebP is implemented but no `webp` conformance class is declared (none exists in the OGC API - Maps 1.0 spec).
+`core`, `collection-map`, `styled-map`, `spatial-subsetting`, `scaling`, `datetime`, `crs`, `png`, `jpeg`. WebP is implemented but no `webp` conformance class is declared (none exists in the OGC API - Maps 1.0 spec). Map Tilesets (`tilesets`) is declared at the shared root only, where map tiles sit under the map resource (`/collections/{id}/map/tiles`); this per-API service links map tilesets in `/tiles` instead.
 
 ## OGC API - Tiles
 
@@ -1807,7 +1846,7 @@ Serves raster data via `MapEngine` (sharing styles, semaphore, and rendered-imag
 | `GET /tiles/collections/{id}/tiles/{tms}/{z}/{row}/{col}` | Get a tile (raster default, MVT via `?f=mvt`) |
 | `GET /tiles/collections/{id}/styles/{styleId}/tiles/{tms}/{z}/{row}/{col}` | Get a styled raster tile; `?f=mvt` is rejected here |
 
-All tiles are 256×256 pixels. Tile coordinates follow OGC convention: `tileRow` is Y top-to-bottom, `tileCol` is X left-to-right.
+Tiles are 256×256 pixels; `width`, `height` or `scale-denominator` resize a map tile over the same area. Tile coordinates follow OGC convention: `tileRow` is Y top-to-bottom, `tileCol` is X left-to-right.
 
 ### Supported TileMatrixSets
 
@@ -1823,11 +1862,14 @@ Both support `tileMatrix` 0–24 (capped by `MAX_ZOOM_LEVEL`). `tileMatrixSetLim
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `f` | no | `image/png` | Raster: `image/png`, `image/jpeg`, `image/webp`. Vector: `mvt` or `application/vnd.mapbox-vector-tile`. |
-| `datetime` | no | latest | ISO 8601 instant; ignored for `?f=mvt` |
-| `parameter-name` | no | engine default | Same semantics as Maps `parameter-name`. Ignored for `?f=mvt`. |
+| `datetime` | no | latest | RFC 3339 instant or interval (`a/b`, `../b`, `a/..`). Map tiles: an instant snaps to an available time step, an interval renders the latest step inside it, none inside is `204`. Vector tiles: the features intersecting it, and those without a time. Not with a time `subset` |
+| `subset` | no | — | `datetime(…)` only: double-quoted RFC 3339 values, partial dates (`yyyy` … `yyyy-mm-ddThh:mmZ`) or `*`, an instant or `low:high`, selecting as `datetime` does. Entirely outside the time axis (a vector collection's temporal extent): `204`. Any other axis: 400 |
+| `width`, `height` | no | 256 | Map tiles only: the image's pixels over the tile's area, a positive integer up to 8000 (`width × height` up to 64 000 000); one alone keeps square pixels |
+| `scale-denominator` | no | — | Map tiles only: the image size at this scale (0.28 mm pixels, ground metres at the tile's centre). Not with `width` or `height` |
+| `parameter-name` | no | engine default | Same semantics as Maps `parameter-name`. Map tiles only. |
 | `quality` | no | see description | Raster only, same semantics as Maps `quality`: 1–100 for `image/webp` (100 = lossless, default the collection's `[wms] webp_quality`, else lossless) and `image/jpeg` (default 85). With `image/png`, out of range or on a vector tile: 400. |
 
-`tileMatrix > 24` returns 400. Tile coordinates outside the matrix (e.g. `row=1` at `z=0` on `WebMercatorQuad`) return 404.
+`tileMatrix > 24` returns 400. Tile coordinates outside the matrix (e.g. `row=1` at `z=0` on `WebMercatorQuad`) return 404. Any other query parameter is a 400 naming the accepted ones; a vector tile takes only `f`, `datetime` and `subset`.
 
 ### Raster Tiles
 
@@ -1836,26 +1878,28 @@ Raster requests resolve a style (the `default` style for the unstyled route, or 
 1. TMS → bbox conversion (Mercator math for `WebMercatorQuad`, linear lon/lat for `WorldCRS84Quad`).
 2. ETag check / rendered-cache check.
 3. On miss: acquire render permit (timed out → 503), call `MapEngine::get_raster_tile()` with the TMS-derived `output_crs`, colorize, encode.
-4. Empty (all-nodata) tiles return a pre-generated transparent PNG with `X-Cache: EMPTY` and `Content-Type: image/png` regardless of the requested format — no engine call, no cache insert. Clients that strictly need JPEG/WebP output should check `X-Cache: EMPTY` and refetch only if needed; the alternative would be re-encoding a known-uniform buffer on every empty tile.
+4. Empty (all-nodata) tiles return a pre-generated transparent PNG of the tile's size with `X-Cache: EMPTY` and `Content-Type: image/png` regardless of the requested format — no cache insert. Clients that strictly need JPEG/WebP output should check `X-Cache: EMPTY` and refetch only if needed; the alternative would be re-encoding a known-uniform buffer on every empty tile.
 
-Successful responses include `Content-Type`, `Content-Crs` (OGC URI for the TMS's CRS), `ETag`, `Cache-Control` (`max-age=86400, immutable` when `datetime` is set, `max-age=60, must-revalidate` otherwise), and `X-Cache: HIT|MISS|EMPTY`.
+Successful responses include `Content-Type`, `Content-Crs` (OGC URI for the TMS's CRS), `ETag`, `Cache-Control` (`max-age=86400, immutable` when a time instant is requested, `max-age=60, must-revalidate` otherwise), `OGCAPI-datetime` (the instant rendered, on a collection with a temporal extent) and `X-Cache: HIT|MISS|EMPTY`. The rendered cache keys on the time step rendered, so every selection resolving to one step shares its tile.
 
 ### Vector Tiles (MVT)
 
-When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against a collection backed by a `FeatureEngine` (GeoJSON, PostGIS, CSV's feature mode), the handler converts the tile bbox into a `FeatureQuery`, encodes the result via `ds-mvt`, and returns Mapbox Vector Tile bytes. The layer name in the MVT payload is the collection ID, matching the convention used by `mapbox-vector-tile-js` (bundled in MapLibre GL JS).
+When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against a collection backed by a `FeatureEngine` (GeoJSON, PostGIS, CSV's feature mode, CAP, nowcast cells, …), or the shared root's `…/tiles/…` route is, the handler converts the tile bbox into a `FeatureQuery`, encodes the result via `ds-mvt`, and returns Mapbox Vector Tile bytes. The layer name in the MVT payload is the collection ID, matching the convention used by `mapbox-vector-tile-js` (bundled in MapLibre GL JS).
 
 | Behavior | Detail |
 |----------|--------|
 | Feature limit | `MAX_FEATURES_PER_TILE = 50,000`. Exceeding it returns **422 Unprocessable Content** (`tile-too-dense`) — the request is well-formed but the data can't be served at that scale. Raise the collection's `minzoom` or narrow the bbox. |
 | Polygon clipping | Features are clipped to a buffered tile envelope (1/16 of `extent`, matching MapLibre's default source-layer buffer) so seams between adjacent tiles remain invisible. |
 | ETag | Content-derived (FNV-1a over the encoded bytes) — a data change yields different bytes and therefore a different ETag, so clients holding the old one revalidate. |
-| Cache | `Cache-Control: public, max-age=300`. Cached in a separate `VectorTileCache` (not the raster `RenderedCache`), keyed by collection + TMS + z/x/y + properties hash + `FeatureEngine::data_version()` so a reload/refresh produces a clean miss instead of an infinite-revalidate loop. |
+| Time | `datetime` or `subset=datetime(…)` becomes the `FeatureQuery` interval (an instant is `start == end`): the engine keeps the features whose temporal geometry intersects it, and those without one. A time subset entirely outside the collection's temporal extent is `204`; a collection without a time dimension is not filtered. |
+| Cache | `Cache-Control: public, max-age=300`. Cached in a separate `VectorTileCache` (not the raster `RenderedCache`), keyed by collection + TMS + z/x/y + properties hash + `FeatureEngine::data_version()` + the time interval, so a reload/refresh produces a clean miss instead of an infinite-revalidate loop, a tile for one time is never served for another, and equal selections share an entry. |
+| Empty | A tile with no matching feature is a `200` MVT holding the empty layer (Tiles `/req/core/tc-error` B). |
 | Styled route | `?f=mvt` is rejected on `/styles/{styleId}/tiles/...` with 400 — vector tiles aren't styled server-side. |
 | Render permit | MVT encoding shares the raster render semaphore (CPU-bound budget). Acquired *after* the feature query so engine I/O doesn't hold a slot. |
 
 ### Conformance Classes
 
-`ogcapi-tiles-1`: `core`, `tileset`, `tilesets-list`, `png`, `jpeg`, `mvt`. `tms-2.0`: `tilematrixset`, `json-tilematrixset`. WebP is implemented but has no conformance class.
+`ogcapi-tiles-1`: `core`, `tileset`, `tilesets-list`, `geodata-tilesets`, `datetime`, `png`, `jpeg`, `mvt`. `tms-2.0`: `tilematrixset`, `json-tilematrixset`. WebP is implemented but has no conformance class. DateTime covers map and vector tiles ([#794](https://github.com/mrauhala/meteocore/issues/794)). At the shared root the Tiles block also declares OGC API - Maps `tilesets`: map tiles sit under the map resource there and take the Maps Scaling parameters.
 
 ## Caching
 

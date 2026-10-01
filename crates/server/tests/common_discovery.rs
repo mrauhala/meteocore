@@ -1686,3 +1686,217 @@ async fn render_parameters_are_advertised_and_declared_on_every_raster_surface()
         }
     }
 }
+
+const MAPS_TILESETS: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets";
+const TILES_DATETIME: &str = "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/datetime";
+
+/// [`app`] for a raster surface ("maps", "tiles" or "shared"), every
+/// collection with a `default` and a `grayscale` style.
+fn styled_app(surface: &str) -> (Router, String) {
+    let (configs, _, engines, features) = catalog();
+    let style = |name: &str| ds_render::StyleInfo {
+        name: name.into(),
+        title: name.into(),
+        palette: ds_render::builtin_palette_arc("viridis").unwrap(),
+        colormap: Arc::new(ds_render::LutColorMap::from_builtin(
+            ds_render::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        )),
+        min: 0.0,
+        max: 1.0,
+        parameter: None,
+    };
+    let styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = configs
+        .keys()
+        .map(|id| {
+            let named = ["default", "grayscale"].map(|name| (name.to_string(), style(name)));
+            (id.clone(), named.into_iter().collect())
+        })
+        .collect();
+    let mut maps = (**maps_state(configs.clone(), engines.clone()).load()).clone();
+    maps.styles = styles.clone();
+    let maps = Arc::new(ArcSwap::from_pointee(maps));
+    let mut tiles =
+        (**tiles_state(configs.clone(), engines, features.clone(), false).load()).clone();
+    tiles.styles = styles;
+    let tiles = Arc::new(ArcSwap::from_pointee(tiles));
+    match surface {
+        "shared" => {
+            let api = api_common::shared::SharedApi::new(
+                "",
+                vec![
+                    Arc::new(api_maps::MapsBlock::new(maps)),
+                    Arc::new(api_tiles::TilesBlock::new(tiles)),
+                    Arc::new(api_features::FeaturesBlock::new(features_state(
+                        configs, features,
+                    ))),
+                ],
+                vec![],
+            );
+            let router = api_common::shared::router(api);
+            (Router::new().nest("/base", router), "/base".into())
+        }
+        "maps" => (
+            Router::new().nest("/base/maps", api_maps::router(maps)),
+            "/base/maps".into(),
+        ),
+        "tiles" => (
+            Router::new().nest("/base/tiles", api_tiles::router(tiles)),
+            "/base/tiles".into(),
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// Map Tilesets `/req/tilesets/desc-links` on one surface: beside every map
+/// resource a collection links (its `map`, and each style's), a
+/// `tilesets-map` link to that map's own tiles, `{map}/tiles`, which
+/// resolves to a tileset list. The number of map resources checked, or the
+/// first that fails.
+async fn map_tiles_beside_every_map(app: &Router, prefix: &str) -> Result<usize, String> {
+    let link = |links: &Value, rel: &str| {
+        links.as_array().and_then(|links| {
+            links
+                .iter()
+                .find(|l| l["rel"] == rel)
+                .and_then(|l| l["href"].as_str())
+                .map(str::to_owned)
+        })
+    };
+    let list = get_json(app, &format!("{prefix}/collections?limit=1000")).await;
+    let mut maps = 0;
+    for entry in list["collections"].as_array().unwrap() {
+        let doc = get_json(app, &link(&entry["links"], "self").unwrap()).await;
+        let id = doc["id"].as_str().unwrap().to_owned();
+        let mut resources = vec![(id.clone(), doc["links"].clone())];
+        for style in doc["styles"].as_array().into_iter().flatten() {
+            resources.push((
+                format!("{id} style {}", style["id"]),
+                style["links"].clone(),
+            ));
+        }
+        for (what, links) in resources {
+            let Some(map) = link(&links, api_common::rel::MAP) else {
+                continue;
+            };
+            maps += 1;
+            let expected = format!("{map}/tiles");
+            match link(&links, api_common::rel::TILESETS_MAP) {
+                Some(tiles) if tiles == expected => {}
+                other => return Err(format!("{what}: tilesets-map {other:?}, not {expected}")),
+            }
+            let tilesets = get_json(app, &expected).await;
+            if tilesets["tilesets"].as_array().is_none_or(Vec::is_empty) {
+                return Err(format!("{what}: {expected} lists no tileset"));
+            }
+        }
+    }
+    Ok(maps)
+}
+
+/// #946: a declared class and the resources it requires cannot drift apart.
+///
+/// - OGC API - Maps "Map Tilesets": declared, every map resource links its
+///   own map tiles beside it (the one valid direction; the converse fails on
+///   purpose, since Tiles' geodata-tilesets class links `tilesets-map` on
+///   `/tiles` without being a Maps class). Only the shared root has
+///   `{map}/tiles`: the per-API `/maps` service links map tilesets in
+///   `/tiles`, which is why it must not declare the class (#259).
+/// - Both classes: the tile operations declare the parameters the class
+///   requires, Tiles DateTime `datetime` and `subset` with the standard's
+///   schemas on every tile, map and vector (#794), and Map Tilesets Maps'
+///   Scaling parameters on map tiles (`/req/tilesets/tiles-parameters`), and
+///   the per-API Tiles document stays valid OpenAPI.
+#[tokio::test]
+async fn declared_map_tile_classes_match_what_each_surface_serves() {
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
+    let validator = jsonschema::Validator::new(&schema).unwrap();
+    for surface in ["shared", "maps", "tiles"] {
+        let (app, prefix) = styled_app(surface);
+        let conformance = get_json(&app, &format!("{prefix}/conformance")).await;
+        let declares = |class: &str| {
+            conformance["conformsTo"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == class)
+        };
+        assert_eq!(declares(MAPS_TILESETS), surface == "shared", "{surface}");
+        assert_eq!(declares(TILES_DATETIME), surface != "maps", "{surface}");
+
+        let beside = map_tiles_beside_every_map(&app, &prefix).await;
+        if declares(MAPS_TILESETS) {
+            // Six collections, each with its map and two styled maps.
+            assert_eq!(beside, Ok(18), "{surface}");
+        }
+        if surface == "maps" {
+            let error = beside.unwrap_err();
+            assert!(error.contains("/tiles/collections/"), "{error}");
+        }
+
+        let api = get_json(&app, &format!("{prefix}/api")).await;
+        let errors: Vec<_> = validator
+            .iter_errors(&api)
+            .map(|e| format!("{e} at {}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{surface}: {}", errors.join("\n"));
+        // Every tile operation, map and vector: the shared root's map,
+        // styled map and vector tiles, the per-API mixed and styled tiles.
+        let tile = "/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}";
+        let tiles: Vec<_> = api["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.ends_with(&format!("/tiles{tile}")))
+            .collect();
+        assert_eq!(
+            tiles.len(),
+            match surface {
+                "maps" => 0,
+                "shared" => 18,
+                _ => 12,
+            },
+            "{surface}"
+        );
+        for (path, item) in tiles {
+            let map_tile = surface == "tiles" || path.contains("/map/tiles/");
+            let operation = &item["get"];
+            let parameter = |name: &str| {
+                operation["parameters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| match p["$ref"].as_str() {
+                        Some(r) => api.pointer(r.strip_prefix('#').unwrap()).unwrap(),
+                        None => p,
+                    })
+                    .find(|p| p["name"] == name && p["in"] == "query")
+                    .cloned()
+            };
+            if declares(TILES_DATETIME) {
+                // `/req/collections/rc-datetime-definition` A and the Tiles
+                // OpenAPI `subset` fragment.
+                let datetime = parameter("datetime").unwrap_or_else(|| panic!("{path}"));
+                assert_eq!(datetime["schema"], json!({"type": "string"}), "{path}");
+                assert_eq!(datetime["style"], "form", "{path}");
+                assert_eq!(datetime["explode"], false, "{path}");
+                let subset = parameter("subset").unwrap_or_else(|| panic!("{path}"));
+                assert_eq!(
+                    subset["schema"],
+                    json!({"type": "array", "items": {"type": "string"}}),
+                    "{path}"
+                );
+                assert_eq!(subset["style"], "form", "{path}");
+                assert_eq!(subset["explode"], false, "{path}");
+                assert!(operation["responses"].get("204").is_some(), "{path}");
+            }
+            if declares(MAPS_TILESETS) && map_tile {
+                for name in ["width", "height", "scale-denominator"] {
+                    assert!(parameter(name).is_some(), "{path} lacks {name}");
+                }
+            }
+        }
+    }
+}

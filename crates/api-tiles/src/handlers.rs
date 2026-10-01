@@ -2,13 +2,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Extension;
 use axum::Json;
 use serde_json::json;
 
+use api_common::map_frame;
+use api_common::subset::{self, RequestedTime, TimeSelection};
 use api_common::workbench::Surface;
 use api_common::{rel, Mount};
 use ds_core::config::CollectionConfig;
@@ -712,6 +714,7 @@ pub(crate) fn collection_openapi_paths(
                         "description": "Column index"
                     },
                     {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/tile-subset"},
                     {"$ref": "#/components/parameters/f"},
                     {"$ref": "#/components/parameters/elevation"}
                 ],
@@ -720,6 +723,7 @@ pub(crate) fn collection_openapi_paths(
                         "description": "Tile image or vector tile",
                         "content": content
                     },
+                    "204": {"description": "Empty tile: a map tile's time selects no time step, or a time subset lies outside the collection's temporal extent"},
                     "400": {"description": "Bad request"},
                     "404": {"description": "Tile not found"},
                     "422": {"description": "Tile too dense (feature count exceeds per-tile cap)"},
@@ -732,8 +736,9 @@ pub(crate) fn collection_openapi_paths(
             if let Some(parameters) =
                 collection_paths[&tile_path]["get"]["parameters"].as_array_mut()
             {
-                parameters.push(json!({"$ref": "#/components/parameters/parameter-name"}));
-                parameters.push(json!({"$ref": "#/components/parameters/quality"}));
+                for name in MAP_TILE_COMPONENTS {
+                    parameters.push(json!({"$ref": format!("#/components/parameters/{name}")}));
+                }
             }
         }
 
@@ -786,6 +791,10 @@ pub(crate) fn collection_openapi_paths(
                         {"$ref": "#/components/parameters/elevation"},
                         {"$ref": "#/components/parameters/parameter-name"},
                         {"$ref": "#/components/parameters/quality"},
+                        {"$ref": "#/components/parameters/tile-subset"},
+                        {"$ref": "#/components/parameters/tile-width"},
+                        {"$ref": "#/components/parameters/tile-height"},
+                        {"$ref": "#/components/parameters/tile-scale-denominator"},
                         {
                             "name": "f",
                             "in": "query",
@@ -803,6 +812,7 @@ pub(crate) fn collection_openapi_paths(
                                 "image/webp": {"schema": {"type": "string", "format": "binary"}}
                             }
                         },
+                        "204": {"description": "Empty map tile: the requested time selects no time step"},
                         "400": {"description": "Bad request"},
                         "404": {"description": "Collection, style or tile not found"},
                         "500": {"description": "Server error"}
@@ -899,16 +909,73 @@ pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, 
     }
 }
 
+/// Map-tile-only parameter components, after `datetime`, `tile-subset`
+/// and `elevation`, which the per-API mixed tile path lists for both kinds.
+pub(crate) const MAP_TILE_COMPONENTS: [&str; 5] = [
+    "parameter-name",
+    "quality",
+    "tile-width",
+    "tile-height",
+    "tile-scale-denominator",
+];
+
 /// OpenAPI components referenced by the per-API layout's paths.
 pub(crate) fn openapi_components() -> serde_json::Value {
     json!({
         "parameters": {
+            // OGC API - Tiles `/req/collections/rc-datetime-definition`, the
+            // Tiles OpenAPI fragment's text and this server's rules.
             "datetime": {
                 "name": "datetime",
                 "in": "query",
+                "description": "Either a date-time or an interval, half-bounded or bounded. Date and time expressions adhere to RFC 3339. Half-bounded intervals are expressed using double-dots.\n\nExamples:\n\n* A date-time: \"2018-02-12T23:20:50Z\"\n* A bounded interval: \"2018-02-12T00:00:00Z/2018-03-18T12:31:12Z\"\n* Half-bounded intervals: \"2018-02-12T00:00:00Z/..\" or \"../2018-03-18T12:31:12Z\"\n\nOn map tiles: an instant is snapped to an available time step (the last one at or before it); an interval renders the latest time step inside it, and is an empty tile (204) when it holds none. Without `datetime` or a `datetime` subset the tile shows the collection's default (normally latest) time. `OGCAPI-datetime` reports the instant rendered. Not with `subset=datetime(…)` (400).\n\nOn vector tiles: only features whose temporal geometry intersects the instant or interval, as Features' `datetime` selects them; features without a time always match. Without a time the tile holds the collection's default features.",
                 "required": false,
                 "schema": {"type": "string"},
-                "description": "ISO 8601 timestamp"
+                "style": "form",
+                "explode": false
+            },
+            // The Tiles OpenAPI `subset` fragment; map and vector tiles take
+            // the `datetime` axis (`/req/datetime/axis`).
+            "tile-subset": {
+                "name": "subset",
+                "in": "query",
+                "description": "Retrieve only part of the data by slicing or trimming along one or more axis\nFor trimming: {axisAbbrev}({low}:{high}) (preserves dimensionality)\n   An asterisk (`*`) can be used instead of {low} or {high} to indicate the minimum/maximum value.\nFor slicing:  {axisAbbrev}({value})      (reduces dimensionality)\n\nTiles take one axis, `datetime`, with double-quoted RFC 3339 values or the partial forms `yyyy`, `yyyy-mm`, `yyyy-mm-dd`, `yyyy-mm-ddThhZ` and `yyyy-mm-ddThh:mmZ`, and `*` for the first or last time step. On map tiles an instant is snapped like `datetime`, and an interval or a partial value renders the latest time step inside it. On vector tiles it selects features as `datetime` does. A value entirely outside the time axis (a vector collection's temporal extent), or a map tile interval holding no time step, is an empty tile (204). Any other axis is a 400. Not with `datetime` (400). Example: `subset=datetime(\"2018-02-12T00:00:00Z\":*)`.",
+                "style": "form",
+                "explode": false,
+                "required": false,
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            // OGC API - Maps Scaling on map tiles (Map Tilesets
+            // `/req/tilesets/tiles-parameters`): the requirement texts'
+            // fragments with this server's rules. Named apart from Maps'
+            // `width`/`height`/`scale-denominator`, whose rules differ, so
+            // the shared root keeps one definition per name.
+            "tile-width": {
+                "name": "width",
+                "in": "query",
+                "description": "Width of the viewport in pixel units to present the response (the map subset).\n\nOn a map tile it overrides the tile matrix's tileWidth; the tile matrix still sets the tile's area. A positive integer up to 8000, and `width` × `height` up to 64000000. Omitted with `height` given: the width that keeps pixels square; both omitted: the tile matrix's tileWidth and tileHeight. Not with `scale-denominator` (400).",
+                "required": false,
+                "style": "form",
+                "schema": {"type": "number", "maximum": map_frame::MAX_MAP_DIMENSION}
+            },
+            "tile-height": {
+                "name": "height",
+                "in": "query",
+                "description": "Height of the viewport in pixel units to present the response (the map subset).\n\nOn a map tile it overrides the tile matrix's tileHeight; the tile matrix still sets the tile's area. A positive integer up to 8000, and `width` × `height` up to 64000000. Omitted with `width` given: the height that keeps pixels square; both omitted: the tile matrix's tileWidth and tileHeight. Not with `scale-denominator` (400).",
+                "required": false,
+                "style": "form",
+                "schema": {"type": "number", "maximum": map_frame::MAX_MAP_DIMENSION}
+            },
+            "tile-scale-denominator": {
+                "name": "scale-denominator",
+                "in": "query",
+                "description": "Number of units in the real-world corresponding to one such unit on the display.\n\nA positive number, on the standard 0.28 mm pixel. On a map tile it sets the image's size over the tile's area: one pixel spans `scale-denominator` × 0.28 mm on the ground at the tile's centre (ground metres, not CRS units), within the 8000 and 64000000 caps. Not with `width` or `height` (400).",
+                "required": false,
+                "style": "form",
+                "schema": {"type": "number"}
             },
             "f": {
                 "name": "f",
@@ -1036,18 +1103,57 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
     }
 }
 
+/// OGC API - Tiles DateTime: map and vector tiles take `datetime` instants
+/// and intervals (`/req/collections/rc-datetime-definition`) and
+/// `subset=datetime(…)` (`/req/datetime/axis`), on both surfaces.
+pub(crate) const TILES_DATETIME: &str =
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/datetime";
+
 /// OGC API - Tiles and 2D TMS classes declared on either surface.
+///
+/// - DateTime ([`TILES_DATETIME`]) holds for every tile. A map tile snaps an
+///   instant as `/per/datetime/closest` allows, renders an interval's latest
+///   time step, and is an empty tile (204) when a selection holds none. A
+///   vector tile holds only the features whose temporal geometry intersects
+///   the selection, and those without one
+///   (`/req/collections/rc-datetime-response` A and B, #794). A time subset
+///   entirely outside the time axis is a 204 on either.
+/// - OGC API - Maps "Map Tilesets" is a Maps class and only holds where map
+///   tiles sit under the map resource, `{map}/tiles`: at the shared root,
+///   where this block declares it through [`SHARED_CONFORMANCE`], never here.
 pub(crate) const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets",
+    TILES_DATETIME,
     "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
     "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/png",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/jpeg",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt",
 ];
+
+/// OGC API - Maps "Map Tilesets" (`/req/tilesets`).
+pub const MAPS_TILESETS: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets";
+
+/// Classes the Tiles block adds at the shared root, where it serves map
+/// tiles under the Maps block's map resources (#789, Tiles Table 8):
+///
+/// - Map Tilesets ([`MAPS_TILESETS`]): every map collection links
+///   `{root}/collections/{id}/map/tiles` with `tilesets-map`
+///   (`/req/tilesets/desc-links`), and each style its
+///   `…/styles/{styleId}/map/tiles`. Map tiles honour the parameters of
+///   every declared Maps class that `/req/tilesets/tiles-parameters` lists:
+///   Scaling's `width`, `height` and `scale-denominator`. Spatial
+///   Subsetting asks only for a vertical `h`/`z` subset, and only where the
+///   spatial extent is three-dimensional, which none is here; Background,
+///   Display Resolution and General Subsetting are not declared.
+///
+/// The per-API `/maps` service has no `{map}/tiles` (its `tilesets-map`
+/// link points into `/tiles`), and `/tiles` serves no map resource, so
+/// neither declares it (#259, #946).
+pub(crate) const SHARED_CONFORMANCE: &[&str] = &[MAPS_TILESETS];
 
 /// GET {mount}/conformance
 pub async fn conformance(
@@ -1653,6 +1759,7 @@ pub async fn map_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
     Query(params): Query<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
     if params.is_mvt() {
@@ -1660,6 +1767,8 @@ pub async fn map_tile(
             "Map tiles are images; vector tiles are served at /collections/{id}/tiles/…"
         )));
     }
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_TILE_PARAMETERS)?;
+    let subsets = subset::query_values(query.as_deref(), "subset");
     render_tile(
         &id,
         "default",
@@ -1668,11 +1777,11 @@ pub async fn map_tile(
         tile_row,
         tile_col,
         params,
+        &subsets,
         headers,
         state,
     )
     .await
-    .map(|r| r.into_response())
 }
 
 /// GET /collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
@@ -1681,6 +1790,7 @@ pub async fn vector_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
     Query(params): Query<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
     if params.format.is_some() && !params.is_mvt() {
@@ -1688,20 +1798,10 @@ pub async fn vector_tile(
             "Vector tiles are served as {MVT_CONTENT_TYPE}; map tiles are at /collections/{id}/map/tiles/…"
         )));
     }
-    // Vector tiles encode every feature the engine returns; reject the raster
-    // selectors rather than ignore them (#605).
-    for (name, value) in [
-        ("datetime", &params.datetime),
-        ("elevation", &params.elevation),
-        ("parameter-name", &params.parameter_name),
-        ("quality", &params.quality),
-    ] {
-        if value.is_some() {
-            return Err(TilesError::BadRequest(format!(
-                "'{name}' is not supported for vector tiles"
-            )));
-        }
-    }
+    // Vector tiles take a time and nothing else: the map tile parameters
+    // and unknown ones are 400s, never ignored (#605).
+    let subsets = subset::query_values(query.as_deref(), "subset");
+    let time = params.validate_vector(query.as_deref(), &subsets)?;
     render_vector_tile(
         headers,
         &id,
@@ -1709,6 +1809,7 @@ pub async fn vector_tile(
         tile_matrix,
         tile_row,
         tile_col,
+        time,
         state,
     )
     .await
@@ -1724,6 +1825,12 @@ pub(crate) const MVT_CONTENT_TYPE: &str = "application/vnd.mapbox-vector-tile";
 /// Validation order mirrors `render_tile` (TMS → zoom → coords → engine
 /// lookup) so error responses stay consistent across raster and vector
 /// tile routes.
+///
+/// `time` filters the features (OGC API - Tiles DateTime): only those whose
+/// temporal geometry intersects it, as the engine applies Features'
+/// `datetime` (`/req/collections/rc-datetime-response` A); features without
+/// one always match (B). `None` keeps the engine's default selection.
+#[allow(clippy::too_many_arguments)]
 async fn render_vector_tile(
     headers: HeaderMap,
     id: &str,
@@ -1731,6 +1838,7 @@ async fn render_vector_tile(
     zoom: u32,
     row: u64,
     col: u64,
+    time: Option<RequestedTime>,
     state: AppState,
 ) -> Result<axum::response::Response, TilesError> {
     let state = state.load_full();
@@ -1768,6 +1876,36 @@ async fn render_vector_tile(
         .tile_bbox(zoom, row, col)
         .ok_or_else(|| TilesError::Internal("Failed to compute tile bbox".into()))?;
 
+    // A time subset entirely outside the collection's temporal extent, the
+    // `datetime` axis' valid values, is a 204
+    // (`/req/collections/rc-subset-definition` C). Any other selection
+    // filters: no matching feature is the usual empty tile.
+    if let (
+        Some(RequestedTime {
+            selection,
+            from_subset: true,
+        }),
+        Some((first, last)),
+    ) = (&time, engine.temporal_extent())
+    {
+        if selection.outside(first, last) {
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .body(axum::body::Body::empty())
+                .unwrap());
+        }
+    }
+    // The interval the engine filters by, and the cache keys on: equal
+    // selections (`datetime=t`, `subset=datetime("t")`) share an entry. A
+    // collection without a time dimension has no temporal geometry to
+    // filter, so every feature matches (`/req/collections/rc-datetime-response`
+    // B): it gets no filter and shares the timeless tile, where Features
+    // would answer 400.
+    let datetime = time
+        .filter(|_| engine.has_time_dimension())
+        .map(|t| t.selection.interval());
+
     let allowlist = PropertyAllowlist::All;
     let props_hash = properties_hash(&allowlist);
     let cache_key = VectorTileKey {
@@ -1780,6 +1918,7 @@ async fn render_vector_tile(
         // Engines bump their data version on reload/refresh; folding it into
         // the ETag forces a fresh fetch instead of an infinite `304` loop.
         data_version: engine.data_version(),
+        time: datetime.clone(),
     };
     let cache_control = "public, max-age=300";
     let if_none_match = headers
@@ -1828,7 +1967,7 @@ async fn render_vector_tile(
         bbox: Some(query_bbox),
         limit: params::MAX_FEATURES_PER_TILE + 1,
         offset: 0,
-        datetime: None,
+        datetime,
         // Vector tiles carry the whole tile's features and are rendered by
         // the client; a server-side order would cost a sort per tile and
         // change nothing the client can observe.
@@ -1915,16 +2054,14 @@ pub async fn get_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
     Query(params): Query<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
     if params.is_mvt() {
-        // A vector tile has no encoder quality; reject it rather than ignore
-        // it (#605).
-        if params.quality.is_some() {
-            return Err(TilesError::BadRequest(
-                "'quality' is not supported for vector tiles".into(),
-            ));
-        }
+        // As the shared root's vector route: a time, and no map tile
+        // parameter (`quality`, sizes, …) or unknown one (#605).
+        let subsets = subset::query_values(query.as_deref(), "subset");
+        let time = params.validate_vector(query.as_deref(), &subsets)?;
         return render_vector_tile(
             headers,
             &id,
@@ -1932,10 +2069,13 @@ pub async fn get_tile(
             tile_matrix,
             tile_row,
             tile_col,
+            time,
             state,
         )
         .await;
     }
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_TILE_PARAMETERS)?;
+    let subsets = subset::query_values(query.as_deref(), "subset");
     render_tile(
         &id,
         "default",
@@ -1944,11 +2084,11 @@ pub async fn get_tile(
         tile_row,
         tile_col,
         params,
+        &subsets,
         headers,
         state,
     )
     .await
-    .map(|r| r.into_response())
 }
 
 /// GET {mount}/collections/{id}/styles/{styleId}/legend
@@ -2120,6 +2260,7 @@ pub async fn get_styled_tile(
         u64,
     )>,
     Query(params): Query<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
     if params.is_mvt() {
@@ -2127,6 +2268,8 @@ pub async fn get_styled_tile(
             "Vector tiles (?f=mvt) are not styled — request via /collections/{id}/tiles/...".into(),
         ));
     }
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_TILE_PARAMETERS)?;
+    let subsets = subset::query_values(query.as_deref(), "subset");
     render_tile(
         &id,
         &style_id,
@@ -2135,14 +2278,15 @@ pub async fn get_styled_tile(
         tile_row,
         tile_col,
         params,
+        &subsets,
         headers,
         state,
     )
     .await
-    .map(|r| r.into_response())
 }
 
-/// Shared tile rendering logic.
+/// Shared tile rendering logic. `subsets` are the `subset` values in request
+/// order.
 #[allow(clippy::too_many_arguments)]
 async fn render_tile(
     collection_id: &str,
@@ -2152,9 +2296,10 @@ async fn render_tile(
     row: u64,
     col: u64,
     params: TileQueryParams,
+    subsets: &[String],
     headers: HeaderMap,
     state: AppState,
-) -> Result<impl IntoResponse, TilesError> {
+) -> Result<Response, TilesError> {
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, collection_id)?;
 
@@ -2187,7 +2332,14 @@ async fn render_tile(
         .ok_or_else(|| TilesError::Internal("Failed to compute tile bbox".into()))?;
 
     // Validate query params
-    let validated = params.validate()?;
+    let validated = params.validate(subsets)?;
+    // The image's size: the tile matrix's tileWidth × tileHeight unless the
+    // Maps Scaling parameters set it over the tile's area (Map Tilesets
+    // `/req/tilesets/tiles-parameters`).
+    let frame = tms
+        .frame(bbox)
+        .ok_or_else(|| TilesError::Internal("Failed to compute tile frame".into()))?;
+    let (width, height) = validated.size(&frame, (tms.tile_width, tms.tile_height))?;
     // The format as encoded: an explicit `quality`, else for WebP the
     // collection's `[wms] webp_quality`, else the format default (JPEG 85,
     // lossless WebP). It keys the rendered cache, so a lossy and a lossless
@@ -2244,7 +2396,14 @@ async fn render_tile(
     };
 
     let content_type = format.content_type();
-    let has_explicit_time = validated.time.is_some();
+    // Only an instant pins the tile: intervals and `*` follow new data.
+    let has_explicit_time = matches!(
+        validated.time,
+        Some(RequestedTime {
+            selection: TimeSelection::Instant(_),
+            ..
+        })
+    );
 
     // Determine output CRS from TileMatrixSet
     let output_crs = match tms_id {
@@ -2261,8 +2420,6 @@ async fn render_tile(
     // the redundant call.
     let raster_info = engine.raster_info_shared();
 
-    let tile_size = params::TILE_SIZE;
-
     // Parameter selection: ?parameter-name= wins over style.parameter. Mirror
     // the precedence and validation used by api-maps + api-wms so the SPA
     // dropdown works identically across all three raster routes. Engines
@@ -2278,15 +2435,40 @@ async fn render_tile(
     // scans every band has, like a parameter's.
     let effective_parameter = validated.parameter_name.clone().or(style_parameter);
 
-    // Omitted `datetime`: the engine's default, else the parameter's (else
-    // the collection's) latest time.
-    let time = validated.time.or_else(|| {
-        ds_core::map_engine::default_request_time(
-            engine.as_ref(),
-            &raster_info,
-            effective_parameter.as_deref(),
-        )
-    });
+    // Reject an `elevation` against a collection with no vertical axis.
+    if validated.z.is_some() && raster_info.vertical.is_none() {
+        return Err(TilesError::BadRequest(format!(
+            "collection '{collection_id}' has no vertical dimension; \
+             the `elevation` parameter is not supported"
+        )));
+    }
+
+    // The instant to render, shared with Maps ([`subset::render_time`]):
+    // omitted, the engine's default, else the parameter's (else the
+    // collection's) latest time; an instant as given, snapped below; an
+    // interval, a partial date or `*` the latest time step inside it. One
+    // that selects no time step is an empty tile, 204: a subset entirely
+    // outside the time axis (`/req/collections/rc-subset-definition` C), or
+    // an interval holding no data (`/req/core/tc-error` B).
+    let time = match subset::render_time(
+        validated.time.as_ref(),
+        engine.as_ref(),
+        &raster_info,
+        effective_parameter.as_deref(),
+    ) {
+        Ok(time) => time,
+        Err(none) => {
+            tracing::debug!(
+                "Tiles: no time step for collection '{collection_id}': {}",
+                none.0
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(header::CACHE_CONTROL, cache_control_value(false, 0))
+                .body(axum::body::Body::empty())
+                .unwrap());
+        }
+    };
     // #521: resolve the run axis to the CONCRETE run the engine will render
     // before the cache key is built (see api-maps for the full rationale —
     // the no-TTL rendered cache keyed on `None` would keep serving the
@@ -2299,14 +2481,18 @@ async fn render_tile(
     // previous timestep's pixels under the PREVIOUS timestep's key. A
     // parameter with its own time axis snaps on that axis.
     let time = engine.resolve_parameter_time(effective_parameter.as_deref(), time, reference_time);
-
-    // Reject an `elevation` against a collection with no vertical axis.
-    if validated.z.is_some() && raster_info.vertical.is_none() {
-        return Err(TilesError::BadRequest(format!(
-            "collection '{collection_id}' has no vertical dimension; \
-             the `elevation` parameter is not supported"
-        )));
-    }
+    // `OGCAPI-datetime` (`/rec/datetime/actual-datetime`) on a collection with
+    // a temporal extent: the instant rendered, not the one requested.
+    let actual_datetime = time
+        .filter(|_| !raster_info.times.is_empty())
+        .map(subset::rfc3339);
+    let with_datetime = |builder: axum::http::response::Builder| match &actual_datetime {
+        Some(value) => builder.header(
+            header::HeaderName::from_static("ogcapi-datetime"),
+            value.as_str(),
+        ),
+        None => builder,
+    };
 
     // Build cache key
     let cache_key = CacheKey {
@@ -2317,8 +2503,8 @@ async fn render_tile(
         format,
         crs: tms_id.to_string(),
         bbox: ds_render::quantize_bbox(&bbox),
-        width: tile_size,
-        height: tile_size,
+        width,
+        height,
         time,
         parameter: effective_parameter.clone(),
         z: validated.z.map(ds_render::quantize_z),
@@ -2357,7 +2543,7 @@ async fn render_tile(
                 // lets the regression test (and curious clients) distinguish
                 // this from a post-render MISS→304, which the handler also
                 // serves.
-                return Ok(axum::response::Response::builder()
+                return Ok(with_datetime(axum::response::Response::builder())
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
@@ -2372,7 +2558,7 @@ async fn render_tile(
                     .into_response());
             }
         }
-        return Ok(axum::response::Response::builder()
+        return Ok(with_datetime(axum::response::Response::builder())
             .header(header::CONTENT_TYPE, content_type)
             .header(header::ETAG, cached.etag())
             .header(header::CACHE_CONTROL, cache_control)
@@ -2401,8 +2587,8 @@ async fn render_tile(
     };
     let (job, memory_permit) = ds_executor::RenderJob::acquire_raster_planes(
         state.render_semaphore.clone(),
-        tile_size,
-        tile_size,
+        width,
+        height,
         planes,
     )
     .await
@@ -2441,8 +2627,8 @@ async fn render_tile(
                     let engine_start = std::time::Instant::now();
                     let tiles = engine.get_raster_tiles(
                         bbox,
-                        tile_size,
-                        tile_size,
+                        width,
+                        height,
                         time,
                         &output_crs,
                         &bands,
@@ -2462,8 +2648,8 @@ async fn render_tile(
             let engine_start = std::time::Instant::now();
             let tile = engine.get_raster_tile(
                 bbox,
-                tile_size,
-                tile_size,
+                width,
+                height,
                 time,
                 &output_crs,
                 render_parameter.as_deref(),
@@ -2541,7 +2727,16 @@ async fn render_tile(
     // `EMPTY_TILE_CACHED` already serves as the deterministic empty
     // response).
     let (cached, x_cache, response_content_type) = match maybe_bytes {
-        None => (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png"),
+        // A tile the Scaling parameters sized gets an empty image of its
+        // own size, from the same shared memo.
+        None if (width, height) == (params::TILE_SIZE, params::TILE_SIZE) => {
+            (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png")
+        }
+        None => {
+            let empty = ds_render::empty_tile(width, height)
+                .map_err(|e| TilesError::Internal(format!("Failed to encode empty tile: {e}")))?;
+            (empty, "EMPTY", "image/png")
+        }
         Some(bytes) => {
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
             rendered_cache.insert(cache_key, cached.clone());
@@ -2559,7 +2754,7 @@ async fn render_tile(
     // panning over out-of-coverage areas.
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
-            return Ok(axum::response::Response::builder()
+            return Ok(with_datetime(axum::response::Response::builder())
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
@@ -2574,7 +2769,7 @@ async fn render_tile(
         }
     }
 
-    Ok(axum::response::Response::builder()
+    Ok(with_datetime(axum::response::Response::builder())
         .header(header::CONTENT_TYPE, response_content_type)
         .header(header::ETAG, cached.etag())
         .header(header::CACHE_CONTROL, cache_control)

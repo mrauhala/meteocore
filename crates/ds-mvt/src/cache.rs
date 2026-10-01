@@ -6,6 +6,7 @@
 
 use bytes::Bytes;
 use ds_cache::ByteBoundedCache;
+use ds_core::feature::DatetimeInterval;
 
 use crate::encode::TmsKind;
 use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
@@ -21,7 +22,12 @@ use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
 /// `data_version` is an opaque token (file mtime, refresh counter, …)
 /// supplied by the source engine: bumping it after a reload invalidates
 /// previously-issued ETags so clients re-fetch instead of stalling on
-/// `304 Not Modified`.
+/// `304 Not Modified`. `time` is the time selection the features were
+/// filtered by, exactly as the engine got it (`FeatureQuery::datetime`), so
+/// a tile for one time is never served for another and equal selections
+/// (`datetime=t` and `subset=datetime("t")`) share an entry; `None` is a
+/// request without one, which an engine may answer differently from an
+/// unbounded interval (#946).
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct VectorTileKey {
     pub collection: String,
@@ -31,6 +37,7 @@ pub struct VectorTileKey {
     pub y: u64,
     pub properties_hash: u64,
     pub data_version: u64,
+    pub time: Option<DatetimeInterval>,
 }
 
 /// Cached tile payload plus its content-derived ETag.
@@ -151,6 +158,7 @@ mod tests {
             y,
             properties_hash: 0,
             data_version: 0,
+            time: None,
         }
     }
 
@@ -164,6 +172,30 @@ mod tests {
         assert_eq!(&got.bytes[..], b"abc");
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 1);
+    }
+
+    /// A tile filtered by one time is never served for another, nor for a
+    /// request without a time; an equal selection hits (#946).
+    #[test]
+    fn keys_differ_by_time_selection() {
+        let at = |s: &str| Some(s.parse().unwrap());
+        let time = |start, end| VectorTileKey {
+            time: Some(DatetimeInterval { start, end }),
+            ..key(2, 1, 1)
+        };
+        let cache = VectorTileCache::new(1);
+        let noon = time(at("2026-10-01T12:00:00Z"), at("2026-10-01T12:00:00Z"));
+        cache.insert(noon.clone(), CachedTile::new(Bytes::from_static(b"noon")));
+        let equal = time(at("2026-10-01T12:00:00Z"), at("2026-10-01T12:00:00Z"));
+        assert_eq!(&cache.get(&equal).unwrap().bytes[..], b"noon");
+        for other in [
+            key(2, 1, 1),
+            time(at("2026-10-01T13:00:00Z"), at("2026-10-01T13:00:00Z")),
+            time(at("2026-10-01T12:00:00Z"), None),
+            time(None, None),
+        ] {
+            assert!(cache.get(&other).is_none(), "{other:?}");
+        }
     }
 
     #[test]

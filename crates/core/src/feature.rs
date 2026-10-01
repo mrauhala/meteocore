@@ -1146,8 +1146,10 @@ impl Bbox {
     }
 }
 
-/// A datetime interval with optional open bounds.
-#[derive(Debug, Clone)]
+/// A datetime interval with optional open bounds. An instant is
+/// `start == end`. Comparable and hashable so a cache can key on the
+/// selection a query filtered by (vector tiles, #946).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DatetimeInterval {
     pub start: Option<DateTime<Utc>>,
     pub end: Option<DateTime<Utc>>,

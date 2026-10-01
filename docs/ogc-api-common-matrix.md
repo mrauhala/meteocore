@@ -110,6 +110,18 @@ unit, a `description` naming what each channel reads, and their own
 not list them: a composite has no numeric values. The Maps and Tiles `legend`
 schema is one of a palette legend or a composite's channel list.
 
+Map tile classes (2026-10-01, [#946](https://github.com/mrauhala/meteocore/issues/946)):
+`/conformance` at the shared root is the blocks' union plus the classes a
+block holds only in the shared layout. Tiles adds OGC API - Maps "Map
+Tilesets" there, where map tiles sit under the map resource
+(`…/map/tiles`, linked `tilesets-map`) and take the Maps Scaling parameters.
+The per-API Maps service, whose `tilesets-map` link points into `/tiles`, does
+not declare it. Tiles DateTime is declared on `/tiles` and at the shared root;
+it covers map and vector tiles, which select features as Features' `datetime`
+does ([#794](https://github.com/mrauhala/meteocore/issues/794)).
+The contract suite checks each declaration against the links and OpenAPI
+parameters it requires. No Common classes change.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a

@@ -60,6 +60,10 @@ impl BuildingBlock for TilesBlock {
         handlers::CONFORMANCE
     }
 
+    fn shared_conformance(&self) -> &'static [&'static str] {
+        handlers::SHARED_CONFORMANCE
+    }
+
     fn landing_links(&self, root: &str) -> Vec<Value> {
         vec![
             json!({"href": format!("{root}/tileMatrixSets"), "rel": rel::TILING_SCHEMES,
@@ -92,8 +96,9 @@ impl BuildingBlock for TilesBlock {
         // The shared layout references only these per-API components; its
         // tile-format parameters are inline (they differ from Maps' `f`).
         let per_api = handlers::openapi_components();
-        let parameters: Map<String, Value> = ["datetime", "elevation", "parameter-name", "quality"]
+        let parameters: Map<String, Value> = ["datetime", "tile-subset", "elevation"]
             .into_iter()
+            .chain(handlers::MAP_TILE_COMPONENTS)
             .filter_map(|name| {
                 let definition = per_api["parameters"].get(name)?.clone();
                 Some((name.to_owned(), definition))
@@ -253,9 +258,13 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
     let raster_query = || {
         vec![
             json!({"$ref": "#/components/parameters/datetime"}),
+            json!({"$ref": "#/components/parameters/tile-subset"}),
             json!({"$ref": "#/components/parameters/elevation"}),
             json!({"$ref": "#/components/parameters/parameter-name"}),
             json!({"$ref": "#/components/parameters/quality"}),
+            json!({"$ref": "#/components/parameters/tile-width"}),
+            json!({"$ref": "#/components/parameters/tile-height"}),
+            json!({"$ref": "#/components/parameters/tile-scale-denominator"}),
             json!({"name": "f", "in": "query", "required": false,
                    "schema": {"type": "string", "default": "image/png", "enum": raster_formats},
                    "description": "Image format. `image/png` emits an 8-bit palette PNG for colormap layers when possible."}),
@@ -284,6 +293,15 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
                 raster_query(),
                 binary(&raster_formats),
             );
+            // A time selection with no time step is an empty map tile.
+            for list in [
+                format!("{m}/collections/{id}/map/tiles"),
+                format!("{m}/collections/{id}/styles/{{styleId}}/map/tiles"),
+            ] {
+                let tile =
+                    format!("{list}/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}");
+                paths[&tile]["get"]["responses"]["204"] = json!({"description": "Empty map tile: the requested time selects no time step"});
+            }
         }
         if sources.has_vector {
             tileset_paths(
@@ -293,11 +311,20 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
                 &format!("Vector_{id}_"),
                 &format!("{} vector", sources.config.title),
                 &[],
-                vec![json!({"name": "f", "in": "query", "required": false,
-                    "schema": {"type": "string", "enum": crate::params::MVT_FORMAT_TOKENS},
-                    "description": "Optional; vector tiles are always Mapbox Vector Tiles."})],
+                vec![
+                    json!({"$ref": "#/components/parameters/datetime"}),
+                    json!({"$ref": "#/components/parameters/tile-subset"}),
+                    json!({"name": "f", "in": "query", "required": false,
+                        "schema": {"type": "string", "enum": crate::params::MVT_FORMAT_TOKENS},
+                        "description": "Optional; vector tiles are always Mapbox Vector Tiles."}),
+                ],
                 binary(&[MVT_CONTENT_TYPE]),
             );
+            let tile = format!(
+                "{m}/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+            );
+            paths[&tile]["get"]["responses"]["204"] = json!({"description":
+                "Empty tile: a time subset lies outside the collection's temporal extent"});
         }
     }
     paths

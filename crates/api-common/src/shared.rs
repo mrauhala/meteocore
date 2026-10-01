@@ -68,8 +68,17 @@ pub struct OpenApiFragment {
 pub trait BuildingBlock: Send + Sync + 'static {
     /// API kind reported in request logs and metrics.
     fn kind(&self) -> &'static str;
-    /// Conformance classes this block implements at the shared root.
+    /// Conformance classes this block implements on its per-API service and
+    /// at the shared root alike.
     fn conformance(&self) -> &'static [&'static str];
+    /// Classes this block implements only in the shared root's layout, where
+    /// it composes with the other blocks: Tiles serves map tiles under Maps'
+    /// map resources there (`{map}/tiles`), which OGC API - Maps "Map
+    /// Tilesets" requires and neither per-API service has. Declared once at
+    /// the shared root, after [`conformance`](Self::conformance).
+    fn shared_conformance(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// Landing-page links beyond the Common ones, for the absolute API root.
     fn landing_links(&self, _root: &str) -> Vec<Value> {
         Vec::new()
@@ -101,7 +110,8 @@ pub struct SharedApi {
     mount: &'static str,
     blocks: Vec<Arc<dyn BuildingBlock>>,
     related: Vec<RelatedLink>,
-    /// Common classes plus every block's, de-duplicated once.
+    /// Common classes plus every block's (its per-API classes, then its
+    /// shared-root ones), de-duplicated once.
     conformance: Vec<&'static str>,
 }
 
@@ -114,7 +124,9 @@ impl SharedApi {
     ) -> Self {
         assert!(!blocks.is_empty(), "a shared OGC API root needs a block");
         let mut conformance: Vec<&'static str> = crate::CONFORMANCE_CLASSES.to_vec();
-        for class in blocks.iter().flat_map(|b| b.conformance()) {
+        let classes = blocks.iter().flat_map(|b| b.conformance());
+        let shared_only = blocks.iter().flat_map(|b| b.shared_conformance());
+        for class in classes.chain(shared_only) {
             if !conformance.contains(class) {
                 conformance.push(class);
             }
