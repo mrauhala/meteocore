@@ -1820,7 +1820,7 @@ mod unimplemented_queries {
             .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)&f=PNG")
             .body(Body::empty())
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -1830,6 +1830,30 @@ mod unimplemented_queries {
         );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+
+        // `Accept: image/png` chooses the heatmap among the two offered
+        // formats, so the response varies on Accept.
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)")
+            .header("accept", "image/png")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+        assert!(resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .any(|v| v.to_str().unwrap().eq_ignore_ascii_case("accept")));
+
+        // A trajectory is never GeoJSON (#929).
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)&f=GeoJSON")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// An along-path (gridded) engine, #926: the handler validates the
@@ -1954,8 +1978,10 @@ mod unimplemented_queries {
             "LINESTRING(24%2060)",
             "LINESTRING%20Z(24%2060,25%2061)",
             "MULTILINESTRING((24%2060,25%2061))",
-            // Only a radar cross-section renders as a PNG.
+            // Only a radar cross-section renders as a PNG; no trajectory is
+            // GeoJSON.
             "LINESTRING(24%2060,25%2061)&f=PNG",
+            "LINESTRING(24%2060,25%2061)&f=GeoJSON",
         ] {
             let (status, json) = fetch(format!("{base}{query}")).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");
@@ -2010,6 +2036,22 @@ mod unimplemented_queries {
             ["2024-01-01T00:00:00+00:00", "2024-01-01T06:00:00+00:00"]
         );
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // `Accept: image/png` is not a failure: CoverageJSON, the only
+        // format offered along a path, so nothing varies on Accept.
+        let req = Request::builder()
+            .uri(format!("{base}LINESTRING(24%2060,25%2061)&z=850"))
+            .header("accept", "image/png")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/vnd.cov+json");
+        assert!(resp.headers().get("vary").is_none_or(|v| !v
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("accept")));
 
         let (_, meta) = fetch("/collections/weather".into()).await;
         assert_eq!(
