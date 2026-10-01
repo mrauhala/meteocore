@@ -172,8 +172,9 @@ pub fn collection_parameter_json(desc: &ParameterDescription) -> Value {
 }
 
 /// A CoverageJSON parameter. Its short name is `observedProperty.label`:
-/// CoverageJSON asks to leave out a parameter `label` identical to it.
-fn build_parameter(desc: &ParameterDescription) -> Value {
+/// CoverageJSON asks to leave out a parameter `label` identical to it. The
+/// EDR GeoJSON `parameters` member lists the same objects (#929).
+pub(crate) fn build_parameter(desc: &ParameterDescription) -> Value {
     let description = parameter_description(desc);
     let mut param = Map::with_capacity(4);
     param.insert("type".into(), Value::String("Parameter".into()));

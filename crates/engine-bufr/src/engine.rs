@@ -589,6 +589,12 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
             .map(|s| s.to_string())
             .collect()
     }
+
+    /// One `PointSeries` per station, at the station's decoded position
+    /// (the snapshot's `get_locations` entry): EDR GeoJSON names each (#929).
+    fn serves_station_series(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
