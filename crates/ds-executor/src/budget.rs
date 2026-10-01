@@ -125,7 +125,7 @@ impl RenderBudget {
         if let Some(bytes) = bytes {
             if self
                 .used
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                     used.checked_add(bytes)
                         .filter(|&total| total <= self.capacity)
                 })

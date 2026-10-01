@@ -56,7 +56,7 @@ impl Budget {
         deadline::check()?;
         let reserved = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|&n| n <= self.capacity)
             })
             .is_ok();
@@ -98,7 +98,7 @@ impl Budget {
                 .checked_add(plan.workspace)
                 .ok_or(DataServerError::ResourceExhausted)?;
             self.used
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                     used.checked_add(bytes).filter(|&n| n <= self.capacity)
                 })
                 .map_err(|_| DataServerError::ResourceExhausted)?;

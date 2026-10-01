@@ -39,7 +39,7 @@ impl Budget {
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Permit, DataServerError> {
         if self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|&n| n <= self.limit)
             })
             .is_err()
