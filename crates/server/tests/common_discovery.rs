@@ -338,6 +338,7 @@ fn app(surface: &str) -> (Router, String) {
         "edr" => api_edr::router(Arc::new(ArcSwap::from_pointee(
             api_edr::handlers::EdrState {
                 engines: edr,
+                feature_engines: HashMap::new(),
                 collections: configs,
                 styles: HashMap::new(),
                 base_url: BASE.into(),
