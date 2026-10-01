@@ -138,7 +138,7 @@ impl EdrEngine for LimitMock {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        ["locations", "position", "area", "radius"]
+        ["locations", "position", "area", "radius", "trajectory"]
             .map(String::from)
             .to_vec()
     }
@@ -630,4 +630,22 @@ async fn openapi_declares_limit_and_offset() {
             "{path}: offset only pages the location list"
         );
     }
+}
+
+/// Trajectory has no `limit` in EDR 1.2; carrying one is a 400, not a
+/// silently unlimited 200, now that every other data query honours it.
+#[tokio::test]
+async fn limit_on_trajectory_is_a_400() {
+    let app = app(1);
+    let (status, json) = app
+        .get("/collections/obs/trajectory?coords=LINESTRING(20%2060,21%2061)&limit=5")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(
+        json["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("not supported on trajectory")),
+        "{json}"
+    );
+    assert_eq!(app.calls(), 0);
 }

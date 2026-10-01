@@ -317,6 +317,9 @@ pub struct TrajectoryQueryParams {
     /// PNG image dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Not supported on trajectory, which EDR 1.2 gives no `limit`: read
+    /// only so a request carrying it is a 400, not a silently unlimited 200.
+    pub limit: Option<String>,
 }
 
 /// A parsed EDR `z` selector: either an explicit list of levels or a

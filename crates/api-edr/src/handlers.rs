@@ -1836,6 +1836,12 @@ pub async fn trajectory_query(
     // live route consistent with the `api_definition` OpenAPI gating and
     // the `data_queries` collection metadata. Flagged by claude-review.
     require_query_type(engine, &id, "trajectory", "trajectory (cross-section)")?;
+    if params.limit.is_some() {
+        return Err(bad_request_msg(
+            "limit is not supported on trajectory queries; a trajectory returns one \
+             coverage per path, so there is nothing to page",
+        ));
+    }
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
 
