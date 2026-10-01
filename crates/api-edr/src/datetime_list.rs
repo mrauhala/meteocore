@@ -12,8 +12,9 @@
 //!   become one coverage whose `t` axis holds every instant's steps, ascending,
 //!   each step once (two instants an engine snaps to the same step yield it
 //!   once);
-//! - any other coverage (a `VerticalProfile`, a `Section`, …) is kept as it
-//!   is, and an identical one from another instant is dropped.
+//! - any other coverage (a `VerticalProfile`, a `Section`, a `Trajectory`,
+//!   …) is kept as it is, and an identical one from another instant is
+//!   dropped.
 //!
 //! The response is `Single` when every instant answered `Single` and the merge
 //! left one coverage, else a `CoverageCollection`.
@@ -302,6 +303,18 @@ fn same_domain(a: &DomainDescription, b: &DomainDescription) -> bool {
                 coverage_floor: bf,
             },
         ) => an == bn && az.kind == bz.kind && az.values == bz.values && af == bf,
+        (
+            D::Trajectory {
+                nodes: an,
+                node_z: anz,
+                z: az,
+            },
+            D::Trajectory {
+                nodes: bn,
+                node_z: bnz,
+                z: bz,
+            },
+        ) => an == bn && same_z(anz, bnz) && same_z(az, bz),
         _ => false,
     }
 }
@@ -526,6 +539,43 @@ mod tests {
             panic!("profiles at two times cannot share one coverage");
         };
         assert_eq!(v.len(), 2);
+    }
+
+    /// An along-path trajectory at one step (#926): `[t, x, y]` nodes.
+    fn trajectory(hour: u32) -> QueryResult {
+        let t = at(hour);
+        QueryResult {
+            domain: DomainDescription::Trajectory {
+                nodes: vec![(t, 24.0, 60.0), (t, 25.0, 61.0)],
+                node_z: None,
+                z: None,
+            },
+            parameters: param(),
+            ranges: HashMap::from([(
+                "temperature".to_string(),
+                NdArray {
+                    shape: vec![2],
+                    axis_names: vec!["composite".into()],
+                    values: vec![Some(270.0), Some(271.0)],
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn trajectories_list_per_instant_and_duplicates_drop() {
+        let merged = merge(vec![
+            CoverageResponse::Single(trajectory(1)),
+            CoverageResponse::Single(trajectory(2)),
+            CoverageResponse::Single(trajectory(2)),
+        ]);
+        let CoverageResponse::Collection(v) = merged else {
+            panic!("trajectories at two steps are two coverages");
+        };
+        assert_eq!(v.len(), 2);
+        assert!(v
+            .iter()
+            .all(|q| matches!(q.domain, DomainDescription::Trajectory { .. })));
     }
 
     #[test]

@@ -1849,12 +1849,16 @@ mod unimplemented_queries {
                 _rt: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                assert!(datetime.is_none());
                 let path = TrajectoryPath::parse(coords)?;
-                let times: [DateTime<Utc>; 2] = [
-                    "2024-01-01T00:00:00Z".parse().unwrap(),
+                // The position-style step selection: every step, or those
+                // inside the window (an instant matches exactly).
+                let times: Vec<DateTime<Utc>> = [
+                    "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
                     "2024-01-01T06:00:00Z".parse().unwrap(),
-                ];
+                ]
+                .into_iter()
+                .filter(|t| datetime.is_none_or(|(start, end)| *t >= start && *t <= end))
+                .collect();
                 let vertical = levels();
                 let plan = TrajectoryPlan::new(
                     &path,
@@ -1906,6 +1910,8 @@ mod unimplemented_queries {
             // An M path carries its times: `datetime` too is an error.
             "LINESTRINGM(24%2060%201704067200,25%2061%201704088800)&datetime=2024-01-01T00:00:00Z",
             "LINESTRING%20ZM(24%2060%20850%201704067200,25%2061%20500%201704088800)&datetime=2024-01-01T00:00:00Z",
+            // A `datetime` list is a `datetime` too.
+            "LINESTRINGM(24%2060%201704067200,25%2061%201704088800)&datetime=2024-01-01T00:00:00Z,2024-01-01T06:00:00Z",
             // Malformed paths never reach the engine.
             "LINESTRING(24%2060)",
             "LINESTRING%20Z(24%2060,25%2061)",
@@ -1941,6 +1947,31 @@ mod unimplemented_queries {
             serde_json::json!([850.0])
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // A 2-D path with a `datetime` list: one engine query per instant,
+        // one coverage per instant (EDR 1.2 /req/core/datetime-response D).
+        let (status, json) = fetch(format!(
+            "{base}LINESTRING(24%2060,25%2061)&z=850\
+             &datetime=2024-01-01T00:00:00Z,2024-01-01T06:00:00Z"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["type"], "CoverageCollection");
+        let steps: Vec<&str> = json["coverages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                c["domain"]["axes"]["composite"]["values"][0][0]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            ["2024-01-01T00:00:00+00:00", "2024-01-01T06:00:00+00:00"]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
 
         let (_, meta) = fetch("/collections/weather".into()).await;
         assert_eq!(

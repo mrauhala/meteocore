@@ -364,7 +364,7 @@ pub struct TrajectoryAxes<'a> {
     /// samples snap to and whose range bounds the vertex times.
     pub times: &'a [DateTime<Utc>],
     /// The collection's (or selected run's) vertical levels; `None` without
-    /// a vertical axis, when a Z coordinate is ignored.
+    /// a vertical axis, when a Z coordinate and `z` are ignored.
     pub vertical: Option<&'a VerticalDimension>,
     /// The request's `z` levels, already validated by the engine; `None`
     /// selects every level of `vertical`. Never set with a Z path.
@@ -473,14 +473,9 @@ impl TrajectoryPlan {
         };
 
         let level_assign: Vec<Assign<Option<f64>>> = match axes.vertical {
-            None => {
-                if axes.z.is_some() {
-                    return Err(invalid(
-                        "This collection has no vertical axis; `z` is not supported".into(),
-                    ));
-                }
-                vec![Assign::Fixed(None)]
-            }
+            // No vertical axis: a Z coordinate and `z` are both ignored
+            // (EDR 1.2 /req/edr/z-response A).
+            None => vec![Assign::Fixed(None)],
             Some(vertical) if path.has_z => {
                 if axes.z.is_some() {
                     return Err(invalid(format!(
@@ -1072,6 +1067,12 @@ mod tests {
         };
         let plan = TrajectoryPlan::new(&high, deg(1.0), flat, 1).unwrap();
         assert!(plan.fields().iter().all(|f| f.level.is_none()));
+        let flat_z = TrajectoryAxes {
+            z: Some(&[850.0]),
+            ..flat
+        };
+        let flat_plan = TrajectoryPlan::new(&path, deg(1.0), flat_z, 1).unwrap();
+        assert!(flat_plan.fields().iter().all(|f| f.level.is_none()));
         let values = fill(&plan, 1);
         let CoverageResponse::Single(cov) = plan.into_response(&[desc("t")], &values).unwrap()
         else {
