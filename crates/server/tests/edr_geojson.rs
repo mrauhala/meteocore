@@ -3,7 +3,7 @@
 //! reports). Every feature must be named by its station — the API layer
 //! matches each series to the engine's `get_locations` by exact coordinates,
 //! the `serves_station_series` contract — and every body validates against
-//! the EDR 1.1 bundle's `application/geo+json` schema of its route.
+//! the EDR 1.1 and 1.2 bundles' `application/geo+json` schema of its route.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,6 +18,9 @@ use tower::ServiceExt;
 
 use ds_core::config::{BufrConfig, CollectionConfig};
 use ds_core::edr_engine::EdrEngine;
+
+#[path = "../../api-edr/tests/support/edr_schema.rs"]
+mod edr_schema;
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -108,19 +111,27 @@ async fn geojson(app: &axum::Router, uri: &str) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-fn assert_valid(route: &str, json: &Value) {
-    let bundle: Value = serde_json::from_str(
-        &std::fs::read_to_string(repo().join("schemas/ogcapi-edr-1.1-bundled.json")).unwrap(),
-    )
-    .unwrap();
-    let schema = &bundle["paths"][route]["get"]["responses"]["200"]["content"]
-        ["application/geo+json"]["schema"];
-    let validator = jsonschema::Validator::new(schema).unwrap();
-    let errors: Vec<String> = validator
-        .iter_errors(json)
-        .map(|e| format!("- {e} (at {})", e.instance_path()))
-        .collect();
-    assert!(errors.is_empty(), "{route}:\n{}", errors.join("\n"));
+/// Validate a GeoJSON body against the `application/geo+json` 200 schema
+/// of `path` in both the EDR 1.1 and 1.2 bundles (`edr_schema`). The
+/// location data path names its parameter `{locationId}` in 1.2 and
+/// `{locId}` in 1.1, so that one path is looked up per version.
+fn assert_valid(path: &str, json: &Value) {
+    if !path.ends_with("/{locationId}") {
+        return edr_schema::assert_valid(path, edr_schema::GEOJSON, json, "GeoJSON");
+    }
+    for version in edr_schema::VERSIONS {
+        let path = match version {
+            edr_schema::Edr::V1_1 => path.replace("{locationId}", "{locId}"),
+            edr_schema::Edr::V1_2 => path.to_string(),
+        };
+        let errors = edr_schema::errors(version, &path, edr_schema::GEOJSON, json);
+        assert!(
+            errors.is_empty(),
+            "EDR {version:?} {path}:\n{}\n\nResponse:\n{}",
+            errors.join("\n"),
+            serde_json::to_string_pretty(json).unwrap()
+        );
+    }
 }
 
 /// Every feature is named by a station of the collection's `/locations`
@@ -176,7 +187,7 @@ async fn csv_station_series_as_geojson() {
         "/collections/weather/locations/Alaj%C3%A4rvi%20M%C3%B6ksy?f=GeoJSON",
     )
     .await;
-    assert_valid("/collections/{collectionId}/locations/{locId}", &one);
+    assert_valid("/collections/{collectionId}/locations/{locationId}", &one);
     assert_named_by_locations(&one, &locations, "weather");
     assert_eq!(one["features"][0]["id"], "Alajärvi Möksy");
     assert_eq!(

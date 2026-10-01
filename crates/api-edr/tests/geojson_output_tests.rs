@@ -2,8 +2,8 @@
 //! `Accept: application/geo+json` on the point queries — locations,
 //! position, radius — of a station-series engine
 //! (`EdrEngine::serves_station_series`); 400 for `f=GeoJSON` everywhere
-//! else. Each GeoJSON body is validated against the EDR 1.1 bundle's
-//! `application/geo+json` schema of its route.
+//! else. Each GeoJSON body is validated against the EDR 1.1 and 1.2
+//! bundles' `application/geo+json` schema of its route.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +22,9 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::parse_point_coords;
 use ds_core::model::*;
+
+#[path = "support/edr_schema.rs"]
+mod edr_schema;
 
 const BASE: &str = "https://api.example.com";
 
@@ -370,32 +373,27 @@ fn varies_on_accept(headers: &HeaderMap) -> bool {
         .any(|v| v.to_str().unwrap().eq_ignore_ascii_case("accept"))
 }
 
-/// Validate a GeoJSON body against the EDR 1.1 bundle's
-/// `application/geo+json` 200 schema of `route` (the
-/// `edrFeatureCollectionGeoJSON` shape).
-fn assert_valid_edr_geojson(route: &str, json: &Value) {
-    let bundle: Value = serde_json::from_str(
-        &std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../schemas/ogcapi-edr-1.1-bundled.json"
-        ))
-        .unwrap(),
-    )
-    .unwrap();
-    let schema = &bundle["paths"][route]["get"]["responses"]["200"]["content"]
-        ["application/geo+json"]["schema"];
-    assert!(schema.is_object(), "{route} has a GeoJSON schema");
-    let validator = jsonschema::Validator::new(schema).unwrap();
-    let errors: Vec<String> = validator
-        .iter_errors(json)
-        .map(|e| format!("- {e} (at {})", e.instance_path()))
-        .collect();
-    assert!(
-        errors.is_empty(),
-        "{route} GeoJSON schema violations:\n{}\n{}",
-        errors.join("\n"),
-        serde_json::to_string_pretty(json).unwrap()
-    );
+/// Validate a GeoJSON body against the `application/geo+json` 200 schema
+/// of `path` in both the EDR 1.1 and 1.2 bundles (`edr_schema`). The
+/// location data path names its parameter `{locationId}` in 1.2 and
+/// `{locId}` in 1.1, so that one path is looked up per version.
+fn assert_valid_edr_geojson(path: &str, json: &Value) {
+    if !path.ends_with("/{locationId}") {
+        return edr_schema::assert_valid(path, edr_schema::GEOJSON, json, "GeoJSON");
+    }
+    for version in edr_schema::VERSIONS {
+        let path = match version {
+            edr_schema::Edr::V1_1 => path.replace("{locationId}", "{locId}"),
+            edr_schema::Edr::V1_2 => path.to_string(),
+        };
+        let errors = edr_schema::errors(version, &path, edr_schema::GEOJSON, json);
+        assert!(
+            errors.is_empty(),
+            "EDR {version:?} {path}:\n{}\n\nResponse:\n{}",
+            errors.join("\n"),
+            serde_json::to_string_pretty(json).unwrap()
+        );
+    }
 }
 
 fn link<'a>(json: &'a Value, rel: &str, kind: &str) -> &'a str {
@@ -506,7 +504,7 @@ async fn location_geojson_names_the_requested_location() {
     let (status, headers, json) = get_json(uri, None).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(content_type(&headers), "application/geo+json");
-    assert_valid_edr_geojson("/collections/{collectionId}/locations/{locId}", &json);
+    assert_valid_edr_geojson("/collections/{collectionId}/locations/{locationId}", &json);
     let f = &json["features"][0];
     assert_eq!(f["id"], "oulu airport");
     assert_eq!(f["properties"]["label"], "Oulu airport");
@@ -698,7 +696,7 @@ async fn a_location_list_is_one_feature_collection_in_request_order() {
     let (status, headers, json) = get_json(uri, None).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(content_type(&headers), "application/geo+json");
-    assert_valid_edr_geojson("/collections/{collectionId}/locations/{locId}", &json);
+    assert_valid_edr_geojson("/collections/{collectionId}/locations/{locationId}", &json);
     let features = json["features"].as_array().unwrap();
     let ids: Vec<&str> = features.iter().map(|f| f["id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["tampere", "oulu airport"]);
