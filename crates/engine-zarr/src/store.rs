@@ -68,6 +68,10 @@ pub(crate) struct Generation {
 }
 
 impl Generation {
+    // `fetch_update` is deprecated since Rust 1.99 in favour of `try_update`,
+    // which is still unstable on the Docker image's Rust 1.94: switch once
+    // the image moves to 1.98 or later.
+    #[allow(deprecated)]
     fn new() -> Self {
         // Nonzero and unique across collection rebuilds in this process; seed
         // from wall time so browser validators also change across restarts.
@@ -78,7 +82,7 @@ impl Generation {
             .as_nanos()
             .min(u64::MAX as u128 - 1) as u64;
         let previous = NEXT
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
                 previous.checked_add(1).map(|next| next.max(now))
             })
             .expect("Zarr generation counter exhausted");

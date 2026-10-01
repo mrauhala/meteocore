@@ -121,11 +121,15 @@ impl RenderBudget {
         }
     }
 
+    // `fetch_update` is deprecated since Rust 1.99 in favour of `try_update`,
+    // which is still unstable on the Docker image's Rust 1.94: switch once
+    // the image moves to 1.98 or later.
+    #[allow(deprecated)]
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: Option<u64>) -> Option<RenderPermit> {
         if let Some(bytes) = bytes {
             if self
                 .used
-                .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                     used.checked_add(bytes)
                         .filter(|&total| total <= self.capacity)
                 })
