@@ -66,6 +66,19 @@ for the specification baselines and remaining gaps.
 
 A query type a collection's engine does not support (not in its `supported_query_types`, so not in `data_queries`) has no resource: position, area, radius and trajectory all answer 404 `NotFound`, and `/api` omits the path (#668).
 
+Every advertised query type's `data_queries.<type>.link.variables` carries
+the six fields EDR 1.2 requires (#918): `title` (`Position query`, …), a
+`description` naming what `coords` takes, `query_type`, `output_formats`
+(PNG only for locations, position and trajectory), `default_output_format`
+(`CoverageJSON`) and `crs_details`, which lists the one CRS data queries
+accept: `CRS84` with the WKT2 of OGC:CRS84, longitude first. Radius adds
+`within_units`. The same builder serves collection documents, the
+`/collections` list and instance documents; the `data_queries.instances`
+link carries only `query_type`, which is all 1.2's `instancesLink` asks for.
+`multiple_locations` on the locations link is not emitted yet (#923).
+`parameter_names` entries carry no `dataType`: engines do not report a
+value type, every CoverageJSON range is encoded as `float`.
+
 ### Instance-scoped routes
 
 | Route | Status |
@@ -84,7 +97,7 @@ A query type a collection's engine does not support (not in its `supported_query
 | `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData and Nowcast (#666); GRIB keeps its own equivalent check |
 | `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent |
 | `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
-| `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
+| `crs` | ✗ | data queries accept CRS84 only, which every `data_queries` link advertises in `crs_details` (#918); the `crs` parameter itself is not parsed (#84); `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
 | `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. On `/locations` it pages the list, below. Not on trajectory: EDR 1.2 does not list it there. `/collections` pages with Common's default and maximum of 1000 |
@@ -283,7 +296,7 @@ generations, not already-published instances.
 
 1. `locations` and `trajectory` under `/instances/{id}/`.
 2. `cube` and `corridor` (derivable from area / trajectory).
-3. `crs` on data queries + `crs_details`; EDR GeoJSON output for point results (then declare `edr-geojson`).
+3. `crs` on data queries, adding its CRSs to `crs_details` (#84); EDR GeoJSON output for point results (then declare `edr-geojson`).
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
 
 Related issues: #585 MULTIPOINT fan-out bound · #667

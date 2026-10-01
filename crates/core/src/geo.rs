@@ -7,6 +7,14 @@ use crate::map_engine::OutputCrs;
 /// radius themselves (`scripts/check_geo_safety.sh` flags the literal);
 /// numerically equal to `web_mercator::EARTH_RADIUS` (the 3857 sphere).
 pub const WGS84_A: f64 = 6_378_137.0;
+
+/// OGC:CRS84 as WKT: WGS 84 with longitude as the first axis, in ISO
+/// 19162:2019 (WKT2) form with an explicit axis `ORDER`. EDR advertises it
+/// in every data query's `crs_details`. The EDR standard's own examples pair
+/// `CRS84` with EPSG:4326's WKT, whose axes are latitude first, so this is
+/// not copied from them. PROJ 9.8 identifies it:
+/// `projinfo '<wkt>' --identify` → `OGC:CRS84: 100 %`.
+pub const CRS84_WKT: &str = r#"GEOGCRS["WGS 84 (CRS84)",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,2],AXIS["geodetic longitude (Lon)",east,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic latitude (Lat)",north,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],ID["OGC","CRS84"]]"#;
 const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
 const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 

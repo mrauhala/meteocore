@@ -3,6 +3,16 @@ use serde::Deserialize;
 
 use crate::response::{COVERAGE_JSON_MEDIA_TYPE, LEGACY_COVERAGE_JSON_MEDIA_TYPE};
 
+/// The one CRS data queries accept: `coords` are read, and results written,
+/// in OGC:CRS84, WGS 84 longitude/latitude. Every data query advertises it as
+/// the `crs` of its `link.variables.crs_details` (EDR 1.2 `/req/edr/rc-crs`).
+/// The `crs` query parameter that would select another one is #84.
+pub const DATA_QUERY_CRS: &str = "CRS84";
+
+/// WKT of [`DATA_QUERY_CRS`], advertised in every `crs_details`. Its home is
+/// `ds_core::geo`, next to the other WGS 84 constants.
+pub use ds_core::geo::CRS84_WKT;
+
 #[derive(Debug, Deserialize)]
 pub struct LocationQueryParams {
     pub datetime: Option<String>,
@@ -758,5 +768,30 @@ mod tests {
         assert!(parse_within_metres("10", "furlong").is_err());
         assert!(parse_within_metres("1001", "km").is_err());
         assert!(parse_within_metres("1000", "km").is_ok());
+    }
+
+    /// `crs_details` promises CRS84, whose first axis is longitude: the WKT
+    /// must say so, or a client that reads it swaps every coordinate. The
+    /// standard's own example WKT is EPSG:4326's, latitude first.
+    #[test]
+    fn crs84_wkt_is_longitude_first() {
+        let lon = CRS84_WKT
+            .find(r#"AXIS["geodetic longitude (Lon)",east,ORDER[1]"#)
+            .expect("longitude axis, order 1");
+        let lat = CRS84_WKT
+            .find(r#"AXIS["geodetic latitude (Lat)",north,ORDER[2]"#)
+            .expect("latitude axis, order 2");
+        assert!(lon < lat);
+        assert!(
+            CRS84_WKT.starts_with(r#"GEOGCRS["WGS 84 (CRS84)",DATUM["World Geodetic System 1984""#)
+        );
+        assert!(CRS84_WKT.ends_with(r#"ID["OGC","CRS84"]]"#));
+        assert!(!CRS84_WKT.contains("4326"));
+        // Brackets balance and never close more than they opened.
+        let depth = CRS84_WKT.chars().try_fold(0i32, |d, c| {
+            let d = d + i32::from(c == '[') - i32::from(c == ']');
+            (d >= 0).then_some(d)
+        });
+        assert_eq!(depth, Some(0));
     }
 }
