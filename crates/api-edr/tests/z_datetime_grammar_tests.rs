@@ -232,6 +232,7 @@ fn router(flat: &Arc<Recorder>, levels: &Arc<Recorder>) -> axum::Router {
         engines,
         collections,
         styles: HashMap::new(),
+        feature_engines: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
     })))

@@ -217,6 +217,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
     );
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),
@@ -265,6 +266,7 @@ mod proxy_headers {
         let cur = state.load();
         state.store(Arc::new(EdrState {
             engines: cur.engines.clone(),
+            feature_engines: cur.feature_engines.clone(),
             collections: cur.collections.clone(),
             styles: cur.styles.clone(),
             base_url: base_url.to_string(),
@@ -1871,6 +1873,7 @@ mod metadata_extras {
         );
         Arc::new(ArcSwap::from_pointee(EdrState {
             engines,
+            feature_engines: HashMap::new(),
             collections,
             styles: HashMap::new(),
             base_url: String::new(),

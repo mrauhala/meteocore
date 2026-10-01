@@ -172,6 +172,7 @@ fn build_router() -> axum::Router {
     );
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),
