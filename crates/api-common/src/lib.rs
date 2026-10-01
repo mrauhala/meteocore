@@ -2,7 +2,9 @@
 //! and extent policy stays in ds-core; adapters supply metadata and engine facets.
 
 pub mod caching;
+pub mod map_frame;
 pub mod shared;
+pub mod subset;
 pub mod workbench;
 
 use std::sync::Arc;

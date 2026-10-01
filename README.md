@@ -358,6 +358,35 @@ the shared root serves all three):
 /metrics                                       Prometheus metrics (text format)
 ```
 
+### Map requests (OGC API - Maps)
+
+`/collections/{id}/map` and `/collections/{id}/styles/{styleId}/map` take the
+Maps Part 1 core, spatial subsetting, scaling, date-time and CRS parameters
+(#945):
+
+- **Area**: at most one of `bbox` (with `bbox-crs`), a spatial `subset` such as
+  `subset=Lon(19:32),Lat(59:70)` (with `subset-crs`; `E`/`N` in a projected
+  CRS; an axis left out or `*` keeps the extent) and `center` (with
+  `center-crs`). Without any, the map is the collection's whole spatial extent.
+- **Size**: `width` and `height` resample a map over an area; an omitted one
+  keeps square pixels, and with both omitted the longer side is 1024 pixels.
+  With `center`, or `scale-denominator` and no area, they set the extent
+  around the point (default: the extent's centre) at the collection's native
+  resolution or the requested scale; omitted, each is the other's value, else
+  1024. `scale-denominator` over an area derives the size: one pixel spans
+  scale × 0.28 mm on the ground at the map centre. Every size is capped at
+  8000 pixels a side and 64 000 000 in all.
+- **CRS**: `crs` takes a URI, safe CURIE or code (`EPSG:3857`); the default is
+  the collection's `storageCrs` when it is one of the five output CRSs, else
+  CRS84. Coordinates follow each CRS's axis order (EPSG:4326 latitude first,
+  EPSG:3035 northing first).
+- **Time**: `datetime` (an instant or an interval) or `subset=time(…)`. An
+  instant snaps to an available time step; an interval renders the latest one
+  inside it, and is a 404 when it holds none.
+- **Headers**: every map carries `Content-Crs`, `Content-Bbox` (the rendered
+  corners, in the CRS's axis order) and, on a collection with a temporal
+  extent, `Content-Datetime` (the instant rendered).
+
 ## Configuration
 
 Edit `config.toml` to configure the server and data collections:

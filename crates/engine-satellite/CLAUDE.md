@@ -85,7 +85,7 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   normalising. `tests/antimeridian.rs` pins renders and EDR positions
   either side of the seam on a real GOES-18 crop. The API edges handle the
   wrapped extent: WMS CRS:84 `BoundingBox` and Tiles limits span every
-  longitude. OGC API Maps rejects a west > east `bbox` (#828).
+  longitude. OGC API Maps takes a west > east `bbox` across the antimeridian (#828).
 - **A scan may be many files.** Himawari ISatSS (`provider = "isatss"`)
   publishes a full disk as 88 tiles of 550 × 550 in the scan's own
   ten-minute directory (`AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/`).

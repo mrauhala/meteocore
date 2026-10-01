@@ -287,7 +287,7 @@
           url.searchParams.set('width',width); url.searchParams.set('height',height);
           url.searchParams.set('f','image/png'); url.searchParams.set('transparent','true');
           if (selectedTime) url.searchParams.set('datetime',selectedTime); else url.searchParams.delete('datetime');
-          if (level?.value) url.searchParams.set('z',level.value); else url.searchParams.delete('z');
+          if (level?.value) url.searchParams.set('elevation',level.value); else url.searchParams.delete('elevation');
           requestedUrl = url.href;
           if (!activeId) requestText.textContent = requestedUrl;
           status.textContent = activeId ? 'Updating map data… Showing the previous image until ready.' : 'Loading map data…';

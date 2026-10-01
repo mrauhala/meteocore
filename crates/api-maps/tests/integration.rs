@@ -1089,11 +1089,14 @@ mod get_map {
         assert!(body[0] == 0xFF && body[1] == 0xD8);
     }
 
+    /// `bbox` is optional (#945): a bare `/map` is the default map, the
+    /// collection's whole extent (see `mod part1`).
     #[tokio::test]
-    async fn missing_bbox_returns_400() {
-        let (status, json) = get("/collections/radar/map").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(json["code"].is_string());
+    async fn missing_bbox_renders_the_default_map() {
+        let (status, headers, body) = get_raw("/collections/radar/map").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-bbox").unwrap(), "10,55,30,70");
+        assert!(body.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 
     #[tokio::test]
@@ -3893,5 +3896,666 @@ mod quality {
             quality["schema"],
             serde_json::json!({"type": "integer", "minimum": 1, "maximum": 100})
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OGC API - Maps Part 1 (#945): the default map, `subset`, `center`,
+// `scale-denominator`, CRS parameters and the map response headers
+// ---------------------------------------------------------------------------
+
+mod part1 {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use std::sync::Mutex;
+
+    const T0: &str = "2024-01-01T00:00:00Z";
+    const T1: &str = "2024-01-01T01:00:00Z";
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// What one `get_raster_tile` call was asked for.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Render {
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        output_crs: OutputCrs,
+        time: Option<DateTime<Utc>>,
+    }
+
+    /// Records every render, and snaps a requested time to the latest
+    /// timestep at or before it (the earliest before them all), as the
+    /// radar engines do.
+    struct Recorder {
+        info: RasterInfo,
+        renders: Mutex<Vec<Render>>,
+    }
+
+    impl Recorder {
+        fn new(info: RasterInfo) -> Arc<Self> {
+            Arc::new(Self {
+                info,
+                renders: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn renders(&self) -> Vec<Render> {
+            self.renders.lock().unwrap().clone()
+        }
+
+        fn last(&self) -> Render {
+            self.renders().last().cloned().expect("a render")
+        }
+    }
+
+    impl MapEngine for Recorder {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.renders.lock().unwrap().push(Render {
+                bbox,
+                width,
+                height,
+                output_crs: output_crs.clone(),
+                time,
+            });
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![Some(0.5); (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            self.info.clone()
+        }
+
+        fn resolve_time(
+            &self,
+            time: Option<DateTime<Utc>>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let times = &self.info.times;
+            let time = time?;
+            times
+                .iter()
+                .rev()
+                .find(|t| **t <= time)
+                .or(times.first())
+                .copied()
+        }
+    }
+
+    /// The mock collection: extent 10,55,30,70 on a 0.01° grid, two hours.
+    fn radar() -> Arc<Recorder> {
+        Recorder::new(MockMapEngine::make_info())
+    }
+
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).map(|v| v.to_str().unwrap())
+    }
+
+    /// The width and height in a PNG's IHDR chunk.
+    fn png_size(body: &[u8]) -> (u32, u32) {
+        let be = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap());
+        (be(&body[16..20]), be(&body[20..24]))
+    }
+
+    fn close(a: [f64; 4], b: [f64; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9)
+    }
+
+    /// A bare `/map`, on both routes: the whole extent, longer side 1024 at
+    /// square pixels, in the storage CRS, at the latest time — and the
+    /// headers saying so (`/req/core/map-op`, `/rec/core/map-op`,
+    /// `/req/core/map-response`).
+    #[tokio::test]
+    async fn bare_map_is_the_default_map() {
+        let app = build_router();
+        for uri in [
+            "/collections/radar/map",
+            "/collections/radar/styles/default/map",
+            "/collections/radar/styles/grayscale/map",
+        ] {
+            let (status, headers, body) = fetch(&app, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(png_size(&body), (1024, 768), "{uri}");
+            assert_eq!(
+                header(&headers, "content-bbox"),
+                Some("10,55,30,70"),
+                "{uri}"
+            );
+            assert_eq!(
+                header(&headers, "content-crs"),
+                Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
+                "{uri}"
+            );
+            assert_eq!(header(&headers, "content-datetime"), Some(T1), "{uri}");
+        }
+    }
+
+    /// One side given: the other keeps square pixels over the area.
+    #[tokio::test]
+    async fn an_omitted_side_keeps_square_pixels() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, _, _) = fetch(&app, "/collections/radar/map?bbox=10,55,30,60&width=400").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((engine.last().width, engine.last().height), (400, 100));
+        let (status, _, _) = fetch(&app, "/collections/radar/map?height=300").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((engine.last().width, engine.last().height), (400, 300));
+    }
+
+    /// `Content-Bbox`, `Content-Crs` and `Content-Datetime` are the same on
+    /// the render, its cache hit and an empty map.
+    #[tokio::test]
+    async fn headers_are_identical_on_a_cache_hit() {
+        let app = build_router();
+        let uri = "/collections/radar/map?bbox=12,56,20,60&datetime=2024-01-01T00:00:00Z&width=64";
+        let (_, miss, _) = fetch(&app, uri).await;
+        let (_, hit, _) = fetch(&app, uri).await;
+        assert_eq!(header(&miss, "x-cache"), Some("MISS"));
+        assert_eq!(header(&hit, "x-cache"), Some("HIT"));
+        for name in ["content-bbox", "content-crs", "content-datetime"] {
+            assert!(miss.get(name).is_some(), "{name}");
+            assert_eq!(miss.get(name), hit.get(name), "{name}");
+        }
+        assert_eq!(header(&miss, "content-bbox"), Some("12,56,20,60"));
+        assert_eq!(header(&miss, "content-datetime"), Some(T0));
+
+        let (status, empty, _) = fetch(
+            &build_empty_router(),
+            "/collections/empty/map?bbox=12,56,20,60",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header(&empty, "x-cache"), Some("EMPTY"));
+        assert_eq!(header(&empty, "content-bbox"), Some("12,56,20,60"));
+    }
+
+    /// `Content-Datetime` is the instant rendered, not the one requested, on
+    /// the render and on the cache hit; a collection without a temporal
+    /// extent sends none.
+    #[tokio::test]
+    async fn content_datetime_is_the_instant_rendered() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let uri = "/collections/radar/map?bbox=12,56,20,60&width=8&datetime=2024-01-01T00:30:00Z";
+        for x_cache in ["MISS", "HIT"] {
+            let (status, headers, _) = fetch(&app, uri).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(header(&headers, "x-cache"), Some(x_cache));
+            assert_eq!(header(&headers, "content-datetime"), Some(T0), "{x_cache}");
+        }
+        assert_eq!(engine.renders().len(), 1);
+        assert_eq!(engine.last().time, Some(at(T0)));
+
+        let timeless = Recorder::new(RasterInfo {
+            times: Vec::new(),
+            ..MockMapEngine::make_info()
+        });
+        let (status, headers, _) = fetch(
+            &build_router_with_engine(timeless),
+            "/collections/radar/map?width=8",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get("content-datetime").is_none());
+        assert_eq!(header(&headers, "content-bbox"), Some("10,55,30,70"));
+    }
+
+    /// A spatial `subset` sets the area (repeated or comma-separated), and
+    /// a `time` subset the time.
+    #[tokio::test]
+    async fn subset_selects_the_area_and_time() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?subset=Lon(12:20),Lat(60:65)\
+             &subset=time(%222024-01-01T00:00:00Z%22)",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert_eq!(render.bbox, [12.0, 60.0, 20.0, 65.0]);
+        assert_eq!((render.width, render.height), (1024, 640));
+        assert_eq!(render.time, Some(at(T0)));
+        assert_eq!(header(&headers, "content-bbox"), Some("12,60,20,65"));
+        assert_eq!(header(&headers, "content-datetime"), Some(T0));
+
+        // One axis: the extent on the other; `*` is the extent's edge.
+        let (status, _, _) = fetch(&app, "/collections/radar/map?subset=Lat(60:*)&width=8").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().bbox, [10.0, 60.0, 30.0, 70.0]);
+        // The seam test box, crossing the antimeridian.
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?subset=Lon(170:-170)&subset=Lat(10:20)&width=8",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().bbox, [170.0, 10.0, 190.0, 20.0]);
+        assert_eq!(header(&headers, "content-bbox"), Some("170,10,-170,20"));
+    }
+
+    /// Time subsets and `datetime` intervals render the latest time inside
+    /// them; nothing inside, or an instant off the axis, is a 404.
+    #[tokio::test]
+    async fn time_intervals_render_their_latest_time() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        for (i, (query, expected)) in [
+            ("subset=time(%222024-01-01%22)", T1),
+            ("subset=time(*)", T1),
+            ("subset=t(*:%222024-01-01T00:59:00Z%22)", T0),
+            (
+                "subset=time(%222024-01-01T00:00:00Z%22:%222024-01-01T00:59:00Z%22)",
+                T0,
+            ),
+            ("datetime=2024-01-01T00:00:00Z/2024-01-01T00:30:00Z", T0),
+            ("datetime=../2024-01-01T00:30:00Z", T0),
+            ("datetime=2024-01-01T00:30:00Z/..", T1),
+            // An instant snaps, as `datetime` always has.
+            ("subset=time(%222024-01-01T00:30:00Z%22)", T0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // A width of its own: a render, never another case's cache hit.
+            let width = 8 + i;
+            let (status, headers, _) = fetch(
+                &app,
+                &format!("/collections/radar/map?width={width}&{query}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(engine.last().width, width as u32, "{query}");
+            assert_eq!(engine.last().time, Some(at(expected)), "{query}");
+            assert_eq!(
+                header(&headers, "content-datetime"),
+                Some(expected),
+                "{query}"
+            );
+        }
+        let before = engine.renders().len();
+        for query in [
+            "subset=time(%222025-01-01T00:00:00Z%22)",
+            "subset=time(%222024-01-01T00:10:00Z%22:%222024-01-01T00:20:00Z%22)",
+            "subset=time(%222023%22)",
+            "datetime=2024-01-01T00:10:00Z/2024-01-01T00:20:00Z",
+            "subset=Lat(91:95)",
+        ] {
+            let (status, _, _) = fetch(&app, &format!("/collections/radar/map?{query}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{query}");
+        }
+        assert_eq!(engine.renders().len(), before);
+    }
+
+    /// An axis the routes do not know is a 400 naming the valid ones, not
+    /// ignored (`/req/spatial-subsetting/subset-definition` D,
+    /// `/req/datetime/subset-definition` C).
+    #[tokio::test]
+    async fn unknown_subset_axis_is_400() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        for uri in [
+            "/collections/radar/map?subset=foo(1)",
+            "/collections/radar/styles/default/map?subset=foo(1)",
+            "/collections/radar/map?subset=h(0:100)",
+            "/collections/radar/map?subset=Lat(60:65),foo(1:2)",
+        ] {
+            let (status, json) = get_on(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(
+                json["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("valid axes: Lon, Lat, E, N, time"),
+                "{uri}: {json}"
+            );
+        }
+        assert!(engine.renders().is_empty());
+    }
+
+    /// `center` with `width`/`height` maps that many pixels around it at
+    /// the native resolution (0.01° here), in any `center-crs`.
+    #[tokio::test]
+    async fn center_with_width_and_height() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?center=20,60&width=200&height=100",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert!(
+            close(render.bbox, [19.0, 59.5, 21.0, 60.5]),
+            "{:?}",
+            render.bbox
+        );
+        assert_eq!((render.width, render.height), (200, 100));
+        assert!(header(&headers, "content-bbox").is_some());
+
+        let x = ds_core::web_mercator::lon_to_x(20.0);
+        let y = ds_core::web_mercator::lat_to_y(60.0);
+        let (status, _, _) = fetch(
+            &app,
+            &format!(
+                "/collections/radar/map?center={x},{y}&center-crs=EPSG:3857&width=200&height=100"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            close(engine.last().bbox, [19.0, 59.5, 21.0, 60.5]),
+            "{:?}",
+            engine.last().bbox
+        );
+    }
+
+    /// `scale-denominator` (`/req/scaling/scale-denominator-definition`):
+    /// with an area it sets the size; without one it sets the area around
+    /// `center` or the extent's centre; with an area and a size it is a 400.
+    #[tokio::test]
+    async fn scale_denominator_sets_size_or_area() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        // 1:1 000 000 is 280 m a pixel: 1° of latitude ≈ 397 pixels, 2° of
+        // longitude at 60.5°N ≈ 391.
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=20,60,22,61&scale-denominator=1000000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert_eq!(render.bbox, [20.0, 60.0, 22.0, 61.0]);
+        assert_eq!(render.height, 397);
+        assert!(render.width.abs_diff(391) <= 1, "{}", render.width);
+
+        // No area: 1024 × 1024 around the extent's centre (20°E, 62.5°N).
+        let (status, headers, _) =
+            fetch(&app, "/collections/radar/map?scale-denominator=1000000").await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert_eq!((render.width, render.height), (1024, 1024));
+        let [w, s, e, n] = render.bbox;
+        assert!(((w + e) / 2.0 - 20.0).abs() < 1e-9 && ((s + n) / 2.0 - 62.5).abs() < 1e-9);
+        assert!(((n - s) - 2.5785).abs() < 1e-3, "{}", n - s);
+        assert!(header(&headers, "content-bbox").is_some());
+
+        // With center and a size: that many pixels at the scale.
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/map?center=20,60&width=100&height=100&scale-denominator=1000000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let [_, s, _, n] = engine.last().bbox;
+        assert!(((n - s) - 0.2518).abs() < 1e-3, "{}", n - s);
+
+        // A time subset is not an area: it goes with bbox and a size.
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=20,60,22,61&scale-denominator=1000000&subset=time(*)",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let before = engine.renders().len();
+        for uri in [
+            "/collections/radar/map?bbox=20,60,22,61&scale-denominator=1000000&width=100",
+            "/collections/radar/map?subset=Lat(60:61)&scale-denominator=1000000&height=100",
+            // Too fine for the area: the derived size exceeds the cap.
+            "/collections/radar/map?bbox=10,55,30,70&scale-denominator=1000",
+            "/collections/radar/map?scale-denominator=0",
+            "/collections/radar/map?scale-denominator=abc",
+        ] {
+            let (status, _, _) = fetch(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(engine.renders().len(), before);
+    }
+
+    /// The combinations Spatial Subsetting and Scaling forbid, and invalid
+    /// values, are 400s that never reach the engine.
+    #[tokio::test]
+    async fn invalid_combinations_are_400() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        for query in [
+            "bbox=10,55,30,70&center=20,60",
+            "bbox=10,55,30,70&subset=Lat(60:65)",
+            "center=20,60&subset=Lon(10:20)",
+            "datetime=2024-01-01T00:00:00Z&subset=time(*)",
+            "subset=Lat(60)",
+            "subset=Lat(65:60)",
+            "subset=Lat(60:65)&subset=Latitude(61:62)",
+            "subset=E(1:2)",
+            "subset=Lat(60:65)&subset-crs=EPSG:9999",
+            "bbox=10,55,30,70&bbox-crs=EPSG:9999",
+            "bbox=10,55,0,30,70,100",
+            "center=20",
+            "center=20,95",
+            "crs=EPSG:9999",
+            "width=0",
+            "width=1.5",
+            "height=9000",
+            "datetime=2024-01-01T02:00:00Z/2024-01-01T01:00:00Z",
+        ] {
+            let (status, json) =
+                get_on(app.clone(), &format!("/collections/radar/map?{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");
+            assert_eq!(json["code"], "BadRequest", "{query}");
+        }
+        assert!(engine.renders().is_empty());
+        // Each CRS parameter is ignored without its parameter.
+        for query in [
+            "bbox-crs=EPSG:9999",
+            "center-crs=nope",
+            "subset-crs=nope&subset=time(*)",
+        ] {
+            let (status, _, _) =
+                fetch(&app, &format!("/collections/radar/map?width=8&{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+        }
+    }
+
+    /// CRS parameters take URIs and CURIEs (`/req/crs/crs-definition` D),
+    /// and the output defaults to the storage CRS (`/req/core/map-response`
+    /// B).
+    #[tokio::test]
+    async fn crs_uris_and_the_storage_crs_default() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=10,55,30,70&width=8\
+             &crs=http://www.opengis.net/def/crs/EPSG/0/3857",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().output_crs, OutputCrs::WebMercator);
+        assert_eq!(
+            header(&headers, "content-crs"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3857")
+        );
+        // Web Mercator metres, easting first.
+        let values: Vec<f64> = header(&headers, "content-bbox")
+            .unwrap()
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert!((values[0] - ds_core::web_mercator::lon_to_x(10.0)).abs() < 1e-6);
+        assert!((values[3] - ds_core::web_mercator::lat_to_y(70.0)).abs() < 1e-6);
+
+        // EPSG:4326 renders the same image, its box latitude first.
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=170,10,-170,20&width=8&crs=[EPSG:4326]",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().output_crs, OutputCrs::Wgs84);
+        assert_eq!(header(&headers, "content-bbox"), Some("10,170,20,-170"));
+
+        // A bbox in Web Mercator metres.
+        let (x0, y0) = (
+            ds_core::web_mercator::lon_to_x(12.0),
+            ds_core::web_mercator::lat_to_y(60.0),
+        );
+        let (x1, y1) = (
+            ds_core::web_mercator::lon_to_x(20.0),
+            ds_core::web_mercator::lat_to_y(65.0),
+        );
+        let (status, _, _) = fetch(
+            &app,
+            &format!("/collections/radar/map?bbox={x0},{y0},{x1},{y1}&bbox-crs=EPSG:3857&width=8"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            close(engine.last().bbox, [12.0, 60.0, 20.0, 65.0]),
+            "{:?}",
+            engine.last().bbox
+        );
+
+        // A TM35FIN collection renders in TM35FIN unless asked otherwise.
+        let tm = Recorder::new(RasterInfo {
+            native_crs: "EPSG:3067".into(),
+            ..MockMapEngine::make_info()
+        });
+        let app = build_router_with_engine(tm.clone());
+        let (status, headers, _) = fetch(&app, "/collections/radar/map?width=8").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(tm.last().output_crs, OutputCrs::Projected { .. }));
+        assert_eq!(
+            header(&headers, "content-crs"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3067")
+        );
+        let (status, headers, _) = fetch(&app, "/collections/radar/map?width=8&crs=CRS:84").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tm.last().output_crs, OutputCrs::Wgs84);
+        assert_eq!(header(&headers, "content-bbox"), Some("10,55,30,70"));
+    }
+
+    /// The default map of a collection crossing the antimeridian is its
+    /// unwrapped extent, reported back in the crossing form.
+    #[tokio::test]
+    async fn default_map_across_the_antimeridian() {
+        let engine = Recorder::new(RasterInfo {
+            spatial_extent: Some([173.9, 11.2, -174.8, 16.3]),
+            grid_size: None,
+            ..MockMapEngine::make_info()
+        });
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(&app, "/collections/radar/map").await;
+        assert_eq!(status, StatusCode::OK);
+        let [w, s, e, n] = engine.last().bbox;
+        assert_eq!([w, s, n], [173.9, 11.2, 16.3]);
+        assert!((e - 185.2).abs() < 1e-9, "{e}");
+        let reported: Vec<f64> = header(&headers, "content-bbox")
+            .unwrap()
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert!(close(
+            reported.try_into().unwrap(),
+            [173.9, 11.2, -174.8, 16.3]
+        ));
+        // No extent yet: the default map has no area.
+        let empty = Recorder::new(RasterInfo {
+            spatial_extent: None,
+            ..MockMapEngine::make_info()
+        });
+        let (status, _, _) =
+            fetch(&build_router_with_engine(empty), "/collections/radar/map").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The OpenAPI document is valid OpenAPI 3.0, `bbox` is no longer
+    /// required, and the Spatial Subsetting and Scaling parameters are the
+    /// standard's (#945).
+    #[tokio::test]
+    async fn openapi_declares_the_part1_parameters() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
+        let validator = jsonschema::Validator::new(&schema).unwrap();
+        let (status, doc) = get("/api").await;
+        assert_eq!(status, StatusCode::OK);
+        let errors: Vec<String> = validator
+            .iter_errors(&doc)
+            .map(|e| format!("{e} at {}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        let parameters = &doc["components"]["parameters"];
+        assert_eq!(parameters["bbox"]["required"], false);
+        assert_eq!(parameters["bbox"]["style"], "form");
+        assert_eq!(parameters["bbox"]["explode"], false);
+        assert_eq!(parameters["subset"]["schema"]["type"], "array");
+        assert_eq!(parameters["center"]["schema"]["maxItems"], 2);
+        assert_eq!(parameters["scale-denominator"]["schema"]["type"], "number");
+        assert_eq!(parameters["map-datetime"]["name"], "datetime");
+        for name in ["bbox-crs", "subset-crs", "center-crs", "crs"] {
+            assert_eq!(parameters[name]["schema"]["type"], "string", "{name}");
+        }
+        for path in [
+            "/maps/collections/radar/map",
+            "/maps/collections/radar/styles/{styleId}/map",
+        ] {
+            let operation = &doc["paths"][path]["get"];
+            for name in [
+                "bbox",
+                "subset",
+                "center",
+                "scale-denominator",
+                "map-datetime",
+            ] {
+                assert!(
+                    operation["parameters"].as_array().unwrap().contains(
+                        &serde_json::json!({"$ref": format!("#/components/parameters/{name}")})
+                    ),
+                    "{path}: {name}"
+                );
+            }
+            let headers = &operation["responses"]["200"]["headers"];
+            for name in ["Content-Bbox", "Content-Crs", "Content-Datetime"] {
+                assert!(headers[name].is_object(), "{path}: {name}");
+            }
+        }
     }
 }

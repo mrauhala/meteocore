@@ -195,6 +195,7 @@ dependencies = [
  "ds-executor",
  "ds-render",
  "http-body-util",
+ "jsonschema",
  "serde",
  "serde_json",
  "tokio",
