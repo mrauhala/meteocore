@@ -1471,6 +1471,18 @@ async fn run_position_query(
         )
     })?;
 
+    if let Some(DatetimeSelector::Instants(instants)) = &datetime {
+        let lookups = points.len().saturating_mul(instants.len());
+        if lookups > crate::params::MAX_POSITION_LOOKUPS {
+            return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                "{} points × {} datetime instants is {lookups} position lookups; the limit is {} — \
+                 name fewer points or instants",
+                points.len(),
+                instants.len(),
+                crate::params::MAX_POSITION_LOOKUPS
+            ))));
+        }
+    }
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
     let engine = engine.clone();
     execute_query(false, move |budget| {

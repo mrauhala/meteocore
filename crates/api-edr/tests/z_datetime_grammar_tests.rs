@@ -430,3 +430,24 @@ async fn malformed_datetime_lists_are_400() {
     }
     assert!(flat.calls().is_empty());
 }
+
+/// A MULTIPOINT × datetime-list position request is capped on the product of
+/// the two (`MAX_POSITION_LOOKUPS`): each instant re-queries every point.
+#[tokio::test]
+async fn multipoint_times_datetime_list_is_capped() {
+    let (flat, levels) = (Recorder::new(false), Recorder::new(true));
+    let app = router(&flat, &levels);
+    let points = (0..20)
+        .map(|i| format!("{}%20{}", 20 + i % 10, 60 + i / 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    let instants = (0..20)
+        .map(|m| format!("2024-01-01T00:{m:02}:00Z"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let uri = format!("/collections/flat/position?coords=MULTIPOINT({points})&datetime={instants}");
+    let (status, body, _) = get(&app, &uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("400 position lookups"), "{body}");
+    assert!(flat.calls().is_empty(), "rejected before any engine call");
+}

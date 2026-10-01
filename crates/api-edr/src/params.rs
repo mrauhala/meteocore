@@ -444,6 +444,12 @@ pub fn resolve_z_levels(
 /// Limits apply to decoded coordinates, before per-point allocations/queries.
 pub const MAX_POSITION_COORD_BYTES: usize = 16 * 1024;
 pub const MAX_POSITION_POINTS: usize = 64;
+/// Most engine position lookups one request may make: MULTIPOINT points ×
+/// `datetime` list instants. Each instant re-queries every point, and a
+/// lookup can be blocking remote I/O, so the product is capped jointly
+/// rather than letting the two limits multiply to 64 × 64 (root CLAUDE.md
+/// Critical Rule 9).
+pub const MAX_POSITION_LOOKUPS: usize = 256;
 /// Combined position response budget, including every point and parameter.
 pub const MAX_POSITION_VALUES: usize = 1_000_000;
 
