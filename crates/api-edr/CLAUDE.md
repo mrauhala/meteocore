@@ -126,7 +126,8 @@ and never under an instance.
 - `f=png` time-series plots are why this crate (alone among API crates)
   depends on ds-render.
 - A location with no data in the requested window returns `LocationNotFound`
-  → 404 (an empty PointSeries would fail schema validation).
+  → 404 (an empty PointSeries would fail schema validation). In a list of
+  ids it contributes nothing instead; see "Location lists" below.
 - When adding endpoints or params, update `api_definition()` in
   `src/handlers.rs` (OpenAPI).
 - **Per-parameter time axes (#819).** When
@@ -182,7 +183,7 @@ pool for their explicit-handle I/O. Never call synchronous engines directly on
 HTTP workers. The admission queue is bounded to 32 waiting requests; deadlines include queue
 time. Beyond the queue, admission fails fast. Permits live with the
 work, including after client timeout/disconnect. Check `QueryBudget::expired`
-between MULTIPOINT elements. Validate the whole coordinate list before dispatch;
+between MULTIPOINT elements and between listed location ids. Validate the whole coordinate list before dispatch;
 keep point, byte and combined-value limits and OpenAPI/README documentation aligned.
 
 Position handlers delegate the validated POINT list to `EdrEngine::query_positions`.
@@ -204,6 +205,24 @@ data-query route must do the same and list `#/components/parameters/limit` in
 the unpaged inventory (clients and ETags rely on it); with `limit` it pages
 through `ds_core::collection_search::page_window`, the `/collections`
 arithmetic, under the same `location_budget` writer.
+
+## Location lists (EDR 1.2, #923)
+
+`/locations/{locationId}` takes a comma-delimited list
+(`params::split_location_ids`), split on the raw path segment from the `Uri`
+extractor: a literal comma separates, `%2C` belongs to an id. Never split the
+decoded `Path` value, which cannot tell them apart. One id, a repeat-only list
+included, keeps the single-id path byte for byte. A list goes through
+`query_location_list`: one engine `query_location` per id in request order,
+flattened into one CoverageCollection, CoverageJSON only, capped at
+`MAX_LOCATION_IDS` ids and `MAX_LOCATION_VALUES` values. A `datetime` list
+runs per id through `datetime_list::run`, and ids × instants is capped at
+`MAX_LOCATION_LOOKUPS` before any engine call. Engines return
+`LocationNotFound` for unknown ids and no-data ids alike, so the handler
+consults `get_locations()`, lazily and once, to answer 404 for an unknown id
+and 204 when every id is known and none has data. The fan-out is
+engine-independent, which is why `data_query_variables` advertises
+`multiple_locations: true` for every collection that serves locations.
 
 ## Shared Common discovery (#739)
 

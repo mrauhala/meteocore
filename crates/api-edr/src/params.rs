@@ -600,6 +600,63 @@ pub const MAX_POSITION_LOOKUPS: usize = 256;
 /// Combined position response budget, including every point and parameter.
 pub const MAX_POSITION_VALUES: usize = 1_000_000;
 
+/// Most location ids one locations query may list (EDR 1.2
+/// `/req/edr/REQ_rc-locationid-definition`, #923), the MULTIPOINT cap. Each
+/// id is one engine call, made in turn, so this bounds that sequence.
+pub const MAX_LOCATION_IDS: usize = MAX_POSITION_POINTS;
+/// Combined values of a multi-location response, every location and
+/// parameter included: the MULTIPOINT budget.
+pub const MAX_LOCATION_VALUES: usize = MAX_POSITION_VALUES;
+/// Most engine location lookups one request may make: listed ids ×
+/// `datetime` list instants. Each instant re-queries every id, so the
+/// product is capped jointly, as for MULTIPOINT ([`MAX_POSITION_LOOKUPS`]),
+/// rather than letting the two limits multiply to 64 × 16 (root CLAUDE.md
+/// Critical Rule 9).
+pub const MAX_LOCATION_LOOKUPS: usize = MAX_POSITION_LOOKUPS;
+
+/// Split a locations query's `{locationId}` path segment, still
+/// percent-encoded as it arrived, into the ids it lists (EDR 1.2
+/// `/req/edr/REQ_rc-locationid-definition`: a comma-delimited list, OpenAPI
+/// `style: simple`, `explode: false`).
+///
+/// A literal comma separates ids. `%2C` is a comma inside an id, which is
+/// how simple-style serialization sends one, so an id containing a comma
+/// stays addressable, alone or in a list. Each element is then
+/// percent-decoded exactly as the router decodes a whole segment. Repeats
+/// collapse to their first occurrence, keeping request order. Elements are
+/// not trimmed: ids may contain spaces. An empty element (`a,,b`, a leading
+/// or trailing comma), an element that is not UTF-8 once decoded, or more
+/// than [`MAX_LOCATION_IDS`] elements, counted before repeats collapse, is a
+/// 400.
+pub fn split_location_ids(segment: &str) -> Result<Vec<String>, DataServerError> {
+    if segment.bytes().filter(|&b| b == b',').count() >= MAX_LOCATION_IDS {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "locationId lists more than {MAX_LOCATION_IDS} locations"
+        )));
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for element in segment.split(',') {
+        if element.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "locationId has an empty element: separate location ids with single commas".into(),
+            ));
+        }
+        let id = percent_encoding::percent_decode_str(element)
+            .decode_utf8()
+            .map_err(|_| {
+                DataServerError::InvalidParameter(
+                    "locationId element is not UTF-8 once percent-decoded".into(),
+                )
+            })?
+            .into_owned();
+        // At most MAX_LOCATION_IDS elements, so a linear scan is cheap.
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 /// Split a position-query `coords` value into one or more `POINT(lon lat)` WKT
 /// strings. Accepts either a single `POINT(lon lat)` or a
 /// `MULTIPOINT((lon lat),(lon lat),...)` (nested form) /
@@ -714,6 +771,63 @@ mod tests {
         for f in ["json", "application/json", "image/jpeg"] {
             assert!(parse_edr_format(Some(f)).is_err(), "{f}");
         }
+    }
+
+    #[test]
+    fn location_ids_split_on_literal_commas_in_request_order() {
+        assert_eq!(split_location_ids("EGLL").unwrap(), ["EGLL"]);
+        assert_eq!(
+            split_location_ids("EGLL,EFHK,CYOW").unwrap(),
+            ["EGLL", "EFHK", "CYOW"]
+        );
+        // Repeats collapse to their first occurrence.
+        assert_eq!(split_location_ids("b,a,b,a,c").unwrap(), ["b", "a", "c"]);
+        assert_eq!(split_location_ids("a,a").unwrap(), ["a"]);
+    }
+
+    #[test]
+    fn location_ids_are_percent_decoded_after_splitting() {
+        // `%2C` is a comma inside an id, a literal comma separates ids.
+        assert_eq!(
+            split_location_ids("Helsinki%2C%20Kaisaniemi,Oulu").unwrap(),
+            ["Helsinki, Kaisaniemi", "Oulu"]
+        );
+        // Not form decoding: `+` is itself, and spaces are kept untrimmed.
+        assert_eq!(split_location_ids("a+b,%20c").unwrap(), ["a+b", " c"]);
+        assert_eq!(
+            split_location_ids("%C3%85land,x").unwrap(),
+            ["\u{c5}land", "x"]
+        );
+        let err = split_location_ids("%FF,x").unwrap_err().to_string();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn location_ids_reject_empty_elements() {
+        for segment in [",a", "a,", "a,,b", ","] {
+            let err = split_location_ids(segment).unwrap_err();
+            assert!(
+                matches!(&err, DataServerError::InvalidParameter(m) if m.contains("empty element")),
+                "{segment}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn location_ids_are_capped_before_repeats_collapse() {
+        let at_cap = vec!["s"; MAX_LOCATION_IDS].join(",");
+        assert_eq!(split_location_ids(&at_cap).unwrap(), ["s"]);
+        let distinct: Vec<String> = (0..MAX_LOCATION_IDS).map(|i| format!("s{i}")).collect();
+        assert_eq!(
+            split_location_ids(&distinct.join(",")).unwrap().len(),
+            MAX_LOCATION_IDS
+        );
+        let over = vec!["s"; MAX_LOCATION_IDS + 1].join(",");
+        let err = split_location_ids(&over).unwrap_err();
+        assert!(
+            matches!(&err, DataServerError::QueryTooLarge(m) if m.contains("more than 64")),
+            "{err}"
+        );
     }
 
     #[test]
