@@ -257,6 +257,30 @@ rendering share `StepFile::default_message` so default labels/units agree.
   decoded cache. It compares serial storage with four concurrent reads, checks
   equal outputs/bytes and prints timings without CI timing thresholds.
 
+## Cube queries
+
+- `query_cube` (#925, `cube.rs`) is offered only by the pressure and
+  model-level views (`supported_query_types` adds `cube` when
+  `vertical_kind()` is set). Output shape is always `[t, z, y, x]`.
+- Steps: no datetime or an instant selects the area query's single step;
+  an interval every step of the run inside it (`cube_steps`). Levels are
+  `selected_levels` (exact); parameters default to every key of the view.
+- Check `check_cube_budget` before I/O with the known dimensions (both
+  horizontal resolutions given ⇒ the full check), then again after the
+  first field supplies the geometry, before allocating output or fetching
+  another field. The first field's values are reused, like area.
+- Remaining fields go through `runtime::run_field_jobs` (four in flight);
+  workers return the resampled `ny × nx` plane only. Skip levels no
+  `resolution-z` position samples. Every field must have the first field's
+  native subset axes, else the "different grid" 400.
+- Resampling is `DecodedGrid::sample_subset` over nearest-index maps from
+  `ds_core::cube::nearest_indices` (half a native cell of tolerance, so a
+  position off a regional grid is null), reading the decoded grid in place.
+  On a 360° grid an x position that misses retries one turn away, so the
+  180° column of a global bbox samples −180°.
+- `west > east` bboxes are a 400 before any I/O (#667); a bbox off the grid
+  is `LocationNotFound` (404).
+
 ## Discovery snapshots
 
 - Publish `RasterInfo` snapshots after catalog changes and successful header/decoded

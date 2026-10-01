@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
+use crate::cube::CubeResolution;
 use crate::error::DataServerError;
+use crate::feature::Bbox;
 use crate::instances::RunInfo;
 use crate::model::{CoverageResponse, Location, ParameterDescription};
 use crate::vertical::VerticalDimension;
@@ -207,6 +209,35 @@ pub trait EdrEngine: Send + Sync {
             emit(self.query_position(point, datetime, parameters, z, reference_time)?)?;
         }
         Ok(())
+    }
+
+    /// Execute a cube query (OGC API - EDR `cube`, #925): every selected
+    /// parameter over the CRS84 `bbox` (`west > east` crosses the
+    /// antimeridian), at the `z` levels (`None` ⇒ every level; the API has
+    /// already expanded an interval against [`Self::get_vertical_extent`]),
+    /// over the `datetime` window, sampled per `resolution`
+    /// ([`CubeResolution`]: native, or `n` evenly spaced positions per axis
+    /// taking their nearest native value). `reference_time` selects a model
+    /// run like the other query methods.
+    ///
+    /// The result is a CoverageJSON `Grid` with `x`, `y`, `z` and `t` axes.
+    /// Check [`crate::cube::check_cube_budget`] before reading or allocating.
+    /// Advertise `"cube"` in [`Self::supported_query_types`] only where this
+    /// is overridden: the API answers 404 for a collection that does not.
+    /// Default implementation returns an error.
+    fn query_cube(
+        &self,
+        bbox: &Bbox,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        resolution: CubeResolution,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let _ = (bbox, datetime, parameters, z, resolution, reference_time);
+        Err(DataServerError::InvalidParameter(
+            "Cube query not supported by this engine".into(),
+        ))
     }
 
     /// Execute a trajectory (vertical cross-section) query along a WKT

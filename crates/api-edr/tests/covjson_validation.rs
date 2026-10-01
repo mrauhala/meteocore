@@ -736,6 +736,52 @@ fn grid_with_z_validates() {
     validate(&json, &schema);
 }
 
+/// The `[t, z, y, x]` Grid a cube query returns (#925): several steps and
+/// levels, with missing cells, validates.
+#[test]
+fn cube_grid_with_t_and_z_validates() {
+    let schema = load_schema();
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "t".to_string(),
+        ParameterDescription {
+            label: "Temperature".to_string(),
+            unit: "°C".to_string(),
+            observed_property: "t".to_string(),
+            standard_name: None,
+        },
+    );
+    let mut ranges = HashMap::new();
+    // shape [t, z, y, x] = [2, 3, 2, 4] = 48 values.
+    ranges.insert(
+        "t".to_string(),
+        NdArray {
+            shape: vec![2, 3, 2, 4],
+            axis_names: vec!["t".into(), "z".into(), "y".into(), "x".into()],
+            values: (0..48).map(|i| (i % 5 != 0).then_some(i as f64)).collect(),
+        },
+    );
+    let result = QueryResult {
+        domain: DomainDescription::Grid {
+            x: vec![-1.0, 0.0, 1.0, 2.0],
+            y: vec![0.0, 1.0],
+            t: Some(vec![make_time(0), make_time(6)]),
+            z: Some(VerticalCoord {
+                kind: VerticalKind::Pressure,
+                values: vec![1000.0, 850.0, 500.0],
+            }),
+        },
+        parameters,
+        ranges,
+    };
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(
+        json["ranges"]["t"]["axisNames"],
+        serde_json::json!(["t", "z", "y", "x"])
+    );
+    validate(&json, &schema);
+}
+
 // --- Section domain (#198 — radar cross-section / trajectory) ---
 
 #[test]
