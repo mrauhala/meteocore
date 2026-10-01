@@ -282,6 +282,12 @@ impl EdrEngine for CsvEngine {
         ]
     }
 
+    /// Every result is one `PointSeries` per CSV location, at the
+    /// coordinates `get_locations` lists: EDR GeoJSON can name each (#929).
+    fn serves_station_series(&self) -> bool {
+        true
+    }
+
     fn query_area(
         &self,
         coords: &str,
@@ -700,5 +706,38 @@ mod tests {
         let engine = CsvEngine::new(test_store());
         let result = engine.get_feature("NonExistent");
         assert!(result.is_err());
+    }
+
+    /// The `serves_station_series` contract EDR GeoJSON relies on (#929):
+    /// every coverage is a `PointSeries` without `z`, at the coordinates of
+    /// one `get_locations` entry.
+    #[test]
+    fn station_series_sit_at_listed_locations() {
+        let engine = CsvEngine::new(test_store());
+        assert!(engine.serves_station_series());
+        let locations = engine.get_locations().unwrap();
+        let CoverageResponse::Collection(coverages) = engine
+            .query_area(
+                "POLYGON((19 59,32 59,32 71,19 71,19 59))",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("an area query answers a collection");
+        };
+        assert_eq!(coverages.len(), locations.len());
+        for coverage in &coverages {
+            let DomainDescription::PointSeries { x, y, z: None, .. } = coverage.domain else {
+                panic!("expected a PointSeries without z: {:?}", coverage.domain);
+            };
+            let at_location = locations
+                .iter()
+                .filter(|l| l.longitude == x && l.latitude == y)
+                .count();
+            assert_eq!(at_location, 1, "({x}, {y})");
+        }
     }
 }

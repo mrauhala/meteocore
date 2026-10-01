@@ -417,6 +417,13 @@ impl EdrEngine for PostgisEngine {
         ]
     }
 
+    /// Station shapes answer one `PointSeries` per station, at the cached
+    /// location's coordinates: EDR GeoJSON names each (#929). Events are
+    /// `Point` coverages with no station, so they stay CoverageJSON only.
+    fn serves_station_series(&self) -> bool {
+        self.config.events().is_none()
+    }
+
     fn query_location(
         &self,
         location_id: &str,
@@ -1613,6 +1620,34 @@ mod tests {
             engine.supported_query_types(),
             vec!["area".to_string(), "radius".to_string()]
         );
+    }
+
+    /// EDR GeoJSON (#929) is offered for station series only: an events
+    /// collection answers `Point` coverages with no station to name.
+    #[test]
+    fn only_station_shapes_serve_station_series() {
+        use crate::config::ValidatedParameter;
+        let stations = PostgisEngineConfig {
+            dsn: "postgres://user:pw@127.0.0.1:1/db".into(),
+            dsn_was_literal: false,
+            pool_size: 2,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            location_source: crate::schema::LocationSource::Stations(dummy_stations()),
+            observations: dummy_long_obs(),
+            parameters: vec![ValidatedParameter {
+                name: "t2m".into(),
+                label: "Air temperature".into(),
+                unit: "°C".into(),
+                observed_property: "air_temperature".into(),
+                source_key: "TEMP".into(),
+            }],
+            locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
+        };
+        assert!(engine_with(stations).serves_station_series());
+        assert!(!engine_with(events_engine_config()).serves_station_series());
     }
 
     #[test]

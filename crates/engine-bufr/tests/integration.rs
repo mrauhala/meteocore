@@ -159,6 +159,8 @@ fn edr_locations_parameters_and_extents() {
         e.supported_query_types(),
         vec!["locations", "position", "area", "radius"]
     );
+    // Station series at the snapshot's locations: EDR GeoJSON (#929).
+    assert!(e.serves_station_series());
     assert_eq!(e.gauges(), (8, 8));
 }
 
@@ -272,6 +274,44 @@ fn edr_area_and_radius() {
         panic!()
     };
     assert_eq!(c.len(), 1);
+}
+
+/// The `serves_station_series` contract EDR GeoJSON relies on (#929): every
+/// coverage is a `PointSeries` without `z`, at the coordinates of exactly one
+/// `get_locations` entry, and a position answer sits at its station.
+#[test]
+fn station_series_sit_at_listed_locations() {
+    let e = engine();
+    assert!(e.serves_station_series());
+    let locations = e.get_locations().unwrap();
+    let at_one_location = |domain: &DomainDescription| {
+        let DomainDescription::PointSeries { x, y, z: None, .. } = domain else {
+            panic!("expected a PointSeries without z: {domain:?}");
+        };
+        let found: Vec<_> = locations
+            .iter()
+            .filter(|l| l.longitude == *x && l.latitude == *y)
+            .collect();
+        assert_eq!(found.len(), 1, "({x}, {y})");
+        found[0].id.clone()
+    };
+    let CoverageResponse::Collection(c) = e
+        .query_area("-180,-90,180,90", None, None, None, None)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(c.len(), locations.len());
+    for coverage in &c {
+        at_one_location(&coverage.domain);
+    }
+    let CoverageResponse::Single(q) = e
+        .query_position("POINT(18.98 57.44)", None, None, None, None)
+        .unwrap()
+    else {
+        panic!("a position answer is one station's series");
+    };
+    assert_eq!(at_one_location(&q.domain), SMHI);
 }
 
 #[test]
