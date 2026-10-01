@@ -202,6 +202,19 @@ accepting each point. Batch implementations must also check their full allocatio
 budget before fetching. The executor installs `ds_core::deadline` for storage
 and engine loops; propagate it explicitly to field workers and map expiry to 504.
 
+## `limit` and locations paging (EDR 1.2, #922)
+
+`params::parse_limit` is the one parser: 1…`MAX_LIMIT` (10000), larger values
+clamp, anything else is a 400, absent means no limit. Every data-query handler
+that returns CoverageJSON passes its result through `limit_coverages` (top-level
+coverages only); position also truncates the point list before dispatch, which
+is safe because an answered point always yields at least one coverage. A new
+data-query route must do the same and list `#/components/parameters/limit` in
+`api_definition()`. `/locations` without `limit` must stay byte-identical to
+the unpaged inventory (clients and ETags rely on it); with `limit` it pages
+through `ds_core::collection_search::page_window`, the `/collections`
+arithmetic, under the same `location_budget` writer.
+
 ## Shared Common discovery (#739)
 
 Use `api-common` for `/collections` validation, responses, links, Common metadata

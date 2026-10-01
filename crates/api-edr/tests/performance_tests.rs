@@ -9,9 +9,10 @@
 // Key concerns identified in the current implementation:
 //
 // 1. COMPLETE INVENTORY on /collections/{id}/locations.
-//    EDR 1.1 does not define locations paging. Direct serialization avoids a
-//    second JSON tree and stays within bounded query execution (#533), but the
-//    final response bytes are capped per response and admitted process-wide.
+//    Without `limit` the list is the whole inventory. Direct serialization
+//    avoids a second JSON tree and stays within bounded query execution
+//    (#533), but the final response bytes are capped per response and
+//    admitted process-wide. EDR 1.2 `limit` pages it under the same caps (#922).
 //
 // 2. FULL IN-MEMORY RESPONSE CONSTRUCTION.
 //    CoverageJSON responses build a serde_json::Value tree before serialization.
@@ -356,6 +357,71 @@ fn locations_budget_errors_are_complete_json_and_memory_recovers() {
                 }
             }
             panic!("budget never rejected a response");
+        });
+}
+
+// A page is admitted by the same byte budget as the complete inventory: one
+// within it is served when the whole inventory is not (#922).
+#[test]
+fn locations_pages_share_the_inventory_byte_budget() {
+    const CHILD: &str = "MC_TEST_LOCATIONS_PAGE_BUDGET";
+    if std::env::var(CHILD).is_err() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "locations_pages_share_the_inventory_byte_budget",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("MC_EDR_LOCATIONS_MAX_BYTES", "4096")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child failed");
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let app = build_app(ScalableEngine {
+                location_count: 100,
+                timestep_count: 1,
+                parameter_count: 1,
+            });
+            let get = |uri: &'static str| {
+                let app = app.clone();
+                async move {
+                    let response = app
+                        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    (status, json)
+                }
+            };
+            for (uri, hint) in [
+                ("/collections/weather/locations", "page it with limit"),
+                (
+                    "/collections/weather/locations?limit=100",
+                    "request a smaller limit",
+                ),
+            ] {
+                let (status, error) = get(uri).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+                assert_eq!(error["code"], "ResponseLimit", "{uri}");
+                let description = error["description"].as_str().unwrap();
+                assert!(description.contains(hint), "{uri}: {description}");
+            }
+            let (status, page) = get("/collections/weather/locations?limit=2&offset=98").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(page["numberMatched"], 100);
+            assert_eq!(page["numberReturned"], 2);
+            assert_eq!(page["features"][1]["id"], "loc_99");
         });
 }
 

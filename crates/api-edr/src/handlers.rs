@@ -20,14 +20,15 @@ use ds_core::trajectory::{TrajectoryPath, MAX_TRAJECTORY_NODES, MAX_TRAJECTORY_S
 use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
-    parse_edr_format, parse_within_metres, parse_z, plot_dimensions, resolve_z_levels,
-    split_position_coords, AreaQueryParams, EdrFormat, LocationQueryParams, PositionQueryParams,
-    RadiusQueryParams, TrajectoryQueryParams, CRS84_WKT, DATA_QUERY_CRS, WITHIN_UNITS,
+    parse_edr_format, parse_limit, parse_locations_paging, parse_within_metres, parse_z,
+    plot_dimensions, resolve_z_levels, split_position_coords, AreaQueryParams, EdrFormat,
+    LocationQueryParams, PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, CRS84_WKT,
+    DATA_QUERY_CRS, MAX_LIMIT, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
     collection_parameter_json, coverage_response_to_json, locations_to_writer, LocationsContext,
-    COVERAGE_JSON_MEDIA_TYPE,
+    LocationsPage, COVERAGE_JSON_MEDIA_TYPE,
 };
 
 /// Converting through [`JsonError`] is what attaches the `ErrorReason` the
@@ -140,6 +141,25 @@ pub(crate) fn bad_request(e: &DataServerError) -> HandlerError {
         StatusCode::BAD_REQUEST,
         Json(json!({ "code": "BadRequest", "description": e.to_string() })),
     )
+}
+
+/// The request's EDR 1.2 `limit` (`None` = no limit), or its 400.
+fn request_limit(raw: Option<&str>) -> Result<Option<usize>, HandlerError> {
+    parse_limit(raw).map_err(|e| bad_request(&e))
+}
+
+/// Apply `limit` to a data query's result (`/req/edr/REQ_rc-limit-response`):
+/// at most `limit` top-level coverages of a CoverageCollection, in the
+/// engine's order. A single Coverage is one top-level object and passes
+/// through. CoverageJSON has no paging links, so the rest are dropped.
+fn limit_coverages(result: CoverageResponse, limit: Option<usize>) -> CoverageResponse {
+    match (result, limit) {
+        (CoverageResponse::Collection(mut coverages), Some(limit)) => {
+            coverages.truncate(limit);
+            CoverageResponse::Collection(coverages)
+        }
+        (result, _) => result,
+    }
 }
 
 pub(crate) fn server_error() -> HandlerError {
@@ -472,16 +492,22 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "summary": format!("Get locations for {}", config.title),
                 "operationId": format!("getLocations_{id}"),
                 "tags": [id],
+                "parameters": [
+                    {"$ref": "#/components/parameters/limit-locations"},
+                    {"$ref": "#/components/parameters/offset-locations"}
+                ],
                 "responses": {
                     "200": {
-                        "description": "Locations in GeoJSON format",
+                        "description": "Locations in GeoJSON format: the complete inventory, or with limit one page of it carrying numberMatched, numberReturned and self/next/prev links",
                         "content": {
                             "application/geo+json": {
                                 "schema": {"type": "object"}
                             }
                         }
                     },
-                    "404": {"description": "Collection not found"}
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Collection not found"},
+                    "503": {"description": "Response budget exhausted; a complete inventory over the response limit can be paged with limit"}
                 }
             }
         });
@@ -509,7 +535,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
                         "required": false,
                         "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                    }
+                    },
+                    {"$ref": "#/components/parameters/limit"}
                 ],
                 "responses": {
                     "200": {
@@ -549,7 +576,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
                             "required": false,
                             "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                        }
+                        },
+                        {"$ref": "#/components/parameters/limit"}
                     ],
                     "responses": {
                         "200": {
@@ -583,7 +611,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/coords-polygon"},
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
-                        {"$ref": "#/components/parameters/z"}
+                        {"$ref": "#/components/parameters/z"},
+                        {"$ref": "#/components/parameters/limit"}
                     ],
                     "responses": {
                         "200": {
@@ -618,7 +647,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/within-units"},
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
-                        {"$ref": "#/components/parameters/z"}
+                        {"$ref": "#/components/parameters/z"},
+                        {"$ref": "#/components/parameters/limit"}
                     ],
                     "responses": {
                         "200": {
@@ -785,7 +815,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                                 "in": "query",
                                 "required": false,
                                 "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                            }
+                            },
+                            {"$ref": "#/components/parameters/limit"}
                         ],
                         "responses": {
                             "200": {
@@ -818,7 +849,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/within-units"},
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
-                            {"$ref": "#/components/parameters/z"}
+                            {"$ref": "#/components/parameters/z"},
+                            {"$ref": "#/components/parameters/limit"}
                         ],
                         "responses": {
                             "200": {
@@ -848,7 +880,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/coords-polygon"},
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
-                            {"$ref": "#/components/parameters/z"}
+                            {"$ref": "#/components/parameters/z"},
+                            {"$ref": "#/components/parameters/limit"}
                         ],
                         "responses": {
                             "200": {
@@ -982,6 +1015,34 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": true,
                     "schema": {"type": "string"},
                     "description": format!("WKT LINESTRING, LINESTRING Z, LINESTRING M or LINESTRING ZM (also written LINESTRINGZ, LINESTRINGM, LINESTRINGZM), CRS84 lon/lat. Z is each vertex's level in the collection's vertical coordinate (`extent.vertical`), snapped to the nearest advertised level; outside the advertised range → 400; ignored by a collection without a vertical extent. M is each vertex's time in seconds since the Unix epoch; each sample, interpolated along the path, takes the nearest available timestep; a time outside the available range → 400. Z cannot be combined with `z`, nor M with `datetime`. At most {MAX_TRAJECTORY_SAMPLES} samples at the source grid spacing, {MAX_TRAJECTORY_NODES} nodes (coverages × samples) and {MAX_AREA_VALUES} values (× parameters) per response; MULTILINESTRING is not supported. Examples: LINESTRING(24 60, 25 61), LINESTRING Z(24 60 850, 25 61 500), LINESTRING M(24 60 1767225600, 25 61 1767247200).")
+                },
+                // EDR 1.2 `/req/edr/rc-limit-definition`, with the schema
+                // describing this server: no default (absent = no limit, not
+                // 10) and values above the maximum clamped, not rejected.
+                "limit": {
+                    "name": "limit",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+                    "style": "form",
+                    "explode": false,
+                    "description": format!("Maximum number of top-level coverages in a CoverageCollection response. A single Coverage is one object and is returned unchanged. A MULTIPOINT position keeps the first coverages in point order, then each point's own coverage order, and skips querying points past the limit. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: no limit, every other response budget still applies. CoverageJSON has no paging links: the remaining coverages are not returned.")
+                },
+                "limit-locations": {
+                    "name": "limit",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
+                    "style": "form",
+                    "explode": false,
+                    "description": format!("Page size of the location list, in the collection's inventory order. With limit the response carries numberMatched, numberReturned and self, next and prev links that repeat the other query parameters. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: the complete inventory in one response, without paging members.")
+                },
+                "offset-locations": {
+                    "name": "offset",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "integer", "minimum": 0, "default": 0},
+                    "description": "Number of locations to skip before the page (offset pagination extension, as on /collections). Requires limit."
                 },
                 "z-trajectory": {
                     "name": "z",
@@ -1371,13 +1432,22 @@ pub async fn instance(
     }))
 }
 
+/// `GET /collections/{id}/locations` — the location inventory as GeoJSON.
+/// Without `limit`, the complete inventory in one response (#533). With the
+/// EDR 1.2 `limit` (+ the `offset` extension), one page of it in the engine's
+/// inventory order, with `numberMatched`/`numberReturned` and `self`/`next`/
+/// `prev` links paged like `/collections` (#922). Either way the encoded body
+/// is admitted by the same byte budget.
 pub async fn locations(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    query: Result<Query<Vec<(String, String)>>, axum::extract::rejection::QueryRejection>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
+    let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid query string"))?;
+    let paging = parse_locations_paging(pairs).map_err(|e| bad_request(&e))?;
 
     let base_url = request_base_url(&state, &headers);
     let query_engine = engine.clone();
@@ -1399,16 +1469,49 @@ pub async fn locations(
             temporal_extent: temporal,
             base_url: &base_url,
         };
+        // One page: the /collections paging arithmetic over the inventory.
+        let mut links = Vec::new();
+        let (page_locs, page) = match &paging {
+            None => (&locs[..], None),
+            Some(paging) => {
+                let window = ds_core::collection_search::page_window(
+                    locs.len(),
+                    paging.offset,
+                    paging.limit,
+                );
+                let href = format!("{base_url}/edr/collections/{id}/locations");
+                links.push((paging.href(&href, paging.offset), "self", "This page"));
+                if window.has_next {
+                    links.push((paging.href(&href, window.next_offset), "next", "Next page"));
+                }
+                if window.has_prev {
+                    links.push((
+                        paging.href(&href, window.prev_offset),
+                        "prev",
+                        "Previous page",
+                    ));
+                }
+                (&locs[window.range()], Some(locs.len()))
+            }
+        };
+        let page = page.map(|number_matched| LocationsPage {
+            number_matched,
+            links: &links,
+        });
         // Keep construction, serialization and hashing under the same worker
         // permit as retrieval, even if the request times out or disconnects.
         let cancelled = || budget.expired();
         let mut writer = crate::location_budget::Writer::new(&cancelled);
-        locations_to_writer(&locs, &ctx, &mut writer).map_err(|_| {
+        locations_to_writer(page_locs, &ctx, page.as_ref(), &mut writer).map_err(|_| {
             match writer.failure {
                 Some(crate::location_budget::Failure::Cancelled) => query_timeout(),
                 Some(crate::location_budget::Failure::Limit) => JsonError(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"code": "ResponseLimit", "description": "Complete location inventory exceeds the configured response limit"})),
+                    Json(json!({"code": "ResponseLimit", "description": if page.is_some() {
+                        "Location page exceeds the configured response limit; request a smaller limit"
+                    } else {
+                        "Complete location inventory exceeds the configured response limit; page it with limit"
+                    }})),
                 ),
                 Some(crate::location_budget::Failure::Memory) => JsonError(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1457,6 +1560,7 @@ pub async fn location_query(
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
+    let limit = request_limit(params.limit.as_deref())?;
 
     let engine = engine.clone();
     let result = execute_query(false, move |_budget| {
@@ -1473,8 +1577,13 @@ pub async fn location_query(
     .await?;
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
-    render_coverage_response(result, format, params.width, params.height)
-        .map(|r| with_data_cache_control(r, datetime))
+    render_coverage_response(
+        limit_coverages(result, limit),
+        format,
+        params.width,
+        params.height,
+    )
+    .map(|r| with_data_cache_control(r, datetime))
 }
 
 /// The 404 for a data query the collection's engine does not support:
@@ -1550,7 +1659,7 @@ async fn run_position_query(
     // Split coords into one or more POINT(lon lat) strings. A single POINT is
     // passed through as one point. Engines can share field reads across the
     // batch; the default implementation still queries each point in turn.
-    let points = split_position_coords(&params.coords).map_err(|e| {
+    let mut points = split_position_coords(&params.coords).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "code": "BadRequest", "description": e.to_string() })),
@@ -1558,9 +1667,18 @@ async fn run_position_query(
     })?;
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
+    // `limit` counts the top-level coverages of the flattened collection
+    // (#922): point order, then each point's own coverages (one per step
+    // for a vertical profile). The response shape follows the request, so
+    // a MULTIPOINT stays a CoverageCollection however few coverages remain.
+    let limit = request_limit(params.limit.as_deref())?.unwrap_or(usize::MAX);
+    let single = points.len() == 1;
+    // A point the engine answers yields at least one coverage (none is a
+    // 404), so the points past the first `limit` cannot reach the response:
+    // never query them.
+    points.truncate(limit);
     let engine = engine.clone();
     execute_query(false, move |budget| {
-        let single = points.len() == 1;
         let mut coverages = Vec::with_capacity(points.len());
         let mut values = 0usize;
         let mut collection_response = !single;
@@ -1569,10 +1687,12 @@ async fn run_position_query(
                 return Err(DataServerError::DeadlineExceeded);
             }
             collection_response |= matches!(&response, CoverageResponse::Collection(_));
-            let batch = match response {
+            let mut batch = match response {
                 CoverageResponse::Single(q) => vec![q],
                 CoverageResponse::Collection(v) => v,
             };
+            // Drop what `limit` excludes before it counts against the budget.
+            batch.truncate(limit.saturating_sub(coverages.len()));
             for q in &batch {
                 for range in q.ranges.values() {
                     values = values.saturating_add(range.values.len());
@@ -1672,6 +1792,7 @@ async fn run_area_query(
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
+    let limit = request_limit(params.limit.as_deref())?;
 
     let engine = engine.clone();
     let result = execute_query(false, move |_budget| {
@@ -1687,6 +1808,7 @@ async fn run_area_query(
     })
     .await?;
 
+    let result = limit_coverages(result, limit);
     Ok(with_data_cache_control(
         coverage_json_response(&result, "Area")?,
         datetime,
@@ -1758,6 +1880,7 @@ async fn run_radius_query(
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
+    let limit = request_limit(params.limit.as_deref())?;
 
     let engine = engine.clone();
     let result = execute_query(false, move |_budget| {
@@ -1774,6 +1897,7 @@ async fn run_radius_query(
     })
     .await?;
 
+    let result = limit_coverages(result, limit);
     Ok(with_data_cache_control(
         coverage_json_response(&result, "Radius")?,
         datetime,
@@ -1795,6 +1919,11 @@ pub async fn trajectory_query(
     // consistent with the `api_definition` OpenAPI gating and the
     // `data_queries` collection metadata. Flagged by claude-review.
     require_query_type(engine, &id, "trajectory", "trajectory")?;
+    if params.limit.is_some() {
+        return Err(bad_request_msg(
+            "limit is not supported on trajectory queries: EDR 1.2 defines no limit for them",
+        ));
+    }
     let shape = engine.trajectory_shape();
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;

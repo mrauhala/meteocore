@@ -24,6 +24,8 @@ pub struct LocationQueryParams {
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
+    pub limit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +40,8 @@ pub struct PositionQueryParams {
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
+    pub limit: Option<String>,
 }
 
 /// EDR response output format selected by the `f` query parameter.
@@ -81,6 +85,141 @@ pub fn plot_dimensions(width: Option<u32>, height: Option<u32>) -> (u32, u32) {
     (width.unwrap_or(800), height.unwrap_or(600))
 }
 
+/// Largest `limit` honoured, the maximum of EDR 1.2
+/// `/req/edr/rc-limit-definition`. A larger value is clamped to it, not an
+/// error (`/req/edr/REQ_rc-limit-response` C).
+pub const MAX_LIMIT: usize = 10_000;
+
+/// Parse the EDR 1.2 `limit` parameter. Absent or blank → `None`: no limit,
+/// which keeps today's responses (the complete `/locations` inventory, every
+/// coverage of a data query) rather than the spec's suggested default of 10.
+/// An integer ≥ 1 is honoured up to [`MAX_LIMIT`]; a larger one, even one too
+/// long for any integer type, is clamped to it. Anything else — zero, a
+/// sign, a fraction, an exponent, a non-number — is a 400 naming the range.
+pub fn parse_limit(raw: Option<&str>) -> Result<Option<usize>, DataServerError> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        DataServerError::InvalidParameter(format!(
+            "Invalid limit '{raw}': expected an integer from 1 to {MAX_LIMIT} \
+             (larger values are clamped to {MAX_LIMIT})"
+        ))
+    };
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    // Digits only, so the one parse failure left is overflow: clamp it.
+    let n = raw.parse::<usize>().unwrap_or(usize::MAX);
+    if n == 0 {
+        return Err(invalid());
+    }
+    Ok(Some(n.min(MAX_LIMIT)))
+}
+
+/// A `/locations` request made with `limit`: one page of the inventory
+/// (EDR 1.2 locations paging, #922). Without `limit` there is no paging and
+/// the complete inventory is served as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationsPaging {
+    /// Resolved page size (clamped to [`MAX_LIMIT`]); links carry this value.
+    pub limit: usize,
+    pub offset: usize,
+    /// Every other query pair, in request order, repeated verbatim in the
+    /// page's navigation links (so an `f`, say, survives paging).
+    pub preserved: Vec<(String, String)>,
+}
+
+impl LocationsPaging {
+    /// `base` plus this request's query at `offset`: the preserved pairs,
+    /// then the resolved `limit`, then `offset` (omitted when 0), as on
+    /// `/collections`.
+    pub fn href(&self, base: &str, offset: usize) -> String {
+        use ds_core::collection_search::encode_query_value as enc;
+        let mut query: Vec<String> = self
+            .preserved
+            .iter()
+            .map(|(name, value)| format!("{}={}", enc(name), enc(value)))
+            .collect();
+        query.push(format!("limit={}", self.limit));
+        if offset > 0 {
+            query.push(format!("offset={offset}"));
+        }
+        format!("{base}?{}", query.join("&"))
+    }
+}
+
+/// Query parameters `/locations` accepts. `bbox` and `datetime` are the
+/// list's EDR filters: accepted but not applied yet (#932), and repeated in
+/// paging links; `f` selects the representation.
+pub const LOCATIONS_PARAMETERS: [&str; 5] = ["limit", "offset", "bbox", "datetime", "f"];
+
+/// Split the `/locations` query into its paging request. `Ok(None)` when no
+/// `limit` is given: the complete inventory. A repeated `limit`/`offset`, an
+/// invalid value, an `offset` without a `limit` (there is no page to offset
+/// into), or a parameter outside [`LOCATIONS_PARAMETERS`] is a 400, so a typo
+/// such as `limti` cannot return the unpaged list as if it worked (#605).
+/// The other accepted parameters are kept for the links.
+pub fn parse_locations_paging(
+    pairs: Vec<(String, String)>,
+) -> Result<Option<LocationsPaging>, DataServerError> {
+    let (mut limit, mut offset) = (None, None);
+    let mut preserved = Vec::new();
+    for (name, value) in pairs {
+        let slot = match name.as_str() {
+            "limit" => &mut limit,
+            "offset" => &mut offset,
+            known if LOCATIONS_PARAMETERS.contains(&known) => {
+                preserved.push((name, value));
+                continue;
+            }
+            _ => {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "Unknown query parameter '{name}' for /locations; valid parameters: {}",
+                    LOCATIONS_PARAMETERS.join(", ")
+                )));
+            }
+        };
+        if slot.replace(value).is_some() {
+            return Err(DataServerError::InvalidParameter(format!(
+                "Duplicate query parameter '{name}'"
+            )));
+        }
+    }
+    let resolved_offset = parse_offset(offset.as_deref())?;
+    match parse_limit(limit.as_deref())? {
+        Some(limit) => Ok(Some(LocationsPaging {
+            limit,
+            offset: resolved_offset,
+            preserved,
+        })),
+        None if offset.is_some_and(|o| !o.trim().is_empty()) => {
+            Err(DataServerError::InvalidParameter(
+                "offset pages the location list and requires limit".into(),
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Parse the `/locations` `offset` (the offset pagination extension
+/// `/collections` also uses). Absent or blank → 0; otherwise a non-negative
+/// integer, else a 400.
+pub fn parse_offset(raw: Option<&str>) -> Result<usize, DataServerError> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(0);
+    };
+    raw.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| raw.parse::<usize>().ok())
+        .flatten()
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter(format!(
+                "Invalid offset '{raw}': expected a non-negative integer"
+            ))
+        })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AreaQueryParams {
     pub coords: String,
@@ -91,6 +230,8 @@ pub struct AreaQueryParams {
     /// Output format. Area queries only support `CoverageJSON`; `PNG` is
     /// rejected (an area result is gridded / multi-coverage, not a single plot).
     pub f: Option<String>,
+    /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
+    pub limit: Option<String>,
 }
 
 /// Radius query parameters (OGC API - EDR 1.1 `radius`): everything
@@ -109,6 +250,8 @@ pub struct RadiusQueryParams {
     pub parameter_name: Option<String>,
     pub z: Option<String>,
     pub f: Option<String>,
+    /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
+    pub limit: Option<String>,
 }
 
 /// `within-units` values the radius query accepts, in the order they are
@@ -176,6 +319,9 @@ pub struct TrajectoryQueryParams {
     /// PNG image dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Not supported on trajectory, which EDR 1.2 gives no `limit`: read
+    /// only so a request carrying it is a 400, not a silently unlimited 200.
+    pub limit: Option<String>,
 }
 
 /// A parsed EDR `z` selector: either an explicit list of levels or a
@@ -555,6 +701,100 @@ mod tests {
     #[test]
     fn rejects_polygon() {
         assert!(split_position_coords("POLYGON((0 0,1 0,1 1,0 1,0 0))").is_err());
+    }
+
+    #[test]
+    fn limit_parses_clamps_and_rejects() {
+        assert_eq!(parse_limit(None).unwrap(), None);
+        assert_eq!(parse_limit(Some("  ")).unwrap(), None);
+        assert_eq!(parse_limit(Some("1")).unwrap(), Some(1));
+        assert_eq!(parse_limit(Some(" 25 ")).unwrap(), Some(25));
+        assert_eq!(parse_limit(Some("10000")).unwrap(), Some(MAX_LIMIT));
+        // Above the maximum clamps, including values no integer type holds.
+        assert_eq!(parse_limit(Some("10001")).unwrap(), Some(MAX_LIMIT));
+        assert_eq!(
+            parse_limit(Some("99999999999999999999999999")).unwrap(),
+            Some(MAX_LIMIT)
+        );
+        for bad in ["0", "000", "-1", "+5", "1.5", "1e3", "abc", "5,6", "NaN"] {
+            let err = parse_limit(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("1 to 10000"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn offset_parses_and_rejects() {
+        assert_eq!(parse_offset(None).unwrap(), 0);
+        assert_eq!(parse_offset(Some("")).unwrap(), 0);
+        assert_eq!(parse_offset(Some("0")).unwrap(), 0);
+        assert_eq!(parse_offset(Some("20")).unwrap(), 20);
+        for bad in ["-1", "+1", "1.0", "x", "99999999999999999999999999"] {
+            assert!(parse_offset(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// An unknown parameter is a 400 naming the valid ones; the accepted
+    /// filters pass through to the links (#605, #932).
+    #[test]
+    fn locations_paging_rejects_unknown_parameters() {
+        let pairs = |q: &[(&str, &str)]| {
+            q.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let err = parse_locations_paging(pairs(&[("limti", "5")])).unwrap_err();
+        assert!(err.to_string().contains("limti"), "{err}");
+        assert!(err.to_string().contains("limit, offset"), "{err}");
+        assert!(parse_locations_paging(pairs(&[("sortby", "id")])).is_err());
+        assert_eq!(
+            parse_locations_paging(pairs(&[("bbox", "0,0,1,1"), ("datetime", "..")])).unwrap(),
+            None
+        );
+        let page = parse_locations_paging(pairs(&[("bbox", "0,0,1,1"), ("limit", "2")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.limit, 2);
+    }
+
+    #[test]
+    fn locations_paging_splits_query() {
+        let pairs = |q: &[(&str, &str)]| {
+            q.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        // No limit: the complete inventory, other parameters untouched.
+        assert_eq!(
+            parse_locations_paging(pairs(&[("f", "json")])).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_locations_paging(pairs(&[("limit", "")])).unwrap(),
+            None
+        );
+        let page = parse_locations_paging(pairs(&[
+            ("f", "geo json"),
+            ("limit", "50000"),
+            ("offset", "20"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!((page.limit, page.offset), (MAX_LIMIT, 20));
+        // Links repeat the other parameters, encoded, and the clamped limit.
+        assert_eq!(
+            page.href("https://x/locations", 10020),
+            "https://x/locations?f=geo%20json&limit=10000&offset=10020"
+        );
+        assert_eq!(page.href("b", 0), "b?f=geo%20json&limit=10000");
+        for bad in [
+            &[("offset", "3")][..],
+            &[("limit", "0")],
+            &[("limit", "2"), ("offset", "-1")],
+            &[("limit", "2"), ("limit", "3")],
+            &[("limit", "2"), ("offset", "1"), ("offset", "1")],
+        ] {
+            assert!(parse_locations_paging(pairs(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
