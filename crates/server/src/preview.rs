@@ -1003,6 +1003,7 @@ mod tests {
     fn empty_edr() -> api_edr::handlers::EdrState {
         api_edr::handlers::EdrState {
             engines: HashMap::new(),
+            feature_engines: HashMap::new(),
             collections: HashMap::new(),
             styles: HashMap::new(),
             base_url: String::new(),

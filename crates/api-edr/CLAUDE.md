@@ -105,6 +105,31 @@ verbatim (only `crs`'s example is CRS84 instead of `native`).
 the grid is missing) and `check_cube_budget` (`MAX_AREA_VALUES` across
 timesteps × levels × cells × parameters).
 
+## Items (#928)
+
+`GET /collections/{id}/items[/{itemId}]` (`src/items.rs`) delegates to the
+collection's `FeatureEngine`; there is no `EdrEngine` method for it. The
+server fills `EdrState::feature_engines` in `admin.rs`
+(`EngineHandle::edr_items_engine`) for every EDR collection whose engine
+implements both traits over the same collection (CSV, BUFR, PostGIS stations,
+nowcast) — `edr` in `apis` enables it, `features` is not required. Only those
+collections get `data_queries.items`, the `/api` paths and a non-404 route,
+and never under an instance.
+
+- Reuse, do not re-implement: bbox/datetime parsing, the GeoJSON encoding and
+  the paging links come from `api-features` (`params`, `response`) — the one
+  API-to-API dependency. A Features change to them changes EDR items too.
+- EDR's own parts: `limit` per `/req/edr/rc-limit-*` (default 10, max 10 000
+  clamped, anything but a positive integer 400), links under `/edr`, GeoJSON
+  only, execution on the EDR executor, ETag over the page with `timeStamp`
+  blanked.
+- Only `bbox`, `datetime`, `limit`, `offset`, `f` (item: `f`); anything else,
+  or a repeat, is a 400 naming them. Adding a Features extension (`sortby`,
+  property filters, `crs`) means validating it here and documenting it in
+  `openapi_parameters`.
+- No `itemType` or `rel=items` link on the collection: the workbench and
+  Features clients read those as a Features resource with an HTML view.
+
 ## Misc
 
 - **`data_queries` link variables (#918).** `data_query_variables` in

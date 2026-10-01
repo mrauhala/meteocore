@@ -208,6 +208,7 @@ fn app(engines: &[(&str, Arc<CubeMock>)]) -> axum::Router {
             .map(|(id, _)| (id.to_string(), config(id)))
             .collect(),
         styles: HashMap::new(),
+        feature_engines: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
     };

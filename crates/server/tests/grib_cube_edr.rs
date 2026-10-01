@@ -80,6 +80,7 @@ fn app() -> axum::Router {
         engines: HashMap::from([(ID.to_string(), Arc::new(view) as Arc<dyn EdrEngine>)]),
         collections: HashMap::from([(ID.to_string(), config)]),
         styles: HashMap::new(),
+        feature_engines: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
     };

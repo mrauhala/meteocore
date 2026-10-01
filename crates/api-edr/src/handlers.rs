@@ -31,11 +31,11 @@ use crate::response::{
 
 /// Converting through [`JsonError`] is what attaches the `ErrorReason` the
 /// request log reads (#119); a `(StatusCode, Json)` tuple converts via `?`.
-type HandlerError = JsonError;
+pub(crate) type HandlerError = JsonError;
 
 /// The executor owns admission and keeps running work accounted for after a
 /// client timeout. No engine-specific execution decisions belong in handlers.
-async fn execute_query<T: Send + 'static>(
+pub(crate) async fn execute_query<T: Send + 'static>(
     blocking: bool,
     work: impl FnOnce(crate::executor::QueryBudget) -> Result<T, HandlerError> + Send + 'static,
 ) -> Result<T, HandlerError> {
@@ -103,7 +103,7 @@ fn render_coverage_response(
 /// errors → 400, absent resources → 404, everything else a generic 500
 /// (logged under `label`). One home for the four data-query handlers so a
 /// new `DataServerError` variant cannot map differently per query type.
-fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
+pub(crate) fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
     match e {
         DataServerError::DeadlineExceeded => query_timeout(),
         DataServerError::ResourceExhausted => JsonError(
@@ -134,14 +134,14 @@ fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
     }
 }
 
-fn bad_request(e: &DataServerError) -> HandlerError {
+pub(crate) fn bad_request(e: &DataServerError) -> HandlerError {
     JsonError(
         StatusCode::BAD_REQUEST,
         Json(json!({ "code": "BadRequest", "description": e.to_string() })),
     )
 }
 
-fn server_error() -> HandlerError {
+pub(crate) fn server_error() -> HandlerError {
     JsonError(
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "code": "ServerError", "description": "Internal server error" })),
@@ -203,6 +203,12 @@ fn with_data_cache_control(
 #[derive(Clone)]
 pub struct EdrState {
     pub engines: HashMap<String, Arc<dyn EdrEngine>>,
+    /// The `FeatureEngine` of each EDR collection whose engine also
+    /// implements one: the `items` query delegates to it (#928), and only
+    /// these collections have `/items` or advertise it. Keyed like
+    /// `engines`; the server fills it for collections that list `edr`
+    /// whether or not they also list `features`.
+    pub feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
     /// Resolved style maps per collection (same `StyleInfo` instances the
     /// WMS/Maps/Tiles registries hold — resolved once by the server through
@@ -221,14 +227,14 @@ pub type AppState = Arc<ArcSwap<EdrState>>;
 
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
-fn request_base_url(state: &EdrState, headers: &HeaderMap) -> String {
+pub(crate) fn request_base_url(state: &EdrState, headers: &HeaderMap) -> String {
     ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
         headers.get(name).and_then(|v| v.to_str().ok())
     })
 }
 
 #[allow(clippy::type_complexity)]
-fn lookup_collection<'a>(
+pub(crate) fn lookup_collection<'a>(
     state: &'a EdrState,
     id: &str,
 ) -> Result<(&'a Arc<dyn EdrEngine>, &'a CollectionConfig), HandlerError> {
@@ -758,6 +764,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             });
         }
 
+        // Items (#928): only collections whose engine also serves features,
+        // matching `data_queries` and the handler's 404.
+        if state.feature_engines.contains_key(id) {
+            for (path, item) in crate::items::openapi_paths(id, &config.title) {
+                collection_paths[&path] = item;
+            }
+        }
+
         // Instances (forecast model runs; #337). Only advertised for engines
         // that expose runs, so the OpenAPI spec matches the `instances`
         // data_query in the collection metadata.
@@ -945,7 +959,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         }
     }
 
-    let openapi = json!({
+    let mut openapi = json!({
         "openapi": "3.0.3",
         "info": {
             "title": "MeteoCore - OGC API EDR",
@@ -1106,6 +1120,21 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         }
     });
+    // Items components (#928), named `items-*` so they cannot collide with
+    // another query's parameters.
+    if !state.feature_engines.is_empty() {
+        for (section, entries) in [
+            ("parameters", crate::items::openapi_parameters()),
+            ("schemas", crate::items::openapi_schemas()),
+        ] {
+            if let (Some(target), Some(entries)) = (
+                openapi["components"][section].as_object_mut(),
+                entries.as_object(),
+            ) {
+                target.extend(entries.clone());
+            }
+        }
+    }
 
     Json(openapi)
 }
@@ -1210,7 +1239,13 @@ pub async fn collections(
             };
             Some(api_common::CollectionEntry {
                 config,
-                metadata: build_collection_metadata(engine.as_ref(), config, base, None),
+                metadata: build_collection_metadata(
+                    engine.as_ref(),
+                    config,
+                    base,
+                    None,
+                    state.feature_engines.contains_key(&config.id),
+                ),
                 bbox: engine.get_spatial_extent(),
                 time: engine.get_temporal_extent(),
             })
@@ -1239,16 +1274,18 @@ pub async fn collection(
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &request_base_url(&state, &headers);
+    let items = state.feature_engines.contains_key(&id);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(build_collection_metadata(
             engine.as_ref(),
             config,
             base,
             None,
+            items,
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = build_collection_metadata(engine.as_ref(), config, base, None);
+            let metadata = build_collection_metadata(engine.as_ref(), config, base, None, items);
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -1296,7 +1333,9 @@ pub async fn instances(
             // precomputed-metadata variant through.
             let instances: Vec<serde_json::Value> = runs
                 .iter()
-                .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run)))
+                .map(|run| {
+                    build_collection_metadata(engine.as_ref(), config, base, Some(run), false)
+                })
                 .collect();
             // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
             // `instances` (each item a collection-shaped instance), not
@@ -1426,10 +1465,12 @@ pub async fn instance(
             config,
             base,
             Some(&run),
+            false,
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = build_collection_metadata(engine.as_ref(), config, base, Some(&run));
+            let metadata =
+                build_collection_metadata(engine.as_ref(), config, base, Some(&run), false);
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -2147,11 +2188,15 @@ fn data_query_variables(query_type: &str) -> Option<serde_json::Value> {
 /// engines). `instance = Some(run)` ⇒ that forecast model run as an OGC EDR
 /// *instance*: `id`, temporal extent and data-query hrefs are scoped to the run
 /// (`/collections/{id}/instances/{instanceId}/…`). See [`ds_core::instances`].
+///
+/// `items` ⇒ the collection serves the `items` query through its
+/// `FeatureEngine` (#928); an instance document never advertises it.
 fn build_collection_metadata(
     engine: &dyn EdrEngine,
     config: &CollectionConfig,
     base_url: &str,
     instance: Option<&ds_core::instances::RunInfo>,
+    items: bool,
 ) -> serde_json::Value {
     let param_descs = engine.get_parameter_descriptions();
     // Advertise a CRS84-domain extent: engine bounds can be grid cell edges
@@ -2289,6 +2334,10 @@ fn build_collection_metadata(
             }),
         );
     }
+    // The collection's features (#928), not scoped to a model run.
+    if instance.is_none() && items {
+        data_queries.insert("items".to_string(), crate::items::data_query(&query_base));
+    }
     // Advertise the model runs (forecast reference times) as EDR instances on
     // the collection itself (not on an instance document).
     if instance.is_none() && engine.has_instances() {
@@ -2329,12 +2378,13 @@ fn build_collection_metadata(
         json!({
             "id": self_id,
             "title": self_title,
-            // No `itemType`: OGC API – Common – Part 2 registers only "feature"
-            // and "record", and the field describes a /collections/{id}/items
-            // sub-resource — which EDR has no equivalent of (data is reached via
-            // /position, /area, /trajectory, …). EDR collections are also not all
-            // coverage data (CSV/PostGIS serve discrete observations), so no single
-            // itemType applies. Omitted rather than mislabelled (review on #298).
+            // No `itemType` and no `rel=items` link: EDR's `items` is a data
+            // query (#928), advertised in `data_queries` like the others and
+            // GeoJSON only, while Common Part 2 `itemType` and the workbench's
+            // `items` link mean a Features-style resource with an HTML view.
+            // EDR collections are also not all coverage data (CSV/PostGIS serve
+            // discrete observations), so no single itemType applies. Omitted
+            // rather than mislabelled (review on #298).
             "extent": extent,
             "data_queries": data_queries,
             "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],

@@ -183,6 +183,7 @@ fn router() -> axum::Router {
         engines,
         collections,
         styles: HashMap::new(),
+        feature_engines: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
     })))

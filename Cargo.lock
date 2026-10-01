@@ -147,6 +147,7 @@ name = "api-edr"
 version = "0.1.0"
 dependencies = [
  "api-common",
+ "api-features",
  "arc-swap",
  "axum",
  "chrono",
