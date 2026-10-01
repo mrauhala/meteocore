@@ -138,6 +138,19 @@ and never under an instance.
   `temporal_extent_json`, the same builder as the collection extent;
   `per_parameter_temporal_extent_validates` pins it against the schema.
 
+## `z` and `datetime` grammar (EDR 1.2, #921)
+
+- `z` is parsed by `params::parse_z` (level, list, closed and open
+  intervals, recurring `Rn/min/step` → a list) and resolved by the
+  handlers' `resolve_request_z`: a collection with no vertical extent
+  **ignores** a well-formed `z` (`/req/edr/z-response` A, a SHALL); a
+  malformed one is a 400. Do not reintroduce the old 400 — WMS/Maps/Tiles
+  `ELEVATION`/`elevation` keep theirs, EDR does not.
+- A `datetime` list `T1,T2,T3` (`params::parse_datetime`) is one engine
+  query per instant `(t, t)`, merged by `src/datetime_list.rs`. Every data
+  query handler calls the engine through `datetime_list::run`; a new one
+  must too, rather than converting the selector to one engine window itself.
+
 ## Caching headers (#499)
 
 Every 200 carries `Cache-Control` + a strong content-derived ETag, and a
@@ -202,7 +215,9 @@ decoded `Path` value, which cannot tell them apart. One id, a repeat-only list
 included, keeps the single-id path byte for byte. A list goes through
 `query_location_list`: one engine `query_location` per id in request order,
 flattened into one CoverageCollection, CoverageJSON only, capped at
-`MAX_LOCATION_IDS` ids and `MAX_LOCATION_VALUES` values. Engines return
+`MAX_LOCATION_IDS` ids and `MAX_LOCATION_VALUES` values. A `datetime` list
+runs per id through `datetime_list::run`, and ids × instants is capped at
+`MAX_LOCATION_LOOKUPS` before any engine call. Engines return
 `LocationNotFound` for unknown ids and no-data ids alike, so the handler
 consults `get_locations()`, lazily and once, to answer 404 for an unknown id
 and 204 when every id is known and none has data. The fan-out is
