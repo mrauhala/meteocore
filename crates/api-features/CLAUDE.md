@@ -43,6 +43,11 @@ without reading code.
   against `schemas/openapi-3.0.json` in tests. New route or parameter ⇒
   update it in the same PR; copy standard parameter schemas verbatim,
   including `style`/`explode`.
+- **EDR `items` reuses this crate** (#928): `params::{parse_bbox,
+  parse_datetime}` and `response::{feature_to_geojson,
+  feature_page_to_geojson, preserved_query}` also serve
+  `/edr/collections/{id}/items`. A change to them changes EDR items too; run
+  `cargo test -p api-edr --test items_tests` with them.
 
 ## Mount-agnostic, and a block of the shared root (#789)
 

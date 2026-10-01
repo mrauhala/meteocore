@@ -297,6 +297,7 @@ fn app() -> axum::Router {
         engines,
         collections,
         styles: HashMap::new(),
+        feature_engines: HashMap::new(),
         base_url: BASE.into(),
         trust_proxy_headers: false,
     })))

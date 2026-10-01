@@ -1591,6 +1591,34 @@ pub enum EngineHandle {
     Nowcast(Arc<engine_nowcast::NowcastEngine>),
 }
 
+impl EngineHandle {
+    /// The `FeatureEngine` that serves this collection's EDR `items` query
+    /// (#928): the engine behind its `EdrEngine`, for the engines that
+    /// implement both over one collection. `None` for engines without
+    /// features or without EDR, and where the features are another resource:
+    /// a PVOL network's site inventory (its EDR collections are per-site
+    /// views) and the PostGIS events shape, whose events are not features
+    /// yet (#503).
+    fn edr_items_engine(&self) -> Option<Arc<dyn ds_core::feature_engine::FeatureEngine>> {
+        match self {
+            Self::Csv(e) => Some(e.clone()),
+            Self::Bufr(e) => Some(e.clone()),
+            Self::Nowcast(e) => Some(e.clone()),
+            Self::Postgis(e) if e.config().events().is_none() => Some(e.clone()),
+            Self::Postgis(_)
+            | Self::OdimVolume(_)
+            | Self::Cap(_)
+            | Self::Geojson(_)
+            | Self::Geotiff(_)
+            | Self::QueryData(_)
+            | Self::Grib(_)
+            | Self::Zarr(_)
+            | Self::Satellite(_)
+            | Self::Odim(_) => None,
+        }
+    }
+}
+
 /// Live engines an incremental reload may reuse, keyed by collection id.
 /// [`do_reload`] populates it with exactly the collections
 /// [`reusable_collections`] deemed unchanged; [`load_collections`] takes an
@@ -3953,10 +3981,21 @@ pub fn load_collections(
     // polar-volume network registers per-site ids (#789).
     let map_tileset_ids = tiles_engines.keys().cloned().collect();
     let vector_tileset_ids = tiles_feature_engines.keys().cloned().collect();
+    // EDR `items` (#928) is the collection's own FeatureEngine, for every EDR
+    // collection whose engine has one: listing `edr` enables the query,
+    // whether or not the collection also lists `features`.
+    let edr_feature_engines = edr_engines
+        .keys()
+        .filter_map(|id| {
+            let engine = engines_by_id.get(id)?.edr_items_engine()?;
+            Some((id.clone(), engine))
+        })
+        .collect();
 
     LoadResult {
         edr_state: EdrState {
             engines: edr_engines,
+            feature_engines: edr_feature_engines,
             collections: edr_collections,
             styles: edr_styles,
             base_url: base_url.to_string(),
@@ -7997,6 +8036,95 @@ colormap = "radar_dbz"
         assert_eq!(edr.len(), wms.len(), "EDR and WMS share one resolution");
         assert_eq!(edr["default"].min, wms["default"].min);
         assert_eq!(edr["default"].max, wms["default"].max);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edr_items_serve_the_collections_own_feature_engine() {
+        // #928: an EDR collection whose engine also implements FeatureEngine
+        // gets `items` from that same engine. Listing `edr` enables it (the
+        // Features API stays off without `features`); a raster EDR
+        // collection gets none.
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("obs.csv");
+        std::fs::write(
+            &csv_path,
+            "location,latitude,longitude,time,temperature\n\
+             Helsinki,60.17,24.94,2026-01-01T00:00:00Z,-3.0\n\
+             Tampere,61.50,23.76,2026-01-01T00:00:00Z,-5.0\n\
+             Oulu,65.01,25.47,2026-01-01T00:00:00Z,-9.0\n",
+        )
+        .unwrap();
+        let csv: CollectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "obs", "title": "Obs", "description": "CSV stations",
+            "engine_type": "csv", "apis": ["edr"],
+            "data_path": csv_path.to_str().unwrap()
+        }))
+        .unwrap();
+        let mut radar = tm35_source_collection("radar");
+        radar.apis = vec!["edr".to_string(), "wms".to_string()];
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = vec!["edr".to_string()];
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[csv, radar, nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let items = &result.edr_state.feature_engines;
+        assert!(items.contains_key("obs"));
+        assert!(items.contains_key("nc"), "nowcast cells are items too");
+        assert!(!items.contains_key("radar"), "a raster engine has no items");
+        assert!(!result.features_state.engines.contains_key("obs"));
+        for id in ["obs", "nc"] {
+            assert_eq!(
+                Arc::as_ptr(&result.edr_state.engines[id]) as *const (),
+                Arc::as_ptr(&items[id]) as *const (),
+                "{id}: items come from the collection's own engine"
+            );
+        }
+
+        let app = api_edr::router(Arc::new(arc_swap::ArcSwap::from_pointee(result.edr_state)));
+        let get = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                )
+            }
+        };
+        let (status, page) = get("/collections/obs/items?limit=2").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["numberMatched"], 3);
+        assert_eq!(page["numberReturned"], 2);
+        let (status, _) = get("/collections/obs/items/Helsinki").await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, metadata) = get("/collections/obs").await;
+        assert_eq!(
+            metadata["data_queries"]["items"]["link"]["variables"]["query_type"],
+            "items"
+        );
+        let (status, _) = get("/collections/radar/items").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, metadata) = get("/collections/radar").await;
+        assert!(metadata["data_queries"].get("items").is_none());
     }
 
     #[test]

@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 api-common = { path = "../api-common" }
+# The `items` query (#928) serves the collection's FeatureEngine through the
+# Features API's own bbox/datetime parsing, GeoJSON encoding and paging links.
+api-features = { path = "../api-features" }
 ds-core = { path = "../core" }
 ds-render = { path = "../render" }
 arc-swap = "1"

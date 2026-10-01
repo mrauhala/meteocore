@@ -82,6 +82,7 @@ fn app() -> axum::Router {
             engines,
             collections,
             styles: HashMap::new(),
+            feature_engines: HashMap::new(),
             base_url: "https://example.org".into(),
             trust_proxy_headers: false,
         },

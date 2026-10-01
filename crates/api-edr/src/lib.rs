@@ -2,6 +2,7 @@ pub mod caching;
 mod executor;
 pub(crate) mod geojson;
 pub mod handlers;
+pub mod items;
 mod location_budget;
 pub mod params;
 pub(crate) mod plot_convert;
@@ -33,6 +34,9 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/trajectory",
             get(handlers::trajectory_query),
         )
+        // Items (#928): the collection's FeatureEngine, where it has one.
+        .route("/collections/{id}/items", get(items::items))
+        .route("/collections/{id}/items/{item_id}", get(items::item))
         // OGC API - EDR instances (forecast model runs; #337). The `{instanceId}`
         // segment name matches the OpenAPI `api_definition()` path parameter.
         .route("/collections/{id}/instances", get(handlers::instances))
