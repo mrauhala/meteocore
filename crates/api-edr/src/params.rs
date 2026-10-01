@@ -1147,7 +1147,9 @@ mod tests {
         );
         // A cross-section: PNG by `f` or by `Accept` (then with `Vary`).
         let section = query_formats("trajectory", false, TrajectoryShape::CrossSection);
-        assert!(negotiate_edr_format(Some("GeoJSON"), None, section, "trajectory queries").is_err());
+        assert!(
+            negotiate_edr_format(Some("GeoJSON"), None, section, "trajectory queries").is_err()
+        );
         assert_eq!(
             negotiate_edr_format(Some("png"), None, section, "trajectory queries")
                 .unwrap()
