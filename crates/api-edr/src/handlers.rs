@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
@@ -17,10 +17,14 @@ use ds_core::error::DataServerError;
 use ds_core::model::CoverageResponse;
 use ds_render::{render_chart, render_heatmap};
 
+use crate::geojson::{
+    encode_path_segment, FeatureIdentity, GeoJsonError, GeoJsonLink, LocationIndex,
+};
 use crate::params::{
-    parse_edr_format, parse_within_metres, parse_z, plot_dimensions, resolve_z_levels,
-    split_position_coords, AreaQueryParams, EdrFormat, LocationQueryParams, PositionQueryParams,
-    RadiusQueryParams, TrajectoryQueryParams, CRS84_WKT, DATA_QUERY_CRS, WITHIN_UNITS,
+    negotiate_edr_format, parse_within_metres, parse_z, plot_dimensions, query_formats,
+    resolve_z_levels, split_position_coords, AreaQueryParams, EdrFormat, LocationQueryParams,
+    NegotiatedFormat, PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, CRS84_WKT,
+    DATA_QUERY_CRS, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -73,19 +77,143 @@ fn coverage_json_response(
     Ok(([(header::CONTENT_TYPE, COVERAGE_JSON_MEDIA_TYPE)], body).into_response())
 }
 
+/// What a data query's GeoJSON representation needs besides the result: the
+/// engine (to name each station) and the request (for its `links`).
+struct GeoJsonRequest {
+    engine: Arc<dyn EdrEngine>,
+    base: String,
+    collection_id: String,
+    collection_title: String,
+    /// The resource path below `/edr`, e.g. `/collections/obs/position`.
+    path: String,
+    raw_query: Option<String>,
+    /// The formats this query offers: one `alternate` link each.
+    offered: &'static [EdrFormat],
+    /// The `/locations/{locationId}` id: names every coverage.
+    location_id: Option<String>,
+}
+
+impl GeoJsonRequest {
+    /// This query's URL with `f` set to `format`, every other parameter as
+    /// the client sent it.
+    fn url(&self, format: EdrFormat) -> String {
+        let f = format!("f={}", format.name());
+        let query: Vec<&str> = self
+            .raw_query
+            .as_deref()
+            .unwrap_or("")
+            .split('&')
+            .filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("f"))
+            .chain(std::iter::once(f.as_str()))
+            .collect();
+        format!("{}/edr{}?{}", self.base, self.path, query.join("&"))
+    }
+
+    /// `/req/edr-geojson/content` B (`/req/core/rc-collection-info-links`):
+    /// `self`, an `alternate` per other offered format, and a link to the
+    /// collection, each with `rel` and `type`.
+    fn links(&self) -> Vec<GeoJsonLink> {
+        let mut links = vec![GeoJsonLink {
+            href: self.url(EdrFormat::GeoJson),
+            rel: "self",
+            kind: EdrFormat::GeoJson.media_type(),
+            title: "This document".into(),
+        }];
+        for &format in self.offered {
+            if format != EdrFormat::GeoJson {
+                links.push(GeoJsonLink {
+                    href: self.url(format),
+                    rel: "alternate",
+                    kind: format.media_type(),
+                    title: format!("This document as {}", format.name()),
+                });
+            }
+        }
+        links.push(GeoJsonLink {
+            href: format!("{}/edr/collections/{}", self.base, self.collection_id),
+            rel: "collection",
+            kind: "application/json",
+            title: self.collection_title.clone(),
+        });
+        links
+    }
+}
+
+/// Encode a station-series result as EDR GeoJSON (#929), naming each
+/// coverage's station: the requested location for `/locations/{id}`, else
+/// the one location at the coverage's exact coordinates.
+fn render_station_geojson(
+    result: &CoverageResponse,
+    req: &GeoJsonRequest,
+) -> Result<Response, HandlerError> {
+    let index = LocationIndex::new(
+        req.engine
+            .get_locations()
+            .map_err(|e| map_query_error(&e, "GeoJSON locations"))?,
+    );
+    let named = req.location_id.as_deref().map(|id| FeatureIdentity {
+        id,
+        label: index.by_id(id).map_or(id, |l| l.label.as_str()),
+    });
+    let mut body = Vec::new();
+    crate::geojson::write_station_series(
+        result,
+        |_, q| {
+            named.or_else(|| match q.domain {
+                ds_core::model::DomainDescription::PointSeries { x, y, .. } => {
+                    index.at(x, y).map(|l| FeatureIdentity {
+                        id: &l.id,
+                        label: &l.label,
+                    })
+                }
+                _ => None,
+            })
+        },
+        &format!("{}/edr/collections/{}", req.base, req.collection_id),
+        &req.links(),
+        &mut body,
+    )
+    .map_err(|e| match e {
+        GeoJsonError::ReservedParameterName(name) => bad_request_msg(&format!(
+            "Parameter '{name}' has no GeoJSON encoding: its name is one of the feature's own \
+             properties ({}). Leave it out of parameter-name, or use f=CoverageJSON",
+            crate::geojson::RESERVED_PROPERTIES.join(", ")
+        )),
+        GeoJsonError::NotStationSeries(kind) => {
+            tracing::error!(
+                collection = %req.collection_id,
+                "EDR GeoJSON: a station-series engine answered a {kind} coverage"
+            );
+            server_error()
+        }
+        GeoJsonError::Json(e) => {
+            tracing::error!("EDR GeoJSON serialise error: {e}");
+            server_error()
+        }
+    })?;
+    Ok((
+        [(header::CONTENT_TYPE, EdrFormat::GeoJson.media_type())],
+        body,
+    )
+        .into_response())
+}
+
 /// Serialise an EDR coverage response in the requested output format.
 ///
-/// `CoverageJSON` is the default; `PNG` renders a vertical-profile or
-/// time-series plot (one stacked panel per parameter). A response that can't
-/// be plotted (a gridded/area result) maps to 400.
+/// `CoverageJSON` is the default; `GeoJSON` encodes station series (only
+/// offered where the engine serves them); `PNG` renders a vertical-profile
+/// or time-series plot (one stacked panel per parameter). A response that
+/// can't be plotted (a gridded/area result) maps to 400.
 fn render_coverage_response(
     result: CoverageResponse,
     format: EdrFormat,
     width: Option<u32>,
     height: Option<u32>,
+    geojson: &GeoJsonRequest,
 ) -> Result<Response, HandlerError> {
     match format {
         EdrFormat::CoverageJson => coverage_json_response(&result, "EDR"),
+        EdrFormat::GeoJson => render_station_geojson(&result, geojson),
         EdrFormat::Png => {
             let panels = coverage_response_to_panels(&result).map_err(|e| bad_request(&e))?;
             let (w, h) = plot_dimensions(width, height);
@@ -153,6 +281,29 @@ fn bad_request_msg(msg: &str) -> HandlerError {
         StatusCode::BAD_REQUEST,
         Json(json!({ "code": "BadRequest", "description": msg })),
     )
+}
+
+/// A data query's output format: `f`, else the `Accept` header, among the
+/// formats `query_type` offers on this engine (400 for an `f` it does not).
+fn data_query_format(
+    engine: &Arc<dyn EdrEngine>,
+    query_type: &str,
+    f: Option<&str>,
+    headers: &HeaderMap,
+    what: &str,
+) -> Result<NegotiatedFormat, HandlerError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let offered = query_formats(query_type, engine.serves_station_series());
+    negotiate_edr_format(f, accept, offered, what).map_err(|e| bad_request(&e))
+}
+
+/// `Vary: Accept` on a data response whose format the `Accept` header chose.
+fn with_format_vary(resp: Response, format: NegotiatedFormat) -> Response {
+    if format.vary_accept {
+        with_vary(resp)
+    } else {
+        resp
+    }
 }
 
 /// Resolve the requested representation from `?f=` + the `Accept` header.
@@ -422,6 +573,49 @@ fn format_parameter() -> serde_json::Value {
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
+/// OpenAPI `f` parameter of a data query offering `formats` (#929).
+fn data_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
+    let described: Vec<&str> = formats
+        .iter()
+        .map(|f| match f {
+            EdrFormat::CoverageJson => "CoverageJSON (the default)",
+            EdrFormat::GeoJson => {
+                "GeoJSON (EDR GeoJSON: one feature per station, its series as \
+                 `time` and per-parameter property arrays)"
+            }
+            EdrFormat::Png => "PNG (a vertical-profile / time-series plot)",
+        })
+        .collect();
+    let names: Vec<&str> = formats.iter().map(|f| f.name()).collect();
+    json!({
+        "name": "f",
+        "in": "query",
+        "required": false,
+        "description": format!(
+            "Output format: {}. Case-insensitive; the media types are accepted too \
+             (encode + as %2B). Without f, the Accept header chooses among them.",
+            described.join(", ")
+        ),
+        "schema": {"type": "string", "enum": names}
+    })
+}
+
+/// OpenAPI `200` content of a data query offering `formats`.
+fn data_response_content(formats: &[EdrFormat]) -> serde_json::Value {
+    let mut content = serde_json::Map::new();
+    for format in formats {
+        let schema = match format {
+            EdrFormat::CoverageJson => json!({"$ref": "#/components/schemas/coverageJSON"}),
+            EdrFormat::GeoJson => {
+                json!({"$ref": "#/components/schemas/edrFeatureCollectionGeoJSON"})
+            }
+            EdrFormat::Png => json!({"type": "string", "format": "binary"}),
+        };
+        content.insert(format.media_type().into(), json!({ "schema": schema }));
+    }
+    serde_json::Value::Object(content)
+}
+
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
@@ -441,6 +635,11 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             .get(id)
             .map(|e| e.supported_query_types().into_iter().collect())
             .unwrap_or_default();
+        let station_series = state
+            .engines
+            .get(id)
+            .is_some_and(|e| e.serves_station_series());
+        let formats = |query_type: &str| query_formats(query_type, station_series);
 
         // Collection detail
         let detail_path = format!("/edr/collections/{id}");
@@ -495,25 +694,12 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/parameter-name"},
                     {"$ref": "#/components/parameters/z"},
-                    {
-                        "name": "f",
-                        "in": "query",
-                        "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
-                        "required": false,
-                        "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                    }
+                    data_format_parameter(formats("locations"))
                 ],
                 "responses": {
                     "200": {
                         "description": "Coverage data",
-                        "content": {
-                            COVERAGE_JSON_MEDIA_TYPE: {
-                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                            },
-                            "image/png": {
-                                "schema": {"type": "string", "format": "binary"}
-                            }
-                        }
+                        "content": data_response_content(formats("locations"))
                     },
                     "400": {"description": "Bad request"},
                     "404": {"description": "Location not found"},
@@ -535,25 +721,12 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
                         {"$ref": "#/components/parameters/z"},
-                        {
-                            "name": "f",
-                            "in": "query",
-                            "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
-                            "required": false,
-                            "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                        }
+                        data_format_parameter(formats("position"))
                     ],
                     "responses": {
                         "200": {
                             "description": "Coverage data",
-                            "content": {
-                                COVERAGE_JSON_MEDIA_TYPE: {
-                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                                },
-                                "image/png": {
-                                    "schema": {"type": "string", "format": "binary"}
-                                }
-                            }
+                            "content": data_response_content(formats("position"))
                         },
                         "400": {"description": "Bad request"},
                         "404": {"description": "Not found"},
@@ -610,16 +783,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/within-units"},
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
-                        {"$ref": "#/components/parameters/z"}
+                        {"$ref": "#/components/parameters/z"},
+                        data_format_parameter(formats("radius"))
                     ],
                     "responses": {
                         "200": {
                             "description": "Coverage data",
-                            "content": {
-                                COVERAGE_JSON_MEDIA_TYPE: {
-                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                                }
-                            }
+                            "content": data_response_content(formats("radius"))
                         },
                         "400": {"description": "Bad request"},
                         "404": {"description": "Not found"},
@@ -731,22 +901,12 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
                             {"$ref": "#/components/parameters/z"},
-                            {
-                                "name": "f",
-                                "in": "query",
-                                "required": false,
-                                "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                            }
+                            data_format_parameter(formats("position"))
                         ],
                         "responses": {
                             "200": {
                                 "description": "Coverage data",
-                                "content": {
-                                    COVERAGE_JSON_MEDIA_TYPE: {
-                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                                    },
-                                    "image/png": {"schema": {"type": "string", "format": "binary"}}
-                                }
+                                "content": data_response_content(formats("position"))
                             },
                             "400": {"description": "Bad request"},
                             "404": {"description": "Not found"},
@@ -769,16 +929,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/within-units"},
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
-                            {"$ref": "#/components/parameters/z"}
+                            {"$ref": "#/components/parameters/z"},
+                            data_format_parameter(formats("radius"))
                         ],
                         "responses": {
                             "200": {
                                 "description": "Coverage data",
-                                "content": {
-                                    COVERAGE_JSON_MEDIA_TYPE: {
-                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                                    }
-                                }
+                                "content": data_response_content(formats("radius"))
                             },
                             "400": {"description": "Bad request"},
                             "404": {"description": "Not found"},
@@ -946,6 +1103,41 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "parameters": {"type": "object"},
                         "ranges": {"type": "object"}
                     }
+                },
+                "edrFeatureCollectionGeoJSON": {
+                    "type": "object",
+                    "description": "EDR GeoJSON FeatureCollection of station series: one Point feature per station, whose properties carry the EDR members (datetime, label, parameter-name, edrqueryendpoint), the series' RFC 3339 instants as `time`, and one array per parameter aligned with `time` (null where there is no value).",
+                    "required": ["type", "features"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["FeatureCollection"]},
+                        "features": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["type", "geometry", "properties"],
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["Feature"]},
+                                    "id": {"type": "string"},
+                                    "geometry": {"type": "object"},
+                                    "properties": {
+                                        "type": "object",
+                                        "required": ["datetime", "parameter-name", "label", "edrqueryendpoint"],
+                                        "properties": {
+                                            "datetime": {"type": "string"},
+                                            "parameter-name": {"type": "array", "items": {"type": "string"}},
+                                            "label": {"type": "string"},
+                                            "edrqueryendpoint": {"type": "string"},
+                                            "time": {"type": "array", "items": {"type": "string"}}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "parameters": {"type": "array", "items": {"type": "object"}},
+                        "links": {"type": "array", "items": {"type": "object"}},
+                        "numberMatched": {"type": "integer", "minimum": 0},
+                        "numberReturned": {"type": "integer", "minimum": 0}
+                    }
                 }
             }
         }
@@ -998,13 +1190,16 @@ pub async fn conformance(
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
     // EDR 1.1 puts every data query under `queries`; each collection's
-    // data_queries identifies supported types. GeoJSON is only available for
-    // /locations, so geojson/edr-geojson conformance is not declared.
+    // data_queries identifies supported types. Feature content is GeoJSON:
+    // the /locations list, and the point queries of station collections,
+    // whose `output_formats` list GeoJSON (#929).
     let classes = api_common::conformance_classes(&[
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/queries",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/geojson",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/edr-geojson",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/html",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/oas30",
@@ -1351,10 +1546,19 @@ pub async fn locations(
 pub async fn location_query(
     Path((id, loc_id)): Path<(String, String)>,
     Query(params): Query<LocationQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
+    let format = data_query_format(
+        engine,
+        "locations",
+        params.f.as_deref(),
+        &headers,
+        "location queries",
+    )?;
 
     let datetime = params
         .datetime
@@ -1375,9 +1579,24 @@ pub async fn location_query(
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
+    let geojson = GeoJsonRequest {
+        engine: engine.clone(),
+        base: request_base_url(&state, &headers),
+        collection_id: id.clone(),
+        collection_title: config.title.clone(),
+        path: format!(
+            "/collections/{id}/locations/{}",
+            encode_path_segment(&loc_id)
+        ),
+        raw_query,
+        offered: query_formats("locations", engine.serves_station_series()),
+        location_id: Some(loc_id.clone()),
+    };
     let engine = engine.clone();
-    let result = execute_query(false, move |_budget| {
-        engine
+    // Rendering stays on the query executor: GeoJSON reads the engine's
+    // location inventory to label the station.
+    let response = execute_query(false, move |_budget| {
+        let result = engine
             .query_location(
                 &loc_id,
                 datetime,
@@ -1385,13 +1604,14 @@ pub async fn location_query(
                 z.as_deref(),
                 None,
             )
-            .map_err(|e| map_query_error(&e, "Location"))
+            .map_err(|e| map_query_error(&e, "Location"))?;
+        render_coverage_response(result, format.format, params.width, params.height, &geojson)
     })
     .await?;
-
-    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
-    render_coverage_response(result, format, params.width, params.height)
-        .map(|r| with_data_cache_control(r, datetime))
+    Ok(with_format_vary(
+        with_data_cache_control(response, datetime),
+        format,
+    ))
 }
 
 /// The 404 for a data query the collection's engine does not support:
@@ -1419,9 +1639,16 @@ fn require_query_type(
 pub async fn position_query(
     Path(id): Path<String>,
     Query(params): Query<PositionQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_position_query(id, None, params, state).await
+    let request = DataRequest {
+        instance_id: None,
+        raw_query,
+        headers,
+    };
+    run_position_query(id, request, params, state).await
 }
 
 /// `GET /collections/{id}/instances/{instanceId}/position` — position query
@@ -1429,21 +1656,65 @@ pub async fn position_query(
 pub async fn instance_position_query(
     Path((id, instance_id)): Path<(String, String)>,
     Query(params): Query<PositionQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_position_query(id, Some(instance_id), params, state).await
+    let request = DataRequest {
+        instance_id: Some(instance_id),
+        raw_query,
+        headers,
+    };
+    run_position_query(id, request, params, state).await
+}
+
+/// The parts of a data-query request its response format depends on.
+struct DataRequest {
+    instance_id: Option<String>,
+    raw_query: Option<String>,
+    headers: HeaderMap,
+}
+
+impl DataRequest {
+    /// The GeoJSON context of a `query_type` query on collection `id`.
+    fn geojson(
+        self,
+        state: &EdrState,
+        engine: &Arc<dyn EdrEngine>,
+        config: &CollectionConfig,
+        query_type: &str,
+    ) -> GeoJsonRequest {
+        let path = match &self.instance_id {
+            Some(iid) => format!(
+                "/collections/{}/instances/{}/{query_type}",
+                config.id,
+                encode_path_segment(iid)
+            ),
+            None => format!("/collections/{}/{query_type}", config.id),
+        };
+        GeoJsonRequest {
+            engine: engine.clone(),
+            base: request_base_url(state, &self.headers),
+            collection_id: config.id.clone(),
+            collection_title: config.title.clone(),
+            path,
+            raw_query: self.raw_query,
+            offered: query_formats(query_type, engine.serves_station_series()),
+            location_id: None,
+        }
+    }
 }
 
 async fn run_position_query(
     id: String,
-    instance_id: Option<String>,
+    request: DataRequest,
     params: PositionQueryParams,
     state: AppState,
 ) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "position", "position")?;
-    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+    let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
 
     let datetime = params
         .datetime
@@ -1474,9 +1745,16 @@ async fn run_position_query(
         )
     })?;
 
-    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
+    let format = data_query_format(
+        engine,
+        "position",
+        params.f.as_deref(),
+        &request.headers,
+        "position queries",
+    )?;
+    let geojson = request.geojson(&state, engine, config, "position");
     let engine = engine.clone();
-    execute_query(false, move |budget| {
+    let response = execute_query(false, move |budget| {
         let single = points.len() == 1;
         let mut coverages = Vec::with_capacity(points.len());
         let mut values = 0usize;
@@ -1525,10 +1803,13 @@ async fn run_position_query(
         } else {
             CoverageResponse::Collection(coverages)
         };
-        render_coverage_response(result, format, params.width, params.height)
-            .map(|r| with_data_cache_control(r, datetime))
+        render_coverage_response(result, format.format, params.width, params.height, &geojson)
     })
-    .await
+    .await?;
+    Ok(with_format_vary(
+        with_data_cache_control(response, datetime),
+        format,
+    ))
 }
 
 pub async fn area_query(
@@ -1562,12 +1843,16 @@ async fn run_area_query(
     // Static request-level checks before engine/instance resolution, so the
     // instance variant rejects the same way as the non-instance `area_query`
     // (e.g. `…/instances/x/area?f=png` → 400 "PNG not available", not a 404 on
-    // the instance). An area result is gridded / multi-coverage, not a plot.
-    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
-        return Err(bad_request(&DataServerError::InvalidParameter(
-            "PNG output is not available for area queries".into(),
-        )));
-    }
+    // the instance). An area result is gridded / multi-coverage, not a plot,
+    // and area is not a point query, so no GeoJSON either (#929): the one
+    // format leaves nothing for `Accept` to choose.
+    data_query_format(
+        engine,
+        "area",
+        params.f.as_deref(),
+        &HeaderMap::new(),
+        "area queries",
+    )?;
 
     let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
@@ -1613,9 +1898,16 @@ async fn run_area_query(
 pub async fn radius_query(
     Path(id): Path<String>,
     Query(params): Query<RadiusQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_radius_query(id, None, params, state).await
+    let request = DataRequest {
+        instance_id: None,
+        raw_query,
+        headers,
+    };
+    run_radius_query(id, request, params, state).await
 }
 
 /// `GET /collections/{id}/instances/{instanceId}/radius` — radius query
@@ -1623,9 +1915,16 @@ pub async fn radius_query(
 pub async fn instance_radius_query(
     Path((id, instance_id)): Path<(String, String)>,
     Query(params): Query<RadiusQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_radius_query(id, Some(instance_id), params, state).await
+    let request = DataRequest {
+        instance_id: Some(instance_id),
+        raw_query,
+        headers,
+    };
+    run_radius_query(id, request, params, state).await
 }
 
 /// OGC API - EDR `radius`: everything within `within` `within-units` of a
@@ -1634,28 +1933,31 @@ pub async fn instance_radius_query(
 /// and error mapping are the area query's.
 async fn run_radius_query(
     id: String,
-    instance_id: Option<String>,
+    request: DataRequest,
     params: RadiusQueryParams,
     state: AppState,
 ) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
 
     // Same capability guard as trajectory: an engine that does not advertise
     // `radius` has no such resource (404), and the live route stays
     // consistent with `data_queries` and the OpenAPI gating.
     require_query_type(engine, &id, "radius", "radius")?;
 
-    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
-        return Err(bad_request(&DataServerError::InvalidParameter(
-            "PNG output is not available for radius queries".into(),
-        )));
-    }
+    // Never PNG (a multi-coverage result); GeoJSON for station series (#929).
+    let format = data_query_format(
+        engine,
+        "radius",
+        params.f.as_deref(),
+        &request.headers,
+        "radius queries",
+    )?;
 
     let within_m =
         parse_within_metres(&params.within, &params.within_units).map_err(|e| bad_request(&e))?;
 
-    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+    let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
 
     let datetime = params
         .datetime
@@ -1676,9 +1978,12 @@ async fn run_radius_query(
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
+    let geojson = request.geojson(&state, engine, config, "radius");
     let engine = engine.clone();
-    let result = execute_query(false, move |_budget| {
-        engine
+    // Rendering stays on the query executor: GeoJSON reads the engine's
+    // location inventory to name the stations.
+    let response = execute_query(false, move |_budget| {
+        let result = engine
             .query_radius(
                 &params.coords,
                 within_m,
@@ -1687,13 +1992,13 @@ async fn run_radius_query(
                 z.as_deref(),
                 reference_time,
             )
-            .map_err(|e| map_query_error(&e, "Radius"))
+            .map_err(|e| map_query_error(&e, "Radius"))?;
+        render_coverage_response(result, format.format, None, None, &geojson)
     })
     .await?;
-
-    Ok(with_data_cache_control(
-        coverage_json_response(&result, "Radius")?,
-        datetime,
+    Ok(with_format_vary(
+        with_data_cache_control(response, datetime),
+        format,
     ))
 }
 
@@ -1701,7 +2006,8 @@ pub async fn trajectory_query(
     Path(id): Path<String>,
     Query(params): Query<TrajectoryQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, HandlerError> {
+    headers: HeaderMap,
+) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
@@ -1713,7 +2019,14 @@ pub async fn trajectory_query(
     // the `data_queries` collection metadata. Flagged by claude-review.
     require_query_type(engine, &id, "trajectory", "trajectory (cross-section)")?;
 
-    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
+    let negotiated = data_query_format(
+        engine,
+        "trajectory",
+        params.f.as_deref(),
+        &headers,
+        "trajectory queries",
+    )?;
+    let format = negotiated.format;
 
     let datetime = params
         .datetime
@@ -1754,11 +2067,15 @@ pub async fn trajectory_query(
     })
     .await?;
 
-    match format {
-        EdrFormat::CoverageJson => Ok(with_data_cache_control(
-            coverage_json_response(&result, "Trajectory")?,
-            datetime,
-        )),
+    let response = match format {
+        EdrFormat::CoverageJson => {
+            with_data_cache_control(coverage_json_response(&result, "Trajectory")?, datetime)
+        }
+        // `query_formats` never offers GeoJSON for a cross-section.
+        EdrFormat::GeoJson => {
+            tracing::error!("EDR trajectory: GeoJSON negotiated for a cross-section");
+            return Err(server_error());
+        }
         EdrFormat::Png => {
             // Render the cross-section as a colour-mapped heatmap using
             // the collection's resolved default style (or a data-scaled
@@ -1778,12 +2095,13 @@ pub async fn trajectory_query(
                 tracing::error!("Trajectory PNG render error: {e}");
                 server_error()
             })?;
-            Ok(with_data_cache_control(
+            with_data_cache_control(
                 ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
                 datetime,
-            ))
+            )
         }
-    }
+    };
+    Ok(with_format_vary(response, negotiated))
 }
 
 /// An EDR `extent.temporal` object: the interval, the Gregorian TRS and,
@@ -1817,41 +2135,43 @@ fn temporal_extent_json(
 /// schemas; all but `query_type` were optional in 1.1). `crs_details` lists
 /// the one CRS data queries accept ([`DATA_QUERY_CRS`], until #84), radius
 /// adds its accepted `within_units`. `output_formats` are the formats the
-/// route answers: area and radius results are gridded or multi-coverage, so
-/// they have no PNG plot.
-fn data_query_variables(query_type: &str) -> Option<serde_json::Value> {
-    let (title, description, output_formats): (&str, &str, &[&str]) = match query_type {
+/// route answers, [`query_formats`] for the engine (`station_series`:
+/// `EdrEngine::serves_station_series`): area and radius results are gridded
+/// or multi-coverage, so they have no PNG plot, and the point queries of a
+/// station collection add GeoJSON (#929).
+fn data_query_variables(query_type: &str, station_series: bool) -> Option<serde_json::Value> {
+    let (title, description) = match query_type {
         "locations" => (
             "Locations query",
             "Lists the collection's named locations as GeoJSON; \
              /locations/{locationId} returns the data at one of them.",
-            &["CoverageJSON", "PNG"],
         ),
         "position" => (
             "Position query",
             "Data at the WKT POINT or MULTIPOINT given in coords, \
              as CRS84 longitude and latitude.",
-            &["CoverageJSON", "PNG"],
         ),
         "area" => (
             "Area query",
             "Data inside the WKT POLYGON given in coords, as CRS84 longitude and latitude.",
-            &["CoverageJSON"],
         ),
         "radius" => (
             "Radius query",
             "Data within a distance of the WKT POINT given in coords, as CRS84 \
              longitude and latitude; within and within-units give the distance.",
-            &["CoverageJSON"],
         ),
         "trajectory" => (
             "Trajectory query",
             "A vertical cross-section along the 2-D WKT LINESTRING given in coords, \
              as CRS84 longitude and latitude.",
-            &["CoverageJSON", "PNG"],
         ),
         _ => return None,
     };
+    // The same list the handler negotiates over (#929).
+    let output_formats: Vec<&str> = query_formats(query_type, station_series)
+        .iter()
+        .map(|f| f.name())
+        .collect();
     let mut variables = json!({
         "title": title,
         "description": description,
@@ -1991,10 +2311,11 @@ fn build_collection_metadata(
     } else {
         engine.supported_query_types()
     };
+    let station_series = engine.serves_station_series();
     let mut data_queries = serde_json::Map::new();
     for qt in &query_types {
         // Every routed query type's path segment is its name.
-        let Some(variables) = data_query_variables(qt) else {
+        let Some(variables) = data_query_variables(qt, station_series) else {
             continue;
         };
         data_queries.insert(
@@ -2058,7 +2379,11 @@ fn build_collection_metadata(
             "data_queries": data_queries,
             "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
             "parameter_names": parameter_names,
-            "output_formats": ["CoverageJSON", "PNG"]
+            "output_formats": if station_series {
+                json!(["CoverageJSON", "GeoJSON", "PNG"])
+            } else {
+                json!(["CoverageJSON", "PNG"])
+            }
         }),
         links,
     )

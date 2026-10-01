@@ -22,8 +22,8 @@ Spec: OGC API - EDR 1.1 (OGC 19-086r6). Base route: `/edr`.
 | `covjson` | ✓ | every CoverageJSON body validates against `schemas/coveragejson.json` (`cargo test -p api-edr`) and is sent as `application/vnd.cov+json` (EDR 1.2's `/req/covjson/definition`, #920). The declared URI is still 1.1's, whose requirement names `application/prs.coverage+json`; that type is accepted in `f` but no longer sent. Moving the declaration to 1.2 is #930 |
 | `html` | ✓ | every metadata resource (landing, conformance, collections, collection, instances, instance) negotiates `?f=html` / `Accept` |
 | `oas30` | ✓ | `/edr/api` (hand-written `api_definition()`), Swagger UI at `/edr/api/docs` |
-| `geojson` | ✗ | data queries answer 400 for `f=GeoJSON`; only `/locations` is GeoJSON |
-| `edr-geojson` | ✗ | same reason (a test pins that it is *not* declared) |
+| `geojson` | ✓ | feature content is `application/geo+json`: the `/locations` list, and the point queries of station collections (see [GeoJSON output](#geojson-output)) |
+| `edr-geojson` | ✓ | those bodies are EDR GeoJSON FeatureCollections; each route's body validates against the EDR 1.1 bundle's `application/geo+json` schema (`tests/geojson_output_tests.rs`, `crates/server/tests/edr_geojson.rs`) |
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
 Part 2 (collections, json, html). The landing page links `/conformance` and
@@ -53,10 +53,10 @@ for the specification baselines and remaining gaps.
 
 | Query type | Route | Status | Notes |
 |---|---|---|---|
-| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list + CoverageJSON/PNG series per location |
-| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined; all coordinates finite and within CRS84 bounds) |
-| `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG rejected |
-| `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667) |
+| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list + CoverageJSON/PNG series per location; EDR GeoJSON too on station collections |
+| `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined; all coordinates finite and within CRS84 bounds); EDR GeoJSON too on station collections, one feature per point |
+| `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG and GeoJSON rejected |
+| `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667); PNG rejected; EDR GeoJSON too on station collections |
 | `trajectory` | `/collections/{id}/trajectory` | partial | 2-D `LINESTRING` only, meaning a *vertical cross-section* (PVOL sites). `LINESTRINGZ/M` (per-node z/time) not accepted; no along-path sampling on gridded engines |
 | `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); instance-scoped queries: position, area, radius only |
 | `cube` | — | ✗ | not in the trait or the router |
@@ -95,7 +95,7 @@ value type, every CoverageJSON range is encoded as `float`.
 | `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..` |
 | `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData and Nowcast (#666); GRIB keeps its own equivalent check |
 | `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent |
-| `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
+| `f` | partial | `CoverageJSON` (default), `GeoJSON` (locations/position/radius on station collections) and `PNG` (position/locations/trajectory plots), case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `application/geo+json`, `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. A format the query does not offer is a 400 naming the ones it does; each query's offer is its `data_queries` `output_formats`. Without `f`, the `Accept` header chooses among the offered media types by q-value (ties go to the order CoverageJSON, GeoJSON, PNG; wildcards and `application/json` keep CoverageJSON, nothing acceptable falls back to it rather than 406), and the response carries `Vary: Accept`. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF |
 | `crs` | ✗ | data queries accept CRS84 only, which every `data_queries` link advertises in `crs_details` (#918); the `crs` parameter itself is not parsed (#84); `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
@@ -127,6 +127,45 @@ Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499
 `/api/docs` uses embedded Swagger UI 5.33.0 assets, served under
 `/api/docs/{asset}`, with a same-origin script policy and `nosniff` headers.
 No executable documentation assets or validation requests use a CDN (#587).
+
+## GeoJSON output
+
+Station collections, whose engine answers time series at its named
+locations (`EdrEngine::serves_station_series`: CSV, PostGIS station shapes,
+BUFR), also answer their point queries (`locations/{locId}`, `position`,
+`radius`) as EDR GeoJSON (#929): `f=GeoJSON`, `f=application/geo+json` or
+`Accept: application/geo+json`. Everything else keeps CoverageJSON, and
+`f=GeoJSON` is a 400 there: gridded, polar and nowcast engines, PostGIS
+events (`Point` coverages with no station), `area` on every engine (not a
+point query), and `trajectory`.
+
+The body is an EDR GeoJSON FeatureCollection with **one feature per
+station**, as the CoverageJSON twin has one coverage per station (a
+MULTIPOINT position has one per point):
+
+- `geometry`: the station's `Point`; `id`: the location id.
+- `properties`: the members EDR's `edrProperties` requires, then the series.
+  `datetime` is the instant or the `start/end` period the series spans;
+  `label` the station name; `parameter-name` the parameters carried;
+  `edrqueryendpoint` the station's `/locations/{locId}` resource (the id
+  percent-encoded); `time` the RFC 3339 instants; and one array per
+  parameter aligned with `time`, `null` where there is no value (as in
+  CoverageJSON).
+- `parameters`: the parameter objects of the CoverageJSON twin, each with its
+  `id`, as an array. `links`: `self`, an `alternate` per other offered format,
+  and the collection. `numberMatched` = `numberReturned` = the feature count
+  (no paging).
+
+Each coverage is named by the one location of `get_locations()` at its exact
+coordinates (the `serves_station_series` contract, pinned per engine by
+`station_series_sit_at_listed_locations` in engine-csv and engine-bufr); a
+`locations/{locId}` result by that id. A series no single location sits at
+(two stations sharing a point, a ship that moved since the snapshot) has no
+`id`, the label `POINT(lon lat)` and the `/locations` list as its endpoint. A
+parameter named `datetime`, `label`, `parameter-name`, `edrqueryendpoint` or
+`time` would collide with the feature's own members: GeoJSON of it is a 400
+naming the alternatives. Bodies are byte-identical across identical requests,
+so ETags revalidate.
 
 ## Parameter metadata (Metocean Profile, Requirement 7)
 
@@ -269,6 +308,12 @@ transforms retain serial retrieval.
 Radius, cube, corridor and items have no engine-specific code: radius is
 answered by every engine that answers area, the other three do not exist.
 
+Output formats: every query is CoverageJSON. EDR GeoJSON is served by CSV,
+PostGIS stations and BUFR for the point queries they support (CSV:
+locations, radius; PostGIS stations and BUFR: locations, position, radius);
+no other engine serves it ([GeoJSON output](#geojson-output)). PNG is
+position/locations/trajectory only.
+
 Compatible nowcast reloads retain motion-field instances alongside forecast
 runs and cell history (#604). Reuse requires unchanged nowcast config, the
 same raster source engine and a compatible retained geometry/product contract;
@@ -279,7 +324,7 @@ generations, not already-published instances.
 
 1. `locations` and `trajectory` under `/instances/{id}/`.
 2. `cube` and `corridor` (derivable from area / trajectory).
-3. `crs` on data queries, adding its CRSs to `crs_details` (#84); EDR GeoJSON output for point results (then declare `edr-geojson`).
+3. `crs` on data queries, adding its CRSs to `crs_details` (#84); EDR GeoJSON for `area` on station collections and for PostGIS events.
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
 
 Related issues: #585 MULTIPOINT fan-out bound · #667

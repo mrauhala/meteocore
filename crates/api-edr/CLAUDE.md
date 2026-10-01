@@ -64,6 +64,22 @@ owns the instance-id string form:
   non-empty.
 - Unknown instance id → 404 (`select_run` returns `None`).
 
+## Output formats and GeoJSON (#929)
+
+- `params::query_formats(query_type, engine.serves_station_series())` is
+  the one list of formats a data query offers: the handler negotiates over
+  it (`f`, else `Accept` by q-value, else the default), and
+  `data_query_variables` (`output_formats`) and `api_definition()` print
+  it. Never hard-code a format list elsewhere. When `Accept` chose among
+  several formats the response carries `Vary: Accept`.
+- EDR GeoJSON (`src/geojson.rs`) is one feature per coverage (per station),
+  the series as `time` + per-parameter arrays in `properties`. It names each
+  coverage by the one `get_locations()` entry at its exact coordinates: that
+  is what `EdrEngine::serves_station_series` promises. An engine opting in
+  must pin it with a test (`station_series_sit_at_listed_locations`).
+- GeoJSON rendering reads `get_locations()`, so it runs inside the query
+  executor with the query, never on an HTTP worker.
+
 ## Radius queries (#513)
 
 `GET /collections/{id}/radius?coords=POINT(lon lat)&within=<n>&within-units=km|m|mi`

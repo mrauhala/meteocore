@@ -19,7 +19,8 @@ pub struct LocationQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
-    /// Output format: `CoverageJSON` (default) or `PNG` (plot).
+    /// Output format: `CoverageJSON` (default), `PNG` (plot) or, on a
+    /// station collection, `GeoJSON` ([`query_formats`]).
     pub f: Option<String>,
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
@@ -33,7 +34,8 @@ pub struct PositionQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
-    /// Output format: `CoverageJSON` (default) or `PNG` (plot).
+    /// Output format: `CoverageJSON` (default), `PNG` (plot) or, on a
+    /// station collection, `GeoJSON` ([`query_formats`]).
     pub f: Option<String>,
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
@@ -46,17 +48,54 @@ pub enum EdrFormat {
     /// OGC CoverageJSON (the default), served as
     /// [`COVERAGE_JSON_MEDIA_TYPE`].
     CoverageJson,
+    /// EDR GeoJSON: one feature per location, for station series (#929).
+    GeoJson,
     /// A rendered PNG plot (vertical profile or time series).
     Png,
 }
 
-/// Parse the `f` query parameter. Absent/blank → CoverageJSON. `coveragejson`
-/// and `png` are accepted case-insensitively, and so are their media types
-/// (#510): `application/vnd.cov+json` (what the responses carry, EDR 1.2,
-/// #920), `application/prs.coverage+json` (EDR 1.1's type, still accepted;
-/// the response is the same CoverageJSON under the 1.2 type) and
-/// `image/png`. A `+` sent unencoded arrives as a space, so a space inside
-/// a media type reads as `+`. Anything else is a 400.
+impl EdrFormat {
+    /// The `f` token, as advertised in `output_formats`.
+    pub fn name(self) -> &'static str {
+        match self {
+            EdrFormat::CoverageJson => "CoverageJSON",
+            EdrFormat::GeoJson => "GeoJSON",
+            EdrFormat::Png => "PNG",
+        }
+    }
+
+    /// The media type a response in this format carries.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            EdrFormat::CoverageJson => COVERAGE_JSON_MEDIA_TYPE,
+            EdrFormat::GeoJson => "application/geo+json",
+            EdrFormat::Png => "image/png",
+        }
+    }
+
+    /// The format a media type names (lowercase), if any. `application/json`
+    /// names none: both JSON formats are JSON, so it leaves the default.
+    fn from_media_type(media: &str) -> Option<EdrFormat> {
+        match media {
+            COVERAGE_JSON_MEDIA_TYPE | LEGACY_COVERAGE_JSON_MEDIA_TYPE => {
+                Some(EdrFormat::CoverageJson)
+            }
+            "application/geo+json" => Some(EdrFormat::GeoJson),
+            "image/png" => Some(EdrFormat::Png),
+            _ => None,
+        }
+    }
+}
+
+/// Parse the `f` query parameter. Absent/blank → CoverageJSON.
+/// `coveragejson`, `geojson` and `png` are accepted case-insensitively, and
+/// so are their media types (#510): `application/vnd.cov+json` (what the
+/// responses carry, EDR 1.2, #920), `application/prs.coverage+json` (EDR
+/// 1.1's type, still accepted; the response is the same CoverageJSON under
+/// the 1.2 type), `application/geo+json` and `image/png`. A `+` sent
+/// unencoded arrives as a space, so a space inside a media type reads as
+/// `+`. Anything else is a 400. Whether the query offers the format is the
+/// caller's check ([`query_formats`]).
 pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
     let f = f
         .map(str::trim)
@@ -64,14 +103,105 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
         .map(|s| s.to_ascii_lowercase().replace(' ', "+"));
     match f.as_deref() {
         None => Ok(EdrFormat::CoverageJson),
-        Some("coveragejson" | COVERAGE_JSON_MEDIA_TYPE | LEGACY_COVERAGE_JSON_MEDIA_TYPE) => {
-            Ok(EdrFormat::CoverageJson)
-        }
-        Some("png" | "image/png") => Ok(EdrFormat::Png),
-        Some(other) => Err(DataServerError::InvalidParameter(format!(
-            "Unsupported output format '{other}' — expected 'CoverageJSON' or 'PNG'"
-        ))),
+        Some("coveragejson") => Ok(EdrFormat::CoverageJson),
+        Some("geojson") => Ok(EdrFormat::GeoJson),
+        Some("png") => Ok(EdrFormat::Png),
+        Some(media) => EdrFormat::from_media_type(media).ok_or_else(|| {
+            DataServerError::InvalidParameter(format!(
+                "Unsupported output format '{media}' — expected 'CoverageJSON', 'GeoJSON' or 'PNG'"
+            ))
+        }),
     }
+}
+
+/// The output formats a data query offers, default first, in the order they
+/// are advertised in `data_queries.*.link.variables.output_formats`. GeoJSON
+/// is offered for the point-shaped queries (`locations`, `position`,
+/// `radius`) of an engine that serves station series
+/// (`EdrEngine::serves_station_series`); gridded results and `area` keep
+/// CoverageJSON (#929). PNG plots a single series or profile, so area and
+/// radius results are not offered as PNG.
+pub fn query_formats(query_type: &str, station_series: bool) -> &'static [EdrFormat] {
+    use EdrFormat::{CoverageJson, GeoJson, Png};
+    match (query_type, station_series) {
+        ("locations" | "position", true) => &[CoverageJson, GeoJson, Png],
+        ("locations" | "position" | "trajectory", _) => &[CoverageJson, Png],
+        ("radius", true) => &[CoverageJson, GeoJson],
+        _ => &[CoverageJson],
+    }
+}
+
+/// A data query's chosen representation. `vary_accept`: the `Accept`
+/// header chose it among several offered formats (no `f`), so the response
+/// must carry `Vary: Accept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegotiatedFormat {
+    pub format: EdrFormat,
+    pub vary_accept: bool,
+}
+
+/// Choose a data query's output format among the `offered` ones (default
+/// first). An explicit `f` wins; a format the query does not offer is a 400
+/// naming the ones it does. Without `f`, the `Accept` header picks the
+/// offered format with the highest q-value among the media types it names
+/// explicitly (ties go to the earlier offered format; `q=0` excludes).
+/// Wildcards and `application/json` name no format, and nothing acceptable
+/// falls back to the default rather than 406, like the metadata resources'
+/// negotiation.
+pub fn negotiate_edr_format(
+    f: Option<&str>,
+    accept: Option<&str>,
+    offered: &[EdrFormat],
+    what: &str,
+) -> Result<NegotiatedFormat, DataServerError> {
+    let default = offered.first().copied().unwrap_or(EdrFormat::CoverageJson);
+    if f.is_some_and(|f| !f.trim().is_empty()) {
+        let format = parse_edr_format(f)?;
+        if !offered.contains(&format) {
+            let names: Vec<&str> = offered.iter().map(|f| f.name()).collect();
+            return Err(DataServerError::InvalidParameter(format!(
+                "{} output is not available for {what}; available: {}",
+                format.name(),
+                names.join(", ")
+            )));
+        }
+        return Ok(NegotiatedFormat {
+            format,
+            vary_accept: false,
+        });
+    }
+    let format = accept
+        .and_then(|accept| accept_preference(accept, offered))
+        .unwrap_or(default);
+    Ok(NegotiatedFormat {
+        format,
+        vary_accept: offered.len() > 1,
+    })
+}
+
+/// The offered format an `Accept` header prefers, if it names one.
+fn accept_preference(accept: &str, offered: &[EdrFormat]) -> Option<EdrFormat> {
+    let mut best: Option<(f32, usize)> = None;
+    for entry in accept.split(',') {
+        let mut parts = entry.split(';').map(str::trim);
+        let media = parts.next().unwrap_or("").to_ascii_lowercase();
+        let Some(rank) = EdrFormat::from_media_type(&media)
+            .and_then(|format| offered.iter().position(|o| *o == format))
+        else {
+            continue;
+        };
+        // Absent q is 1; a malformed one is 0 (not acceptable), as in
+        // `ds_core::html::negotiate`.
+        let q = parts
+            .filter_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
+            .map(|v| v.trim().parse::<f32>().unwrap_or(0.0))
+            .next_back()
+            .unwrap_or(1.0);
+        if q > 0.0 && best.is_none_or(|(bq, br)| q > bq || (q == bq && rank < br)) {
+            best = Some((q, rank));
+        }
+    }
+    best.map(|(_, rank)| offered[rank])
 }
 
 /// Default plot dimensions when `width`/`height` aren't supplied. The actual
@@ -89,7 +219,8 @@ pub struct AreaQueryParams {
     pub parameter_name: Option<String>,
     pub z: Option<String>,
     /// Output format. Area queries only support `CoverageJSON`; `PNG` is
-    /// rejected (an area result is gridded / multi-coverage, not a single plot).
+    /// rejected (an area result is gridded / multi-coverage, not a single
+    /// plot), and so is `GeoJSON` (not a point query, #929).
     pub f: Option<String>,
 }
 
@@ -97,7 +228,7 @@ pub struct AreaQueryParams {
 /// within `within` `within-units` of a WKT `POINT`. Both distance
 /// parameters are required by the spec's OpenAPI; the accepted units are
 /// [`WITHIN_UNITS`]. Like area, the result is multi-coverage / gridded, so
-/// `PNG` is rejected.
+/// `PNG` is rejected; a station collection also offers `GeoJSON`.
 #[derive(Debug, Deserialize)]
 pub struct RadiusQueryParams {
     pub coords: String,
@@ -398,9 +529,119 @@ mod tests {
         for f in ["png", "PNG", "image/png"] {
             assert_eq!(parse_edr_format(Some(f)).unwrap(), EdrFormat::Png, "{f}");
         }
-        for f in ["json", "application/json", "image/jpeg"] {
+        for f in [
+            "GeoJSON",
+            "geojson",
+            "GEOJSON",
+            "application/geo+json",
+            "Application/Geo+JSON",
+            "application/geo json",
+        ] {
+            assert_eq!(
+                parse_edr_format(Some(f)).unwrap(),
+                EdrFormat::GeoJson,
+                "{f}"
+            );
+        }
+        for f in ["json", "application/json", "image/jpeg", "geo+json"] {
             assert!(parse_edr_format(Some(f)).is_err(), "{f}");
         }
+    }
+
+    #[test]
+    fn geojson_is_offered_for_point_queries_of_station_series_only() {
+        use EdrFormat::{CoverageJson, GeoJson, Png};
+        assert_eq!(
+            query_formats("position", true),
+            [CoverageJson, GeoJson, Png]
+        );
+        assert_eq!(
+            query_formats("locations", true),
+            [CoverageJson, GeoJson, Png]
+        );
+        assert_eq!(query_formats("radius", true), [CoverageJson, GeoJson]);
+        assert_eq!(query_formats("area", true), [CoverageJson]);
+        for qt in ["locations", "position", "trajectory"] {
+            assert_eq!(query_formats(qt, false), [CoverageJson, Png], "{qt}");
+        }
+        for qt in ["area", "radius", "cube"] {
+            assert_eq!(query_formats(qt, false), [CoverageJson], "{qt}");
+        }
+    }
+
+    #[test]
+    fn explicit_f_must_be_offered() {
+        use EdrFormat::{CoverageJson, GeoJson, Png};
+        let offered = [CoverageJson, GeoJson, Png];
+        let got = negotiate_edr_format(
+            Some("geojson"),
+            Some("image/png"),
+            &offered,
+            "position queries",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            NegotiatedFormat {
+                format: GeoJson,
+                vary_accept: false
+            }
+        );
+        let err = negotiate_edr_format(
+            Some("GeoJSON"),
+            None,
+            &[CoverageJson, Png],
+            "position queries",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("GeoJSON output is not available for position queries")
+                && err.contains("available: CoverageJSON, PNG"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accept_picks_the_preferred_offered_media_type() {
+        use EdrFormat::{CoverageJson, GeoJson, Png};
+        let offered = [CoverageJson, GeoJson, Png];
+        let pick = |accept: Option<&str>| {
+            let got = negotiate_edr_format(None, accept, &offered, "q").unwrap();
+            assert!(got.vary_accept);
+            got.format
+        };
+        assert_eq!(pick(None), CoverageJson);
+        assert_eq!(pick(Some("*/*")), CoverageJson);
+        assert_eq!(pick(Some("application/json")), CoverageJson);
+        assert_eq!(pick(Some("application/geo+json")), GeoJson);
+        assert_eq!(pick(Some("Application/Geo+JSON; charset=utf-8")), GeoJson);
+        assert_eq!(pick(Some("image/png")), Png);
+        assert_eq!(
+            pick(Some("application/geo+json;q=0.5, application/vnd.cov+json")),
+            CoverageJson
+        );
+        assert_eq!(
+            pick(Some(
+                "application/prs.coverage+json;q=0.2, application/geo+json;q=0.9"
+            )),
+            GeoJson
+        );
+        // Equal q: the earlier offered format wins.
+        assert_eq!(pick(Some("image/png, application/geo+json")), GeoJson);
+        // q=0 and malformed q exclude; nothing left → the default.
+        assert_eq!(pick(Some("application/geo+json;q=0")), CoverageJson);
+        assert_eq!(pick(Some("application/geo+json;q=abc")), CoverageJson);
+        // A format the query does not offer is not chosen, and a query
+        // with one format does not vary.
+        let radius = negotiate_edr_format(None, Some("image/png"), &[CoverageJson], "q").unwrap();
+        assert_eq!(
+            radius,
+            NegotiatedFormat {
+                format: CoverageJson,
+                vary_accept: false
+            }
+        );
     }
 
     #[test]

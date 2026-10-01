@@ -128,6 +128,19 @@ pub trait EdrEngine: Send + Sync {
         vec!["locations".to_string()]
     }
 
+    /// Whether this engine's results are time series at its named locations
+    /// (stations): every `locations`, `position` and `radius` result is a
+    /// `PointSeries`, or a collection of them, with no `z`, at the
+    /// coordinates of a location [`Self::get_locations`] lists. The EDR layer
+    /// then also encodes those queries as EDR GeoJSON, one feature per
+    /// location (#929). **O(1)**: it is read per metadata request.
+    ///
+    /// Default `false`: gridded and polar results are coverages, not
+    /// features, and keep CoverageJSON only.
+    fn serves_station_series(&self) -> bool {
+        false
+    }
+
     /// Execute an area query within the given bounding box / polygon.
     /// Default implementation returns an error.
     fn query_area(

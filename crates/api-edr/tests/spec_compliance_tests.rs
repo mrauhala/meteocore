@@ -630,6 +630,9 @@ async fn finding_16_data_queries_link_structure() {
     let vars = &link["variables"];
     assert_eq!(vars["query_type"], "locations");
     let formats = vars["output_formats"].as_array().expect("output_formats");
+    // The mock does not declare `serves_station_series`, so it keeps
+    // CoverageJSON and PNG (#929; tests/geojson_output_tests.rs covers the
+    // station engines that serve GeoJSON).
     assert!(
         !formats.iter().any(|v| v == "GeoJSON"),
         "GeoJSON must not appear in locations output_formats — f=GeoJSON returns HTTP 400"
@@ -641,7 +644,7 @@ async fn finding_16_data_queries_link_structure() {
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "f=GeoJSON must be rejected on the locations data endpoint"
+        "f=GeoJSON must be rejected where the engine serves no station series"
     );
 }
 
@@ -1111,17 +1114,12 @@ async fn finding_27_conformance_valid() {
     for item in conforms_to {
         assert!(item.is_string(), "each conformsTo entry must be a string");
     }
-    assert!(
-        !conforms_to.iter().any(|v| v
-            .as_str()
-            .is_some_and(|s| s.ends_with("/conf/edr-geojson"))),
-        "edr-geojson conformance class must not be advertised — data queries return HTTP 400 for f=GeoJSON"
-    );
 }
 
 // EDR 1.1 (19-086r6) declares one `queries` class for every query type,
 // plus `html` and `oas30` for the representations the server actually
-// serves. The two GeoJSON classes stay out (see finding 27).
+// serves, and the two GeoJSON classes: feature content (the /locations
+// list, station collections' point queries) is GeoJSON (#929).
 #[tokio::test]
 async fn declares_edr_queries_html_oas30_classes() {
     let (_status, json) = get_json("/conformance").await;
@@ -1132,6 +1130,8 @@ async fn declares_edr_queries_html_oas30_classes() {
         "collections",
         "queries",
         "json",
+        "geojson",
+        "edr-geojson",
         "covjson",
         "html",
         "oas30",
@@ -1139,10 +1139,6 @@ async fn declares_edr_queries_html_oas30_classes() {
         let uri = format!("http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/{class}");
         assert!(uris.contains(&uri.as_str()), "must declare {uri}");
     }
-    assert!(
-        !uris.iter().any(|u| u.ends_with("/conf/geojson")),
-        "geojson class must not be advertised — data queries cannot return GeoJSON"
-    );
 }
 
 // ===========================================================================

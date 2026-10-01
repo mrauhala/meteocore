@@ -1,5 +1,6 @@
 pub mod caching;
 mod executor;
+pub(crate) mod geojson;
 pub mod handlers;
 mod location_budget;
 pub mod params;
