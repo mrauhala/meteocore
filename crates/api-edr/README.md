@@ -66,6 +66,19 @@ for the specification baselines and remaining gaps.
 
 A query type a collection's engine does not support (not in its `supported_query_types`, so not in `data_queries`) has no resource: position, area, radius, cube and trajectory all answer 404 `NotFound`, and `/api` omits the path (#668).
 
+Every advertised query type's `data_queries.<type>.link.variables` carries
+the six fields EDR 1.2 requires (#918): `title` (`Position query`, …), a
+`description` naming what `coords` takes, `query_type`, `output_formats`
+(PNG only for locations, position and trajectory), `default_output_format`
+(`CoverageJSON`) and `crs_details`, which lists the one CRS data queries
+accept: `CRS84` with the WKT2 of OGC:CRS84, longitude first. Radius adds
+`within_units`. The same builder serves collection documents, the
+`/collections` list and instance documents; the `data_queries.instances`
+link carries only `query_type`, which is all 1.2's `instancesLink` asks for.
+`multiple_locations` on the locations link is not emitted yet (#923).
+`parameter_names` entries carry no `dataType`: engines do not report a
+value type, every CoverageJSON range is encoded as `float`.
+
 ### Instance-scoped routes
 
 | Route | Status |
@@ -86,7 +99,7 @@ A query type a collection's engine does not support (not in its `supported_query
 | `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent. Cube also takes the interval from a six-number `bbox` when `z` is absent |
 | `bbox` | ✓ | cube only: four or six comma-separated numbers (EDR 1.2 `cube-bbox`, `style: form`, `explode: false`); `west > east` crosses the antimeridian |
 | `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
-| `crs` | partial | data queries serve CRS84 only. Cube validates it: the CRS84 URI, `CRS84` or `OGC:CRS84` are accepted, anything else is a 400; the other data queries do not read it. `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
+| `crs` | partial | data queries serve CRS84 only, which every `data_queries` link advertises in `crs_details` (#918). Cube validates it: the CRS84 URI, `CRS84` or `OGC:CRS84` are accepted, anything else is a 400; the other data queries do not read it (#84). `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | partial | cube only: `n` evenly spaced positions from the bbox's west/south edge to its east/north edge (for `z`, from the lowest to the highest selected level), both ends included, each taking the nearest native value; a position more than half a cell off the grid is null. `0` or absent is the native resolution; a whole number up to 1 000 000, else 400 stating that range. Area does not take `resolution-x`/`-y` |
 | `limit` | partial | `/collections` pagination only; `/locations` returns the full inventory (EDR 1.1 does not define locations paging) |
@@ -274,7 +287,7 @@ generations, not already-published instances.
 1. `locations` and `trajectory` under `/instances/{id}/`.
 2. `corridor` (derivable from trajectory); cube on Zarr once it exposes
    vertical levels; `resolution-x`/`-y` on area.
-3. `crs` on data queries + `crs_details`; EDR GeoJSON output for point results (then declare `edr-geojson`).
+3. `crs` on data queries, adding its CRSs to `crs_details` (#84); EDR GeoJSON output for point results (then declare `edr-geojson`).
 4. `items` for the feature engines (CAP, GeoJSON, PostGIS events).
 
 Related issues: #585 MULTIPOINT fan-out bound · #667

@@ -107,6 +107,13 @@ timesteps × levels × cells × parameters).
 
 ## Misc
 
+- **`data_queries` link variables (#918).** `data_query_variables` in
+  `src/handlers.rs` is the one table of what each query type advertises:
+  `title`, `description`, `output_formats`, `default_output_format` and
+  `crs_details` (`params::{DATA_QUERY_CRS, CRS84_WKT}`), all required by
+  EDR 1.2. A query type without an arm there is not advertised at all, so a
+  new query type needs one. When `crs` lands (#84), its CRSs join
+  `crs_details`; keep the WKT longitude-first (`crs84_wkt_is_longitude_first`).
 - Cross-section responses (`query_trajectory`, ODIM PVOL) are CoverageJSON
   `Section` with a composite `[t,x,y]` axis + numeric `z` axis. When the
   domain carries `coverage_floor` (#514), the JSON emits it as the

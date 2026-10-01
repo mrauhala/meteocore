@@ -21,7 +21,7 @@ use crate::params::{
     check_crs, parse_cube_bbox, parse_edr_format, parse_resolution, parse_within_metres, parse_z,
     plot_dimensions, resolve_z_levels, split_position_coords, AreaQueryParams, CubeQueryParams,
     EdrFormat, LocationQueryParams, PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams,
-    ZSelector, WITHIN_UNITS,
+    ZSelector, CRS84_WKT, DATA_QUERY_CRS, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -2077,6 +2077,70 @@ fn temporal_extent_json(
     serde_json::Value::Object(temporal)
 }
 
+/// A data query's `data_queries.<type>.link.variables`, or `None` for a query
+/// type this API has no route for.
+///
+/// EDR 1.2 requires `title`, `description`, `query_type`, `output_formats`,
+/// `default_output_format` and `crs_details` in every one (the `*DataQuery`
+/// schemas; all but `query_type` were optional in 1.1). `crs_details` lists
+/// the one CRS data queries accept ([`DATA_QUERY_CRS`], until #84), radius
+/// adds its accepted `within_units`. `output_formats` are the formats the
+/// route answers: area and radius results are gridded or multi-coverage, so
+/// they have no PNG plot.
+fn data_query_variables(query_type: &str) -> Option<serde_json::Value> {
+    let (title, description, output_formats): (&str, &str, &[&str]) = match query_type {
+        "locations" => (
+            "Locations query",
+            "Lists the collection's named locations as GeoJSON; \
+             /locations/{locationId} returns the data at one of them.",
+            &["CoverageJSON", "PNG"],
+        ),
+        "position" => (
+            "Position query",
+            "Data at the WKT POINT or MULTIPOINT given in coords, \
+             as CRS84 longitude and latitude.",
+            &["CoverageJSON", "PNG"],
+        ),
+        "area" => (
+            "Area query",
+            "Data inside the WKT POLYGON given in coords, as CRS84 longitude and latitude.",
+            &["CoverageJSON"],
+        ),
+        "radius" => (
+            "Radius query",
+            "Data within a distance of the WKT POINT given in coords, as CRS84 \
+             longitude and latitude; within and within-units give the distance.",
+            &["CoverageJSON"],
+        ),
+        "trajectory" => (
+            "Trajectory query",
+            "A vertical cross-section along the 2-D WKT LINESTRING given in coords, \
+             as CRS84 longitude and latitude.",
+            &["CoverageJSON", "PNG"],
+        ),
+        "cube" => (
+            "Cube query",
+            "Data inside the bbox given as west,south,east,north in CRS84 longitude and \
+             latitude, at the levels z selects; resolution-x, -y and -z resample it.",
+            &["CoverageJSON"],
+        ),
+        _ => return None,
+    };
+    let mut variables = json!({
+        "title": title,
+        "description": description,
+        "query_type": query_type,
+        "output_formats": output_formats,
+        "default_output_format": "CoverageJSON",
+        "crs_details": [{ "crs": DATA_QUERY_CRS, "wkt": CRS84_WKT }]
+    });
+    if query_type == "radius" {
+        // EDR radius link variables carry the accepted `within-units`.
+        variables["within_units"] = json!(WITHIN_UNITS);
+    }
+    Some(variables)
+}
+
 /// Build a collection (or instance) metadata document.
 ///
 /// `instance = None` ⇒ the collection itself (un-pinned; latest run for forecast
@@ -2204,33 +2268,10 @@ fn build_collection_metadata(
     };
     let mut data_queries = serde_json::Map::new();
     for qt in &query_types {
-        let (endpoint, output_formats) = match qt.as_str() {
-            "locations" => (
-                format!("{query_base}/locations"),
-                json!(["CoverageJSON", "PNG"]),
-            ),
-            "position" => (
-                format!("{query_base}/position"),
-                json!(["CoverageJSON", "PNG"]),
-            ),
-            "area" => (format!("{query_base}/area"), json!(["CoverageJSON"])),
-            "radius" => (format!("{query_base}/radius"), json!(["CoverageJSON"])),
-            "cube" => (format!("{query_base}/cube"), json!(["CoverageJSON"])),
-            "trajectory" => (
-                format!("{query_base}/trajectory"),
-                json!(["CoverageJSON", "PNG"]),
-            ),
-            _ => continue,
+        // Every routed query type's path segment is its name.
+        let Some(mut variables) = data_query_variables(qt) else {
+            continue;
         };
-        let mut variables = json!({
-            "query_type": qt,
-            "output_formats": output_formats,
-            "default_output_format": "CoverageJSON"
-        });
-        if qt == "radius" {
-            // EDR 1.1 radius link variables carry the accepted `within-units`.
-            variables["within_units"] = json!(WITHIN_UNITS);
-        }
         if qt == "cube" {
             // EDR 1.2 `/req/edr/rc-cube-variables` B: the units `z` is given
             // in — the collection's vertical axis unit.
@@ -2241,7 +2282,7 @@ fn build_collection_metadata(
             qt.clone(),
             json!({
                 "link": {
-                    "href": endpoint,
+                    "href": format!("{query_base}/{qt}"),
                     "rel": "data",
                     "variables": variables
                 }
