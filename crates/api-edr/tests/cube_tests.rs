@@ -515,7 +515,7 @@ async fn invalid_cube_requests_are_400_before_the_engine_runs() {
         ("/collections/model/cube?bbox=0,0,1,1&f=PNG", "PNG"),
         (
             "/collections/model/cube?bbox=0,0,1,1&f=GeoJSON",
-            "Unsupported output format",
+            "GeoJSON output is not available for cube queries",
         ),
         (
             "/collections/model/cube?bbox=0,0,1,1&resolution-x=-1",

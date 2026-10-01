@@ -201,8 +201,8 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
 /// are advertised in `data_queries.*.link.variables.output_formats`. GeoJSON
 /// is offered for the point-shaped queries (`locations`, `position`,
 /// `radius`) of an engine that serves station series
-/// (`EdrEngine::serves_station_series`); gridded results and `area` keep
-/// CoverageJSON (#929). PNG plots a single series or profile, so area and
+/// (`EdrEngine::serves_station_series`); gridded results, `area` and `cube`
+/// keep CoverageJSON only (#929). PNG plots a single series or profile, so area and
 /// radius results are not offered as PNG.
 pub fn query_formats(query_type: &str, station_series: bool) -> &'static [EdrFormat] {
     use EdrFormat::{CoverageJson, GeoJson, Png};
@@ -1088,6 +1088,7 @@ mod tests {
         );
         assert_eq!(query_formats("radius", true), [CoverageJson, GeoJson]);
         assert_eq!(query_formats("area", true), [CoverageJson]);
+        assert_eq!(query_formats("cube", true), [CoverageJson]);
         for qt in ["locations", "position", "trajectory"] {
             assert_eq!(query_formats(qt, false), [CoverageJson, Png], "{qt}");
         }

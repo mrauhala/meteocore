@@ -2651,11 +2651,15 @@ async fn run_cube_query(
 
     let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid cube query string"))?;
     let params = CubeQueryParams::from_pairs(pairs).map_err(|e| bad_request(&e))?;
-    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
-        return Err(bad_request(&DataServerError::InvalidParameter(
-            "PNG output is not available for cube queries".into(),
-        )));
-    }
+    // Cube is CoverageJSON only: no PNG plot of a 4-D grid, and no GeoJSON
+    // (not a point query, #929). One format leaves nothing for `Accept`.
+    data_query_format(
+        engine,
+        "cube",
+        params.f.as_deref(),
+        &HeaderMap::new(),
+        "cube queries",
+    )?;
     check_crs(params.crs.as_deref()).map_err(|e| bad_request(&e))?;
     // EDR `/req/edr/rc-cube` D: a cube without a bbox is a 400.
     let raw_bbox = params
