@@ -6,10 +6,11 @@ use serde::Deserialize;
 use crate::response::{COVERAGE_JSON_MEDIA_TYPE, LEGACY_COVERAGE_JSON_MEDIA_TYPE};
 
 /// Most instants one `datetime` list may name. Each is its own engine
-/// query (see [`DatetimeSelector::Instants`]), so the count is bounded;
-/// the merged response also shares one value budget
-/// (`crate::datetime_list::MAX_LIST_VALUES`).
-pub const MAX_DATETIME_INSTANTS: usize = 64;
+/// query (see [`DatetimeSelector::Instants`]), run one after another on one
+/// EDR executor slot, and a query can be blocking remote I/O, so the count is
+/// kept small (root CLAUDE.md Critical Rule 9); the merged response also
+/// shares one value budget (`crate::datetime_list::MAX_LIST_VALUES`).
+pub const MAX_DATETIME_INSTANTS: usize = 16;
 
 /// A parsed EDR `datetime` value (`/req/core/datetime-response` D).
 #[derive(Debug, Clone, PartialEq)]
@@ -447,7 +448,7 @@ pub const MAX_POSITION_POINTS: usize = 64;
 /// Most engine position lookups one request may make: MULTIPOINT points ×
 /// `datetime` list instants. Each instant re-queries every point, and a
 /// lookup can be blocking remote I/O, so the product is capped jointly
-/// rather than letting the two limits multiply to 64 × 64 (root CLAUDE.md
+/// rather than letting the two limits multiply to 64 × 16 (root CLAUDE.md
 /// Critical Rule 9).
 pub const MAX_POSITION_LOOKUPS: usize = 256;
 /// Combined position response budget, including every point and parameter.

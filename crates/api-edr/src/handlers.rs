@@ -889,7 +889,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": "Either a date-time, an interval (open or closed), or a list of date-times. Date and time expressions adhere to RFC 3339; open intervals use double dots. Examples: 2018-02-12T23:20:50Z; 2018-02-12T00:00:00Z/2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z/.. or ../2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z,2018-02-12T01:00:00Z,2018-02-14T12:00:00Z. A list names at most 64 instants, each matched exactly as a request for that instant alone would be; the answers merge into one response (a series gains every instant's steps) bounded to 1000000 values, and an instant with no data contributes nothing. Repeating intervals are not supported."
+                    "description": "Either a date-time, an interval (open or closed), or a list of date-times. Date and time expressions adhere to RFC 3339; open intervals use double dots. Examples: 2018-02-12T23:20:50Z; 2018-02-12T00:00:00Z/2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z/.. or ../2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z,2018-02-12T01:00:00Z,2018-02-14T12:00:00Z. A list names at most 16 instants, each matched exactly as a request for that instant alone would be; the answers merge into one response (a series gains every instant's steps) bounded to 1000000 values, and an instant with no data contributes nothing. Repeating intervals are not supported."
                 },
                 "parameter-name": {
                     "name": "parameter-name",
