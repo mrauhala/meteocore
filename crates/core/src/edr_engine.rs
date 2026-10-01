@@ -61,8 +61,9 @@ pub trait EdrEngine: Send + Sync {
     ///
     /// `z` selects vertical levels: `None` returns every level (a profile),
     /// `Some([v])` pins one level, `Some([v1, v2, …])` selects several.
-    /// Engines with no vertical dimension ignore it (the API layer rejects
-    /// a `z` against a collection that has no vertical extent).
+    /// Engines with no vertical dimension never see one: the EDR layer
+    /// ignores a `z` sent to a collection without a vertical extent (EDR 1.2
+    /// `/req/edr/z-response` A).
     ///
     /// `reference_time` selects a forecast model run (see [`Self::get_instances`]):
     /// `None` ⇒ the latest run (the default and only behaviour for non-forecast

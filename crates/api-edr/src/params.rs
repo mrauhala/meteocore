@@ -1,7 +1,86 @@
+use chrono::{DateTime, Utc};
+use ds_core::datetime::parse_datetime_interval;
 use ds_core::error::DataServerError;
 use serde::Deserialize;
 
 use crate::response::{COVERAGE_JSON_MEDIA_TYPE, LEGACY_COVERAGE_JSON_MEDIA_TYPE};
+
+/// Most instants one `datetime` list may name. Each is its own engine
+/// query (see [`DatetimeSelector::Instants`]), run one after another on one
+/// EDR executor slot, and a query can be blocking remote I/O, so the count is
+/// kept small (root CLAUDE.md Critical Rule 9); the merged response also
+/// shares one value budget (`crate::datetime_list::MAX_LIST_VALUES`).
+pub const MAX_DATETIME_INSTANTS: usize = 16;
+
+/// A parsed EDR `datetime` value (`/req/core/datetime-response` D).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DatetimeSelector {
+    /// An instant `(t, t)` or an interval. An open end is the
+    /// `parse_datetime_interval` sentinel (`MIN_UTC` / `MAX_UTC`).
+    Window(DateTime<Utc>, DateTime<Utc>),
+    /// A list `T1,T2,T3` of two or more distinct instants, ascending. Each
+    /// is queried as the single instant `(t, t)`, so it is matched exactly
+    /// as a request naming that instant alone would be.
+    Instants(Vec<DateTime<Utc>>),
+}
+
+impl DatetimeSelector {
+    /// The window the selection spans: what the settled-response
+    /// `Cache-Control` policy is decided on.
+    pub fn envelope(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        match self {
+            Self::Window(start, end) => (*start, *end),
+            // Non-empty by construction (`parse_datetime` builds it).
+            Self::Instants(v) => (v[0], v[v.len() - 1]),
+        }
+    }
+}
+
+/// Parse the EDR `datetime` query parameter: an RFC 3339 instant, an
+/// interval (`start/end`, `../end`, `start/..`), or — EDR 1.2's
+/// `list of datetimes` — a comma-separated list of instants, at most
+/// [`MAX_DATETIME_INSTANTS`]. A list element must be an instant, not an
+/// interval. Repeated instants collapse; a list that collapses to one
+/// instant is that instant.
+pub fn parse_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, DataServerError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if !raw.contains(',') {
+        let (start, end) = parse_datetime_interval(raw)?;
+        return Ok(Some(DatetimeSelector::Window(start, end)));
+    }
+    let elements: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if elements.len() > MAX_DATETIME_INSTANTS {
+        return Err(DataServerError::InvalidDatetime(format!(
+            "a datetime list names {} instants; the maximum is {MAX_DATETIME_INSTANTS}",
+            elements.len()
+        )));
+    }
+    let mut instants = elements
+        .into_iter()
+        .map(|element| {
+            if element.is_empty() {
+                return Err(DataServerError::InvalidDatetime(
+                    "a datetime list has an empty element — check for a stray comma".into(),
+                ));
+            }
+            if element.contains('/') {
+                return Err(DataServerError::InvalidDatetime(format!(
+                    "'{element}': a datetime list holds instants only, not intervals"
+                )));
+            }
+            let (instant, _) = parse_datetime_interval(element)?;
+            Ok(instant)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    instants.sort_unstable();
+    instants.dedup();
+    Ok(Some(match instants[..] {
+        [only] => DatetimeSelector::Window(only, only),
+        _ => DatetimeSelector::Instants(instants),
+    }))
+}
 
 /// The one CRS data queries accept: `coords` are read, and results written,
 /// in OGC:CRS84, WGS 84 longitude/latitude. Every data query advertises it as
@@ -479,16 +558,33 @@ pub struct TrajectoryQueryParams {
     pub limit: Option<String>,
 }
 
-/// A parsed EDR `z` selector: either an explicit list of levels or a
-/// closed `min/max` interval. The interval is resolved against the
-/// collection's advertised vertical levels at the handler boundary (see
-/// [`resolve_z_levels`]) so engines keep their `Option<&[f64]>` contract.
+/// A parsed EDR `z` selector: either an explicit list of levels or an
+/// interval. The interval is resolved against the collection's advertised
+/// vertical levels at the handler boundary (see [`resolve_z_levels`]) so
+/// engines keep their `Option<&[f64]>` contract.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ZSelector {
-    /// Discrete levels (`z=0.5` or `z=850,700,500`).
+    /// Discrete levels: `z=0.5`, `z=850,700,500`, or the levels a
+    /// recurring interval `z=Rn/min/step` expands to.
     Levels(Vec<f64>),
-    /// A closed interval `z=min/max` (OGC EDR interval form).
+    /// An interval: closed `z=min/max`, or open `z=../max` / `z=min/..`
+    /// (EDR 1.2 `/req/edr/z-response`). An open end is `-∞` / `+∞`, so it
+    /// reaches the extreme advertised level.
     Interval { min: f64, max: f64 },
+}
+
+/// Most levels a recurring `z=Rn/min/step` may expand to. The count is
+/// the number of levels, as in the standard's example: `z=R20/100/50` is
+/// "20 levels at 50 unit intervals starting at level 100".
+pub const MAX_Z_RECURRENCES: u32 = 1000;
+
+/// An interval bound as it is written in a request: `..` when open.
+fn fmt_z_bound(v: f64) -> String {
+    if v.is_finite() {
+        v.to_string()
+    } else {
+        "..".to_string()
+    }
 }
 
 /// Parse one finite `f64` from a `z` token, rejecting `inf`/`nan` (a
@@ -507,26 +603,54 @@ fn parse_z_value(part: &str) -> Result<f64, DataServerError> {
         })
 }
 
-/// Parse the EDR `z` query parameter. Accepts a comma-separated list of
-/// numeric levels (`z=850,700,500` / a single `z=0.5`) **or** the OGC
-/// `min/max` interval form (`z=850/500`, order-independent). An absent or
-/// blank value yields `None` (the whole vertical extent / a profile).
+/// Parse the EDR `z` query parameter (EDR 1.2 `/req/edr/z-response`):
+///
+/// - a level or a comma-separated list: `z=0.5`, `z=850,700,500`;
+/// - a closed interval `z=850/500` (order-independent);
+/// - an open interval `z=../850` or `z=500/..`, reaching the lowest or
+///   highest advertised level;
+/// - a recurring interval `z=Rn/min/step`: `n` levels from `min`, `step`
+///   apart (`step` may be negative, never zero), at most
+///   [`MAX_Z_RECURRENCES`]. It becomes a list, snapped like one.
+///
+/// An absent or blank value yields `None` (the whole vertical extent / a
+/// profile).
 pub fn parse_z(z: Option<&str>) -> Result<Option<ZSelector>, DataServerError> {
     let Some(raw) = z.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
 
-    // Interval form `min/max` — exactly one slash, two finite endpoints.
+    if let Some(rest) = raw.strip_prefix(['R', 'r']) {
+        return parse_z_recurring(rest).map(Some);
+    }
+
+    // Interval form — exactly one slash; either end may be `..` (open).
     if raw.contains('/') {
-        let parts: Vec<&str> = raw.split('/').collect();
-        if parts.len() != 2 {
+        let parts: Vec<&str> = raw.split('/').map(str::trim).collect();
+        let [a, b] = parts[..] else {
             return Err(DataServerError::InvalidParameter(
-                "`z` interval must be `min/max` (one slash, two values)".into(),
+                "`z` interval must be `min/max`, `../max` or `min/..` (one slash), or a \
+                 recurring `Rn/min/step`"
+                    .into(),
             ));
-        }
-        let a = parse_z_value(parts[0])?;
-        let b = parse_z_value(parts[1])?;
-        let (min, max) = if a <= b { (a, b) } else { (b, a) };
+        };
+        let (min, max) = match (a, b) {
+            ("..", "..") => {
+                return Err(DataServerError::InvalidParameter(
+                    "`z` interval `../..` has no bound; omit `z` for every level".into(),
+                ))
+            }
+            ("..", b) => (f64::NEG_INFINITY, parse_z_value(b)?),
+            (a, "..") => (parse_z_value(a)?, f64::INFINITY),
+            (a, b) => {
+                let (a, b) = (parse_z_value(a)?, parse_z_value(b)?);
+                if a <= b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            }
+        };
         return Ok(Some(ZSelector::Interval { min, max }));
     }
 
@@ -544,18 +668,53 @@ pub fn parse_z(z: Option<&str>) -> Result<Option<ZSelector>, DataServerError> {
     Ok((!levels.is_empty()).then_some(ZSelector::Levels(levels)))
 }
 
+/// Expand the part of a recurring `z=Rn/min/step` after the `R`.
+fn parse_z_recurring(rest: &str) -> Result<ZSelector, DataServerError> {
+    let parts: Vec<&str> = rest.split('/').map(str::trim).collect();
+    let [count, min, step] = parts[..] else {
+        return Err(DataServerError::InvalidParameter(
+            "`z` recurring interval must be `Rn/min/step`, e.g. R20/100/50".into(),
+        ));
+    };
+    let n: u32 = count.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+        DataServerError::InvalidParameter(format!(
+            "`z` recurring interval count 'R{count}' must be a positive whole number of levels"
+        ))
+    })?;
+    if n > MAX_Z_RECURRENCES {
+        return Err(DataServerError::InvalidParameter(format!(
+            "`z` recurring interval R{n} exceeds the maximum of {MAX_Z_RECURRENCES} levels"
+        )));
+    }
+    let min = parse_z_value(min)?;
+    let step = parse_z_value(step)?;
+    if step == 0.0 {
+        return Err(DataServerError::InvalidParameter(
+            "`z` recurring interval step must be non-zero".into(),
+        ));
+    }
+    let levels: Vec<f64> = (0..n).map(|i| min + step * f64::from(i)).collect();
+    if levels.iter().any(|v| !v.is_finite()) {
+        return Err(DataServerError::InvalidParameter(
+            "`z` recurring interval runs past the finite number range".into(),
+        ));
+    }
+    Ok(ZSelector::Levels(levels))
+}
+
 /// Resolve a [`ZSelector`] into the concrete level list an engine samples.
 ///
-/// - `Levels` pass through unchanged (the engine snaps each to its nearest
-///   available level).
+/// - `Levels` pass through unchanged (the engine applies its list rule to
+///   each: ODIM snaps to the nearest sweep, GRIB requires an exact level).
 /// - `Interval { min, max }` expands to the collection's advertised levels
-///   that fall within `[min, max]` (inclusive). An interval that selects no
-///   advertised level is a 400 — the caller asked for a band the collection
-///   doesn't cover.
+///   that fall within `[min, max]` (inclusive; an open end is infinite, so
+///   it reaches the extreme level). An interval that selects no advertised
+///   level is a 400 — the caller asked for a band the collection doesn't
+///   cover.
 ///
 /// `extent` is the collection's advertised vertical levels; it must be
-/// present for an interval (callers gate `z` against a missing vertical
-/// dimension first).
+/// present for an interval (callers drop `z` for a collection without a
+/// vertical dimension first).
 pub fn resolve_z_levels(
     sel: &ZSelector,
     extent: Option<&ds_core::vertical::VerticalDimension>,
@@ -575,8 +734,10 @@ pub fn resolve_z_levels(
                 .collect();
             if selected.is_empty() {
                 return Err(DataServerError::InvalidParameter(format!(
-                    "`z` interval {min}/{max} selects none of the collection's \
-                     available levels"
+                    "`z` interval {}/{} selects none of the collection's \
+                     available levels",
+                    fmt_z_bound(*min),
+                    fmt_z_bound(*max)
                 )));
             }
             Ok(selected)
@@ -587,6 +748,12 @@ pub fn resolve_z_levels(
 /// Limits apply to decoded coordinates, before per-point allocations/queries.
 pub const MAX_POSITION_COORD_BYTES: usize = 16 * 1024;
 pub const MAX_POSITION_POINTS: usize = 64;
+/// Most engine position lookups one request may make: MULTIPOINT points ×
+/// `datetime` list instants. Each instant re-queries every point, and a
+/// lookup can be blocking remote I/O, so the product is capped jointly
+/// rather than letting the two limits multiply to 64 × 16 (root CLAUDE.md
+/// Critical Rule 9).
+pub const MAX_POSITION_LOOKUPS: usize = 256;
 /// Combined position response budget, including every point and parameter.
 pub const MAX_POSITION_VALUES: usize = 1_000_000;
 
@@ -749,6 +916,196 @@ mod tests {
         assert!(parse_z(Some("a/2")).is_err());
         assert!(parse_z(Some("nan")).is_err());
         assert!(parse_z(Some("1,,3")).is_err());
+    }
+
+    #[test]
+    fn parse_z_open_intervals() {
+        assert_eq!(
+            parse_z(Some("../850")).unwrap(),
+            Some(ZSelector::Interval {
+                min: f64::NEG_INFINITY,
+                max: 850.0
+            })
+        );
+        assert_eq!(
+            parse_z(Some("500/..")).unwrap(),
+            Some(ZSelector::Interval {
+                min: 500.0,
+                max: f64::INFINITY
+            })
+        );
+        // Whitespace around the parts is tolerated, like the other forms.
+        assert_eq!(
+            parse_z(Some(" .. / 850 ")).unwrap(),
+            parse_z(Some("../850")).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_z_rejects_bad_open_intervals() {
+        for z in [
+            "../..",
+            "..",
+            "../",
+            "/..",
+            "../abc",
+            "inf/..",
+            "..,850",
+            "../850/..",
+        ] {
+            assert!(parse_z(Some(z)).is_err(), "{z}");
+        }
+    }
+
+    /// `R20/100/50` is the standard's example: "20 levels at 50 unit
+    /// intervals starting at level 100" — the count is of levels.
+    #[test]
+    fn parse_z_recurring_expands_to_levels() {
+        let Some(ZSelector::Levels(levels)) = parse_z(Some("R20/100/50")).unwrap() else {
+            panic!("a recurring interval is a list");
+        };
+        assert_eq!(levels.len(), 20);
+        assert_eq!(levels[0], 100.0);
+        assert_eq!(levels[19], 1050.0);
+        assert_eq!(
+            parse_z(Some("R3/1000/-150")).unwrap(),
+            Some(ZSelector::Levels(vec![1000.0, 850.0, 700.0]))
+        );
+        assert_eq!(
+            parse_z(Some("r1/0.5/1")).unwrap(),
+            Some(ZSelector::Levels(vec![0.5]))
+        );
+        let max = format!("R{MAX_Z_RECURRENCES}/0/1");
+        let Some(ZSelector::Levels(levels)) = parse_z(Some(&max)).unwrap() else {
+            panic!("the cap itself is accepted");
+        };
+        assert_eq!(levels.len(), MAX_Z_RECURRENCES as usize);
+    }
+
+    #[test]
+    fn parse_z_rejects_bad_recurring_intervals() {
+        for z in [
+            "R",
+            "R/100/50",
+            "R0/100/50",
+            "R-2/100/50",
+            "R1.5/100/50",
+            "R20/100",
+            "R20/100/50/1",
+            "R20/../50",
+            "R20/100/0",
+            "R20/abc/50",
+            "R20/100/inf",
+            "R2/1e308/1e308",
+        ] {
+            assert!(parse_z(Some(z)).is_err(), "{z}");
+        }
+        let over = format!("R{}/0/1", MAX_Z_RECURRENCES + 1);
+        let err = parse_z(Some(&over)).unwrap_err().to_string();
+        assert!(err.contains(&MAX_Z_RECURRENCES.to_string()), "{err}");
+    }
+
+    fn pressure_extent() -> VerticalDimension {
+        VerticalDimension::new(
+            VerticalKind::Pressure,
+            vec![1000.0, 850.0, 700.0, 500.0, 250.0],
+        )
+    }
+
+    #[test]
+    fn resolve_z_levels_open_interval_reaches_the_extreme_level() {
+        let ext = pressure_extent();
+        let below = parse_z(Some("../700")).unwrap().unwrap();
+        assert_eq!(
+            resolve_z_levels(&below, Some(&ext)).unwrap(),
+            vec![700.0, 500.0, 250.0]
+        );
+        let above = parse_z(Some("700/..")).unwrap().unwrap();
+        assert_eq!(
+            resolve_z_levels(&above, Some(&ext)).unwrap(),
+            vec![1000.0, 850.0, 700.0]
+        );
+        // Open past every level: none selected, and the message shows `..`.
+        let none = parse_z(Some("1001/..")).unwrap().unwrap();
+        let err = resolve_z_levels(&none, Some(&ext)).unwrap_err().to_string();
+        assert!(err.contains("1001/.."), "{err}");
+    }
+
+    #[test]
+    fn resolve_z_levels_passes_a_recurring_list_through() {
+        let sel = parse_z(Some("R3/1000/-150")).unwrap().unwrap();
+        assert_eq!(
+            resolve_z_levels(&sel, Some(&pressure_extent())).unwrap(),
+            vec![1000.0, 850.0, 700.0]
+        );
+    }
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn parse_datetime_instant_and_intervals() {
+        assert_eq!(parse_datetime(None).unwrap(), None);
+        let at = t("2024-01-01T03:00:00Z");
+        assert_eq!(
+            parse_datetime(Some("2024-01-01T03:00:00Z")).unwrap(),
+            Some(DatetimeSelector::Window(at, at))
+        );
+        assert_eq!(
+            parse_datetime(Some("../2024-01-01T03:00:00Z")).unwrap(),
+            Some(DatetimeSelector::Window(DateTime::<Utc>::MIN_UTC, at))
+        );
+        assert!(parse_datetime(Some("")).is_err());
+        assert!(parse_datetime(Some("not-a-date")).is_err());
+    }
+
+    /// The EDR 1.2 example `2018-02-12T00:00Z,2018-02-12T01:00Z,2018-02-14T12:00Z`
+    /// omits seconds; RFC 3339 requires them, so it is written with them here.
+    #[test]
+    fn parse_datetime_list_sorts_and_collapses_repeats() {
+        let got = parse_datetime(Some(
+            "2018-02-14T12:00:00Z,2018-02-12T00:00:00Z, 2018-02-12T01:00:00Z,2018-02-12T00:00:00+00:00",
+        ))
+        .unwrap();
+        assert_eq!(
+            got,
+            Some(DatetimeSelector::Instants(vec![
+                t("2018-02-12T00:00:00Z"),
+                t("2018-02-12T01:00:00Z"),
+                t("2018-02-14T12:00:00Z"),
+            ]))
+        );
+        assert_eq!(
+            got.unwrap().envelope(),
+            (t("2018-02-12T00:00:00Z"), t("2018-02-14T12:00:00Z"))
+        );
+        // A list that collapses to one instant is that instant.
+        let at = t("2018-02-12T00:00:00Z");
+        assert_eq!(
+            parse_datetime(Some("2018-02-12T00:00:00Z,2018-02-12T00:00:00Z")).unwrap(),
+            Some(DatetimeSelector::Window(at, at))
+        );
+    }
+
+    #[test]
+    fn parse_datetime_rejects_bad_lists() {
+        for raw in [
+            "2018-02-12T00:00:00Z,",
+            ",2018-02-12T00:00:00Z",
+            "2018-02-12T00:00:00Z,,2018-02-12T01:00:00Z",
+            "2018-02-12T00:00:00Z,2018-02-12T01:00:00Z/..",
+            "../2018-02-12T00:00:00Z,2018-02-12T01:00:00Z",
+            "2018-02-12T00:00:00Z,..",
+            "2018-02-12T00:00:00Z,tomorrow",
+        ] {
+            assert!(parse_datetime(Some(raw)).is_err(), "{raw}");
+        }
+        let at_cap = vec!["2018-02-12T00:00:00Z"; MAX_DATETIME_INSTANTS].join(",");
+        assert!(parse_datetime(Some(&at_cap)).is_ok());
+        let over = vec!["2018-02-12T00:00:00Z"; MAX_DATETIME_INSTANTS + 1].join(",");
+        let err = parse_datetime(Some(&over)).unwrap_err().to_string();
+        assert!(err.contains(&MAX_DATETIME_INSTANTS.to_string()), "{err}");
     }
 
     #[test]

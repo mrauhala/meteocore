@@ -10,7 +10,6 @@ use serde_json::json;
 
 use api_common::JsonError;
 use ds_core::config::CollectionConfig;
-use ds_core::datetime::parse_datetime_interval;
 use ds_core::edr_engine::EdrEngine;
 
 use ds_core::error::DataServerError;
@@ -18,11 +17,11 @@ use ds_core::model::CoverageResponse;
 use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
-    check_crs, parse_cube_bbox, parse_edr_format, parse_limit, parse_locations_paging,
-    parse_resolution, parse_within_metres, parse_z, plot_dimensions, resolve_z_levels,
-    split_position_coords, AreaQueryParams, CubeQueryParams, EdrFormat, LocationQueryParams,
-    PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, ZSelector, CRS84_WKT,
-    DATA_QUERY_CRS, MAX_LIMIT, WITHIN_UNITS,
+    check_crs, parse_cube_bbox, parse_datetime, parse_edr_format, parse_limit,
+    parse_locations_paging, parse_resolution, parse_within_metres, parse_z, plot_dimensions,
+    resolve_z_levels, split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector,
+    EdrFormat, LocationQueryParams, PositionQueryParams, RadiusQueryParams,
+    TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, MAX_LIMIT, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -195,8 +194,9 @@ fn with_vary(mut resp: Response) -> Response {
 /// Attach the data-query `Cache-Control` policy (#499) to a success response:
 /// a settled window (closed `datetime` interval entirely in the past) gets the
 /// long policy, everything else the short one. `datetime` is the parsed
-/// request interval; the `parse_datetime_interval` open-bound sentinels
-/// (`MIN_UTC`/`MAX_UTC`) map back to "open" for
+/// request interval, or the span of a datetime list
+/// ([`DatetimeSelector::envelope`]); the `parse_datetime_interval`
+/// open-bound sentinels (`MIN_UTC`/`MAX_UTC`) map back to "open" for
 /// [`ds_core::http_cache::data_cache_control`]. Metadata endpoints don't call
 /// this — they fall through to the middleware's short default
 /// (`caching::conditional_get`).
@@ -323,10 +323,15 @@ fn resolve_instance(
 /// list an engine samples.
 ///
 /// - Absent / blank → `None` (whole vertical extent).
-/// - A `z` against a collection with no vertical dimension → 400 (rather
-///   than silently ignored).
-/// - An interval (`z=min/max`) is expanded against the collection's
-///   advertised levels; a list passes through for the engine to snap.
+/// - The value is parsed first, so a malformed `z` is a 400 on every
+///   collection.
+/// - A well-formed `z` against a collection with no vertical dimension is
+///   ignored → `None`: EDR 1.2 `/req/edr/z-response` A says it SHALL be.
+///   WMS `ELEVATION` and Maps/Tiles `elevation` keep rejecting it; they
+///   follow their own standards.
+/// - An interval (`z=min/max`, `../max`, `min/..`) is expanded against the
+///   collection's advertised levels; a list — including the levels a
+///   recurring `Rn/min/step` expands to — passes through for the engine.
 fn resolve_request_z(
     engine: &Arc<dyn EdrEngine>,
     z: Option<&str>,
@@ -334,23 +339,27 @@ fn resolve_request_z(
     let Some(sel) = parse_z(z).map_err(|e| bad_request(&e))? else {
         return Ok(None);
     };
-    resolve_z_selector(engine, &sel, "the `z` query parameter").map(Some)
+    resolve_z_selector(engine, &sel)
 }
 
-/// [`resolve_request_z`] for an already parsed selector; `what` names its
-/// source in the 400 a collection without a vertical dimension answers.
+/// [`resolve_request_z`] for an already parsed selector — also the vertical
+/// pair of a cube's six-number `bbox`, which is ignored the same way on a
+/// collection without a vertical dimension.
 fn resolve_z_selector(
     engine: &Arc<dyn EdrEngine>,
     sel: &ZSelector,
-    what: &str,
-) -> Result<Vec<f64>, HandlerError> {
-    let extent = engine.get_vertical_extent();
-    if extent.is_none() {
-        return Err(bad_request_msg(&format!(
-            "This collection has no vertical dimension; {what} is not supported"
-        )));
-    }
-    resolve_z_levels(sel, extent.as_ref()).map_err(|e| bad_request(&e))
+) -> Result<Option<Vec<f64>>, HandlerError> {
+    let Some(extent) = engine.get_vertical_extent() else {
+        return Ok(None);
+    };
+    let levels = resolve_z_levels(sel, Some(&extent)).map_err(|e| bad_request(&e))?;
+    Ok(Some(levels))
+}
+
+/// Parse the request `datetime` (an instant, an interval, or an EDR 1.2
+/// list of instants) into a 400 on failure.
+fn request_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, HandlerError> {
+    parse_datetime(raw).map_err(|e| bad_request(&e))
 }
 
 pub async fn landing_page(
@@ -488,8 +497,9 @@ fn cube_operation(
                 "Return the data values for the data cube defined by the query parameters, as a \
                  CoverageJSON Grid with x, y, z and t axes. bbox is CRS84: four numbers, or six \
                  whose vertical pair is a z interval that an explicit z overrides. z takes a \
-                 level, a list or a min/max interval of the advertised levels (the Rn/min/interval \
-                 form is not supported); without it every level is returned. resolution-x, \
+                 level, a list, a closed or open interval or a recurring Rn/min/step sequence of \
+                 the advertised levels; without it every level is returned. A datetime list runs \
+                 the cube once per instant and joins the grids along t. resolution-x, \
                  resolution-y and resolution-z ask for that many evenly spaced positions from the \
                  bbox edges (the lowest and highest selected level for z), both included, each \
                  taking the nearest native value; 0 or absent is the native resolution, and the \
@@ -1009,7 +1019,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
+                    "description": "Either a date-time, an interval (open or closed), or a list of date-times. Date and time expressions adhere to RFC 3339; open intervals use double dots. Examples: 2018-02-12T23:20:50Z; 2018-02-12T00:00:00Z/2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z/.. or ../2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z,2018-02-12T01:00:00Z,2018-02-14T12:00:00Z. A list names at most 16 instants, each matched exactly as a request for that instant alone would be; the answers merge into one response (a series gains every instant's steps) bounded to 1000000 values, and an instant with no data contributes nothing. Repeating intervals are not supported."
                 },
                 "parameter-name": {
                     "name": "parameter-name",
@@ -1025,7 +1035,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": false,
                     "schema": {"type": "string"},
-                    "description": "Vertical level selector — a single value or a comma-separated list (e.g. z=0.5 or z=850,700,500). Only valid for collections that advertise a vertical extent. Each requested value is snapped to the nearest level in the collection's advertised vertical extent; the response domain reports the snapped level."
+                    "style": "form",
+                    "explode": false,
+                    "description": "Vertical level selector. Forms: z=850 (one level); z=10,80,200 (a list); z=100/550 (every advertised level between and including the two); z=../850 or z=500/.. (open intervals, reaching the lowest or highest advertised level); z=R20/100/50 (20 levels 50 apart starting at 100, at most 1000 levels, treated as a list). A single level or list is matched against the collection's advertised vertical extent by the collection's engine (the response domain reports the level served). A collection with no vertical extent ignores z, but a malformed z is still a 400."
                 },
                 "coords-point": {
                     "name": "coords",
@@ -1163,7 +1175,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": false,
                     "schema": {"type": "string"},
-                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), or z=0.3/15 (a min/max interval → every advertised angle in range). The selected angle window bounds which sweeps build the RHI; the rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
+                    "style": "form",
+                    "explode": false,
+                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), z=0.3/15 (a min/max interval → every advertised angle in range), z=../5 or z=5/.. (open intervals, reaching the lowest or highest advertised angle), or z=R4/0.5/1 (4 angles 1° apart from 0.5°, treated as a list). The selected angle window bounds which sweeps build the RHI; the rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
                 }
             },
             "schemas": {
@@ -1656,17 +1670,8 @@ pub async fn location_query(
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime_interval)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?;
+    let datetime = request_datetime(params.datetime.as_deref())?;
+    let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -1677,16 +1682,21 @@ pub async fn location_query(
     let limit = request_limit(params.limit.as_deref())?;
 
     let engine = engine.clone();
-    let result = execute_query(false, move |_budget| {
-        engine
-            .query_location(
-                &loc_id,
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                None,
-            )
-            .map_err(|e| map_query_error(&e, "Location"))
+    let result = execute_query(false, move |budget| {
+        crate::datetime_list::run(
+            datetime.as_ref(),
+            || budget.expired(),
+            |datetime| {
+                engine.query_location(
+                    &loc_id,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    None,
+                )
+            },
+        )
+        .map_err(|e| map_query_error(&e, "Location"))
     })
     .await?;
 
@@ -1697,7 +1707,7 @@ pub async fn location_query(
         params.width,
         params.height,
     )
-    .map(|r| with_data_cache_control(r, datetime))
+    .map(|r| with_data_cache_control(r, window))
 }
 
 /// The 404 for a data query the collection's engine does not support:
@@ -1751,17 +1761,8 @@ async fn run_position_query(
     require_query_type(engine, &id, "position", "position")?;
     let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime_interval)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?;
+    let datetime = request_datetime(params.datetime.as_deref())?;
+    let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -1780,6 +1781,18 @@ async fn run_position_query(
         )
     })?;
 
+    if let Some(DatetimeSelector::Instants(instants)) = &datetime {
+        let lookups = points.len().saturating_mul(instants.len());
+        if lookups > crate::params::MAX_POSITION_LOOKUPS {
+            return Err(bad_request(&DataServerError::QueryTooLarge(format!(
+                "{} points × {} datetime instants is {lookups} position lookups; the limit is {} — \
+                 name fewer points or instants",
+                points.len(),
+                instants.len(),
+                crate::params::MAX_POSITION_LOOKUPS
+            ))));
+        }
+    }
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
     // `limit` counts the top-level coverages of the flattened collection
     // (#922): point order, then each point's own coverages (one per step
@@ -1793,57 +1806,72 @@ async fn run_position_query(
     points.truncate(limit);
     let engine = engine.clone();
     execute_query(false, move |budget| {
-        let mut coverages = Vec::with_capacity(points.len());
+        // Shared by every instant of a datetime list, so the budget bounds
+        // the whole response.
         let mut values = 0usize;
-        let mut collection_response = !single;
-        let mut emit = |response| {
-            if budget.expired() {
-                return Err(DataServerError::DeadlineExceeded);
-            }
-            collection_response |= matches!(&response, CoverageResponse::Collection(_));
-            let mut batch = match response {
-                CoverageResponse::Single(q) => vec![q],
-                CoverageResponse::Collection(v) => v,
-            };
-            // Drop what `limit` excludes before it counts against the budget.
-            batch.truncate(limit.saturating_sub(coverages.len()));
-            for q in &batch {
-                for range in q.ranges.values() {
-                    values = values.saturating_add(range.values.len());
-                }
-            }
-            if values > crate::params::MAX_POSITION_VALUES {
-                return Err(DataServerError::QueryTooLarge(format!(
-                    "Position response exceeds {} values",
-                    crate::params::MAX_POSITION_VALUES
-                )));
-            }
-            coverages.extend(batch);
-            Ok(())
-        };
         if budget.expired() {
             return Err(query_timeout());
         }
-        engine
-            .query_positions(
+        // One engine batch over every point for one datetime window.
+        let mut query = |datetime| -> Result<CoverageResponse, DataServerError> {
+            let values_before = values;
+            let mut coverages = Vec::with_capacity(points.len());
+            let mut collection_response = !single;
+            let mut emit = |response| {
+                if budget.expired() {
+                    return Err(DataServerError::DeadlineExceeded);
+                }
+                collection_response |= matches!(&response, CoverageResponse::Collection(_));
+                let mut batch = match response {
+                    CoverageResponse::Single(q) => vec![q],
+                    CoverageResponse::Collection(v) => v,
+                };
+                // Drop what `limit` excludes before it counts against the budget.
+                batch.truncate(limit.saturating_sub(coverages.len()));
+                for q in &batch {
+                    for range in q.ranges.values() {
+                        values = values.saturating_add(range.values.len());
+                    }
+                }
+                if values > crate::params::MAX_POSITION_VALUES {
+                    return Err(DataServerError::QueryTooLarge(format!(
+                        "Position response exceeds {} values",
+                        crate::params::MAX_POSITION_VALUES
+                    )));
+                }
+                coverages.extend(batch);
+                Ok(())
+            };
+            let queried = engine.query_positions(
                 &points,
                 datetime,
                 param_names.as_deref(),
                 z.as_deref(),
                 reference_time,
                 &mut emit,
-            )
+            );
+            if let Err(e) = queried {
+                // A datetime-list instant without data is skipped: its
+                // partial batch no longer counts against the budget.
+                values = values_before;
+                return Err(e);
+            }
+            Ok(if !collection_response && coverages.len() == 1 {
+                CoverageResponse::Single(coverages.remove(0))
+            } else {
+                CoverageResponse::Collection(coverages)
+            })
+        };
+        let result = crate::datetime_list::run(datetime.as_ref(), || budget.expired(), &mut query)
             .map_err(|e| map_query_error(&e, "Position"))?;
         if budget.expired() {
             return Err(query_timeout());
         }
-        let result = if !collection_response && coverages.len() == 1 {
-            CoverageResponse::Single(coverages.remove(0))
-        } else {
-            CoverageResponse::Collection(coverages)
-        };
+        // Each instant is capped above; coverages that a datetime list's merge
+        // could not join are capped again on the whole response.
+        let result = limit_coverages(result, Some(limit));
         render_coverage_response(result, format, params.width, params.height)
-            .map(|r| with_data_cache_control(r, datetime))
+            .map(|r| with_data_cache_control(r, window))
     })
     .await
 }
@@ -1888,17 +1916,8 @@ async fn run_area_query(
 
     let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime_interval)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?;
+    let datetime = request_datetime(params.datetime.as_deref())?;
+    let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -1909,23 +1928,28 @@ async fn run_area_query(
     let limit = request_limit(params.limit.as_deref())?;
 
     let engine = engine.clone();
-    let result = execute_query(false, move |_budget| {
-        engine
-            .query_area(
-                &params.coords,
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                reference_time,
-            )
-            .map_err(|e| map_query_error(&e, "Area"))
+    let result = execute_query(false, move |budget| {
+        crate::datetime_list::run(
+            datetime.as_ref(),
+            || budget.expired(),
+            |datetime| {
+                engine.query_area(
+                    &params.coords,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    reference_time,
+                )
+            },
+        )
+        .map_err(|e| map_query_error(&e, "Area"))
     })
     .await?;
 
     let result = limit_coverages(result, limit);
     Ok(with_data_cache_control(
         coverage_json_response(&result, "Area")?,
-        datetime,
+        window,
     ))
 }
 
@@ -1976,17 +2000,8 @@ async fn run_radius_query(
 
     let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime_interval)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?;
+    let datetime = request_datetime(params.datetime.as_deref())?;
+    let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -1997,24 +2012,29 @@ async fn run_radius_query(
     let limit = request_limit(params.limit.as_deref())?;
 
     let engine = engine.clone();
-    let result = execute_query(false, move |_budget| {
-        engine
-            .query_radius(
-                &params.coords,
-                within_m,
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                reference_time,
-            )
-            .map_err(|e| map_query_error(&e, "Radius"))
+    let result = execute_query(false, move |budget| {
+        crate::datetime_list::run(
+            datetime.as_ref(),
+            || budget.expired(),
+            |datetime| {
+                engine.query_radius(
+                    &params.coords,
+                    within_m,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    reference_time,
+                )
+            },
+        )
+        .map_err(|e| map_query_error(&e, "Radius"))
     })
     .await?;
 
     let result = limit_coverages(result, limit);
     Ok(with_data_cache_control(
         coverage_json_response(&result, "Radius")?,
-        datetime,
+        window,
     ))
 }
 
@@ -2086,43 +2106,48 @@ async fn run_cube_query(
 
     let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime_interval)
-        .transpose()
-        .map_err(|e| bad_request_msg(&e.to_string()))?;
+    // A datetime list runs the cube once per instant; the per-instant
+    // `[t, z, y, x]` grids share x, y and z, so the merge joins them along t.
+    let datetime = request_datetime(params.datetime.as_deref())?;
+    let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    // An explicit `z` overrides the vertical pair of a six-number bbox.
+    // An explicit `z` overrides the vertical pair of a six-number bbox; on
+    // a collection without a vertical dimension both are ignored, as `z`
+    // is on every query (EDR 1.2 `/req/edr/z-response` A).
     let z = match (params.z.as_deref(), bbox_z) {
         (Some(z), _) => resolve_request_z(engine, Some(z))?,
-        (None, Some(sel)) => Some(resolve_z_selector(engine, &sel, "a six-number bbox")?),
+        (None, Some(sel)) => resolve_z_selector(engine, &sel)?,
         (None, None) => None,
     };
 
     let engine = engine.clone();
-    let result = execute_query(false, move |_budget| {
-        engine
-            .query_cube(
-                &bbox,
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                resolution,
-                reference_time,
-            )
-            .map_err(|e| map_query_error(&e, "Cube"))
+    let result = execute_query(false, move |budget| {
+        crate::datetime_list::run(
+            datetime.as_ref(),
+            || budget.expired(),
+            |datetime| {
+                engine.query_cube(
+                    &bbox,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    resolution,
+                    reference_time,
+                )
+            },
+        )
+        .map_err(|e| map_query_error(&e, "Cube"))
     })
     .await?;
 
     Ok(with_data_cache_control(
         coverage_json_response(&result, "Cube")?,
-        datetime,
+        window,
     ))
 }
 
@@ -2150,17 +2175,8 @@ pub async fn trajectory_query(
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
 
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime_interval)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?;
+    let datetime = request_datetime(params.datetime.as_deref())?;
+    let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -2176,23 +2192,28 @@ pub async fn trajectory_query(
     // and therefore require a blocking thread rather than an async worker.
     let engine = engine.clone();
     let coords = params.coords.clone();
-    let result = execute_query(true, move |_budget| {
-        engine
-            .query_trajectory(
-                &coords,
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                None,
-            )
-            .map_err(|e| map_query_error(&e, "Trajectory"))
+    let result = execute_query(true, move |budget| {
+        crate::datetime_list::run(
+            datetime.as_ref(),
+            || budget.expired(),
+            |datetime| {
+                engine.query_trajectory(
+                    &coords,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    None,
+                )
+            },
+        )
+        .map_err(|e| map_query_error(&e, "Trajectory"))
     })
     .await?;
 
     match format {
         EdrFormat::CoverageJson => Ok(with_data_cache_control(
             coverage_json_response(&result, "Trajectory")?,
-            datetime,
+            window,
         )),
         EdrFormat::Png => {
             // Render the cross-section as a colour-mapped heatmap using
@@ -2215,7 +2236,7 @@ pub async fn trajectory_query(
             })?;
             Ok(with_data_cache_control(
                 ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
-                datetime,
+                window,
             ))
         }
     }
