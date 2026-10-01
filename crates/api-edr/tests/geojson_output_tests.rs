@@ -86,8 +86,38 @@ fn series(x: f64, y: f64, extra: Option<&str>) -> QueryResult {
     }
 }
 
+/// `series` cut to the steps inside `window`, like a station engine's
+/// answer; `None` (a 404 from the engine) when no step is inside it.
+fn windowed(
+    x: f64,
+    y: f64,
+    extra: Option<&str>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<QueryResult> {
+    let mut q = series(x, y, extra);
+    let Some((start, end)) = window else {
+        return Some(q);
+    };
+    let DomainDescription::PointSeries { t, .. } = &mut q.domain else {
+        unreachable!("series is a PointSeries")
+    };
+    let keep: Vec<bool> = t.iter().map(|t| *t >= start && *t <= end).collect();
+    let mut kept = keep.iter();
+    t.retain(|_| *kept.next().unwrap());
+    if t.is_empty() {
+        return None;
+    }
+    for range in q.ranges.values_mut() {
+        let mut kept = keep.iter();
+        range.values.retain(|_| *kept.next().unwrap());
+        range.shape = vec![range.values.len()];
+    }
+    Some(q)
+}
+
 /// A station engine (CSV/PostGIS/BUFR-like): series at its locations'
-/// exact coordinates. `extra` replaces the parameters with one of that name.
+/// exact coordinates, cut to the requested window. `extra` replaces the
+/// parameters with one of that name.
 struct StationEngine {
     extra: Option<&'static str>,
 }
@@ -100,7 +130,7 @@ impl EdrEngine for StationEngine {
     fn query_location(
         &self,
         location_id: &str,
-        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
@@ -109,11 +139,9 @@ impl EdrEngine for StationEngine {
             .into_iter()
             .find(|l| l.id == location_id)
             .ok_or_else(|| DataServerError::LocationNotFound(location_id.into()))?;
-        Ok(CoverageResponse::Single(series(
-            loc.longitude,
-            loc.latitude,
-            self.extra,
-        )))
+        windowed(loc.longitude, loc.latitude, self.extra, datetime)
+            .map(CoverageResponse::Single)
+            .ok_or_else(|| DataServerError::LocationNotFound(format!("{location_id} (no data)")))
     }
 
     fn query_position(
@@ -136,7 +164,7 @@ impl EdrEngine for StationEngine {
     fn query_area(
         &self,
         coords: &str,
-        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
@@ -146,7 +174,7 @@ impl EdrEngine for StationEngine {
             stations()
                 .into_iter()
                 .filter(|l| polygon.contains(l.longitude, l.latitude))
-                .map(|l| series(l.longitude, l.latitude, self.extra))
+                .filter_map(|l| windowed(l.longitude, l.latitude, self.extra, datetime))
                 .collect(),
         ))
     }
@@ -587,6 +615,78 @@ async fn limit_caps_features_and_counts_the_matches() {
     // An invalid limit is the same 400 as for CoverageJSON.
     let (status, _, _) = request(&format!("{radius}&limit=0"), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A `datetime` list (#936) queries each instant and merges each station's
+/// series along `t`: still one feature per station, its `time` the listed
+/// instants, and `numberMatched` the merged features before `limit`.
+#[tokio::test]
+async fn datetime_lists_merge_into_one_feature_per_station() {
+    let list = "datetime=2024-01-01T00:00:00Z,2024-01-01T02:00:00Z";
+    let radius = format!(
+        "/collections/obs/radius?coords=POINT(24.94%2060.17)&within=200&within-units=km&f=GeoJSON&{list}"
+    );
+    let (status, headers, json) = get_json(&radius, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(content_type(&headers), "application/geo+json");
+    assert_valid_edr_geojson("/collections/{collectionId}/radius", &json);
+    let ids: Vec<&str> = json["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["helsinki", "tampere"]);
+    let p = &json["features"][0]["properties"];
+    assert_eq!(
+        p["time"],
+        json!(["2024-01-01T00:00:00+00:00", "2024-01-01T02:00:00+00:00"])
+    );
+    assert_eq!(
+        p["datetime"],
+        "2024-01-01T00:00:00+00:00/2024-01-01T02:00:00+00:00"
+    );
+    assert_eq!(p["temperature"], json!([-2.5, -3.1]));
+    assert_eq!(p["humidity"], json!([80.0, 82.0]));
+    assert_eq!(json["numberMatched"], 2);
+
+    // `limit` caps the merged features, not the per-instant answers.
+    let (_, _, json) = get_json(&format!("{radius}&limit=1"), None).await;
+    assert_eq!(json["numberReturned"], 1);
+    assert_eq!(json["numberMatched"], 2);
+
+    // Position: two points over two instants are still two features.
+    let (status, _, json) = get_json(
+        &format!(
+            "/collections/obs/position?coords=MULTIPOINT((24.94%2060.17),(23.76%2061.5))&f=GeoJSON&{list}&limit=5"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_valid_edr_geojson("/collections/{collectionId}/position", &json);
+    assert_eq!(json["numberReturned"], 2);
+    assert_eq!(json["numberMatched"], 2);
+    assert_eq!(
+        json["features"][1]["properties"]["time"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A location over a list it has one instant of: the other is skipped.
+    let (status, _, json) = get_json(
+        "/collections/obs/locations/tampere?f=GeoJSON&datetime=2024-01-01T01:00:00Z,2024-01-01T05:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["features"][0]["properties"]["time"],
+        json!(["2024-01-01T01:00:00+00:00"])
+    );
+    assert_eq!(json["features"][0]["properties"]["humidity"], json!([null]));
 }
 
 #[tokio::test]
