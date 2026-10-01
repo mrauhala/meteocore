@@ -13,7 +13,9 @@
 # glibc-2.38 symbol (icechunk 2.1, #578) and then broke production. Pin
 # the distro in BOTH stages' tags so a base-image rebase can never split
 # the pair again.
-FROM rust:1.94-slim-trixie AS chef
+# Keep the Rust version current with the stable toolchain CI and local
+# builds use, at the newest `rust:<x.y>-slim-trixie` tag published.
+FROM rust:1.98-slim-trixie AS chef
 WORKDIR /build
 RUN cargo install cargo-chef --locked --version 0.1.71
 
