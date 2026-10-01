@@ -665,15 +665,147 @@ fn spatial_extent_is_half_cell_expanded() {
 }
 
 #[test]
-fn supported_query_types_are_position_area_radius() {
+fn supported_query_types_are_position_area_radius_trajectory() {
     assert_eq!(
         engine().supported_query_types(),
         vec![
             "position".to_string(),
             "area".to_string(),
-            "radius".to_string()
+            "radius".to_string(),
+            "trajectory".to_string()
         ]
     );
+}
+
+/// A `Trajectory` node `(t, lon, lat)` and one parameter's value there.
+type TrajectorySample = ((chrono::DateTime<Utc>, f64, f64), Option<f64>);
+
+/// The `Trajectory` nodes and one parameter's values of a coverage.
+fn trajectory_nodes(qr: &ds_core::model::QueryResult, param: &str) -> Vec<TrajectorySample> {
+    let ds_core::model::DomainDescription::Trajectory { nodes, .. } = &qr.domain else {
+        panic!("expected a Trajectory domain, got {:?}", qr.domain)
+    };
+    let range = &qr.ranges[param];
+    assert_eq!(range.axis_names, ["composite"]);
+    assert_eq!(range.shape, [nodes.len()]);
+    nodes
+        .iter()
+        .copied()
+        .zip(range.values.iter().copied())
+        .collect()
+}
+
+/// #926: a 2-D path is sampled at about the 1° grid spacing, one coverage
+/// per timestep, each sample equal to a position query at that node — the
+/// same bilinear interpolation, exact on the fixture's linear field.
+#[test]
+fn trajectory_samples_along_the_path_like_position() {
+    let e = engine();
+    let CoverageResponse::Collection(coverages) = e
+        .query_trajectory("LINESTRING(1 50, 5 54, 9 54)", None, None, None, None)
+        .unwrap()
+    else {
+        panic!("four timesteps → a collection")
+    };
+    assert_eq!(coverages.len(), 4);
+    let times = e.get_available_times().unwrap();
+    for (step, coverage) in coverages.iter().enumerate() {
+        let samples = trajectory_nodes(coverage, "t2m");
+        // 4 cells up the first segment, 4 along the second, plus the start.
+        assert_eq!(samples.len(), 9);
+        assert_eq!((samples[0].0 .1, samples[0].0 .2), (1.0, 50.0));
+        assert_eq!((samples[8].0 .1, samples[8].0 .2), (9.0, 54.0));
+        for ((t, lon, lat), value) in samples {
+            assert_eq!(t, times[step]);
+            let expected = 273.15 + 0.1 * lat + 0.01 * lon + 0.5 * step as f64;
+            let v = value.unwrap();
+            assert!((v - expected).abs() < 0.02, "{v} vs {expected}");
+            let position = single(
+                e.query_position(
+                    &format!("POINT({lon} {lat})"),
+                    Some((t, t)),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            for param in ["t2m", "t2m_packed"] {
+                let own = trajectory_nodes(coverage, param)
+                    .into_iter()
+                    .find(|n| n.0 == (t, lon, lat))
+                    .unwrap()
+                    .1;
+                let want = position.ranges[param].values[0];
+                assert!(
+                    own.zip(want).is_some_and(|(a, b)| (a - b).abs() < 1e-9),
+                    "{param} at {lon},{lat}: {own:?} vs position {want:?}"
+                );
+            }
+        }
+    }
+}
+
+/// An M path snaps each sample to the nearest timestep of the store; its
+/// times must lie within the time axis. A Z coordinate is ignored: the
+/// store has no vertical axis (EDR `/req/edr/z-response` A).
+#[test]
+fn trajectory_time_and_level_rules() {
+    let e = engine();
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let t18 = Utc.with_ymd_and_hms(2026, 1, 1, 18, 0, 0).unwrap();
+    let coords = format!(
+        "LINESTRING M(1 50 {}, 7 50 {})",
+        t0.timestamp(),
+        t18.timestamp()
+    );
+    let qr = single(e.query_trajectory(&coords, None, None, None, None).unwrap());
+    let samples = trajectory_nodes(&qr, "t2m");
+    assert_eq!(samples.len(), 7);
+    let hours: Vec<i64> = samples.iter().map(|s| (s.0 .0 - t0).num_hours()).collect();
+    // Samples every 3 h snap to the 6-hourly steps, ties to the earlier.
+    assert_eq!(hours, [0, 0, 6, 6, 12, 12, 18]);
+    for ((t, lon, lat), value) in samples {
+        let step = (t - t0).num_hours() as f64 / 6.0;
+        let expected = 273.15 + 0.1 * lat + 0.01 * lon + 0.5 * step;
+        assert!((value.unwrap() - expected).abs() < 0.02);
+    }
+
+    let late = format!(
+        "LINESTRING M(1 50 {}, 7 50 {})",
+        t0.timestamp(),
+        t18.timestamp() + 3600
+    );
+    assert!(matches!(
+        e.query_trajectory(&late, None, None, None, None),
+        Err(ds_core::error::DataServerError::InvalidParameter(_))
+    ));
+
+    let t = Utc.with_ymd_and_hms(2026, 1, 1, 6, 0, 0).unwrap();
+    let qr = single(
+        e.query_trajectory(
+            "LINESTRING Z(1 50 100, 3 50 5000)",
+            Some((t, t)),
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        qr.domain,
+        ds_core::model::DomainDescription::Trajectory {
+            node_z: None,
+            z: None,
+            ..
+        }
+    ));
+
+    // A path entirely outside the store is a 404, like an area query.
+    assert!(matches!(
+        e.query_trajectory("LINESTRING(100 10, 101 11)", None, None, None, None),
+        Err(ds_core::error::DataServerError::LocationNotFound(_))
+    ));
 }
 
 #[test]

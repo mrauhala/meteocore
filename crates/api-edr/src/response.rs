@@ -263,6 +263,7 @@ fn domain_type_name(domain: &DomainDescription) -> &'static str {
         DomainDescription::Grid { .. } => "Grid",
         DomainDescription::VerticalProfile { .. } => "VerticalProfile",
         DomainDescription::Section { .. } => "Section",
+        DomainDescription::Trajectory { .. } => "Trajectory",
     }
 }
 
@@ -442,6 +443,52 @@ fn build_domain(desc: &DomainDescription) -> Value {
                 domain.insert("meteocore:beamCoverage".into(), json!({ "floor": floor }));
             }
             Value::Object(domain)
+        }
+        DomainDescription::Trajectory { nodes, node_z, z } => {
+            // The CoverageJSON 1.0 `Trajectory` domain: a composite axis of
+            // `[t, x, y]` tuples, or `[t, x, y, z]` when every node has its
+            // own level; a level the whole path shares is a single-valued
+            // `z` axis beside it (the only other axis the schema allows).
+            let mut referencing = vec![spatial_ref(), temporal_ref()];
+            let (coordinates, tuples): (Value, Vec<Value>) = match node_z {
+                Some(levels) => {
+                    referencing.push(vertical_ref(levels));
+                    (
+                        json!(["t", "x", "y", "z"]),
+                        nodes
+                            .iter()
+                            .zip(&levels.values)
+                            .map(|((t, x, y), z)| json!([t.to_rfc3339(), x, y, z]))
+                            .collect(),
+                    )
+                }
+                None => (
+                    json!(["t", "x", "y"]),
+                    nodes
+                        .iter()
+                        .map(|(t, x, y)| json!([t.to_rfc3339(), x, y]))
+                        .collect(),
+                ),
+            };
+            let mut axes = Map::new();
+            axes.insert(
+                "composite".into(),
+                json!({
+                    "dataType": "tuple",
+                    "coordinates": coordinates,
+                    "values": tuples,
+                }),
+            );
+            if let Some(zc) = z {
+                axes.insert("z".into(), json!({ "values": zc.values }));
+                referencing.push(vertical_ref(zc));
+            }
+            json!({
+                "type": "Domain",
+                "domainType": "Trajectory",
+                "axes": axes,
+                "referencing": referencing
+            })
         }
     }
 }

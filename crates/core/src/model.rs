@@ -71,6 +71,22 @@ pub enum DomainDescription {
         z: VerticalCoord,
         coverage_floor: Option<Vec<f64>>,
     },
+    /// Values sampled along a path through space and time: the CoverageJSON
+    /// `Trajectory` domain (#926). `nodes` carries one `(time, longitude,
+    /// latitude)` tuple per sample, serialised as the mandatory composite
+    /// axis; the range shape is `[nodes.len()]` over axis `composite`.
+    ///
+    /// At most one of the two vertical fields is set. `node_z` gives every
+    /// node its own level (`values.len() == nodes.len()`), which puts `z`
+    /// into the composite tuples (`["t", "x", "y", "z"]`); `z` is one level
+    /// the whole path shares, a single-valued `z` axis beside the
+    /// composite one. Composite tuples must be unique (CoverageJSON
+    /// `uniqueItems`).
+    Trajectory {
+        nodes: Vec<(DateTime<Utc>, f64, f64)>,
+        node_z: Option<VerticalCoord>,
+        z: Option<VerticalCoord>,
+    },
 }
 
 #[derive(Debug, Clone)]

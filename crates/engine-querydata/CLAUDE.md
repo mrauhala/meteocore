@@ -38,6 +38,13 @@ runtime).
   bilinearly interpolated and cells outside the polygon masked to null
   (`QueryPolygon::sample_grid` in ds-core, #671). One `t` axis when the
   datetime window selects several steps.
+- EDR trajectory (#926): the path, time rules and layout come from
+  `ds_core::trajectory::TrajectoryPlan`, densified at the area query's mean
+  cell size (`lonlat_extent` / grid dims). Each sample is projected once
+  (`world_to_grid_px`) and reused for every parameter and step, then
+  `sample_grid_bilinear` — the position query's own interpolation. The run
+  is memory mapped, so there is no I/O to group. No vertical axis: a Z
+  coordinate is ignored.
 - Missing-value sentinel: `32700.0`.
 - Config: `wms_parameter`, `poll_interval_secs` (default 30), `max_runs`
   (default 4; set 1 for latest-only).

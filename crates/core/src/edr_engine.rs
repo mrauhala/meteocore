@@ -208,12 +208,29 @@ pub trait EdrEngine: Send + Sync {
         Ok(())
     }
 
-    /// Execute a trajectory (vertical cross-section) query along a WKT
-    /// `LINESTRING`. The result is a CoverageJSON `Section` domain (or a
-    /// collection of them, one per timestep): a 2-D field over an
-    /// along-path composite axis and a vertical `z` axis. `z`, when set,
-    /// pins the height range — engines free to interpret as a discrete
-    /// list, a `[min, max]` interval, or both.
+    /// How this engine answers `trajectory` queries; see [`TrajectoryShape`].
+    /// Read by the API layer before dispatch (accepted geometries, `f=PNG`,
+    /// execution context), so it must agree with [`Self::query_trajectory`].
+    /// Default [`TrajectoryShape::AlongPath`], the OGC API - EDR meaning.
+    fn trajectory_shape(&self) -> TrajectoryShape {
+        TrajectoryShape::AlongPath
+    }
+
+    /// Execute a trajectory query along a WKT `LINESTRING`, in the form
+    /// [`Self::trajectory_shape`] declares:
+    ///
+    /// - [`TrajectoryShape::AlongPath`] (gridded engines, #926): values
+    ///   sampled along the path, a CoverageJSON `Trajectory` domain built
+    ///   with [`crate::trajectory`]. `coords` may also be `LINESTRING Z`,
+    ///   `M` or `ZM`; `z` is the request's level list (never set together
+    ///   with a Z path), `datetime` its time window (never set together with
+    ///   an M path).
+    /// - [`TrajectoryShape::CrossSection`] (radar polar volumes): a
+    ///   `Section` domain (or a collection of them, one per timestep), a 2-D
+    ///   field over an along-path composite axis and a vertical `z` axis.
+    ///   `z`, when set, pins the height range — engines free to interpret
+    ///   as a discrete list, a `[min, max]` interval, or both.
+    ///
     /// Default implementation returns an error.
     fn query_trajectory(
         &self,
@@ -228,6 +245,21 @@ pub trait EdrEngine: Send + Sync {
             "Trajectory query not supported by this engine".into(),
         ))
     }
+}
+
+/// What an engine's `trajectory` query returns ([`EdrEngine::trajectory_shape`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrajectoryShape {
+    /// Values sampled along the path (OGC API - EDR trajectory): a
+    /// CoverageJSON `Trajectory` domain. Accepts `LINESTRING`,
+    /// `LINESTRING Z`, `M` and `ZM`; CoverageJSON output only. Runs on the
+    /// EDR query runtime's workers, like position and area.
+    AlongPath,
+    /// A vertical cross-section under a 2-D `LINESTRING` (radar polar
+    /// volumes): a CoverageJSON `Section` domain, also as a PNG heatmap.
+    /// Runs on the query runtime's blocking pool, because the engine drives
+    /// its remote reads through an explicit runtime handle.
+    CrossSection,
 }
 
 /// Resolve an EDR `parameter-name` selection against the parameters a

@@ -11,10 +11,12 @@ use serde_json::json;
 use api_common::JsonError;
 use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 
 use ds_core::error::DataServerError;
+use ds_core::feature::MAX_AREA_VALUES;
 use ds_core::model::CoverageResponse;
+use ds_core::trajectory::{TrajectoryPath, MAX_TRAJECTORY_NODES, MAX_TRAJECTORY_SAMPLES};
 use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
@@ -629,51 +631,84 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             });
         }
 
-        // Trajectory query (vertical cross-section). Only advertised
-        // for engines that report `trajectory` in
-        // `supported_query_types` — keeps the OpenAPI spec consistent
-        // with `data_queries` in the collection metadata. A client that
-        // calls the path on a non-trajectory engine gets a 404 from the
-        // handler's capability guard (the resource doesn't exist for
-        // that collection).
+        // Trajectory query. Only advertised for engines that report
+        // `trajectory` in `supported_query_types` — keeps the OpenAPI spec
+        // consistent with `data_queries` in the collection metadata. A
+        // client that calls the path on a non-trajectory engine gets a 404
+        // from the handler's capability guard (the resource doesn't exist
+        // for that collection). The engine's shape picks the variant:
+        // along-path sampling (gridded) or a radar cross-section.
         if supported.contains("trajectory") {
             let trajectory_path = format!("/edr/collections/{id}/trajectory");
-            collection_paths[&trajectory_path] = json!({
-                "get": {
-                    "summary": format!("Trajectory cross-section for {}", config.title),
-                    "operationId": format!("getTrajectory_{id}"),
-                    "tags": [id],
-                    "parameters": [
-                        {"$ref": "#/components/parameters/coords-linestring"},
-                        {"$ref": "#/components/parameters/datetime"},
-                        {"$ref": "#/components/parameters/parameter-name"},
-                        {"$ref": "#/components/parameters/z-trajectory"},
-                        {
-                            "name": "f",
-                            "in": "query",
-                            "description": "Output format: CoverageJSON (default) or PNG (a colour-mapped distance×height cross-section heatmap).",
-                            "required": false,
-                            "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
-                        }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
-                            "content": {
-                                COVERAGE_JSON_MEDIA_TYPE: {
-                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                                },
-                                "image/png": {
-                                    "schema": {"type": "string", "format": "binary"}
+            let shape = state
+                .engines
+                .get(id)
+                .map_or(TrajectoryShape::AlongPath, |e| e.trajectory_shape());
+            collection_paths[&trajectory_path] = match shape {
+                TrajectoryShape::AlongPath => json!({
+                    "get": {
+                        "summary": format!("Trajectory query for {}", config.title),
+                        "description": "Values sampled along the path at about the source grid spacing (one sample per grid cell crossed, the path's vertices kept), interpolated the way a position query is. Segments follow the short great circle. A 2-D or Z path returns one CoverageJSON Trajectory coverage per timestep that `datetime` selects; a 2-D or M path one per level that `z` selects (all levels when omitted on a collection with a vertical extent). Samples at the same place and step appear once.",
+                        "operationId": format!("getTrajectory_{id}"),
+                        "tags": [id],
+                        "parameters": [
+                            {"$ref": "#/components/parameters/coords-trajectory"},
+                            {"$ref": "#/components/parameters/datetime"},
+                            {"$ref": "#/components/parameters/parameter-name"},
+                            {"$ref": "#/components/parameters/z"}
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Coverage data: a CoverageJSON Trajectory coverage, or a CoverageCollection of them",
+                                "content": {
+                                    COVERAGE_JSON_MEDIA_TYPE: {
+                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                    }
                                 }
-                            }
-                        },
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Not found"},
-                        "500": {"description": "Server error"}
+                            },
+                            "400": {"description": "Bad request"},
+                            "404": {"description": "Not found"},
+                            "500": {"description": "Server error"}
+                        }
                     }
-                }
-            });
+                }),
+                TrajectoryShape::CrossSection => json!({
+                    "get": {
+                        "summary": format!("Trajectory cross-section for {}", config.title),
+                        "operationId": format!("getTrajectory_{id}"),
+                        "tags": [id],
+                        "parameters": [
+                            {"$ref": "#/components/parameters/coords-linestring"},
+                            {"$ref": "#/components/parameters/datetime"},
+                            {"$ref": "#/components/parameters/parameter-name"},
+                            {"$ref": "#/components/parameters/z-trajectory"},
+                            {
+                                "name": "f",
+                                "in": "query",
+                                "description": "Output format: CoverageJSON (default) or PNG (a colour-mapped distance×height cross-section heatmap).",
+                                "required": false,
+                                "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
+                            }
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
+                                "content": {
+                                    COVERAGE_JSON_MEDIA_TYPE: {
+                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                    },
+                                    "image/png": {
+                                        "schema": {"type": "string", "format": "binary"}
+                                    }
+                                }
+                            },
+                            "400": {"description": "Bad request"},
+                            "404": {"description": "Not found"},
+                            "500": {"description": "Server error"}
+                        }
+                    }
+                }),
+            };
         }
 
         // Instances (forecast model runs; #337). Only advertised for engines
@@ -925,7 +960,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": true,
                     "schema": {"type": "string"},
-                    "description": "WKT LINESTRING geometry (lon lat, lon lat, …). LINESTRINGZ/M variants are not accepted — per-node z and time will arrive in a follow-up."
+                    "description": "WKT LINESTRING geometry (lon lat, lon lat, …), the ground track of a vertical cross-section. A cross-section is 2-D: LINESTRING Z, M and ZM are not accepted."
+                },
+                "coords-trajectory": {
+                    "name": "coords",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": format!("WKT LINESTRING, LINESTRING Z, LINESTRING M or LINESTRING ZM (also written LINESTRINGZ, LINESTRINGM, LINESTRINGZM), CRS84 lon/lat. Z is each vertex's level in the collection's vertical coordinate (`extent.vertical`), snapped to the nearest advertised level; outside the advertised range → 400; ignored by a collection without a vertical extent. M is each vertex's time in seconds since the Unix epoch; each sample, interpolated along the path, takes the nearest available timestep; a time outside the available range → 400. Z cannot be combined with `z`, nor M with `datetime`. At most {MAX_TRAJECTORY_SAMPLES} samples at the source grid spacing, {MAX_TRAJECTORY_NODES} nodes (coverages × samples) and {MAX_AREA_VALUES} values (× parameters) per response; MULTILINESTRING is not supported. Examples: LINESTRING(24 60, 25 61), LINESTRING Z(24 60 850, 25 61 500), LINESTRING M(24 60 1767225600, 25 61 1767247200).")
                 },
                 "z-trajectory": {
                     "name": "z",
@@ -1705,15 +1747,23 @@ pub async fn trajectory_query(
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
-    // An engine that doesn't advertise `trajectory` has no cross-section
-    // capability. Return 404 (the resource doesn't exist for this
-    // collection) rather than letting the default trait method answer
-    // 400 (which wrongly implies the *request* was malformed). Keeps the
-    // live route consistent with the `api_definition` OpenAPI gating and
-    // the `data_queries` collection metadata. Flagged by claude-review.
-    require_query_type(engine, &id, "trajectory", "trajectory (cross-section)")?;
+    // An engine that doesn't advertise `trajectory` has no such resource.
+    // Return 404 (the resource doesn't exist for this collection) rather
+    // than letting the default trait method answer 400 (which wrongly
+    // implies the *request* was malformed). Keeps the live route
+    // consistent with the `api_definition` OpenAPI gating and the
+    // `data_queries` collection metadata. Flagged by claude-review.
+    require_query_type(engine, &id, "trajectory", "trajectory")?;
+    let shape = engine.trajectory_shape();
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
+    if format == EdrFormat::Png && shape == TrajectoryShape::AlongPath {
+        return Err(bad_request(&DataServerError::InvalidParameter(
+            "PNG output is only available for radar cross-section trajectories; this \
+             collection answers CoverageJSON"
+                .into(),
+        )));
+    }
 
     let datetime = params
         .datetime
@@ -1732,16 +1782,39 @@ pub async fn trajectory_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    // Trajectory `z` selects elevation angles from the collection's
-    // advertised vertical extent (the cross-section is built from those
-    // sweeps); an interval `z=0.3/15` expands to the angles in range.
+    // `z` selects levels from the collection's advertised vertical extent:
+    // elevation angles bounding a radar cross-section's sweeps, or the
+    // levels a 2-D / M path is sampled on. An interval expands to the
+    // advertised levels in range.
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
-    // Trajectory implementations use explicit runtime handles for remote I/O,
-    // and therefore require a blocking thread rather than an async worker.
+    if shape == TrajectoryShape::AlongPath {
+        // Validate the whole path before dispatch. OGC API - EDR 1.2: a
+        // path that carries its own levels (Z) or times (M) SHALL NOT be
+        // combined with `z` or `datetime` (the trajectory query type's
+        // error list; /conf/trajectory/coords-param-separate-z-*).
+        let path = TrajectoryPath::parse(&params.coords).map_err(|e| bad_request(&e))?;
+        if path.has_z && z.is_some() {
+            return Err(bad_request_msg(&format!(
+                "A {} carries each vertex's level; do not also pass `z`",
+                path.keyword()
+            )));
+        }
+        if path.has_m && datetime.is_some() {
+            return Err(bad_request_msg(&format!(
+                "A {} carries each vertex's time; do not also pass `datetime`",
+                path.keyword()
+            )));
+        }
+    }
+
+    // A cross-section engine drives its remote reads through an explicit
+    // runtime handle and needs a blocking thread; along-path sampling runs
+    // on the query runtime's workers like position and area.
+    let blocking = shape == TrajectoryShape::CrossSection;
     let engine = engine.clone();
     let coords = params.coords.clone();
-    let result = execute_query(true, move |_budget| {
+    let result = execute_query(blocking, move |_budget| {
         engine
             .query_trajectory(
                 &coords,
@@ -1948,7 +2021,11 @@ fn build_collection_metadata(
             "radius" => (format!("{query_base}/radius"), json!(["CoverageJSON"])),
             "trajectory" => (
                 format!("{query_base}/trajectory"),
-                json!(["CoverageJSON", "PNG"]),
+                match engine.trajectory_shape() {
+                    // Only a radar cross-section renders as a PNG heatmap.
+                    TrajectoryShape::CrossSection => json!(["CoverageJSON", "PNG"]),
+                    TrajectoryShape::AlongPath => json!(["CoverageJSON"]),
+                },
             ),
             _ => continue,
         };

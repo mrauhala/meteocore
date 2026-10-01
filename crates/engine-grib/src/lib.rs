@@ -13,6 +13,7 @@ mod runtime;
 mod scan_tests;
 #[cfg(test)]
 mod test_support;
+mod trajectory;
 pub mod units;
 mod vertical;
 pub mod wgrib2_index;
@@ -1256,7 +1257,21 @@ impl EdrEngine for GribEngine {
             "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
+            "trajectory".to_string(),
         ]
+    }
+
+    /// Values along a WKT `LINESTRING` / `Z` / `M` / `ZM` path (#926), each
+    /// field it crosses read once; see `trajectory.rs`.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.query_batched_trajectory(coords, datetime, parameters, z, reference_time)
     }
 
     fn query_position(

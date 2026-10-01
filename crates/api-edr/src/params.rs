@@ -145,12 +145,14 @@ pub fn parse_within_metres(within: &str, units: &str) -> Result<f64, DataServerE
     Ok(metres)
 }
 
-/// Trajectory (vertical cross-section) query parameters. Accepts a WKT
-/// `LINESTRING(lon lat, lon lat, …)` and the standard EDR filters; `z`
-/// selects *elevation angles* from the collection's advertised vertical
-/// extent (a list or a `min/max` interval), bounding which sweeps build
-/// the cross-section — whose own axis is derived height. The corridor
-/// variant (`corridor-width` / `corridor-height`) ships in a follow-up.
+/// Trajectory query parameters. `coords` is a WKT `LINESTRING`; a
+/// gridded (along-path) collection also takes `LINESTRING Z`, `M` and `ZM`,
+/// where Z is each vertex's level and M its time in Unix epoch seconds.
+/// `z` selects levels from the collection's advertised vertical extent (a
+/// list or a `min/max` interval): the levels a 2-D or M path is sampled on,
+/// or, for a radar cross-section, the *elevation angles* bounding which
+/// sweeps build it — whose own axis is derived height. The corridor query
+/// (`corridor-width` / `corridor-height`) is a separate follow-up.
 #[derive(Debug, Deserialize)]
 pub struct TrajectoryQueryParams {
     pub coords: String,
@@ -158,8 +160,8 @@ pub struct TrajectoryQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
-    /// Output format: `CoverageJSON` (default) or `PNG` — a colour-mapped
-    /// cross-section heatmap (distance × height).
+    /// Output format: `CoverageJSON` (default) or, for a radar
+    /// cross-section, `PNG` — a colour-mapped heatmap (distance × height).
     pub f: Option<String>,
     /// PNG image dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,

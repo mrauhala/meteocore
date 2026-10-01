@@ -239,7 +239,7 @@ fn ring_centroid(ring: &[[f64; 2]]) -> (f64, f64) {
 const MAX_WKT_VERTICES: usize = 10_000;
 
 /// Maximum byte length of a WKT coords string.
-const MAX_WKT_LENGTH: usize = 10_240;
+pub(crate) const MAX_WKT_LENGTH: usize = 10_240;
 
 /// A parsed polygon for area queries: exterior ring, optional holes, and precomputed bbox.
 #[derive(Debug, Clone)]
@@ -828,9 +828,11 @@ pub fn radius_polygon_wkt(lon: f64, lat: f64, radius_m: f64) -> Result<String, D
 /// for legacy reasons; cross-section paths always carry `(lon, lat)` here).
 ///
 /// A leading space before `(` is tolerated. `LINESTRINGZ` / `LINESTRINGM` /
-/// `LINESTRINGZM` are rejected — per-node z and time are deferred to a
-/// follow-up. At least two distinct nodes are required (a single node is
-/// not a path; the position query covers that case).
+/// `LINESTRINGZM` are rejected: this is the radar cross-section's parser,
+/// whose path is 2-D (the along-path trajectory of the gridded engines
+/// parses per-vertex z and time with [`crate::trajectory::TrajectoryPath`]).
+/// At least two distinct nodes are required (a single node is not a path;
+/// the position query covers that case).
 pub fn parse_linestring_coords(coords: &str) -> Result<Vec<(f64, f64)>, DataServerError> {
     // Bound the input before any parsing so a 10 MB payload can't
     // allocate one `(f64, f64)` per comma before `TRAJECTORY_MAX_NODES`

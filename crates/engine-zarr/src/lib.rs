@@ -27,6 +27,7 @@ mod retrieval;
 mod runtime;
 mod source;
 mod store;
+mod trajectory;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -318,7 +319,28 @@ impl EdrEngine for ZarrEngine {
             "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
+            "trajectory".to_string(),
         ]
+    }
+
+    /// Values along a WKT `LINESTRING` / `Z` / `M` / `ZM` path (#926),
+    /// bilinear like position, read as bounded windows per path segment
+    /// (see `trajectory.rs`). No vertical axis: a Z coordinate is ignored.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        trajectory::query(
+            &self.catalog.load(),
+            coords,
+            datetime,
+            parameters,
+            reference_time,
+        )
     }
 
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the store's

@@ -49,7 +49,8 @@ Key schema rules:
    requirements.
 4. Add a validation test in `tests/covjson_validation.rs`.
 
-Currently implemented: `PointSeries`, `Grid`, `VerticalProfile`.
+Currently implemented: `Point`, `PointSeries`, `Grid`, `VerticalProfile`,
+`Section`, `Trajectory`.
 
 ## Instances (forecast model runs, #337)
 
@@ -81,6 +82,27 @@ variables.within_units` advertises the accepted units (`params::WITHIN_UNITS`).
 The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
 containing a pole or crossing the antimeridian is a 400 (#667). Engine
 errors from all data-query handlers map through `map_query_error`.
+
+## Trajectory (#926)
+
+`EdrEngine::trajectory_shape` decides what `/trajectory` is for a
+collection, and the handler, `data_queries` and `api_definition()` all read
+it:
+
+- `AlongPath` (default; GRIB, QueryData, Zarr): the handler parses the
+  whole WKT with `ds_core::trajectory::TrajectoryPath` before dispatch and
+  enforces EDR 1.2's exclusions (Z/ZM + `z`, M/ZM + `datetime` → 400);
+  CoverageJSON only (`f=PNG` → 400 before the query runs); runs on the
+  query runtime's workers like position. Engines build the response with
+  `ds_core::trajectory::TrajectoryPlan` — never a per-engine copy of the
+  parse/densify/snap/layout rules — and sample per field, chunk or window,
+  never per sample.
+- `CrossSection` (ODIM PVOL sites): the coords go to the engine unparsed
+  (its own 2-D parser), PNG heatmaps are offered, and it runs on the
+  blocking pool (`blocking_pixel_handle` needs a blocking thread).
+
+The `Trajectory` domain's composite tuples must be unique (`uniqueItems`):
+the plan drops a repeated node, which reads the same field at the same place.
 
 ## Misc
 
@@ -132,8 +154,8 @@ Features `items` handler).
 ## Query execution and limits (#178, #585)
 
 Every data query uses `executor`: normal engines run on a dedicated multi-thread
-runtime (storage sync bridges are valid there), trajectories use its blocking
-pool for their explicit-handle I/O. Never call synchronous engines directly on
+runtime (storage sync bridges are valid there), cross-section trajectories use
+its blocking pool for their explicit-handle I/O. Never call synchronous engines directly on
 HTTP workers. The admission queue is bounded to 32 waiting requests; deadlines include queue
 time. Beyond the queue, admission fails fast. Permits live with the
 work, including after client timeout/disconnect. Check `QueryBudget::expired`

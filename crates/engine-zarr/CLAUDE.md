@@ -183,6 +183,20 @@ pool: they do not use the Icechunk runtime bridge.
   arrays. Startup also logs outer/inner shapes, native bytes, and time steps
   per chunk to expose temporal decode amplification in map reads.
 
+## Trajectory queries (#926)
+
+`src/trajectory.rs`: the run, steps and variables are selected like a
+position query (`select_time_idx`, `select_vars`), and the path, time rules
+and layout come from `ds_core::trajectory::TrajectoryPlan`, densified at
+`Catalog::native_spacing`. Reads are per **path segment**, never per sample:
+consecutive samples share one `read_window_span` per variable while the
+window stays ≤ 256 × 256 native cells per step and ≤ 1M values across its
+step span; an antimeridian jump starts a new segment. At most
+`MAX_TRAJECTORY_READS` (64) segment × variable reads → 400, since each is a
+sequential blocking subset retrieval. Sampling is `Window::sample`, the
+same bilinear + nearest fallback as `sample_series`. No vertical axis: a Z
+coordinate is ignored.
+
 ## APIs
 
 The `engine_type → supported_apis` allowlist in `server/src/admin.rs` lists

@@ -57,7 +57,7 @@ for the specification baselines and remaining gaps.
 | `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined; all coordinates finite and within CRS84 bounds) |
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667) |
-| `trajectory` | `/collections/{id}/trajectory` | partial | 2-D `LINESTRING` only, meaning a *vertical cross-section* (PVOL sites). `LINESTRINGZ/M` (per-node z/time) not accepted; no along-path sampling on gridded engines |
+| `trajectory` | `/collections/{id}/trajectory` | ✓ | gridded engines (GRIB, QueryData, Zarr): values sampled along a WKT `LINESTRING`, `LINESTRING Z`, `M` or `ZM` (Z = level, M = Unix epoch seconds), CoverageJSON `Trajectory`, see [Trajectory](#trajectory-926); PVOL sites: a 2-D `LINESTRING` is a *vertical cross-section* (`Section`, also PNG). `MULTILINESTRING` not supported |
 | `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); instance-scoped queries: position, area, radius only |
 | `cube` | — | ✗ | not in the trait or the router |
 | `corridor` | — | ✗ | not in the trait or the router (`corridor-width`/`-height` documented as follow-up on trajectory) |
@@ -79,10 +79,10 @@ A query type a collection's engine does not support (not in its `supported_query
 | Parameter | Status | Notes |
 |---|---|---|
 | `coords` | ✓ | WKT per query type (see above) |
-| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..` |
+| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`; 400 with a `LINESTRING M`/`ZM` trajectory, which carries its own times |
 | `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData and Nowcast (#666); GRIB keeps its own equivalent check |
-| `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent |
-| `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations/trajectory plots) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
+| `z` | ✓ | single, list, or `min/max` interval, snapped to the collection's advertised levels; 400 on a collection with no vertical extent. On a trajectory: the levels a 2-D or M path is sampled on; 400 with a `LINESTRING Z`/`ZM` |
+| `f` | partial | `CoverageJSON` (default) and `PNG` (position/locations plots, radar cross-section trajectories) only, case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV/NetCDF/GeoJSON |
 | `crs` | ✗ | data queries accept CRS84 only; `crs_details` not advertised; `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | ✗ | (cube / area resolution hints) not accepted |
@@ -158,8 +158,9 @@ labels are English.
 
 `PointSeries`, `Point` (events), `Grid` (with optional `t` and `z` axes),
 `VerticalProfile`, `Section` (trajectory cross-sections, with the
-`meteocore:beamCoverage` foreign member). Everything validates against the
-CoverageJSON 1.0 schema.
+`meteocore:beamCoverage` foreign member), `Trajectory` (along-path samples:
+a composite `[t, x, y]` or `[t, x, y, z]` axis, optionally a single-valued
+`z` axis). Everything validates against the CoverageJSON 1.0 schema.
 
 Zarr/Icechunk storage reads honor the query deadline. Branch-backed collections
 refresh on their poll interval; each query uses one pinned snapshot, and a failed
@@ -241,9 +242,9 @@ transforms retain serial retrieval.
 |---|---|---|---|---|---|---|---|
 | CSV | ✓ | – | ✓ | ✓ | – | n/a | stations whose point is inside the polygon (≤ 500) |
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | n/a | Grid over the polygon's bbox at native resolution, no 256-cell coarsening (≤ 1M values across timesteps → 400, checked before any read, #858), pixels outside the polygon masked; `t` axis when several steps; a file that cannot be read is a timestep of nulls, any other error fails the query |
-| GRIB | – | ✓ | ✓ | ✓ | – | ✓ | Grid over the polygon's bbox at native resolution (≤ 1M values across levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
-| QueryData | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Lat/lon, rotated, stereographic and LCC grids (including the tangent-cone MEPS grid, on the sphere its file declares); a projected grid's extent is its projected rectangle's edges, not its corners' lon/lat box |
-| Zarr | – | ✓ | ✓ | ✓ | – | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, one subset retrieval per variable for the whole time span (each may read multiple chunks) (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
+| GRIB | – | ✓ | ✓ | ✓ | ✓ | ✓ | Grid over the polygon's bbox at native resolution (≤ 1M values across levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
+| QueryData | – | ✓ | ✓ | ✓ | ✓ | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Lat/lon, rotated, stereographic and LCC grids (including the tangent-cone MEPS grid, on the sphere its file declares); a projected grid's extent is its projected rectangle's edges, not its corners' lon/lat box |
+| Zarr | – | ✓ | ✓ | ✓ | ✓ | ✓ | Grid over bbox at native resolution, ≤ 256 cells/axis, one subset retrieval per variable for the whole time span (each may read multiple chunks) (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | n/a | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
 | ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | ✓ | n/a | polar sampling; trajectory = RHI cross-section |
 | PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | n/a | stations-only `location_source`: exact `ST_Within` in SQL; observations-derived: exact point-in-polygon on the cached station set |
@@ -255,6 +256,71 @@ transforms retain serial retrieval.
 
 Radius, cube, corridor and items have no engine-specific code: radius is
 answered by every engine that answers area, the other three do not exist.
+Trajectory is along-path sampling on GRIB, QueryData and Zarr (see
+[Trajectory](#trajectory-926)) and a vertical cross-section on PVOL sites;
+GeoTIFF, ODIM composite, Satellite, Nowcast and the station engines do not
+answer it (404).
+
+### Trajectory (#926)
+
+The gridded engines share one implementation, `ds_core::trajectory`: WKT
+parsing, path densification, the time and level rules and the CoverageJSON
+`Trajectory` layout. Each engine only selects its run, timesteps, levels and
+parameters exactly as its position query does, and samples the planned
+fields with the position query's interpolation (bilinear; GRIB also applies
+its display unit conversion).
+
+- **Geometry.** `LINESTRING`, `LINESTRING Z`, `LINESTRING M` and
+  `LINESTRING ZM`, case-insensitive, the dimension apart (ISO) or attached
+  (`LINESTRINGZM`, as in the EDR examples); `lon lat [z] [m]` per vertex in
+  CRS84. The whole path is validated before dispatch; a malformed or
+  wrong-arity vertex, a coordinate out of range or all-identical vertices
+  are 400. `MULTILINESTRING` is not supported (EDR makes it optional per
+  collection).
+- **Densification.** Segments follow the short great circle (as the radar
+  cross-section does), so a path from 170° to −170° crosses the
+  antimeridian. Each segment gets about one sample per source grid cell it
+  crosses, the vertices kept exactly; at most 2000 samples → 400. Antipodal
+  segment ends define no single path → 400.
+- **M (time).** Seconds since the Unix epoch, OGC API - EDR 1.2's trajectory
+  query-type definition. A sample's time is interpolated along its segment
+  and takes the nearest timestep of the selected run, the earlier on a tie;
+  the domain reports that timestep. A vertex time outside the run's time
+  range is a 400 (EDR 1.2 abstract test `/conf/trajectory/
+  coords-param-invalid-time`). The path's time window selects the run like
+  a `datetime` window does. `datetime` together with M/ZM → 400.
+- **Z (level).** In the collection's vertical coordinate (`extent.vertical`,
+  hPa or model level on GRIB level views), interpolated along the segment
+  and snapped to the nearest advertised level, which the domain reports. A
+  vertex level outside the advertised range is a 400 (`/conf/trajectory/
+  coords-param-invalid-linestringz`); a collection without a vertical extent
+  ignores Z (`/req/edr/z-response` A) — QueryData and Zarr today. `z`
+  together with Z/ZM → 400.
+- **2-D and Z paths** use the `datetime` selection of a position query (all
+  steps of the latest run when omitted): one `Trajectory` coverage per
+  timestep. **2-D and M paths** on a collection with a vertical extent are
+  sampled on the `z` levels (all levels when omitted, `/req/edr/z-response`
+  F): one coverage per level, each with a single-valued `z` axis. A single
+  coverage is a bare `Coverage`, several a `CoverageCollection`.
+- **Output.** A composite `[t, x, y]` axis, or `[t, x, y, z]` for Z/ZM
+  paths, and ranges of shape `[samples]` over axis `composite`. Composite
+  axis values must be unique, so a sample repeating an earlier node (a
+  closed loop back to its start) is dropped: it would read the same field at
+  the same place. CoverageJSON only (`f=PNG` → 400); the whole response is
+  capped at 250 000 nodes (coverages × samples) and 1 000 000 values
+  (× parameters) → 400.
+  A path entirely outside the collection's extent is a 404; samples off the
+  grid are null.
+- **Reads.** GRIB fetches and decodes each planned field (parameter × step ×
+  level) once, sampling every point that reads it, on the position query's
+  four-worker scheduler; a missing field is null. Zarr splits the path into
+  segments whose read window is at most 256 × 256 native cells per step and
+  1M values across its step span, and reads each segment once per variable
+  (at most 64 reads → 400; the antimeridian starts a new segment; the store's
+  own longitude frame only, #667). QueryData samples its memory-mapped run,
+  projecting each sample once.
+- Not yet: `/instances/{id}/trajectory` (#924), `corridor` (#927), and
+  along-path sampling on GeoTIFF, ODIM composite and Satellite.
 
 Compatible nowcast reloads retain motion-field instances alongside forecast
 runs and cell history (#604). Reuse requires unchanged nowcast config, the

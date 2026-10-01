@@ -128,6 +128,48 @@ pub fn destination_point(
     (lon, lat.to_degrees())
 }
 
+/// The point a fraction `f` (0 = start, 1 = end) of the way along the
+/// **great circle** from (`lon0`, `lat0`) to (`lon1`, `lat1`), degrees, with
+/// longitude wrapped into (−180, 180] by [`wrap_lon`]. The short way round,
+/// so a segment from 170° to −170° crosses the antimeridian rather than
+/// the Greenwich meridian — the path [`destination_point`] walks too.
+///
+/// Returns `None` when the endpoints are (nearly) antipodal: every great
+/// circle through them is equally short, so no single path is defined.
+/// Coincident endpoints return the start point.
+pub fn intermediate_point(
+    lon0: f64,
+    lat0: f64,
+    lon1: f64,
+    lat1: f64,
+    f: f64,
+) -> Option<(f64, f64)> {
+    let unit = |lon: f64, lat: f64| {
+        let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+        let (sin_lon, cos_lon) = lon.to_radians().sin_cos();
+        [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat]
+    };
+    let (a, b) = (unit(lon0, lat0), unit(lon1, lat1));
+    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
+    let d = dot.acos();
+    let sin_d = d.sin();
+    if sin_d < 1e-12 {
+        // Coincident (d ≈ 0) or antipodal (d ≈ π).
+        return (d < 1.0).then_some((wrap_lon(lon0), lat0));
+    }
+    // Spherical linear interpolation of the two unit vectors.
+    let wa = ((1.0 - f) * d).sin() / sin_d;
+    let wb = (f * d).sin() / sin_d;
+    let p = [
+        wa * a[0] + wb * b[0],
+        wa * a[1] + wb * b[1],
+        wa * a[2] + wb * b[2],
+    ];
+    let lat = p[2].atan2(p[0].hypot(p[1])).to_degrees();
+    let lon = p[1].atan2(p[0]).to_degrees();
+    Some((wrap_lon(lon), lat))
+}
+
 /// Coordinate reference system.
 ///
 /// Stores projection parameters and provides forward/inverse transforms
@@ -2016,6 +2058,57 @@ mod tests {
         // Eastbound across the antimeridian wraps into (−180, 180]: 179 + 10 → −171.
         let (lon, _lat) = destination_point(179.0, 0.0, ten_deg, 90.0);
         assert!((lon - (-171.0)).abs() < 1e-9, "wrapped past +180 → {lon}");
+    }
+
+    #[test]
+    fn intermediate_point_follows_the_short_great_circle() {
+        let close = |(lon, lat): (f64, f64), want: (f64, f64)| {
+            assert!(
+                (lon - want.0).abs() < 1e-9 && (lat - want.1).abs() < 1e-9,
+                "got ({lon}, {lat}), want {want:?}"
+            );
+        };
+        // Endpoints are exact; a meridian and the equator are closed forms.
+        close(
+            intermediate_point(10.0, 20.0, 30.0, 40.0, 0.0).unwrap(),
+            (10.0, 20.0),
+        );
+        close(
+            intermediate_point(10.0, 20.0, 30.0, 40.0, 1.0).unwrap(),
+            (30.0, 40.0),
+        );
+        close(
+            intermediate_point(0.0, 0.0, 0.0, 10.0, 0.5).unwrap(),
+            (0.0, 5.0),
+        );
+        close(
+            intermediate_point(0.0, 0.0, 20.0, 0.0, 0.25).unwrap(),
+            (5.0, 0.0),
+        );
+        // The antimeridian seam (170,10 → −170,20): the short way crosses
+        // ±180, never the Greenwich meridian, and wraps into (−180, 180].
+        let (lon, lat) = intermediate_point(170.0, 10.0, -170.0, 20.0, 0.5).unwrap();
+        assert!(lon.abs() > 175.0, "midpoint crosses the seam, got {lon}");
+        assert!((14.0..16.0).contains(&lat), "lat {lat}");
+        close(
+            intermediate_point(179.0, 0.0, -179.0, 0.0, 0.75).unwrap(),
+            (-179.5, 0.0),
+        );
+        // Off the equator a great circle bulges poleward of the rhumb line,
+        // and its midpoint is equidistant from both ends.
+        let mid = intermediate_point(0.0, 60.0, 90.0, 60.0, 0.5).unwrap();
+        assert!(mid.1 > 60.0, "poleward bulge, got {mid:?}");
+        let (d0, d1) = (
+            great_circle_distance_m(0.0, 60.0, mid.0, mid.1),
+            great_circle_distance_m(90.0, 60.0, mid.0, mid.1),
+        );
+        assert!((d0 - d1).abs() < 1e-3, "{d0} vs {d1}");
+        // Antipodal endpoints define no single path; coincident ones do.
+        assert!(intermediate_point(0.0, 0.0, 180.0, 0.0, 0.5).is_none());
+        close(
+            intermediate_point(5.0, 5.0, 5.0, 5.0, 0.5).unwrap(),
+            (5.0, 5.0),
+        );
     }
 
     #[test]
