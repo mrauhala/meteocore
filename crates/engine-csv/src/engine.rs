@@ -49,7 +49,8 @@ impl CsvEngine {
     }
 
     /// Whether `location_id` has an observation row inside `interval`
-    /// (open bounds are unbounded).
+    /// (open bounds are unbounded): the one `datetime` rule of Features
+    /// `/items` and EDR `/locations` (#682, #932).
     fn has_rows_in(
         &self,
         location_id: &str,
@@ -209,6 +210,19 @@ impl EdrEngine for CsvEngine {
         }
 
         Ok(locations)
+    }
+
+    /// `/locations?datetime=` (#932): stations with an observation row in
+    /// one of the intervals, the Features `datetime` rule (#682).
+    fn location_time_filter<'a>(
+        &'a self,
+        intervals: &'a [ds_core::feature::DatetimeInterval],
+    ) -> Option<ds_core::edr_engine::LocationFilter<'a>> {
+        Some(Box::new(move |location| {
+            intervals
+                .iter()
+                .any(|interval| self.has_rows_in(&location.id, interval))
+        }))
     }
 
     fn query_location(

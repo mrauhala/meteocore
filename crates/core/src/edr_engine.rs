@@ -4,13 +4,40 @@ use chrono::{DateTime, Utc};
 
 use crate::cube::CubeResolution;
 use crate::error::DataServerError;
-use crate::feature::Bbox;
+use crate::feature::{Bbox, DatetimeInterval};
 use crate::instances::RunInfo;
 use crate::model::{CoverageResponse, Location, ParameterDescription};
 use crate::vertical::VerticalDimension;
 
+/// A predicate over [`EdrEngine::get_locations`] entries: `true` keeps the
+/// location in a `/locations?datetime=` list (#932). It may hold a read
+/// guard on the engine's index for as long as it lives.
+pub type LocationFilter<'a> = Box<dyn Fn(&Location) -> bool + 'a>;
+
 pub trait EdrEngine: Send + Sync {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
+
+    /// The `datetime` filter of the `/locations` list (#932): a predicate
+    /// that is `true` for a location with at least one observation inside
+    /// one of `intervals`, both ends included and an open end unbounded.
+    /// That is the rule station `FeatureEngine`s apply to `datetime` (#682),
+    /// so share their code: `/locations` and `/items` must list the same
+    /// stations. A `datetime` list arrives as one instant interval
+    /// (`start == end`) per element, each matched exactly; no interval is
+    /// reversed.
+    ///
+    /// The API builds it once per request on the EDR query executor, after
+    /// [`Self::get_locations`], and calls it for every listed location: read
+    /// in-memory indexes only, no storage or database I/O.
+    ///
+    /// Default `None`: the engine cannot tell when a location has data, and
+    /// the API answers `datetime` with a 400 rather than an unfiltered list.
+    fn location_time_filter<'a>(
+        &'a self,
+        _intervals: &'a [DatetimeInterval],
+    ) -> Option<LocationFilter<'a>> {
+        None
+    }
 
     /// The forecast model runs this engine exposes as OGC API - EDR
     /// *instances*, ascending by reference time (latest last).

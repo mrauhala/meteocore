@@ -233,6 +233,9 @@ and never under an instance.
   annex's "repetitions" reading is the outlier); the duration goes through
   `ds_core::datetime::parse_iso8601_duration`, which rejects years and
   months and must stay overflow-safe, since request input reaches it.
+- An interval that ends before it starts is a 400 in `parse_datetime`, on
+  every route (#932), as in Features, Maps and Tiles. Before, it reached the
+  engines: CSV and BUFR `BTreeMap::range` panic on a reversed range.
 
 ## Caching headers (#499)
 
@@ -285,10 +288,26 @@ coverages only); position also truncates the point list before dispatch, which
 is safe because an answered point always yields at least one coverage. A new
 data-query route must do the same and list `#/components/parameters/limit` in
 `api_definition()` — unless EDR 1.2 defines no `limit` for its query type
-(trajectory, cube): then a `limit` is a 400, never silently ignored. `/locations` without `limit` must stay byte-identical to
+(trajectory, cube): then a `limit` is a 400, never silently ignored. `/locations` without `limit` or a filter must stay byte-identical to
 the unpaged inventory (clients and ETags rely on it); with `limit` it pages
 through `ds_core::collection_search::page_window`, the `/collections`
 arithmetic, under the same `location_budget` writer.
+
+`params::parse_locations_query` is the one `/locations` parser (#932).
+`bbox` (`parse_cube_bbox`, heights dropped), then `datetime`, filter the
+`get_locations()` result in place before paging, so `numberMatched` and the
+links count the filtered list; an unpaged filtered list gets a `self` link
+carrying its query. `datetime` is the engine's answer:
+`EdrEngine::location_time_filter` takes `DatetimeSelector::intervals()` (open
+ends unbounded, a list as one instant interval each) and returns a predicate,
+built on the executor after `get_locations` (it may hold a read guard) and
+called per location. Its rule is the Features one (#682): at least one
+observation in an interval, from the same engine code as `/items`, so the
+two list the same stations (CSV `has_rows_in`, BUFR `has_report_in`, ODIM
+PVOL site views the network's `any_time_in_interval` over volume times).
+The default `None` (PostGIS stations, every gridded engine) is a 400 naming
+the collection, never the unfiltered list. A new station engine implements
+it from in-memory indexes, never storage or SQL per request.
 
 ## Location lists (EDR 1.2, #923)
 

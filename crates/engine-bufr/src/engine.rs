@@ -13,8 +13,8 @@ use ds_core::config::{BufrConfig, Wis2Config};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
-    check_mask_budget, parse_area_coords, parse_point_coords, sort_features, Feature, FeaturePage,
-    FeatureQuery,
+    check_mask_budget, parse_area_coords, parse_point_coords, sort_features, DatetimeInterval,
+    Feature, FeaturePage, FeatureQuery,
 };
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::geo::great_circle_distance_m;
@@ -29,7 +29,7 @@ use crate::health::Health;
 use crate::metadata::Snapshot;
 use crate::params::ParameterTable;
 use crate::source::LocalSource;
-use crate::store::{Ingest, ObsStore};
+use crate::store::{Ingest, ObsStore, StationInfo};
 use crate::wis2::Wis2Source;
 
 /// Stations an `area` query may touch (the postgis convention).
@@ -465,6 +465,30 @@ impl BufrEngine {
     }
 }
 
+/// Whether `station` has at least one report INSIDE `interval`: the one
+/// `datetime` rule of Features `/items` and EDR `/locations` (#682, #932).
+/// `[first_report, last_report]` overlapping the interval is only the cheap
+/// prefilter (hourly SYNOP leaves gaps a narrow window can fall into); the
+/// rows themselves decide, one BTreeMap range probe. A reversed interval
+/// matches nothing (the API layers reject one; `range` would panic on it).
+fn has_report_in(store: &ObsStore, station: &StationInfo, interval: &DatetimeInterval) -> bool {
+    if let (Some(start), Some(end)) = (interval.start, interval.end) {
+        if start > end {
+            return false;
+        }
+    }
+    let overlaps = interval
+        .start
+        .is_none_or(|start| station.last_report >= start)
+        && interval.end.is_none_or(|end| station.first_report <= end);
+    overlaps
+        && store.get(&station.id).is_some_and(|series| {
+            let lo = interval.start.map_or(Bound::Unbounded, Bound::Included);
+            let hi = interval.end.map_or(Bound::Unbounded, Bound::Included);
+            series.rows.range((lo, hi)).next().is_some()
+        })
+}
+
 /// Rows are `f32` (BUFR values carry at most ~7 significant digits); widen
 /// back to the decimal the producer encoded rather than the binary
 /// expansion (`290.12`, not `290.1199951171875`).
@@ -479,6 +503,28 @@ fn round_stored(v: f32) -> f64 {
 impl ds_core::edr_engine::EdrEngine for BufrEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(self.snapshot.load().locations.as_ref().clone())
+    }
+
+    /// `/locations?datetime=` (#932): stations with a report inside one of
+    /// the intervals, the Features `datetime` rule (`has_report_in`). Holds
+    /// the store's read lock while the API filters the list, as one
+    /// `get_features` does.
+    fn location_time_filter<'a>(
+        &'a self,
+        intervals: &'a [DatetimeInterval],
+    ) -> Option<ds_core::edr_engine::LocationFilter<'a>> {
+        let snap = self.snapshot.load_full();
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+        Some(Box::new(move |location| {
+            snap.index
+                .get(location.id.as_str())
+                .and_then(|&i| snap.stations.get(i))
+                .is_some_and(|station| {
+                    intervals
+                        .iter()
+                        .any(|interval| has_report_in(&store, station, interval))
+                })
+        }))
     }
 
     fn query_location(
@@ -627,10 +673,8 @@ impl FeatureEngine for BufrEngine {
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let snap = self.snapshot.load();
         // `datetime`: a station matches when it has at least one report
-        // INSIDE the interval — `[first_report, last_report]` overlapping the
-        // interval is only the cheap prefilter (hourly SYNOP leaves gaps a
-        // narrow window can fall into), the rows themselves decide. One read
-        // lock for the whole filter; a BTreeMap range probe per candidate.
+        // inside the interval (`has_report_in`). One read lock for the whole
+        // filter.
         let store = query
             .datetime
             .as_ref()
@@ -644,16 +688,7 @@ impl FeatureEngine for BufrEngine {
                 None => true,
             })
             .filter(|(_, s)| match (&query.datetime, &store) {
-                (Some(dt), Some(store)) => {
-                    let overlaps = dt.start.is_none_or(|start| s.last_report >= start)
-                        && dt.end.is_none_or(|end| s.first_report <= end);
-                    overlaps
-                        && store.get(&s.id).is_some_and(|series| {
-                            let lo = dt.start.map_or(Bound::Unbounded, Bound::Included);
-                            let hi = dt.end.map_or(Bound::Unbounded, Bound::Included);
-                            series.rows.range((lo, hi)).next().is_some()
-                        })
-                }
+                (Some(dt), Some(store)) => has_report_in(store, s, dt),
                 _ => true,
             })
             .filter(|(f, _)| ds_core::feature::matches_property_filters(f, &query.property_filters))

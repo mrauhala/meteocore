@@ -4400,6 +4400,27 @@ impl EdrEngine for PolarVolumeSiteView {
         }])
     }
 
+    /// `/locations?datetime=` (#932): the site when one of its volumes falls
+    /// inside one of the intervals. The network's Features `datetime` rule
+    /// (`any_time_in_interval`, #285/#682) over the same volume times that
+    /// span the collection's temporal extent, and the volumes
+    /// `query_location` would answer with: a window between two volumes
+    /// matches nothing, as `/locations/{nod}` would answer 404 there.
+    fn location_time_filter<'a>(
+        &'a self,
+        intervals: &'a [DatetimeInterval],
+    ) -> Option<ds_core::edr_engine::LocationFilter<'a>> {
+        let catalog = self.catalog.load();
+        let has_volume = catalog.by_site_meta.get(&self.nod).is_some_and(|m| {
+            intervals
+                .iter()
+                .any(|interval| any_time_in_interval(&m.times, interval))
+        });
+        Some(Box::new(move |location| {
+            has_volume && location.id == self.nod
+        }))
+    }
+
     /// Query this radar site by NOD code. The only valid `location_id` is
     /// the view's own `nod`; any other is `LocationNotFound`.
     fn query_location(
@@ -6623,6 +6644,65 @@ mod tests {
         assert_eq!(locs.len(), 1, "a per-site collection has one location");
         assert_eq!(locs[0].id, "fivih");
         assert_eq!(locs[0].label, "Test Site");
+    }
+
+    /// `/locations?datetime=` on a per-site view (#932): the site is listed
+    /// when one of its volumes falls inside an interval — inside the
+    /// collection's temporal extent alone is not enough — and each instant of
+    /// a list must be a volume time.
+    #[test]
+    fn site_view_location_time_filter_matches_volume_times() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let mut early = synthetic_volume(25.0, 60.0);
+        early.time = t("2026-07-05T00:00:00Z");
+        let mut late = synthetic_volume(25.0, 60.0);
+        late.time = t("2026-07-05T06:00:00Z");
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(early, "e"), entry(late, "l")],
+        );
+        let view = site_view_for(by_site, "fivih");
+        assert_eq!(
+            EdrEngine::get_temporal_extent(&view),
+            Some((t("2026-07-05T00:00:00Z"), t("2026-07-05T06:00:00Z")))
+        );
+        let site = EdrEngine::get_locations(&view).unwrap().remove(0);
+        let other = Location {
+            id: "fianj".into(),
+            ..site.clone()
+        };
+        let window = |start: Option<&str>, end: Option<&str>| DatetimeInterval {
+            start: start.map(t),
+            end: end.map(t),
+        };
+        let at = |s: &str| window(Some(s), Some(s));
+        let listed = |intervals: &[DatetimeInterval]| {
+            let keep = EdrEngine::location_time_filter(&view, intervals).expect("a site has times");
+            assert!(!keep(&other), "only the view's own site");
+            keep(&site)
+        };
+        assert!(listed(&[at("2026-07-05T06:00:00Z")]));
+        assert!(!listed(&[at("2026-07-05T03:00:00Z")]), "between volumes");
+        assert!(listed(&[window(
+            Some("2026-07-05T05:00:00Z"),
+            Some("2026-07-05T07:00:00Z")
+        )]));
+        assert!(!listed(&[window(
+            Some("2026-07-05T01:00:00Z"),
+            Some("2026-07-05T05:00:00Z")
+        )]));
+        assert!(listed(&[window(None, Some("2026-07-05T00:00:00Z"))]));
+        assert!(!listed(&[window(Some("2026-07-05T06:00:01Z"), None)]));
+        assert!(listed(&[window(None, None)]));
+        assert!(listed(&[
+            at("2026-07-05T03:00:00Z"),
+            at("2026-07-05T00:00:00Z")
+        ]));
+        assert!(!listed(&[
+            at("2026-07-05T03:00:00Z"),
+            at("2026-07-05T09:00:00Z")
+        ]));
     }
 
     /// The per-site view renders with a bare-quantity parameter, and
