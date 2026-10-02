@@ -16,7 +16,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
-use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindSource};
+use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
 
 use crate::parse::QueryData;
 
@@ -888,7 +888,11 @@ fn wind_facts(data: &QueryData) -> WindFacts {
                 let name = map_name(&p.name);
                 ParameterFacts {
                     edr_name: (name != p.name).then(|| p.name.clone()),
-                    fmi_param: Some(p.id),
+                    // Only a wind number asserts a role. Any other id says
+                    // nothing about wind, so the name may still pair it by
+                    // the source vocabulary (`10u`/`10v` from a converter
+                    // that kept GRIB short names but not FMI's numbers).
+                    fmi_param: WindRole::from_fmi_param(p.id).map(|_| p.id),
                     // newbase's convention, see above.
                     frame: VectorFrame::Grid,
                     ..ParameterFacts::new(name)

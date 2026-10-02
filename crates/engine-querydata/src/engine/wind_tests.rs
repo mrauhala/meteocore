@@ -236,3 +236,23 @@ fn ecmwf_short_names_keep_their_full_edr_names() {
     let v = components.ranges["10 metre V wind component (10v)"].values[0].unwrap();
     assert_eq!(derived.ranges["10si"].values[0], Some(u.hypot(v)));
 }
+
+/// A pair named in a source vocabulary pairs by name when its FMI numbers
+/// are not wind numbers: a non-wind id asserts nothing about wind, so it
+/// must not block the vocabulary fallback.
+#[test]
+fn vocabulary_names_pair_without_fmi_wind_numbers() {
+    let fixture = Fixture::new(
+        KENYA,
+        &[
+            (MSL, b"\n98\n31 10 metre U wind component (10u)\n"),
+            (T2M, b"\n99\n31 10 metre V wind component (10v)\n"),
+        ],
+    );
+    let (_, wind, logged) = wrap(&fixture);
+    assert_eq!(
+        logged,
+        ["qd: 10u/10v: derived speed '10si' and direction '10wdir'"]
+    );
+    assert!(map_names(&wind).contains(&"10si".to_string()));
+}
