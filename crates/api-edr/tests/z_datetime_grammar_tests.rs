@@ -5,7 +5,8 @@
 //! `z` against a collection without a vertical extent is ignored (EDR 1.2
 //! `/req/edr/z-response` A) on every query route, open and recurring `z`
 //! intervals resolve against a vertical collection's levels, and a
-//! `datetime` list runs one query per instant and merges the answers.
+//! `datetime` list, or the repeating interval `Rn/date-time/duration` that
+//! expands to one (#933), runs one query per instant and merges the answers.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -447,6 +448,93 @@ async fn multipoint_times_datetime_list_is_capped() {
         .collect::<Vec<_>>()
         .join(",");
     let uri = format!("/collections/flat/position?coords=MULTIPOINT({points})&datetime={instants}");
+    let (status, body, _) = get(&app, &uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("320 position lookups"), "{body}");
+    assert!(flat.calls().is_empty(), "rejected before any engine call");
+}
+
+/// A repeating interval `R3/T/PT1H` (#933) is the list of its three
+/// instants: on every data route it makes the same engine calls and gets
+/// the same response, status, body and `Cache-Control`, as the list
+/// `T,T+1h,T+2h` — including the instant without data dropping out.
+#[tokio::test]
+async fn repeating_datetime_answers_like_the_equivalent_list() {
+    let (flat, levels) = (Recorder::new(false), Recorder::new(true));
+    let app = router(&flat, &levels);
+    let repeating = "R3/2024-01-01T01:00:00Z/PT1H";
+    let list = "2024-01-01T01:00:00Z,2024-01-01T02:00:00Z,2024-01-01T03:00:00Z";
+    let templates = [
+        "/collections/flat/locations/site?datetime={dt}",
+        "/collections/flat/position?coords=POINT(24%2060)&datetime={dt}",
+        "/collections/flat/position?coords=MULTIPOINT((24%2060),(25%2061))&datetime={dt}",
+        "/collections/flat/area?coords=POLYGON((23%2059,25%2059,25%2061,23%2061,23%2059))&datetime={dt}",
+        "/collections/flat/radius?coords=POINT(24%2060)&within=10&within-units=km&datetime={dt}",
+        "/collections/flat/trajectory?coords=LINESTRING(24%2060,25%2061)&datetime={dt}",
+        "/collections/flat/instances/20240101T0000Z/position?coords=POINT(24%2060)&datetime={dt}",
+    ];
+    for template in templates {
+        flat.clear();
+        let uri = template.replace("{dt}", repeating);
+        let got = get(&app, &uri).await;
+        let got_calls = flat.calls();
+        flat.clear();
+        let want = get(&app, &template.replace("{dt}", list)).await;
+        assert_eq!(got_calls, flat.calls(), "{uri}");
+        assert_eq!(got, want, "{uri}");
+        assert_eq!(got.0, StatusCode::OK, "{uri}: {}", got.1);
+    }
+    // The position answer itself: one series over the instants with data.
+    let (_, body, _) = get(
+        &app,
+        &format!("/collections/flat/position?coords=POINT(24%2060)&datetime={repeating}"),
+    )
+    .await;
+    assert_eq!(
+        body["domain"]["axes"]["t"]["values"],
+        serde_json::json!([at(1).to_rfc3339(), at(3).to_rfc3339()]),
+        "{body}"
+    );
+    assert_eq!(
+        body["ranges"]["temperature"]["values"],
+        serde_json::json!([1.0, 3.0]),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_repeating_datetimes_are_400() {
+    let (flat, levels) = (Recorder::new(false), Recorder::new(true));
+    let app = router(&flat, &levels);
+    for (value, fragment) in [
+        ("R0/2024-01-01T00:00:00Z/PT1H", "R0"),
+        ("R/2024-01-01T00:00:00Z/PT1H", "unbounded"),
+        ("R17/2024-01-01T00:00:00Z/PT1H", "the maximum is 16"),
+        ("R3/2024-01-01T00:00:00Z/PT0S", "zero or negative"),
+        ("R3/2024-01-01T00:00:00Z/P1M", "months"),
+        ("R3/2024-01-01T00:00:00Z", "Rn/date-time/duration"),
+        ("R3/PT1H/2024-01-01T00:00:00Z", "RFC 3339"),
+    ] {
+        let uri = format!("/collections/flat/position?coords=POINT(24%2060)&datetime={value}");
+        let (status, body, _) = get(&app, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {body}");
+        let description = body["description"].as_str().unwrap_or_default();
+        assert!(description.contains(fragment), "{value}: {body}");
+    }
+    assert!(
+        flat.calls().is_empty(),
+        "no engine call for a malformed value"
+    );
+
+    // The expanded instants count toward MULTIPOINT points × instants, as a
+    // list's do: 20 points × R16 is 320 lookups.
+    let points = (0..20)
+        .map(|i| format!("{}%20{}", 20 + i % 10, 60 + i / 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    let uri = format!(
+        "/collections/flat/position?coords=MULTIPOINT({points})&datetime=R16/2024-01-01T00:00:00Z/PT1M"
+    );
     let (status, body, _) = get(&app, &uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("320 position lookups"), "{body}");
