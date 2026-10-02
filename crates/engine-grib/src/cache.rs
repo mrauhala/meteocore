@@ -64,6 +64,9 @@ pub struct DecodedGrid {
     /// Units depend on `first_surface_type` (see WMO Code Table 4.5):
     /// 100 → Pa, 103 → m, 107 → K, etc.
     pub first_surface_value: Option<f64>,
+    /// Which way the message's vector components point: GRIB2 flag table
+    /// 3.3 bit 5 of Section 3 (#897).
+    pub uv_frame: ds_core::wind::VectorFrame,
 }
 
 /// Native grid selection without allocating its values. Area queries validate
@@ -738,6 +741,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let row = |grid: &DecodedGrid, bbox: [f64; 4]| {
             grid.resample(bbox, 20, 1, &OutputCrs::Wgs84)
@@ -780,6 +784,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         }
     }
 
@@ -848,6 +853,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
         // Western Europe, straddling the Greenwich meridian.
@@ -891,6 +897,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
         let bbox = [4_096_000.0, 7_168_000.0, 5_120_000.0, 8_192_000.0];
@@ -986,6 +993,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         }
     }
 
@@ -1094,6 +1102,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let (x, _, v) = g.extract_bbox([359.75, 0.0, 360.25, 0.0]).expect("seam");
         assert_eq!(x, vec![359.75, 360.0, 360.25]);

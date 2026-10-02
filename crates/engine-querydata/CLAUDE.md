@@ -46,5 +46,23 @@ runtime).
   is memory mapped, so there is no I/O to group. No vertical axis: a Z
   coordinate is ignored.
 - Missing-value sentinel: `32700.0`.
+- **Names:** EDR uses the full descriptor (`2 Metre Temperature (2t)`), the
+  map APIs the short name in parentheses (`2t`, `map_name`).
+- **Wind (#897):** `wind_facts` reports each parameter's FMI number and both
+  names, built with the run set. `ds_core::wind` pairs `kFmiWindUMS` /
+  `kFmiWindVMS` (23/24), or vocabulary short names, into `WindSpeedMS` (or
+  e.g. `10si`), plus `WindDirection` where the frame allows. The format
+  carries **no u/v frame flag** (not in the header, the parameter
+  descriptors or the area classes), so the frame is FMI newbase's
+  convention: **u/v are relative to the data's own grid**
+  (`VectorFrame::Grid`). Its basis is smartmet-library-newbase
+  `newbase/NFmiFastQueryInfo.cpp`, `NFmiFastQueryInfo::DoWindComponentFix`:
+  reprojecting `kFmiWindUMS`/`kFmiWindVMS` onto another grid, it turns them
+  by the difference of the two areas' `NFmiArea::TrueNorthAzimuth`
+  (`GridValues`/`PressureValues`/`HeightValues` with `relative_uv`).
+  `gribtoqd` copies GRIB components without reading their flag. On a
+  lat/lon area grid-relative is earth-relative: speed and direction. On
+  LCC, stereographic and rotated lat/lon areas (`GridAxes::Rotated`) speed
+  only, until `ds_core::wind` can turn components to true north.
 - Config: `wms_parameter`, `poll_interval_secs` (default 30), `max_runs`
   (default 4; set 1 for latest-only).

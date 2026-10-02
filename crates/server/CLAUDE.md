@@ -121,6 +121,19 @@ disk, no TOML needed.
   the asymmetry explicit, naming the watched dirs. Keep them writable only by
   trusted principals; avoid shared/NFS mounts for them.
 
+## Derived wind (#897)
+
+`wind_wrapped` registers grib/querydata/zarr engines (each GRIB level view
+too) wrapped in `ds_core::wind::DerivedWind` unless the collection sets
+`derive_wind = false`; styles are resolved from the wrapper's `RasterInfo`,
+so a derived speed layer gets the built-in `wind_speed` default. The
+wrapper logs one INFO line per u/v pair (`Collection 'x': wind u/v: …`) at
+load and when a pair's outcome changes. Wrappers live in
+`LoadResult::wind_by_id` / `ServerState::wind_handles` (configured id →
+registered id): a reused engine keeps its wrappers through `EngineReuse::wind`,
+so the registered `Arc` is the same after an incremental reload (a nowcast
+compares its source by identity) and the load log is not repeated.
+
 ## Reverse-proxy base URL (`trust_proxy_headers`, #12)
 
 Absolute self-links (landing pages, `collections`, GeoJSON `links`, WMS

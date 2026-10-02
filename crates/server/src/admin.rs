@@ -1511,6 +1511,9 @@ pub struct ServerState {
     /// Live poll-loop engines by collection id — the reuse pool the next
     /// incremental reload draws from (#574).
     pub engine_handles: RwLock<HashMap<String, EngineHandle>>,
+    /// Live derived-wind wrappers (#897), keyed like
+    /// [`LoadResult::wind_by_id`]: a reused engine keeps its wrapper.
+    pub wind_handles: RwLock<WindHandles>,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -1542,7 +1545,13 @@ pub struct LoadResult {
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
     pub engines_by_id: HashMap<String, EngineHandle>,
+    /// Every derived-wind wrapper (#897) by configured collection id, then
+    /// by registered id (a GRIB source registers one per level family).
+    pub wind_by_id: WindHandles,
 }
+
+/// Derived-wind wrappers by configured collection id, then registered id.
+pub type WindHandles = HashMap<String, HashMap<String, Arc<ds_core::wind::DerivedWind>>>;
 
 impl LoadResult {
     /// Staging a load must not mutate live engines: call only after the reload
@@ -1627,6 +1636,10 @@ impl EngineHandle {
 #[derive(Default)]
 pub struct EngineReuse {
     pub engines: HashMap<String, EngineHandle>,
+    /// The derived-wind wrappers of those engines (#897). A reused engine
+    /// keeps them: the registered `Arc` stays the same (a nowcast's source
+    /// identity), and the once-per-pair load log is not repeated.
+    pub wind: WindHandles,
 }
 
 macro_rules! reuse_take {
@@ -1848,6 +1861,7 @@ pub fn load_collections(
     // Reuse pool for the NEXT reload: every poll-loop engine that made it
     // into this load, whether freshly built or taken from `engine_reuse`.
     let mut engines_by_id: HashMap<String, EngineHandle> = HashMap::new();
+    let mut wind_by_id: WindHandles = HashMap::new();
     let mut nowcast_dependency_updates = Vec::new();
 
     for collection in collections {
@@ -2211,8 +2225,10 @@ pub fn load_collections(
                 let poll_secs = qd_config.map_or(30, |c| c.poll_interval_secs);
                 let max_runs = qd_config.map_or(4, |c| c.max_runs);
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_querydata(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
@@ -2250,15 +2266,21 @@ pub fn load_collections(
 
                 querydata_engines.push(engine.clone());
 
+                let (map_engine, edr_engine) = wind_wrapped(
+                    &collection.id,
+                    collection,
+                    &engine,
+                    reused_engine,
+                    &mut engine_reuse,
+                    &mut wind_by_id,
+                );
+
                 // Get parameter list for per-parameter-layer styles
-                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                let raster_info = map_engine.raster_info();
                 let raster_params = raster_info.parameters;
 
                 if collection.apis.contains(&"edr".to_string()) {
-                    edr_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                    );
+                    edr_engines.insert(collection.id.clone(), edr_engine.clone());
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2270,10 +2292,7 @@ pub fn load_collections(
                 }
 
                 if collection.apis.contains(&"wms".to_string()) {
-                    map_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    map_engines.insert(collection.id.clone(), map_engine.clone());
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2285,10 +2304,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
-                    maps_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    maps_engines.insert(collection.id.clone(), map_engine.clone());
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2300,10 +2316,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    tiles_engines.insert(collection.id.clone(), map_engine.clone());
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2349,8 +2362,10 @@ pub fn load_collections(
                     }
                 };
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_grib(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
@@ -2407,6 +2422,7 @@ pub fn load_collections(
                         ),
                     });
                 }
+                let source_id = collection.id.clone();
                 for engine in views {
                     let mut view_config = collection.clone();
                     if let Some(family) = engine.level_type() {
@@ -2416,15 +2432,20 @@ pub fn load_collections(
                             format!("{} ({})", collection.description, family.label());
                     }
                     let collection = &view_config;
+                    let (map_engine, edr_engine) = wind_wrapped(
+                        &source_id,
+                        collection,
+                        &engine,
+                        reused_engine,
+                        &mut engine_reuse,
+                        &mut wind_by_id,
+                    );
                     // Get parameter list for per-parameter-layer styles
-                    let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                    let raster_info = map_engine.raster_info();
                     let raster_params = raster_info.parameters;
 
                     if collection.apis.contains(&"edr".to_string()) {
-                        edr_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                        );
+                        edr_engines.insert(collection.id.clone(), edr_engine.clone());
                         edr_collections.insert(collection.id.clone(), collection.clone());
                         edr_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2436,10 +2457,7 @@ pub fn load_collections(
                     }
 
                     if collection.apis.contains(&"wms".to_string()) {
-                        map_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
+                        map_engines.insert(collection.id.clone(), map_engine.clone());
                         map_collections.insert(collection.id.clone(), collection.clone());
                         map_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2451,10 +2469,7 @@ pub fn load_collections(
                         info!("Collection '{}': wired to WMS API", collection.id);
                     }
                     if collection.apis.contains(&"maps".to_string()) {
-                        maps_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
+                        maps_engines.insert(collection.id.clone(), map_engine.clone());
                         maps_collections.insert(collection.id.clone(), collection.clone());
                         maps_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2466,10 +2481,7 @@ pub fn load_collections(
                         info!("Collection '{}': wired to Maps API", collection.id);
                     }
                     if collection.apis.contains(&"tiles".to_string()) {
-                        tiles_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
+                        tiles_engines.insert(collection.id.clone(), map_engine.clone());
                         tiles_collections.insert(collection.id.clone(), collection.clone());
                         tiles_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2518,8 +2530,10 @@ pub fn load_collections(
                     }
                 };
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_zarr(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
@@ -2557,16 +2571,22 @@ pub fn load_collections(
 
                 zarr_engines.push(engine.clone());
 
+                let (map_engine, edr_engine) = wind_wrapped(
+                    &collection.id,
+                    collection,
+                    &engine,
+                    reused_engine,
+                    &mut engine_reuse,
+                    &mut wind_by_id,
+                );
+
                 // Per-parameter-layer styles (one WMS/Maps/Tiles layer per Zarr
-                // variable).
-                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                // variable, and per derived wind speed).
+                let raster_info = map_engine.raster_info();
                 let raster_params = raster_info.parameters;
 
                 if collection.apis.contains(&"edr".to_string()) {
-                    edr_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                    );
+                    edr_engines.insert(collection.id.clone(), edr_engine.clone());
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2579,10 +2599,7 @@ pub fn load_collections(
                 }
 
                 if collection.apis.contains(&"wms".to_string()) {
-                    map_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    map_engines.insert(collection.id.clone(), map_engine.clone());
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2594,10 +2611,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
-                    maps_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    maps_engines.insert(collection.id.clone(), map_engine.clone());
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2609,10 +2623,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    tiles_engines.insert(collection.id.clone(), map_engine.clone());
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -4067,7 +4078,68 @@ pub fn load_collections(
         nowcast_engines,
         nowcast_dependency_updates,
         engines_by_id,
+        wind_by_id,
     }
+}
+
+/// The `MapEngine` and `EdrEngine` a collection registers (#897): its engine
+/// wrapped in [`ds_core::wind::DerivedWind`], which adds wind speed and
+/// direction derived from u/v components, or the engine itself when the
+/// collection opts out (`derive_wind = false`).
+///
+/// A reused engine (`reused_engine`) keeps its wrapper: the registered `Arc`
+/// then survives an incremental reload like the engine does (a nowcast
+/// checks its source's identity), and the per-pair load log is not
+/// repeated. A GRIB source registers one wrapper per level family, all
+/// under its configured collection id (`source_id`) in `built`.
+fn wind_wrapped<E>(
+    source_id: &str,
+    collection: &CollectionConfig,
+    engine: &Arc<E>,
+    reused_engine: bool,
+    reuse: &mut EngineReuse,
+    built: &mut WindHandles,
+) -> (
+    Arc<dyn ds_core::map_engine::MapEngine>,
+    Arc<dyn ds_core::edr_engine::EdrEngine>,
+)
+where
+    E: ds_core::map_engine::MapEngine
+        + ds_core::edr_engine::EdrEngine
+        + ds_core::wind::WindSource
+        + 'static,
+{
+    if !collection.derives_wind() {
+        return (engine.clone(), engine.clone());
+    }
+    let reused = reused_engine
+        .then(|| {
+            reuse
+                .wind
+                .get_mut(source_id)
+                .and_then(|views| views.remove(&collection.id))
+        })
+        .flatten();
+    let wind = reused.unwrap_or_else(|| {
+        Arc::new(ds_core::wind::DerivedWind::new(
+            collection.id.clone(),
+            engine.clone(),
+            wind_log(),
+        ))
+    });
+    built
+        .entry(source_id.to_string())
+        .or_default()
+        .insert(collection.id.clone(), wind.clone());
+    (wind.clone(), wind)
+}
+
+/// The derived-wind load log (#897): one line per u/v pair, saying what was
+/// derived, or what was not and why.
+fn wind_log() -> ds_core::wind::OutcomeLog {
+    Arc::new(|collection: &str, outcome: &ds_core::wind::PairOutcome| {
+        info!("Collection '{collection}': wind {outcome}");
+    })
 }
 
 /// Legacy-behavior fallback when style resolution fails despite config
@@ -4728,6 +4800,14 @@ fn apply_load(
             .filter(|(id, _)| reusable.contains(id.as_str()))
             .map(|(id, e)| (id.clone(), e.clone()))
             .collect(),
+        wind: state
+            .wind_handles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(id, _)| reusable.contains(id.as_str()))
+            .map(|(id, w)| (id.clone(), w.clone()))
+            .collect(),
     };
     info!(
         "Incremental reload: {} of {} configured collection(s) unchanged — reusing their live engines",
@@ -4993,6 +5073,10 @@ fn apply_load(
         .engine_handles
         .write()
         .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut result.engines_by_id);
+    *state
+        .wind_handles
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut result.wind_by_id);
 
     *state
         .accepted_load
@@ -6279,6 +6363,7 @@ mod tests {
                 radar_source: None,
             }),
             preview: None,
+            derive_wind: None,
         }
     }
 
@@ -6363,6 +6448,97 @@ mod tests {
         }
     }
 
+    /// #897: u/v components give a derived speed on every API, styled with
+    /// the built-in `wind_speed` default; a collection opts out with
+    /// `derive_wind = false`; a reused engine keeps its wrapper. The
+    /// direction is EDR only. No committed `.sqd` carries wind: the Kenya
+    /// (lat/lon) fixture's msl and 2t become FMI's u and v (newbase
+    /// `kFmiWindUMS = 23`, `kFmiWindVMS = 24`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derived_wind_is_registered_styled_reused_and_opted_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "202604042019_202604040600_ecmwf_kenya_surface.sqd";
+        let mut bytes = std::fs::read(format!("../../testdata/ecmwf-kenya/{name}")).unwrap();
+        for (from, to) in [
+            (
+                &b"\n1\n29 Mean Sea Level Pressure (msl)\n"[..],
+                &b"\n23\n7 WindUMS\n"[..],
+            ),
+            (b"\n4\n24 2 Metre Temperature (2t)\n", b"\n24\n7 WindVMS\n"),
+        ] {
+            let at = bytes.windows(from.len()).position(|w| w == from).unwrap();
+            bytes.splice(at..at + from.len(), to.iter().copied());
+        }
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+        let collection = |derive_wind: Option<bool>| -> CollectionConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": "kenya", "title": "Kenya", "description": "u/v",
+                "engine_type": "querydata", "apis": ["edr", "wms", "maps", "tiles"],
+                "data_path": dir.path(), "derive_wind": derive_wind,
+            }))
+            .unwrap()
+        };
+        let load = |collection: CollectionConfig, reuse| {
+            super::load_collections(
+                &ds_render::StyleContext::with_builtins(),
+                &[collection],
+                &[],
+                "http://x",
+                false,
+                0,
+                super::ReusableCaches::default(),
+                reuse,
+            )
+        };
+        let has = |engine: &Arc<dyn ds_core::map_engine::MapEngine>, name: &str| {
+            engine
+                .raster_info()
+                .parameters
+                .iter()
+                .any(|p| p.name == name)
+        };
+
+        let result = load(collection(None), super::EngineReuse::default());
+        for engines in [
+            &result.wms_state.engines,
+            &result.maps_state.engines,
+            &result.tiles_state.map_engines,
+        ] {
+            assert!(has(&engines["kenya"], "WindSpeedMS"));
+            assert!(!has(&engines["kenya"], "WindDirection"));
+        }
+        let speed = &result.wms_state.styles["kenya/WindSpeedMS"]["default"];
+        assert_eq!(speed.palette.name, "wind_speed");
+        assert_eq!((speed.min, speed.max), (0.0, 40.0));
+        let edr = result.edr_state.engines["kenya"].get_parameters();
+        assert!(edr.contains(&"WindSpeedMS".to_string()));
+        assert!(edr.contains(&"WindDirection".to_string()));
+        assert_eq!(result.wind_by_id["kenya"].len(), 1);
+
+        // A reused engine keeps its wrapper: one registered Arc throughout.
+        let reused = load(
+            collection(None),
+            super::EngineReuse {
+                engines: result.engines_by_id.clone(),
+                wind: result.wind_by_id.clone(),
+            },
+        );
+        let ptr = |e: &Arc<dyn ds_core::map_engine::MapEngine>| Arc::as_ptr(e) as *const ();
+        assert_eq!(
+            ptr(&reused.wms_state.engines["kenya"]),
+            ptr(&result.wms_state.engines["kenya"])
+        );
+
+        // Opted out: the components only, and no wrapper.
+        let off = load(collection(Some(false)), super::EngineReuse::default());
+        assert!(!has(&off.wms_state.engines["kenya"], "WindSpeedMS"));
+        assert!(!off.edr_state.engines["kenya"]
+            .get_parameters()
+            .contains(&"WindSpeedMS".to_string()));
+        assert!(!off.wms_state.styles.contains_key("kenya/WindSpeedMS"));
+        assert!(off.wind_by_id.is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn grib_level_collections_register_metadata_queries_and_reuse_one_owner() {
         use axum::{
@@ -6415,6 +6591,7 @@ mod tests {
         }
         let reused = load(super::EngineReuse {
             engines: result.engines_by_id.clone(),
+            wind: result.wind_by_id.clone(),
         });
         assert!(Arc::ptr_eq(
             &reused.grib_engines[0],
@@ -6903,6 +7080,7 @@ mod tests {
                 .filter(|(id, _)| eligible.contains(id.as_str()))
                 .map(|(id, e)| (id.clone(), e.clone()))
                 .collect(),
+            wind: HashMap::new(),
         }
     }
 

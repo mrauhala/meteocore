@@ -22,6 +22,7 @@ use zarrs::storage::StorageError;
 use ds_core::error::DataServerError;
 use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
+use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 
 use crate::cf::{self, AxisRole};
 use crate::decoded::{DecodedArray, DecodedCache};
@@ -129,7 +130,9 @@ pub struct Catalog {
     /// Map-capabilities snapshot, built once here so `raster_info()` is O(1) and
     /// swaps **atomically** with the data (one `ArcSwap<Catalog>`), with no
     /// window where the advertised metadata and the served data disagree.
-    pub raster_info: RasterInfo,
+    pub raster_info: Arc<RasterInfo>,
+    /// The variables' wind components (#897), built with the catalog.
+    pub wind: Arc<WindFacts>,
 }
 
 impl Catalog {
@@ -954,13 +957,14 @@ fn build_with_codec_setup(
         .iter()
         .map(|base| leads.iter().map(|d| *base + *d).collect())
         .collect();
-    let raster_info = build_raster_info(
+    let raster_info = Arc::new(build_raster_info(
         &vars,
         &times,
         &reference_times,
         extent,
         [lons.len() as u32, lats.len() as u32],
-    );
+    ));
+    let wind = Arc::new(wind_facts(&vars));
 
     Ok(Catalog {
         read_budget: read_budget::BUDGET.clone(),
@@ -975,7 +979,31 @@ fn build_with_codec_setup(
         lons,
         extent,
         raster_info,
+        wind,
     })
+}
+
+/// What the variables state for wind derivation (#897): the CF
+/// `standard_name` gives both the component and its frame
+/// (`eastward_wind` earth-relative, `x_wind` grid-relative). The catalog
+/// reads only 1-D latitude/longitude coordinate axes, so the grid's x is
+/// east and y north.
+fn wind_facts(vars: &[Variable]) -> WindFacts {
+    WindFacts {
+        grid: GridAxes::NorthAligned,
+        parameters: vars
+            .iter()
+            .map(|v| ParameterFacts {
+                standard_name: v.standard_name.clone(),
+                frame: v
+                    .standard_name
+                    .as_deref()
+                    .map_or(VectorFrame::Unknown, VectorFrame::from_standard_name),
+                unit: v.units.clone(),
+                ..ParameterFacts::new(v.name.clone())
+            })
+            .collect(),
+    }
 }
 
 /// Build the map-capabilities snapshot (one layer per variable). Stored on the

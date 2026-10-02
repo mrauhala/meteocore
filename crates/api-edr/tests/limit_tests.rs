@@ -214,6 +214,7 @@ fn app(per_point: usize) -> App {
         bufr: None,
         satellite: None,
         preview: None,
+        derive_wind: None,
     };
     let state = Arc::new(ArcSwap::from_pointee(EdrState {
         engines: HashMap::from([("obs".to_string(), engine)]),

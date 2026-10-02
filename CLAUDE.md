@@ -355,6 +355,14 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    ends inclusive) and those without one. Features `/items` and vector tiles
    (Tiles DateTime, #946) both pass it; the vector tile cache keys on it.
    Without time, return `false` from `has_time_dimension`.
+   **If the engine's parameters can be wind components** (u/v), implement
+   `ds_core::wind::WindSource`: an O(1) `Arc<WindFacts>` snapshot, built at
+   load/poll refresh, of what the source states per parameter (GRIB triple,
+   CF `standard_name`, FMI number, the u/v frame, the level) and how the
+   grid's axes lie (`GridAxes`). Report a frame only from source metadata,
+   never assumed. Add the engine type to `config::DERIVE_WIND_ENGINES` and
+   register it through `wind_wrapped` in `server/src/admin.rs`; the shared
+   `DerivedWind` wrapper does the rest (#897).
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.
@@ -589,6 +597,25 @@ one never implies the other.
   `MapEngine`s (engine-cap today) may depend on ds-render for it — an
   approved exception; engines still return `RasterTile` domain types and
   colorization stays in the API layer.
+- **`ds_core::wind`** — wind speed and direction derived from u/v
+  components (#897), the one home for the formulas (`hypot(u, v)`; the
+  direction the wind blows **from**, `atan2(-u, -v)`, calm → null), the frame
+  rules (`derivable`: unknown frame → no direction, speed only where the
+  grid's axes are orthogonal; mixed frames → nothing; grid-relative →
+  direction only on a north-aligned grid until rotation by the convergence
+  angle exists) and the pairing in each source's own vocabulary
+  (`WindPlan`: `10u`/`10v` → `10si`/`10wdir`, `u`/`v` → `ws`/`wdir`,
+  `UGRD`/`VGRD` → `WIND`/`WDIR`, FMI → `WindSpeedMS`/`WindDirection`, CF
+  stores by `standard_name`; skipped when the collection already has the
+  quantity at that level). `DerivedWind` wraps an engine's `MapEngine` +
+  `EdrEngine` in the server's registry wiring (`admin::wind_wrapped`, like
+  the nowcast wraps its source): speed on every API, direction in EDR only
+  (no cyclic palette). It derives **after sampling** — two component reads
+  with identical bbox/size/time/z/run, combined per value, never a derived
+  field interpolated — and resolves time/run/content as the components do
+  (`resolve_parameters_time` over u and v, intersected axes; #507/#521).
+  Per collection `derive_wind = false` opts out. Engines report facts
+  (`WindSource`); they never compute derived fields themselves.
 
 ## Engine Capabilities
 
@@ -598,11 +625,11 @@ one never implies the other.
 | CSV | `EdrEngine` + `FeatureEngine` | EDR (locations, area, radius), Features |
 | GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles |
+| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles; derived wind speed + direction from u/v (`ds_core::wind`) |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
-| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP |
+| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; derived wind speed from u/v, direction on lat/lon areas (newbase's grid-relative convention) |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
@@ -738,6 +765,16 @@ style_bundle = "radar_multi"
 # NOT constrain the underlying engine.
 [collections.preview]
 time_window = "PT12H"
+
+# grib / querydata / zarr collections derive wind speed (and, where the
+# source states the u/v frame, direction) from u/v components (#897).
+[[collections]]
+id = "nwp"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+derive_wind = false     # opt out (default on); a load error on other engines
+[collections.grib]
+data_path = "testdata/grib-local"
 
 # Derived nowcast collection (#519): motion-extrapolates another collection's
 # frames into the future. `source` must be a non-derived collection in the

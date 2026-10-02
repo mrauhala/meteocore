@@ -320,8 +320,8 @@ to leave it out when it equals `observedProperty.label`, which holds it.
 |---|---|---|
 | CSV | built-in column table (`temperature` °C, `humidity` %, `wind_speed` m/s, `pressure` hPa, `precipitation` mm); other columns none | – |
 | GeoTIFF | config `unit` | – |
-| GRIB | Code Table 4.2 unit after display conversion (`°C`, `hPa`, `m s-1`, `mm`, `%`, …) | – (WMO triples are not mapped to CF) |
-| QueryData | none: descriptors carry no trustworthy unit | – |
+| GRIB | Code Table 4.2 unit after display conversion (`°C`, `hPa`, `m s-1`, `mm`, `%`, …) | – (WMO triples are not mapped to CF); ✓ derived wind |
+| QueryData | none: descriptors carry no trustworthy unit | – ; ✓ derived wind |
 | Zarr | CF `units` attribute | ✓ `standard_name` attribute |
 | ODIM composite | config `unit` | – |
 | ODIM PVOL | ODIM quantity table (`dBZ`, `m/s`, `dB`, `deg`, …), in `parameter_names` too; none for dimensionless quantities (RHOHV, SQI, QIND) | – |
@@ -334,6 +334,44 @@ Remaining for Requirement 7: CF standard names for every engine but Zarr (a
 vocabulary for GRIB/ODIM/BUFR built-ins, a `standard_name` config key for the
 config-driven engines), QueryData units, and a check that config-given
 labels are English.
+
+## Derived wind (#897)
+
+A collection that publishes wind only as u/v components serves speed and
+direction derived from them (`ds_core::wind`; the server wraps the engine in
+`DerivedWind`). They are in `parameter_names` and work like native
+parameters in every query type, `parameter-name` (case-insensitive) and
+`f=png`. The components are queried with the engine's own sampling and
+combined value by value, never interpolated afterwards: speed `hypot(u, v)`,
+direction `atan2(-u, -v)` in degrees, where the wind blows **from**, 0° =
+north. Calm (`u = v = 0`) has no direction; a missing component gives a
+missing value. Units: the components' for speed, `°` (QUDT `DEG`) for
+direction; `observedProperty.id` is the NERC URI of `wind_speed` /
+`wind_from_direction`. Components a request did not name are not returned.
+Without `parameter-name` every parameter is returned, the derived ones on
+top of the components. The derived values count against the same response
+budget as the engine's (1 million values, `MAX_AREA_VALUES`), counted before
+any is computed: a response that would exceed it is a 400 "Query would
+return N values (… queried + … derived wind values)" naming the limit.
+
+| Engine | Pairs | Derived names | Frame from | Derived |
+|---|---|---|---|---|
+| GRIB | ECMWF `10u`/`10v`, `100u`/`100v`, `u`/`v`; wgrib2 `UGRD`/`VGRD` | `10si`/`10wdir`, `100si`/`100wdir`, `ws`/`wdir`, `WIND`/`WDIR` | GRIB2 flag table 3.3 bit 5, from the header probe or a decode | speed and direction (lat/lon grids, where both frames coincide); speed only until a pair's headers are read |
+| QueryData | FMI `WindUMS`/`WindVMS` (23/24), or vocabulary short names | `WindSpeedMS`/`WindDirection` (or the vocabulary's, e.g. `10si`/`10wdir`) | no flag: FMI newbase's convention, relative to the data's own grid (`NFmiFastQueryInfo::DoWindComponentFix`) | speed and direction on lat/lon areas; speed only on LCC, stereographic and rotated lat/lon |
+| Zarr | CF `standard_name` `eastward_wind`/`northward_wind`, `x_wind`/`y_wind` | the store's vocabulary: `wind_u_10m` → `wind_speed_10m`/`wind_direction_10m`, `10m_u_component_of_wind` → `10m_wind_speed`/…, ECMWF `u10` → `si10`/`wdir10` | the standard name | speed and direction (lat/lon grids) |
+| others | – | – | – | – |
+
+A derived parameter is skipped when the collection already has that
+quantity at that level (by name, GRIB 0/2/1 or 0/2/0, CF standard name, FMI
+number) or its name is taken; speed and direction are independent.
+`derive_wind = false` turns it off per collection. The server logs per pair
+what was derived, or why not. `100wdir` is MeteoCore's name, not an ECMWF
+short name: ECMWF has none for 100 m direction, so it follows `10wdir`.
+Derived values are checked against native ones on Météo-France ARPEGE
+analysis fields (`testdata/grib-arpege-wind`): speed within 0.012 m/s,
+direction within 0.5° wherever the wind exceeds 1 m/s, over the whole
+domain. Not yet: direction from grid-relative components on rotated or
+projected grids (rotation by the convergence angle).
 
 ## Domain types produced
 

@@ -214,6 +214,7 @@ fn config(id: &str) -> CollectionConfig {
         bufr: None,
         satellite: None,
         preview: None,
+        derive_wind: None,
     }
 }
 

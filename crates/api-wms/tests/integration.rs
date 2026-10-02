@@ -97,6 +97,7 @@ fn build_empty_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -277,6 +278,7 @@ fn build_failing_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -468,6 +470,7 @@ fn build_populated_state_with_wms(
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -860,6 +863,7 @@ fn build_counting_router_versioned(
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1130,6 +1134,7 @@ fn build_snapping_router_with(
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1585,6 +1590,7 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         bufr: None,
         satellite: None,
         preview: None,
+        derive_wind: None,
     }
 }
 
@@ -1816,6 +1822,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1970,6 +1977,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -2047,6 +2055,7 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -2112,6 +2121,7 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -2437,6 +2447,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -2623,6 +2634,7 @@ fn build_advancing_router() -> AdvancingFixture {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -3682,6 +3694,7 @@ mod per_parameter_times {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -4393,6 +4406,7 @@ mod composites {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),

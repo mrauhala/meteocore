@@ -256,9 +256,25 @@ pub struct CollectionConfig {
     pub satellite: Option<SatelliteConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
+    /// Wind speed and direction derived from u/v component pairs (#897,
+    /// `ds_core::wind`). Unset or `true` derives them for the engines that
+    /// report their components (`grib`, `querydata`, `zarr`); `false` opts
+    /// the collection out. Any other engine type rejects the key at load.
+    #[serde(default)]
+    pub derive_wind: Option<bool>,
 }
 
+/// The engine types whose collections derive wind from u/v components.
+pub const DERIVE_WIND_ENGINES: [&str; 3] = ["grib", "querydata", "zarr"];
+
 impl CollectionConfig {
+    /// Whether this collection serves wind derived from u/v components:
+    /// on by default for [`DERIVE_WIND_ENGINES`], off with
+    /// `derive_wind = false`.
+    pub fn derives_wind(&self) -> bool {
+        DERIVE_WIND_ENGINES.contains(&self.engine_type.as_str()) && self.derive_wind != Some(false)
+    }
+
     /// The collection's default WebP quality, `[wms] webp_quality`: what a
     /// WebP map or tile request without its own quality is encoded at.
     /// `None` = lossless.
@@ -3577,6 +3593,19 @@ impl ServerConfig {
                 }
             }
 
+            // Only the engines that report u/v components derive wind: the
+            // key anywhere else would read as a setting that does nothing.
+            if collection.derive_wind.is_some()
+                && !DERIVE_WIND_ENGINES.contains(&collection.engine_type.as_str())
+            {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': 'derive_wind' applies only to engine types {}, \
+                     not '{}'",
+                    DERIVE_WIND_ENGINES.join(", "),
+                    collection.engine_type
+                )));
+            }
+
             // GeoTIFF engine requires geotiff config section
             if collection.engine_type == "geotiff" && collection.geotiff.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -4803,6 +4832,32 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn validate_rejects_non_http_license_url() {
         let cfg = collection_with("[collections.license]\ntitle = \"X\"\nurl = \"ftp://x/y\"\n");
         assert!(cfg.validate().is_err());
+    }
+
+    /// `derive_wind` (#897): on by default for the engines that report u/v
+    /// components, off with `false`; rejected where it would do nothing,
+    /// and a non-boolean is a parse error.
+    #[test]
+    fn derive_wind_defaults_on_and_opts_out_per_collection() {
+        let grib = grib_collection("data_path = \"/data\"\n");
+        assert_eq!(grib.collections[0].derive_wind, None);
+        assert!(grib.collections[0].derives_wind());
+        let off = collection_with(
+            "engine_type = \"grib\"\nderive_wind = false\n\
+             [collections.grib]\ndata_path = \"/data\"\n",
+        );
+        assert!(!off.collections[0].derives_wind());
+        assert!(off.validate().is_ok());
+        let csv = collection_with("derive_wind = true\n");
+        assert!(!csv.collections[0].derives_wind(), "csv has no components");
+        let err = csv.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("'derive_wind' applies only to engine types grib, querydata, zarr"),
+            "{err}"
+        );
+        let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\
+                    description=\"d\"\nengine_type=\"grib\"\nderive_wind=\"no\"\n";
+        assert!(toml::from_str::<ServerConfig>(toml).is_err());
     }
 
     #[test]

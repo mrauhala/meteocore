@@ -168,6 +168,7 @@ fn build_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {

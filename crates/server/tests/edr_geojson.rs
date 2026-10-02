@@ -48,6 +48,7 @@ fn collection(id: &str, engine_type: &str) -> CollectionConfig {
         bufr: None,
         satellite: None,
         preview: None,
+        derive_wind: None,
     }
 }
 

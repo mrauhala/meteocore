@@ -503,6 +503,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
 | `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name) and optional `url`. When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
+| `derive_wind` | no | on | `grib`, `querydata` and `zarr` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
 
 ### Per-File Collection Configs
 
@@ -1268,6 +1269,30 @@ max = 40.0
 ```
 
 Ready-to-use disabled examples ship in `collections.d/` (`ecmwf-aifs-single-icechunk.toml.disabled`, `noaa-gfs-icechunk.toml.disabled`, `dwd-icon-eu.toml.disabled`) — rename to drop `.disabled` and run with `--features icechunk`.
+
+### Derived wind speed and direction
+
+NWP sources often publish wind only as u and v components. GRIB, QueryData
+and Zarr collections then also serve the speed and direction derived from
+them (#897, `ds_core::wind`), named in the source's own vocabulary: ECMWF
+`10u`/`10v` → `10si`/`10wdir`, `100u`/`100v` → `100si`/`100wdir` and
+`u`/`v` → `ws`/`wdir`, wgrib2 `UGRD`/`VGRD` → `WIND`/`WDIR`, FMI
+`WindUMS`/`WindVMS` → `WindSpeedMS`/`WindDirection`, and CF stores by
+`standard_name` (`wind_u_10m` → `wind_speed_10m`). `100wdir` is MeteoCore's
+name, not an ECMWF short name: ECMWF's parameter database has no 100 m wind
+direction, so it follows `10wdir`. The
+speed is a WMS/Maps/Tiles layer with the built-in `wind_speed` style
+(0–40 m/s); the direction (where the wind blows from, 0° = north) is served
+by EDR only. A parameter the collection already has is not derived again.
+
+Direction needs to know whether u and v are earth- or grid-relative, and
+that comes from the source: the GRIB2 resolution-and-component flag, the CF
+standard name (`eastward_wind` vs `x_wind`). QueryData carries no flag and
+follows FMI newbase's convention, components relative to the data's own
+grid: direction on lat/lon areas, speed only on projected ones (LCC,
+stereographic, rotated lat/lon) until grid-relative components can be turned
+to true north. The server logs, per u/v pair, what was derived or why not.
+`derive_wind = false` turns it off for a collection.
 
 ### Satellite
 

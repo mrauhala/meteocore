@@ -618,6 +618,14 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
     ))
 }
 
+/// The catalog's wind components for `ds_core::wind::DerivedWind` (#897):
+/// an `Arc` clone of the snapshot built with the catalog.
+impl ds_core::wind::WindSource for ZarrEngine {
+    fn wind_facts(&self) -> Arc<ds_core::wind::WindFacts> {
+        self.catalog.load().wind.clone()
+    }
+}
+
 impl MapEngine for ZarrEngine {
     #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
@@ -730,6 +738,10 @@ impl MapEngine for ZarrEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
+        (*self.catalog.load().raster_info).clone()
+    }
+
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
         self.catalog.load().raster_info.clone()
     }
 
@@ -851,3 +863,5 @@ mod tests {
 
 #[cfg(test)]
 mod refresh_tests;
+#[cfg(test)]
+mod wind_tests;

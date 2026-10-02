@@ -1104,6 +1104,7 @@ mod tests {
             style_fingerprint: std::sync::atomic::AtomicU64::new(0),
             last_collections: RwLock::new(HashMap::new()),
             engine_handles: RwLock::new(HashMap::new()),
+            wind_handles: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1129,6 +1130,7 @@ mod tests {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         }
     }
 

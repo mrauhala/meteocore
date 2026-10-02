@@ -183,6 +183,21 @@ pool: they do not use the Icechunk runtime bridge.
   arrays. Startup also logs outer/inner shapes, native bytes, and time steps
   per chunk to expose temporal decode amplification in map reads.
 
+## Wind components (#897)
+
+`catalog::wind_facts` reports each variable's CF `standard_name`, the frame
+it states (`eastward_wind` earth-, `x_wind` grid-relative) and its units,
+built with the catalog (`Catalog::wind`, swapped with it). The grid is
+`GridAxes::NorthAligned`: the catalog reads only 1-D lat/lon axes.
+`ds_core::wind` pairs CF components and names the derived parameters in
+the store's own vocabulary: a known one (ECMWF `u10`/`v10` → `si10`/
+`wdir10`), else the u name with its component replaced (`wind_u_10m` →
+`wind_speed_10m`/`wind_direction_10m`, `10m_u_component_of_wind` →
+`10m_wind_speed`, `x_wind_10m` → `wind_speed_10m`). Without a
+`standard_name` a store's own names pair nothing. `Catalog::raster_info`
+is an `Arc`, so `raster_info_shared` is O(1) and the wrapper's extended
+snapshot stays cached.
+
 ## Trajectory queries (#926)
 
 `src/trajectory.rs`: the run, steps and variables are selected like a

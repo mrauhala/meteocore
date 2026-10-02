@@ -3,12 +3,15 @@
 
 use super::*;
 use crate::catalog::MessageEntry;
+use ds_core::wind::{GridAxes, ParameterFacts, WindFacts};
 use metadata::GridGeometry;
 
 type MessageId = (String, u64);
 
 pub(super) struct Discovery {
     pub views: BTreeMap<Option<GribLevelType>, Arc<RasterInfo>>,
+    /// Each view's wind components (#897), rebuilt with `views`.
+    pub wind: BTreeMap<Option<GribLevelType>, Arc<WindFacts>>,
     pub empty: Arc<RasterInfo>,
     // At most one representative per view. Cache unknown/unsupported geometry
     // too, so a successful header probe is not repeated every poll.
@@ -20,6 +23,7 @@ impl Default for Discovery {
     fn default() -> Self {
         Self {
             views: BTreeMap::new(),
+            wind: BTreeMap::new(),
             grids: HashMap::new(),
             wanted: HashSet::new(),
             empty: Arc::new(RasterInfo {
@@ -83,6 +87,7 @@ impl GribEngine {
             .collect();
         discovery.grids.retain(|id, _| wanted.contains(id));
         discovery.wanted = wanted;
+        let mut wind = BTreeMap::new();
         discovery.views = catalogs(&catalog)
             .map(|(family, catalog)| {
                 let geometry = representative(catalog).and_then(|(file, entry)| {
@@ -97,9 +102,11 @@ impl GribEngine {
                     family,
                     source: self.source.clone(),
                 };
+                wind.insert(family, Arc::new(view.build_wind_facts(catalog)));
                 (family, Arc::new(view.build_raster_info(catalog, geometry)))
             })
             .collect();
+        discovery.wind = wind;
     }
 
     pub(super) fn geometry_probes<'a>(
@@ -143,6 +150,52 @@ impl GribEngine {
             .insert((url.to_owned(), entry.offset), geometry);
         true
     }
+    /// What each parameter's latest-run metadata states for wind
+    /// derivation (#897): its WMO triple and GRIB2 component flag, read by
+    /// the header probe or a decode (`Unknown` until then), and the
+    /// canonical level it is served at.
+    fn build_wind_facts(&self, catalog: &Catalog) -> WindFacts {
+        let keys = catalog
+            .latest_run()
+            .and_then(|run| catalog.parameter_keys(&run.reference_time));
+        // A pressure or model-level view's parameters span its vertical
+        // axis; a request reads every component at the same level.
+        let single_level = self.vertical_kind().is_none();
+        let parameters = catalog
+            .all_params()
+            .into_iter()
+            .map(|name| {
+                let meta = self.param_metadata(catalog, &name);
+                let level = keys
+                    .and_then(|keys| keys.get(&name))
+                    .filter(|_| single_level)
+                    .map(|key| match key.level {
+                        Some(level) => format!("{}:{level}", key.levtype),
+                        None => key.levtype.clone(),
+                    });
+                let level_label = meta
+                    .first_surface_type
+                    .and_then(|t| units::format_level_qualifier(t, meta.first_surface_value));
+                ParameterFacts {
+                    grib: meta.triple,
+                    frame: meta.uv_frame,
+                    level,
+                    level_label,
+                    unit: meta.display.display_unit.to_string(),
+                    ..ParameterFacts::new(name)
+                }
+            })
+            .collect();
+        WindFacts {
+            // Template 3.0 only (`reader::extract_grid_params` rejects every
+            // other grid): x is east and y north, so a grid-relative flag
+            // needs no rotation. A rotated or projected template must
+            // report its own axes here.
+            grid: GridAxes::NorthAligned,
+            parameters,
+        }
+    }
+
     fn build_raster_info(
         &self,
         catalog: &Catalog,

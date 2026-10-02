@@ -153,6 +153,7 @@ fn build_router_with_engine_and_wms(
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -224,6 +225,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -342,6 +344,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -393,6 +396,7 @@ fn router_with(
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -1543,6 +1547,7 @@ fn build_empty_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1674,6 +1679,7 @@ fn build_multi_param_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -2195,6 +2201,7 @@ mod searchable {
                     bufr: None,
                     satellite: None,
                     preview: None,
+                    derive_wind: None,
                 },
             );
         }
@@ -2668,6 +2675,7 @@ fn build_router_with_styles(styles: HashMap<String, HashMap<String, StyleInfo>>)
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -3523,6 +3531,7 @@ mod composites {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(MapsState {
             engines: HashMap::from([("radar".to_string(), engine)]),

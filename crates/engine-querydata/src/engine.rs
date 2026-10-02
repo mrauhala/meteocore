@@ -16,6 +16,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
+use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
 
 use crate::parse::QueryData;
 
@@ -32,6 +33,8 @@ struct RunEntry {
 #[derive(Default)]
 struct RunSet {
     runs: BTreeMap<DateTime<Utc>, RunEntry>,
+    /// The latest run's wind components (#897), built with the set.
+    wind: Option<Arc<WindFacts>>,
 }
 
 impl RunSet {
@@ -545,6 +548,18 @@ impl EdrEngine for QueryDataEngine {
     }
 }
 
+/// The latest run's wind components for `ds_core::wind::DerivedWind`
+/// (#897): an `Arc` clone of the snapshot built with the run set.
+impl WindSource for QueryDataEngine {
+    fn wind_facts(&self) -> Arc<WindFacts> {
+        self.runs
+            .load()
+            .wind
+            .clone()
+            .unwrap_or_else(WindFacts::none)
+    }
+}
+
 impl MapEngine for QueryDataEngine {
     #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors
     fn get_raster_tile(
@@ -733,12 +748,7 @@ impl MapEngine for QueryDataEngine {
             .iter()
             .map(|p| {
                 // Extract short name from parentheses, e.g., "2 Metre Temperature (2t)" → "2t"
-                let short = p
-                    .name
-                    .rfind('(')
-                    .and_then(|start| p.name[start + 1..].strip_suffix(')'))
-                    .unwrap_or(&p.name)
-                    .to_string();
+                let short = map_name(&p.name).to_string();
                 ds_core::map_engine::ParameterInfo {
                     name: short,
                     title: p.name.clone(),
@@ -847,7 +857,58 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
             );
         }
     }
-    RunSet { runs }
+    let wind = runs
+        .values()
+        .next_back()
+        .map(|latest| Arc::new(wind_facts(&latest.data)));
+    RunSet { runs, wind }
+}
+
+/// What a run states about its wind components (#897): each parameter's
+/// FMI number and its map and EDR names, and the frame of its u/v.
+///
+/// The format has no u/v frame flag (neither the header, a parameter
+/// descriptor nor an area class carries one), so the frame is FMI newbase's
+/// convention: u and v are relative to the data's own grid. newbase's
+/// `NFmiFastQueryInfo::DoWindComponentFix` (smartmet-library-newbase,
+/// `newbase/NFmiFastQueryInfo.cpp`) relies on it when it reprojects
+/// `kFmiWindUMS`/`kFmiWindVMS` onto another grid: it turns them by the
+/// difference of the two areas' `NFmiArea::TrueNorthAzimuth`, which would be
+/// wrong for components already along east and north. So the components are
+/// grid-relative: on a lat/lon area that is east and north, giving speed and
+/// direction; on a rotated lat/lon, stereographic or LCC area `ds_core::wind`
+/// gives speed only until it can turn them to true north.
+fn wind_facts(data: &QueryData) -> WindFacts {
+    WindFacts {
+        grid: GridAxes::of(&data.grid.area.crs),
+        parameters: data
+            .params
+            .iter()
+            .map(|p| {
+                let name = map_name(&p.name);
+                ParameterFacts {
+                    edr_name: (name != p.name).then(|| p.name.clone()),
+                    // Only a wind number asserts a role. Any other id says
+                    // nothing about wind, so the name may still pair it by
+                    // the source vocabulary (`10u`/`10v` from a converter
+                    // that kept GRIB short names but not FMI's numbers).
+                    fmi_param: WindRole::from_fmi_param(p.id).map(|_| p.id),
+                    // newbase's convention, see above.
+                    frame: VectorFrame::Grid,
+                    ..ParameterFacts::new(name)
+                }
+            })
+            .collect(),
+    }
+}
+
+/// A parameter's map name: the short name in parentheses at the end of its
+/// descriptor (`"2 Metre Temperature (2t)"` → `"2t"`), else the descriptor.
+/// EDR uses the full descriptor.
+fn map_name(name: &str) -> &str {
+    name.rfind('(')
+        .and_then(|start| name[start + 1..].strip_suffix(')'))
+        .unwrap_or(name)
 }
 
 fn load_file(path: &Path, collection_id: &str) -> Result<QueryData, DataServerError> {
@@ -1693,3 +1754,6 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+mod wind_tests;
