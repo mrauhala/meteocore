@@ -23,7 +23,7 @@ use crate::geojson::{
 };
 use crate::params::{
     check_crs, negotiate_edr_format, parse_cube_bbox, parse_datetime, parse_edr_format,
-    parse_limit, parse_locations_paging, parse_resolution, parse_within_metres, parse_z,
+    parse_limit, parse_locations_query, parse_resolution, parse_within_metres, parse_z,
     plot_dimensions, query_formats, resolve_z_levels, split_location_ids, split_position_coords,
     AreaQueryParams, CubeQueryParams, DatetimeSelector, EdrFormat, LocationQueryParams,
     NegotiatedFormat, PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, ZSelector,
@@ -835,12 +835,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "operationId": format!("getLocations_{id}"),
                 "tags": [id],
                 "parameters": [
+                    {"$ref": "#/components/parameters/bbox-locations"},
+                    {"$ref": "#/components/parameters/datetime-locations"},
                     {"$ref": "#/components/parameters/limit-locations"},
                     {"$ref": "#/components/parameters/offset-locations"}
                 ],
                 "responses": {
                     "200": {
-                        "description": "Locations in GeoJSON format: the complete inventory, or with limit one page of it carrying numberMatched, numberReturned and self/next/prev links",
+                        "description": "Locations in GeoJSON format: the complete inventory, or the locations inside bbox with an observation in datetime; with limit one page of that list carrying numberMatched, numberReturned and self/next/prev links",
                         "content": {
                             "application/geo+json": {
                                 "schema": {"type": "object"}
@@ -1431,6 +1433,34 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "integer", "minimum": 0, "default": 0},
                     "description": "Number of locations to skip before the page (offset pagination extension, as on /collections). Requires limit."
                 },
+                // The EDR 1.2 `bbox` and `datetime` parameters of
+                // `/locations`, schema, `style` and `explode` copied from the
+                // 1.2 OpenAPI; the descriptions say what this server does
+                // with them (CRS84 only, heights ignored, the observation
+                // rule of `location_time_filter`).
+                "bbox-locations": {
+                    "name": "bbox",
+                    "in": "query",
+                    "description": "Only locations whose point lies inside the bounding box, edges included, are listed; the list is filtered before it is paged, so numberMatched and the paging links count the locations inside the box.\nThe bounding box is provided as four or six numbers:\n* Lower left corner, coordinate axis 1\n* Lower left corner, coordinate axis 2\n* Minimum value, coordinate axis 3 (optional)\n* Upper right corner, coordinate axis 1\n* Upper right corner, coordinate axis 2\n* Maximum value, coordinate axis 3 (optional)\nThe coordinate reference system of the values is WGS 84 longitude/latitude (http://www.opengis.net/def/crs/OGC/1.3/CRS84); bbox-crs is not supported.\nFor WGS 84 longitude/latitude the values are in most cases the sequence of\nminimum longitude, minimum latitude, maximum longitude and maximum latitude.\nHowever, in cases where the box spans the antimeridian the first value\n(west-most box edge) is larger than the third value (east-most box edge).\nLocations are points without a height: the third and sixth numbers of a six-number box must be numbers and are otherwise ignored. A malformed box is a 400.",
+                    "required": false,
+                    "schema": {
+                        "oneOf": [
+                            {"items": {"type": "number"}, "type": "array", "minItems": 4, "maxItems": 4},
+                            {"items": {"type": "number"}, "type": "array", "minItems": 6, "maxItems": 6}
+                        ]
+                    },
+                    "style": "form",
+                    "explode": false
+                },
+                "datetime-locations": {
+                    "name": "datetime",
+                    "in": "query",
+                    "description": "Either a date-time, an interval (open or closed), or a list of date-times, in the grammar of the data queries' datetime. Date and time expressions adhere to RFC 3339; open intervals use double dots. Examples: 2018-02-12T23:20:50Z; 2018-02-12T00:00:00Z/2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z/.. or ../2018-03-18T12:31:12Z; 2018-02-12T00:00:00Z,2018-02-12T01:00:00Z. Only locations with at least one observation in the interval are listed, each date-time of a list matched exactly; the list is filtered before it is paged, so numberMatched and the paging links count those locations, and the links repeat datetime. A malformed value, or an interval that ends before it starts, is a 400, and so is any datetime on a collection whose locations carry no per-location time.",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
                 "z-trajectory": {
                     "name": "z",
                     "in": "query",
@@ -1861,8 +1891,10 @@ pub async fn instance(
 /// Without `limit`, the complete inventory in one response (#533). With the
 /// EDR 1.2 `limit` (+ the `offset` extension), one page of it in the engine's
 /// inventory order, with `numberMatched`/`numberReturned` and `self`/`next`/
-/// `prev` links paged like `/collections` (#922). Either way the encoded body
-/// is admitted by the same byte budget.
+/// `prev` links paged like `/collections` (#922). `bbox` and `datetime`
+/// filter the list before it is paged, so the counts and links describe the
+/// filtered list (#932). Either way the encoded body is admitted by the same
+/// byte budget.
 pub async fn locations(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -1872,7 +1904,7 @@ pub async fn locations(
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
     let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid query string"))?;
-    let paging = parse_locations_paging(pairs).map_err(|e| bad_request(&e))?;
+    let request = parse_locations_query(pairs).map_err(|e| bad_request(&e))?;
 
     let base_url = request_base_url(&state, &headers);
     let query_engine = engine.clone();
@@ -1883,7 +1915,31 @@ pub async fn locations(
                 Json(json!({ "code": "ServerError", "description": "Internal server error" })),
             )
         };
-        let locs = query_engine.get_locations().map_err(|_| server_error())?;
+        let mut locs = query_engine.get_locations().map_err(|_| server_error())?;
+        // Filter first, then page: `numberMatched` and the links count the
+        // locations left. `contains` handles `west > east`; the box goes
+        // first, so the time filter probes only the locations inside it.
+        if let Some(bbox) = &request.bbox {
+            locs.retain(|loc| bbox.contains(loc.longitude, loc.latitude));
+        }
+        if let Some(datetime) = &request.datetime {
+            let intervals = datetime.intervals();
+            // Built after `get_locations`, never around it: the filter may
+            // hold a read guard on the engine's index.
+            let Some(has_data) = query_engine.location_time_filter(&intervals) else {
+                return Err(JsonError(
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "code": "BadRequest",
+                        "description": format!(
+                            "Collection '{id}' cannot filter its locations by datetime: \
+                             they carry no per-location time. Leave datetime out to list them all"
+                        )
+                    })),
+                ));
+            };
+            locs.retain(|loc| has_data(loc));
+        }
         let params = query_engine.get_parameters();
         let temporal = query_engine
             .get_temporal_extent()
@@ -1894,24 +1950,31 @@ pub async fn locations(
             temporal_extent: temporal,
             base_url: &base_url,
         };
-        // One page: the /collections paging arithmetic over the inventory.
+        let href = format!("{base_url}/edr/collections/{id}/locations");
         let mut links = Vec::new();
-        let (page_locs, page) = match &paging {
-            None => (&locs[..], None),
+        let (page_locs, number_matched) = match &request.paging {
+            // The whole list. A filtered one names its query in `self`; an
+            // unfiltered one keeps the complete inventory's body.
+            None => {
+                if request.is_filtered() {
+                    links.push((request.href(&href, 0), "self", "Locations"));
+                }
+                (&locs[..], None)
+            }
+            // One page: the /collections paging arithmetic over the list.
             Some(paging) => {
                 let window = ds_core::collection_search::page_window(
                     locs.len(),
                     paging.offset,
                     paging.limit,
                 );
-                let href = format!("{base_url}/edr/collections/{id}/locations");
-                links.push((paging.href(&href, paging.offset), "self", "This page"));
+                links.push((request.href(&href, paging.offset), "self", "This page"));
                 if window.has_next {
-                    links.push((paging.href(&href, window.next_offset), "next", "Next page"));
+                    links.push((request.href(&href, window.next_offset), "next", "Next page"));
                 }
                 if window.has_prev {
                     links.push((
-                        paging.href(&href, window.prev_offset),
+                        request.href(&href, window.prev_offset),
                         "prev",
                         "Previous page",
                     ));
@@ -1919,7 +1982,8 @@ pub async fn locations(
                 (&locs[window.range()], Some(locs.len()))
             }
         };
-        let page = page.map(|number_matched| LocationsPage {
+        let paged = request.paging.is_some();
+        let page = (!links.is_empty()).then_some(LocationsPage {
             number_matched,
             links: &links,
         });
@@ -1932,7 +1996,7 @@ pub async fn locations(
                 Some(crate::location_budget::Failure::Cancelled) => query_timeout(),
                 Some(crate::location_budget::Failure::Limit) => JsonError(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"code": "ResponseLimit", "description": if page.is_some() {
+                    Json(json!({"code": "ResponseLimit", "description": if paged {
                         "Location page exceeds the configured response limit; request a smaller limit"
                     } else {
                         "Complete location inventory exceeds the configured response limit; page it with limit"

@@ -105,7 +105,10 @@ no opt-out, as for GRIB; a client wanting kelvin converts back.
   report inside the interval — the snapshot's `[first_report, last_report]`
   overlap is only the prefilter, the rows decide (one store read lock per
   `datetime` query, a BTreeMap range probe per candidate; hourly SYNOP
-  leaves gaps a narrow window falls into); `sortby` ∈ `last_report,
+  leaves gaps a narrow window falls into). That rule is `has_report_in`,
+  shared with EDR `/locations?datetime=` (`location_time_filter`, #932,
+  each listed instant matched exactly): keep the two lists identical;
+  `sortby` ∈ `last_report,
   first_report, report_count, name` via `ds_core::feature::sort_features`;
   `data_version` = snapshot version.
 

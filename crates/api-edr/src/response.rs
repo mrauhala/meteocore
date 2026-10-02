@@ -502,10 +502,13 @@ pub struct LocationsContext<'a> {
     pub base_url: &'a str,
 }
 
-/// One page of a `/locations` list requested with `limit` (EDR 1.2, #922).
+/// The links of a `/locations` list that is not the plain complete
+/// inventory: one page of a list requested with `limit` (EDR 1.2, #922), or
+/// a list filtered by `bbox` or `datetime` (#932).
 pub struct LocationsPage<'a> {
-    /// Size of the whole inventory the page was cut from.
-    pub number_matched: usize,
+    /// A page's `numberMatched`: the size of the (filtered) list it was cut
+    /// from. `None` for an unpaged list, which carries no counts.
+    pub number_matched: Option<usize>,
     /// `self`, then `next`/`prev` when they exist: `(href, rel, title)`.
     pub links: &'a [(String, &'static str, &'static str)],
 }
@@ -525,8 +528,8 @@ pub fn locations_to_json(
 /// Serialize into an admitted writer so size/deadline/memory failures stop
 /// construction before an unbounded response buffer has been allocated.
 /// `page` is `None` for the complete inventory, whose body stays exactly the
-/// pre-paging one (no counts, one `self` link); a page adds `numberMatched`,
-/// `numberReturned` and its navigation links.
+/// pre-paging one (no counts, one `self` link); otherwise its links replace
+/// that `self` link, and a page adds `numberMatched` and `numberReturned`.
 pub(crate) fn locations_to_writer(
     locations: &[Location],
     ctx: &LocationsContext,
@@ -569,8 +572,8 @@ pub(crate) fn locations_to_writer(
                 datetime: &datetime,
             },
             links,
-            number_matched: page.map(|p| p.number_matched),
-            number_returned: page.map(|_| locations.len()),
+            number_matched: page.and_then(|p| p.number_matched),
+            number_returned: page.and_then(|p| p.number_matched).map(|_| locations.len()),
             kind: "FeatureCollection",
         },
     )
@@ -714,7 +717,7 @@ mod location_tests {
         ];
         let mut bytes = Vec::new();
         let page = LocationsPage {
-            number_matched: 7,
+            number_matched: Some(7),
             links: &links,
         };
         locations_to_writer(
@@ -734,5 +737,22 @@ mod location_tests {
         assert_eq!(paged["numberReturned"], 1);
         assert_eq!(paged["links"][1]["rel"], "next");
         assert_eq!(paged["links"][1]["type"], "application/geo+json");
+
+        // An unpaged filtered list: its own `self` link, no counts.
+        let self_href = format!("{endpoint}?bbox=0,0,1,1");
+        let links = [(self_href.clone(), "self", "Locations")];
+        let filtered = LocationsPage {
+            number_matched: None,
+            links: &links,
+        };
+        let mut bytes = Vec::new();
+        locations_to_writer(&[], &ctx, Some(&filtered), &mut bytes).unwrap();
+        let filtered: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(filtered.get("numberMatched").is_none());
+        assert!(filtered.get("numberReturned").is_none());
+        assert_eq!(
+            filtered["links"],
+            json!([{ "href": self_href, "rel": "self", "title": "Locations", "type": "application/geo+json" }])
+        );
     }
 }

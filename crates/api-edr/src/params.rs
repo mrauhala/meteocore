@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use ds_core::datetime::{parse_datetime_interval, parse_iso8601_duration};
 use ds_core::edr_engine::TrajectoryShape;
 use ds_core::error::DataServerError;
+use ds_core::feature::DatetimeInterval;
 use serde::Deserialize;
 
 use crate::response::{COVERAGE_JSON_MEDIA_TYPE, LEGACY_COVERAGE_JSON_MEDIA_TYPE};
@@ -36,6 +37,29 @@ impl DatetimeSelector {
             Self::Instants(v) => (v[0], v[v.len() - 1]),
         }
     }
+
+    /// The selection as the intervals a location must have an observation
+    /// in (`EdrEngine::location_time_filter`, #932): the window, its open
+    /// ends unbounded, or one instant interval per listed instant, so each
+    /// is matched exactly.
+    pub fn intervals(&self) -> Vec<DatetimeInterval> {
+        let bound = |t: DateTime<Utc>| {
+            (t != DateTime::<Utc>::MIN_UTC && t != DateTime::<Utc>::MAX_UTC).then_some(t)
+        };
+        match self {
+            Self::Window(start, end) => vec![DatetimeInterval {
+                start: bound(*start),
+                end: bound(*end),
+            }],
+            Self::Instants(v) => v
+                .iter()
+                .map(|t| DatetimeInterval {
+                    start: Some(*t),
+                    end: Some(*t),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Parse the EDR `datetime` query parameter: an RFC 3339 instant, an
@@ -48,6 +72,10 @@ impl DatetimeSelector {
 /// - `repeating interval`: `Rn/date-time/duration`, the `n` instants
 ///   `start + i × duration` for `i` in `0..n`, `n` counting instants as
 ///   `z=Rn/min/step` counts levels. `R1` is the start alone.
+///
+/// An interval that ends before it starts is a 400, as in Features, Maps
+/// and Tiles: it selects nothing, and the station engines' range lookups
+/// panic on it.
 pub fn parse_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, DataServerError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -59,6 +87,11 @@ pub fn parse_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, Dat
     }
     if !raw.contains(',') {
         let (start, end) = parse_datetime_interval(raw)?;
+        if start > end {
+            return Err(DataServerError::InvalidDatetime(format!(
+                "'{raw}' ends before it starts"
+            )));
+        }
         return Ok(Some(DatetimeSelector::Window(start, end)));
     }
     let elements: Vec<&str> = raw.split(',').map(str::trim).collect();
@@ -430,22 +463,43 @@ pub fn parse_limit(raw: Option<&str>) -> Result<Option<usize>, DataServerError> 
     Ok(Some(n.min(MAX_LIMIT)))
 }
 
-/// A `/locations` request made with `limit`: one page of the inventory
-/// (EDR 1.2 locations paging, #922). Without `limit` there is no paging and
-/// the complete inventory is served as before.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A `/locations` request made with `limit`: one page of the list (EDR 1.2
+/// locations paging, #922). Without `limit` there is no paging and the whole
+/// list is served as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocationsPaging {
     /// Resolved page size (clamped to [`MAX_LIMIT`]); links carry this value.
     pub limit: usize,
     pub offset: usize,
-    /// Every other query pair, in request order, repeated verbatim in the
-    /// page's navigation links (so an `f`, say, survives paging).
+}
+
+/// A parsed `/locations` request: its filters and its page (#922, #932).
+#[derive(Debug, Clone)]
+pub struct LocationsQuery {
+    /// `bbox`: only the locations whose point lies inside it, edges
+    /// included, are listed, before paging.
+    pub bbox: Option<ds_core::feature::Bbox>,
+    /// `datetime`, in the data queries' grammar ([`parse_datetime`]): only
+    /// the locations with an observation in it are listed, before paging,
+    /// as the engine's `EdrEngine::location_time_filter` decides.
+    pub datetime: Option<DatetimeSelector>,
+    /// `None` without `limit`: the whole list.
+    pub paging: Option<LocationsPaging>,
+    /// Every pair but `limit` and `offset`, in request order, repeated
+    /// verbatim in the links (so `bbox`, `datetime` and `f` survive paging).
     pub preserved: Vec<(String, String)>,
 }
 
-impl LocationsPaging {
-    /// `base` plus this request's query at `offset`: the preserved pairs,
-    /// then the resolved `limit`, then `offset` (omitted when 0), as on
+impl LocationsQuery {
+    /// Whether the request names a filter. Only then does an unpaged list's
+    /// `self` link carry the query; without one the body stays the complete
+    /// inventory's, byte for byte.
+    pub fn is_filtered(&self) -> bool {
+        self.bbox.is_some() || self.datetime.is_some()
+    }
+
+    /// `base` plus this request's query: the preserved pairs, then, when
+    /// paged, the resolved `limit` and `offset` (omitted when 0), as on
     /// `/collections`.
     pub fn href(&self, base: &str, offset: usize) -> String {
         use ds_core::collection_search::encode_query_value as enc;
@@ -454,35 +508,49 @@ impl LocationsPaging {
             .iter()
             .map(|(name, value)| format!("{}={}", enc(name), enc(value)))
             .collect();
-        query.push(format!("limit={}", self.limit));
-        if offset > 0 {
-            query.push(format!("offset={offset}"));
+        if let Some(paging) = &self.paging {
+            query.push(format!("limit={}", paging.limit));
+            if offset > 0 {
+                query.push(format!("offset={offset}"));
+            }
         }
-        format!("{base}?{}", query.join("&"))
+        if query.is_empty() {
+            base.to_owned()
+        } else {
+            format!("{base}?{}", query.join("&"))
+        }
     }
 }
 
-/// Query parameters `/locations` accepts. `bbox` and `datetime` are the
-/// list's EDR filters: accepted but not applied yet (#932), and repeated in
-/// paging links; `f` selects the representation.
+/// Query parameters `/locations` accepts: the EDR filters `bbox` and
+/// `datetime`, the paging pair `limit`/`offset`, and `f`.
 pub const LOCATIONS_PARAMETERS: [&str; 5] = ["limit", "offset", "bbox", "datetime", "f"];
 
-/// Split the `/locations` query into its paging request. `Ok(None)` when no
-/// `limit` is given: the complete inventory. A repeated `limit`/`offset`, an
-/// invalid value, an `offset` without a `limit` (there is no page to offset
-/// into), or a parameter outside [`LOCATIONS_PARAMETERS`] is a 400, so a typo
-/// such as `limti` cannot return the unpaged list as if it worked (#605).
-/// The other accepted parameters are kept for the links.
-pub fn parse_locations_paging(
+/// Parse the `/locations` query. A parameter outside [`LOCATIONS_PARAMETERS`],
+/// a repeated `limit`, `offset`, `bbox` or `datetime`, an invalid value, or an
+/// `offset` without a `limit` (there is no page to offset into) is a 400, so
+/// a typo such as `limti` cannot return the unpaged list as if it worked
+/// (#605).
+///
+/// `bbox` is the EDR 1.2 parameter: CRS84, four numbers, `west > east`
+/// crossing the antimeridian, or six whose vertical pair must be numbers and
+/// is otherwise ignored. A location is a 2-D point with no height to test, as
+/// `items` ignores the heights and a collection without a vertical extent
+/// ignores `z` (`/req/edr/z-response` A). `datetime` takes [`parse_datetime`]'s
+/// grammar; whether the collection can filter by it is the engine's answer,
+/// known only once the query runs.
+pub fn parse_locations_query(
     pairs: Vec<(String, String)>,
-) -> Result<Option<LocationsPaging>, DataServerError> {
-    let (mut limit, mut offset) = (None, None);
+) -> Result<LocationsQuery, DataServerError> {
+    let (mut limit, mut offset, mut bbox, mut datetime) = (None, None, None, None);
     let mut preserved = Vec::new();
     for (name, value) in pairs {
         let slot = match name.as_str() {
             "limit" => &mut limit,
             "offset" => &mut offset,
-            known if LOCATIONS_PARAMETERS.contains(&known) => {
+            "bbox" => &mut bbox,
+            "datetime" => &mut datetime,
+            "f" => {
                 preserved.push((name, value));
                 continue;
             }
@@ -493,26 +561,40 @@ pub fn parse_locations_paging(
                 )));
             }
         };
-        if slot.replace(value).is_some() {
+        if slot.is_some() {
             return Err(DataServerError::InvalidParameter(format!(
                 "Duplicate query parameter '{name}'"
             )));
         }
+        if matches!(name.as_str(), "bbox" | "datetime") {
+            preserved.push((name, value.clone()));
+        }
+        *slot = Some(value);
     }
+    let bbox = bbox
+        .as_deref()
+        .map(|raw| parse_cube_bbox(raw).map(|(bbox, _heights)| bbox))
+        .transpose()?;
+    let datetime = parse_datetime(datetime.as_deref())?;
     let resolved_offset = parse_offset(offset.as_deref())?;
-    match parse_limit(limit.as_deref())? {
-        Some(limit) => Ok(Some(LocationsPaging {
+    let paging = match parse_limit(limit.as_deref())? {
+        Some(limit) => Some(LocationsPaging {
             limit,
             offset: resolved_offset,
-            preserved,
-        })),
+        }),
         None if offset.is_some_and(|o| !o.trim().is_empty()) => {
-            Err(DataServerError::InvalidParameter(
+            return Err(DataServerError::InvalidParameter(
                 "offset pages the location list and requires limit".into(),
             ))
         }
-        None => Ok(None),
-    }
+        None => None,
+    };
+    Ok(LocationsQuery {
+        bbox,
+        datetime,
+        paging,
+        preserved,
+    })
 }
 
 /// Parse the `/locations` `offset` (the offset pagination extension
@@ -635,7 +717,8 @@ impl CubeQueryParams {
 /// The cube `bbox`: `minx,miny,maxx,maxy`, or six numbers
 /// `minx,miny,minz,maxx,maxy,maxz` whose vertical pair becomes a `z`
 /// interval (overridden by an explicit `z`, EDR `/req/edr/rc-cube` C).
-/// CRS84 only; `minx > maxx` crosses the antimeridian.
+/// CRS84 only; `minx > maxx` crosses the antimeridian. `/locations` parses
+/// its `bbox` here too and drops the vertical pair.
 pub fn parse_cube_bbox(
     raw: &str,
 ) -> Result<(ds_core::feature::Bbox, Option<ZSelector>), DataServerError> {
@@ -1573,6 +1656,37 @@ mod tests {
         );
         assert!(parse_datetime(Some("")).is_err());
         assert!(parse_datetime(Some("not-a-date")).is_err());
+        // An interval that ends before it starts selects nothing: a 400.
+        let err = parse_datetime(Some("2024-01-02T00:00:00Z/2024-01-01T00:00:00Z")).unwrap_err();
+        assert!(err.to_string().contains("ends before it starts"), "{err}");
+        assert!(parse_datetime(Some("2024-01-01T00:00:00Z/2024-01-01T00:00:00Z")).is_ok());
+        assert!(parse_datetime(Some("../..")).is_ok());
+    }
+
+    /// The intervals `location_time_filter` receives (#932): a window with
+    /// its open ends unbounded, a list as one instant interval per element.
+    #[test]
+    fn datetime_selector_intervals() {
+        let (a, b) = (t("2024-01-01T00:00:00Z"), t("2024-01-01T06:00:00Z"));
+        let interval = |start, end| DatetimeInterval { start, end };
+        let intervals = |raw| parse_datetime(Some(raw)).unwrap().unwrap().intervals();
+        assert_eq!(
+            intervals("2024-01-01T00:00:00Z/2024-01-01T06:00:00Z"),
+            [interval(Some(a), Some(b))]
+        );
+        assert_eq!(
+            intervals("../2024-01-01T06:00:00Z"),
+            [interval(None, Some(b))]
+        );
+        assert_eq!(
+            intervals("2024-01-01T00:00:00Z/.."),
+            [interval(Some(a), None)]
+        );
+        assert_eq!(intervals("../.."), [interval(None, None)]);
+        assert_eq!(
+            intervals("2024-01-01T06:00:00Z,2024-01-01T00:00:00Z"),
+            [interval(Some(a), Some(a)), interval(Some(b), Some(b))]
+        );
     }
 
     /// The EDR 1.2 example `2018-02-12T00:00Z,2018-02-12T01:00Z,2018-02-14T12:00Z`
@@ -2031,59 +2145,59 @@ mod tests {
         }
     }
 
+    fn pairs(q: &[(&str, &str)]) -> Vec<(String, String)> {
+        q.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     /// An unknown parameter is a 400 naming the valid ones; the accepted
     /// filters pass through to the links (#605, #932).
     #[test]
-    fn locations_paging_rejects_unknown_parameters() {
-        let pairs = |q: &[(&str, &str)]| {
-            q.iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<Vec<_>>()
-        };
-        let err = parse_locations_paging(pairs(&[("limti", "5")])).unwrap_err();
+    fn locations_query_rejects_unknown_parameters() {
+        let err = parse_locations_query(pairs(&[("limti", "5")])).unwrap_err();
         assert!(err.to_string().contains("limti"), "{err}");
         assert!(err.to_string().contains("limit, offset"), "{err}");
-        assert!(parse_locations_paging(pairs(&[("sortby", "id")])).is_err());
-        assert_eq!(
-            parse_locations_paging(pairs(&[("bbox", "0,0,1,1"), ("datetime", "..")])).unwrap(),
-            None
-        );
-        let page = parse_locations_paging(pairs(&[("bbox", "0,0,1,1"), ("limit", "2")]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(page.limit, 2);
+        assert!(parse_locations_query(pairs(&[("sortby", "id")])).is_err());
+        let query = parse_locations_query(pairs(&[
+            ("bbox", "0,0,1,1"),
+            ("datetime", "../2026-01-01T00:00:00Z"),
+        ]))
+        .unwrap();
+        assert_eq!(query.paging, None);
+        assert!(query.is_filtered());
+        let query = parse_locations_query(pairs(&[("bbox", "0,0,1,1"), ("limit", "2")])).unwrap();
+        assert_eq!(query.paging.unwrap().limit, 2);
     }
 
     #[test]
-    fn locations_paging_splits_query() {
-        let pairs = |q: &[(&str, &str)]| {
-            q.iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<Vec<_>>()
-        };
+    fn locations_query_splits_query() {
         // No limit: the complete inventory, other parameters untouched.
+        let query = parse_locations_query(pairs(&[("f", "json")])).unwrap();
+        assert_eq!(query.paging, None);
+        assert!(!query.is_filtered());
+        assert_eq!(query.href("b", 0), "b?f=json");
         assert_eq!(
-            parse_locations_paging(pairs(&[("f", "json")])).unwrap(),
+            parse_locations_query(pairs(&[("limit", "")]))
+                .unwrap()
+                .paging,
             None
         );
-        assert_eq!(
-            parse_locations_paging(pairs(&[("limit", "")])).unwrap(),
-            None
-        );
-        let page = parse_locations_paging(pairs(&[
+        let query = parse_locations_query(pairs(&[
             ("f", "geo json"),
             ("limit", "50000"),
             ("offset", "20"),
         ]))
-        .unwrap()
         .unwrap();
+        let page = query.paging.unwrap();
         assert_eq!((page.limit, page.offset), (MAX_LIMIT, 20));
         // Links repeat the other parameters, encoded, and the clamped limit.
         assert_eq!(
-            page.href("https://x/locations", 10020),
+            query.href("https://x/locations", 10020),
             "https://x/locations?f=geo%20json&limit=10000&offset=10020"
         );
-        assert_eq!(page.href("b", 0), "b?f=geo%20json&limit=10000");
+        assert_eq!(query.href("b", 0), "b?f=geo%20json&limit=10000");
+        assert_eq!(parse_locations_query(Vec::new()).unwrap().href("b", 0), "b");
         for bad in [
             &[("offset", "3")][..],
             &[("limit", "0")],
@@ -2091,7 +2205,77 @@ mod tests {
             &[("limit", "2"), ("limit", "3")],
             &[("limit", "2"), ("offset", "1"), ("offset", "1")],
         ] {
-            assert!(parse_locations_paging(pairs(bad)).is_err(), "{bad:?}");
+            assert!(parse_locations_query(pairs(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `bbox` and `datetime` are parsed, kept in request order for the
+    /// links, and a malformed or repeated one is a 400 naming it (#932).
+    #[test]
+    fn locations_query_parses_its_filters() {
+        let query = parse_locations_query(pairs(&[
+            ("datetime", "2026-01-01T00:00:00Z/.."),
+            ("limit", "2"),
+            ("bbox", "170, 10,-170,20"),
+        ]))
+        .unwrap();
+        let bbox = query.bbox.unwrap();
+        assert_eq!(
+            (bbox.west, bbox.south, bbox.east, bbox.north),
+            (170.0, 10.0, -170.0, 20.0)
+        );
+        assert!(bbox.crosses_antimeridian());
+        assert!(matches!(
+            query.datetime,
+            Some(DatetimeSelector::Window(_, end)) if end == DateTime::<Utc>::MAX_UTC
+        ));
+        assert_eq!(
+            query.href("b", 2),
+            "b?datetime=2026-01-01T00:00:00Z/..&bbox=170,%2010,-170,20&limit=2&offset=2"
+        );
+        // Six numbers: the vertical pair is checked, then dropped.
+        let six = parse_locations_query(pairs(&[("bbox", "20,55,1000,30,65,0")]))
+            .unwrap()
+            .bbox
+            .unwrap();
+        assert_eq!(
+            (six.west, six.south, six.east, six.north),
+            (20.0, 55.0, 30.0, 65.0)
+        );
+        // The list form is the data queries' list.
+        let list = parse_locations_query(pairs(&[(
+            "datetime",
+            "2026-01-01T06:00:00Z,2026-01-01T00:00:00Z",
+        )]))
+        .unwrap();
+        assert!(matches!(list.datetime, Some(DatetimeSelector::Instants(ref v)) if v.len() == 2));
+
+        for (bad, names) in [
+            (&[("bbox", "1,2,3")][..], "Invalid bbox"),
+            (&[("bbox", "1,2,3,4,5")], "Invalid bbox"),
+            (&[("bbox", "a,0,1,1")], "Invalid bbox"),
+            (&[("bbox", "0,0,1,1,NaN,2")], "Invalid bbox"),
+            (&[("bbox", "")], "Invalid bbox"),
+            (&[("bbox", "0,60,1,50")], "Invalid bbox"),
+            (&[("bbox", "190,0,200,1")], "Invalid bbox"),
+            (&[("bbox", "0,0,1,1"), ("bbox", "0,0,2,2")], "'bbox'"),
+            (&[("datetime", "yesterday")], "datetime"),
+            (&[("datetime", "")], "datetime"),
+            (
+                &[("datetime", "2026-01-01T00:00:00Z,2026-01-02T00:00:00Z/..")],
+                "datetime",
+            ),
+            (&[("datetime", ".."), ("limit", "2")], "datetime"),
+            (
+                &[
+                    ("datetime", "2026-01-01T00:00:00Z"),
+                    ("datetime", "2026-01-02T00:00:00Z"),
+                ],
+                "'datetime'",
+            ),
+        ] {
+            let err = parse_locations_query(pairs(bad)).unwrap_err().to_string();
+            assert!(err.contains(names), "{bad:?}: {err}");
         }
     }
 

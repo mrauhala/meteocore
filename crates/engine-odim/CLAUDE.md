@@ -26,7 +26,11 @@ around `ds-storage` calls (Critical Rules 6–7).
   `coverage_radius_m`/`latest_volume_time`/`volume_count`/`collection`).
   `quantities`/`elevation_angles` use `PropertyValue::List`.
   `GET /features/collections/{base}/items[/{nod}]` supports
-  bbox/limit/offset/datetime.
+  bbox/limit/offset/datetime (`datetime` = a volume inside the interval,
+  `any_time_in_interval`). Each site view's EDR `/locations?datetime=`
+  (`location_time_filter`, #932) lists its site by the same rule over the
+  same volume times, not by its temporal extent: a window between two
+  volumes matches nothing, as `/locations/{nod}` would answer 404 there.
 - **Auto-split happens in `server/src/admin.rs`** (`load_collections`, the
   `"odim-volume"` arm): build the engine once, enumerate `engine.sites()`
   (`(nod, label)` pairs), register one view per site (cloning the base
