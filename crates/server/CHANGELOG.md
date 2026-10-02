@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.0](https://github.com/mrauhala/meteocore/compare/v0.10.0...v0.11.0) (2026-10-02)
+
+
+### Features
+
+* **edr:** repeating datetime interval Rn/date-time/duration ([#957](https://github.com/mrauhala/meteocore/issues/957)) ([c3970f4](https://github.com/mrauhala/meteocore/commit/c3970f43bcc91ccebc08f17edc05df76f237c8c2))
+* **wind:** derive wind speed and direction from u/v components ([#960](https://github.com/mrauhala/meteocore/issues/960)) ([1b9b2cc](https://github.com/mrauhala/meteocore/commit/1b9b2cc9c45d2c961296b06fb89c0b2826804a57))
+
+
+### Bug Fixes
+
+* **edr:** filter /locations by bbox and datetime before paging ([#959](https://github.com/mrauhala/meteocore/issues/959)) ([2b4f3a2](https://github.com/mrauhala/meteocore/commit/2b4f3a295d2c3ce5ce67f04653f1819bc4854e25))
+
 ## [0.10.0](https://github.com/mrauhala/meteocore/compare/v0.9.0...v0.10.0) (2026-10-01)
 
 
