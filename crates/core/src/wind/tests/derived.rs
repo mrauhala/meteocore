@@ -183,6 +183,13 @@ impl EdrEngine for Mock {
         Ok(Vec::new())
     }
 
+    fn location_time_filter<'a>(
+        &'a self,
+        _: &'a [crate::feature::DatetimeInterval],
+    ) -> Option<crate::edr_engine::LocationFilter<'a>> {
+        Some(Box::new(|location: &Location| location.id == "kept"))
+    }
+
     fn has_instances(&self) -> bool {
         true
     }
@@ -496,6 +503,17 @@ fn every_other_method_delegates() {
     assert_eq!(wind.get_temporal_extent(), Some((hour(0), hour(2))));
     assert_eq!(wind.get_spatial_extent(), Some([0.0, 0.0, 1.0, 1.0]));
     assert_eq!(wind.collection_id(), "nwp");
+    let location = |id: &str| Location {
+        id: id.into(),
+        label: id.into(),
+        latitude: 0.0,
+        longitude: 0.0,
+    };
+    let filter = wind
+        .location_time_filter(&[])
+        .expect("the inner engine's location filter");
+    assert!(filter(&location("kept")));
+    assert!(!filter(&location("dropped")));
 }
 
 /// The derived values count against the shared response budget before any
