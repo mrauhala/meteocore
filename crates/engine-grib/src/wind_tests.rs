@@ -138,7 +138,8 @@ fn ugrd_vgrd_give_wind_and_wdir_derived_after_sampling() {
         components.ranges["UGRD"].values[0].unwrap(),
         components.ranges["VGRD"].values[0].unwrap(),
     );
-    assert!((u - 0.75).abs() < 1e-9 && (v - 1.5).abs() < 1e-9, "{u} {v}");
+    assert!((u - 0.75).abs() < 1e-9);
+    assert!((v - 1.5).abs() < 1e-9);
     let derived = position(&wind, &["WIND", "WDIR"], None);
     let (speed, direction) = expected(u, v);
     assert!((derived.ranges["WIND"].values[0].unwrap() - speed).abs() < 1e-9);
