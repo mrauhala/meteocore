@@ -179,6 +179,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {

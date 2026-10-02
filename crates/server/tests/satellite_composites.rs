@@ -121,6 +121,7 @@ fn collection(dir: &Path, apis: &[&str]) -> CollectionConfig {
         bufr: None,
         satellite: Some(satellite_config(dir)),
         preview: None,
+        derive_wind: None,
     }
 }
 

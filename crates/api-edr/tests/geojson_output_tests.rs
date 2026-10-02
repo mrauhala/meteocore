@@ -299,6 +299,7 @@ fn config(id: &str, title: &str) -> CollectionConfig {
         bufr: None,
         satellite: None,
         preview: None,
+        derive_wind: None,
     }
 }
 

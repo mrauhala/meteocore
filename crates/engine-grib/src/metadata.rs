@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use ds_core::error::DataServerError;
+use ds_core::wind::VectorFrame;
 use ds_storage::{bytes::Bytes, object_store::path::Path, DataStore};
 
 use crate::{cache::DecodedGrid, catalog::MessageEntry, runtime::run_fetches};
@@ -66,6 +67,8 @@ pub(crate) struct MessageMetadata {
     pub first_surface_type: u8,
     pub first_surface_value: Option<f64>,
     pub geometry: Option<GridGeometry>,
+    /// GRIB2 flag table 3.3 bit 5 of the message's grid section (#897).
+    pub uv_frame: VectorFrame,
 }
 
 impl From<&DecodedGrid> for MessageMetadata {
@@ -83,6 +86,7 @@ impl From<&DecodedGrid> for MessageMetadata {
                 grid.lon_inc,
                 grid.lat_inc,
             ),
+            uv_frame: grid.uv_frame,
         }
     }
 }
@@ -134,6 +138,7 @@ impl MessageMetadata {
             first_surface_type,
             first_surface_value,
             geometry: None,
+            uv_frame: VectorFrame::Unknown,
         })
     }
 }
@@ -221,6 +226,7 @@ pub(crate) fn read_metadata(
     let mut previous = 0;
     let mut centre = None;
     let mut geometry = None;
+    let mut uv_frame = VectorFrame::Unknown;
     loop {
         let header = reader.read(position, 5)?;
         let section_length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
@@ -257,6 +263,7 @@ pub(crate) fn read_metadata(
                         &product,
                     )?;
                     metadata.geometry = geometry;
+                    metadata.uv_frame = uv_frame;
                     return Ok(metadata);
                 }
             }
@@ -267,9 +274,10 @@ pub(crate) fn read_metadata(
                     let header = reader.read(position, 14)?;
                     if header[12..14] == [0, 0] && section_length >= 72 {
                         let payload = reader.read(position + 5, 67)?.to_vec().into_boxed_slice();
-                        geometry = grib::GridDefinition::from_payload(payload)
-                            .ok()
-                            .and_then(|grid| crate::reader::grid_geometry(&grid).ok());
+                        if let Ok(grid) = grib::GridDefinition::from_payload(payload) {
+                            geometry = crate::reader::grid_geometry(&grid).ok();
+                            uv_frame = crate::reader::uv_frame(&grid);
+                        }
                     }
                 }
             }

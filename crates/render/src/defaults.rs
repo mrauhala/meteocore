@@ -124,8 +124,13 @@ static RULES: &[DefaultRule] = &[
         ],
         fallback_range: None,
     },
+    // Wind speed, native or derived from u/v (#897: `10si`, `100si`, `ws`,
+    // wgrib2 `WIND`, FMI `WindSpeedMS`, CF stores' `…wind_speed…`; every
+    // derived title starts "Wind speed").
     DefaultRule {
-        names: &["ws", "ff", "si10", "10si", "gust", "fg", "wgust"],
+        names: &[
+            "ws", "ff", "si10", "10si", "si100", "100si", "wind", "gust", "fg", "wgust",
+        ],
         contains: &["windspeed", "windgust"],
         palette: "wind_speed",
         unit_ranges: &[
@@ -497,6 +502,40 @@ mod tests {
             .match_default("param42", "2 metre temperature", Some("K"))
             .unwrap();
         assert_eq!(air.palette, "temperature");
+    }
+
+    /// #897: every name and title a derived wind speed gets, and the native
+    /// speeds it never duplicates, render as wind speed over 0–40 m/s. A
+    /// derived direction is no map layer and matches nothing.
+    #[test]
+    fn derived_wind_speeds_get_the_wind_speed_default() {
+        let d = builtin();
+        for (name, title, unit) in [
+            ("10si", "Wind speed (10 m above ground)", Some("m s-1")),
+            ("100si", "Wind speed (100 m above ground)", Some("m s-1")),
+            ("ws", "Wind speed", Some("m s-1")),
+            ("WIND", "Wind speed (10 m above ground)", Some("m s-1")),
+            // A native GFS speed before its header has been probed.
+            ("WIND", "WIND", None),
+            ("si10", "Wind speed", Some("m s**-1")),
+            // QueryData publishes no units.
+            ("WindSpeedMS", "Wind speed", None),
+            ("wind_speed_10m", "Wind speed", Some("m s-1")),
+            ("10m_wind_speed", "Wind speed", Some("m/s")),
+        ] {
+            let m = d
+                .match_default(name, title, unit)
+                .unwrap_or_else(|| panic!("no default for {name}"));
+            assert_eq!(m.palette, "wind_speed", "{name}");
+            assert_eq!(m.range, Some((0.0, 40.0)), "{name}");
+        }
+        for (name, title) in [
+            ("10wdir", "Wind direction (10 m above ground)"),
+            ("WDIR", "Wind direction"),
+            ("WindDirection", "Wind direction"),
+        ] {
+            assert_eq!(d.match_default(name, title, Some("°")), None, "{name}");
+        }
     }
 
     #[test]

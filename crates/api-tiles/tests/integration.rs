@@ -151,6 +151,7 @@ fn build_state_with_wms(wms: Option<ds_core::config::WmsConfig>) -> api_tiles::A
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -234,6 +235,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -1139,6 +1141,7 @@ fn build_empty_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1272,6 +1275,7 @@ fn build_multi_param_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1774,6 +1778,7 @@ mod mvt {
                 bufr: None,
                 satellite: None,
                 preview: None,
+                derive_wind: None,
             },
         );
 
@@ -1864,6 +1869,7 @@ mod mvt {
                 bufr: None,
                 satellite: None,
                 preview: None,
+                derive_wind: None,
             },
         );
 
@@ -2250,6 +2256,7 @@ mod temporal_grid_jitter {
                 bufr: None,
                 satellite: None,
                 preview: None,
+                derive_wind: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(TilesState {
@@ -2424,6 +2431,7 @@ mod metadata_extras {
                 bufr: None,
                 satellite: None,
                 preview: None,
+                derive_wind: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(TilesState {
@@ -2733,6 +2741,7 @@ fn build_param_layer_router() -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -3665,6 +3674,7 @@ mod composites {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(TilesState {
             map_engines: HashMap::from([("radar".to_string(), engine)]),

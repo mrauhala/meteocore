@@ -297,6 +297,36 @@ rendering share `StepFile::default_message` so default labels/units agree.
 - `west > east` bboxes are a 400 before any I/O (#667); a bbox off the grid
   is `LocationNotFound` (404).
 
+## Wind components (#897)
+
+- `ds_core::wind::DerivedWind` (wired in `server/src/admin.rs`) derives
+  speed and direction from u/v pairs; this engine only reports facts
+  (`WindSource`). Never compute a derived field here.
+- Read GRIB2 flag table 3.3 bit 5 (`0x08`, Section 3 octet 55) from **every**
+  message, in both the header probe (`metadata::read_metadata`) and the
+  decode (`reader::uv_frame`), into `MessageMetadata::uv_frame` /
+  `DecodedGrid::uv_frame` and the per-key `ParamMetadata` (with the triple).
+  A key not yet probed reports `VectorFrame::Unknown`: speed only until its
+  header is read, then direction too.
+- `discovery::build_wind_facts` builds each view's `WindFacts` with its
+  `RasterInfo` (`refresh_discovery`), so `wind_facts()` is an `Arc` clone.
+  Single-level views give each parameter its canonical level identity
+  (`hag:10`, `sfc`) and label; pressure/model views none (a request's `z`
+  reads both components at that level). The latest run's canonical level is
+  the pairing basis.
+- The grid is reported `GridAxes::NorthAligned` because only Template 3.0
+  decodes. A rotated or projected template must report its own axes there,
+  or grid-relative components would silently pass as earth-relative.
+- GRIB1 (code table 7, same bit) is not read: the engine is GRIB2 only.
+- `wind_tests::derived_matches_native_arpege_speed_and_direction_over_the_domain`
+  is the frame check against real data: `testdata/grib-arpege-wind` (13 KB,
+  Météo-France ARPEGE 10 m u/v plus native 10si/10wdir, every 20th node of
+  the 0.1° Europe grid; provenance in its README) served once as published
+  and once as components only (`parameters = ["10u", "10v"]`). Derived and
+  native agree within 0.02 m/s and 0.5° over the domain.
+- Code Table 4.2 now has 0/2/0 wind direction (`°`) and 0/2/1 wind speed
+  (`m s-1`), so native speeds and directions carry units.
+
 ## Discovery snapshots
 
 - Publish `RasterInfo` snapshots after catalog changes and successful header/decoded

@@ -75,6 +75,7 @@ fn app() -> axum::Router {
         bufr: None,
         satellite: None,
         preview: None,
+        derive_wind: None,
     };
     let state = api_edr::handlers::EdrState {
         engines: HashMap::from([(ID.to_string(), Arc::new(view) as Arc<dyn EdrEngine>)]),

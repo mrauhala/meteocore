@@ -176,6 +176,7 @@ fn build_router_with(engine: Arc<dyn FeatureEngine>) -> axum::Router {
             bufr: None,
             satellite: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -498,6 +499,7 @@ mod vector_tile_discovery {
                 bufr: None,
                 satellite: None,
                 preview: None,
+                derive_wind: None,
             },
         );
         Arc::new(ArcSwap::from_pointee(FeaturesState {
@@ -1128,6 +1130,7 @@ mod metadata_extras {
                 bufr: None,
                 satellite: None,
                 preview: None,
+                derive_wind: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(FeaturesState {

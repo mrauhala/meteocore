@@ -742,6 +742,7 @@ async fn main() {
                 .collect(),
         ),
         engine_handles: RwLock::new(result.engines_by_id),
+        wind_handles: RwLock::new(result.wind_by_id),
     });
 
     let recovery_state = server_state.clone();

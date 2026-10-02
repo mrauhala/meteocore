@@ -396,6 +396,7 @@ fn mk_collection(
         bufr: None,
         satellite: None,
         preview: None,
+        derive_wind: None,
     }
 }
 

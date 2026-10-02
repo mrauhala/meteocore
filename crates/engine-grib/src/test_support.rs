@@ -77,6 +77,31 @@ pub fn message(scan: u8, base: f32, packed: [u8; 4], surface: u8, level: u32) ->
     bytes
 }
 
+/// [`message`] with another GRIB2 parameter (discipline 0) and the grid's
+/// resolution-and-component flags (Section 3 octet 55, flag table 3.3). The
+/// builder writes `0x30`: both increments given, components earth-relative;
+/// `0x38` adds bit 5, grid-relative components.
+pub fn parameter_message(
+    category: u8,
+    number: u8,
+    flags: u8,
+    base: f32,
+    packed: [u8; 4],
+    surface: u8,
+    level: u32,
+) -> Vec<u8> {
+    let mut bytes = message(0, base, packed, surface, level);
+    // Indicator 16 bytes, Section 1 21: Section 3 starts at 37, Section 4
+    // at 37 + 72. Octets are 1-based in the WMO tables.
+    let (s3, s4) = (37, 109);
+    assert_eq!((bytes[s3 + 4], bytes[s4 + 4]), (3, 4));
+    assert_eq!(bytes[s3 + 54], 0x30);
+    bytes[s3 + 54] = flags;
+    bytes[s4 + 9] = category;
+    bytes[s4 + 10] = number;
+    bytes
+}
+
 pub struct TestSource {
     pub dir: PathBuf,
 }

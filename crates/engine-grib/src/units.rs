@@ -158,6 +158,8 @@ fn standard_lookup(discipline: u8, category: u8, number: u8) -> Option<ParamInfo
         (0, 1, 64) => ("Total column integrated water vapour", SourceUnit::KgPerM2),
 
         // Category 2: momentum
+        (0, 2, 0) => ("Wind direction (from which blowing)", SourceUnit::Raw("°")),
+        (0, 2, 1) => ("Wind speed", SourceUnit::MetresPerSecond),
         (0, 2, 2) => ("u-component of wind", SourceUnit::MetresPerSecond),
         (0, 2, 3) => ("v-component of wind", SourceUnit::MetresPerSecond),
         (0, 2, 8) => ("Vertical velocity (pressure)", SourceUnit::Raw("Pa s-1")),

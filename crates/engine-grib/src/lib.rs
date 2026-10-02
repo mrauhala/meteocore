@@ -18,6 +18,8 @@ mod trajectory;
 pub mod units;
 mod vertical;
 pub mod wgrib2_index;
+#[cfg(test)]
+mod wind_tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -63,6 +65,11 @@ struct ParamMetadata {
     /// 101 MSL, 200 entire atmosphere).
     first_surface_value: Option<f64>,
     window_qualifier: Option<String>,
+    /// WMO `(discipline, category, number)` of the probed or decoded
+    /// message; `None` until one is read.
+    triple: Option<(u8, u8, u8)>,
+    /// The message's GRIB2 flag table 3.3 bit 5 (#897).
+    uv_frame: ds_core::wind::VectorFrame,
 }
 
 impl ParamMetadata {
@@ -81,6 +88,8 @@ impl ParamMetadata {
             first_surface_type: None,
             first_surface_value: None,
             window_qualifier: None,
+            triple: None,
+            uv_frame: ds_core::wind::VectorFrame::Unknown,
         }
     }
 
@@ -1047,6 +1056,8 @@ impl GribEngine {
                 first_surface_type: None,
                 first_surface_value: None,
                 window_qualifier: None,
+                triple: None,
+                uv_frame: ds_core::wind::VectorFrame::Unknown,
             },
             None => {
                 tracing::debug!(
@@ -1064,6 +1075,8 @@ impl GribEngine {
         meta.window_qualifier = step_kind.qualifier();
         meta.first_surface_type = Some(message.first_surface_type);
         meta.first_surface_value = message.first_surface_value;
+        meta.triple = Some(message.triple);
+        meta.uv_frame = message.uv_frame;
 
         let mut cache = self.source.param_meta.write().unwrap();
         cache.insert(key.clone(), meta);
@@ -1458,6 +1471,19 @@ impl MapEngine for GribEngine {
             .get(&self.family)
             .unwrap_or(&discovery.empty)
             .clone()
+    }
+}
+
+/// Each view's wind components for `ds_core::wind::DerivedWind` (#897): an
+/// `Arc` clone of the snapshot rebuilt with the view's `RasterInfo`.
+impl ds_core::wind::WindSource for GribEngine {
+    fn wind_facts(&self) -> Arc<ds_core::wind::WindFacts> {
+        let discovery = self.source.discovery.read().unwrap();
+        discovery
+            .wind
+            .get(&self.family)
+            .cloned()
+            .unwrap_or_else(ds_core::wind::WindFacts::none)
     }
 }
 
@@ -1947,6 +1973,7 @@ mod tests {
                     centre: 7,
                     first_surface_type: 1,
                     first_surface_value: None,
+                    uv_frame: ds_core::wind::VectorFrame::Earth,
                 }),
             );
         }

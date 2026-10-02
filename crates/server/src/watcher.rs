@@ -443,6 +443,7 @@ pub(crate) mod tests {
                     .collect(),
             ),
             engine_handles: RwLock::new(result.engines_by_id),
+            wind_handles: RwLock::new(result.wind_by_id),
         })
     }
 
