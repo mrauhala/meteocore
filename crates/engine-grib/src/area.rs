@@ -128,7 +128,13 @@ impl GribEngine {
             .iter()
             .map(|&x| ds_core::geo::wrap_lon(x))
             .collect();
-        let mask = polygon.mask_cells(&x_wrapped, y_coords);
+        // The native spacing sizes a lone edge node's cell (a bbox clamped
+        // at a regional grid's edge).
+        let mask = polygon.mask_native_cells(
+            &x_wrapped,
+            y_coords,
+            Some((grid.lon_inc.abs(), grid.lat_inc.abs())),
+        );
         if !mask.iter().any(|&m| m) {
             return Err(DataServerError::LocationNotFound(
                 "The polygon contains no grid cell".into(),

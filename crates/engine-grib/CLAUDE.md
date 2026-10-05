@@ -275,9 +275,12 @@ ones only in the legacy layout.
   of completion order. Validate grid axes before extracting each subset.
 - Radius delegates to the same area path via the default EDR trait method.
 - `bbox_subset` rounds out to the nodes enclosing the polygon's bbox; the
-  shared `QueryPolygon::mask_cells` nulls the nodes outside the polygon:
-  for a rectangle those whose cell, half a spacing either side, misses it
-  (#966), for any other polygon those centred outside it (#671). Keep
+  shared `QueryPolygon::mask_native_cells` nulls the nodes outside the
+  polygon: for a rectangle those whose cell, half a spacing either side,
+  misses it (#966), for any other polygon those centred outside it (#671).
+  Pass the native spacing: a bbox clamped at a regional grid's edge leaves
+  a lone node, whose cell only the spacing sizes. A rectangle no cell meets
+  is a 404; the vertex fallback never applies to it. Keep
   `bbox_subset` enclosing (and `extract_bbox` with it): the cube trims its
   own axes from it instead.
 - Run `cargo test -p engine-grib area::tests::area_latency_replay -- --ignored

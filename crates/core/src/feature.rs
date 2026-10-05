@@ -474,9 +474,17 @@ impl QueryPolygon {
     /// body) are used instead, so a small-but-real shape still returns its
     /// data instead of a false "no cell inside" 404 (#671). A rectangle
     /// (the bbox form) instead keeps every cell whose footprint, halfway to
-    /// its neighbours, intersects it, without a ring walk (#966); bound the
-    /// rest with [`check_mask_budget`].
+    /// its neighbours, intersects it, without a ring walk and without the
+    /// fallback (#966); bound the rest with [`check_mask_budget`].
     pub fn mask_cells(&self, x: &[f64], y: &[f64]) -> Vec<bool> {
+        self.mask_native_cells(x, y, None)
+    }
+
+    /// [`Self::mask_cells`] over the nodes of a native grid `native = (dx,
+    /// dy)` degrees apart. Only a rectangle uses it: an axis of a single node
+    /// then has its native cell as footprint, not the whole bbox — GRIB's
+    /// lone edge node when a bbox is clamped at a regional grid's edge.
+    pub fn mask_native_cells(&self, x: &[f64], y: &[f64], native: Option<(f64, f64)>) -> Vec<bool> {
         let (nx, ny) = (x.len(), y.len());
         let spacing = |axis: &[f64], lo: f64, hi: f64| -> f64 {
             if axis.len() > 1 {
@@ -487,13 +495,16 @@ impl QueryPolygon {
         };
         let hx = spacing(x, self.bbox.west, self.bbox.east);
         let hy = spacing(y, self.bbox.south, self.bbox.north);
-        let mut mask: Vec<bool> = if self.is_rectangle() {
+        if self.is_rectangle() {
             // A cell is in when its footprint intersects the bbox, per axis:
             // no ring walk. An engine's native axes may reach past the bbox
             // (GRIB's enclosing nodes), and a cell lying wholly outside it is
             // outside the area (/req/edr/coords-response A, #966). Longitude
             // modulo 360, so a seam-crossing bbox and an axis in another turn
             // agree; a hair of slack keeps a footprint computed onto an edge.
+            // The answer is final: the footprints tile the grid, so a
+            // rectangle on it always meets one, and the vertex fallback's
+            // full cell of tolerance would put back a cell wholly outside.
             let Bbox {
                 west,
                 south,
@@ -508,7 +519,7 @@ impl QueryPolygon {
             let (tx, ty) = (hx * 1e-9, hy * 1e-9);
             let x_in: Vec<bool> = x
                 .iter()
-                .zip(cell_footprints(x, hx, true))
+                .zip(cell_footprints(x, native.map_or(hx, |(dx, _)| dx), true))
                 .map(|(&lon, (lo, hi))| {
                     let d = (lon - west).rem_euclid(360.0);
                     (d + lo <= lon_span + tx && d + hi >= -tx) || d + hi - 360.0 >= -tx
@@ -516,18 +527,19 @@ impl QueryPolygon {
                 .collect();
             let y_in: Vec<bool> = y
                 .iter()
-                .zip(cell_footprints(y, hy, false))
+                .zip(cell_footprints(y, native.map_or(hy, |(_, dy)| dy), false))
                 .map(|(&lat, (lo, hi))| lat + lo <= north + ty && lat + hi >= south - ty)
                 .collect();
-            y_in.iter()
+            return y_in
+                .iter()
                 .flat_map(|&y_in| x_in.iter().map(move |&x_in| x_in && y_in))
-                .collect()
-        } else {
-            y.iter()
-                .flat_map(|&yy| x.iter().map(move |&xx| (xx, yy)))
-                .map(|(xx, yy)| self.contains(xx, yy))
-                .collect()
-        };
+                .collect();
+        }
+        let mut mask: Vec<bool> = y
+            .iter()
+            .flat_map(|&yy| x.iter().map(move |&xx| (xx, yy)))
+            .map(|(xx, yy)| self.contains(xx, yy))
+            .collect();
         if mask.iter().any(|&m| m) || nx == 0 || ny == 0 {
             return mask;
         }
@@ -2333,6 +2345,33 @@ mod tests {
             assert_eq!(row, expect, "x from {first}: 24.1..=25.9 only");
             assert_eq!(mask.iter().filter(|&&m| m).count(), 19 * 19);
         }
+    }
+
+    #[test]
+    fn rectangle_mask_with_no_cell_meeting_it_stays_empty() {
+        // #977 review: the footprint test is final for a rectangle. A bbox
+        // past the last node by more than half a cell meets no footprint,
+        // and the vertex fallback (a full cell of tolerance) must not put
+        // the edge cell back.
+        let axis = [0.0, 1.0, 2.0];
+        let past = parse_area_coords("2.6,2.6,2.8,2.8").unwrap();
+        assert!(past.mask_cells(&axis, &axis).iter().all(|&m| !m));
+        // A lone node: its footprint is the bbox unless the native spacing
+        // is given, which decides a bbox clamped at a grid's edge.
+        let near = parse_area_coords("1.2,1.2,1.4,1.4").unwrap();
+        let far = parse_area_coords("1.6,1.6,1.8,1.8").unwrap();
+        assert_eq!(near.mask_cells(&[1.0], &[1.0]), vec![false]);
+        assert_eq!(
+            near.mask_native_cells(&[1.0], &[1.0], Some((1.0, 1.0))),
+            vec![true]
+        );
+        assert_eq!(
+            far.mask_native_cells(&[1.0], &[1.0], Some((1.0, 1.0))),
+            vec![false]
+        );
+        // A non-rectangular polygon keeps its #671 vertex fallback.
+        let tri = parse_area_coords("POLYGON((1.1 1.1,1.4 1.1,1.1 1.4,1.1 1.1))").unwrap();
+        assert_eq!(tri.mask_cells(&[1.0], &[1.0]), vec![true]);
     }
 
     #[test]

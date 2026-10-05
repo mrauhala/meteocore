@@ -291,6 +291,33 @@ fn rectangle_nodes_whose_cell_misses_an_unaligned_bbox_are_null() {
 }
 
 #[test]
+fn rectangle_past_a_regional_grid_edge_is_404_beyond_half_a_cell() {
+    // #977 review: a bbox past the last node is clamped to that lone node,
+    // whose native cell (half a spacing either side) decides. Within half a
+    // cell it is served; past it, no cell meets the bbox: 404, never the
+    // edge node put back by the vertex fallback.
+    let (_source, engine) = fixture(None, 1, 1, &[]);
+    let p0 = |offset: f64| Some(f64::from(base_value(0, 0)) + offset - 273.15);
+    let area = |coords: &str| engine.query_area(coords, None, Some(&[parameter(0)]), None, None);
+    let result = single(area("1.2,0,1.4,1").unwrap());
+    let DomainDescription::Grid { x, y, .. } = &result.domain else {
+        panic!("expected a grid")
+    };
+    assert_eq!((x.as_slice(), y.as_slice()), (&[1.0][..], &[0.0, 1.0][..]));
+    for (&actual, expected) in result.ranges["P0"].values.iter().zip([p0(6.0), p0(2.0)]) {
+        assert_value(actual, expected);
+    }
+    // 0.6 past the last node: the vertex fallback's tolerance (the 0.8
+    // bbox span of a lone node) would have reached it.
+    for coords in ["1.6,0,2.4,1", "0,1.6,1,2.4"] {
+        assert!(
+            matches!(area(coords), Err(DataServerError::LocationNotFound(_))),
+            "{coords}"
+        );
+    }
+}
+
+#[test]
 fn area_and_radius_default_to_every_parameter_of_the_view() {
     // /req/edr/parameter-name-response A (#966): without `parameter-name`,
     // every parameter, as position and cube answer, not one default.
