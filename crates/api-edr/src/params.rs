@@ -260,6 +260,9 @@ pub enum EdrFormat {
     GeoJson,
     /// A rendered PNG plot (vertical profile or time series).
     Png,
+    /// An HTML page of the response (EDR `/req/html/definition`, #971):
+    /// offered by every data query, after its data formats.
+    Html,
 }
 
 impl EdrFormat {
@@ -269,6 +272,7 @@ impl EdrFormat {
             EdrFormat::CoverageJson => "CoverageJSON",
             EdrFormat::GeoJson => "GeoJSON",
             EdrFormat::Png => "PNG",
+            EdrFormat::Html => "HTML",
         }
     }
 
@@ -278,6 +282,7 @@ impl EdrFormat {
             EdrFormat::CoverageJson => COVERAGE_JSON_MEDIA_TYPE,
             EdrFormat::GeoJson => "application/geo+json",
             EdrFormat::Png => "image/png",
+            EdrFormat::Html => "text/html",
         }
     }
 
@@ -290,17 +295,18 @@ impl EdrFormat {
             }
             "application/geo+json" => Some(EdrFormat::GeoJson),
             "image/png" => Some(EdrFormat::Png),
+            "text/html" => Some(EdrFormat::Html),
             _ => None,
         }
     }
 }
 
 /// Parse the `f` query parameter. Absent/blank → CoverageJSON.
-/// `coveragejson`, `geojson` and `png` are accepted case-insensitively, and
+/// `coveragejson`, `geojson`, `png` and `html` are accepted case-insensitively, and
 /// so are their media types (#510): `application/vnd.cov+json` (what the
 /// responses carry, EDR 1.2, #920), `application/prs.coverage+json` (EDR
 /// 1.1's type, still accepted; the response is the same CoverageJSON under
-/// the 1.2 type), `application/geo+json` and `image/png`. A `+` sent
+/// the 1.2 type), `application/geo+json`, `image/png` and `text/html`. A `+` sent
 /// unencoded arrives as a space, so a space inside a media type reads as
 /// `+`. Anything else is a 400. Whether the query offers the format is the
 /// caller's check ([`query_formats`]).
@@ -314,9 +320,10 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
         Some("coveragejson") => Ok(EdrFormat::CoverageJson),
         Some("geojson") => Ok(EdrFormat::GeoJson),
         Some("png") => Ok(EdrFormat::Png),
+        Some("html") => Ok(EdrFormat::Html),
         Some(media) => EdrFormat::from_media_type(media).ok_or_else(|| {
             DataServerError::InvalidParameter(format!(
-                "Unsupported output format '{media}' — expected 'CoverageJSON', 'GeoJSON' or 'PNG'"
+                "Unsupported output format '{media}' — expected 'CoverageJSON', 'GeoJSON', 'PNG' or 'HTML'"
             ))
         }),
     }
@@ -332,22 +339,54 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
 /// radius results are not offered as PNG. A trajectory is never GeoJSON; it
 /// is a PNG heatmap only as a radar cross-section
 /// (`EdrEngine::trajectory_shape`), an along-path trajectory (#926) being
-/// CoverageJSON only.
+/// CoverageJSON otherwise. Every query also offers HTML (#971), last, so an
+/// `Accept` naming it beside a data format at the same q keeps the data.
 pub fn query_formats(
     query_type: &str,
     station_series: bool,
     trajectory: TrajectoryShape,
 ) -> &'static [EdrFormat] {
-    use EdrFormat::{CoverageJson, GeoJson, Png};
+    use EdrFormat::{CoverageJson, GeoJson, Html, Png};
     match (query_type, station_series) {
-        ("locations" | "position", true) => &[CoverageJson, GeoJson, Png],
-        ("locations" | "position", false) => &[CoverageJson, Png],
+        ("locations" | "position", true) => &[CoverageJson, GeoJson, Png, Html],
+        ("locations" | "position", false) => &[CoverageJson, Png, Html],
         ("trajectory", _) => match trajectory {
-            TrajectoryShape::CrossSection => &[CoverageJson, Png],
-            TrajectoryShape::AlongPath => &[CoverageJson],
+            TrajectoryShape::CrossSection => &[CoverageJson, Png, Html],
+            TrajectoryShape::AlongPath => &[CoverageJson, Html],
         },
-        ("radius", true) => &[CoverageJson, GeoJson],
-        _ => &[CoverageJson],
+        ("radius", true) => &[CoverageJson, GeoJson, Html],
+        _ => &[CoverageJson, Html],
+    }
+}
+
+/// The formats of the `/locations` list (#971): GeoJSON, the default, and
+/// HTML. `json` and `application/json` in `f` name GeoJSON, as on `items`.
+pub const LOCATIONS_LIST_FORMATS: [EdrFormat; 2] = [EdrFormat::GeoJson, EdrFormat::Html];
+
+/// Negotiate the `/locations` list's or `items`' format over
+/// [`LOCATIONS_LIST_FORMATS`], like [`negotiate_edr_format`]: an `f` naming
+/// neither is a 400 naming both, not the GeoJSON the list once answered for
+/// any `f` (#605).
+pub fn negotiate_list_format(
+    f: Option<&str>,
+    accept: Option<&str>,
+    what: &str,
+) -> Result<NegotiatedFormat, DataServerError> {
+    let Some(f) = f.map(str::trim).filter(|f| !f.is_empty()) else {
+        return negotiate_edr_format(None, accept, &LOCATIONS_LIST_FORMATS, what);
+    };
+    let format = match f.to_ascii_lowercase().as_str() {
+        "json" | "application/json" => Ok(EdrFormat::GeoJson),
+        _ => parse_edr_format(Some(f)),
+    };
+    match format {
+        Ok(format) if LOCATIONS_LIST_FORMATS.contains(&format) => Ok(NegotiatedFormat {
+            format,
+            vary_accept: false,
+        }),
+        _ => Err(DataServerError::InvalidParameter(format!(
+            "Unsupported output format '{f}' for {what}; available: GeoJSON, HTML"
+        ))),
     }
 }
 
@@ -1266,27 +1305,81 @@ mod tests {
 
     #[test]
     fn geojson_is_offered_for_point_queries_of_station_series_only() {
-        use EdrFormat::{CoverageJson, GeoJson, Png};
+        use EdrFormat::{CoverageJson, GeoJson, Html, Png};
         let along = TrajectoryShape::AlongPath;
         assert_eq!(
             query_formats("position", true, along),
-            [CoverageJson, GeoJson, Png]
+            [CoverageJson, GeoJson, Png, Html]
         );
         assert_eq!(
             query_formats("locations", true, along),
-            [CoverageJson, GeoJson, Png]
+            [CoverageJson, GeoJson, Png, Html]
         );
         assert_eq!(
             query_formats("radius", true, along),
-            [CoverageJson, GeoJson]
+            [CoverageJson, GeoJson, Html]
         );
-        assert_eq!(query_formats("area", true, along), [CoverageJson]);
-        assert_eq!(query_formats("cube", true, along), [CoverageJson]);
+        assert_eq!(query_formats("area", true, along), [CoverageJson, Html]);
+        assert_eq!(query_formats("cube", true, along), [CoverageJson, Html]);
         for qt in ["locations", "position"] {
-            assert_eq!(query_formats(qt, false, along), [CoverageJson, Png], "{qt}");
+            assert_eq!(
+                query_formats(qt, false, along),
+                [CoverageJson, Png, Html],
+                "{qt}"
+            );
         }
         for qt in ["area", "radius", "cube"] {
-            assert_eq!(query_formats(qt, false, along), [CoverageJson], "{qt}");
+            assert_eq!(
+                query_formats(qt, false, along),
+                [CoverageJson, Html],
+                "{qt}"
+            );
+        }
+    }
+
+    /// HTML (#971): `f=html` or `text/html`, and an `Accept` naming it. A
+    /// browser's `Accept` names only HTML explicitly, so it gets the page;
+    /// a tie with a data format keeps the data format, and wildcards keep
+    /// the default.
+    #[test]
+    fn html_is_negotiated_by_f_and_accept_after_the_data_formats() {
+        use EdrFormat::{CoverageJson, GeoJson, Html};
+        for f in ["html", "HTML", "text/html", "Text/HTML"] {
+            assert_eq!(parse_edr_format(Some(f)).unwrap(), Html, "{f}");
+        }
+        let offered = query_formats("area", false, TrajectoryShape::AlongPath);
+        let pick = |accept: &str| {
+            negotiate_edr_format(None, Some(accept), offered, "q")
+                .unwrap()
+                .format
+        };
+        let browser = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+        assert_eq!(pick(browser), Html);
+        assert_eq!(pick("text/html, application/vnd.cov+json"), CoverageJson);
+        assert_eq!(
+            pick("text/html;q=0.5, application/vnd.cov+json"),
+            CoverageJson
+        );
+        assert_eq!(pick("text/*"), CoverageJson);
+        assert_eq!(pick("*/*"), CoverageJson);
+        // The location list: GeoJSON by default and for `json`, HTML on
+        // request, anything else a 400.
+        let list = |f: Option<&str>, accept: Option<&str>| {
+            negotiate_list_format(f, accept, "the location list").map(|n| n.format)
+        };
+        assert_eq!(list(None, None).unwrap(), GeoJson);
+        assert_eq!(list(None, Some(browser)).unwrap(), Html);
+        for f in [
+            "json",
+            "application/json",
+            "GeoJSON",
+            "application/geo+json",
+        ] {
+            assert_eq!(list(Some(f), Some(browser)).unwrap(), GeoJson, "{f}");
+        }
+        assert_eq!(list(Some("html"), None).unwrap(), Html);
+        for f in ["foo", "CoverageJSON", "PNG"] {
+            assert!(list(Some(f), None).is_err(), "{f}");
         }
     }
 
@@ -1295,19 +1388,19 @@ mod tests {
     /// CoverageJSON only — whatever the engine's station-series flag.
     #[test]
     fn trajectory_formats_follow_the_shape() {
-        use EdrFormat::{CoverageJson, Png};
+        use EdrFormat::{CoverageJson, Html, Png};
         for station_series in [false, true] {
             assert_eq!(
                 query_formats("trajectory", station_series, TrajectoryShape::CrossSection),
-                [CoverageJson, Png]
+                [CoverageJson, Png, Html]
             );
             assert_eq!(
                 query_formats("trajectory", station_series, TrajectoryShape::AlongPath),
-                [CoverageJson]
+                [CoverageJson, Html]
             );
         }
         // Along a path: PNG and GeoJSON are 400s, `Accept: image/png` falls
-        // back to CoverageJSON without `Vary` (one format offered).
+        // back to CoverageJSON (with `Vary`: HTML is offered too).
         let along = query_formats("trajectory", false, TrajectoryShape::AlongPath);
         for f in ["PNG", "GeoJSON"] {
             assert!(negotiate_edr_format(Some(f), None, along, "trajectory queries").is_err());
@@ -1316,7 +1409,7 @@ mod tests {
             negotiate_edr_format(None, Some("image/png"), along, "trajectory queries").unwrap(),
             NegotiatedFormat {
                 format: CoverageJson,
-                vary_accept: false
+                vary_accept: true
             }
         );
         // A cross-section: PNG by `f` or by `Accept` (then with `Vary`).

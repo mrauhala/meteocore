@@ -328,7 +328,7 @@ async fn unknown_repeated_and_malformed_parameters_are_400() {
         "bbox=21,61,23,59",
         "datetime=yesterday",
         "datetime=2026-01-02T00:00:00Z/2026-01-01T00:00:00Z",
-        "f=html",
+        "f=PNG",
         "f=CoverageJSON",
     ] {
         let (status, err) = get(&format!("/collections/stations/items?{query}")).await;
@@ -376,7 +376,7 @@ async fn a_single_item_is_a_feature_and_an_unknown_one_404() {
     let (status, err) = get("/collections/stations/items/nope").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(err["code"], "NotFound");
-    for query in ["limit=1", "f=html", "f=json&f=json"] {
+    for query in ["limit=1", "f=PNG", "f=json&f=json"] {
         let (status, _) = get(&format!("/collections/stations/items/s3?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
     }
@@ -419,7 +419,10 @@ async fn items_is_advertised_in_data_queries_with_the_edr_1_2_link_variables() {
     assert!(variables["description"]
         .as_str()
         .is_some_and(|d| !d.is_empty()));
-    assert_eq!(variables["output_formats"], serde_json::json!(["GeoJSON"]));
+    assert_eq!(
+        variables["output_formats"],
+        serde_json::json!(["GeoJSON", "HTML"])
+    );
     assert_eq!(variables["default_output_format"], "GeoJSON");
     let crs = &variables["crs_details"][0];
     assert_eq!(crs["crs"], "CRS84");

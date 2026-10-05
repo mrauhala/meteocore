@@ -2038,8 +2038,8 @@ mod unimplemented_queries {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 4);
 
-        // `Accept: image/png` is not a failure: CoverageJSON, the only
-        // format offered along a path, so nothing varies on Accept.
+        // `Accept: image/png` is not a failure: CoverageJSON, the default
+        // along a path. HTML is offered too, so the response varies on Accept.
         let req = Request::builder()
             .uri(format!("{base}LINESTRING(24%2060,25%2061)&z=850"))
             .header("accept", "image/png")
@@ -2048,7 +2048,7 @@ mod unimplemented_queries {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "application/vnd.cov+json");
-        assert!(resp.headers().get("vary").is_none_or(|v| !v
+        assert!(resp.headers().get("vary").is_some_and(|v| v
             .to_str()
             .unwrap()
             .to_ascii_lowercase()
@@ -2057,7 +2057,7 @@ mod unimplemented_queries {
         let (_, meta) = fetch("/collections/weather".into()).await;
         assert_eq!(
             meta["data_queries"]["trajectory"]["link"]["variables"]["output_formats"],
-            serde_json::json!(["CoverageJSON"])
+            serde_json::json!(["CoverageJSON", "HTML"])
         );
         let (_, api) = fetch("/api".into()).await;
         let op = &api["paths"]["/edr/collections/weather/trajectory"]["get"];

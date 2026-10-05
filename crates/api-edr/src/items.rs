@@ -7,8 +7,8 @@
 //! GeoJSON encoding and the `self`/`next`/`prev` links that carry the filters.
 //! What differs is EDR's: the `limit` definition (`/req/edr/rc-limit-*`:
 //! default 10, maximum 10 000, larger values clamped, anything that is not a
-//! positive integer a 400), links under the EDR mount, GeoJSON only, and
-//! execution on the bounded EDR query executor.
+//! positive integer a 400), links under the EDR mount, GeoJSON or its HTML
+//! page (#971), and execution on the bounded EDR query executor.
 //!
 //! Only `bbox`, `datetime`, `limit`, `offset` (the paging links' position)
 //! and `f` are accepted; any other parameter, or one given twice, is a 400
@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -33,8 +33,9 @@ use ds_core::feature_engine::FeatureEngine;
 
 use crate::handlers::{
     bad_request, execute_query, lookup_collection, map_query_error, request_base_url, server_error,
-    AppState, EdrState, HandlerError,
+    with_format_vary, AppState, EdrState, HandlerError,
 };
+use crate::params::{negotiate_list_format, EdrFormat, NegotiatedFormat};
 
 /// Page size without `limit` (`/req/edr/rc-limit-definition`).
 pub const DEFAULT_LIMIT: usize = 10;
@@ -45,8 +46,12 @@ pub const MAX_LIMIT: usize = 10_000;
 /// The parameters of `/items`, in the order a 400 lists them.
 pub const LIST_PARAMETERS: [&str; 5] = ["bbox", "datetime", "limit", "offset", "f"];
 
-/// The only output format, as `data_queries` advertises it.
+/// The default output format, as `data_queries` advertises it.
 pub const OUTPUT_FORMAT: &str = "GeoJSON";
+
+/// Every output format, as `data_queries` advertises them: GeoJSON and its
+/// HTML page (#971).
+pub const OUTPUT_FORMATS: [&str; 2] = [OUTPUT_FORMAT, "HTML"];
 
 // The WKT every data query advertises in `crs_details` (#918).
 use ds_core::geo::CRS84_WKT;
@@ -58,6 +63,8 @@ pub struct ItemsParams {
     pub datetime: Option<DatetimeInterval>,
     pub limit: usize,
     pub offset: usize,
+    /// `f`, checked by [`parse_format`]; negotiated with `Accept`.
+    pub f: Option<String>,
 }
 
 impl ItemsParams {
@@ -70,6 +77,7 @@ impl ItemsParams {
             datetime: None,
             limit: DEFAULT_LIMIT,
             offset: 0,
+            f: None,
         };
         let mut seen = HashSet::new();
         for (name, value) in pairs {
@@ -95,7 +103,10 @@ impl ItemsParams {
                         ))
                     })?
                 }
-                _ => parse_format(&value)?,
+                _ => {
+                    parse_format(&value)?;
+                    params.f = Some(value);
+                }
             }
         }
         Ok(params)
@@ -122,35 +133,65 @@ pub fn parse_limit(value: &str) -> Result<usize, DataServerError> {
     Ok(usize::try_from(n).map_or(MAX_LIMIT, |n| n.min(MAX_LIMIT)))
 }
 
-/// `f` on items: GeoJSON, by its EDR name or media type, or as `json`. An
-/// unencoded `+` in `application/geo+json` arrives as a space.
-pub fn parse_format(value: &str) -> Result<(), DataServerError> {
-    let normalized = value.trim().to_ascii_lowercase().replace(' ', "+");
-    match normalized.as_str() {
-        "geojson" | "application/geo+json" | "json" | "application/json" => Ok(()),
-        _ => Err(DataServerError::InvalidParameter(format!(
-            "Unsupported output format '{value}' for items — expected '{OUTPUT_FORMAT}'"
-        ))),
-    }
+/// `f` on items: GeoJSON, by its EDR name or media type, or as `json`; or
+/// HTML (#971). An unencoded `+` in `application/geo+json` arrives as a
+/// space.
+pub fn parse_format(value: &str) -> Result<EdrFormat, DataServerError> {
+    negotiate_list_format(Some(value), None, "items").map(|n| n.format)
 }
 
 /// The `/items/{itemId}` query: `f` at most once, nothing else.
-fn parse_item_pairs(pairs: Vec<(String, String)>) -> Result<(), DataServerError> {
-    let mut format = false;
+fn parse_item_pairs(pairs: Vec<(String, String)>) -> Result<Option<String>, DataServerError> {
+    let mut format = None;
     for (name, value) in pairs {
         if name != "f" {
             return Err(DataServerError::InvalidParameter(format!(
                 "unsupported parameter '{name}' on a single item; only 'f' is accepted"
             )));
         }
-        if std::mem::replace(&mut format, true) {
+        if format.is_some() {
             return Err(DataServerError::InvalidParameter(
                 "duplicate parameter 'f'".into(),
             ));
         }
         parse_format(&value)?;
+        format = Some(value);
     }
-    Ok(())
+    Ok(format)
+}
+
+/// The response format of an items request: `f`, else `Accept`.
+fn items_format(f: Option<&str>, headers: &HeaderMap) -> Result<NegotiatedFormat, HandlerError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    negotiate_list_format(f, accept, "items").map_err(|e| bad_request(&e))
+}
+
+/// The HTML page context of an items response (#971): its links as HTML.
+fn html_page<'a>(
+    doc: &Value,
+    root: &'a str,
+    collection_id: &'a str,
+    collection_title: &'a str,
+    raw_query: Option<&'a str>,
+) -> crate::html::DataPage<'a> {
+    let links = crate::html::feature_page_links(&doc["links"]);
+    let json_url = links
+        .iter()
+        .find(|l| l.rel == "alternate")
+        .map(|l| l.href.clone())
+        .unwrap_or_default();
+    crate::html::DataPage {
+        base: root.strip_suffix(api_common::mounts::EDR).unwrap_or(root),
+        collection_id,
+        collection_title,
+        title: match doc["id"].as_str() {
+            Some(id) => format!("Item {id}"),
+            None => "Items".into(),
+        },
+        raw_query,
+        json_url,
+        links,
+    }
 }
 
 /// The collection's feature engine: 404 for an unknown collection, and for
@@ -197,12 +238,19 @@ fn serialize(doc: &Value) -> Result<String, HandlerError> {
 pub async fn items(
     Path(id): Path<String>,
     Query(pairs): Query<Vec<(String, String)>>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let engine = items_engine(&state, &id)?;
     let params = ItemsParams::from_pairs(pairs).map_err(|e| bad_request(&e))?;
+    let format = items_format(params.f.as_deref(), &headers)?;
+    let title = state
+        .collections
+        .get(&id)
+        .map(|c| c.title.clone())
+        .unwrap_or_default();
     // A collection whose features carry no time cannot filter by it: a 400,
     // not the full set with 200 — the Features API's rule (#682).
     if params.datetime.is_some() && !engine.has_time_dimension() {
@@ -245,13 +293,25 @@ pub async fn items(
         );
         // `timeStamp` is the generation time: hash the page without it, or
         // `If-None-Match` could never match (the Features `items` rule).
+        let time_stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        if format.format == EdrFormat::Html {
+            let page = html_page(&doc, &root, &id, &title, raw_query.as_deref());
+            let mut html = crate::html::features_page(&doc, &page, true);
+            let etag = ds_core::http_cache::etag_of(html.as_bytes());
+            // Filled in place: no second copy of the page.
+            if let Some(at) = html.find(crate::html::TIMESTAMP_SLOT) {
+                let filled = format!("<time data-generated>{time_stamp}</time>");
+                html.replace_range(at..at + crate::html::TIMESTAMP_SLOT.len(), &filled);
+            }
+            return Ok((crate::html::response(html), etag));
+        }
         let etag = ds_core::http_cache::etag_of(serialize(&doc)?.as_bytes());
-        doc["timeStamp"] = json!(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-        Ok((serialize(&doc)?, etag))
+        doc["timeStamp"] = json!(time_stamp);
+        Ok((geojson_response(serialize(&doc)?), etag))
     })
     .await?;
 
-    let mut resp = geojson_response(body);
+    let mut resp = with_format_vary(body, format);
     resp.headers_mut().insert(
         header::ETAG,
         HeaderValue::from_str(&etag).expect("quoted-hex etag is a valid header value"),
@@ -273,21 +333,29 @@ pub async fn item(
 ) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let engine = items_engine(&state, &id)?;
-    parse_item_pairs(pairs).map_err(|e| bad_request(&e))?;
+    let f = parse_item_pairs(pairs).map_err(|e| bad_request(&e))?;
+    let format = items_format(f.as_deref(), &headers)?;
+    let title = state
+        .collections
+        .get(&id)
+        .map(|c| c.title.clone())
+        .unwrap_or_default();
     let root = edr_root(&state, &headers);
-    let body = execute_query(false, move |_budget| {
+    let response = execute_query(false, move |_budget| {
         let feature = engine
             .get_feature(&item_id)
             .map_err(|e| map_query_error(&e, "Item"))?;
-        serialize(&feature_to_geojson(
-            &feature,
-            &id,
-            &root,
-            &ResponseCrs::default(),
-        ))
+        let doc = feature_to_geojson(&feature, &id, &root, &ResponseCrs::default());
+        if format.format == EdrFormat::Html {
+            let page = html_page(&doc, &root, &id, &title, None);
+            return Ok(crate::html::response(crate::html::features_page(
+                &doc, &page, false,
+            )));
+        }
+        Ok(geojson_response(serialize(&doc)?))
     })
     .await?;
-    Ok(geojson_response(body))
+    Ok(with_format_vary(response, format))
 }
 
 /// The `data_queries.items` entry of a collection whose engine serves
@@ -302,7 +370,7 @@ pub fn data_query(query_base: &str) -> Value {
                 "title": "Items query",
                 "description": "The collection's features as a GeoJSON FeatureCollection, filtered by bbox and datetime and paged by limit",
                 "query_type": "items",
-                "output_formats": [OUTPUT_FORMAT],
+                "output_formats": OUTPUT_FORMATS,
                 "default_output_format": OUTPUT_FORMAT,
                 "crs_details": [{"crs": "CRS84", "wkt": CRS84_WKT}]
             }
@@ -317,8 +385,8 @@ pub fn openapi_paths(id: &str, title: &str) -> Vec<(String, Value)> {
         "name": "f",
         "in": "query",
         "required": false,
-        "schema": {"type": "string", "enum": ["GeoJSON", "application/geo+json", "json", "application/json"]},
-        "description": "Output format: GeoJSON, the default and only one (case-insensitive; encode the plus sign as %2B in application/geo+json)."
+        "schema": {"type": "string", "enum": ["GeoJSON", "application/geo+json", "json", "application/json", "HTML", "text/html"]},
+        "description": "Output format: GeoJSON, the default, or HTML (case-insensitive; encode the plus sign as %2B in application/geo+json). Without f, the Accept header chooses."
     });
     let errors = |not_found: &str| {
         json!({
@@ -538,7 +606,7 @@ mod tests {
             vec![("offset", "-1")],
             vec![("bbox", "1,2,3")],
             vec![("datetime", "2026-01-02T00:00:00Z/2026-01-01T00:00:00Z")],
-            vec![("f", "html")],
+            vec![("f", "foo")],
             vec![("f", "CoverageJSON")],
         ] {
             assert!(ItemsParams::from_pairs(pairs(&q)).is_err(), "{q:?}");
@@ -555,6 +623,12 @@ mod tests {
         assert!(parse_item_pairs(pairs(&[("f", "GeoJSON")])).is_ok());
         assert!(parse_item_pairs(pairs(&[("f", "json"), ("f", "json")])).is_err());
         assert!(parse_item_pairs(pairs(&[("limit", "1")])).is_err());
-        assert!(parse_item_pairs(pairs(&[("f", "html")])).is_err());
+        assert!(parse_item_pairs(pairs(&[("f", "PNG")])).is_err());
+        assert_eq!(
+            parse_item_pairs(pairs(&[("f", "html")]))
+                .unwrap()
+                .as_deref(),
+            Some("html")
+        );
     }
 }

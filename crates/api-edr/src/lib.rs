@@ -3,6 +3,7 @@ mod datetime_list;
 mod executor;
 pub(crate) mod geojson;
 pub mod handlers;
+mod html;
 pub mod items;
 mod location_budget;
 pub mod params;
