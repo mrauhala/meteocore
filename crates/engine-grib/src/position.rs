@@ -136,8 +136,8 @@ impl GribEngine {
     /// The parameters a point-sampling query (position, trajectory) returns:
     /// the requested ones (checked against the run on level views), else
     /// every parameter of a pressure/model view, else the near-surface
-    /// products of the selected steps. `steps` empty, or no parameter on a
-    /// vertical view, is a 400.
+    /// products of the selected steps. `steps` empty is a 404, no parameter
+    /// on a vertical view a 400.
     pub(crate) fn position_parameters(
         &self,
         parameters: Option<&[String]>,
@@ -161,7 +161,14 @@ impl GribEngine {
         if self.family.is_some() {
             self.validate_parameters(keys, &params)?;
         }
-        if steps.is_empty() || (params.is_empty() && self.vertical_kind().is_some()) {
+        // A pinned run without a step in the `datetime` window: the 404 of
+        // an unpinned one (`resolve_run`), which a datetime list skips.
+        if steps.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No forecast step matches the requested datetime".into(),
+            ));
+        }
+        if params.is_empty() && self.vertical_kind().is_some() {
             return Err(DataServerError::InvalidParameter(
                 "No forecast data matches the query".into(),
             ));

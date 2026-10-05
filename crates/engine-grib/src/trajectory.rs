@@ -28,8 +28,13 @@ impl GribEngine {
         ds_core::deadline::check()?;
         let path = TrajectoryPath::parse(coords)?;
         let catalog = self.catalog();
-        // An M path's own times select the run, as a `datetime` window does.
-        let run = resolve_run(&catalog, reference_time, path.time_window().or(datetime))?;
+        // An M path's samples snap to the run's nearest step, so its run
+        // only has to cover the path's first time, as a map `TIME` does; a
+        // 2-D or Z path selects by `datetime`, like position.
+        let run = match path.time_window() {
+            Some((first, _)) => covering_run(&catalog, reference_time, Some(first))?,
+            None => resolve_run(&catalog, reference_time, datetime)?,
+        };
         let keys = catalog
             .parameter_keys(&run.reference_time)
             .cloned()
@@ -383,16 +388,17 @@ mod tests {
             panic!()
         };
         assert!(nodes.iter().all(|n| n.0 == t));
-        // A window with no step is the position query's 400.
+        // A window with no step is the position query's 404.
         let empty = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
-        assert!(engine
-            .query_trajectory(
+        assert!(matches!(
+            engine.query_trajectory(
                 "LINESTRING(0 0, 1 1)",
                 Some((empty, empty)),
                 None,
                 None,
                 None
-            )
-            .is_err());
+            ),
+            Err(DataServerError::LocationNotFound(_))
+        ));
     }
 }

@@ -40,7 +40,10 @@ impl GribEngine {
             )));
         }
         let catalog = self.catalog();
-        let (run, steps) = cube_steps(&catalog, reference_time, datetime)?;
+        // No datetime is the run's last step, as an area query answers; an
+        // instant the step valid at it, an interval every step inside it.
+        let run = resolve_run(&catalog, reference_time, datetime)?;
+        let steps = grid_steps(run, datetime)?;
         let keys = catalog
             .parameter_keys(&run.reference_time)
             .cloned()
@@ -229,51 +232,6 @@ impl GribEngine {
             ranges,
         }))
     }
-}
-
-/// The forecast run and steps a cube covers. An interval selects every step
-/// of the run inside it, the run chosen as for position queries (the latest
-/// covering the interval start), else the latest with any step inside it, so
-/// an open start (`../end`) works too. An instant, or no datetime, is the one
-/// step an area query selects: the nearest step, or the run's last.
-#[allow(clippy::type_complexity)]
-fn cube_steps<'a>(
-    catalog: &'a Catalog,
-    reference_time: Option<DateTime<Utc>>,
-    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<(&'a ForecastRun, Vec<(DateTime<Utc>, &'a StepFile)>), DataServerError> {
-    let valid_time = |run: &ForecastRun, step: u32| {
-        run.reference_time + chrono::Duration::hours(i64::from(step))
-    };
-    let Some((start, end)) = datetime.filter(|(start, end)| start < end) else {
-        let (run, step, file) = select_run_step(catalog, reference_time, datetime)?;
-        return Ok((run, vec![(valid_time(run, step), file)]));
-    };
-    let inside = |run: &'a ForecastRun| -> Vec<(DateTime<Utc>, &'a StepFile)> {
-        run.steps
-            .iter()
-            .map(|(&step, file)| (valid_time(run, step), file))
-            .filter(|(time, _)| *time >= start && *time <= end)
-            .collect()
-    };
-    let run = match resolve_run(catalog, reference_time, datetime) {
-        Ok(run) => run,
-        Err(error) if reference_time.is_none() => catalog
-            .runs
-            .values()
-            .rev()
-            .find(|run| !inside(run).is_empty())
-            .ok_or(error)?,
-        Err(error) => return Err(error),
-    };
-    let steps = inside(run);
-    if steps.is_empty() {
-        return Err(DataServerError::InvalidParameter(format!(
-            "The forecast run {} has no step between {start} and {end}",
-            run.reference_time
-        )));
-    }
-    Ok((run, steps))
 }
 
 /// The output grid of a cube over one native grid: the native subset's axes
