@@ -16,7 +16,7 @@ use tower::ServiceExt;
 
 use api_edr::handlers::EdrState;
 use ds_core::config::CollectionConfig;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, ItemRadius};
 use ds_core::error::DataServerError;
 use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
@@ -32,6 +32,9 @@ mod edr_schema;
 struct Stations {
     timed: bool,
     runs: bool,
+    /// The EDR query types: a collection without `locations` has items that
+    /// are no locations, as the nowcast's cells.
+    queries: &'static [&'static str],
 }
 
 const COUNT: usize = 25;
@@ -100,8 +103,16 @@ impl FeatureEngine for Stations {
 }
 
 impl EdrEngine for Stations {
+    /// Every station is a location, labelled unlike its `name` property.
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+        Ok((0..COUNT)
+            .map(|i| Location {
+                id: format!("s{i}"),
+                label: format!("Station {i}"),
+                latitude: 60.0,
+                longitude: 20.0 + 0.5 * i as f64,
+            })
+            .collect())
     }
 
     fn query_location(
@@ -128,7 +139,19 @@ impl EdrEngine for Stations {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["locations".into(), "area".into()]
+        self.queries.iter().map(|q| q.to_string()).collect()
+    }
+
+    /// Every item is a 2.34 km circle at its own report time, as a nowcast
+    /// sizes its cells; used only where `radius` is served.
+    fn item_radius(&self, feature: &Feature) -> Option<ItemRadius> {
+        let Some(PropertyValue::String(time)) = feature.properties.get("time") else {
+            return None;
+        };
+        Some(ItemRadius {
+            within_km: 2.34,
+            datetime: Some(time.parse().unwrap()),
+        })
     }
 
     fn get_instances(&self) -> Vec<RunInfo> {
@@ -153,18 +176,27 @@ fn config(id: &str) -> CollectionConfig {
 
 /// `stations` serves items; `timeless` serves items without a time
 /// dimension; `runs` has model runs and items; `grid` is EDR without a
-/// feature engine.
+/// feature engine; `cells`, `points` and `areas` serve items but no
+/// locations, `cells` a radius query and `points` a position query.
 fn router() -> axum::Router {
     let mut engines: HashMap<String, Arc<dyn EdrEngine>> = HashMap::new();
     let mut feature_engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
     let mut collections = HashMap::new();
-    for (id, timed, runs, items) in [
-        ("stations", true, false, true),
-        ("timeless", false, false, true),
-        ("runs", true, true, true),
-        ("grid", true, false, false),
+    const LOCATED: &[&str] = &["locations", "area"];
+    for (id, timed, runs, items, queries) in [
+        ("stations", true, false, true, LOCATED),
+        ("timeless", false, false, true, LOCATED),
+        ("runs", true, true, true, LOCATED),
+        ("grid", true, false, false, LOCATED),
+        ("cells", true, false, true, &["area", "radius"][..]),
+        ("points", true, false, true, &["position"][..]),
+        ("areas", true, false, true, &["area"][..]),
     ] {
-        let engine = Arc::new(Stations { timed, runs });
+        let engine = Arc::new(Stations {
+            timed,
+            runs,
+            queries,
+        });
         engines.insert(id.into(), engine.clone());
         if items {
             feature_engines.insert(id.into(), engine);
@@ -270,6 +302,110 @@ async fn items_is_a_geojson_page_of_the_default_limit_with_paging_links() {
     assert_eq!(last["numberReturned"], 5);
     assert!(link(&last, "next").is_none());
     assert!(link(&last, "prev").unwrap().contains("offset=10&limit=10"));
+}
+
+/// `/req/edr-geojson/content` A: every item is an EDR GeoJSON feature. Its
+/// properties gain the `edrProperties` members, with the values the
+/// station's `/locations` feature carries, and keep the engine's own.
+#[tokio::test]
+async fn items_are_edr_geojson_features_of_their_locations() {
+    let (_, locations) = get("/collections/stations/locations").await;
+    let (status, doc) = get("/collections/stations/items?limit=25").await;
+    assert_eq!(status, StatusCode::OK);
+    edr_schema::assert_valid(
+        "/collections/{collectionId}/items",
+        edr_schema::GEOJSON,
+        &doc,
+        "items",
+    );
+    let features = doc["features"].as_array().unwrap();
+    assert_eq!(features.len(), COUNT);
+    for (i, feature) in features.iter().enumerate() {
+        let properties = &feature["properties"];
+        let location = &locations["features"][i]["properties"];
+        assert_eq!(properties["label"], format!("Station {i}"));
+        assert_eq!(
+            properties["edrqueryendpoint"],
+            format!("https://example.test/edr/collections/stations/locations/s{i}")
+        );
+        for member in ["datetime", "parameter-name", "label", "edrqueryendpoint"] {
+            assert_eq!(properties[member], location[member], "s{i} {member}");
+        }
+        assert_eq!(
+            properties["parameter-name"],
+            serde_json::json!(["temperature"])
+        );
+        assert_eq!(
+            properties["datetime"],
+            "2026-01-01T00:00:00+00:00/2026-01-02T00:00:00+00:00"
+        );
+        // The engine's own properties stay.
+        assert_eq!(properties["name"], format!("S{i}"));
+        assert!(properties["time"].is_string());
+    }
+
+    let (status, item) = get("/collections/stations/items/s3").await;
+    assert_eq!(status, StatusCode::OK);
+    edr_schema::assert_valid(edr_schema::ITEM, edr_schema::GEOJSON, &item, "item");
+    assert_eq!(item["properties"], features[3]["properties"]);
+
+    // The members follow the station, not the page or the filter.
+    let (_, filtered) = get("/collections/stations/items?bbox=21,59,23,61&limit=1").await;
+    assert_eq!(
+        filtered["features"][0]["properties"],
+        features[2]["properties"]
+    );
+
+    // The Features encoding without them fails the EDR schema: the check
+    // above is not vacuous.
+    let mut bare = item.clone();
+    bare["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("edrqueryendpoint");
+    for version in edr_schema::VERSIONS {
+        assert!(
+            !edr_schema::errors(version, edr_schema::ITEM, edr_schema::GEOJSON, &bare).is_empty(),
+            "{version:?}"
+        );
+    }
+}
+
+/// An item that is no location still carries the members: its `name` as
+/// `label`; the radius query the engine sizes for it, at its own time,
+/// where the collection answers radius; else a position query at its point;
+/// else the collection itself, with the collection's temporal extent.
+#[tokio::test]
+async fn items_that_are_no_locations_name_another_query() {
+    let extent = "2026-01-01T00:00:00+00:00/2026-01-02T00:00:00+00:00";
+    for (collection, endpoint, datetime) in [
+        (
+            "cells",
+            "https://example.test/edr/collections/cells/radius?coords=POINT(21.5%2060)&within=2.4&within-units=km",
+            "2026-01-01T03:00:00Z",
+        ),
+        (
+            "points",
+            "https://example.test/edr/collections/points/position?coords=POINT(21.5%2060)",
+            extent,
+        ),
+        ("areas", "https://example.test/edr/collections/areas", extent),
+    ] {
+        let (status, item) = get(&format!("/collections/{collection}/items/s3")).await;
+        assert_eq!(status, StatusCode::OK, "{item}");
+        edr_schema::assert_valid(edr_schema::ITEM, edr_schema::GEOJSON, &item, collection);
+        assert_eq!(item["properties"]["label"], "S3", "{collection}");
+        assert_eq!(item["properties"]["edrqueryendpoint"], endpoint);
+        assert_eq!(item["properties"]["datetime"], datetime, "{collection}");
+        let (_, page) = get(&format!("/collections/{collection}/items?limit=25")).await;
+        edr_schema::assert_valid(
+            "/collections/{collectionId}/items",
+            edr_schema::GEOJSON,
+            &page,
+            collection,
+        );
+        assert_eq!(page["features"][3]["properties"], item["properties"]);
+    }
 }
 
 #[tokio::test]

@@ -183,6 +183,18 @@ and never under an instance.
   `openapi_parameters`.
 - No `itemType` or `rel=items` link on the collection: the workbench and
   Features clients read those as a Features resource with an HTML view.
+- The body is EDR GeoJSON (`/req/edr-geojson/content` A, #970): `EdrMembers`
+  adds `datetime`, `parameter-name`, `label` and `edrqueryendpoint` to every
+  feature's properties, after the Features encoding and only here, never in
+  the Features API's `/items`. A station item is one of the collection's
+  locations and gets what its `/locations` feature says, from the same
+  sources (`get_locations`, `get_parameters`, `get_temporal_extent`), so the
+  two cannot disagree; `crates/server/tests/edr_geojson.rs` pins that on CSV
+  and BUFR and follows the endpoint. Location ids in links go through
+  `geojson::encode_path_segment`, on `/locations` too. An item that is no
+  location (a nowcast cell) names the radius query its engine sizes in
+  `EdrEngine::item_radius`, else a position query, else the collection;
+  the nowcast case is followed end to end in the same test file.
 
 ## Misc
 

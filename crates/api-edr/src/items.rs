@@ -13,8 +13,14 @@
 //! Only `bbox`, `datetime`, `limit`, `offset` (the paging links' position)
 //! and `f` are accepted; any other parameter, or one given twice, is a 400
 //! naming the valid ones (root CLAUDE.md: never silently ignore a parameter).
+//!
+//! The body is EDR GeoJSON (`/req/edr-geojson/content` A): every feature's
+//! `properties` gains the four `edrProperties` members ([`EdrMembers`]) next
+//! to the engine's own. They are added here, never in the Features API's
+//! `/items`, whose features are not EDR features.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -27,14 +33,18 @@ use api_common::JsonError;
 use api_features::crs::ResponseCrs;
 use api_features::params::{parse_bbox, parse_datetime};
 use api_features::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{Bbox, DatetimeInterval, FeatureQuery};
+use ds_core::feature::{Bbox, DatetimeInterval, Feature, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
+use ds_core::model::Location;
 
+use crate::geojson::encode_path_segment;
 use crate::handlers::{
     bad_request, error_response, execute_query, lookup_collection, map_query_error,
     request_base_url, server_error, AppState, EdrState, HandlerError,
 };
+use crate::params::MAX_WITHIN_M;
 
 /// Page size without `limit` (`/req/edr/rc-limit-definition`).
 pub const DEFAULT_LIMIT: usize = 10;
@@ -153,15 +163,15 @@ fn parse_item_pairs(pairs: Vec<(String, String)>) -> Result<(), DataServerError>
     Ok(())
 }
 
-/// The collection's feature engine: 404 for an unknown collection, and for
-/// one whose engine serves no features (the query does not exist for it,
-/// as for every other unsupported query type, #668).
-fn items_engine(
-    state: &EdrState,
-    id: &str,
-) -> Result<std::sync::Arc<dyn FeatureEngine>, HandlerError> {
-    lookup_collection(state, id)?;
-    state.feature_engines.get(id).cloned().ok_or_else(|| {
+/// A collection's EDR engine and the feature engine its items come from.
+type ItemsEngines = (Arc<dyn EdrEngine>, Arc<dyn FeatureEngine>);
+
+/// The collection's EDR and feature engines: 404 for an unknown collection,
+/// and for one whose engine serves no features (the query does not exist
+/// for it, as for every other unsupported query type, #668).
+fn items_engines(state: &EdrState, id: &str) -> Result<ItemsEngines, HandlerError> {
+    let (edr, _) = lookup_collection(state, id)?;
+    let features = state.feature_engines.get(id).cloned().ok_or_else(|| {
         JsonError(
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -169,7 +179,137 @@ fn items_engine(
                 "description": format!("Collection '{id}' does not support items queries")
             })),
         )
-    })
+    })?;
+    Ok((edr.clone(), features))
+}
+
+/// The `edrProperties` members every item carries (`datetime`,
+/// `parameter-name`, `label`, `edrqueryendpoint`), required by
+/// `/req/edr-geojson/content` A. An item that is one of the collection's
+/// locations (a CSV, BUFR or PostGIS station) gets what its `/locations`
+/// feature says: the location's label, its `/locations/{id}` query, and the
+/// collection's parameters and temporal extent. Any other item (a nowcast
+/// cell) gets the radius query the engine sizes for it
+/// ([`EdrEngine::item_radius`]), else a position query at its point, else
+/// the collection. Built on the query executor, since it reads
+/// `get_locations()`.
+struct EdrMembers<'a> {
+    engine: &'a dyn EdrEngine,
+    /// `start/end` of the collection's temporal extent, empty without one.
+    datetime: String,
+    parameter_names: Vec<String>,
+    /// The page's items that are locations, by id.
+    locations: HashMap<String, Location>,
+    /// `{edr root}/collections/{id}`.
+    collection_url: String,
+    serves_position: bool,
+    serves_radius: bool,
+}
+
+impl<'a> EdrMembers<'a> {
+    /// The members for the items `ids` of collection `id`, under `root`.
+    fn new(
+        engine: &'a dyn EdrEngine,
+        root: &str,
+        id: &str,
+        ids: &[&str],
+    ) -> Result<Self, DataServerError> {
+        let query_types = engine.supported_query_types();
+        let serves = |query_type: &str| query_types.iter().any(|q| q == query_type);
+        let locations = if serves("locations") {
+            let wanted: HashSet<&str> = ids.iter().copied().collect();
+            engine
+                .get_locations()?
+                .into_iter()
+                .filter(|l| wanted.contains(l.id.as_str()))
+                .map(|l| (l.id.clone(), l))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        Ok(Self {
+            engine,
+            datetime: engine
+                .get_temporal_extent()
+                .map(|(start, end)| format!("{}/{}", start.to_rfc3339(), end.to_rfc3339()))
+                .unwrap_or_default(),
+            parameter_names: engine.get_parameters(),
+            locations,
+            collection_url: format!("{root}/collections/{id}"),
+            serves_position: serves("position"),
+            serves_radius: serves("radius"),
+        })
+    }
+
+    /// Add the members to `json`, the GeoJSON of `feature`. They replace an
+    /// engine property of the same name: their meaning is EDR's.
+    fn apply(&self, feature: &Feature, json: &mut Value) {
+        let (label, endpoint, datetime) = match self.locations.get(&feature.id) {
+            Some(location) => (
+                location.label.clone(),
+                format!(
+                    "{}/locations/{}",
+                    self.collection_url,
+                    encode_path_segment(&location.id)
+                ),
+                None,
+            ),
+            None => {
+                let (endpoint, datetime) = self.query_at(feature);
+                let label = match feature.properties.get("name") {
+                    Some(PropertyValue::String(name)) => name.clone(),
+                    _ => feature.id.clone(),
+                };
+                (label, endpoint, datetime)
+            }
+        };
+        if let Some(properties) = json["properties"].as_object_mut() {
+            properties.insert(
+                "datetime".into(),
+                json!(datetime.as_deref().unwrap_or(&self.datetime)),
+            );
+            properties.insert("parameter-name".into(), json!(self.parameter_names));
+            properties.insert("label".into(), json!(label));
+            properties.insert("edrqueryendpoint".into(), json!(endpoint));
+        }
+    }
+
+    /// The query of an item that is not a location, and its own `datetime`
+    /// when it has one: the engine's radius query around its point, else a
+    /// position query at its point, else the collection, whose
+    /// `data_queries` list its queries.
+    fn query_at(&self, feature: &Feature) -> (String, Option<String>) {
+        let Geometry::Point { x, y } = *feature.geometry else {
+            return (self.collection_url.clone(), None);
+        };
+        let radius = self
+            .serves_radius
+            .then(|| self.engine.item_radius(feature))
+            .flatten()
+            .filter(|r| r.within_km.is_finite() && r.within_km > 0.0);
+        if let Some(radius) = radius {
+            // Up to the next 100 m, so the URL stays short and the circle
+            // never narrows; within the radius cap.
+            let within = ((radius.within_km * 10.0).ceil() / 10.0).min(MAX_WITHIN_M / 1000.0);
+            let datetime = radius
+                .datetime
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+            return (
+                format!(
+                    "{}/radius?coords=POINT({x}%20{y})&within={within}&within-units=km",
+                    self.collection_url
+                ),
+                datetime,
+            );
+        }
+        if self.serves_position {
+            return (
+                format!("{}/position?coords=POINT({x}%20{y})", self.collection_url),
+                None,
+            );
+        }
+        (self.collection_url.clone(), None)
+    }
 }
 
 /// The absolute root the item links hang off: the EDR mount.
@@ -201,11 +341,11 @@ pub async fn items(
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     let state = state.load_full();
-    let engine = items_engine(&state, &id)?;
+    let (edr, features) = items_engines(&state, &id)?;
     let params = ItemsParams::from_pairs(pairs).map_err(|e| bad_request(&e))?;
     // A collection whose features carry no time cannot filter by it: a 400,
     // not the full set with 200 — the Features API's rule (#682).
-    if params.datetime.is_some() && !engine.has_time_dimension() {
+    if params.datetime.is_some() && !features.has_time_dimension() {
         return Err(bad_request(&DataServerError::InvalidParameter(format!(
             "Collection '{id}' has no time dimension; datetime is not supported"
         ))));
@@ -230,7 +370,7 @@ pub async fn items(
     };
 
     let (body, etag) = execute_query(false, move |_budget| {
-        let page = engine
+        let page = features
             .get_features(&query)
             .map_err(|e| map_query_error(&e, "Items"))?;
         let mut doc = feature_page_to_geojson(
@@ -243,6 +383,14 @@ pub async fn items(
             &root,
             &ResponseCrs::default(),
         );
+        let ids: Vec<&str> = page.features.iter().map(|f| f.id.as_str()).collect();
+        let members = EdrMembers::new(edr.as_ref(), &root, &id, &ids)
+            .map_err(|e| map_query_error(&e, "Items"))?;
+        if let Some(json) = doc["features"].as_array_mut() {
+            for (feature, json) in page.features.iter().zip(json) {
+                members.apply(feature, json);
+            }
+        }
         // `timeStamp` is the generation time: hash the page without it, or
         // `If-None-Match` could never match (the Features `items` rule).
         let etag = ds_core::http_cache::etag_of(serialize(&doc)?.as_bytes());
@@ -272,19 +420,18 @@ pub async fn item(
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     let state = state.load_full();
-    let engine = items_engine(&state, &id)?;
+    let (edr, features) = items_engines(&state, &id)?;
     parse_item_pairs(pairs).map_err(|e| bad_request(&e))?;
     let root = edr_root(&state, &headers);
     let body = execute_query(false, move |_budget| {
-        let feature = engine
+        let feature = features
             .get_feature(&item_id)
             .map_err(|e| map_query_error(&e, "Item"))?;
-        serialize(&feature_to_geojson(
-            &feature,
-            &id,
-            &root,
-            &ResponseCrs::default(),
-        ))
+        let mut json = feature_to_geojson(&feature, &id, &root, &ResponseCrs::default());
+        EdrMembers::new(edr.as_ref(), &root, &id, &[feature.id.as_str()])
+            .map_err(|e| map_query_error(&e, "Item"))?
+            .apply(&feature, &mut json);
+        serialize(&json)
     })
     .await?;
     Ok(geojson_response(body))
@@ -300,7 +447,7 @@ pub fn data_query(query_base: &str) -> Value {
             "rel": "data",
             "variables": {
                 "title": "Items query",
-                "description": "The collection's features as a GeoJSON FeatureCollection, filtered by bbox and datetime and paged by limit",
+                "description": "The collection's features as an EDR GeoJSON FeatureCollection, filtered by bbox and datetime and paged by limit",
                 "query_type": "items",
                 "output_formats": [OUTPUT_FORMAT],
                 "default_output_format": OUTPUT_FORMAT,
@@ -340,7 +487,7 @@ pub fn openapi_paths(id: &str, title: &str) -> Vec<(String, Value)> {
             json!({
                 "get": {
                     "summary": format!("Items query for {title}"),
-                    "description": "The collection's features, following OGC API - Features item access. Accepts only bbox, datetime, limit, offset and f; any other parameter is a 400.",
+                    "description": "The collection's features as EDR GeoJSON, following OGC API - Features item access: each feature's properties carry the EDR members datetime, parameter-name, label and edrqueryendpoint next to its own. Accepts only bbox, datetime, limit, offset and f; any other parameter is a 400.",
                     "operationId": format!("getItems_{id}"),
                     "tags": [id],
                     "parameters": [
@@ -351,7 +498,7 @@ pub fn openapi_paths(id: &str, title: &str) -> Vec<(String, Value)> {
                         format.clone()
                     ],
                     "responses": with_ok(json!({
-                        "description": "A page of features",
+                        "description": "A page of EDR GeoJSON features",
                         "content": {
                             "application/geo+json": {
                                 "schema": {"$ref": "#/components/schemas/items-featureCollection"}
@@ -379,7 +526,7 @@ pub fn openapi_paths(id: &str, title: &str) -> Vec<(String, Value)> {
                         format
                     ],
                     "responses": with_ok(json!({
-                        "description": "One feature",
+                        "description": "One EDR GeoJSON feature",
                         "content": {
                             "application/geo+json": {
                                 "schema": {"$ref": "#/components/schemas/items-feature"}
@@ -446,7 +593,9 @@ pub fn openapi_parameters() -> Value {
     })
 }
 
-/// The `components.schemas` the items responses reference.
+/// The `components.schemas` the items responses reference: EDR GeoJSON
+/// (`edrFeatureCollectionGeoJSON`, `featureGeoJSON`), whose feature
+/// properties require the `edrProperties` members and keep the engine's own.
 pub fn openapi_schemas() -> Value {
     let link = json!({
         "type": "object",
@@ -478,7 +627,16 @@ pub fn openapi_schemas() -> Value {
                 "type": {"type": "string", "enum": ["Feature"]},
                 "id": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
                 "geometry": {"type": "object", "nullable": true},
-                "properties": {"type": "object", "nullable": true},
+                "properties": {
+                    "type": "object",
+                    "required": ["datetime", "parameter-name", "label", "edrqueryendpoint"],
+                    "properties": {
+                        "datetime": {"type": "string", "description": "The collection's temporal extent, start/end (RFC 3339), or empty without one"},
+                        "parameter-name": {"type": "array", "items": {"type": "string"}, "description": "The collection's parameter ids"},
+                        "label": {"type": "string", "description": "The location's label, else the item's name or id"},
+                        "edrqueryendpoint": {"type": "string", "description": "The item's location query, /locations/{locationId}"}
+                    }
+                },
                 "links": {"type": "array", "items": link}
             }
         }
