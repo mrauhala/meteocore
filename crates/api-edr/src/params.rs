@@ -209,8 +209,9 @@ fn parse_datetime_repeating(raw: &str, rest: &str) -> Result<DatetimeSelector, D
 
 /// The one CRS data queries accept: `coords` are read, and results written,
 /// in OGC:CRS84, WGS 84 longitude/latitude. Every data query advertises it as
-/// the `crs` of its `link.variables.crs_details` (EDR 1.2 `/req/edr/rc-crs`).
-/// The `crs` query parameter that would select another one is #84.
+/// the `crs` of its `link.variables.crs_details` (EDR 1.2 `/req/edr/rc-crs`),
+/// and its `crs` query parameter accepts only it ([`check_crs`]). Serving
+/// another CRS is #84.
 pub const DATA_QUERY_CRS: &str = "CRS84";
 
 /// WKT of [`DATA_QUERY_CRS`], advertised in every `crs_details`. Its home is
@@ -226,6 +227,9 @@ pub struct LocationQueryParams {
     /// Output format: `CoverageJSON` (default), `PNG` (plot) or, on a
     /// station collection, `GeoJSON` ([`query_formats`]).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -243,6 +247,9 @@ pub struct PositionQueryParams {
     /// Output format: `CoverageJSON` (default), `PNG` (plot) or, on a
     /// station collection, `GeoJSON` ([`query_formats`]).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -526,11 +533,37 @@ impl LocationsQuery {
 /// `datetime`, the paging pair `limit`/`offset`, and `f`.
 pub const LOCATIONS_PARAMETERS: [&str; 5] = ["limit", "offset", "bbox", "datetime", "f"];
 
+/// The `f` values `/locations` accepts, case-insensitively: its one
+/// representation, GeoJSON, by its EDR name or media type, or as `json`.
+pub const LOCATIONS_FORMATS: [&str; 4] = [
+    "GeoJSON",
+    "application/geo+json",
+    "json",
+    "application/json",
+];
+
+/// Check a `/locations` `f` against [`LOCATIONS_FORMATS`]; a blank one is
+/// the default, anything else a 400 (EDR 1.2 `/req/edr/REQ_rc-f-response`
+/// D). An unencoded `+` in `application/geo+json` arrives as a space.
+fn check_locations_format(value: &str) -> Result<(), DataServerError> {
+    let normalized = value.trim().replace(' ', "+");
+    if normalized.is_empty()
+        || LOCATIONS_FORMATS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(&normalized))
+    {
+        return Ok(());
+    }
+    Err(DataServerError::InvalidParameter(format!(
+        "Unsupported output format '{value}' for /locations; available: GeoJSON"
+    )))
+}
+
 /// Parse the `/locations` query. A parameter outside [`LOCATIONS_PARAMETERS`],
-/// a repeated `limit`, `offset`, `bbox` or `datetime`, an invalid value, or an
-/// `offset` without a `limit` (there is no page to offset into) is a 400, so
-/// a typo such as `limti` cannot return the unpaged list as if it worked
-/// (#605).
+/// a repeated `limit`, `offset`, `bbox` or `datetime`, an invalid value (an
+/// `f` outside [`LOCATIONS_FORMATS`] included), or an `offset` without a
+/// `limit` (there is no page to offset into) is a 400, so a typo such as
+/// `limti` cannot return the unpaged list as if it worked (#605).
 ///
 /// `bbox` is the EDR 1.2 parameter: CRS84, four numbers, `west > east`
 /// crossing the antimeridian, or six whose vertical pair must be numbers and
@@ -551,6 +584,7 @@ pub fn parse_locations_query(
             "bbox" => &mut bbox,
             "datetime" => &mut datetime,
             "f" => {
+                check_locations_format(&value)?;
                 preserved.push((name, value));
                 continue;
             }
@@ -626,6 +660,9 @@ pub struct AreaQueryParams {
     /// rejected (an area result is gridded / multi-coverage, not a single
     /// plot), and so is `GeoJSON` (not a point query, #929).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
     pub limit: Option<String>,
 }
@@ -646,6 +683,9 @@ pub struct RadiusQueryParams {
     pub parameter_name: Option<String>,
     pub z: Option<String>,
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
     pub limit: Option<String>,
 }
@@ -870,6 +910,9 @@ pub struct TrajectoryQueryParams {
     /// Output format: `CoverageJSON` (default) or, for a radar
     /// cross-section, `PNG` — a colour-mapped heatmap (distance × height).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// PNG image dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -2183,8 +2226,9 @@ mod tests {
                 .paging,
             None
         );
+        // An unencoded `+` arrives as a space.
         let query = parse_locations_query(pairs(&[
-            ("f", "geo json"),
+            ("f", "application/geo json"),
             ("limit", "50000"),
             ("offset", "20"),
         ]))
@@ -2194,9 +2238,9 @@ mod tests {
         // Links repeat the other parameters, encoded, and the clamped limit.
         assert_eq!(
             query.href("https://x/locations", 10020),
-            "https://x/locations?f=geo%20json&limit=10000&offset=10020"
+            "https://x/locations?f=application/geo%20json&limit=10000&offset=10020"
         );
-        assert_eq!(query.href("b", 0), "b?f=geo%20json&limit=10000");
+        assert_eq!(query.href("b", 0), "b?f=application/geo%20json&limit=10000");
         assert_eq!(parse_locations_query(Vec::new()).unwrap().href("b", 0), "b");
         for bad in [
             &[("offset", "3")][..],
@@ -2206,6 +2250,31 @@ mod tests {
             &[("limit", "2"), ("offset", "1"), ("offset", "1")],
         ] {
             assert!(parse_locations_query(pairs(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `f` names the list's one representation, GeoJSON, or is a 400
+    /// (`/req/edr/REQ_rc-f-response` D): before, any value was a 200.
+    #[test]
+    fn locations_query_accepts_only_geojson_formats() {
+        for f in [
+            "GeoJSON",
+            "geojson",
+            "application/geo+json",
+            "Application/Geo+JSON",
+            "application/geo json",
+            "json",
+            "application/json",
+            "",
+        ] {
+            let query = parse_locations_query(pairs(&[("f", f)])).unwrap();
+            assert_eq!(query.preserved, pairs(&[("f", f)]), "{f}");
+        }
+        for f in ["xyz", "html", "CoverageJSON", "PNG", "geo json"] {
+            let err = parse_locations_query(pairs(&[("f", f)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("available: GeoJSON"), "{f}: {err}");
         }
     }
 
