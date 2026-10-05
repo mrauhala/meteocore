@@ -25,7 +25,7 @@ locations paging (#922), several location ids in one locations query
 | `html` | ✓ | every metadata resource (landing, conformance, collections, collection, instances, instance) negotiates `?f=html` / `Accept` |
 | `oas30` | ✓ | `/edr/api` (hand-written `api_definition()`), Swagger UI at `/edr/api/docs` |
 | `geojson` | ✓ | feature content is `application/geo+json`: the `/locations` list, `items`, and the point queries of station collections (see [GeoJSON output](#geojson-output)) |
-| `edr-geojson` | ✓ | those bodies are EDR GeoJSON FeatureCollections; each route's body validates against the EDR 1.1 bundle's `application/geo+json` schema (`tests/geojson_output_tests.rs`, `crates/server/tests/edr_geojson.rs`) |
+| `edr-geojson` | ✓ | those bodies are EDR GeoJSON: every feature's `properties` carries the `edrProperties` members `datetime`, `parameter-name`, `label` and `edrqueryendpoint`, on `items` too (#970, see [Items](#items)). Each route's body validates against the EDR 1.1 and 1.2 bundles' `application/geo+json` schema, a single item against the items list's feature schema, 1.2's `featureGeoJSON` (`tests/geojson_output_tests.rs`, `tests/items_tests.rs`, `crates/server/tests/edr_geojson.rs`) |
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
 Part 2 (collections, json, html). The landing page links `/conformance` and
@@ -72,7 +72,7 @@ commit and why the 3.0 bundle rather than the 3.1 one.
 
 | Query type | Route | Status | Notes |
 |---|---|---|---|
-| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list, complete without `limit` and paged with it, `bbox` and `datetime` filtering it before paging (see below), + CoverageJSON/PNG series per location, and EDR GeoJSON on station collections; `{locId}` may be a comma-delimited list of up to 64 ids, answered in request order as one CoverageCollection or, on station collections, one EDR GeoJSON FeatureCollection (no PNG), and with a `datetime` list at most 256 ids × instants (see [Location lists](#location-lists)) |
+| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list, each feature's data link and `edrqueryendpoint` carrying its id percent-encoded (#970), complete without `limit` and paged with it, `bbox` and `datetime` filtering it before paging (see below), + CoverageJSON/PNG series per location, and EDR GeoJSON on station collections; `{locId}` may be a comma-delimited list of up to 64 ids, answered in request order as one CoverageCollection or, on station collections, one EDR GeoJSON FeatureCollection (no PNG), and with a `datetime` list at most 256 ids × instants (see [Location lists](#location-lists)) |
 | `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined, and with a `datetime` list at most 256 points × instants; all coordinates finite and within CRS84 bounds); EDR GeoJSON too on station collections, one feature per point |
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG and GeoJSON rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667); PNG rejected; EDR GeoJSON too on station collections |
@@ -118,8 +118,9 @@ the per-engine semantics of `bbox` and `datetime` are those in the
 
 | | Behaviour |
 |---|---|
-| `/items` | GeoJSON `FeatureCollection` with `numberMatched`, `numberReturned`, `timeStamp` and `self`/`next`/`prev` links under `/edr` that carry `bbox` and `datetime` |
-| `/items/{itemId}` | GeoJSON `Feature` with `self` and `collection` links; an unknown id is 404 |
+| `/items` | EDR GeoJSON `FeatureCollection` with `numberMatched`, `numberReturned`, `timeStamp` and `self`/`next`/`prev` links under `/edr` that carry `bbox` and `datetime` |
+| `/items/{itemId}` | EDR GeoJSON `Feature` with `self` and `collection` links; an unknown id is 404 |
+| feature `properties` | the engine's own, plus the `edrProperties` members `/req/edr-geojson/content` A requires (#970), with the values the item's `/locations` feature carries, since every station item is one of the collection's locations: `label` the location's label, `edrqueryendpoint` its `/locations/{locId}` query with the id percent-encoded, `parameter-name` the collection's parameters and `datetime` its temporal extent as `start/end`, empty without one. An item that is not a location gets its `name` property or id as `label` and, as `edrqueryendpoint`, the radius query its engine sizes for it (`EdrEngine::item_radius`, `within` rounded up to 100 m) with the item's own instant as `datetime`; else a `position` query at its point; else the collection. A tracked nowcast cell gets its id, `radius?coords=POINT(lon lat)&within=<r>&within-units=km` over the motion field with `r` its `area_km2` as a disc, and its `observed` frame time. No floor on `r`: a circle narrower than a motion block still answers the nearest block (#671). The members replace an engine property of the same name. They are added by `api-edr` only: the Features API's `/items` keeps the engine's properties alone |
 | `bbox` | CRS84, 4 or 6 values (heights ignored), `west > east` crosses the antimeridian; malformed → 400. No `bbox-crs` |
 | `datetime` | RFC 3339 instant, `start/end`, `../end`, `start/..`; a reversed interval → 400; on a collection whose features carry no time (PostGIS stations) → 400 rather than the unfiltered set (Features #682; EDR's abstract test would include time-less features) |
 | `limit` | `/req/edr/rc-limit-*`: default 10, maximum 10 000; a larger value is served as 10 000; 0, a sign, a fraction or text → 400 |
@@ -130,10 +131,11 @@ the per-engine semantics of `bbox` and `datetime` are those in the
 | caching | the ETag hashes the page with `timeStamp` blanked, so `If-None-Match` revalidates; a closed `datetime` window in the past gets the long `Cache-Control` |
 | metadata | `data_queries.items` with `title`, `description`, `query_type`, `output_formats`, `default_output_format` and `crs_details` (CRS84); not on instance documents, no `itemType` or `rel=items` link (those mean a Features resource with an HTML view) |
 
-Not implemented: `/instances/{instanceId}/items`, HTML, the Features
-extensions (`sortby`, property filters, `crs`), and the EDR GeoJSON feature
-schema that `/rec/core/edr-geojson` recommends (a SHOULD): features carry their
-engine's properties, not `datetime`/`parameter-name`/`label`/`edrqueryendpoint`.
+Not implemented: `/instances/{instanceId}/items`, HTML, and the Features
+extensions (`sortby`, property filters, `crs`). The EDR GeoJSON feature schema
+that `/rec/core/edr-geojson` recommends is the encoding (#970). `datetime` is
+the collection's extent, as on `/locations`, not the station's own reporting
+period.
 
 Every advertised query type's `data_queries.<type>.link.variables` carries
 the six fields EDR 1.2 requires (#918): `title` (`Position query`, …), a
@@ -469,7 +471,7 @@ transforms retain serial retrieval.
 | PostGIS stations | ✓, `datetime` → 400 | ✓ | ✓ | ✓ | – | – | n/a | ✓ stations, no `datetime` | stations-only `location_source`: exact `ST_Within` in SQL; observations-derived: exact point-in-polygon on the cached station set |
 | PostGIS events | – | – | ✓ | ✓ | – | – | n/a | – (events as features = #503) | events in the polygon (exact, in SQL) as a `Point` CoverageCollection |
 | BUFR | ✓, `datetime` by reports | ✓ | ✓ | ✓ | – | – | n/a | ✓ stations | stations whose point is inside the polygon (exact, in memory; ≤ 10 001 stations, ≤ 500 000 values per response → 400); position = nearest station within `position_radius_km` (25 km) else 404; one `PointSeries` per station over the in-memory `retention` window; same semantics for the polled-directory and WIS2 (push) sources; units are the BUFR units mechanically converted for display (K → °C, Pa → hPa, kg m-2 → mm) like GRIB |
-| Nowcast | – | – | ✓ (motion field) | ✓ | – | – | ✓ | ✓ tracked cells | motion blocks over the polygon's bbox, blocks outside the polygon masked; reflectivity via EDR = #523 |
+| Nowcast | – | – | ✓ (motion field) | ✓ | – | – | ✓ | ✓ tracked cells, each naming a radius query over the motion field | motion blocks over the polygon's bbox, blocks outside the polygon masked; reflectivity via EDR = #523 |
 | Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – | GOES-R, Himawari-9 (ISatSS) and the GMGSI global mosaic, whose values are 8-bit display counts (unit `1`), not brightness temperatures; its grid wraps at 180°, so a position either side of the seam, or an area given west > east across it, reads the pixels there. Each product is a parameter on its own time axis: the time axis of a response is the union of the selected products' scans (null where a product has none), an instant snaps per product to its latest scan at or before it, and `parameter_names` carries each product's own `extent.temporal`. RGB composites (`[[satellite.composites]]`) are map layers, not EDR parameters: naming one in `parameter-name` → 400. Position = the pixel under the point per scan; behind the Earth or off the mosaic's 72°S–72°N → 404. Area = grid over the bbox at the nadir pixel size (≤ 256 cells/axis), sampled through a coarse projection grid, masked to the polygon; polygon outside the imagery → 404; `t` axis when several scans. A query may download at most 8 scans the cache evicted and decode at most 1024 image blocks (summed per product grid; a GOES-R block is a strip of 24 full-width rows, a GMGSI block a 793 × 1322 chunk) → 400 |
 | CAP, GeoJSON | — no `EdrEngine` (Features/Maps only) — | | | | | | | | |
 

@@ -37,6 +37,12 @@ pub const VERSIONS: [Edr; 2] = [Edr::V1_1, Edr::V1_2];
 /// list's `instances` item schema.
 pub const INSTANCE: &str = "/collections/{collectionId}/instances/{instanceId}";
 
+/// One item. `/req/edr-geojson/content` A makes a single feature an EDR
+/// GeoJSON Feature (`featureGeoJSON`), but both bundles give
+/// `/items/{itemId}` a collection or coverage schema, so its schema is the
+/// items list's feature schema: 1.2's `featureGeoJSON`, 1.1's inlined twin.
+pub const ITEM: &str = "/collections/{collectionId}/items/{itemId}";
+
 pub const JSON: &str = "application/json";
 pub const GEOJSON: &str = "application/geo+json";
 
@@ -91,6 +97,9 @@ fn response_schema(version: Edr, path: &str, media: &str) -> &'static Value {
     let schema = if path == INSTANCE {
         let list = response_schema(version, "/collections/{collectionId}/instances", media);
         &deref(bundle, list)["properties"]["instances"]["items"]
+    } else if path == ITEM {
+        let list = response_schema(version, "/collections/{collectionId}/items", media);
+        &deref(bundle, list)["properties"]["features"]["items"]
     } else {
         let response = deref(bundle, &bundle["paths"][path]["get"]["responses"]["200"]);
         &response["content"][media]["schema"]
