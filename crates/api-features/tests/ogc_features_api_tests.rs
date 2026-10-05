@@ -1180,6 +1180,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "CC-BY-4.0".into(),
             url: None,
+            media_type: None,
         };
         let json = collection_json(vec!["cities".into(), "Finland".into()], Some(lic)).await;
         assert_eq!(json["keywords"], serde_json::json!(["cities", "Finland"]));

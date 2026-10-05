@@ -132,18 +132,14 @@ fn i18n(text: &str) -> Value {
 }
 
 /// `observedProperty`: identified by the CF standard name URI when the
-/// engine knows one, else by `fallback_id` (if any) and described by
-/// `description` (Metocean Requirement 7F).
-fn build_observed_property(
-    desc: &ParameterDescription,
-    fallback_id: Option<&str>,
-    description: Value,
-) -> Value {
+/// engine knows one, else by the engine's observed-property name and
+/// described by `description` (Metocean Requirement 7F). EDR 1.2
+/// `/req/edr/rc-parameters` F requires the `id` either way.
+fn build_observed_property(desc: &ParameterDescription, description: Value) -> Value {
     let mut m = Map::with_capacity(3);
     let cf_id = cf_standard_name_uri(desc);
-    if let Some(id) = cf_id.as_deref().or(fallback_id) {
-        m.insert("id".into(), Value::String(id.into()));
-    }
+    let id = cf_id.as_deref().unwrap_or(&desc.observed_property);
+    m.insert("id".into(), Value::String(id.into()));
     m.insert("label".into(), i18n(&desc.label));
     if cf_id.is_none() {
         m.insert("description".into(), description);
@@ -153,10 +149,11 @@ fn build_observed_property(
 
 /// One entry of a collection's `parameter_names` (an EDR 1.1 parameter
 /// object: plain-string `label` and `description`). The coverage
-/// `parameters` of a data query say the same things (#273).
+/// `parameters` of a data query say the same things (#273), the same
+/// `observedProperty.id` included.
 pub fn collection_parameter_json(desc: &ParameterDescription) -> Value {
     let description = parameter_description(desc);
-    let observed = build_observed_property(desc, None, Value::String(description.clone()));
+    let observed = build_observed_property(desc, Value::String(description.clone()));
     let mut param = Map::with_capacity(6);
     param.insert("type".into(), Value::String("Parameter".into()));
     param.insert(
@@ -184,7 +181,7 @@ pub(crate) fn build_parameter(desc: &ParameterDescription) -> Value {
     }
     param.insert(
         "observedProperty".into(),
-        build_observed_property(desc, Some(&desc.observed_property), i18n(&description)),
+        build_observed_property(desc, i18n(&description)),
     );
     Value::Object(param)
 }

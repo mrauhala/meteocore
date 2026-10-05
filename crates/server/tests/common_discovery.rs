@@ -724,6 +724,20 @@ async fn metadata_and_search_use_the_same_temporal_extent() {
             link(&detail, "license"),
             "https://spdx.org/licenses/CC-BY-4.0.html"
         );
+        // The shared license link has a `type` on every surface (EDR 1.2
+        // `/req/core/rc-collection-info-links` B: all links do).
+        let license = detail["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "license")
+            .unwrap();
+        assert_eq!(license["type"], "text/html", "{surface}");
+        if *surface == "edr" {
+            for l in detail["links"].as_array().unwrap() {
+                assert!(l["type"].is_string(), "{l}");
+            }
+        }
         let (status, headers, _) = get(&app, link(&detail, "alternate"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(headers[header::CONTENT_TYPE]
