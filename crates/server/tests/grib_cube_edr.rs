@@ -238,3 +238,60 @@ async fn grib_pressure_collection_serves_cube_queries() {
         "{body}"
     );
 }
+
+/// `/req/core/datetime-response` A and F (#967) on the fixture's only step,
+/// 2026-04-05T00Z: a window around it, closed or open, selects it on every
+/// query (they were 400 "No forecast run covers time"), an area or radius
+/// reports it on a `t` axis, and an instant between steps is no data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grib_datetime_windows_intersect_the_steps() {
+    let app = app();
+    let covjson = schema("coveragejson.json");
+    let queries = [
+        "position?coords=POINT(25%2060)",
+        "area?coords=POLYGON((20%2055,30%2055,30%2065,20%2065,20%2055))",
+        "radius?coords=POINT(25%2060)&within=50&within-units=km",
+        "trajectory?coords=LINESTRING(20%2055,30%2065)",
+    ];
+    for query in queries {
+        for datetime in [
+            "2026-04-04T00:00:00Z/2026-04-06T00:00:00Z",
+            "../2026-04-05T06:00:00Z",
+            "2026-04-04T00:00:00Z/..",
+        ] {
+            let uri = format!("/collections/{ID}/{query}&datetime={datetime}");
+            let (status, body) = get(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_valid(&covjson, &body, &uri);
+            if query.starts_with("area") || query.starts_with("radius") {
+                let axes = &body["domain"]["axes"];
+                assert_eq!(
+                    axes["t"]["values"],
+                    json!(["2026-04-05T00:00:00+00:00"]),
+                    "{uri}"
+                );
+                assert_eq!(
+                    body["ranges"]["q"]["axisNames"],
+                    json!(["t", "z", "y", "x"]),
+                    "{uri}"
+                );
+            }
+        }
+        // Between steps: no data, where the nearest step used to answer.
+        let uri = format!("/collections/{ID}/{query}&datetime=2026-04-05T01:00:00Z");
+        let (status, body) = get(&app, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    // The exact instant keeps the t-less area Grid.
+    let (status, body) = get(
+        &app,
+        &format!(
+            "/collections/{ID}/{}&datetime=2026-04-05T00:00:00Z",
+            queries[1]
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_valid(&covjson, &body, "area at the step");
+    assert_eq!(body["ranges"]["q"]["axisNames"], json!(["z", "y", "x"]));
+}
