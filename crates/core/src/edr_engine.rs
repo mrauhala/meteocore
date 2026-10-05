@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 
 use crate::cube::CubeResolution;
 use crate::error::DataServerError;
-use crate::feature::{Bbox, DatetimeInterval};
+use crate::feature::{Bbox, DatetimeInterval, Feature};
 use crate::instances::RunInfo;
 use crate::model::{CoverageResponse, Location, ParameterDescription};
 use crate::vertical::VerticalDimension;
@@ -171,6 +171,20 @@ pub trait EdrEngine: Send + Sync {
         false
     }
 
+    /// The radius query that answers an EDR item which is not one of
+    /// [`Self::get_locations`], such as a tracked storm cell (#970): its
+    /// EDR GeoJSON `edrqueryendpoint` is this circle around the item's
+    /// point, and its `datetime` the instant given here. `feature` is the
+    /// item as this collection's `FeatureEngine` served it. Only a
+    /// collection that advertises `"radius"` uses it.
+    ///
+    /// Default `None`: such an item names a position query at its point
+    /// where the collection answers one, else the collection.
+    fn item_radius(&self, feature: &Feature) -> Option<ItemRadius> {
+        let _ = feature;
+        None
+    }
+
     /// Execute an area query within the given bounding box / polygon.
     /// Default implementation returns an error.
     fn query_area(
@@ -317,6 +331,18 @@ pub trait EdrEngine: Send + Sync {
             "Trajectory query not supported by this engine".into(),
         ))
     }
+}
+
+/// The radius query of an EDR item that is not a location
+/// ([`EdrEngine::item_radius`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ItemRadius {
+    /// The circle's radius in kilometres: the item's own size, but wide
+    /// enough that the query answers data rather than an empty circle.
+    pub within_km: f64,
+    /// The instant the item describes, its EDR `datetime`; `None` keeps
+    /// the collection's temporal extent.
+    pub datetime: Option<DateTime<Utc>>,
 }
 
 /// What an engine's `trajectory` query returns ([`EdrEngine::trajectory_shape`]).

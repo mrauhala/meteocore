@@ -209,8 +209,9 @@ fn parse_datetime_repeating(raw: &str, rest: &str) -> Result<DatetimeSelector, D
 
 /// The one CRS data queries accept: `coords` are read, and results written,
 /// in OGC:CRS84, WGS 84 longitude/latitude. Every data query advertises it as
-/// the `crs` of its `link.variables.crs_details` (EDR 1.2 `/req/edr/rc-crs`).
-/// The `crs` query parameter that would select another one is #84.
+/// the `crs` of its `link.variables.crs_details` (EDR 1.2 `/req/edr/rc-crs`),
+/// and its `crs` query parameter accepts only it ([`check_crs`]). Serving
+/// another CRS is #84.
 pub const DATA_QUERY_CRS: &str = "CRS84";
 
 /// WKT of [`DATA_QUERY_CRS`], advertised in every `crs_details`. Its home is
@@ -226,6 +227,9 @@ pub struct LocationQueryParams {
     /// Output format: `CoverageJSON` (default), `PNG` (plot) or, on a
     /// station collection, `GeoJSON` ([`query_formats`]).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -243,6 +247,9 @@ pub struct PositionQueryParams {
     /// Output format: `CoverageJSON` (default), `PNG` (plot) or, on a
     /// station collection, `GeoJSON` ([`query_formats`]).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// PNG plot dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -356,37 +363,6 @@ pub fn query_formats(
         },
         ("radius", true) => &[CoverageJson, GeoJson, Html],
         _ => &[CoverageJson, Html],
-    }
-}
-
-/// The formats of the `/locations` list (#971): GeoJSON, the default, and
-/// HTML. `json` and `application/json` in `f` name GeoJSON, as on `items`.
-pub const LOCATIONS_LIST_FORMATS: [EdrFormat; 2] = [EdrFormat::GeoJson, EdrFormat::Html];
-
-/// Negotiate the `/locations` list's or `items`' format over
-/// [`LOCATIONS_LIST_FORMATS`], like [`negotiate_edr_format`]: an `f` naming
-/// neither is a 400 naming both, not the GeoJSON the list once answered for
-/// any `f` (#605).
-pub fn negotiate_list_format(
-    f: Option<&str>,
-    accept: Option<&str>,
-    what: &str,
-) -> Result<NegotiatedFormat, DataServerError> {
-    let Some(f) = f.map(str::trim).filter(|f| !f.is_empty()) else {
-        return negotiate_edr_format(None, accept, &LOCATIONS_LIST_FORMATS, what);
-    };
-    let format = match f.to_ascii_lowercase().as_str() {
-        "json" | "application/json" => Ok(EdrFormat::GeoJson),
-        _ => parse_edr_format(Some(f)),
-    };
-    match format {
-        Ok(format) if LOCATIONS_LIST_FORMATS.contains(&format) => Ok(NegotiatedFormat {
-            format,
-            vary_accept: false,
-        }),
-        _ => Err(DataServerError::InvalidParameter(format!(
-            "Unsupported output format '{f}' for {what}; available: GeoJSON, HTML"
-        ))),
     }
 }
 
@@ -565,11 +541,66 @@ impl LocationsQuery {
 /// `datetime`, the paging pair `limit`/`offset`, and `f`.
 pub const LOCATIONS_PARAMETERS: [&str; 5] = ["limit", "offset", "bbox", "datetime", "f"];
 
+/// The `f` values `/locations` and `items` accept, case-insensitively:
+/// GeoJSON, the default, by its EDR name or media type, or as `json`; and
+/// its HTML page (#971). The one list the handlers check and `/api`
+/// documents.
+pub const LOCATIONS_FORMATS: [&str; 6] = [
+    "GeoJSON",
+    "application/geo+json",
+    "json",
+    "application/json",
+    "HTML",
+    "text/html",
+];
+
+/// The format a `/locations` or `items` `f` names ([`LOCATIONS_FORMATS`]),
+/// `None` for a blank one (the default); anything else is a 400 (EDR 1.2
+/// `/req/edr/REQ_rc-f-response` D). An unencoded `+` in
+/// `application/geo+json` arrives as a space.
+fn list_format(value: &str, what: &str) -> Result<Option<EdrFormat>, DataServerError> {
+    let normalized = value.trim().replace(' ', "+");
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    match LOCATIONS_FORMATS
+        .iter()
+        .find(|f| f.eq_ignore_ascii_case(&normalized))
+    {
+        Some(&("HTML" | "text/html")) => Ok(Some(EdrFormat::Html)),
+        Some(_) => Ok(Some(EdrFormat::GeoJson)),
+        None => Err(DataServerError::InvalidParameter(format!(
+            "Unsupported output format '{value}' for {what}; available: GeoJSON, HTML"
+        ))),
+    }
+}
+
+fn check_locations_format(value: &str) -> Result<(), DataServerError> {
+    list_format(value, "/locations").map(|_| ())
+}
+
+/// The `/locations` list's or `items`' format: `f` ([`LOCATIONS_FORMATS`]),
+/// else `Accept` over GeoJSON and HTML as [`negotiate_edr_format`] ranks
+/// them, GeoJSON first.
+pub fn negotiate_list_format(
+    f: Option<&str>,
+    accept: Option<&str>,
+    what: &str,
+) -> Result<NegotiatedFormat, DataServerError> {
+    match f.map(|f| list_format(f, what)).transpose()?.flatten() {
+        Some(format) => Ok(NegotiatedFormat {
+            format,
+            vary_accept: false,
+        }),
+        None => negotiate_edr_format(None, accept, &[EdrFormat::GeoJson, EdrFormat::Html], what),
+    }
+}
+
 /// Parse the `/locations` query. A parameter outside [`LOCATIONS_PARAMETERS`],
-/// a repeated `limit`, `offset`, `bbox` or `datetime`, an invalid value, or an
-/// `offset` without a `limit` (there is no page to offset into) is a 400, so
-/// a typo such as `limti` cannot return the unpaged list as if it worked
-/// (#605).
+/// a repeated `limit`, `offset`, `bbox` or `datetime`, an invalid value (an
+/// `f` outside [`LOCATIONS_FORMATS`] included), or an `offset` without a
+/// `limit` (there is no page to offset into) is a 400, so a typo such as
+/// `limti` cannot return the unpaged list as if it worked (#605).
 ///
 /// `bbox` is the EDR 1.2 parameter: CRS84, four numbers, `west > east`
 /// crossing the antimeridian, or six whose vertical pair must be numbers and
@@ -590,6 +621,7 @@ pub fn parse_locations_query(
             "bbox" => &mut bbox,
             "datetime" => &mut datetime,
             "f" => {
+                check_locations_format(&value)?;
                 preserved.push((name, value));
                 continue;
             }
@@ -665,6 +697,9 @@ pub struct AreaQueryParams {
     /// rejected (an area result is gridded / multi-coverage, not a single
     /// plot), and so is `GeoJSON` (not a point query, #929).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
     pub limit: Option<String>,
 }
@@ -685,6 +720,9 @@ pub struct RadiusQueryParams {
     pub parameter_name: Option<String>,
     pub z: Option<String>,
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`].
     pub limit: Option<String>,
 }
@@ -909,6 +947,9 @@ pub struct TrajectoryQueryParams {
     /// Output format: `CoverageJSON` (default) or, for a radar
     /// cross-section, `PNG` — a colour-mapped heatmap (distance × height).
     pub f: Option<String>,
+    /// EDR 1.2 `crs` (`/req/edr/REQ_rc-crs-definition`): CRS84 only, see
+    /// [`check_crs`].
+    pub crs: Option<String>,
     /// PNG image dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -932,10 +973,14 @@ pub enum ZSelector {
     Interval { min: f64, max: f64 },
 }
 
-/// Most levels a recurring `z=Rn/min/step` may expand to. The count is
-/// the number of levels, as in the standard's example: `z=R20/100/50` is
-/// "20 levels at 50 unit intervals starting at level 100".
-pub const MAX_Z_RECURRENCES: u32 = 1000;
+/// Most levels one `z` may name, in a list or as the levels a recurring
+/// `z=Rn/min/step` expands to (#940). Every engine loops over the requested
+/// levels before any response budget applies, so the request bounds that
+/// work; no collection advertises anywhere near this many levels. For the
+/// recurring form the count is the number of levels, as in the standard's
+/// example: `z=R20/100/50` is "20 levels at 50 unit intervals starting at
+/// level 100".
+pub const MAX_Z_LEVELS: usize = 1000;
 
 /// An interval bound as it is written in a request: `..` when open.
 fn fmt_z_bound(v: f64) -> String {
@@ -969,8 +1014,11 @@ fn parse_z_value(part: &str) -> Result<f64, DataServerError> {
 /// - an open interval `z=../850` or `z=500/..`, reaching the lowest or
 ///   highest advertised level;
 /// - a recurring interval `z=Rn/min/step`: `n` levels from `min`, `step`
-///   apart (`step` may be negative, never zero), at most
-///   [`MAX_Z_RECURRENCES`]. It becomes a list, snapped like one.
+///   apart (`step` may be negative, never zero). It becomes a list,
+///   matched like one.
+///
+/// A list or a recurring interval names at most [`MAX_Z_LEVELS`] levels;
+/// more is a 400 naming the cap, raised before any value is parsed.
 ///
 /// An absent or blank value yields `None` (the whole vertical extent / a
 /// profile).
@@ -1013,6 +1061,12 @@ pub fn parse_z(z: Option<&str>) -> Result<Option<ZSelector>, DataServerError> {
         return Ok(Some(ZSelector::Interval { min, max }));
     }
 
+    let count = raw.split(',').count();
+    if count > MAX_Z_LEVELS {
+        return Err(DataServerError::InvalidParameter(format!(
+            "`z` list has {count} levels, more than the maximum of {MAX_Z_LEVELS}"
+        )));
+    }
     let levels: Vec<f64> = raw
         .split(',')
         .map(|part| {
@@ -1040,9 +1094,9 @@ fn parse_z_recurring(rest: &str) -> Result<ZSelector, DataServerError> {
             "`z` recurring interval count 'R{count}' must be a positive whole number of levels"
         ))
     })?;
-    if n > MAX_Z_RECURRENCES {
+    if n as usize > MAX_Z_LEVELS {
         return Err(DataServerError::InvalidParameter(format!(
-            "`z` recurring interval R{n} exceeds the maximum of {MAX_Z_RECURRENCES} levels"
+            "`z` recurring interval R{n} exceeds the maximum of {MAX_Z_LEVELS} levels"
         )));
     }
     let min = parse_z_value(min)?;
@@ -1063,8 +1117,10 @@ fn parse_z_recurring(rest: &str) -> Result<ZSelector, DataServerError> {
 
 /// Resolve a [`ZSelector`] into the concrete level list an engine samples.
 ///
-/// - `Levels` pass through unchanged (the engine applies its list rule to
-///   each: ODIM snaps to the nearest sweep, GRIB requires an exact level).
+/// - `Levels` pass through unchanged for the engine to match against its
+///   own levels, keeping only those it has (`/req/edr/z-response` B):
+///   ODIM PVOL a sweep within 0.05° of a requested angle, GRIB an exact
+///   level. None matching is the engine's 400, worded like the interval's.
 /// - `Interval { min, max }` expands to the collection's advertised levels
 ///   that fall within `[min, max]` (inclusive; an open end is infinite, so
 ///   it reaches the extreme level). An interval that selects no advertised
@@ -1666,11 +1722,11 @@ mod tests {
             parse_z(Some("r1/0.5/1")).unwrap(),
             Some(ZSelector::Levels(vec![0.5]))
         );
-        let max = format!("R{MAX_Z_RECURRENCES}/0/1");
+        let max = format!("R{MAX_Z_LEVELS}/0/1");
         let Some(ZSelector::Levels(levels)) = parse_z(Some(&max)).unwrap() else {
             panic!("the cap itself is accepted");
         };
-        assert_eq!(levels.len(), MAX_Z_RECURRENCES as usize);
+        assert_eq!(levels.len(), MAX_Z_LEVELS);
     }
 
     #[test]
@@ -1691,9 +1747,31 @@ mod tests {
         ] {
             assert!(parse_z(Some(z)).is_err(), "{z}");
         }
-        let over = format!("R{}/0/1", MAX_Z_RECURRENCES + 1);
+        let over = format!("R{}/0/1", MAX_Z_LEVELS + 1);
         let err = parse_z(Some(&over)).unwrap_err().to_string();
-        assert!(err.contains(&MAX_Z_RECURRENCES.to_string()), "{err}");
+        assert!(err.contains(&MAX_Z_LEVELS.to_string()), "{err}");
+    }
+
+    /// #940: a list is capped like the recurring form, before its values
+    /// are parsed — an over-long list of garbage still names the cap.
+    #[test]
+    fn parse_z_caps_the_length_of_a_list() {
+        let list = |n: usize, v: &str| vec![v; n].join(",");
+        let Some(ZSelector::Levels(levels)) = parse_z(Some(&list(MAX_Z_LEVELS, "850"))).unwrap()
+        else {
+            panic!("a list at the cap is accepted");
+        };
+        assert_eq!(levels.len(), MAX_Z_LEVELS);
+        for v in ["850", "x"] {
+            let err = parse_z(Some(&list(MAX_Z_LEVELS + 1, v)))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{}", MAX_Z_LEVELS + 1))
+                    && err.contains(&format!("maximum of {MAX_Z_LEVELS}")),
+                "{err}"
+            );
+        }
     }
 
     fn pressure_extent() -> VerticalDimension {
@@ -2276,8 +2354,9 @@ mod tests {
                 .paging,
             None
         );
+        // An unencoded `+` arrives as a space.
         let query = parse_locations_query(pairs(&[
-            ("f", "geo json"),
+            ("f", "application/geo json"),
             ("limit", "50000"),
             ("offset", "20"),
         ]))
@@ -2287,9 +2366,9 @@ mod tests {
         // Links repeat the other parameters, encoded, and the clamped limit.
         assert_eq!(
             query.href("https://x/locations", 10020),
-            "https://x/locations?f=geo%20json&limit=10000&offset=10020"
+            "https://x/locations?f=application/geo%20json&limit=10000&offset=10020"
         );
-        assert_eq!(query.href("b", 0), "b?f=geo%20json&limit=10000");
+        assert_eq!(query.href("b", 0), "b?f=application/geo%20json&limit=10000");
         assert_eq!(parse_locations_query(Vec::new()).unwrap().href("b", 0), "b");
         for bad in [
             &[("offset", "3")][..],
@@ -2299,6 +2378,33 @@ mod tests {
             &[("limit", "2"), ("offset", "1"), ("offset", "1")],
         ] {
             assert!(parse_locations_query(pairs(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `f` names GeoJSON or the list's HTML page (#971), or is a 400
+    /// (`/req/edr/REQ_rc-f-response` D): before, any value was a 200.
+    #[test]
+    fn locations_query_accepts_only_geojson_and_html_formats() {
+        for f in [
+            "GeoJSON",
+            "geojson",
+            "application/geo+json",
+            "Application/Geo+JSON",
+            "application/geo json",
+            "json",
+            "application/json",
+            "html",
+            "text/html",
+            "",
+        ] {
+            let query = parse_locations_query(pairs(&[("f", f)])).unwrap();
+            assert_eq!(query.preserved, pairs(&[("f", f)]), "{f}");
+        }
+        for f in ["xyz", "CoverageJSON", "PNG", "geo json"] {
+            let err = parse_locations_query(pairs(&[("f", f)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("available: GeoJSON, HTML"), "{f}: {err}");
         }
     }
 

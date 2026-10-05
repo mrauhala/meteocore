@@ -589,6 +589,20 @@ async fn links_are_anchors() {
     assert!(body.contains("rel") && body.contains("next"));
     assert!(body.contains(&next.replace('&', "&amp;")), "{next}");
     assert!(body.contains("&lt;i&gt;S0&lt;/i&gt;") && !body.contains("<i>S0"));
+    // The EDR members (#970) are columns, the query endpoint an anchor.
+    for member in ["datetime", "parameter-name", "label", "edrqueryendpoint"] {
+        assert!(
+            body.contains(&format!("<th scope=\"col\">{member}</th>")),
+            "{member}"
+        );
+    }
+    for feature in json["features"].as_array().unwrap() {
+        let endpoint = feature["properties"]["edrqueryendpoint"].as_str().unwrap();
+        assert!(
+            anchored(&body, &endpoint.replace('&', "&amp;")),
+            "{endpoint}"
+        );
+    }
 }
 
 /// An items page's `timeStamp` changes per request; its ETag does not.

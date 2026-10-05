@@ -35,7 +35,7 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::cell_facts::{CellFactSheet, LightningFacts, ScoredCell, Trend, DEFAULT_CELL_WEIGHTS};
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, ItemRadius};
 use ds_core::error::DataServerError;
 use ds_core::feature::{
     DatetimeInterval, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
@@ -2360,6 +2360,27 @@ impl EdrEngine for NowcastEngine {
 
     fn supported_query_types(&self) -> Vec<String> {
         vec!["area".to_string(), "radius".to_string()]
+    }
+
+    /// A tracked cell as an EDR item (#970): the radius query over the
+    /// motion field centred on it, as wide as the cell (its `area_km2` as a
+    /// disc), at the frame the cell was `observed` in. A circle narrower than
+    /// a motion block still answers: the area mask then keeps the block
+    /// nearest its vertices (#671), so no floor is needed.
+    fn item_radius(&self, feature: &Feature) -> Option<ItemRadius> {
+        let &PropertyValue::Float(area_km2) = feature.properties.get("area_km2")? else {
+            return None;
+        };
+        let datetime = match feature.properties.get("observed") {
+            Some(PropertyValue::String(observed)) => DateTime::parse_from_rfc3339(observed)
+                .ok()
+                .map(|t| t.with_timezone(&Utc)),
+            _ => None,
+        };
+        (area_km2 > 0.0).then(|| ItemRadius {
+            within_km: (area_km2 / std::f64::consts::PI).sqrt(),
+            datetime,
+        })
     }
 
     /// The block-centre motion field inside the query polygon's bbox as a

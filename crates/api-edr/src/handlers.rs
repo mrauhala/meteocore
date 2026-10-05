@@ -27,8 +27,8 @@ use crate::params::{
     parse_z, plot_dimensions, query_formats, resolve_z_levels, split_location_ids,
     split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector, EdrFormat,
     LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
-    TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, MAX_LIMIT, MAX_LOCATION_IDS,
-    MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
+    TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, LOCATIONS_FORMATS, MAX_LIMIT,
+    MAX_LOCATION_IDS, MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -340,6 +340,12 @@ fn request_limit(raw: Option<&str>) -> Result<Option<usize>, HandlerError> {
     parse_limit(raw).map_err(|e| bad_request(&e))
 }
 
+/// The 400 for a data query's `crs` naming a CRS other than the CRS84 every
+/// `crs_details` lists (EDR 1.2 `/req/edr/REQ_rc-crs-response` C).
+fn request_crs(raw: Option<&str>) -> Result<(), HandlerError> {
+    check_crs(raw).map_err(|e| bad_request(&e))
+}
+
 /// The number of top-level coverages a result has before `limit`: the
 /// `numberMatched` of its GeoJSON representation (#929).
 fn coverage_count(result: &CoverageResponse) -> usize {
@@ -631,7 +637,7 @@ pub async fn landing_page(
         (
             format!("{base}/edr/api"),
             "service-desc",
-            "application/vnd.oai.openapi+json;version=3.0",
+            OPENAPI_MEDIA_TYPE,
             "API definition",
         ),
         (
@@ -703,13 +709,158 @@ pub async fn landing_page(
 }
 
 /// OpenAPI `f` (output-format) query parameter, shared by the content-negotiated
-/// metadata endpoints (landing, conformance, collections, collection detail).
+/// metadata endpoints (landing, conformance, collection detail, instances).
 fn format_parameter() -> serde_json::Value {
     json!({"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
            "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
 }
 
-/// OpenAPI `f` parameter of a data query offering `formats` (#929).
+/// The media type `/api` is served as: the type the landing page's
+/// `service-desc` link names (`/req/core/api-definition-success` C).
+const OPENAPI_MEDIA_TYPE: &str = "application/vnd.oai.openapi+json;version=3.0";
+
+/// The shared responses of `/api` (`components.responses`): status, name
+/// and default description. Operations reference them through
+/// [`responses`] and [`document_router_responses`], so an operation lists
+/// every status its route can answer (EDR 1.2 `/req/oas/completeness`,
+/// `/req/oas/exceptions-codes`).
+const SHARED_RESPONSES: [(u16, &str, &str); 6] = [
+    (
+        304,
+        "NotModified",
+        "Not modified: If-None-Match names the representation's current ETag. No body.",
+    ),
+    (
+        400,
+        "BadRequest",
+        "Bad request: an invalid, unknown or repeated query parameter, or an unsupported f. \
+         A query string that does not parse into the operation's parameters at all, such as a \
+         missing coords, is answered as text/plain.",
+    ),
+    (
+        404,
+        "NotFound",
+        "Not found: the collection, a resource within it, a query type it does not support, \
+         or data for the request.",
+    ),
+    (
+        500,
+        "ServerError",
+        "Internal server error. The body, when there is one, carries no details.",
+    ),
+    (
+        503,
+        "ServiceUnavailable",
+        "The query executor is at capacity (ServerBusy), or a response would exceed its \
+         configured budget (ResponseLimit); retry later, or narrow the request.",
+    ),
+    (
+        504,
+        "GatewayTimeout",
+        "The query exceeded its time budget, queue time included (Timeout).",
+    ),
+];
+
+/// Error statuses of a content-negotiated metadata resource: an unknown `f`
+/// (400) and an unknown collection or instance (404).
+const METADATA_ERRORS: &[u16] = &[400, 404];
+
+/// Error statuses of a data query: an invalid request (400); an unknown
+/// collection, a query type it does not support or no data (404); and the
+/// query executor's capacity (503) and deadline (504), from
+/// [`execute_query`] and [`map_query_error`].
+const QUERY_ERRORS: &[u16] = &[400, 404, 503, 504];
+
+/// Statuses every route of this router can answer, whatever its handler:
+/// 304 to a matching `If-None-Match` (`caching::conditional_get`, #499) and
+/// 500.
+const ROUTER_RESPONSES: [u16; 2] = [304, 500];
+
+/// The OpenAPI response of an error `status`: `description` and the body
+/// every JSON error carries, the `exception` schema. A 400 may also be the
+/// framework's text/plain message (see [`SHARED_RESPONSES`]).
+pub(crate) fn error_response(status: u16, description: &str) -> serde_json::Value {
+    let mut content = json!({
+        "application/json": {"schema": {"$ref": "#/components/schemas/exception"}}
+    });
+    if status == 400 {
+        content["text/plain"] = json!({"schema": {"type": "string"}});
+    }
+    json!({"description": description, "content": content})
+}
+
+/// A reference to the shared response of `status` (dangling for a status
+/// outside [`SHARED_RESPONSES`], which the `/api` tests catch).
+fn shared_response(status: u16) -> serde_json::Value {
+    let name = SHARED_RESPONSES
+        .iter()
+        .find(|(s, _, _)| *s == status)
+        .map_or_else(|| status.to_string(), |(_, name, _)| name.to_string());
+    json!({"$ref": format!("#/components/responses/{name}")})
+}
+
+/// `components.responses`: [`SHARED_RESPONSES`] as response objects.
+fn shared_responses_component() -> serde_json::Value {
+    let responses: serde_json::Map<String, serde_json::Value> = SHARED_RESPONSES
+        .iter()
+        .map(|&(status, name, description)| {
+            let response = match status {
+                304 => json!({"description": description}),
+                _ => error_response(status, description),
+            };
+            (name.to_string(), response)
+        })
+        .collect();
+    serde_json::Value::Object(responses)
+}
+
+/// An operation's `responses`: `ok` as its 200 and the shared response of
+/// each of `errors`. [`document_router_responses`] adds [`ROUTER_RESPONSES`].
+fn responses(ok: serde_json::Value, errors: &[u16]) -> serde_json::Value {
+    let mut responses = serde_json::Map::new();
+    responses.insert("200".into(), ok);
+    for &status in errors {
+        responses.insert(status.to_string(), shared_response(status));
+    }
+    serde_json::Value::Object(responses)
+}
+
+/// Add [`ROUTER_RESPONSES`] to every operation in `paths` that does not
+/// describe them itself, so a new route cannot leave them out.
+fn document_router_responses(paths: &mut serde_json::Value) {
+    let operations = paths
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|paths| paths.values_mut())
+        .filter_map(serde_json::Value::as_object_mut)
+        .flat_map(|item| item.values_mut());
+    for operation in operations {
+        if let Some(responses) = operation
+            .get_mut("responses")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for status in ROUTER_RESPONSES {
+                responses
+                    .entry(status.to_string())
+                    .or_insert_with(|| shared_response(status));
+            }
+        }
+    }
+}
+
+/// The `200` of a metadata resource: JSON, or HTML with `f=html`.
+fn metadata_ok(description: &str) -> serde_json::Value {
+    json!({
+        "description": description,
+        "content": {
+            "application/json": {"schema": {"type": "object"}},
+            "text/html": {"schema": {"type": "string"}}
+        }
+    })
+}
+
+/// OpenAPI `f` parameter of a data query offering `formats` (#929): the one
+/// place its `enum` is built.
 fn data_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
     let described: Vec<&str> = formats
         .iter()
@@ -776,6 +927,7 @@ fn cube_operation(
     operation_id: String,
     tag: &str,
     instance_id_param: Option<serde_json::Value>,
+    formats: &[EdrFormat],
 ) -> serde_json::Value {
     let mut parameters: Vec<serde_json::Value> = instance_id_param.into_iter().collect();
     parameters.extend([
@@ -787,13 +939,7 @@ fn cube_operation(
         json!({"$ref": "#/components/parameters/resolution-y"}),
         json!({"$ref": "#/components/parameters/resolution-z"}),
         json!({"$ref": "#/components/parameters/crs"}),
-        json!({
-            "name": "f",
-            "in": "query",
-            "description": "format to return the data response in: CoverageJSON (the default) or HTML.",
-            "required": false,
-            "schema": {"type": "string"}
-        }),
+        data_format_parameter(formats),
     ]);
     json!({
         "get": {
@@ -816,19 +962,10 @@ fn cube_operation(
             "operationId": operation_id,
             "tags": [tag],
             "parameters": parameters,
-            "responses": {
-                "200": {
-                    "description": "Coverage data",
-                    "content": {
-                        COVERAGE_JSON_MEDIA_TYPE: {
-                            "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                        }
-                    }
-                },
-                "400": {"description": "Bad request"},
-                "404": {"description": "Not found"},
-                "500": {"description": "Server error"}
-            }
+            "responses": responses(
+                json!({"description": "Coverage data", "content": data_response_content(formats)}),
+                QUERY_ERRORS,
+            )
         }
     })
 }
@@ -871,81 +1008,94 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "operationId": format!("getCollection_{id}"),
                 "tags": [id],
                 "parameters": [format_parameter()],
-                "responses": {
-                    "200": {"description": "Collection metadata"},
-                    "404": {"description": "Collection not found"}
-                }
+                "responses": responses(metadata_ok("Collection metadata"), METADATA_ERRORS)
             }
         });
 
-        // Locations list
-        let locations_path = format!("/edr/collections/{id}/locations");
-        collection_paths[&locations_path] = json!({
-            "get": {
-                "summary": format!("Get locations for {}", config.title),
-                "operationId": format!("getLocations_{id}"),
-                "tags": [id],
-                "parameters": [
-                    {"$ref": "#/components/parameters/bbox-locations"},
-                    {"$ref": "#/components/parameters/datetime-locations"},
-                    {"$ref": "#/components/parameters/limit-locations"},
-                    {"$ref": "#/components/parameters/offset-locations"}
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Locations in GeoJSON format: the complete inventory, or the locations inside bbox with an observation in datetime; with limit one page of that list carrying numberMatched, numberReturned and self/next/prev links",
-                        "content": {
-                            "application/geo+json": {
-                                "schema": {"type": "object"}
-                            }
-                        }
-                    },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Collection not found"},
-                    "503": {"description": "Response budget exhausted; a complete inventory over the response limit can be paged with limit"}
+        // Locations, gated like every data query: an engine without
+        // location support has neither path, and both routes answer 404.
+        if supported.contains("locations") {
+            let locations_path = format!("/edr/collections/{id}/locations");
+            let mut list_responses = responses(
+                json!({
+                    "description": "Locations in GeoJSON format: the complete inventory, or the locations inside bbox with an observation in datetime; with limit one page of that list carrying numberMatched, numberReturned and self/next/prev links",
+                    "content": {
+                        "application/geo+json": {
+                            "schema": {"$ref": "#/components/schemas/edrFeatureCollectionGeoJSON"}
+                        },
+                        "text/html": {"schema": {"type": "string"}}
+                    }
+                }),
+                QUERY_ERRORS,
+            );
+            list_responses["503"] = error_response(
+                503,
+                "The query executor is at capacity (ServerBusy), or the list is over the response budget (ResponseLimit): page a list over it with limit, or request a smaller limit",
+            );
+            collection_paths[&locations_path] = json!({
+                "get": {
+                    "summary": format!("Get locations for {}", config.title),
+                    "operationId": format!("getLocations_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/bbox-locations"},
+                        {"$ref": "#/components/parameters/datetime-locations"},
+                        {"$ref": "#/components/parameters/limit-locations"},
+                        {"$ref": "#/components/parameters/offset-locations"},
+                        {"$ref": "#/components/parameters/f-locations"}
+                    ],
+                    "responses": list_responses
                 }
-            }
-        });
+            });
 
-        // Location data query. `locationId` per EDR 1.2
-        // `/req/edr/REQ_rc-locationid-definition` (#923), as the 1.2 bundle
-        // writes it: the requirement's fragment puts `style`/`explode` in the
-        // schema and says `required: false`, neither valid for an OpenAPI path
-        // parameter.
-        let location_path = format!("/edr/collections/{id}/locations/{{locationId}}");
-        collection_paths[&location_path] = json!({
-            "get": {
-                "summary": format!("Get data for one or more locations in {}", config.title),
-                "operationId": format!("getLocationData_{id}"),
-                "tags": [id],
-                "parameters": [
-                    {
-                        "name": "locationId",
-                        "in": "path",
-                        "required": true,
-                        "description": format!("Comma-delimited list of location ids (EGLL or EGLL,EFHK), from the /locations inventory. At most {MAX_LOCATION_IDS}, and with a datetime list at most {MAX_LOCATION_LOOKUPS} ids × instants; a repeated id is answered once. A literal comma separates ids, so a comma inside an id is sent encoded as %2C. One id answers as before: a Coverage or CoverageCollection, 404 when it has no data in the window. A list answers one CoverageCollection with every id's coverages in request order, or on a station collection one EDR GeoJSON FeatureCollection with every id's features in request order, each named by its id; an id without data in the window contributes none; any unknown id is a 404 naming it; PNG is a 400 for a list."),
-                        "schema": {"type": "string"},
-                        "style": "simple",
-                        "explode": false
-                    },
-                    {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/parameter-name"},
-                    {"$ref": "#/components/parameters/z"},
-                    locations_format_parameter(formats("locations")),
-                    {"$ref": "#/components/parameters/limit"}
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Coverage data",
-                        "content": data_response_content(formats("locations"))
-                    },
-                    "204": {"description": "A list of locations, none of which has data in the requested window"},
-                    "400": {"description": format!("Bad request, including an empty element in or more than {MAX_LOCATION_IDS} ids in locationId, more than {MAX_LOCATION_LOOKUPS} ids × datetime instants, and PNG for a list")},
-                    "404": {"description": "Location not found: an unknown id, or one id without data in the requested window"},
-                    "500": {"description": "Server error"}
+            // Location data query. `locationId` per EDR 1.2
+            // `/req/edr/REQ_rc-locationid-definition` (#923), as the 1.2
+            // bundle writes it: the requirement's fragment puts
+            // `style`/`explode` in the schema and says `required: false`,
+            // neither valid for an OpenAPI path parameter.
+            let location_path = format!("/edr/collections/{id}/locations/{{locationId}}");
+            let mut location_responses = responses(
+                json!({
+                    "description": "Coverage data",
+                    "content": data_response_content(formats("locations"))
+                }),
+                QUERY_ERRORS,
+            );
+            location_responses["204"] = json!({"description": "A list of locations, none of which has data in the requested window"});
+            location_responses["400"] = error_response(
+                400,
+                &format!("Bad request, including an empty element in or more than {MAX_LOCATION_IDS} ids in locationId, more than {MAX_LOCATION_LOOKUPS} ids × datetime instants, and PNG for a list"),
+            );
+            location_responses["404"] = error_response(
+                404,
+                "Location not found: an unknown id, or one id without data in the requested window",
+            );
+            collection_paths[&location_path] = json!({
+                "get": {
+                    "summary": format!("Get data for one or more locations in {}", config.title),
+                    "operationId": format!("getLocationData_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {
+                            "name": "locationId",
+                            "in": "path",
+                            "required": true,
+                            "description": format!("Comma-delimited list of location ids (EGLL or EGLL,EFHK), from the /locations inventory. At most {MAX_LOCATION_IDS}, and with a datetime list at most {MAX_LOCATION_LOOKUPS} ids × instants; a repeated id is answered once. A literal comma separates ids, so a comma inside an id is sent encoded as %2C. One id answers as before: a Coverage or CoverageCollection, 404 when it has no data in the window. A list answers one CoverageCollection with every id's coverages in request order, or on a station collection one EDR GeoJSON FeatureCollection with every id's features in request order, each named by its id; an id without data in the window contributes none; any unknown id is a 404 naming it; PNG is a 400 for a list."),
+                            "schema": {"type": "string"},
+                            "style": "simple",
+                            "explode": false
+                        },
+                        {"$ref": "#/components/parameters/datetime"},
+                        {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/z"},
+                        {"$ref": "#/components/parameters/crs"},
+                        locations_format_parameter(formats("locations")),
+                        {"$ref": "#/components/parameters/limit"}
+                    ],
+                    "responses": location_responses
                 }
-            }
-        });
+            });
+        }
 
         // Position query
         if supported.contains("position") {
@@ -960,18 +1110,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
                         {"$ref": "#/components/parameters/z"},
+                        {"$ref": "#/components/parameters/crs"},
                         data_format_parameter(formats("position")),
                         {"$ref": "#/components/parameters/limit"}
                     ],
-                    "responses": {
-                        "200": {
-                            "description": "Coverage data",
-                            "content": data_response_content(formats("position"))
-                        },
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Not found"},
-                        "500": {"description": "Server error"}
-                    }
+                    "responses": responses(
+                        json!({"description": "Coverage data", "content": data_response_content(formats("position"))}),
+                        QUERY_ERRORS,
+                    )
                 }
             });
         }
@@ -989,21 +1135,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
                         {"$ref": "#/components/parameters/z"},
+                        {"$ref": "#/components/parameters/crs"},
+                        data_format_parameter(formats("area")),
                         {"$ref": "#/components/parameters/limit"}
                     ],
-                    "responses": {
-                        "200": {
-                            "description": "Coverage data",
-                            "content": {
-                                COVERAGE_JSON_MEDIA_TYPE: {
-                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                                }
-                            }
-                        },
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Not found"},
-                        "500": {"description": "Server error"}
-                    }
+                    "responses": responses(
+                        json!({"description": "Coverage data", "content": data_response_content(formats("area"))}),
+                        QUERY_ERRORS,
+                    )
                 }
             });
         }
@@ -1025,18 +1164,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
                         {"$ref": "#/components/parameters/z"},
+                        {"$ref": "#/components/parameters/crs"},
                         data_format_parameter(formats("radius")),
                         {"$ref": "#/components/parameters/limit"}
                     ],
-                    "responses": {
-                        "200": {
-                            "description": "Coverage data",
-                            "content": data_response_content(formats("radius"))
-                        },
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Not found"},
-                        "500": {"description": "Server error"}
-                    }
+                    "responses": responses(
+                        json!({"description": "Coverage data", "content": data_response_content(formats("radius"))}),
+                        QUERY_ERRORS,
+                    )
                 }
             });
         }
@@ -1050,6 +1185,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 format!("getCube_{id}"),
                 id,
                 None,
+                formats("cube"),
             );
         }
 
@@ -1064,6 +1200,12 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             let trajectory_path = format!("/edr/collections/{id}/trajectory");
             // The formats this shape offers, the ones the handler negotiates.
             let trajectory_formats = formats("trajectory");
+            let trajectory_responses = |description: &str| {
+                responses(
+                    json!({"description": description, "content": data_response_content(trajectory_formats)}),
+                    QUERY_ERRORS,
+                )
+            };
             collection_paths[&trajectory_path] = match trajectory_shape {
                 TrajectoryShape::AlongPath => json!({
                     "get": {
@@ -1075,51 +1217,37 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/coords-trajectory"},
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
-                            {"$ref": "#/components/parameters/z"}
+                            {"$ref": "#/components/parameters/z"},
+                            {"$ref": "#/components/parameters/crs"},
+                            data_format_parameter(trajectory_formats)
                         ],
-                        "responses": {
-                            "200": {
-                                "description": "Coverage data: a CoverageJSON Trajectory coverage, or a CoverageCollection of them",
-                                "content": data_response_content(trajectory_formats)
-                            },
-                            "400": {"description": "Bad request"},
-                            "404": {"description": "Not found"},
-                            "500": {"description": "Server error"}
-                        }
+                        "responses": trajectory_responses(
+                            "Coverage data: a CoverageJSON Trajectory coverage, or a CoverageCollection of them",
+                        )
                     }
                 }),
-                TrajectoryShape::CrossSection => json!({
-                    "get": {
-                        "summary": format!("Trajectory cross-section for {}", config.title),
-                        "operationId": format!("getTrajectory_{id}"),
-                        "tags": [id],
-                        "parameters": [
-                            {"$ref": "#/components/parameters/coords-linestring"},
-                            {"$ref": "#/components/parameters/datetime"},
-                            {"$ref": "#/components/parameters/parameter-name"},
-                            {"$ref": "#/components/parameters/z-trajectory"},
-                            {
-                                "name": "f",
-                                "in": "query",
-                                "description": "Output format: CoverageJSON (default), PNG (a colour-mapped distance×height cross-section heatmap) or HTML. Case-insensitive; the media types are accepted too (encode + as %2B). Without f, the Accept header chooses among them.",
-                                "required": false,
-                                "schema": {
-                                    "type": "string",
-                                    "enum": trajectory_formats.iter().map(|f| f.name()).collect::<Vec<_>>()
-                                }
-                            }
-                        ],
-                        "responses": {
-                            "200": {
-                                "description": "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
-                                "content": data_response_content(trajectory_formats)
-                            },
-                            "400": {"description": "Bad request"},
-                            "404": {"description": "Not found"},
-                            "500": {"description": "Server error"}
+                TrajectoryShape::CrossSection => {
+                    let mut format = data_format_parameter(trajectory_formats);
+                    format["description"] = json!("Output format: CoverageJSON (default), PNG (a colour-mapped distance×height cross-section heatmap) or HTML (a page of the response). Case-insensitive; the media types are accepted too (encode + as %2B). Without f, the Accept header chooses among them.");
+                    json!({
+                        "get": {
+                            "summary": format!("Trajectory cross-section for {}", config.title),
+                            "operationId": format!("getTrajectory_{id}"),
+                            "tags": [id],
+                            "parameters": [
+                                {"$ref": "#/components/parameters/coords-linestring"},
+                                {"$ref": "#/components/parameters/datetime"},
+                                {"$ref": "#/components/parameters/parameter-name"},
+                                {"$ref": "#/components/parameters/z-trajectory"},
+                                {"$ref": "#/components/parameters/crs"},
+                                format
+                            ],
+                            "responses": trajectory_responses(
+                                "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
+                            )
                         }
-                    }
-                }),
+                    })
+                }
             };
         }
 
@@ -1154,10 +1282,11 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "summary": format!("List model runs (instances) for {}", config.title),
                     "operationId": format!("getInstances_{id}"),
                     "tags": [id],
-                    "responses": {
-                        "200": {"description": "Available instances (model runs)"},
-                        "404": {"description": "Collection not found"}
-                    }
+                    "parameters": [format_parameter()],
+                    "responses": responses(
+                        metadata_ok("Available instances (model runs)"),
+                        METADATA_ERRORS,
+                    )
                 }
             });
             let instance_path = format!("/edr/collections/{id}/instances/{{instanceId}}");
@@ -1166,12 +1295,11 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "summary": format!("Get one model run's metadata for {}", config.title),
                     "operationId": format!("getInstance_{id}"),
                     "tags": [id],
-                    "parameters": [instance_id_param.clone()],
-                    "responses": {
-                        "200": {"description": "Instance (model run) metadata"},
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Instance not found"}
-                    }
+                    "parameters": [instance_id_param.clone(), format_parameter()],
+                    "responses": responses(
+                        metadata_ok("Instance (model run) metadata"),
+                        METADATA_ERRORS,
+                    )
                 }
             });
             if supported.contains("position") {
@@ -1187,18 +1315,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
                             {"$ref": "#/components/parameters/z"},
+                            {"$ref": "#/components/parameters/crs"},
                             data_format_parameter(formats("position")),
                             {"$ref": "#/components/parameters/limit"}
                         ],
-                        "responses": {
-                            "200": {
-                                "description": "Coverage data",
-                                "content": data_response_content(formats("position"))
-                            },
-                            "400": {"description": "Bad request"},
-                            "404": {"description": "Not found"},
-                            "500": {"description": "Server error"}
-                        }
+                        "responses": responses(
+                            json!({"description": "Coverage data", "content": data_response_content(formats("position"))}),
+                            QUERY_ERRORS,
+                        )
                     }
                 });
             }
@@ -1217,18 +1341,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
                             {"$ref": "#/components/parameters/z"},
+                            {"$ref": "#/components/parameters/crs"},
                             data_format_parameter(formats("radius")),
                             {"$ref": "#/components/parameters/limit"}
                         ],
-                        "responses": {
-                            "200": {
-                                "description": "Coverage data",
-                                "content": data_response_content(formats("radius"))
-                            },
-                            "400": {"description": "Bad request"},
-                            "404": {"description": "Not found"},
-                            "500": {"description": "Server error"}
-                        }
+                        "responses": responses(
+                            json!({"description": "Coverage data", "content": data_response_content(formats("radius"))}),
+                            QUERY_ERRORS,
+                        )
                     }
                 });
             }
@@ -1239,6 +1359,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     format!("getInstanceCube_{id}"),
                     id,
                     Some(instance_id_param.clone()),
+                    formats("cube"),
                 );
             }
             if supported.contains("area") {
@@ -1254,21 +1375,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/datetime"},
                             {"$ref": "#/components/parameters/parameter-name"},
                             {"$ref": "#/components/parameters/z"},
+                            {"$ref": "#/components/parameters/crs"},
+                            data_format_parameter(formats("area")),
                             {"$ref": "#/components/parameters/limit"}
                         ],
-                        "responses": {
-                            "200": {
-                                "description": "Coverage data",
-                                "content": {
-                                    COVERAGE_JSON_MEDIA_TYPE: {
-                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
-                                    }
-                                }
-                            },
-                            "400": {"description": "Bad request"},
-                            "404": {"description": "Not found"},
-                            "500": {"description": "Server error"}
-                        }
+                        "responses": responses(
+                            json!({"description": "Coverage data", "content": data_response_content(formats("area"))}),
+                            QUERY_ERRORS,
+                        )
                     }
                 });
             }
@@ -1282,9 +1396,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "operationId": "getLandingPage",
                 "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
-                "responses": {
-                    "200": {"description": "Landing page"}
-                }
+                "responses": responses(metadata_ok("Landing page"), &[400])
             }
         },
         "/edr/conformance": {
@@ -1293,9 +1405,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "operationId": "getConformance",
                 "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
-                "responses": {
-                    "200": {"description": "Conformance classes"}
-                }
+                "responses": responses(metadata_ok("Conformance classes"), &[400])
             }
         },
         "/edr/collections": {"get": api_common::collection_operation()}
@@ -1308,6 +1418,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             main_obj.insert(k.clone(), v.clone());
         }
     }
+    document_router_responses(&mut paths);
 
     let mut openapi = json!({
         "openapi": "3.0.3",
@@ -1344,7 +1455,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": "Vertical level selector. Forms: z=850 (one level); z=10,80,200 (a list); z=100/550 (every advertised level between and including the two); z=../850 or z=500/.. (open intervals, reaching the lowest or highest advertised level); z=R20/100/50 (20 levels 50 apart starting at 100, at most 1000 levels, treated as a list). A single level or list is matched against the collection's advertised vertical extent by the collection's engine (the response domain reports the level served). A collection with no vertical extent ignores z, but a malformed z is still a 400."
+                    "description": format!("Vertical level selector. Forms: z=850 (one level); z=10,80,200 (a list); z=100/550 (every advertised level between and including the two); z=../850 or z=500/.. (open intervals, reaching the lowest or highest advertised level); z=R20/100/50 (20 levels 50 apart starting at 100, treated as a list). A list or recurring interval names at most {} levels; more is a 400. A single level or list is matched against the collection's advertised vertical extent by the collection's engine, which keeps only the levels it has: an exact level, or on radar volumes a sweep within 0.05° of the requested elevation angle (the response domain reports the level served). An interval or list that matches no level is a 400. A collection with no vertical extent ignores z, but a malformed z is still a 400.", crate::params::MAX_Z_LEVELS)
                 },
                 "coords-point": {
                     "name": "coords",
@@ -1448,13 +1559,26 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "style": "form",
                     "explode": false
                 },
+                // EDR 1.2 `/req/edr/REQ_rc-crs-definition`, on every data
+                // query: the requirement's `style` and `explode`, the
+                // bundle's description, and what this server accepts.
                 "crs": {
                     "name": "crs",
                     "in": "query",
-                    "description": "identifier (id) of the coordinate system to return data in list of valid crs identifiers for the chosen collection are defined in the metadata responses.  If not supplied the coordinate reference system will default to WGS84.",
+                    "description": "identifier (id) of the coordinate system to return data in list of valid crs identifiers for the chosen collection are defined in the metadata responses.  If not supplied the coordinate reference system will default to WGS84. This server serves CRS84 only, the crs_details of every data query: its OGC URI, CRS84 or OGC:CRS84 are accepted, any other value is a 400.",
                     "required": false,
                     "example": crate::params::CRS84,
-                    "schema": {"type": "string"}
+                    "schema": {"type": "string"},
+                    "style": "form",
+                    "explode": false
+                },
+                // `f` on `/locations`: GeoJSON or its HTML page (#971).
+                "f-locations": {
+                    "name": "f",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string", "enum": LOCATIONS_FORMATS},
+                    "description": "Output format: GeoJSON, the default, or HTML (case-insensitive; encode the plus sign as %2B in application/geo+json). Without f, the Accept header chooses. Any other value is a 400."
                 },
                 // EDR 1.2 `/req/edr/rc-limit-definition`, with the schema
                 // describing this server: no default (absent = no limit, not
@@ -1522,7 +1646,25 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), z=0.3/15 (a min/max interval → every advertised angle in range), z=../5 or z=5/.. (open intervals, reaching the lowest or highest advertised angle), or z=R4/0.5/1 (4 angles 1° apart from 0.5°, treated as a list). The selected angle window bounds which sweeps build the RHI; the rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
                 }
             },
+            "responses": shared_responses_component(),
             "schemas": {
+                // The body of every JSON error this API sends: `code` and
+                // `description` always, as `JsonError` builds them. The
+                // EDR 1.2 bundle's `exception` requires only `code`.
+                "exception": {
+                    "type": "object",
+                    "required": ["code", "description"],
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "The error kind: BadRequest, NotFound, ServerError, ServerBusy, ResponseLimit or Timeout"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "What went wrong, for a person; a 500 carries no internal details"
+                        }
+                    }
+                },
                 "coverageJSON": {
                     "type": "object",
                     "description": "OGC CoverageJSON 1.0 Coverage object",
@@ -1536,7 +1678,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 },
                 "edrFeatureCollectionGeoJSON": {
                     "type": "object",
-                    "description": "EDR GeoJSON FeatureCollection of station series: one Point feature per station, whose properties carry the EDR members (datetime, label, parameter-name, edrqueryendpoint), the series' RFC 3339 instants as `time`, and one array per parameter aligned with `time` (null where there is no value).",
+                    "description": "EDR GeoJSON FeatureCollection: one Point feature per location, whose properties carry the EDR members (datetime, label, parameter-name, edrqueryendpoint). A station series adds its RFC 3339 instants as `time` and one array per parameter aligned with `time` (null where there is no value); the /locations list has neither.",
                     "required": ["type", "features"],
                     "properties": {
                         "type": {"type": "string", "enum": ["FeatureCollection"]},
@@ -1588,7 +1730,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         }
     }
 
-    Json(openapi)
+    ([(header::CONTENT_TYPE, OPENAPI_MEDIA_TYPE)], Json(openapi))
 }
 
 pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -1963,6 +2105,7 @@ pub async fn locations(
 ) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
+    require_query_type(engine, &id, "locations", "location")?;
     let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid query string"))?;
     let request = parse_locations_query(pairs).map_err(|e| bad_request(&e))?;
     let f = request
@@ -2051,7 +2194,15 @@ pub async fn locations(
                 (&locs[window.range()], Some(locs.len()))
             }
         };
-        let paged = request.paging.is_some();
+        // What a `ResponseLimit` names: a page, a filtered list or the
+        // complete inventory (#961).
+        let too_large = if request.paging.is_some() {
+            "Location page exceeds the configured response limit; request a smaller limit"
+        } else if request.is_filtered() {
+            "Filtered location list exceeds the configured response limit; page it with limit"
+        } else {
+            "Complete location inventory exceeds the configured response limit; page it with limit"
+        };
         // Keep construction, serialization and hashing under the same worker
         // permit as retrieval, even if the request times out or disconnects.
         let cancelled = || budget.expired();
@@ -2078,11 +2229,7 @@ pub async fn locations(
                 Some(crate::location_budget::Failure::Cancelled) => query_timeout(),
                 Some(crate::location_budget::Failure::Limit) => JsonError(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"code": "ResponseLimit", "description": if paged {
-                        "Location page exceeds the configured response limit; request a smaller limit"
-                    } else {
-                        "Complete location inventory exceeds the configured response limit; page it with limit"
-                    }})),
+                    Json(json!({"code": "ResponseLimit", "description": too_large})),
                 ),
                 Some(crate::location_budget::Failure::Memory) => JsonError(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2172,6 +2319,7 @@ pub async fn location_query(
 ) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
+    require_query_type(engine, &id, "locations", "location")?;
 
     // Split the segment as it arrived: a literal comma separates ids, `%2C`
     // belongs to one. The decoded `loc_id` can no longer tell them apart.
@@ -2202,6 +2350,7 @@ pub async fn location_query(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format = negotiate_edr_format(params.f.as_deref(), accept, &offered, "location queries")
         .map_err(|e| bad_request(&e))?;
+    request_crs(params.crs.as_deref())?;
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -2570,6 +2719,7 @@ async fn run_position_query(
         &request.headers,
         "position queries",
     )?;
+    request_crs(params.crs.as_deref())?;
     // `limit` counts the top-level coverages of the flattened collection
     // (#922): point order, then each point's own coverages (one per step
     // for a vertical profile). The response shape follows the request, so
@@ -2728,6 +2878,7 @@ async fn run_area_query(
         &request.headers,
         "area queries",
     )?;
+    request_crs(params.crs.as_deref())?;
 
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
 
@@ -2834,6 +2985,7 @@ async fn run_radius_query(
         &request.headers,
         "radius queries",
     )?;
+    request_crs(params.crs.as_deref())?;
 
     let within_m =
         parse_within_metres(&params.within, &params.within_units).map_err(|e| bad_request(&e))?;
@@ -2951,7 +3103,7 @@ async fn run_cube_query(
         &request.headers,
         "cube queries",
     )?;
-    check_crs(params.crs.as_deref()).map_err(|e| bad_request(&e))?;
+    request_crs(params.crs.as_deref())?;
     // EDR `/req/edr/rc-cube` D: a cube without a bbox is a 400.
     let raw_bbox = params
         .bbox
@@ -3057,6 +3209,7 @@ pub async fn trajectory_query(
         "trajectory queries",
     )?;
     let format = negotiated.format;
+    request_crs(params.crs.as_deref())?;
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
