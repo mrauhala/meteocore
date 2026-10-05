@@ -624,6 +624,74 @@ async fn instance_documents_validate_against_edr_bundles() {
     }
 }
 
+/// The `rel=data` links of a document's `links` (EDR 1.2
+/// `/req/core/rc-md-query-links` A), as sorted `(href, type)` pairs, after checking that
+/// every link has a `rel` and a `type` (B).
+fn data_links(doc: &Value) -> Vec<(&str, &str)> {
+    let links = doc["links"].as_array().unwrap();
+    for link in links {
+        assert!(
+            link["rel"].is_string() && link["type"].is_string(),
+            "{link}"
+        );
+    }
+    links
+        .iter()
+        .filter(|l| l["rel"] == "data")
+        .map(|l| (l["href"].as_str().unwrap(), l["type"].as_str().unwrap()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// A forecast collection links its query end points and its instances list;
+/// an instance document links the run's own end points and no instances.
+#[tokio::test]
+async fn collection_and_instance_links_name_their_query_end_points() {
+    let (_, collection) = get("/collections/fc").await;
+    assert_eq!(
+        data_links(&collection),
+        [
+            ("/edr/collections/fc/instances", "application/json"),
+            ("/edr/collections/fc/position", "application/vnd.cov+json"),
+        ]
+    );
+    assert_eq!(
+        collection["data_queries"]["instances"]["link"]["type"],
+        "application/json"
+    );
+    // No radius query, so no collection-level `within_units`.
+    assert!(collection.get("within_units").is_none());
+
+    let (_, instance) = get("/collections/fc/instances/2026-06-07T00:00:00Z").await;
+    assert_eq!(
+        data_links(&instance),
+        [(
+            "/edr/collections/fc/instances/2026-06-07T00:00:00Z/position",
+            "application/vnd.cov+json"
+        )]
+    );
+    let (_, list) = get("/collections/fc/instances").await;
+    for instance in list["instances"].as_array().unwrap() {
+        assert_eq!(data_links(instance).len(), 1, "{instance}");
+    }
+}
+
+/// The HTML pages list the data queries from `data_queries`; the `rel=data`
+/// links are not repeated there as `?f=html` pages a data query is not.
+#[tokio::test]
+async fn html_pages_do_not_open_data_queries_as_pages() {
+    for uri in [
+        "/collections/fc?f=html",
+        "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
+    ] {
+        let (status, _, body) = get_raw(uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(body.contains("/position"), "{uri} lists the position query");
+        assert!(!body.contains("/position?f=html"), "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn collection_advertises_instances_data_query() {
     let (status, body) = get("/collections/fc").await;

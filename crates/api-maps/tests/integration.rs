@@ -468,6 +468,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "All rights reserved".into(),
             url: None,
+            media_type: None,
         };
         let html = fetch_collection_html_with(Some(lic.clone())).await;
         assert!(html.contains("License: All rights reserved"));
@@ -492,6 +493,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "CC-BY 4.0".into(),
             url: Some("https://example/lic".into()),
+            media_type: None,
         };
         let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
         let link = json["links"]
@@ -509,6 +511,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "Apache-2.0".into(),
             url: None,
+            media_type: None,
         };
         let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
         let link = json["links"]

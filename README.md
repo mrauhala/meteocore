@@ -501,7 +501,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"`, `"3dtiles"` |
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"` |
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
-| `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name) and optional `url`. When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. |
+| `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name), optional `url` and optional `type`, the media type `url` serves (default `text/html`; only with `url`). When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. The `rel="license"` link carries the `type`. |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 | `derive_wind` | no | on | `grib`, `querydata` and `zarr` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
 
