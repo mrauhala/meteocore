@@ -385,7 +385,9 @@ impl EdrEngine for QueryDataEngine {
 
         let time_indices = find_time_range(&data, datetime);
         if time_indices.is_empty() {
-            return Err(DataServerError::InvalidParameter(
+            // No step in the window: no data (404), so a datetime list
+            // skips the instant.
+            return Err(DataServerError::LocationNotFound(
                 "No data available for the requested time range".into(),
             ));
         }
@@ -493,9 +495,9 @@ impl EdrEngine for QueryDataEngine {
 
         let time_indices = find_time_range(&data, datetime);
         if time_indices.is_empty() {
-            // A window outside the run's steps is a request error (400), the
-            // same classification `query_area` uses — not a 500.
-            return Err(DataServerError::InvalidParameter(
+            // A window without a run step has no data (404), as in
+            // `query_area`; a datetime list skips such an instant.
+            return Err(DataServerError::LocationNotFound(
                 "No data available for the requested time range".into(),
             ));
         }
@@ -1511,14 +1513,23 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, DataServerError::LocationNotFound(_)), "{err}");
-        // And a datetime window past the run's steps is a 400 on both paths.
+        // And a datetime window without a run step has no data (404) on
+        // every path, so a datetime list skips that instant instead of
+        // failing (EDR 1.2 /req/core/datetime-response A).
         let far: DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
         for r in [
             engine.query_area("36,-2,38,0", Some((far, far)), None, None, None),
             engine.query_position("POINT(36.8 -1.3)", Some((far, far)), None, None, None),
+            engine.query_trajectory(
+                "LINESTRING(36 -2, 38 0)",
+                Some((far, far)),
+                None,
+                None,
+                None,
+            ),
         ] {
             assert!(
-                matches!(r, Err(DataServerError::InvalidParameter(_))),
+                matches!(r, Err(DataServerError::LocationNotFound(_))),
                 "{r:?}"
             );
         }

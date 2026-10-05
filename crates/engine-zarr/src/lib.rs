@@ -204,8 +204,9 @@ fn select_vars<'a>(
 }
 
 /// The time-axis indices an EDR query addresses: every step when
-/// `datetime` is absent, else the closed interval; none → 400. Shared by
-/// position and area so the window semantics cannot drift.
+/// `datetime` is absent, else the closed interval; none has no data → 404,
+/// so a datetime list skips that instant. Shared by position, area and
+/// trajectory so the window semantics cannot drift.
 /// Returns `(indices, valid times of the run)`.
 fn select_time_idx(
     cat: &Catalog,
@@ -223,7 +224,7 @@ fn select_time_idx(
             .collect(),
     };
     if time_idx.is_empty() {
-        return Err(DataServerError::InvalidParameter(
+        return Err(DataServerError::LocationNotFound(
             "No data available for the requested time range".into(),
         ));
     }
