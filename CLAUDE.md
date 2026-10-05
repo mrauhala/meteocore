@@ -732,6 +732,7 @@ keywords = ["weather", "observations", "Finland"]   # optional discovery metadat
 title = "CC-BY-4.0"   # required; an SPDX id (no spaces). With no `url`, the
                       # link auto-resolves to https://spdx.org/licenses/<id>.html
 # url = "https://creativecommons.org/licenses/by/4.0/"   # optional explicit override
+# type = "application/pdf"   # optional media type of `url` (default text/html)
 
 [[collections]]
 id = "radar"
@@ -928,10 +929,13 @@ every API from the shared `CollectionConfig`:
   `https://spdx.org/licenses/<id>.html`. Rendered as a `rel="license"` JSON
   link, `<Attribution>` in WMS (after `<Dimension>` elements), and an HTML
   link. A free-text title with no `url` shows its name but produces no JSON
-  link (a link object requires an `href`).
+  link (a link object requires an `href`). The JSON link's `type` is
+  `text/html` or the optional `type` of a configured `url` (EDR 1.2 requires
+  a `type` on every link, #964).
 
-Both validated at config load: empty keyword entries, empty license title, or
-a non-http(s) license URL are rejected.
+Both validated at config load: empty keyword entries, empty license title, a
+non-http(s) license URL, or a license `type` that is not a media type or has
+no `url` are rejected.
 
 ## Admin & Operations
 

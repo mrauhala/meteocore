@@ -55,6 +55,13 @@ and used by the cross-API response tests. Regular temporal grids now include
 metadata does not expose sample registration or axis direction. These checks
 add no conformance classes and do not supersede the historical assessment above.
 
+Link type update (2026-10-05, [#964](https://github.com/mrauhala/meteocore/issues/964)):
+the shared license link now carries a `type`, `text/html` unless
+`[collections.license] type` names what its configured `url` serves, on every
+API. EDR 1.2 requires `rel` and `type` on every collection link; the license
+link was the one without. EDR collections also list their query end points as
+`rel=data` links. No Common class changes.
+
 Link relation update (2026-09-24, [#789](https://github.com/mrauhala/meteocore/issues/789)
 Phase 0): landing pages add the registered `…/rel/ogc/1.0/conformance` relation
 that Part 1 Req 13 B names, and `…/data`, next to the short `conformance`/`data`
@@ -148,10 +155,10 @@ collection.
 | Collection description `/collections/{id}` (§7.2) | Yes | Yes | Yes | Yes |
 | Collection identifier, title and description | Yes | Yes | Yes | Yes |
 | Collection keywords | Yes — configuration | Yes — configuration | Yes — configuration | Yes — configuration |
-| License links | Yes — when configured with a resolvable URL | Yes — same | Yes — same | Yes — same |
+| License links | Yes — when configured with a resolvable URL; `type` `text/html` or the configured `type` | Yes — same | Yes — same | Yes — same |
 | `attribution` / `attributionMediaType` | No | No | No | No |
 | `itemType` for individually accessible items | Omitted; EDR locations require applicability review | N/A — map access | N/A — tile access | Yes — `feature` |
-| Links to data access mechanisms | Yes — EDR `data_queries` | Yes — map/styles, tiles when enabled | Yes — tilesets | Yes — items, vector tiles when enabled |
+| Links to data access mechanisms | Yes — EDR `data_queries`, repeated as typed `rel=data` collection links | Yes — map/styles, tiles when enabled | Yes — tilesets | Yes — items, vector tiles when enabled |
 | `self` links on collection list/detail | Yes | Yes | Yes | Yes |
 | `alternate` links for every supported representation (§7.1.2, §7.2.2.3) | Yes [4] | Yes [4] | Yes [4] | Yes [4] |
 | Spatial extent in CRS84 | Yes — engine-dependent | Yes — engine-dependent | Yes — raster or feature extent | Yes — engine-dependent |

@@ -1580,6 +1580,7 @@ mod tests {
         let license = LicenseConfig {
             title: "Use with attribution".into(),
             url: None,
+            media_type: None,
         };
         let html = collection(base, "maps", &doc, Some(&license));
         let crumbs = html

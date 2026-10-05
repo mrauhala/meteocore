@@ -455,6 +455,13 @@ pub struct LicenseConfig {
     /// [`resolved_url`]: Self::resolved_url
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub url: Option<String>,
+    /// Media type of the document at `url` (`type` in TOML): the license
+    /// link's `type`, which every OGC API link carries (EDR 1.2
+    /// `/req/core/rc-collection-info-links` B). Absent, it is `text/html`,
+    /// what a license page and the synthesized `spdx.org` URL serve. Only
+    /// valid together with `url`.
+    #[serde(default, rename = "type", deserialize_with = "de_trimmed_opt_string")]
+    pub media_type: Option<String>,
 }
 
 impl LicenseConfig {
@@ -494,6 +501,12 @@ impl LicenseConfig {
         self.resolved_url().map(|url| (self.title.clone(), url))
     }
 
+    /// The media type of the [`card_link`](Self::card_link) target: the
+    /// configured `type`, else `text/html`.
+    pub fn link_type(&self) -> &str {
+        self.media_type.as_deref().unwrap_or("text/html")
+    }
+
     /// `(title, href?)` for **display** contexts (HTML cards) that show the
     /// license name even when no URL resolves. Unlike [`card_link`](Self::card_link)
     /// this always yields the title; the href is `None` for a free-text license
@@ -501,6 +514,20 @@ impl LicenseConfig {
     pub fn card_label(&self) -> (String, Option<String>) {
         (self.title.clone(), self.resolved_url())
     }
+}
+
+/// `type/subtype` of RFC 6838 restricted-name characters, optionally followed
+/// by `;` parameters: enough to reject a typo or a bare word.
+fn is_media_type(value: &str) -> bool {
+    let token = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    let essence = value.split(';').next().unwrap_or_default().trim();
+    essence
+        .split_once('/')
+        .is_some_and(|(kind, subtype)| token(kind) && token(subtype))
 }
 
 /// Preview-SPA tuning knobs. Only affects what `/preview/manifest.json`
@@ -3591,6 +3618,20 @@ impl ServerConfig {
                         )));
                     }
                 }
+                // `type` describes `url`; the synthesized SPDX page is HTML.
+                if let Some(media_type) = &license.media_type {
+                    if license.url.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [collections.license] 'type' needs a 'url' to describe"
+                        )));
+                    }
+                    if !is_media_type(media_type) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [collections.license] 'type' must be a media type \
+                             such as \"text/html\" or \"application/pdf\""
+                        )));
+                    }
+                }
             }
 
             // Only the engines that report u/v components derive wind: the
@@ -4195,6 +4236,24 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             lic.resolved_url().as_deref(),
             Some("https://creativecommons.org/licenses/by/4.0/")
         );
+        // No `type`: the link says text/html.
+        assert_eq!(lic.media_type, None);
+        assert_eq!(lic.link_type(), "text/html");
+    }
+
+    /// `type` names what the license `url` serves (TOML `type`, trimmed);
+    /// without it the link type is `text/html`, which the synthesized SPDX
+    /// page always is.
+    #[test]
+    fn license_type_parses_and_defaults_to_html() {
+        let lic: LicenseConfig = toml::from_str(
+            "title = \"X\"\nurl = \"https://example.com/lic.pdf\"\ntype = \" application/pdf \"",
+        )
+        .unwrap();
+        assert_eq!(lic.media_type.as_deref(), Some("application/pdf"));
+        assert_eq!(lic.link_type(), "application/pdf");
+        let spdx: LicenseConfig = toml::from_str("title = \"CC-BY-4.0\"").unwrap();
+        assert_eq!(spdx.link_type(), "text/html");
     }
 
     #[test]
@@ -4210,6 +4269,7 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let lic = LicenseConfig {
             title: "Apache-2.0".into(),
             url: None,
+            media_type: None,
         };
         assert_eq!(
             lic.resolved_url().as_deref(),
@@ -4246,6 +4306,7 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let lic = LicenseConfig {
             title: "All rights reserved".into(),
             url: None,
+            media_type: None,
         };
         assert_eq!(lic.resolved_url(), None);
         assert_eq!(lic.card_link(), None);
@@ -4832,6 +4893,26 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn validate_rejects_non_http_license_url() {
         let cfg = collection_with("[collections.license]\ntitle = \"X\"\nurl = \"ftp://x/y\"\n");
         assert!(cfg.validate().is_err());
+    }
+
+    /// A license `type` must look like a media type and needs the `url` it
+    /// describes.
+    #[test]
+    fn validate_checks_license_type() {
+        let license = |fields: &str| {
+            collection_with(&format!("[collections.license]\ntitle = \"X\"\n{fields}"))
+                .validate()
+                .map_err(|e| e.to_string())
+        };
+        let url = "url = \"https://example.com/lic\"\n";
+        assert!(license(&format!("{url}type = \"text/plain; charset=utf-8\"\n")).is_ok());
+        assert!(license(&format!("{url}type = \"application/pdf\"\n")).is_ok());
+        for bad in ["pdf", "text/", "/html", "text/ html", ""] {
+            let err = license(&format!("{url}type = \"{bad}\"\n")).unwrap_err();
+            assert!(err.contains("'type' must be a media type"), "{bad}: {err}");
+        }
+        let err = license("type = \"text/html\"\n").unwrap_err();
+        assert!(err.contains("'type' needs a 'url'"), "{err}");
     }
 
     /// `derive_wind` (#897): on by default for the engines that report u/v

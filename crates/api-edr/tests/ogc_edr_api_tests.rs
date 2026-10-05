@@ -694,8 +694,8 @@ mod collections {
     /// (#273) as far as the engine's metadata goes: a `label` of at most 50
     /// characters, a `description` that is not just the label, a QUDT
     /// `unit.symbol` for units QUDT has, and the CF standard name URI as
-    /// `observedProperty.id` when the engine knows one. Still EDR 1.1- and
-    /// 1.2-valid.
+    /// `observedProperty.id` when the engine knows one, else the engine's
+    /// observed-property name. Still EDR 1.1- and 1.2-valid.
     #[tokio::test]
     async fn parameter_names_follow_metocean_profile() {
         struct DescribedEngine(MockEngine);
@@ -798,13 +798,15 @@ mod collections {
             assert!(t2m["observedProperty"].get("description").is_none());
 
             // No QUDT unit for radar reflectivity: the UCUM form stays. No CF
-            // name: the property is described instead of identified.
+            // name: the engine's observed-property name identifies the
+            // property (EDR 1.2 `/req/edr/rc-parameters` F requires an id), as
+            // in CoverageJSON, and the description says what it is.
             let dbzh = &names["DBZH"];
             assert_eq!(
                 dbzh["unit"]["symbol"],
                 serde_json::json!({"value": "dBZ", "type": "http://www.opengis.net/def/uom/UCUM/"})
             );
-            assert!(dbzh["observedProperty"].get("id").is_none());
+            assert_eq!(dbzh["observedProperty"]["id"], "DBZH");
             assert_eq!(
                 dbzh["observedProperty"]["description"],
                 "DBZH — Reflectivity (horizontal), in dBZ"
@@ -833,7 +835,13 @@ mod collections {
                 names["RHOHV"]["description"],
                 "Correlation coefficient (unit not specified)"
             );
-            assert!(names["t_err"]["observedProperty"].get("id").is_none());
+            assert_eq!(names["t_err"]["observedProperty"]["id"], "t_err");
+            // Every parameter's observedProperty has a string `id` and `label`.
+            for (name, param) in names {
+                let observed = &param["observedProperty"];
+                assert!(observed["id"].is_string(), "{uri} {name}: {observed}");
+                assert!(observed["label"].is_object(), "{uri} {name}: {observed}");
+            }
 
             edr_schema::assert_valid(path, JSON, &json, uri);
         }
@@ -863,6 +871,56 @@ mod collections {
             assert!(link.get("href").is_some());
             assert!(link.get("rel").is_some());
         }
+    }
+
+    /// EDR 1.2 `/req/core/rc-collection-info-links` and
+    /// `/req/core/rc-md-query-links`: every link of a collection carries
+    /// `rel` and `type`, and its `links` name each query end point as
+    /// `rel=data`, with the href and type of its `data_queries` link. The
+    /// radius link brings a collection-level `within_units`
+    /// (`/req/edr/rc-collection-info` J).
+    #[tokio::test]
+    async fn collection_links_name_every_query_end_point() {
+        let (_, list) = get("/collections").await;
+        let (_, detail) = get("/collections/weather").await;
+        for (what, doc) in [("listing", &list["collections"][0]), ("detail", &detail)] {
+            let links = doc["links"].as_array().unwrap();
+            for link in links {
+                assert!(link["rel"].is_string(), "{what}: {link}");
+                assert!(link["type"].is_string(), "{what}: {link}");
+            }
+            let data: Vec<&Value> = links.iter().filter(|l| l["rel"] == "data").collect();
+            let queries = doc["data_queries"].as_object().unwrap();
+            assert_eq!(data.len(), queries.len(), "{what}: {data:?}");
+            for (query_type, query) in queries {
+                let link = &query["link"];
+                let data_link = data
+                    .iter()
+                    .find(|l| l["href"] == link["href"])
+                    .unwrap_or_else(|| panic!("{what}: no data link to {query_type}"));
+                assert_eq!(data_link["type"], link["type"], "{what} {query_type}");
+                assert_eq!(
+                    data_link["title"], link["variables"]["title"],
+                    "{what} {query_type}"
+                );
+            }
+            let media_type = |query_type: &str| &doc["data_queries"][query_type]["link"]["type"];
+            assert_eq!(media_type("locations"), "application/geo+json", "{what}");
+            for query_type in ["position", "area", "radius"] {
+                assert_eq!(
+                    media_type(query_type),
+                    "application/vnd.cov+json",
+                    "{what} {query_type}"
+                );
+            }
+            assert_eq!(
+                doc["within_units"],
+                serde_json::json!(["km", "m", "mi"]),
+                "{what}"
+            );
+        }
+        edr_schema::assert_valid("/collections", JSON, &list, "listing");
+        edr_schema::assert_valid("/collections/{collectionId}", JSON, &detail, "detail");
     }
 
     #[tokio::test]
@@ -2198,6 +2256,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "CC-BY-4.0".into(),
             url: None,
+            media_type: None,
         };
         let json = collection_json(vec!["radar".into(), "weather".into()], Some(lic)).await;
         assert_eq!(json["keywords"], serde_json::json!(["radar", "weather"]));
@@ -2209,6 +2268,8 @@ mod metadata_extras {
             .expect("a rel=license link");
         assert_eq!(link["href"], "https://spdx.org/licenses/CC-BY-4.0.html");
         assert_eq!(link["title"], "CC-BY-4.0");
+        // Every link has a `type` (EDR 1.2 `/req/core/rc-collection-info-links` B).
+        assert_eq!(link["type"], "text/html");
     }
 
     #[tokio::test]

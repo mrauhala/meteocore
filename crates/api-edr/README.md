@@ -39,6 +39,8 @@ preserve filters and the negotiated format. Advertised spatial extents are norma
 domain (grid cell edges past ±180°/±90° are clamped; an extent describing no area
 is omitted), matching the other APIs and collection search. Collection descriptions expose HTML
 alternate links and configured keywords/license metadata through the shared helper.
+The license link carries a `type` (#964): `text/html`, or the
+`[collections.license] type` of a configured `url`.
 
 Text discovery supports whitespace-normalized whole-word phrases in `q`, and
 `query` adds required (`+`) and excluded (`-`) terms within comma-separated OR
@@ -188,6 +190,25 @@ documents, the `/collections` list and instance documents; the
 `instancesLink` asks for. `parameter_names` entries carry no `dataType`:
 engines do not report a value type, every CoverageJSON range is encoded as
 `float`.
+
+Collection `links` (#964). Every `data_queries` link carries the `type` its
+end point answers by default: `application/vnd.cov+json` for the data
+queries, `application/geo+json` for the `/locations` list and `items`,
+`application/json` for the instances list. The collection's own `links`
+repeat each one as `rel=data` with the same href and type, titled like its
+variables (`Position query`, …; the instances list `Instances (forecast
+model runs)`), as EDR 1.2 `/req/core/rc-collection-info-links` A and
+`/req/core/rc-md-query-links` A require: at least one link to a query end
+point or instance in `links` itself. Built from `data_queries`, so the two
+cannot disagree; instance documents link their run's end points. Every link
+has `rel` and `type` (B of both): `self` and `alternate` always did, the
+license link now does too, see [Conformance classes](#conformance-classes).
+With a radius link in `links`, the collection also carries a top-level
+`within_units` (`["km", "m", "mi"]`, the radius variables' list), which
+`/req/edr/rc-collection-info` J then requires. The HTML collection and
+instance pages leave the `rel=data` links out of their link lists: they
+already list the queries from `data_queries`, with the API reference for
+their inputs.
 
 ### Instance-scoped routes
 
@@ -344,7 +365,7 @@ EUMETNET/OGC API - EDR Metocean Profile `/req/core/collection_parameter_names`
 | C | `label` ≤ 50 characters | ✓ | a longer engine label is cut to 49 characters + `…`; the whole text stays in `description` and `observedProperty.label` |
 | D | `label` in English | partial | the built-in tables (ODIM quantities, GRIB WMO Code Table 4.2, BUFR SYNOP) are English; config- or source-given labels (CSV column names, GeoTIFF/PostGIS/Satellite config, Zarr `long_name`) are served as given, tagged `en` |
 | E | `unit.symbol.type` = `https://qudt.org/vocab/unit/<unit>`, `value` = `qudt:symbol` | partial | every unit `ds_core::units::qudt_unit` knows — `K`, `°C`, `Pa`, `hPa`, `m/s`, `km/h`, `m`, `km`, `cm`, `mm`, `mm/h`, `%`, `dB`, `°`, `kg/m²`, `kg/(m²·s)`, `kg/m³`, `kg/kg`, `J/kg`, `J/m²`, `W/m²`, `m²/s²`, `m³/m³`, `Pa/s`, `/s`, `s`, `min`, `h`, `DU`, `kA`, in their UCUM, CF/udunits and WMO spellings. Units with no faithful QUDT entry keep the engine's string typed as UCUM: `dBZ` (QUDT's `DeciB_Z` is acoustic Z-weighting, not reflectivity), `gpm`, `deg/km`, CF `1`, BUFR code tables. `unit.label` stays the engine's unit string |
-| F | `observedProperty.id` = `https://vocab.nerc.ac.uk/standard_name/<name>` when CF, else `observedProperty.description` | partial | the CF URI when the engine knows the standard name (`ParameterDescription.standard_name`, only set from a CF `standard_name` attribute; a value with a CF modifier is not published). Otherwise `observedProperty.description` carries the description, and CoverageJSON keeps the engine's parameter name as `observedProperty.id` |
+| F | `observedProperty.id` = `https://vocab.nerc.ac.uk/standard_name/<name>` when CF, else `observedProperty.description` | partial | the CF URI when the engine knows the standard name (`ParameterDescription.standard_name`, only set from a CF `standard_name` attribute; a value with a CF modifier is not published). Otherwise `observedProperty.description` carries the description, and `observedProperty.id` is the engine's observed-property name (`DBZH`, `air_temperature`), in `parameter_names` as in CoverageJSON: EDR 1.2 `/req/edr/rc-parameters` F requires an `id` on every observed property (#964) |
 
 CoverageJSON parameters carry no parameter-level `label`: CoverageJSON asks
 to leave it out when it equals `observedProperty.label`, which holds it.
