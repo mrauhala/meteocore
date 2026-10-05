@@ -317,9 +317,14 @@ pub fn collection_metadata(
             json!({"href": format!("{href}?f=html"), "rel": "alternate", "type": "text/html", "title": "This collection as HTML"}),
         );
     }
-    if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
-        // Operator-supplied URLs need not serve HTML; do not invent their type.
-        links.push(json!({"href": url, "rel": "license", "title": title}));
+    if let Some(license) = &config.license {
+        // Every link carries a `type` (EDR 1.2 `/req/core/rc-collection-info-
+        // links` B): `text/html` unless the operator says what the URL serves.
+        if let Some((title, url)) = license.card_link() {
+            links.push(
+                json!({"href": url, "rel": "license", "type": license.link_type(), "title": title}),
+            );
+        }
     }
     let mut metadata = json!({
         "id": config.id, "title": config.title, "description": config.description,
@@ -594,6 +599,46 @@ mod tests {
             layer_subtitle: None,
             reference_times: vec![],
         }
+    }
+
+    /// Every link of a collection document carries `rel` and `type` (EDR 1.2
+    /// `/req/core/rc-collection-info-links` B), the license link included:
+    /// `text/html` unless the license configures the `type` of its `url`.
+    #[test]
+    fn license_link_carries_a_type() {
+        let links = |license: Value| {
+            let config: CollectionConfig = serde_json::from_value(
+                json!({"id": "c", "title": "C", "description": "", "license": license}),
+            )
+            .unwrap();
+            let self_link =
+                json!({"href": "https://x/c", "rel": "self", "type": "application/json"});
+            collection_metadata(&config, json!({}), vec![self_link])["links"].clone()
+        };
+        let license = |links: &Value| {
+            let links = links.as_array().unwrap();
+            for link in links {
+                assert!(
+                    link["rel"].is_string() && link["type"].is_string(),
+                    "{link}"
+                );
+            }
+            links
+                .iter()
+                .find(|l| l["rel"] == "license")
+                .unwrap()
+                .clone()
+        };
+        let spdx = license(&links(json!({"title": "CC-BY-4.0"})));
+        assert_eq!(spdx["href"], "https://spdx.org/licenses/CC-BY-4.0.html");
+        assert_eq!(spdx["type"], "text/html");
+        let page = license(&links(json!({"title": "Terms", "url": "https://x/terms"})));
+        assert_eq!(page["type"], "text/html");
+        let pdf = license(&links(
+            json!({"title": "Terms", "url": "https://x/terms.pdf", "type": "application/pdf"}),
+        ));
+        assert_eq!(pdf["href"], "https://x/terms.pdf");
+        assert_eq!(pdf["type"], "application/pdf");
     }
 
     #[test]
