@@ -1724,11 +1724,27 @@ pub async fn conformance(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-    // EDR 1.1 puts every data query under `queries`; each collection's
+    // EDR puts every data query under `queries`; each collection's
     // data_queries identifies supported types. Feature content is GeoJSON:
     // the /locations list, and the point queries of station collections,
-    // whose `output_formats` list GeoJSON (#929).
+    // whose `output_formats` list GeoJSON (#929). The EDR 1.2 classes come
+    // first and the 1.1 ones stay for clients that know only 1.1 (#930).
+    // 1.2's `/req/core/conformance` A names the two Common classes with
+    // `https://`; Common and the other APIs that share its list publish
+    // `http://`, so only EDR adds those forms.
     let classes = api_common::conformance_classes(&[
+        "https://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+        "https://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/core",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/collections",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/queries",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/instances",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/json",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/geojson",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/edr-geojson",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/covjson",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/html",
+        "https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/oas30",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/queries",

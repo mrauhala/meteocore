@@ -285,6 +285,9 @@ All four APIs currently return the same Common declarations:
 | Part 4 sorting, filtering, hierarchy | Not declared | Not declared | Not declared | Not declared |
 
 The emitted URIs use `http://www.opengis.net/spec/ogcapi-common-{part}/1.0/conf/…`.
+EDR also lists the `https://` forms of Part 1 `core` and Part 2 `collections`,
+the identifiers EDR 1.2's `/req/core/conformance` A requires (#979); the
+shared list, and with it every other API, keeps `http://`.
 Current draft documents use HTTPS in some identifiers; exact URI expectations
 should be recorded when running their conformance tests. JSON/HTML support and
 declarations in other API specifications do not substitute automatically for

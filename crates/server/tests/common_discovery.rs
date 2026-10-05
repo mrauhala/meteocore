@@ -780,20 +780,35 @@ async fn openapi_and_conformance_are_consistent_across_surfaces() {
         }
         baseline = Some(params.clone());
         let conformance = get_json(&app, &format!("{prefix}/conformance")).await;
-        let common: Vec<_> = conformance["conformsTo"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|s| s.contains("ogcapi-common-"))
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(common.len(), 6);
-        assert!(!common.iter().any(|c| c.contains("common-4")));
+        let common = |scheme: &str| -> Vec<String> {
+            let prefix = format!("{scheme}://www.opengis.net/spec/ogcapi-common-");
+            conformance["conformsTo"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| s.starts_with(&prefix))
+                .map(str::to_owned)
+                .collect()
+        };
+        let shared = common("http");
+        assert_eq!(shared.len(), 6);
+        assert!(!shared.iter().any(|c| c.contains("common-4")));
         if let Some(ref baseline) = classes_baseline {
-            assert_eq!(&common, baseline);
+            assert_eq!(&shared, baseline);
         }
-        classes_baseline = Some(common);
+        classes_baseline = Some(shared);
+        // EDR 1.2's `/req/core/conformance` A names two of them with
+        // `https://`, so EDR alone adds those forms (#979).
+        let https: &[&str] = if *surface == "edr" {
+            &[
+                "https://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+                "https://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+            ]
+        } else {
+            &[]
+        };
+        assert_eq!(common("https"), https, "{surface}");
         let doc = get_json(&app, &format!("{prefix}/collections?limit=9999")).await;
         assert!(link(&doc, "self").contains("limit=1000"));
         assert_eq!(doc["numberReturned"], 6);

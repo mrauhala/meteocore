@@ -22,8 +22,8 @@ use std::sync::LazyLock;
 use jsonschema::{Draft, Validator};
 use serde_json::{json, Value};
 
-/// The EDR versions whose bundles are vendored. MeteoCore declares 1.1 and
-/// validates against both.
+/// The EDR versions whose bundles are vendored. MeteoCore declares both
+/// and validates against both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edr {
     V1_1,

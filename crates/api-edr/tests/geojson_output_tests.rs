@@ -1013,7 +1013,12 @@ async fn conformance_declares_the_geojson_classes() {
     let (_, _, json) = get_json("/conformance", None).await;
     let classes = json["conformsTo"].as_array().unwrap();
     for class in ["geojson", "edr-geojson"] {
-        let uri = format!("http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/{class}");
-        assert!(classes.iter().any(|c| c == &json!(uri)), "{uri}");
+        for version in [
+            "http://www.opengis.net/spec/ogcapi-edr-1/1.1",
+            "https://www.opengis.net/spec/ogcapi-edr-1/1.2",
+        ] {
+            let uri = format!("{version}/conf/{class}");
+            assert!(classes.iter().any(|c| c == &json!(uri)), "{uri}");
+        }
     }
 }
