@@ -152,7 +152,8 @@ like the other data queries: each instant's `[t, z, y, x]` grid shares x, y
 and z, so the merge joins them along `t`. `data_queries.cube.link.variables.height_units` (required by EDR 1.2)
 is the vertical axis unit. The OpenAPI parameters are the EDR 1.2
 `cube-bbox`, `cube-z`, `resolution-x/-y/-z` and `crs` components, copied
-verbatim (only `crs`'s example is CRS84 instead of `native`).
+verbatim (`crs` adds its requirement's `style`/`explode`, says it accepts
+CRS84 only and gives CRS84 as its example instead of `native`).
 `ds_core::cube` holds the shared pieces engines use: `axis_positions`
 (both ends included), `nearest_indices` (half-cell tolerance, a position off
 the grid is missing) and `check_cube_budget` (`MAX_AREA_VALUES` across
@@ -182,6 +183,18 @@ and never under an instance.
   `openapi_parameters`.
 - No `itemType` or `rel=items` link on the collection: the workbench and
   Features clients read those as a Features resource with an HTML view.
+- The body is EDR GeoJSON (`/req/edr-geojson/content` A, #970): `EdrMembers`
+  adds `datetime`, `parameter-name`, `label` and `edrqueryendpoint` to every
+  feature's properties, after the Features encoding and only here, never in
+  the Features API's `/items`. A station item is one of the collection's
+  locations and gets what its `/locations` feature says, from the same
+  sources (`get_locations`, `get_parameters`, `get_temporal_extent`), so the
+  two cannot disagree; `crates/server/tests/edr_geojson.rs` pins that on CSV
+  and BUFR and follows the endpoint. Location ids in links go through
+  `geojson::encode_path_segment`, on `/locations` too. An item that is no
+  location (a nowcast cell) names the radius query its engine sizes in
+  `EdrEngine::item_radius`, else a position query, else the collection;
+  the nowcast case is followed end to end in the same test file.
 
 ## Misc
 
@@ -207,6 +220,16 @@ and never under an instance.
   ids it contributes nothing instead; see "Location lists" below.
 - When adding endpoints or params, update `api_definition()` in
   `src/handlers.rs` (OpenAPI).
+- **`/api` lists every status a route answers (#965,
+  `/req/oas/completeness`).** Build an operation's `responses` with
+  `responses(ok, METADATA_ERRORS | QUERY_ERRORS)`;
+  `document_router_responses` adds 304 (`conditional_get`) and 500 to every
+  operation. A status a route newly answers joins `SHARED_RESPONSES` and the
+  operation's list: `tests/openapi_tests.rs` sends requests and fails on an
+  answered status the operation does not document. Every data query reads
+  and declares `crs` (`request_crs`, CRS84 only, #84) and `f`, whose `enum`
+  only `data_format_parameter` builds. `/api` is sent as
+  `application/vnd.oai.openapi+json;version=3.0`.
 - **Per-parameter time axes (#819).** When
   `EdrEngine::get_parameter_available_times(name)` is `Some`, that
   parameter's `parameter_names` entry carries its own `extent.temporal`

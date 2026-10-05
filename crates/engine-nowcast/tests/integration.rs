@@ -3369,3 +3369,56 @@ fn reload_rejects_geometry_and_product_changes_even_with_the_same_source_arc() {
     *source.info.write().unwrap() = original;
     assert!(engine.prepare_dependency_update(&candidate()).is_none());
 }
+
+/// A tracked cell as an EDR item (#970): its radius query is the cell's
+/// area as a disc at the frame it was observed in, and the query answers
+/// motion vectors. A circle far narrower than a motion block answers too
+/// (the #671 mask fallback), which is why the radius has no floor.
+#[test]
+fn a_cell_item_names_a_radius_query_that_answers() {
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::feature::{FeatureQuery, Geometry, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use ds_core::model::CoverageResponse;
+
+    let anchor = t0() + Duration::minutes(5);
+    let (_source, engine) = build("PT30M", &[t0(), anchor]);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let cell = &page.features[0];
+    let Some(&PropertyValue::Float(area)) = cell.properties.get("area_km2") else {
+        panic!("a cell has an area");
+    };
+    let Some(PropertyValue::String(observed)) = cell.properties.get("observed") else {
+        panic!("a cell has an observation time");
+    };
+    let radius = engine.item_radius(cell).expect("a cell has a radius query");
+    let disc = (area / std::f64::consts::PI).sqrt();
+    assert!(
+        (radius.within_km - disc).abs() < 1e-9,
+        "{radius:?} vs {disc}"
+    );
+    assert_eq!(radius.datetime, Some(observed.parse().unwrap()));
+
+    let Geometry::Point { x, y } = *cell.geometry else {
+        panic!("a cell is a point");
+    };
+    // The cell's circle and a 10 m one, far inside one motion block.
+    for within_m in [radius.within_km * 1000.0, 10.0] {
+        let CoverageResponse::Single(cov) = engine
+            .query_radius(&format!("POINT({x} {y})"), within_m, None, None, None, None)
+            .expect("the cell's radius query answers")
+        else {
+            panic!("expected a single coverage");
+        };
+        assert!(
+            cov.ranges["motion_u"].values.iter().any(Option::is_some),
+            "{within_m} m"
+        );
+    }
+
+    // Not a cell: no area, no radius query.
+    let mut plain = cell.clone();
+    plain.properties = Arc::new(Default::default());
+    assert!(engine.item_radius(&plain).is_none());
+}

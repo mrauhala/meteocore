@@ -215,6 +215,15 @@ coasting, joins, or raw-byte forecast encoding. See
 - The whole-domain document is ~3k vectors (~30 KB before gzip) — no
   tiling; a client uploads it as one texture and bilinear-samples it, which
   reproduces the engine's own `MotionField::sample` field.
+- **Cells as EDR items (#970).** EDR `items` serves the tracked cells
+  (the `FeatureEngine`), and EDR GeoJSON requires each to name a query.
+  `item_radius` answers it from the served feature's own properties: a
+  radius query centred on the cell, `within` = `area_km2` as a disc,
+  `datetime` = `observed`. No floor: a circle narrower than a block still
+  gets the nearest block through the #671 mask fallback. Renaming
+  `area_km2` or `observed` silently drops a cell back to the collection
+  URL; `tests/integration.rs` `a_cell_item_names_a_radius_query_that_answers`
+  pins it.
 
 ## Lightning metrics (#616)
 
