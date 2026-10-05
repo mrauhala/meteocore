@@ -384,24 +384,39 @@ fn edr_position_is_a_time_series_on_the_union_axis() {
         .all(Option::is_none));
     assert_eq!(result.parameters["ir_10_3"].unit, "K");
 
-    // An instant snaps to its scan, per product.
-    let instant = at("2026-09-25T19:05:00Z");
+    // An instant is the scan at exactly that time, per product
+    // (`/req/core/datetime-response` A), not the scan a map at that time
+    // renders: cloud top temperature has none at 19:10 and reads null.
+    let instant = at("2026-09-25T19:10:00Z");
     let result = single(
         engine
-            .query_position(
-                &point,
-                Some((instant, instant)),
-                Some(&["ir_10_3".to_string()]),
-                None,
-                None,
-            )
+            .query_position(&point, Some((instant, instant)), None, None, None)
             .unwrap(),
     );
     let DomainDescription::PointSeries { t, .. } = &result.domain else {
         panic!("expected a point series");
     };
-    assert_eq!(t, &[at("2026-09-25T19:00:00Z")]);
-    assert_eq!(result.ranges.len(), 1);
+    assert_eq!(t, &[instant]);
+    assert_eq!(result.ranges["ir_10_3"].shape, [1]);
+    assert!(result.ranges["ir_10_3"].values[0].is_some());
+    assert_eq!(result.ranges["cloud_top_temperature"].values, [None]);
+    // Between scans there is no data: a 404, where the scan at or before
+    // used to answer. Renders still snap to it.
+    let between = at("2026-09-25T19:05:00Z");
+    assert!(matches!(
+        engine.query_position(
+            &point,
+            Some((between, between)),
+            Some(&["ir_10_3".to_string()]),
+            None,
+            None,
+        ),
+        Err(ds_core::error::DataServerError::LocationNotFound(_))
+    ));
+    assert_eq!(
+        engine.resolve_parameter_time(Some("ir_10_3"), Some(between), None),
+        Some(at("2026-09-25T19:00:00Z"))
+    );
 
     // Behind the Earth, and an unknown parameter.
     assert!(matches!(
