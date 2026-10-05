@@ -605,6 +605,39 @@ async fn links_are_anchors() {
     }
 }
 
+/// The collection and instance pages anchor every `data_queries` end point
+/// (`/req/html/content`), though their link lists leave `rel=data` out
+/// (#980): the page lists those end points from `data_queries`.
+#[tokio::test]
+async fn collection_pages_anchor_their_data_queries() {
+    let base = "https://example.org/edr/collections/c";
+    for (uri, queries) in [
+        (
+            "/collections/c?f=html",
+            &["position", "area", "radius", "trajectory", "cube"][..],
+        ),
+        (
+            &*format!("/collections/c/instances/{INSTANCE}?f=html"),
+            &["position", "area", "radius", "cube"][..],
+        ),
+    ] {
+        let (status, _, body) = get(uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        for q in queries {
+            let href = if uri.contains("/instances/") {
+                format!("{base}/instances/{INSTANCE}/{q}")
+            } else {
+                format!("{base}/{q}")
+            };
+            assert!(body.contains(&format!("href=\"{href}\"")), "{uri}: {href}");
+        }
+    }
+    let (_, _, body) = get("/collections/c?f=html", None).await;
+    for q in ["locations", "items", "instances"] {
+        assert!(body.contains(&format!("href=\"{base}/{q}?f=html\"")), "{q}");
+    }
+}
+
 /// An items page's `timeStamp` changes per request; its ETag does not.
 #[tokio::test]
 async fn items_html_etag_ignores_the_generation_time() {

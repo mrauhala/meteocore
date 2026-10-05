@@ -1741,6 +1741,7 @@ fn capabilities_emit_keywords_and_attribution() {
     config.license = Some(ds_core::config::LicenseConfig {
         title: "CC-BY 4.0".into(),
         url: Some("https://example/lic".into()),
+        media_type: None,
     });
     collections.insert("radar-fivih".to_string(), config);
 
@@ -1809,6 +1810,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             license: Some(ds_core::config::LicenseConfig {
                 title: "CC-BY 4.0".into(),
                 url: Some("https://example/lic".into()),
+                media_type: None,
             }),
             geotiff: None,
             querydata: None,

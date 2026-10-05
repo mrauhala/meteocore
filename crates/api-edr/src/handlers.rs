@@ -1882,7 +1882,13 @@ pub async fn collection(
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = build_collection_metadata(engine.as_ref(), config, base, None, items);
+            let metadata = html_document(build_collection_metadata(
+                engine.as_ref(),
+                config,
+                base,
+                None,
+                items,
+            ));
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -2072,8 +2078,13 @@ pub async fn instance(
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata =
-                build_collection_metadata(engine.as_ref(), config, base, Some(&run), false);
+            let metadata = html_document(build_collection_metadata(
+                engine.as_ref(),
+                config,
+                base,
+                Some(&run),
+                false,
+            ));
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -3621,6 +3632,11 @@ fn build_collection_metadata(
             }),
         );
     }
+    // Every query link names the media type its end point answers
+    // (`/req/core/rc-md-query-links` B).
+    for (query_type, query) in data_queries.iter_mut() {
+        query["link"]["type"] = json!(query_media_type(query_type));
+    }
 
     let self_title = match instance {
         Some(_) => format!("{} — run {self_id}", config.title),
@@ -3641,29 +3657,73 @@ fn build_collection_metadata(
             "title": config.title
         }));
     }
+    // EDR 1.2 `/req/core/rc-collection-info-links` A and
+    // `/req/core/rc-md-query-links` A: the collection's own `links` name its
+    // query end points, and a forecast collection's instances, not only
+    // `data_queries`. Copied from it, so the two cannot disagree.
+    links.extend(
+        data_queries
+            .iter()
+            .map(|(query_type, query)| data_link(query_type, &query["link"])),
+    );
+    // `/req/edr/rc-collection-info` J: with a radius link in `links`, the
+    // collection lists the `within-units` it accepts.
+    let radius = data_queries.contains_key("radius");
 
-    api_common::collection_metadata(
-        config,
-        json!({
-            "id": self_id,
-            "title": self_title,
-            // No `itemType` and no `rel=items` link: EDR's `items` is a data
-            // query (#928), advertised in `data_queries` like the others and
-            // GeoJSON only, while Common Part 2 `itemType` and the workbench's
-            // `items` link mean a Features-style resource with an HTML view.
-            // EDR collections are also not all coverage data (CSV/PostGIS serve
-            // discrete observations), so no single itemType applies. Omitted
-            // rather than mislabelled (review on #298).
-            "extent": extent,
-            "data_queries": data_queries,
-            "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
-            "parameter_names": parameter_names,
-            "output_formats": if station_series {
-                json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
-            } else {
-                json!(["CoverageJSON", "PNG", "HTML"])
-            }
-        }),
-        links,
-    )
+    let mut fields = json!({
+        "id": self_id,
+        "title": self_title,
+        // No `itemType` and no `rel=items` link: EDR's `items` is a data
+        // query (#928), advertised in `data_queries` like the others and
+        // GeoJSON only, while Common Part 2 `itemType` and the workbench's
+        // `items` link mean a Features-style resource with an HTML view.
+        // EDR collections are also not all coverage data (CSV/PostGIS serve
+        // discrete observations), so no single itemType applies. Omitted
+        // rather than mislabelled (review on #298).
+        "extent": extent,
+        "data_queries": data_queries,
+        "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
+        "parameter_names": parameter_names,
+        "output_formats": if station_series {
+            json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
+        } else {
+            json!(["CoverageJSON", "PNG", "HTML"])
+        }
+    });
+    if radius {
+        fields["within_units"] = json!(WITHIN_UNITS);
+    }
+    api_common::collection_metadata(config, fields, links)
+}
+
+/// The media type the end point of a `data_queries` entry answers by
+/// default: the `/locations` list and `items` are GeoJSON, the instances
+/// list JSON, every other data query CoverageJSON.
+fn query_media_type(query_type: &str) -> &'static str {
+    match query_type {
+        "locations" | "items" => EdrFormat::GeoJson.media_type(),
+        "instances" => "application/json",
+        _ => EdrFormat::CoverageJson.media_type(),
+    }
+}
+
+/// The collection's `rel=data` link to one `data_queries` end point: the
+/// same href and type, titled like its variables.
+fn data_link(query_type: &str, link: &serde_json::Value) -> serde_json::Value {
+    let title = match query_type {
+        "instances" => "Instances (forecast model runs)",
+        _ => link["variables"]["title"].as_str().unwrap_or(query_type),
+    };
+    json!({"href": link["href"], "rel": "data", "type": link["type"], "title": title})
+}
+
+/// The collection or instance document the HTML page renders, without its
+/// `rel=data` links: the page already lists the same end points from
+/// `data_queries`, each with its documentation, where a link list would open
+/// them bare as `?f=html`.
+fn html_document(mut metadata: serde_json::Value) -> serde_json::Value {
+    if let Some(links) = metadata["links"].as_array_mut() {
+        links.retain(|link| link["rel"] != "data");
+    }
+    metadata
 }
