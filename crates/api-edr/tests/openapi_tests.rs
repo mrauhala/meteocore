@@ -522,6 +522,17 @@ async fn every_operation_lists_its_status_classes_and_parameters() {
             continue;
         }
         queries += 1;
+        // Every data query documents its HTML page (#971) in `f` and in
+        // its 200's content.
+        let ok = resolve(&api, &responses["200"]);
+        assert!(ok["content"]["text/html"].is_object(), "{path}: {ok}");
+        let f = parameter(&api, op, "f").unwrap_or_else(|| panic!("{path} lacks f"));
+        assert!(
+            f["schema"]["enum"]
+                .as_array()
+                .is_some_and(|e| e.iter().any(|v| v == "HTML")),
+            "{path}: {f}"
+        );
         for status in ["400", "404", "503", "504"] {
             assert!(has(status), "{path} lacks {status}: {responses}");
         }

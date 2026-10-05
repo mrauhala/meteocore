@@ -265,7 +265,7 @@ async fn cube_is_a_data_query_with_height_units_on_the_collection_and_its_runs()
     assert_eq!(link["rel"], "data");
     let variables = &link["variables"];
     assert_eq!(variables["query_type"], "cube");
-    assert_eq!(variables["output_formats"], json!(["CoverageJSON"]));
+    assert_eq!(variables["output_formats"], json!(["CoverageJSON", "HTML"]));
     assert_eq!(variables["default_output_format"], "CoverageJSON");
     assert_eq!(variables["height_units"], json!(["hPa"]));
     // EDR 1.2 link variables every query carries (#918).

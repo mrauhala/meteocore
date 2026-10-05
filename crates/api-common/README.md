@@ -195,7 +195,13 @@ retain the existing structured JSON error response.
 
 No engine queries run from the renderer. Metadata comes from the existing JSON
 builders. The workbench does not add HTML representations to map images, tiles,
-EDR data-query responses, or the WMS/3D Tiles viewers.
+or the WMS/3D Tiles viewers. EDR data-query pages (#971) are built by api-edr
+from the query response and wrapped in this shell (`Page`).
+
+Every EDR `data_queries` link is an anchor (`data_query_links`): on the
+collection and instance pages, in catalog rows and under each model run.
+Instances, locations and items link to their HTML view; parameterised queries
+link to their endpoint, next to the API reference button.
 
 The HTML structure and theme styles follow the approved #744 mockup: API workspace
 selector and branded sidebar, grouped collection query controls, removable applied

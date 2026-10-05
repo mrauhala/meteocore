@@ -800,7 +800,7 @@ pub fn collection_html(
                 } else {
                     format!("{root}/api/docs")
                 };
-                body.push_str(&format!("<div class=\"endpoint\"><div><strong>{} query</strong><code>{}</code><p>{}</p></div>{}</div>",escape(name),escape(href),value_html(&query["link"]["variables"]["output_formats"]),anchor(&target,if name=="instances"{"Browse runs →"}else{"API docs ↗"},"btn small")));
+                body.push_str(&format!("<div class=\"endpoint\"><div><a class=\"resource-title\" href=\"{}\"><strong>{} query</strong><code>{}</code></a><p>{}</p></div>{}</div>",escape(safe_href(&data_query_target(name, href))),escape(name),escape(href),value_html(&query["link"]["variables"]["output_formats"]),anchor(&target,if name=="instances"{"Browse runs →"}else{"API docs ↗"},"btn small")));
             }
         }
         body.push_str("</div>");
@@ -889,6 +889,31 @@ pub fn collection_html(
         labels.push((href, title));
         labels
     })
+}
+
+/// Where a `data_queries` link points in HTML (every link an `<a>`, OGC
+/// API - EDR `/req/html/content`): the HTML view of a resource that is
+/// one (instances, locations, items), else the query endpoint itself,
+/// which needs its parameters.
+fn data_query_target(name: &str, href: &str) -> String {
+    if matches!(name, "instances" | "locations" | "items") {
+        with_format(href, "html")
+    } else {
+        href.to_owned()
+    }
+}
+
+/// A document's `data_queries` links as anchors, one per query type.
+pub fn data_query_links(doc: &Value) -> String {
+    doc["data_queries"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, query)| {
+            let href = query["link"]["href"].as_str()?;
+            Some(anchor(&data_query_target(name, href), name, "chip"))
+        })
+        .collect()
 }
 
 /// A labelled native input; optional enhanced fields acquire names only while
@@ -1179,6 +1204,13 @@ fn collection_facts(doc: &Value) -> String {
     if let Some(n) = doc.get("numberItems") {
         fact("Items", value_html(n));
     }
+    let queries = data_query_links(doc);
+    if !queries.is_empty() {
+        fact(
+            "Data queries",
+            format!("<span class=\"chip-row\">{queries}</span>"),
+        );
+    }
     facts.push_str("</dl>");
     facts
 }
@@ -1396,10 +1428,13 @@ pub fn pagination(nav: &[LinkView]) -> String {
 }
 
 /// Model-run navigation uses the same shell without claiming collection search.
+/// `queries` holds each card's instance document, whose `data_queries`
+/// links are listed under it.
 pub fn instances_html(
     surface: Surface<'_>,
     title: &str,
     cards: &[ds_core::html::CollectionCard],
+    queries: &[Value],
     nav: &[LinkView],
 ) -> String {
     let url = nav
@@ -1416,12 +1451,13 @@ pub fn instances_html(
         ));
     }
     body.push_str("<div class=\"collection-list\">");
-    for card in cards {
+    for (i, card) in cards.iter().enumerate() {
         body.push_str(&format!(
-            "<article class=\"collection-row\"><div class=\"collection-main\"><h2>{}</h2><code>{}</code><p>{}</p></div></article>",
+            "<article class=\"collection-row\"><div class=\"collection-main\"><h2>{}</h2><code>{}</code><p>{}</p><div class=\"chip-row\">{}</div></div></article>",
             anchor(&with_format(&card.self_href, "html"), &card.title, ""),
             escape(&card.id),
-            escape(&card.description)
+            escape(&card.description),
+            queries.get(i).map(data_query_links).unwrap_or_default()
         ));
     }
     if cards.is_empty() {
@@ -1858,6 +1894,36 @@ mod tests {
         assert!(html.contains("data-mode=\"tiles\""));
         // (The inlined map script names the input too; check the switch itself.)
         assert!(!html.contains("<fieldset class=\"map-mode\">"));
+    }
+
+    #[test]
+    /// OGC API - EDR `/req/html/content` A: every `data_queries` link is an
+    /// `<a>` on the collection (and instance) page and in the catalog row;
+    /// a resource with an HTML view links to it.
+    fn data_query_links_are_anchors() {
+        let edr = Surface {
+            base: "https://x",
+            root: "https://x/edr",
+            api: "edr",
+        };
+        let link = |href: &str| json!({"link": {"href": href, "rel": "data"}});
+        let doc = json!({"id": "c", "links": [{"rel": "self", "href": "https://x/edr/collections/c"}],
+            "data_queries": {
+                "position": link("https://x/edr/collections/c/position"),
+                "locations": link("https://x/edr/collections/c/locations"),
+                "instances": link("https://x/edr/collections/c/instances"),
+                "evil": link("javascript:alert(1)")}});
+        let hrefs = [
+            "https://x/edr/collections/c/position\"",
+            "https://x/edr/collections/c/locations?f=html\"",
+            "https://x/edr/collections/c/instances?f=html\"",
+        ];
+        for html in [collection_html(edr, &doc, None), collection_facts(&doc)] {
+            for href in hrefs {
+                assert!(html.contains(&format!("href=\"{href}")), "{href}: {html}");
+            }
+            assert!(!html.contains("href=\"javascript:"));
+        }
     }
 
     #[test]

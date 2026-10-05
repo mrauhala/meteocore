@@ -22,13 +22,13 @@ use crate::geojson::{
     encode_path_segment, FeatureIdentity, GeoJsonError, GeoJsonLink, LocationIndex,
 };
 use crate::params::{
-    check_crs, negotiate_edr_format, parse_cube_bbox, parse_datetime, parse_edr_format,
-    parse_limit, parse_locations_query, parse_resolution, parse_within_metres, parse_z,
-    plot_dimensions, query_formats, resolve_z_levels, split_location_ids, split_position_coords,
-    AreaQueryParams, CubeQueryParams, DatetimeSelector, EdrFormat, LocationQueryParams,
-    NegotiatedFormat, PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, ZSelector,
-    CRS84_WKT, DATA_QUERY_CRS, LOCATIONS_FORMATS, MAX_LIMIT, MAX_LOCATION_IDS,
-    MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
+    check_crs, negotiate_edr_format, negotiate_list_format, parse_cube_bbox, parse_datetime,
+    parse_edr_format, parse_limit, parse_locations_query, parse_resolution, parse_within_metres,
+    parse_z, plot_dimensions, query_formats, resolve_z_levels, split_location_ids,
+    split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector, EdrFormat,
+    LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
+    TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, LOCATIONS_FORMATS, MAX_LIMIT,
+    MAX_LOCATION_IDS, MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -119,14 +119,19 @@ impl GeoJsonRequest {
     /// `self`, an `alternate` per other offered format, and a link to the
     /// collection, each with `rel` and `type`.
     fn links(&self) -> Vec<GeoJsonLink> {
+        self.links_as(EdrFormat::GeoJson)
+    }
+
+    /// The links of this query's `current` representation: see [`Self::links`].
+    fn links_as(&self, current: EdrFormat) -> Vec<GeoJsonLink> {
         let mut links = vec![GeoJsonLink {
-            href: self.url(EdrFormat::GeoJson),
+            href: self.url(current),
             rel: "self",
-            kind: EdrFormat::GeoJson.media_type(),
+            kind: current.media_type(),
             title: "This document".into(),
         }];
         for &format in &self.offered {
-            if format != EdrFormat::GeoJson {
+            if format != current {
                 links.push(GeoJsonLink {
                     href: self.url(format),
                     rel: "alternate",
@@ -142,6 +147,45 @@ impl GeoJsonRequest {
             title: self.collection_title.clone(),
         });
         links
+    }
+
+    /// This query's HTML page context (#971): its links as HTML, the
+    /// default format as the page's JSON switch.
+    fn html_page(&self) -> crate::html::DataPage<'_> {
+        let segment = self.path.rsplit('/').next().unwrap_or_default();
+        let title = if self.path.contains("/locations/") {
+            let ids = percent_encoding::percent_decode_str(segment).decode_utf8_lossy();
+            format!("Location data: {ids}")
+        } else {
+            let mut query = segment.to_owned();
+            if let Some(first) = query.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{query} query")
+        };
+        crate::html::DataPage {
+            base: &self.base,
+            collection_id: &self.collection_id,
+            collection_title: &self.collection_title,
+            title,
+            raw_query: self.raw_query.as_deref(),
+            json_url: self.url(
+                self.offered
+                    .first()
+                    .copied()
+                    .unwrap_or(EdrFormat::CoverageJson),
+            ),
+            links: self
+                .links_as(EdrFormat::Html)
+                .into_iter()
+                .map(|l| crate::html::Link {
+                    href: l.href,
+                    rel: l.rel.into(),
+                    kind: l.kind.into(),
+                    title: l.title,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -219,8 +263,9 @@ fn render_station_geojson(
 /// offered where the engine serves them), with `number_matched` (the
 /// top-level coverages before `limit`, `None` when uncounted) as its
 /// `numberMatched`; `PNG` renders a vertical-profile or time-series plot
-/// (one stacked panel per parameter). A response that can't be plotted (a
-/// gridded/area result) maps to 400.
+/// (one stacked panel per parameter); `HTML` is a page of the CoverageJSON
+/// (#971). A response that can't be plotted (a gridded/area result) maps
+/// to 400.
 fn render_coverage_response(
     result: CoverageResponse,
     number_matched: Option<usize>,
@@ -241,6 +286,10 @@ fn render_coverage_response(
             })?;
             Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
         }
+        EdrFormat::Html => Ok(crate::html::response(crate::html::coverage_page(
+            &result,
+            &geojson.html_page(),
+        ))),
     }
 }
 
@@ -360,7 +409,7 @@ fn data_query_format(
 }
 
 /// `Vary: Accept` on a data response whose format the `Accept` header chose.
-fn with_format_vary(resp: Response, format: NegotiatedFormat) -> Response {
+pub(crate) fn with_format_vary(resp: Response, format: NegotiatedFormat) -> Response {
     if format.vary_accept {
         with_vary(resp)
     } else {
@@ -822,6 +871,7 @@ fn data_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
                  `time` and per-parameter property arrays)"
             }
             EdrFormat::Png => "PNG (a vertical-profile / time-series plot)",
+            EdrFormat::Html => "HTML (a page of the response)",
         })
         .collect();
     let names: Vec<&str> = formats.iter().map(|f| f.name()).collect();
@@ -861,6 +911,7 @@ fn data_response_content(formats: &[EdrFormat]) -> serde_json::Value {
                 json!({"$ref": "#/components/schemas/edrFeatureCollectionGeoJSON"})
             }
             EdrFormat::Png => json!({"type": "string", "format": "binary"}),
+            EdrFormat::Html => json!({"type": "string"}),
         };
         content.insert(format.media_type().into(), json!({ "schema": schema }));
     }
@@ -971,7 +1022,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "content": {
                         "application/geo+json": {
                             "schema": {"$ref": "#/components/schemas/edrFeatureCollectionGeoJSON"}
-                        }
+                        },
+                        "text/html": {"schema": {"type": "string"}}
                     }
                 }),
                 QUERY_ERRORS,
@@ -1176,7 +1228,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }),
                 TrajectoryShape::CrossSection => {
                     let mut format = data_format_parameter(trajectory_formats);
-                    format["description"] = json!("Output format: CoverageJSON (default) or PNG (a colour-mapped distance×height cross-section heatmap). Case-insensitive; the media types are accepted too (encode + as %2B). Without f, the Accept header chooses among them.");
+                    format["description"] = json!("Output format: CoverageJSON (default), PNG (a colour-mapped distance×height cross-section heatmap) or HTML (a page of the response). Case-insensitive; the media types are accepted too (encode + as %2B). Without f, the Accept header chooses among them.");
                     json!({
                         "get": {
                             "summary": format!("Trajectory cross-section for {}", config.title),
@@ -1520,13 +1572,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "style": "form",
                     "explode": false
                 },
-                // `f` on `/locations`: its one representation, GeoJSON.
+                // `f` on `/locations`: GeoJSON or its HTML page (#971).
                 "f-locations": {
                     "name": "f",
                     "in": "query",
                     "required": false,
                     "schema": {"type": "string", "enum": LOCATIONS_FORMATS},
-                    "description": "Output format: GeoJSON, the default and only one (case-insensitive; encode the plus sign as %2B in application/geo+json). Any other value is a 400."
+                    "description": "Output format: GeoJSON, the default, or HTML (case-insensitive; encode the plus sign as %2B in application/geo+json). Without f, the Accept header chooses. Any other value is a 400."
                 },
                 // EDR 1.2 `/req/edr/rc-limit-definition`, with the schema
                 // describing this server: no default (absent = no limit, not
@@ -1925,6 +1977,13 @@ pub async fn instances(
                 .iter()
                 .map(|run| instance_card(config, base, run))
                 .collect();
+            // Each run's data queries, anchored under its card (#971).
+            let docs: Vec<serde_json::Value> = runs
+                .iter()
+                .map(|run| {
+                    build_collection_metadata(engine.as_ref(), config, base, Some(run), false)
+                })
+                .collect();
             let nav = [
                 LinkView::new(format!("{self_href}?f=json"), "alternate", Some("JSON")),
                 LinkView::new(
@@ -1941,6 +2000,7 @@ pub async fn instances(
                 },
                 &format!("{} — instances", config.title),
                 &cards,
+                &docs,
                 &nav,
             ))
             .into_response()
@@ -2062,18 +2122,28 @@ pub async fn instance(
 /// `prev` links paged like `/collections` (#922). `bbox` and `datetime`
 /// filter the list before it is paged, so the counts and links describe the
 /// filtered list (#932). Either way the encoded body is admitted by the same
-/// byte budget.
+/// byte budget, and so is its HTML page (#971).
 pub async fn locations(
     Path(id): Path<String>,
     State(state): State<AppState>,
     query: Result<Query<Vec<(String, String)>>, axum::extract::rejection::QueryRejection>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, HandlerError> {
+) -> Result<Response, HandlerError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "locations", "location")?;
     let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid query string"))?;
     let request = parse_locations_query(pairs).map_err(|e| bad_request(&e))?;
+    let f = request
+        .preserved
+        .iter()
+        .find(|(name, _)| name == "f")
+        .map(|(_, value)| value.as_str());
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let format =
+        negotiate_list_format(f, accept, "the location list").map_err(|e| bad_request(&e))?;
+    let collection_title = config.title.clone();
 
     let base_url = request_base_url(&state, &headers);
     let query_engine = engine.clone();
@@ -2160,15 +2230,28 @@ pub async fn locations(
         } else {
             "Complete location inventory exceeds the configured response limit; page it with limit"
         };
-        let page = (!links.is_empty()).then_some(LocationsPage {
-            number_matched,
-            links: &links,
-        });
         // Keep construction, serialization and hashing under the same worker
         // permit as retrieval, even if the request times out or disconnects.
         let cancelled = || budget.expired();
         let mut writer = crate::location_budget::Writer::new(&cancelled);
-        locations_to_writer(page_locs, &ctx, page.as_ref(), &mut writer).map_err(|_| {
+        let written = if format.format == EdrFormat::Html {
+            let page = locations_html_page(
+                &href,
+                &links,
+                raw_query.as_deref(),
+                &ctx,
+                &collection_title,
+            );
+            let counts = number_matched.map(|matched| (matched, page_locs.len()));
+            crate::html::write_locations(page_locs, &ctx, &page, counts, &mut writer)
+        } else {
+            let page = (!links.is_empty()).then_some(LocationsPage {
+                number_matched,
+                links: &links,
+            });
+            locations_to_writer(page_locs, &ctx, page.as_ref(), &mut writer).map_err(Into::into)
+        };
+        written.map_err(|_| {
             match writer.failure {
                 Some(crate::location_budget::Failure::Cancelled) => query_timeout(),
                 Some(crate::location_budget::Failure::Limit) => JsonError(
@@ -2187,13 +2270,65 @@ pub async fn locations(
         Ok((body, etag))
     })
     .await?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/geo+json".to_owned()),
-            (header::ETAG, etag),
-        ],
-        body,
+    let content_type = match format.format {
+        EdrFormat::Html => crate::html::CONTENT_TYPE,
+        _ => "application/geo+json",
+    };
+    Ok(with_format_vary(
+        (
+            [
+                (header::CONTENT_TYPE, content_type.to_owned()),
+                (header::ETAG, etag),
+            ],
+            body,
+        )
+            .into_response(),
+        format,
     ))
+}
+
+/// The `/locations` HTML page's context (#971): the GeoJSON's `self`,
+/// `next` and `prev` links as HTML pages, the GeoJSON as `alternate`.
+fn locations_html_page<'a>(
+    href: &str,
+    links: &[(String, &'static str, &'static str)],
+    raw_query: Option<&'a str>,
+    ctx: &LocationsContext<'a>,
+    collection_title: &'a str,
+) -> crate::html::DataPage<'a> {
+    let json_url = links
+        .iter()
+        .find(|(_, rel, _)| *rel == "self")
+        .map_or(href, |(href, _, _)| href.as_str());
+    let json_url = api_common::workbench::with_format(json_url, "GeoJSON");
+    let mut page_links = vec![crate::html::Link {
+        href: json_url.clone(),
+        rel: "alternate".into(),
+        kind: "application/geo+json".into(),
+        title: "This document as GeoJSON".into(),
+    }];
+    let own: Vec<(String, &str, &str)> = if links.is_empty() {
+        vec![(href.to_owned(), "self", "Locations")]
+    } else {
+        links.to_vec()
+    };
+    for (href, rel, title) in own {
+        page_links.push(crate::html::Link {
+            href: api_common::workbench::with_format(&href, "html"),
+            rel: rel.into(),
+            kind: "text/html".into(),
+            title: title.into(),
+        });
+    }
+    crate::html::DataPage {
+        base: ctx.base_url,
+        collection_id: ctx.collection_id,
+        collection_title,
+        title: "Locations".into(),
+        raw_query,
+        json_url,
+        links: page_links,
+    }
 }
 
 /// `GET /collections/{id}/locations/{locationId}`: the data at one named
@@ -2718,9 +2853,16 @@ async fn run_position_query(
 pub async fn area_query(
     Path(id): Path<String>,
     Query(params): Query<AreaQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_area_query(id, None, params, state).await
+    let request = DataRequest {
+        instance_id: None,
+        raw_query,
+        headers,
+    };
+    run_area_query(id, request, params, state).await
 }
 
 /// `GET /collections/{id}/instances/{instanceId}/area` — area query against a
@@ -2728,37 +2870,44 @@ pub async fn area_query(
 pub async fn instance_area_query(
     Path((id, instance_id)): Path<(String, String)>,
     Query(params): Query<AreaQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_area_query(id, Some(instance_id), params, state).await
+    let request = DataRequest {
+        instance_id: Some(instance_id),
+        raw_query,
+        headers,
+    };
+    run_area_query(id, request, params, state).await
 }
 
 async fn run_area_query(
     id: String,
-    instance_id: Option<String>,
+    request: DataRequest,
     params: AreaQueryParams,
     state: AppState,
 ) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "area", "area")?;
 
     // Static request-level checks before engine/instance resolution, so the
     // instance variant rejects the same way as the non-instance `area_query`
     // (e.g. `…/instances/x/area?f=png` → 400 "PNG not available", not a 404 on
     // the instance). An area result is gridded / multi-coverage, not a plot,
-    // and area is not a point query, so no GeoJSON either (#929): the one
-    // format leaves nothing for `Accept` to choose.
-    data_query_format(
+    // and area is not a point query, so no GeoJSON either (#929): CoverageJSON
+    // or its HTML page (#971).
+    let format = data_query_format(
         engine,
         "area",
         params.f.as_deref(),
-        &HeaderMap::new(),
+        &request.headers,
         "area queries",
     )?;
     request_crs(params.crs.as_deref())?;
 
-    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+    let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -2771,9 +2920,10 @@ async fn run_area_query(
     let z = resolve_request_z(engine, params.z.as_deref())?;
     let limit = request_limit(params.limit.as_deref())?;
 
+    let page = request.geojson(&state, engine, config, "area");
     let engine = engine.clone();
-    let result = execute_query(false, move |budget| {
-        crate::datetime_list::run(
+    let response = execute_query(false, move |budget| {
+        let result = crate::datetime_list::run(
             datetime.as_ref(),
             || budget.expired(),
             |datetime| {
@@ -2786,14 +2936,21 @@ async fn run_area_query(
                 )
             },
         )
-        .map_err(|e| map_query_error(&e, "Area"))
+        .map_err(|e| map_query_error(&e, "Area"))?;
+        render_coverage_response(
+            limit_coverages(result, limit),
+            None,
+            format.format,
+            None,
+            None,
+            &page,
+        )
     })
     .await?;
 
-    let result = limit_coverages(result, limit);
-    Ok(with_data_cache_control(
-        coverage_json_response(&result, "Area")?,
-        window,
+    Ok(with_format_vary(
+        with_data_cache_control(response, window),
+        format,
     ))
 }
 
@@ -2918,9 +3075,16 @@ type QueryPairs = Result<Query<Vec<(String, String)>>, axum::extract::rejection:
 pub async fn cube_query(
     Path(id): Path<String>,
     query: QueryPairs,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_cube_query(id, None, query, state).await
+    let request = DataRequest {
+        instance_id: None,
+        raw_query,
+        headers,
+    };
+    run_cube_query(id, request, query, state).await
 }
 
 /// `GET /collections/{id}/instances/{instanceId}/cube` — cube query against
@@ -2928,9 +3092,16 @@ pub async fn cube_query(
 pub async fn instance_cube_query(
     Path((id, instance_id)): Path<(String, String)>,
     query: QueryPairs,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, HandlerError> {
-    run_cube_query(id, Some(instance_id), query, state).await
+    let request = DataRequest {
+        instance_id: Some(instance_id),
+        raw_query,
+        headers,
+    };
+    run_cube_query(id, request, query, state).await
 }
 
 /// OGC API - EDR `cube` (#925): the parameters over a CRS84 `bbox`, at the
@@ -2940,23 +3111,23 @@ pub async fn instance_cube_query(
 /// than CRS84, `f=PNG`) is a 400 — before the engine runs.
 async fn run_cube_query(
     id: String,
-    instance_id: Option<String>,
+    request: DataRequest,
     query: QueryPairs,
     state: AppState,
 ) -> Result<impl IntoResponse, HandlerError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "cube", "cube")?;
 
     let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid cube query string"))?;
     let params = CubeQueryParams::from_pairs(pairs).map_err(|e| bad_request(&e))?;
-    // Cube is CoverageJSON only: no PNG plot of a 4-D grid, and no GeoJSON
-    // (not a point query, #929). One format leaves nothing for `Accept`.
-    data_query_format(
+    // Cube is CoverageJSON or its HTML page (#971): no PNG plot of a 4-D
+    // grid, and no GeoJSON (not a point query, #929).
+    let format = data_query_format(
         engine,
         "cube",
         params.f.as_deref(),
-        &HeaderMap::new(),
+        &request.headers,
         "cube queries",
     )?;
     request_crs(params.crs.as_deref())?;
@@ -2980,7 +3151,7 @@ async fn run_cube_query(
         ));
     }
 
-    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+    let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
 
     // A datetime list runs the cube once per instant; the per-instant
     // `[t, z, y, x]` grids share x, y and z, so the merge joins them along t.
@@ -3001,9 +3172,10 @@ async fn run_cube_query(
         (None, None) => None,
     };
 
+    let page = request.geojson(&state, engine, config, "cube");
     let engine = engine.clone();
-    let result = execute_query(false, move |budget| {
-        crate::datetime_list::run(
+    let response = execute_query(false, move |budget| {
+        let result = crate::datetime_list::run(
             datetime.as_ref(),
             || budget.expired(),
             |datetime| {
@@ -3017,24 +3189,26 @@ async fn run_cube_query(
                 )
             },
         )
-        .map_err(|e| map_query_error(&e, "Cube"))
+        .map_err(|e| map_query_error(&e, "Cube"))?;
+        render_coverage_response(result, None, format.format, None, None, &page)
     })
     .await?;
 
-    Ok(with_data_cache_control(
-        coverage_json_response(&result, "Cube")?,
-        window,
+    Ok(with_format_vary(
+        with_data_cache_control(response, window),
+        format,
     ))
 }
 
 pub async fn trajectory_query(
     Path(id): Path<String>,
     Query(params): Query<TrajectoryQueryParams>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
 
     // An engine that doesn't advertise `trajectory` has no such resource.
     // Return 404 (the resource doesn't exist for this collection) rather
@@ -3106,13 +3280,22 @@ pub async fn trajectory_query(
     // runtime handle and needs a blocking thread; along-path sampling runs
     // on the query runtime's workers like position and area.
     let blocking = shape == TrajectoryShape::CrossSection;
+    // The HTML page (#971) renders on the query worker, as every query's does.
+    let page = (format == EdrFormat::Html).then(|| {
+        DataRequest {
+            instance_id: None,
+            raw_query,
+            headers,
+        }
+        .geojson(&state, engine, config, "trajectory")
+    });
     let engine = engine.clone();
     let coords = params.coords.clone();
-    let result = execute_query(blocking, move |budget| {
+    let (result, html) = execute_query(blocking, move |budget| {
         // A `datetime` list runs one query per instant and merges them
         // (one coverage per instant for an along-path 2-D or Z path; an M
         // path never gets here with a `datetime`).
-        crate::datetime_list::run(
+        let result = crate::datetime_list::run(
             datetime.as_ref(),
             || budget.expired(),
             |datetime| {
@@ -3125,7 +3308,9 @@ pub async fn trajectory_query(
                 )
             },
         )
-        .map_err(|e| map_query_error(&e, "Trajectory"))
+        .map_err(|e| map_query_error(&e, "Trajectory"))?;
+        let html = page.map(|page| crate::html::coverage_page(&result, &page.html_page()));
+        Ok((result, html))
     })
     .await?;
 
@@ -3161,6 +3346,13 @@ pub async fn trajectory_query(
                 ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
                 window,
             )
+        }
+        EdrFormat::Html => {
+            let Some(html) = html else {
+                tracing::error!("EDR trajectory: HTML negotiated but not rendered");
+                return Err(server_error());
+            };
+            with_data_cache_control(crate::html::response(html), window)
         }
     };
     Ok(with_format_vary(response, negotiated))
@@ -3509,9 +3701,9 @@ fn build_collection_metadata(
         "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
         "parameter_names": parameter_names,
         "output_formats": if station_series {
-            json!(["CoverageJSON", "GeoJSON", "PNG"])
+            json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
         } else {
-            json!(["CoverageJSON", "PNG"])
+            json!(["CoverageJSON", "PNG", "HTML"])
         }
     });
     if radius {

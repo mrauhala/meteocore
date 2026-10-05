@@ -119,7 +119,7 @@ it:
 - `AlongPath` (default; GRIB, QueryData, Zarr): the handler parses the
   whole WKT with `ds_core::trajectory::TrajectoryPath` before dispatch and
   enforces EDR 1.2's exclusions (Z/ZM + `z`, M/ZM + `datetime` → 400);
-  CoverageJSON only — `params::query_formats` takes the shape, so the
+  CoverageJSON (and HTML) only — `params::query_formats` takes the shape, so the
   handler's negotiation (`f=PNG`/`GeoJSON` → 400 before the query runs) and
   `data_queries.trajectory` `output_formats` cannot disagree; runs on the
   query runtime's workers like position. Engines build the response with
@@ -250,6 +250,11 @@ and never under an instance.
   query per instant `(t, t)`, merged by `src/datetime_list.rs`. Every data
   query handler calls the engine through `datetime_list::run`; a new one
   must too, rather than converting the selector to one engine window itself.
+  The list skips an instant only on `LocationNotFound`, so an engine must
+  report "no step/row in the window" as that (404), never `InvalidParameter`,
+  which fails the whole list (#968). A `Grid` without `t` gets a one-step
+  `t` axis at its instant before the merge, so gridded areas join along `t`;
+  single-`datetime` responses keep the engine's shape.
 - A repeating interval `Rn/date-time/duration` (#933) expands inside
   `parse_datetime` to the same `DatetimeSelector::Instants`, so handlers
   never see it. `n` counts instants, like `z`'s `Rn` (the informative

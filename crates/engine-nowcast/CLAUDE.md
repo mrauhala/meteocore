@@ -199,11 +199,15 @@ coasting, joins, or raw-byte forecast encoding. See
   field by the interval ratio before blending, so a skipped composite no
   longer biases the blended (and served) speed.
 - Block selection is by footprint overlap padded by one block each side
-  (a sub-block bbox still gets its block; edge bilinear sampling has both
-  neighbours — GRIB's enclosing-cell rule), a trailing partial block's
-  centre is clamped into the grid so served coordinates never leave the
-  spatial extent, and `y` ascends south→north like GRIB (ODIM/GeoTIFF are
-  north-first; a client must read `axes.y.values` either way).
+  (a sub-block bbox still gets its block — GRIB's enclosing-cell rule).
+  EDR returns nothing outside the area (#966): a rectangle keeps the
+  blocks whose footprint meets it, so the overlapping blocks a particle
+  client samples up to the edge keep their values and only the padding
+  is null; any other polygon keeps the blocks centred inside it (#671).
+  A trailing partial block's centre is clamped into the grid so served
+  coordinates never leave the spatial extent, and `y` ascends south→north
+  like GRIB (ODIM/GeoTIFF are north-first; a client must read
+  `axes.y.values` either way).
 - **`/preview` coupling:** `server/src/preview.rs` prefers the MAP time
   axis over EDR instants when both exist — because this collection's two
   surfaces are different products (anchors vs leads). Do not make

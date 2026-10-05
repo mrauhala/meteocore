@@ -133,11 +133,32 @@ impl GribEngine {
         Ok(())
     }
 
+    /// The parameters a query without `parameter-name` returns: every
+    /// parameter of a pressure/model view, else the products of `files`
+    /// (near-surface ones only in the legacy layout), in index order. One
+    /// rule for position, trajectory, area/radius and cube (#966).
+    pub(crate) fn default_parameters<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a StepFile>,
+        keys: &ParameterKeys,
+    ) -> Vec<String> {
+        if self.vertical_kind().is_some() {
+            return keys.keys().cloned().collect();
+        }
+        let mut seen = HashSet::new();
+        files
+            .into_iter()
+            .flat_map(|file| &file.messages)
+            .filter(|m| self.family == Some(GribLevelType::Single) || m.is_near_surface())
+            .filter(|m| seen.insert(m.param.clone()))
+            .map(|m| m.param.clone())
+            .collect()
+    }
+
     /// The parameters a point-sampling query (position, trajectory) returns:
     /// the requested ones (checked against the run on level views), else
-    /// every parameter of a pressure/model view, else the near-surface
-    /// products of the selected steps. `steps` empty is a 404, no parameter
-    /// on a vertical view a 400.
+    /// [`Self::default_parameters`] of the selected steps. `steps` empty is a
+    /// 404, no parameter on a vertical view a 400.
     pub(crate) fn position_parameters(
         &self,
         parameters: Option<&[String]>,
@@ -146,17 +167,7 @@ impl GribEngine {
     ) -> Result<Vec<String>, DataServerError> {
         let params: Vec<String> = match parameters {
             Some(params) => params.to_vec(),
-            None if self.vertical_kind().is_some() => keys.keys().cloned().collect(),
-            None => {
-                let mut seen = HashSet::new();
-                steps
-                    .iter()
-                    .flat_map(|(_, file)| &file.messages)
-                    .filter(|m| self.family == Some(GribLevelType::Single) || m.is_near_surface())
-                    .filter(|m| seen.insert(m.param.clone()))
-                    .map(|m| m.param.clone())
-                    .collect()
-            }
+            None => self.default_parameters(steps.iter().map(|(_, file)| *file), keys),
         };
         if self.family.is_some() {
             self.validate_parameters(keys, &params)?;

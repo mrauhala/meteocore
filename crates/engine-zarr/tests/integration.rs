@@ -893,6 +893,34 @@ fn area_query_all_timesteps_has_t_axis() {
     }
 }
 
+/// An instant between the 6-hourly steps has no data: a 404 on every
+/// query, never a 400, so a datetime list skips it (EDR 1.2
+/// `/req/core/datetime-response` A).
+#[test]
+fn an_instant_without_a_step_is_not_found() {
+    let e = engine();
+    let t = Utc.with_ymd_and_hms(2026, 1, 1, 3, 0, 0).unwrap();
+    for (query, r) in [
+        (
+            "position",
+            e.query_position("POINT(5.5 54.5)", Some((t, t)), None, None, None),
+        ),
+        (
+            "area",
+            e.query_area("5,50,7,52", Some((t, t)), None, None, None),
+        ),
+        (
+            "trajectory",
+            e.query_trajectory("LINESTRING(1 50, 7 50)", Some((t, t)), None, None, None),
+        ),
+    ] {
+        assert!(
+            matches!(r, Err(ds_core::error::DataServerError::LocationNotFound(_))),
+            "{query}: {r:?}"
+        );
+    }
+}
+
 #[test]
 fn area_query_outside_extent_is_not_found() {
     let err = engine()
