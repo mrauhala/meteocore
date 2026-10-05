@@ -138,7 +138,8 @@ pins do not fall back. No requested datetime still selects the latest run.
 Each run also has canonical `(parameter, level type, level)` selectors,
 rebuilt with `Catalog::refresh_metadata` before publication. Metadata
 probes and all query paths share these selectors. A missing canonical level
-is null in a position series and an error in a map/area request; never
+is null in a position series and an error in a map request or an area that
+names the parameter (a defaulted area parameter is null); never
 silently substitute an upper-air field. Metadata is cached by that full
 identity, so historical runs with different selected levels keep their labels.
 Pressure/model views may reuse metadata from a probed or decoded level of the same
@@ -225,11 +226,16 @@ on the request path. Single-level and legacy views require exact metadata.
   128 MiB message cache. It checks identical samples and reports timings/read
   bytes; no wall-clock thresholds belong in CI.
 
-Default Maps/area parameter selection preserves the first previously supported
+Default Maps parameter selection preserves the first previously supported
 near-surface product before considering acc/ave records, regardless of index
 ordering. Aggregate-only collections fall back to their first aggregate;
 upper-air-only collections to their first message. Raster metadata and actual
 rendering share `StepFile::default_message` so default labels/units agree.
+EDR queries without `parameter-name` (position, trajectory, area/radius,
+cube) return `default_parameters` instead, every parameter of the view
+(EDR 1.2 `/req/edr/parameter-name-response` A, #966): every key of a
+pressure/model view, else the products of the selected steps, near-surface
+ones only in the legacy layout.
 
 ## Position queries
 
@@ -281,12 +287,21 @@ rendering share `StepFile::default_message` so default labels/units agree.
   step/parameter/level slots. Preserve requested level order and missing upper-air nulls regardless
   of completion order. Validate grid axes before extracting each subset.
 - Radius delegates to the same area path via the default EDR trait method.
+- `bbox_subset` rounds out to the nodes enclosing the polygon's bbox; the
+  shared `QueryPolygon::mask_native_cells` nulls the nodes outside the
+  polygon: for a rectangle those whose cell, half a spacing either side,
+  misses it (#966), for any other polygon those centred outside it (#671).
+  Pass the native spacing: a bbox clamped at a regional grid's edge leaves
+  a lone node, whose cell only the spacing sizes. A rectangle no cell meets
+  is a 404; the vertex fallback never applies to it. Keep
+  `bbox_subset` enclosing (and `extract_bbox` with it): the cube trims its
+  own axes from it instead.
 - Steps come from `grid_steps`: no datetime is the run's last step and an
   instant its exact step, both a t-less `[z,]y,x` Grid; an interval every
   step inside it on a `t` axis (`[t, z, y, x]` like cube), even one step.
   The values budget counts steps × levels. A parameter some steps lack
   (an aggregate at the analysis step) is null there; one no step has is
-  the canonical-level 400.
+  the canonical-level 400 when named, null when defaulted.
 - Run `cargo test -p engine-grib area::tests::area_latency_replay -- --ignored
   --nocapture` for a 32-field replay with simulated 150 ms GET latency and no
   decoded cache. It compares serial storage with four concurrent reads, checks
@@ -314,6 +329,11 @@ rendering share `StepFile::default_message` so default labels/units agree.
   position off a regional grid is null), reading the decoded grid in place.
   On a 360° grid an x position that misses retries one turn away, so the
   180° column of a global bbox samples −180°.
+- At the native resolution the axes keep only the subset's nodes whose
+  cell, half a spacing either side, intersects the bbox (`axis_map`; EDR
+  1.2 `/req/edr/rc-bbox-response-cube` A, #966), the same rule as the area
+  rectangle mask. The cells tile the grid, so a bbox between two nodes
+  keeps the cell it lies in; none is a bbox off the grid.
 - `west > east` bboxes are a 400 before any I/O (#667); a bbox off the grid
   is `LocationNotFound` (404).
 

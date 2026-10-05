@@ -31,7 +31,8 @@
 //!   a collection without a vertical axis ignores it (`/req/edr/z-response`
 //!   A).
 //! - A 2-D or Z path takes the `datetime` selection of a position query,
-//!   one coverage per timestep; the `z` parameter (or every level) selects
+//!   one coverage per timestep; no timestep in it is a 404 (no data), so a
+//!   `datetime` list skips that instant. The `z` parameter (or every level) selects
 //!   the levels of a 2-D or M path, one coverage per level.
 //! - A Z path with `z`, or an M path with `datetime`, is a 400; the API
 //!   layer rejects those before dispatch.
@@ -442,8 +443,10 @@ impl TrajectoryPlan {
         parameters: usize,
     ) -> Result<Self, DataServerError> {
         let invalid = DataServerError::InvalidParameter;
+        // No timestep in the window has no data (404), as a position query
+        // without one: a datetime list skips that instant.
         let (Some(&first), Some(&last)) = (axes.times.first(), axes.times.last()) else {
-            return Err(invalid(
+            return Err(DataServerError::LocationNotFound(
                 "No data available for the requested time range".into(),
             ));
         };
@@ -1013,13 +1016,17 @@ mod tests {
             matches!(&err, DataServerError::InvalidParameter(m) if m.contains("outside")),
             "{err}"
         );
-        // No timesteps at all is a 400 too.
+        // No timestep in the window has no data: a 404, which a datetime
+        // list skips, not a 400 failing the list.
         let none = TrajectoryAxes {
             times: &[],
             vertical: None,
             z: None,
         };
-        assert!(TrajectoryPlan::new(&path, deg(1.0), none, 1).is_err());
+        assert!(matches!(
+            TrajectoryPlan::new(&path, deg(1.0), none, 1),
+            Err(DataServerError::LocationNotFound(_))
+        ));
     }
 
     #[test]

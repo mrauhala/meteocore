@@ -387,11 +387,21 @@ impl BufrEngine {
 
     // ---- query helpers -------------------------------------------------
 
-    fn selected_params(&self, parameters: Option<&[String]>) -> Vec<usize> {
-        match parameters {
-            Some(req) => req.iter().filter_map(|p| self.table.index_of(p)).collect(),
-            None => (0..self.table.len()).collect(),
-        }
+    /// The table columns `parameter-name` selects, through the shared rule:
+    /// an unknown name or an empty list is a 400 naming the valid ones, and
+    /// matching ignores case (#666, #966).
+    fn selected_params(
+        &self,
+        parameters: Option<&[String]>,
+    ) -> Result<Vec<usize>, DataServerError> {
+        let names = self.table.names();
+        let available: Vec<&str> = names.iter().map(String::as_str).collect();
+        Ok(
+            ds_core::edr_engine::select_parameters(parameters, &available)?
+                .into_iter()
+                .filter_map(|name| self.table.index_of(name))
+                .collect(),
+        )
     }
 
     /// Build one station's `PointSeries` coverage. `budget` is decremented
@@ -535,7 +545,7 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let params = self.selected_params(parameters);
+        let params = self.selected_params(parameters)?;
         let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         if store.get(location_id).is_none() {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));
@@ -601,7 +611,7 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
                 inside.len()
             )));
         }
-        let params = self.selected_params(parameters);
+        let params = self.selected_params(parameters)?;
         let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         let mut budget = MAX_RESPONSE_VALUES;
         let mut out = Vec::with_capacity(inside.len());
