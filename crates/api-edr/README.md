@@ -461,7 +461,7 @@ transforms retain serial retrieval.
 |---|---|---|---|---|---|---|---|---|---|
 | CSV | ✓, `datetime` by observation rows | – | ✓ | ✓ | – | – | n/a | ✓ stations | stations whose point is inside the polygon (≤ 500) |
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | – | n/a | – | Grid over the polygon's bbox at native resolution, no 256-cell coarsening (≤ 1M values across timesteps → 400, checked before any read, #858), pixels outside the polygon masked; `t` axis when several steps; a file that cannot be read is a timestep of nulls, any other error fails the query |
-| GRIB | – | ✓ | ✓ | ✓ | ✓ pressure/model views | ✓ | ✓ | – | Grid over the polygon's bbox at native resolution (≤ 1M values across levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667) |
+| GRIB | – | ✓ | ✓ | ✓ | ✓ pressure/model views | ✓ | ✓ | – | Grid over the polygon's bbox at native resolution (≤ 1M values across steps/levels/parameters), cells outside the polygon masked; antimeridian-crossing bboxes rejected (#667). `datetime` matches steps exactly on every query (#967): an instant is the step valid at it, never the nearest; an interval, open ends included, every step inside it, on a `t` axis for area and radius even when one step is inside; no step → 404. Without `datetime` an area is the latest run's last step |
 | QueryData | – | ✓ | ✓ | ✓ | – | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Lat/lon, rotated, stereographic and LCC grids (including the tangent-cone MEPS grid, on the sphere its file declares); a projected grid's extent is its projected rectangle's edges, not its corners' lon/lat box |
 | Zarr | – | ✓ | ✓ | ✓ | – | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, one subset retrieval per variable for the whole time span (each may read multiple chunks) (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | – | n/a | – | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
@@ -470,7 +470,7 @@ transforms retain serial retrieval.
 | PostGIS events | – | – | ✓ | ✓ | – | – | n/a | – (events as features = #503) | events in the polygon (exact, in SQL) as a `Point` CoverageCollection |
 | BUFR | ✓, `datetime` by reports | ✓ | ✓ | ✓ | – | – | n/a | ✓ stations | stations whose point is inside the polygon (exact, in memory; ≤ 10 001 stations, ≤ 500 000 values per response → 400); position = nearest station within `position_radius_km` (25 km) else 404; one `PointSeries` per station over the in-memory `retention` window; same semantics for the polled-directory and WIS2 (push) sources; units are the BUFR units mechanically converted for display (K → °C, Pa → hPa, kg m-2 → mm) like GRIB |
 | Nowcast | – | – | ✓ (motion field) | ✓ | – | – | ✓ | ✓ tracked cells | motion blocks over the polygon's bbox, blocks outside the polygon masked; reflectivity via EDR = #523 |
-| Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – | GOES-R, Himawari-9 (ISatSS) and the GMGSI global mosaic, whose values are 8-bit display counts (unit `1`), not brightness temperatures; its grid wraps at 180°, so a position either side of the seam, or an area given west > east across it, reads the pixels there. Each product is a parameter on its own time axis: the time axis of a response is the union of the selected products' scans (null where a product has none), an instant snaps per product to its latest scan at or before it, and `parameter_names` carries each product's own `extent.temporal`. RGB composites (`[[satellite.composites]]`) are map layers, not EDR parameters: naming one in `parameter-name` → 400. Position = the pixel under the point per scan; behind the Earth or off the mosaic's 72°S–72°N → 404. Area = grid over the bbox at the nadir pixel size (≤ 256 cells/axis), sampled through a coarse projection grid, masked to the polygon; polygon outside the imagery → 404; `t` axis when several scans. A query may download at most 8 scans the cache evicted and decode at most 1024 image blocks (summed per product grid; a GOES-R block is a strip of 24 full-width rows, a GMGSI block a 793 × 1322 chunk) → 400 |
+| Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – | GOES-R, Himawari-9 (ISatSS) and the GMGSI global mosaic, whose values are 8-bit display counts (unit `1`), not brightness temperatures; its grid wraps at 180°, so a position either side of the seam, or an area given west > east across it, reads the pixels there. Each product is a parameter on its own time axis: the time axis of a response is the union of the selected products' scans (null where a product has none), an instant is only a scan at exactly that time, per product, never the scan a map at that time renders (#967), no scan at all → 404, and `parameter_names` carries each product's own `extent.temporal`. RGB composites (`[[satellite.composites]]`) are map layers, not EDR parameters: naming one in `parameter-name` → 400. Position = the pixel under the point per scan; behind the Earth or off the mosaic's 72°S–72°N → 404. Area = grid over the bbox at the nadir pixel size (≤ 256 cells/axis), sampled through a coarse projection grid, masked to the polygon; polygon outside the imagery → 404; `t` axis when several scans. A query may download at most 8 scans the cache evicted and decode at most 1024 image blocks (summed per product grid; a GOES-R block is a strip of 24 full-width rows, a GMGSI block a 793 × 1322 chunk) → 400 |
 | CAP, GeoJSON | — no `EdrEngine` (Features/Maps only) — | | | | | | | | |
 
 Radius, corridor, items and location lists have no engine-specific code:
@@ -513,9 +513,10 @@ its display unit conversion).
   and takes the nearest timestep of the selected run, the earlier on a tie;
   the domain reports that timestep. A vertex time outside the run's time
   range is a 400 (EDR 1.2 abstract test `/conf/trajectory/
-  coords-param-invalid-time`). The path's time window selects the run like
-  a `datetime` window does. `datetime` (a list too) together with M/ZM →
-  400.
+  coords-param-invalid-time`). On GRIB the run is the newest whose
+  time range covers the path's first time, as for a map `TIME`, since the
+  samples snap; a pinned instance never falls back. `datetime` (a list too)
+  together with M/ZM → 400.
 - **Z (level).** In the collection's vertical coordinate (`extent.vertical`,
   hPa or model level on GRIB level views), interpolated along the segment
   and snapped to the nearest advertised level, which the domain reports. A
@@ -625,7 +626,8 @@ selected, or a `CoverageCollection` of `VerticalProfile` coverages (one per
 step) for multiple levels. `z` omitted selects all levels; single, list,
 closed/open interval and recurring (`Rn/min/step`) selectors are supported — a
 recurring interval is a list, so each of its levels must exist. Area/radius queries return a `[z,y,x]` Grid at one
-forecast step; the 1M-value budget includes every selected level and parameter.
+forecast step, or a `[t,z,y,x]` Grid over a `datetime` interval; the 1M-value
+budget includes every selected step, level and parameter.
 A missing field at an available level is null; an unavailable level is 400.
 Levels are exact discrete coordinates, not interpolated. Model levels are not
 converted to geometric heights. Soil-depth/isentropic axes and fractional index
@@ -633,11 +635,11 @@ level values remain unsupported by this split.
 
 GRIB cube queries (#925) answer on the pressure and model-level views. The
 time axis follows area and position: no `datetime` is the run's last step,
-an instant the nearest step, and an interval every step of the run inside
-it, the run being the latest that covers the interval start, else the
-latest with any step inside it (so `../end` works). A pinned instance never
-falls back. A datetime list is one cube per instant (the nearest step each),
-joined along `t`; instants snapping to the same step give it once. Without `parameter-name` every parameter of the view is
+an instant the step valid at it (between steps → 404), and an interval every
+step of the run inside it, the run chosen as for every GRIB query (below). A
+pinned instance never falls back. A datetime list is one cube per instant
+(its exact step), joined along `t`; an instant without a step contributes
+nothing. Without `parameter-name` every parameter of the view is
 returned; `z` levels are exact, as for area. The response budget is checked
 before any read when `resolution-x` and `-y` are both given, else after the
 first field supplies the grid geometry and before the output is allocated
@@ -684,11 +686,16 @@ order; a missing ground field cannot be replaced by a tropopause field.
 Soil layers retain both depth boundaries internally but remain excluded from
 the three level families.
 
-For datetime selection, a GRIB run must contain the requested start instant
-within its published valid-time extent. An incomplete newer run does not hide
-a covering older run. Area selects the nearest step within the chosen run;
-position returns the steps in the requested interval. Explicit instance pins
-never fall back to another run.
+GRIB `datetime` selection (#967, `/req/core/datetime-response` A and F) is
+by intersection on every EDR query. The run is the newest that covers the
+window's start and has a step inside the window, else the newest with any
+step inside it, so `../end` and a window starting before a run find one; an
+instant needs a step valid at exactly that time. An incomplete newer run does
+not hide a covering older run. Position, area, radius, cube and 2-D or Z
+trajectories then take every step of that run inside the window. No step
+inside is a 404, which a datetime list skips. Explicit instance pins never
+fall back to another run. Maps, Tiles and WMS keep snapping `TIME` to the
+nearest step of the newest run covering it.
 
 If a wgrib2 index repeats the same parameter/level/window at different offsets,
 the scan emits one summary warning after parameter/family filtering, with

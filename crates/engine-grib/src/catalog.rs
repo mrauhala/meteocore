@@ -235,6 +235,23 @@ impl ForecastRun {
             .collect()
     }
 
+    /// The steps valid inside `[start, end]`, ascending: for an instant
+    /// `(t, t)` only a step valid at exactly `t`. An open bound is chrono's
+    /// `MIN_UTC`/`MAX_UTC`, which compares like any other time.
+    pub fn steps_within(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Iterator<Item = (DateTime<Utc>, &StepFile)> + '_ {
+        self.steps
+            .iter()
+            .map(|(&step, file)| {
+                let time = self.reference_time + chrono::Duration::hours(i64::from(step));
+                (time, file)
+            })
+            .filter(move |(time, _)| start <= *time && *time <= end)
+    }
+
     /// Find the closest step within this run's available valid-time extent.
     pub fn find_step_for_time(&self, valid_time: DateTime<Utc>) -> Option<(u32, &StepFile)> {
         let (&first, _) = self.steps.first_key_value()?;

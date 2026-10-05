@@ -274,8 +274,10 @@ sliver, plus the CDL it is built from (its README has the details).
 
 Position, area and radius (radius via area). GMGSI serves its display
 counts with unit `"1"`, like any product. A response's time axis is the
-union of the selected products' scans, null where a product has none; an
-instant snaps per product through `select`. `get_parameter_available_times`
+union of the selected products' scans, null where a product has none. An
+instant is only a scan at exactly that time, per product
+(`/req/core/datetime-response` A, #967), never `select`'s snapping, which
+stays the renders' and their cache keys'; no scan at all is a 404. `get_parameter_available_times`
 feeds each product's own `extent.temporal` in `parameter_names`. Area grids
 sample at the finest selected product's nadir pixel size through a
 `ProjectionGrid` (never a per-cell geostationary forward). Update `crates/api-edr/README.md` with any change here.

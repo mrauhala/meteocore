@@ -701,8 +701,9 @@ impl SatelliteEngine {
     }
 
     /// The scans an EDR query addresses for one product: every scan for no
-    /// `datetime`, the scan [`Self::select`] renders for an instant, and the
-    /// scans inside an interval.
+    /// `datetime`, else the scans inside the window, so an instant is only a
+    /// scan at exactly that time (`/req/core/datetime-response` A). Never
+    /// [`Self::select`]: that snapping is for renders and their cache keys.
     fn query_times(
         catalog: &Catalog,
         index: usize,
@@ -710,9 +711,6 @@ impl SatelliteEngine {
     ) -> Vec<DateTime<Utc>> {
         match datetime {
             None => catalog.frames[index].keys().copied().collect(),
-            Some((start, end)) if start == end => Self::select(catalog, index, Some(start))
-                .into_iter()
-                .collect(),
             Some((start, end)) => catalog.frames[index]
                 .range(start..=end)
                 .map(|(time, _)| *time)
@@ -747,8 +745,9 @@ impl SatelliteEngine {
             plan.iter().flat_map(|(_, t)| t.iter().copied()).collect();
         times.sort_unstable();
         times.dedup();
+        // No data, the 404 a datetime list skips.
         if times.is_empty() {
-            return Err(DataServerError::InvalidParameter(
+            return Err(DataServerError::LocationNotFound(
                 "No scans available for the requested time range".into(),
             ));
         }
