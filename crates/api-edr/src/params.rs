@@ -893,10 +893,14 @@ pub enum ZSelector {
     Interval { min: f64, max: f64 },
 }
 
-/// Most levels a recurring `z=Rn/min/step` may expand to. The count is
-/// the number of levels, as in the standard's example: `z=R20/100/50` is
-/// "20 levels at 50 unit intervals starting at level 100".
-pub const MAX_Z_RECURRENCES: u32 = 1000;
+/// Most levels one `z` may name, in a list or as the levels a recurring
+/// `z=Rn/min/step` expands to (#940). Every engine loops over the requested
+/// levels before any response budget applies, so the request bounds that
+/// work; no collection advertises anywhere near this many levels. For the
+/// recurring form the count is the number of levels, as in the standard's
+/// example: `z=R20/100/50` is "20 levels at 50 unit intervals starting at
+/// level 100".
+pub const MAX_Z_LEVELS: usize = 1000;
 
 /// An interval bound as it is written in a request: `..` when open.
 fn fmt_z_bound(v: f64) -> String {
@@ -930,8 +934,11 @@ fn parse_z_value(part: &str) -> Result<f64, DataServerError> {
 /// - an open interval `z=../850` or `z=500/..`, reaching the lowest or
 ///   highest advertised level;
 /// - a recurring interval `z=Rn/min/step`: `n` levels from `min`, `step`
-///   apart (`step` may be negative, never zero), at most
-///   [`MAX_Z_RECURRENCES`]. It becomes a list, snapped like one.
+///   apart (`step` may be negative, never zero). It becomes a list,
+///   matched like one.
+///
+/// A list or a recurring interval names at most [`MAX_Z_LEVELS`] levels;
+/// more is a 400 naming the cap, raised before any value is parsed.
 ///
 /// An absent or blank value yields `None` (the whole vertical extent / a
 /// profile).
@@ -974,6 +981,12 @@ pub fn parse_z(z: Option<&str>) -> Result<Option<ZSelector>, DataServerError> {
         return Ok(Some(ZSelector::Interval { min, max }));
     }
 
+    let count = raw.split(',').count();
+    if count > MAX_Z_LEVELS {
+        return Err(DataServerError::InvalidParameter(format!(
+            "`z` list has {count} levels, more than the maximum of {MAX_Z_LEVELS}"
+        )));
+    }
     let levels: Vec<f64> = raw
         .split(',')
         .map(|part| {
@@ -1001,9 +1014,9 @@ fn parse_z_recurring(rest: &str) -> Result<ZSelector, DataServerError> {
             "`z` recurring interval count 'R{count}' must be a positive whole number of levels"
         ))
     })?;
-    if n > MAX_Z_RECURRENCES {
+    if n as usize > MAX_Z_LEVELS {
         return Err(DataServerError::InvalidParameter(format!(
-            "`z` recurring interval R{n} exceeds the maximum of {MAX_Z_RECURRENCES} levels"
+            "`z` recurring interval R{n} exceeds the maximum of {MAX_Z_LEVELS} levels"
         )));
     }
     let min = parse_z_value(min)?;
@@ -1024,8 +1037,10 @@ fn parse_z_recurring(rest: &str) -> Result<ZSelector, DataServerError> {
 
 /// Resolve a [`ZSelector`] into the concrete level list an engine samples.
 ///
-/// - `Levels` pass through unchanged (the engine applies its list rule to
-///   each: ODIM snaps to the nearest sweep, GRIB requires an exact level).
+/// - `Levels` pass through unchanged for the engine to match against its
+///   own levels, keeping only those it has (`/req/edr/z-response` B):
+///   ODIM PVOL a sweep within 0.05° of a requested angle, GRIB an exact
+///   level. None matching is the engine's 400, worded like the interval's.
 /// - `Interval { min, max }` expands to the collection's advertised levels
 ///   that fall within `[min, max]` (inclusive; an open end is infinite, so
 ///   it reaches the extreme level). An interval that selects no advertised
@@ -1573,11 +1588,11 @@ mod tests {
             parse_z(Some("r1/0.5/1")).unwrap(),
             Some(ZSelector::Levels(vec![0.5]))
         );
-        let max = format!("R{MAX_Z_RECURRENCES}/0/1");
+        let max = format!("R{MAX_Z_LEVELS}/0/1");
         let Some(ZSelector::Levels(levels)) = parse_z(Some(&max)).unwrap() else {
             panic!("the cap itself is accepted");
         };
-        assert_eq!(levels.len(), MAX_Z_RECURRENCES as usize);
+        assert_eq!(levels.len(), MAX_Z_LEVELS);
     }
 
     #[test]
@@ -1598,9 +1613,31 @@ mod tests {
         ] {
             assert!(parse_z(Some(z)).is_err(), "{z}");
         }
-        let over = format!("R{}/0/1", MAX_Z_RECURRENCES + 1);
+        let over = format!("R{}/0/1", MAX_Z_LEVELS + 1);
         let err = parse_z(Some(&over)).unwrap_err().to_string();
-        assert!(err.contains(&MAX_Z_RECURRENCES.to_string()), "{err}");
+        assert!(err.contains(&MAX_Z_LEVELS.to_string()), "{err}");
+    }
+
+    /// #940: a list is capped like the recurring form, before its values
+    /// are parsed — an over-long list of garbage still names the cap.
+    #[test]
+    fn parse_z_caps_the_length_of_a_list() {
+        let list = |n: usize, v: &str| vec![v; n].join(",");
+        let Some(ZSelector::Levels(levels)) = parse_z(Some(&list(MAX_Z_LEVELS, "850"))).unwrap()
+        else {
+            panic!("a list at the cap is accepted");
+        };
+        assert_eq!(levels.len(), MAX_Z_LEVELS);
+        for v in ["850", "x"] {
+            let err = parse_z(Some(&list(MAX_Z_LEVELS + 1, v)))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{}", MAX_Z_LEVELS + 1))
+                    && err.contains(&format!("maximum of {MAX_Z_LEVELS}")),
+                "{err}"
+            );
+        }
     }
 
     fn pressure_extent() -> VerticalDimension {

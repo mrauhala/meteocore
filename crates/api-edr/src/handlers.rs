@@ -1293,7 +1293,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": "Vertical level selector. Forms: z=850 (one level); z=10,80,200 (a list); z=100/550 (every advertised level between and including the two); z=../850 or z=500/.. (open intervals, reaching the lowest or highest advertised level); z=R20/100/50 (20 levels 50 apart starting at 100, at most 1000 levels, treated as a list). A single level or list is matched against the collection's advertised vertical extent by the collection's engine (the response domain reports the level served). A collection with no vertical extent ignores z, but a malformed z is still a 400."
+                    "description": format!("Vertical level selector. Forms: z=850 (one level); z=10,80,200 (a list); z=100/550 (every advertised level between and including the two); z=../850 or z=500/.. (open intervals, reaching the lowest or highest advertised level); z=R20/100/50 (20 levels 50 apart starting at 100, treated as a list). A list or recurring interval names at most {} levels; more is a 400. A single level or list is matched against the collection's advertised vertical extent by the collection's engine, which keeps only the levels it has: an exact level, or on radar volumes a sweep within 0.05° of the requested elevation angle (the response domain reports the level served). An interval or list that matches no level is a 400. A collection with no vertical extent ignores z, but a malformed z is still a 400.", crate::params::MAX_Z_LEVELS)
                 },
                 "coords-point": {
                     "name": "coords",
