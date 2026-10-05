@@ -9,6 +9,8 @@
 #   - it is detached at a commit already in origin/main.
 # Entries whose directory is gone are pruned; their branches get the same
 # merged-PR test before deletion. Everything else is listed as kept, with why.
+# A removed worktree's build dir, `<repo>/target-<worktree name>` (lint.sh's
+# default), goes with it. Build dirs left without a worktree are listed.
 set -u
 case ${1:-} in
   "") apply="" ;;
@@ -32,6 +34,12 @@ merged_pr() {  # <branch> → "<n> <sha>" when its PR merged and nothing extra i
   echo "$n $sha"
 }
 
+drop_target() {  # <worktree path> → remove <repo>/target-<name> if it exists
+  local t="$main/target-${1:t}"
+  [ -d "$t" ] || return 0
+  rm -rf "$t" && echo "  removed build dir ${t:t}"
+}
+
 git worktree list --porcelain | awk '
   /^worktree /{w=substr($0,10)} /^branch /{b=substr($0,19); print w "\t" b}
   /^detached/{print w "\t-"}' | tail -n +2 |
@@ -51,7 +59,7 @@ while IFS=$'\t' read -r wt br; do
   if [ "$br" = - ]; then
     if git merge-base --is-ancestor "$(git -C "$wt" rev-parse HEAD)" origin/main; then
       echo "remove (detached, in main): $wt"
-      [ -n "$apply" ] && git worktree remove "$wt"
+      [ -n "$apply" ] && git worktree remove "$wt" && drop_target "$wt"
     else
       echo "KEEP (detached, not in main): $wt"
     fi
@@ -59,9 +67,15 @@ while IFS=$'\t' read -r wt br; do
   fi
   if pr=$(merged_pr "$br"); then
     echo "remove (PR #${pr%% *} merged): $wt [$br]"
-    [ -n "$apply" ] && git worktree remove "$wt" && git branch -D "$br" >/dev/null
+    [ -n "$apply" ] && git worktree remove "$wt" && git branch -D "$br" >/dev/null \
+      && drop_target "$wt"
   else
     echo "KEEP (no merged PR, or commits outside it): $wt [$br]"
   fi
+done
+live=$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | xargs -n1 basename)
+for t in "$main"/target-*(N/); do
+  print -r -- "$live" | grep -qx "${${t:t}#target-}" ||
+    echo "build dir without a worktree: ${t:t} ($(du -sh "$t" | awk '{print $1}')); rm -rf it if it is yours"
 done
 [ -n "$apply" ] || echo "(dry run: pass --apply to remove)"
