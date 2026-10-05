@@ -20,6 +20,12 @@ impl GribEngine {
 
     /// Exact discrete selection; unavailable levels never silently snap to a
     /// different surface. Missing fields at a valid level remain missing.
+    ///
+    /// A requested list (`z=850,700`, or the levels `Rn/min/step` expands
+    /// to) keeps the run's levels it names, in request order and each once,
+    /// as an interval keeps those inside it (`/req/edr/z-response` B, D, E):
+    /// a level the run lacks is dropped, and only a request naming none of
+    /// them is a 400.
     pub(crate) fn selected_levels(
         &self,
         catalog: &Catalog,
@@ -39,21 +45,17 @@ impl GribEngine {
             .get(&run)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let selected = z.unwrap_or(available);
-        if selected.is_empty()
-            || selected
-                .iter()
-                .any(|v| !v.is_finite() || !available.contains(v))
-        {
-            return Err(DataServerError::InvalidParameter(format!(
-                "Requested vertical level is unavailable in this run; available levels: {available:?}"
-            )));
-        }
         let mut levels = Vec::new();
-        for &value in selected {
-            if !levels.contains(&Some(value)) {
+        for &value in z.unwrap_or(available) {
+            if available.contains(&value) && !levels.contains(&Some(value)) {
                 levels.push(Some(value));
             }
+        }
+        if levels.is_empty() {
+            return Err(DataServerError::InvalidParameter(format!(
+                "The requested vertical levels select none of the levels available in this \
+                 run; available levels: {available:?}"
+            )));
         }
         Ok(levels)
     }
@@ -552,6 +554,64 @@ mod tests {
         assert_eq!(area.ranges["TMP"].axis_names, ["z", "y", "x"]);
         assert!(area.ranges["OTHER"].values[4..].iter().all(Option::is_none));
         assert!((area.ranges["TMP"].values[4].unwrap() + 23.15).abs() < 1e-9);
+    }
+
+    /// `/req/edr/z-response` B, D, E: a `z` list, or the levels a recurring
+    /// interval expands to, keeps the run's levels it names, as an interval
+    /// does; only a list naming none of them is a 400.
+    #[test]
+    fn z_lists_keep_the_available_levels_and_reject_only_none() {
+        let source = TestSource::new();
+        source.write(
+            "f000",
+            &[
+                ("TMP", "850 mb", message(0, 270.0, [0; 4], 100, 85000)),
+                ("TMP", "500 mb", message(0, 250.0, [0; 4], 100, 50000)),
+            ],
+            0,
+        );
+        let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+        let views = engine.level_collections();
+        let pressure = &views[0];
+        let tmp = ["TMP".to_string()];
+        let position =
+            |z: &[f64]| pressure.query_position("POINT(0.5 0.5)", None, Some(&tmp), Some(z), None);
+        let profile_levels = |z: &[f64]| match position(z).unwrap() {
+            CoverageResponse::Collection(profiles) => match &profiles[0].domain {
+                DomainDescription::VerticalProfile { z, .. } => z.values.clone(),
+                other => panic!("{other:?}"),
+            },
+            CoverageResponse::Single(series) => match &series.domain {
+                DomainDescription::PointSeries { z: Some(z), .. } => z.values.clone(),
+                other => panic!("{other:?}"),
+            },
+        };
+        // Unavailable members drop out; request order holds, repeats once.
+        assert_eq!(
+            profile_levels(&[500.0, 200.0, 850.0, 500.0]),
+            [500.0, 850.0]
+        );
+        // `R4/1000/-150` = 1000, 850, 700, 550: only 850 is in the run.
+        assert_eq!(profile_levels(&[1000.0, 850.0, 700.0, 550.0]), [850.0]);
+        let CoverageResponse::Single(area) = pressure
+            .query_area("0,0,1,1", None, Some(&tmp), Some(&[925.0, 500.0]), None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let DomainDescription::Grid { z: Some(z), .. } = &area.domain else {
+            panic!()
+        };
+        assert_eq!(z.values, [500.0]);
+        // Naming none of the run's levels is a 400 listing the ones there are.
+        for z in [&[925.0][..], &[925.0, 200.0]] {
+            match position(z) {
+                Err(DataServerError::InvalidParameter(m)) => {
+                    assert!(m.contains("[850.0, 500.0]"), "{m}")
+                }
+                other => panic!("{z:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]

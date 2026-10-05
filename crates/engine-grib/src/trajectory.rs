@@ -61,7 +61,8 @@ impl GribEngine {
                     .unwrap_or_default(),
             )
         });
-        // Exact levels, like position: an unavailable `z` is a 400.
+        // Exact levels, like position: the run's levels `z` names, a 400
+        // when it names none.
         let z_levels: Option<Vec<f64>> = z
             .map(|z| {
                 self.selected_levels(&catalog, run.reference_time, Some(z))

@@ -406,7 +406,15 @@ fn locations_pages_share_the_inventory_byte_budget() {
                 }
             };
             for (uri, hint) in [
-                ("/collections/weather/locations", "page it with limit"),
+                (
+                    "/collections/weather/locations",
+                    "Complete location inventory exceeds the configured response limit; page it with limit",
+                ),
+                // Filtered, not the complete inventory (#961).
+                (
+                    "/collections/weather/locations?bbox=-180,-90,180,90",
+                    "Filtered location list exceeds the configured response limit; page it with limit",
+                ),
                 (
                     "/collections/weather/locations?limit=100",
                     "request a smaller limit",

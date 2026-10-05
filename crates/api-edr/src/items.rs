@@ -32,8 +32,8 @@ use ds_core::feature::{Bbox, DatetimeInterval, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
 
 use crate::handlers::{
-    bad_request, execute_query, lookup_collection, map_query_error, request_base_url, server_error,
-    AppState, EdrState, HandlerError,
+    bad_request, error_response, execute_query, lookup_collection, map_query_error,
+    request_base_url, server_error, AppState, EdrState, HandlerError,
 };
 
 /// Page size without `limit` (`/req/edr/rc-limit-definition`).
@@ -322,11 +322,11 @@ pub fn openapi_paths(id: &str, title: &str) -> Vec<(String, Value)> {
     });
     let errors = |not_found: &str| {
         json!({
-            "400": {"description": "Bad request"},
-            "404": {"description": not_found},
-            "500": {"description": "Server error"},
-            "503": {"description": "Query capacity exhausted; retry later"},
-            "504": {"description": "Query deadline exceeded"}
+            "400": error_response(400, "Bad request"),
+            "404": error_response(404, not_found),
+            "500": error_response(500, "Server error"),
+            "503": error_response(503, "Query capacity exhausted; retry later"),
+            "504": error_response(504, "Query deadline exceeded")
         })
     };
     let with_ok = |ok: Value, not_found: &str| {
