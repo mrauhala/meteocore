@@ -774,9 +774,9 @@ async fn a_location_list_is_one_feature_collection_in_request_order() {
         "{json}"
     );
 
-    // A gridded collection offers no GeoJSON for a list either.
+    // A gridded collection serves no location queries at all (#965).
     let (status, _, _) = request("/collections/grid/locations/a,b?f=GeoJSON", None).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

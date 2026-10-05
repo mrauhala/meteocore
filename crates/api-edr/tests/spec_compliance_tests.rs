@@ -992,8 +992,8 @@ async fn finding_20_instances_endpoint_present() {
 // ===========================================================================
 // Spec: EDR query endpoints should accept "crs" parameter to specify the
 //   CRS of the response data.
-// Implementation: LocationQueryParams only has datetime and parameter_name.
-// Fix: Add "crs" (and "f") to LocationQueryParams.
+// RESOLVED (#965): every data query, location queries included, reads
+//   `crs` and accepts CRS84, the one CRS its `crs_details` lists.
 
 #[tokio::test]
 async fn finding_21_location_query_params_incomplete() {
@@ -1007,10 +1007,12 @@ async fn finding_21_location_query_params_incomplete() {
         get_json("/collections/weather/locations/station1?parameter-name=temperature").await;
     assert_eq!(status, StatusCode::OK);
 
-    // "crs" param is not supported but should be accepted without error
-    // (axum by default ignores unknown query params, so this passes)
+    // `crs` names CRS84, the one CRS served; any other is a 400 (#965).
     let (status, _) = get_json("/collections/weather/locations/station1?crs=CRS84").await;
     assert_eq!(status, StatusCode::OK);
+    let (status, json) = get_json("/collections/weather/locations/station1?crs=EPSG:3067").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BadRequest");
 }
 
 // ===========================================================================
