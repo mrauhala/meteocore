@@ -188,20 +188,25 @@ fn edr_location_series_position_and_parameter_filter() {
     assert_eq!(q.parameters["relative_humidity"].unit, "%");
     assert_eq!(q.parameters["air_temperature"].unit, "°C");
 
-    // Parameter filter keeps only known names.
+    // `parameter-name` is the shared rule (#966): case-insensitive, and an
+    // unknown name or an empty list is a 400, never silently narrowed.
     let CoverageResponse::Single(q) = e
-        .query_location(
-            SMHI,
-            None,
-            Some(&["wind_speed".to_string(), "nope".to_string()]),
-            None,
-            None,
-        )
+        .query_location(SMHI, None, Some(&["WIND_SPEED".to_string()]), None, None)
         .unwrap()
     else {
         panic!()
     };
     assert_eq!(q.ranges.keys().collect::<Vec<_>>(), vec!["wind_speed"]);
+    for names in [vec!["wind_speed".to_string(), "nope".to_string()], vec![]] {
+        assert!(matches!(
+            e.query_location(SMHI, None, Some(&names), None, None),
+            Err(DataServerError::InvalidParameter(m)) if m.contains("wind_speed")
+        ));
+        assert!(matches!(
+            e.query_area("18,57,20,58", None, Some(&names), None, None),
+            Err(DataServerError::InvalidParameter(_))
+        ));
+    }
 
     // Position: 5 km from Östergarnsholm hits it; the middle of the Baltic
     // is beyond 25 km → 404.

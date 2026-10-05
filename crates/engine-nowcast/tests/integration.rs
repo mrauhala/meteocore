@@ -2671,6 +2671,36 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
         "about half the bbox masked: {inside}/{}",
         tx.len() * ty.len()
     );
+
+    // #966: a rectangle keeps every block whose footprint meets it, a block
+    // centred just outside included; only the padding blocks wholly outside
+    // the bbox are on the axes without values.
+    let (w, s, e, n) = (2.5, 52.5, 7.5, 57.5);
+    let rect = format!("POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))");
+    let CoverageResponse::Single(rect_cov) = engine
+        .query_area(&rect, None, None, None, None)
+        .expect("rectangle area query")
+    else {
+        panic!("expected a single coverage");
+    };
+    let DomainDescription::Grid { x: rx, y: ry, .. } = &rect_cov.domain else {
+        panic!("expected a Grid domain");
+    };
+    assert!(rx[0] < w && rx[rx.len() - 1] > e, "padded x axis {rx:?}");
+    let (hx, hy) = ((rx[1] - rx[0]) / 2.0, (ry[1] - ry[0]) / 2.0);
+    let ru = &rect_cov.ranges["motion_u"].values;
+    let (mut valued_outside, mut null_padding) = (0, 0);
+    for (iy, &lat) in ry.iter().enumerate() {
+        for (ix, &lon) in rx.iter().enumerate() {
+            let meets = lon - hx <= e && lon + hx >= w && lat - hy <= n && lat + hy >= s;
+            let valued = ru[iy * rx.len() + ix].is_some();
+            assert_eq!(valued, meets, "block centred at ({lon}, {lat})");
+            let centre_in = (w..=e).contains(&lon) && (s..=n).contains(&lat);
+            valued_outside += usize::from(valued && !centre_in);
+            null_padding += usize::from(!valued);
+        }
+    }
+    assert!(valued_outside > 0 && null_padding > 0);
 }
 
 #[test]

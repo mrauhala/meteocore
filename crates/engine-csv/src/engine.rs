@@ -109,15 +109,20 @@ impl CsvEngine {
             )));
         }
 
-        // Determine which parameters to include
-        let param_names: Vec<String> = match parameters {
-            Some(requested) => requested
-                .iter()
-                .filter(|p| self.store.parameter_names.contains(p))
-                .cloned()
-                .collect(),
-            None => self.store.parameter_names.clone(),
-        };
+        // Which parameters to include: the shared `parameter-name` rule, so
+        // an unknown name or an empty list is a 400 naming the valid ones
+        // and matching ignores case (#666, #966).
+        let available: Vec<&str> = self
+            .store
+            .parameter_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let param_names: Vec<String> =
+            ds_core::edr_engine::select_parameters(parameters, &available)?
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
 
         // Build time axis (sorted)
         let first_row = &self.store.rows[row_indices[0]];
@@ -720,6 +725,33 @@ mod tests {
         let engine = CsvEngine::new(test_store());
         let result = engine.get_feature("NonExistent");
         assert!(result.is_err());
+    }
+
+    /// `parameter-name` is the shared rule (#966): case-insensitive, the
+    /// canonical spelling back, and an unknown name or an empty list is a
+    /// 400 naming the valid ones, never silently narrowed.
+    #[test]
+    fn parameter_name_is_known_names_only() {
+        let engine = CsvEngine::new(test_store());
+        let station = "Alajärvi Möksy";
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let CoverageResponse::Single(q) = engine
+            .query_location(station, None, Some(&names(&["TEMPERATURE"])), None, None)
+            .unwrap()
+        else {
+            panic!("a location query answers one coverage");
+        };
+        assert_eq!(q.ranges.keys().collect::<Vec<_>>(), vec!["temperature"]);
+        for requested in [names(&["temperature", "nope"]), names(&[])] {
+            assert!(matches!(
+                engine.query_location(station, None, Some(&requested), None, None),
+                Err(DataServerError::InvalidParameter(m)) if m.contains("wind_speed")
+            ));
+            assert!(matches!(
+                engine.query_area("19,59,32,71", None, Some(&requested), None, None),
+                Err(DataServerError::InvalidParameter(_))
+            ));
+        }
     }
 
     /// The `serves_station_series` contract EDR GeoJSON relies on (#929):

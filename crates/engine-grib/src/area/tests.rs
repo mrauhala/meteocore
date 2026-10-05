@@ -245,6 +245,139 @@ fn single_and_legacy_radius_queries_fetch_each_field_once() {
 }
 
 #[test]
+fn rectangle_nodes_whose_cell_misses_an_unaligned_bbox_are_null() {
+    // #966: the native subset encloses the bbox with the nodes around it;
+    // a rectangle keeps the nodes whose cell (half a spacing either side)
+    // meets it, and nulls the rest.
+    let (_source, engine) = fixture(None, 1, 1, &[]);
+    let p0 = |offset: f64| Some(f64::from(base_value(0, 0)) + offset - 273.15);
+    for (coords, expected) in [
+        // Only the (1, 1) cell meets the bbox, in either form.
+        ("0.6,0.6,1.5,1.5", [None, None, None, p0(2.0)]),
+        (
+            "POLYGON((0.6 0.6,1.5 0.6,1.5 1.5,0.6 1.5,0.6 0.6))",
+            [None, None, None, p0(2.0)],
+        ),
+        // Centres outside, cells reaching in: every node keeps its value.
+        ("0.2,0.2,1.5,1.5", [p0(4.0), p0(6.0), p0(0.0), p0(2.0)]),
+        // On the nodes: every one.
+        ("0,0,1,1", [p0(4.0), p0(6.0), p0(0.0), p0(2.0)]),
+        // Between nodes: the cell it lies in.
+        ("0.3,0.3,0.4,0.4", [p0(4.0), None, None, None]),
+    ] {
+        let result = single(
+            engine
+                .query_area(coords, None, Some(&[parameter(0)]), None, None)
+                .unwrap(),
+        );
+        let DomainDescription::Grid { x, y, .. } = &result.domain else {
+            panic!("expected a grid")
+        };
+        assert_eq!(
+            (x.as_slice(), y.as_slice()),
+            (&[0.0, 1.0][..], &[0.0, 1.0][..])
+        );
+        let values = &result.ranges["P0"].values;
+        assert_eq!(values.len(), 4, "{coords}");
+        for (&actual, expected) in values.iter().zip(expected) {
+            assert_value(actual, expected);
+        }
+    }
+    // GRIB areas still never cross the antimeridian (#667).
+    assert!(matches!(
+        engine.query_area("170,10,-170,20", None, Some(&[parameter(0)]), None, None),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+}
+
+#[test]
+fn area_and_radius_default_to_every_parameter_of_the_view() {
+    // /req/edr/parameter-name-response A (#966): without `parameter-name`,
+    // every parameter, as position and cube answer, not one default.
+    for kind in [
+        None,
+        Some(GribLevelType::Single),
+        Some(GribLevelType::Pressure),
+    ] {
+        let levels = if kind == Some(GribLevelType::Pressure) {
+            2
+        } else {
+            1
+        };
+        let (_source, owner) = fixture(kind, 3, levels, &[]);
+        let engine = view(&owner);
+        let names: Vec<_> = (0..3).map(parameter).collect();
+        for result in [
+            engine.query_area("0,0,1,1", None, None, None, None),
+            engine.query_radius("POINT(0 0)", 20_000.0, None, None, None, None),
+        ] {
+            let result = single(result.unwrap());
+            let mut returned: Vec<_> = result.ranges.keys().cloned().collect();
+            returned.sort();
+            assert_eq!(returned, names, "{kind:?}");
+            let mut described: Vec<_> = result.parameters.keys().cloned().collect();
+            described.sort();
+            assert_eq!(described, names, "{kind:?}");
+            for (param, name) in names.iter().enumerate() {
+                let values = &result.ranges[name].values;
+                assert_eq!(values.len(), levels * 4, "{kind:?} {name}");
+                // The south-west node of the first level (the bottom, highest
+                // pressure, of a pressure view), from its own field.
+                assert_value(
+                    values[0],
+                    Some(
+                        f64::from(base_value(param, levels - 1)) + 4.0
+                            - if param.is_multiple_of(2) { 273.15 } else { 0.0 },
+                    ),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_defaulted_parameter_missing_at_its_canonical_level_is_null() {
+    // Legacy layout: `T` is canonical at 2 m (step 1) but step 0 carries it
+    // only at the surface. Named, that is a 400 (never a substitute level);
+    // defaulted, it is null beside the parameters that are there.
+    let source = TestSource::new();
+    source.write(
+        "f000",
+        &[
+            ("T", "surface", message(0, 280.0, [0, 2, 4, 6], 1, 0)),
+            (
+                "Q",
+                "2 m above ground",
+                message(0, 270.0, [0, 2, 4, 6], 103, 2),
+            ),
+        ],
+        0,
+    );
+    source.write(
+        "f001",
+        &[
+            ("T", "2 m above ground", message(0, 290.0, [0; 4], 103, 2)),
+            ("Q", "2 m above ground", message(0, 275.0, [0; 4], 103, 2)),
+        ],
+        1,
+    );
+    let engine = GribEngine::new("canonical", &source.config()).unwrap();
+    let step0: DateTime<Utc> = "2026-04-05T00:00:00Z".parse().unwrap();
+    let datetime = Some((step0, step0));
+    assert!(matches!(
+        engine.query_area("0,0,1,1", datetime, Some(&["T".into()]), None, None),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+    let result = single(
+        engine
+            .query_area("0,0,1,1", datetime, None, None, None)
+            .unwrap(),
+    );
+    assert_eq!(result.ranges["T"].values, vec![None; 4]);
+    assert_value(result.ranges["Q"].values[0], Some(274.0 - 273.15));
+}
+
+#[test]
 fn invalid_requests_and_oversized_areas_stop_before_loading_other_fields() {
     let source = TestSource::new();
     let global = include_bytes!("../../../../testdata/grib-local/sample-message.grib2");
@@ -284,6 +417,11 @@ fn invalid_requests_and_oversized_areas_stop_before_loading_other_fields() {
     ));
     assert_eq!(store.reads.lock().unwrap().attempts.len(), 1);
     assert_eq!(engine.storage_bytes_read(), global.len() as u64);
+    // Every parameter by default (#966) is held to the same budget.
+    assert!(matches!(
+        engine.query_area("-180,-90,180,90", None, None, None, None),
+        Err(DataServerError::QueryTooLarge(_))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -115,9 +115,11 @@ pub struct MotionGrid {
 /// `bbox` (`[west, south, east, north]`, WGS84), plus one block of padding
 /// on each side, converted to east/north m/s over `interval_secs`.
 /// Overlap, not centre-inside: a bbox smaller than one block spacing still
-/// gets the block it sits in. The padding is what lets a client bilinear-
-/// sample right up to the bbox edge — the same enclosing-cell selection
-/// GRIB's `extract_bbox` does. `None` when the bbox misses the grid.
+/// gets the block it sits in. The padding is the same enclosing-cell
+/// selection GRIB's `extract_bbox` does. The EDR area query then nulls the
+/// blocks outside its polygon: for a rectangle, those whose footprint misses
+/// it, so the overlapping blocks keep their values and the padding blocks
+/// are on the axes without them (#966). `None` when the bbox misses the grid.
 ///
 /// A block's centre is at working-grid pixel `((b + 0.5) * block)` on each
 /// axis — the same convention [`MotionField::sample`] interpolates

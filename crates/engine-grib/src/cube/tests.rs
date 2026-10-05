@@ -139,6 +139,83 @@ fn cube_is_steps_by_levels_by_the_native_bbox() {
 }
 
 #[test]
+fn native_cube_keeps_only_the_nodes_whose_cell_meets_the_bbox() {
+    // /req/edr/rc-bbox-response-cube A (#966): an enclosing node whose cell
+    // (half a spacing either side) lies wholly outside an unaligned bbox is
+    // trimmed from the axes.
+    let (_source, engine) = fixture(Some(GribLevelType::Pressure));
+    let cube = |bbox: Bbox| {
+        engine.query_cube(
+            &bbox,
+            Some((at(0), at(0))),
+            Some(&["P0".to_string()]),
+            Some(&[850.0]),
+            CubeResolution::default(),
+            None,
+        )
+    };
+    for (west, south, east, north, xs, ys, cells) in [
+        (0.6, 0.6, 1.5, 1.5, vec![1.0], vec![1.0], vec![2.0]),
+        (
+            0.0,
+            0.6,
+            1.0,
+            1.0,
+            vec![0.0, 1.0],
+            vec![1.0],
+            vec![0.0, 2.0],
+        ),
+        // On the nodes: unchanged.
+        (
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            vec![0.0, 1.0],
+            vec![0.0, 1.0],
+            CELLS.to_vec(),
+        ),
+        // A cell edge touching the bbox edge intersects it.
+        (
+            0.5,
+            0.5,
+            1.5,
+            1.5,
+            vec![0.0, 1.0],
+            vec![0.0, 1.0],
+            CELLS.to_vec(),
+        ),
+        // Between nodes: the cells the bbox lies in.
+        (0.3, 0.3, 0.4, 0.4, vec![0.0], vec![0.0], vec![4.0]),
+        (
+            0.4,
+            0.4,
+            0.6,
+            0.6,
+            vec![0.0, 1.0],
+            vec![0.0, 1.0],
+            CELLS.to_vec(),
+        ),
+    ] {
+        let result = grid(cube(bbox(west, south, east, north)).unwrap());
+        let DomainDescription::Grid { x, y, .. } = result.domain else {
+            panic!("expected a Grid")
+        };
+        assert_eq!((&x, &y), (&xs, &ys), "bbox {west},{south},{east},{north}");
+        let range = &result.ranges["P0"];
+        assert_eq!(range.shape, [1, 1, ys.len(), xs.len()]);
+        for (&actual, cell) in range.values.iter().zip(cells) {
+            assert_close(actual, Some(expected(0, 1, 0, cell)));
+        }
+    }
+    // More than half a cell past the last node: no cell intersects it.
+    assert!(matches!(
+        cube(bbox(1.6, 1.6, 1.8, 1.8)),
+        Err(DataServerError::LocationNotFound(_))
+    ));
+}
+
+#[test]
 fn resolution_resamples_by_nearest_neighbour_and_reads_only_sampled_levels() {
     let (_source, engine) = fixture(Some(GribLevelType::Pressure));
     let probed = engine.storage_bytes_read(); // discovery's header probes

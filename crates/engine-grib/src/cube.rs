@@ -59,7 +59,7 @@ impl GribEngine {
                 }
                 unique
             }),
-            None => keys.keys().cloned().collect(),
+            None => self.default_parameters(steps.iter().map(|(_, file)| *file), &keys),
         };
         self.validate_parameters(&keys, &params)?;
         if params.is_empty() {
@@ -143,6 +143,11 @@ impl GribEngine {
             (grid.lon_inc.abs(), grid.lat_inc.abs()),
             params[first_param].clone(),
         ));
+        if layout.x.is_empty() || layout.y.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "The bbox lies outside the collection's grid".into(),
+            ));
+        }
         check_cube_budget(
             steps.len(),
             z_axis.len(),
@@ -277,8 +282,8 @@ fn cube_steps<'a>(
 }
 
 /// The output grid of a cube over one native grid: the native subset's axes
-/// and, per output position, the subset index it samples (identity at the
-/// native resolution).
+/// and, per output position, the subset index it samples (at the native
+/// resolution, the subset's nodes whose cell meets the bbox).
 struct CubeLayout {
     bbox: [f64; 4],
     native_x: Vec<f64>,
@@ -357,9 +362,9 @@ impl CubeLayout {
     }
 }
 
-/// An output axis and its index map into the native `axis`: the native axis
-/// itself, or `n` evenly spaced positions from `min` to `max` sampling the
-/// nearest node within half a native `spacing`.
+/// An output axis and its index map into the native `axis`: the native nodes
+/// whose cell meets `min..=max`, or `n` evenly spaced positions from `min` to
+/// `max` sampling the nearest node within half a native `spacing`.
 fn axis_map(
     axis: &[f64],
     resolution: Option<usize>,
@@ -368,7 +373,22 @@ fn axis_map(
     spacing: f64,
 ) -> (Vec<f64>, Vec<Option<usize>>) {
     match resolution {
-        None => (axis.to_vec(), (0..axis.len()).map(Some).collect()),
+        // `bbox_subset` rounds out to the enclosing nodes, whose cells can
+        // lie wholly outside an unaligned bbox (/req/edr/rc-bbox-response-cube
+        // A, #966): keep the nodes whose cell, half a spacing either side
+        // (with rounding slack), intersects it, as an area query's rectangle
+        // mask does. The cells tile the grid, so a bbox between two nodes
+        // keeps the cell it lies in, and none at all is a bbox off the grid.
+        None => {
+            let reach = spacing * HALF_CELL;
+            let kept: Vec<usize> = (0..axis.len())
+                .filter(|&i| axis[i] >= min - reach && axis[i] <= max + reach)
+                .collect();
+            (
+                kept.iter().map(|&i| axis[i]).collect(),
+                kept.into_iter().map(Some).collect(),
+            )
+        }
         Some(n) => {
             let positions = axis_positions(min, max, n);
             let map = nearest_indices(axis, &positions, spacing * HALF_CELL);

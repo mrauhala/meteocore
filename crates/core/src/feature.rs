@@ -289,8 +289,8 @@ impl QueryPolygon {
 
     /// `true` when the polygon is exactly its bounding box (the
     /// `west,south,east,north` form, or an axis-aligned rectangle ring with no
-    /// holes): every cell centre inside the bbox is inside the polygon, so
-    /// a mask is all-true without a ring walk.
+    /// holes): a cell intersects the polygon exactly when its footprint
+    /// intersects the bbox, so a mask needs no ring walk.
     pub fn is_rectangle(&self) -> bool {
         if !self.holes.is_empty() {
             return false;
@@ -473,28 +473,11 @@ impl QueryPolygon {
     /// polygon vertex (within one cell spacing, see the rounding note in the
     /// body) are used instead, so a small-but-real shape still returns its
     /// data instead of a false "no cell inside" 404 (#671). A rectangle
-    /// (the bbox form) is all-true without a ring walk; bound the rest with
-    /// [`check_mask_budget`].
+    /// (the bbox form) instead keeps every cell whose footprint, halfway to
+    /// its neighbours, intersects it, without a ring walk (#966); bound the
+    /// rest with [`check_mask_budget`].
     pub fn mask_cells(&self, x: &[f64], y: &[f64]) -> Vec<bool> {
         let (nx, ny) = (x.len(), y.len());
-        if self.is_rectangle() {
-            // The axes were built inside this bbox, so every centre is in.
-            return vec![true; nx * ny];
-        }
-        let mut mask: Vec<bool> = y
-            .iter()
-            .flat_map(|&yy| x.iter().map(move |&xx| (xx, yy)))
-            .map(|(xx, yy)| self.contains(xx, yy))
-            .collect();
-        if mask.iter().any(|&m| m) || nx == 0 || ny == 0 {
-            return mask;
-        }
-        // One-cell tolerance from the axis spacing (a single-cell axis spans
-        // the whole bbox): every vertex lies inside the grid footprint, whose
-        // outermost centres are at most half a cell from its edge, so the
-        // nearest centre is always within one cell — the tolerance only
-        // rejects a vertex that is off the grid altogether. Half a cell would
-        // let a vertex exactly on the bbox edge miss by rounding.
         let spacing = |axis: &[f64], lo: f64, hi: f64| -> f64 {
             if axis.len() > 1 {
                 (axis[1] - axis[0]).abs().max(f64::EPSILON)
@@ -504,6 +487,56 @@ impl QueryPolygon {
         };
         let hx = spacing(x, self.bbox.west, self.bbox.east);
         let hy = spacing(y, self.bbox.south, self.bbox.north);
+        let mut mask: Vec<bool> = if self.is_rectangle() {
+            // A cell is in when its footprint intersects the bbox, per axis:
+            // no ring walk. An engine's native axes may reach past the bbox
+            // (GRIB's enclosing nodes), and a cell lying wholly outside it is
+            // outside the area (/req/edr/coords-response A, #966). Longitude
+            // modulo 360, so a seam-crossing bbox and an axis in another turn
+            // agree; a hair of slack keeps a footprint computed onto an edge.
+            let Bbox {
+                west,
+                south,
+                east,
+                north,
+            } = self.bbox;
+            let lon_span = if self.bbox.crosses_antimeridian() {
+                east + 360.0 - west
+            } else {
+                east - west
+            };
+            let (tx, ty) = (hx * 1e-9, hy * 1e-9);
+            let x_in: Vec<bool> = x
+                .iter()
+                .zip(cell_footprints(x, hx, true))
+                .map(|(&lon, (lo, hi))| {
+                    let d = (lon - west).rem_euclid(360.0);
+                    (d + lo <= lon_span + tx && d + hi >= -tx) || d + hi - 360.0 >= -tx
+                })
+                .collect();
+            let y_in: Vec<bool> = y
+                .iter()
+                .zip(cell_footprints(y, hy, false))
+                .map(|(&lat, (lo, hi))| lat + lo <= north + ty && lat + hi >= south - ty)
+                .collect();
+            y_in.iter()
+                .flat_map(|&y_in| x_in.iter().map(move |&x_in| x_in && y_in))
+                .collect()
+        } else {
+            y.iter()
+                .flat_map(|&yy| x.iter().map(move |&xx| (xx, yy)))
+                .map(|(xx, yy)| self.contains(xx, yy))
+                .collect()
+        };
+        if mask.iter().any(|&m| m) || nx == 0 || ny == 0 {
+            return mask;
+        }
+        // One-cell tolerance from the axis spacing (a single-cell axis spans
+        // the whole bbox): every vertex lies inside the grid footprint, whose
+        // outermost centres are at most half a cell from its edge, so the
+        // nearest centre is always within one cell — the tolerance only
+        // rejects a vertex that is off the grid altogether. Half a cell would
+        // let a vertex exactly on the bbox edge miss by rounding.
         let nearest = |axis: &[f64], v: f64, tol: f64| -> Option<usize> {
             axis.iter()
                 .enumerate()
@@ -524,6 +557,36 @@ impl QueryPolygon {
         }
         mask
     }
+}
+
+/// Each cell's footprint along `axis` (either orientation) as `(lo, hi)`
+/// offsets from its centre: halfway to each neighbour, so the footprints
+/// tile the grid. An end cell mirrors its one neighbour; a lone cell spans
+/// `single`. With `wrap` (longitude) a step is taken modulo 360, so an axis
+/// wrapped at the seam stays regular.
+fn cell_footprints(axis: &[f64], single: f64, wrap: bool) -> Vec<(f64, f64)> {
+    let step = |from: f64, to: f64| {
+        let d = to - from;
+        if wrap {
+            (d + 180.0).rem_euclid(360.0) - 180.0
+        } else {
+            d
+        }
+    };
+    let n = axis.len();
+    (0..n)
+        .map(|i| {
+            let prev = i.checked_sub(1).map(|p| step(axis[i], axis[p]));
+            let next = (i + 1 < n).then(|| step(axis[i], axis[i + 1]));
+            let (prev, next) = match (prev, next) {
+                (Some(prev), Some(next)) => (prev, next),
+                (Some(prev), None) => (prev, -prev),
+                (None, Some(next)) => (-next, next),
+                (None, None) => (-single, single),
+            };
+            (prev.min(next) / 2.0, prev.max(next) / 2.0)
+        })
+        .collect()
 }
 
 /// Ray-casting point-in-polygon test for a single ring.
@@ -2200,9 +2263,119 @@ mod tests {
         assert!(ccw.is_rectangle() && cw.is_rectangle());
         assert!(tri.contains(11.0, 51.0), "on the hypotenuse");
         assert!(!tri.contains(11.0, 51.0000001));
-        // A rectangle mask is all-true without a ring walk.
+        // Axes built inside a rectangle are all inside its mask.
         let axes = rect.sample_grid(0.5, 0.5, 256);
         assert!(rect.cell_mask(&axes).iter().all(|&m| m));
+    }
+
+    #[test]
+    fn rectangle_mask_keeps_the_cells_whose_footprint_meets_the_bbox() {
+        // GRIB's native axes enclose an unaligned bbox (#966): a node whose
+        // cell, halfway to its neighbours, lies wholly outside the bbox is
+        // outside the area, in both the bbox and WKT forms and either y
+        // orientation.
+        let (x, y) = ([0.0, 1.0, 2.0], [0.0, 1.0, 2.0]);
+        let y_desc = [2.0, 1.0, 0.0];
+        let on = |m: Vec<bool>| (0..m.len()).filter(|&i| m[i]).collect::<Vec<_>>();
+        for coords in [
+            "0.6,0.6,1.4,1.4",
+            "POLYGON((0.6 0.6,1.4 0.6,1.4 1.4,0.6 1.4,0.6 0.6))",
+        ] {
+            let rect = parse_area_coords(coords).unwrap();
+            assert!(rect.is_rectangle());
+            assert_eq!(on(rect.mask_cells(&x, &y)), vec![4], "{coords}");
+            assert_eq!(on(rect.mask_cells(&x, &y_desc)), vec![4], "{coords}");
+        }
+        // A footprint touching the bbox edge intersects it.
+        let touching = parse_area_coords("0.5,0.5,1.5,1.5").unwrap();
+        assert!(touching.mask_cells(&x, &y).iter().all(|&m| m));
+        // Between two nodes: the cells the bbox lies in.
+        let tiny = parse_area_coords("0.3,0.3,0.4,0.4").unwrap();
+        assert_eq!(
+            tiny.mask_cells(&[0.0, 1.0], &[0.0, 1.0]),
+            vec![true, false, false, false]
+        );
+        let straddle = parse_area_coords("0.4,0.4,0.6,0.6").unwrap();
+        assert!(straddle
+            .mask_cells(&[0.0, 1.0], &[0.0, 1.0])
+            .iter()
+            .all(|&m| m));
+
+        // The audit's case on a 0.25° grid: 24.2 misses the 24.0 cell
+        // (23.875..24.125), 24.1 meets it.
+        let quarter: Vec<f64> = (0..=12).map(|i| 23.5 + 0.25 * f64::from(i)).collect();
+        let lat: Vec<f64> = (0..=12).map(|i| 59.5 + 0.25 * f64::from(i)).collect();
+        for (coords, kept) in [
+            ("24.2,60.2,25.8,61.8", 3..=9),
+            ("24.1,60.1,25.9,61.9", 2..=10),
+        ] {
+            let mask = parse_area_coords(coords)
+                .unwrap()
+                .mask_cells(&quarter, &lat);
+            let kept = &kept;
+            let expect: Vec<bool> = (0..=12)
+                .flat_map(|j| (0..=12).map(move |i| kept.contains(&i) && kept.contains(&j)))
+                .collect();
+            assert_eq!(mask, expect, "{coords}");
+        }
+
+        // A footprint computed onto an edge in floating point still meets
+        // it: from −180 at 0.1°, 25.9's cell starts 7e-15 past 25.85.
+        let rect = parse_area_coords("24.15,60.15,25.85,61.85").unwrap();
+        for first in [0.0, -180.0] {
+            let x: Vec<f64> = (0..=20)
+                .map(|i| first + f64::from((24.0 - first) as i32 * 10 + i) * 0.1)
+                .collect();
+            let y: Vec<f64> = (600..=620).map(|i| f64::from(i) * 0.1).collect();
+            let mask = rect.mask_cells(&x, &y);
+            let row: Vec<bool> = (0..21).map(|i| mask[5 * 21 + i]).collect();
+            let expect: Vec<bool> = (0..=20).map(|i| (1..=19).contains(&i)).collect();
+            assert_eq!(row, expect, "x from {first}: 24.1..=25.9 only");
+            assert_eq!(mask.iter().filter(|&&m| m).count(), 19 * 19);
+        }
+    }
+
+    #[test]
+    fn rectangle_mask_compares_longitude_modulo_360() {
+        let y = [5.0, 10.0, 15.0, 20.0, 25.0];
+        let y_in = [false, true, true, true, false];
+        // Seam-crossing bboxes over 5° cells: at ±170 the centres are inside;
+        // at ±171 they are not but their cells still reach in; at ±173 the
+        // cells centred at ±170 no longer do.
+        for (coords, x_in) in [
+            (
+                "170,10,-170,20",
+                [false, true, true, true, true, true, false],
+            ),
+            (
+                "171,10,-171,20",
+                [false, true, true, true, true, true, false],
+            ),
+            (
+                "173,10,-173,20",
+                [false, false, true, true, true, false, false],
+            ),
+        ] {
+            let seam = parse_area_coords(coords).unwrap();
+            assert!(seam.is_rectangle() && seam.bbox.crosses_antimeridian());
+            let expect: Vec<bool> = y_in
+                .iter()
+                .flat_map(|&yy| x_in.iter().map(move |&xx| xx && yy))
+                .collect();
+            // Wrapped into (−180, 180] and continuous through +180 alike.
+            for x in [
+                [165.0, 170.0, 175.0, 180.0, -175.0, -170.0, -165.0],
+                [165.0, 170.0, 175.0, 180.0, 185.0, 190.0, 195.0],
+            ] {
+                assert_eq!(seam.mask_cells(&x, &y), expect, "{coords} {x:?}");
+            }
+        }
+        // An axis a turn away from a bbox that does not cross the seam.
+        let rect = parse_area_coords("-10,0,10,10").unwrap();
+        assert_eq!(
+            rect.mask_cells(&[340.0, 350.0, 360.0, 370.0, 380.0], &[5.0]),
+            vec![false, true, true, true, false]
+        );
     }
 
     #[test]

@@ -33,14 +33,18 @@ impl GribEngine {
             .unwrap_or_default();
         let levels = self.selected_levels(&catalog, run.reference_time, z)?;
 
-        // Default to first near-surface parameter
-        let query_params: Vec<&str> = match parameters {
-            Some(p) => p.iter().map(|s| s.as_str()).collect(),
-            None => step_file
-                .default_message()
-                .map(|m| vec![m.param.as_str()])
-                .unwrap_or_default(),
+        // Without `parameter-name`, every parameter of the view, as position
+        // and cube answer (/req/edr/parameter-name-response A, #966); the
+        // value budget below makes too many of them a 400.
+        let defaults = match parameters {
+            Some(_) => Vec::new(),
+            None => self.default_parameters([step_file], &keys),
         };
+        let query_params: Vec<&str> = parameters
+            .unwrap_or(&defaults)
+            .iter()
+            .map(String::as_str)
+            .collect();
 
         if query_params.is_empty() {
             return Err(DataServerError::InvalidParameter(
@@ -63,7 +67,9 @@ impl GribEngine {
                 .map(|&z| Self::keys_at_level(&keys, z))
                 .collect::<Vec<_>>(),
         );
-        if self.vertical_kind().is_none() {
+        // A requested field missing at its canonical level is an error; a
+        // defaulted one is null, so one gap cannot fail the whole default.
+        if self.vertical_kind().is_none() && parameters.is_some() {
             for &name in &query_params {
                 if !step_file
                     .messages
