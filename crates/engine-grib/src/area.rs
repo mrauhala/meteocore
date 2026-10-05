@@ -16,8 +16,8 @@ impl GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         ds_core::deadline::check()?;
-        // The polygon's bbox selects the native grid subset; cells whose
-        // centre falls outside the polygon are masked to null (#671).
+        // The polygon's bbox selects the native grid subset; cells outside
+        // the polygon are masked to null (#671, #966).
         let polygon = ds_core::feature::parse_area_coords(coords)?;
         let bbox = [
             polygon.bbox.west,
@@ -32,21 +32,24 @@ impl GribEngine {
         // run's last step) is the one step of a t-less Grid.
         let steps = grid_steps(run, datetime)?;
         let time_axis = datetime.is_some_and(|(start, end)| start < end);
-        let step_file = steps[0].1;
         let keys = catalog
             .parameter_keys(&run.reference_time)
             .cloned()
             .unwrap_or_default();
         let levels = self.selected_levels(&catalog, run.reference_time, z)?;
 
-        // Default to first near-surface parameter
-        let query_params: Vec<&str> = match parameters {
-            Some(p) => p.iter().map(|s| s.as_str()).collect(),
-            None => step_file
-                .default_message()
-                .map(|m| vec![m.param.as_str()])
-                .unwrap_or_default(),
+        // Without `parameter-name`, every parameter of the view, as position
+        // and cube answer (/req/edr/parameter-name-response A, #966); the
+        // value budget below makes too many of them a 400.
+        let defaults = match parameters {
+            Some(_) => Vec::new(),
+            None => self.default_parameters(steps.iter().map(|(_, file)| *file), &keys),
         };
+        let query_params: Vec<&str> = parameters
+            .unwrap_or(&defaults)
+            .iter()
+            .map(String::as_str)
+            .collect();
 
         if query_params.is_empty() {
             return Err(DataServerError::InvalidParameter(
@@ -70,9 +73,11 @@ impl GribEngine {
                 .map(|&z| Self::keys_at_level(&keys, z))
                 .collect::<Vec<_>>(),
         );
-        // A field some selected steps lack (an aggregate at the analysis
-        // step) is null there, as in a position series.
-        if self.vertical_kind().is_none() {
+        // A requested field no selected step has at its canonical level is
+        // an error. One some steps lack (an aggregate at the analysis step)
+        // is null there, as in a position series; a defaulted one is null
+        // throughout, so one gap cannot fail the whole default.
+        if self.vertical_kind().is_none() && parameters.is_some() {
             for &name in &query_params {
                 if !steps
                     .iter()
@@ -133,7 +138,13 @@ impl GribEngine {
             .iter()
             .map(|&x| ds_core::geo::wrap_lon(x))
             .collect();
-        let mask = polygon.mask_cells(&x_wrapped, y_coords);
+        // The native spacing sizes a lone edge node's cell (a bbox clamped
+        // at a regional grid's edge).
+        let mask = polygon.mask_native_cells(
+            &x_wrapped,
+            y_coords,
+            Some((grid.lon_inc.abs(), grid.lat_inc.abs())),
+        );
         if !mask.iter().any(|&m| m) {
             return Err(DataServerError::LocationNotFound(
                 "The polygon contains no grid cell".into(),
@@ -153,7 +164,8 @@ impl GribEngine {
             self.param_metadata_for(&level_keys[first_level], query_params[first_param]);
         layout.mask_and_convert(&mut first_values, first_meta.display);
         drop(grid); // only small subsets survive while the other fields load
-                    // Per parameter, `[t][z][y][x]`: one plane per step and level.
+
+        // Per parameter, `[t][z][y][x]`: one plane per step and level.
         let n_levels = levels.len();
         let plane = |step: usize, level: usize| {
             let offset = (step * n_levels + level) * area_pixels;

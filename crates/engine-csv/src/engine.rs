@@ -75,13 +75,35 @@ impl CsvEngine {
         times.range((start, end)).next().is_some()
     }
 
+    /// The parameters `parameter-name` selects, through the shared rule: an
+    /// unknown name or an empty list is a 400 naming the valid ones, and
+    /// matching ignores case (#666, #966). Resolved before any station is
+    /// read, so an area without data cannot turn the 400 into a 404.
+    fn selected_parameters(
+        &self,
+        parameters: Option<&[String]>,
+    ) -> Result<Vec<String>, DataServerError> {
+        let available: Vec<&str> = self
+            .store
+            .parameter_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        Ok(
+            ds_core::edr_engine::select_parameters(parameters, &available)?
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
     /// Build a `PointSeries` coverage for one location, `None` when it has
     /// no row in `datetime`. Shared by `query_location` and `query_area`.
     fn location_series(
         &self,
         location_id: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-        parameters: Option<&[String]>,
+        param_names: &[String],
     ) -> Result<Option<QueryResult>, DataServerError> {
         let time_map = self
             .store
@@ -107,16 +129,6 @@ impl CsvEngine {
             return Ok(None);
         }
 
-        // Determine which parameters to include
-        let param_names: Vec<String> = match parameters {
-            Some(requested) => requested
-                .iter()
-                .filter(|p| self.store.parameter_names.contains(p))
-                .cloned()
-                .collect(),
-            None => self.store.parameter_names.clone(),
-        };
-
         // Build time axis (sorted)
         let first_row = &self.store.rows[row_indices[0]];
         let mut times: Vec<DateTime<Utc>> = row_indices
@@ -136,7 +148,7 @@ impl CsvEngine {
 
         // Build parameter descriptions
         let mut param_descs = HashMap::new();
-        for name in &param_names {
+        for name in param_names {
             let unit = self
                 .store
                 .parameter_units
@@ -162,7 +174,7 @@ impl CsvEngine {
 
         // Build ranges — values ordered by time
         let mut ranges = HashMap::new();
-        for name in &param_names {
+        for name in param_names {
             let mut values: Vec<Option<f64>> = Vec::with_capacity(times.len());
             for t in &times {
                 let val = time_to_row
@@ -231,8 +243,9 @@ impl EdrEngine for CsvEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        let param_names = self.selected_parameters(parameters)?;
         let series = self
-            .location_series(location_id, datetime, parameters)?
+            .location_series(location_id, datetime, &param_names)?
             .ok_or_else(|| {
                 DataServerError::LocationNotFound(format!("{location_id} (no data in time range)"))
             })?;
@@ -312,6 +325,7 @@ impl EdrEngine for CsvEngine {
         const MAX_LOCATIONS: usize = 500;
 
         let polygon = parse_area_coords(coords)?;
+        let param_names = self.selected_parameters(parameters)?;
 
         // Find unique locations within the polygon
         let mut seen = HashMap::new();
@@ -346,7 +360,7 @@ impl EdrEngine for CsvEngine {
         // (EDR 1.2 /req/edr/REQ_rc-within-response A), as in engine-bufr.
         let mut coverages = Vec::with_capacity(matching_locations.len());
         for loc_id in &matching_locations {
-            coverages.extend(self.location_series(loc_id, datetime, parameters)?);
+            coverages.extend(self.location_series(loc_id, datetime, &param_names)?);
         }
         if coverages.is_empty() {
             return Err(DataServerError::LocationNotFound(
@@ -726,6 +740,45 @@ mod tests {
         let engine = CsvEngine::new(test_store());
         let result = engine.get_feature("NonExistent");
         assert!(result.is_err());
+    }
+
+    /// `parameter-name` is the shared rule (#966): case-insensitive, the
+    /// canonical spelling back, and an unknown name or an empty list is a
+    /// 400 naming the valid ones, never silently narrowed.
+    #[test]
+    fn parameter_name_is_known_names_only() {
+        let engine = CsvEngine::new(test_store());
+        let station = "Alajärvi Möksy";
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let CoverageResponse::Single(q) = engine
+            .query_location(station, None, Some(&names(&["TEMPERATURE"])), None, None)
+            .unwrap()
+        else {
+            panic!("a location query answers one coverage");
+        };
+        assert_eq!(q.ranges.keys().collect::<Vec<_>>(), vec!["temperature"]);
+        for requested in [names(&["temperature", "nope"]), names(&[])] {
+            assert!(matches!(
+                engine.query_location(station, None, Some(&requested), None, None),
+                Err(DataServerError::InvalidParameter(m)) if m.contains("wind_speed")
+            ));
+            assert!(matches!(
+                engine.query_area("19,59,32,71", None, Some(&requested), None, None),
+                Err(DataServerError::InvalidParameter(_))
+            ));
+        }
+        // Resolved before any station is read: an area without data in the
+        // window is a 404, but with an unknown name still the 400.
+        let never = "2030-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let window = Some((never, never));
+        assert!(matches!(
+            engine.query_area("19,59,32,71", window, None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+        assert!(matches!(
+            engine.query_area("19,59,32,71", window, Some(&names(&["nope"])), None, None),
+            Err(DataServerError::InvalidParameter(_))
+        ));
     }
 
     fn station_history() -> CsvEngine {
