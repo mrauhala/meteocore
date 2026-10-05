@@ -2434,13 +2434,34 @@ fn resolve_quantities(
     Ok(quantities)
 }
 
-/// Snap requested elevation angles to the catalog's canonical sweep-angle
-/// set, dropping duplicates while preserving request order.
+/// How far (degrees) a requested elevation angle may lie from an advertised
+/// sweep angle and still select that sweep: half the 0.1° step
+/// [`round_elevation`] publishes sweep angles at. An advertised angle
+/// already stands for every raw sweep angle within ±0.05° of it, so a
+/// requested angle in the same band names the same sweep (`z=0.30001`
+/// selects 0.3°), and one outside every band names none (`z=50` on a
+/// 0.3–9° volume). EDR 1.2 `/req/edr/z-response` B: only sweeps whose
+/// angle intersects `z` may be returned.
+const SWEEP_MATCH_TOLERANCE_DEG: f64 = 0.05;
+
+/// Whether the advertised sweep angle `level` matches the requested
+/// `want`, per [`SWEEP_MATCH_TOLERANCE_DEG`]. The band is inclusive; the
+/// `1e-9` absorbs binary rounding of decimal angles, so `1.55` lies
+/// within it of both 1.5° and 1.6°.
+fn sweep_matches(level: f64, want: f64) -> bool {
+    (level - want).abs() <= SWEEP_MATCH_TOLERANCE_DEG + 1e-9
+}
+
+/// Match requested elevation angles to the catalog's canonical sweep-angle
+/// set: each keeps the nearest sweep within [`SWEEP_MATCH_TOLERANCE_DEG`],
+/// and one with no sweep that close drops out. Duplicates collapse while
+/// request order holds.
 fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
     let mut out: Vec<f64> = Vec::new();
     for &want in requested {
         if let Some(&lvl) = canonical
             .iter()
+            .filter(|lvl| sweep_matches(**lvl, want))
             .min_by(|a, b| (**a - want).abs().total_cmp(&(**b - want).abs()))
         {
             if !out.contains(&lvl) {
@@ -2543,16 +2564,20 @@ fn volume_profile(
     })
 }
 
-/// One `PointSeries` coverage pinned to elevation angle `level`: the
-/// sweep nearest `level` in each selected volume, sampled at `(lon, lat)`.
+/// One `PointSeries` coverage pinned to the advertised elevation angle
+/// `level`: in each selected volume, the sweep at that angle, sampled at
+/// `(lon, lat)`. As in [`volume_profile`], a split cut's first sweep that
+/// carries the quantity is authoritative. A volume without a sweep at
+/// `level` (an older scan strategy in the window) has no sample there,
+/// never a neighbouring sweep's (`/req/edr/z-response` B).
 ///
 /// The returned flag is "this level ever *measured* the point": at least
 /// one sample classified `Value` or `Undetect` across every quantity and
 /// timestep. Clear air (`Undetect`) is a measurement — the radar looked
 /// and saw nothing — and serialises as CoverageJSON `null`; only `Masked`
-/// (out of the nearest sweep's range, sweep lacks the quantity, unreadable
-/// pixels) means the point was never observed. The caller drops the level
-/// when the flag is false.
+/// (out of the sweep's range, no sweep at `level` carries the quantity,
+/// unreadable pixels) means the point was never observed. The caller
+/// drops the level when the flag is false.
 fn level_series(
     selected: &[&VolumeEntry],
     pix: Pixels,
@@ -2569,7 +2594,14 @@ fn level_series(
         let values: Vec<Option<f64>> = selected
             .iter()
             .map(|e| {
-                let class = nearest_sweep(&e.volume, level)
+                let class = e
+                    .volume
+                    .sweeps
+                    .iter()
+                    .find(|s| {
+                        round_elevation(s.elangle) == level
+                            && s.moments.iter().any(|m| &m.quantity == quantity)
+                    })
                     .and_then(|sweep| {
                         let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
                         let pixels =
@@ -3064,8 +3096,8 @@ fn site_coverages(
             Ok(lvls
                 .iter()
                 // Drop a level only when the point was never *measured*
-                // there — every sample `Masked` (out of the nearest sweep's
-                // range, or the sweep carries no data for the quantity).
+                // there — every sample `Masked` (out of the sweep's range,
+                // or no sweep at the level carries the quantity).
                 // Clear air (`undetect`) IS a measurement — the radar looked
                 // and saw nothing — so an all-clear-air series is kept and
                 // serves HTTP 200 with null values; collapsing it into the
@@ -3086,7 +3118,9 @@ fn site_coverages(
 /// advertised sweep angles. `None` (or an empty selector) means "every
 /// level — a profile". `canonical` is the collection's (or site's)
 /// advertised vertical axis; `None` there means the collection exposes no
-/// sweeps to select with `z` (a 400).
+/// sweeps to select with `z` (a 400). A requested angle keeps a sweep only
+/// within [`SWEEP_MATCH_TOLERANCE_DEG`] of it; when none does, the request
+/// is a 400 like a `z` interval that selects no level.
 fn resolve_levels(
     canonical: Option<&[f64]>,
     z: Option<&[f64]>,
@@ -3100,7 +3134,14 @@ fn resolve_levels(
         )
     })?;
     let snapped = snap_levels(zs, canonical);
-    Ok((!snapped.is_empty()).then_some(snapped))
+    if snapped.is_empty() {
+        return Err(DataServerError::InvalidParameter(format!(
+            "`z` selects none of the collection's available levels: no elevation sweep \
+             lies within {SWEEP_MATCH_TOLERANCE_DEG}° of a requested angle \
+             (sweeps: {canonical:?})"
+        )));
+    }
+    Ok(Some(snapped))
 }
 
 /// Run a point-style EDR query (position / single-site location) against
@@ -5101,6 +5142,108 @@ mod tests {
             Err(DataServerError::InvalidParameter(_)) => {}
             other => panic!("expected InvalidParameter for out-of-range z, got {other:?}"),
         }
+    }
+
+    /// EDR 1.2 `/req/edr/z-response` B: a requested elevation angle keeps
+    /// a sweep only within `SWEEP_MATCH_TOLERANCE_DEG` of it, never the
+    /// nearest sweep at any distance; a `z` keeping none is a 400.
+    #[test]
+    fn resolve_levels_keeps_only_sweeps_within_tolerance() {
+        let canonical = [0.3, 0.4, 0.7, 1.5, 2.0, 3.0, 4.0, 5.0, 9.0];
+        let resolve = |z: &[f64]| resolve_levels(Some(&canonical), Some(z));
+        for (z, kept) in [
+            (&[0.3][..], &[0.3][..]),
+            (&[0.30001], &[0.3]),
+            // A list keeps its matching angles only.
+            (&[0.3, 50.0], &[0.3]),
+            // Both ends of the band are inclusive; one sweep is kept once.
+            (&[8.95, 9.05], &[9.0]),
+            (&[1.55, 0.4], &[1.5, 0.4]),
+        ] {
+            assert_eq!(resolve(z).unwrap().as_deref(), Some(kept), "{z:?}");
+        }
+        // Above, below and between the sweeps: no sweep's angle intersects.
+        for z in [&[50.0][..], &[-3.0], &[6.9], &[9.1], &[50.0, -3.0]] {
+            match resolve(z) {
+                Err(DataServerError::InvalidParameter(m)) => {
+                    assert!(m.contains("selects none"), "{m}")
+                }
+                other => panic!("{z:?}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+        // No `z` is every sweep: a profile.
+        assert_eq!(resolve_levels(Some(&canonical), None).unwrap(), None);
+    }
+
+    /// The per-site position, location and area queries apply the
+    /// tolerance: `z=50` or `z=-3` on a 0.5° volume is a 400 (it used to
+    /// return the 0.5° sweep), and a list keeps its matching angle only.
+    #[test]
+    fn site_view_z_outside_every_sweep_is_400() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+        let dbzh = ["DBZH".to_string()];
+        let point = "POINT(25.0 60.1)";
+        for z in [&[50.0][..], &[-3.0]] {
+            for result in [
+                EdrEngine::query_position(&view, point, None, Some(&dbzh), Some(z), None),
+                EdrEngine::query_location(&view, "fivih", None, Some(&dbzh), Some(z), None),
+                EdrEngine::query_area(
+                    &view,
+                    "24.0,59.0,26.0,61.0",
+                    None,
+                    Some(&dbzh),
+                    Some(z),
+                    None,
+                ),
+            ] {
+                assert!(
+                    matches!(result, Err(DataServerError::InvalidParameter(_))),
+                    "{z:?}: {result:?}"
+                );
+            }
+        }
+        let response =
+            EdrEngine::query_position(&view, point, None, Some(&dbzh), Some(&[0.5, 50.0]), None)
+                .unwrap();
+        let CoverageResponse::Single(cov) = response else {
+            panic!("one matching angle is a single PointSeries, got {response:?}");
+        };
+        let DomainDescription::PointSeries { z: Some(z), .. } = &cov.domain else {
+            panic!("expected a PointSeries, got {:?}", cov.domain);
+        };
+        assert_eq!(z.values, vec![0.5]);
+    }
+
+    /// A volume in the window without a sweep at the pinned angle (an older
+    /// scan strategy) has no sample there, never its nearest sweep's.
+    #[test]
+    fn site_coverages_level_never_samples_another_sweep() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let latest = synthetic_volume(site_lon, site_lat);
+        let mut older = synthetic_volume(site_lon, site_lat);
+        older.sweeps[0].elangle = 0.7;
+        older.time = latest.time - chrono::Duration::minutes(5);
+        let volumes = vec![entry(older, "level-older"), entry(latest, "level-latest")];
+        // 10.5 km due east, mid-bin 10, as in the single-volume test above.
+        let dlon = 10_500.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let covs = site_coverages(
+            &volumes,
+            test_pixels(),
+            site_lon + dlon,
+            site_lat,
+            None,
+            None,
+            Some(&[0.5]),
+        )
+        .unwrap();
+        assert_eq!(covs.len(), 1);
+        assert_eq!(covs[0].ranges["DBZH"].values, vec![None, Some(10.0)]);
     }
 
     /// `height_axis` builds a monotonic 0..top grid whose ceiling tracks
@@ -7132,9 +7275,9 @@ mod tests {
         ));
     }
 
-    /// A z-pinned query whose level never *measured* the point (the nearest
-    /// sweep carries no data for the requested quantity — every sample
-    /// `Masked`) is a 404, not an HTTP 200 all-null `PointSeries`.
+    /// A z-pinned query whose level never *measured* the point (the sweep
+    /// at that angle carries no data for the requested quantity — every
+    /// sample `Masked`) is a 404, not an HTTP 200 all-null `PointSeries`.
     #[test]
     fn site_view_z_level_all_null_is_404() {
         // sweep0 @0.5° has DBZH; an added 15° sweep has VRADH only.

@@ -313,6 +313,36 @@ async fn malformed_z_is_a_400_even_without_a_vertical_extent() {
     assert!(flat.calls().is_empty(), "no engine call for a malformed z");
 }
 
+/// #940: a `z` list longer than the cap is a 400 naming it on every route,
+/// with or without a vertical extent, before any engine call.
+#[tokio::test]
+async fn z_list_over_the_cap_is_a_400_before_the_engine() {
+    use api_edr::params::MAX_Z_LEVELS;
+    let (flat, levels) = (Recorder::new(false), Recorder::new(true));
+    let app = router(&flat, &levels);
+    let at_cap = vec!["850"; MAX_Z_LEVELS].join(",");
+    let (status, body, _) = get(&app, &route(ROUTES[1], "levels", &at_cap)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a list at the cap is served: {body}"
+    );
+    levels.clear();
+    let over = vec!["850"; MAX_Z_LEVELS + 1].join(",");
+    for template in ROUTES {
+        for collection in ["flat", "levels"] {
+            let (status, body, _) = get(&app, &route(template, collection, &over)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{template}");
+            let message = body["description"].as_str().unwrap();
+            assert!(
+                message.contains(&format!("maximum of {MAX_Z_LEVELS}")),
+                "{template}: {message}"
+            );
+        }
+    }
+    assert!(flat.calls().is_empty() && levels.calls().is_empty());
+}
+
 #[tokio::test]
 async fn z_is_honoured_with_a_vertical_extent() {
     let (flat, levels) = (Recorder::new(false), Recorder::new(true));
