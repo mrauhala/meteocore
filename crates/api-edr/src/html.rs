@@ -114,7 +114,7 @@ fn coverage_html(doc: &Value, page: &DataPage) -> String {
         Some(coverages) => coverages.iter().collect(),
         None => vec![doc],
     };
-    page.render_into(body_estimate(&coverages), |body| {
+    page.render_into(body_estimate(doc, &coverages, page), |body| {
         coverage_body(body, doc, coverages, page)
     })
 }
@@ -122,14 +122,29 @@ fn coverage_html(doc: &Value, page: &DataPage) -> String {
 /// The bytes a coverage page's body takes, from above: a value cell is at
 /// most `<td>`, an f64's longest JSON form and `</td>` ([`CELL`]); a row
 /// table adds a cell per axis coordinate and the row tags per value; the
-/// domain table lists every axis value. 64 KiB covers the panels and
-/// headings.
-fn body_estimate(coverages: &[&Value]) -> usize {
+/// domain table lists every axis value. The request, links, parameters and
+/// any other member are measured ([`panels_estimate`], [`json_html_len`]);
+/// 16 KiB covers the fixed markup.
+fn body_estimate(doc: &Value, coverages: &[&Value], page: &DataPage) -> usize {
     const CELL: usize = 33;
     const ROW: usize = 9;
     const AXIS_VALUE: usize = 40;
-    let mut bytes: usize = 64 * 1024;
+    let mut bytes: usize = 16 * 1024 + panels_estimate(page);
+    bytes += members_len(doc, &["coverages", "parameters", "domain", "ranges"]);
+    // A parameter's row shows its label, unit and observed property, each
+    // part of the parameter, then all of it.
+    for (key, parameter) in doc["parameters"].as_object().into_iter().flatten() {
+        bytes = bytes.saturating_add(256 + escaped_len(key) + 4 * json_html_len(parameter));
+    }
     for coverage in coverages {
+        bytes = bytes.saturating_add(members_len(
+            &coverage["domain"],
+            &["type", "domainType", "axes"],
+        ));
+        bytes = bytes.saturating_add(members_len(
+            coverage,
+            &["type", "domain", "ranges", "parameters"],
+        ));
         let axes = &coverage["domain"]["axes"];
         for axis in axes.as_object().into_iter().flatten().map(|(_, a)| a) {
             let width = axis["coordinates"].as_array().map_or(1, Vec::len);
@@ -669,6 +684,131 @@ fn json_html(value: &Value) -> String {
     }
 }
 
+/// Counts the bytes [`escape`] would make of what is written to it.
+struct EscapedLen(usize);
+
+impl std::fmt::Write for EscapedLen {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 += escaped_len(s);
+        Ok(())
+    }
+}
+
+/// `escape(s).len()`, without building it.
+fn escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '&' | '\'' => 5,
+            '<' | '>' => 4,
+            '"' => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
+/// `json_html(value).len()`, without building it (pinned by
+/// `json_html_len_is_exact`).
+fn json_html_len(value: &Value) -> usize {
+    match value {
+        Value::Null => 31,
+        Value::String(s) if is_url(s) => 24 + 2 * escaped_len(s),
+        Value::String(s) => escaped_len(s),
+        Value::Array(items) if items.is_empty() => 29,
+        Value::Array(items) if items.iter().all(|i| !i.is_array() && !i.is_object()) => {
+            items.iter().map(json_html_len).sum::<usize>() + 2 * (items.len() - 1)
+        }
+        Value::Array(items) => 9 + items.iter().map(|i| 9 + json_html_len(i)).sum::<usize>(),
+        Value::Object(map) => {
+            28 + map
+                .iter()
+                .map(|(k, v)| 31 + escaped_len(k) + json_html_len(v))
+                .sum::<usize>()
+        }
+        other => {
+            let mut len = EscapedLen(0);
+            let _ = write!(len, "{other}");
+            len.0
+        }
+    }
+}
+
+/// The bytes of [`members_panel`]'s rows for `doc` without `skip`, plus
+/// its frame.
+fn members_len(doc: &Value, skip: &[&str]) -> usize {
+    256 + doc
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !skip.contains(&k.as_str()))
+        .map(|(k, v)| 31 + escaped_len(k) + json_html_len(v))
+        .sum::<usize>()
+}
+
+/// The bytes of a page's heading, request and links panels, from above:
+/// the request is decoded then escaped (at most 6 bytes per raw byte),
+/// each link's href shown twice.
+fn panels_estimate(page: &DataPage) -> usize {
+    let raw = page.raw_query.unwrap_or("");
+    let heading = 1024 + 6 * (page.title.len() + page.collection_title.len());
+    let request = 512 + 6 * raw.len() + 40 * (raw.matches('&').count() + 1);
+    let links = 512
+        + page
+            .links
+            .iter()
+            .map(|l| {
+                160 + 2 * escaped_len(&l.href)
+                    + escaped_len(&l.rel)
+                    + escaped_len(&l.title)
+                    + escaped_len(&l.kind)
+            })
+            .sum::<usize>();
+    heading + request + links
+}
+
+/// The bytes of one `items` table row ([`features_body`]), from above:
+/// its id link, geometry type and coordinates, a cell per column and its
+/// links, each measured.
+fn feature_row_len(feature: &Value, columns: &[&str]) -> usize {
+    let id = scalar_text(&feature["id"]);
+    let id_cell = match self_href(feature) {
+        Some(href) => 34 + escaped_len(&ui::with_format(href, "html")) + escaped_len(&id),
+        None => escaped_len(&id),
+    };
+    let geometry = &feature["geometry"];
+    let mut coordinates = EscapedLen(0);
+    let _ = write!(coordinates, "{}", geometry["coordinates"]);
+    let cells: usize = columns
+        .iter()
+        .map(|c| 9 + feature["properties"].get(*c).map_or(0, json_html_len))
+        .sum();
+    let links: usize = feature["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|l| {
+            let href = l["href"].as_str().unwrap_or_default();
+            let label = l["title"].as_str().or(l["rel"].as_str()).unwrap_or(href);
+            34 + escaped_len(href) + escaped_len(label) + 4
+        })
+        .sum();
+    48 + id_cell
+        + escaped_len(geometry["type"].as_str().unwrap_or("null"))
+        + coordinates.0
+        + cells
+        + 14
+        + links
+}
+
+/// A feature's `self` link.
+fn self_href(feature: &Value) -> Option<&str> {
+    feature["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|l| l["rel"] == "self")
+        .and_then(|l| l["href"].as_str())
+}
+
 /// The `/locations` list as HTML, written into `w` (the GeoJSON's budgeted
 /// writer, so the page meets the same byte limit and memory admission).
 /// Every location's `datetime` and `parameter-name` are the collection's,
@@ -787,22 +927,61 @@ pub(crate) const TIMESTAMP_SLOT: &str = "<time data-generated></time>";
 /// geometry, every property and its links. `time_stamp` renders the
 /// `timeStamp` member as [`TIMESTAMP_SLOT`].
 pub(crate) fn features_page(doc: &Value, page: &DataPage, time_stamp: bool) -> String {
+    let (features, columns) = features_layout(doc);
+    let estimate = features_estimate(doc, &features, &columns, page);
+    page.render_into(estimate, |body| {
+        features_body(body, doc, &features, &columns, page, time_stamp)
+    })
+}
+
+/// An `items` response's features (a page's, or the one Feature) and its
+/// property columns, in first-seen order.
+fn features_layout(doc: &Value) -> (Vec<&Value>, Vec<&str>) {
     let features: Vec<&Value> = match doc["features"].as_array() {
         Some(features) => features.iter().collect(),
         None => vec![doc],
     };
-    // A row's cells, links and geometry: a few hundred bytes per feature
-    // (an `items` page holds at most 10 000).
-    let estimate = 64 * 1024 + features.len() * 512;
-    page.render_into(estimate, |body| {
-        features_body(body, doc, &features, page, time_stamp)
-    })
+    let mut columns: Vec<&str> = Vec::new();
+    for feature in &features {
+        for key in feature["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+        {
+            if !columns.contains(&key.as_str()) {
+                columns.push(key);
+            }
+        }
+    }
+    (features, columns)
+}
+
+/// The bytes an `items` page's body takes, from above: measured per
+/// feature ([`feature_row_len`]), never guessed, so a polygon's coordinates
+/// or a wide property set cannot overrun the reservation.
+fn features_estimate(doc: &Value, features: &[&Value], columns: &[&str], page: &DataPage) -> usize {
+    // The members panel `features_body` writes, and the `timeStamp` slot.
+    let members = if doc["features"].is_array() {
+        members_len(doc, &["features", "links", "timeStamp"]) + 64
+    } else {
+        members_len(doc, &["type", "id", "geometry", "properties", "links"])
+    };
+    16 * 1024
+        + panels_estimate(page)
+        + members
+        + columns.iter().map(|c| 32 + escaped_len(c)).sum::<usize>()
+        + features
+            .iter()
+            .map(|f| feature_row_len(f, columns))
+            .sum::<usize>()
 }
 
 fn features_body(
     body: &mut String,
     doc: &Value,
     features: &[&Value],
+    columns: &[&str],
     page: &DataPage,
     time_stamp: bool,
 ) {
@@ -829,33 +1008,14 @@ fn features_body(
         }
         body.push_str(&members);
     }
-    let mut columns: Vec<&str> = Vec::new();
-    for feature in features {
-        for key in feature["properties"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(k, _)| k)
-        {
-            if !columns.contains(&key.as_str()) {
-                columns.push(key);
-            }
-        }
-    }
     body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Features</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">geometry</th>");
-    for column in &columns {
+    for column in columns {
         let _ = write!(body, "<th scope=\"col\">{}</th>", escape(column));
     }
     body.push_str("<th scope=\"col\">links</th></tr></thead><tbody>");
     for feature in features {
         let id = scalar_text(&feature["id"]);
-        let own = feature["links"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|l| l["rel"] == "self")
-            .and_then(|l| l["href"].as_str());
-        let id_cell = match own {
+        let id_cell = match self_href(feature) {
             Some(href) => ui::anchor(&ui::with_format(href, "html"), &id, "table-link"),
             None => escape(&id),
         };
@@ -866,7 +1026,7 @@ fn features_body(
             escape(geometry["type"].as_str().unwrap_or("null")),
             escape(&geometry["coordinates"].to_string())
         );
-        for column in &columns {
+        for column in columns {
             let _ = write!(
                 body,
                 "<td>{}</td>",
@@ -1007,10 +1167,72 @@ mod tests {
         let (head, tail) = page.shell();
         for doc in [grid, series] {
             let html = coverage_html(&doc, &page);
-            let reserved = head.len() + body_estimate(&[&doc]) + tail.len();
+            let reserved = head.len() + body_estimate(&doc, &[&doc], &page) + tail.len();
             assert!(html.len() <= reserved, "{} > {reserved}", html.len());
+            assert_eq!(html.capacity(), reserved, "the buffer regrew");
             // And not wildly above it: within twice the page.
             assert!(reserved < 2 * html.len(), "{reserved} vs {}", html.len());
+        }
+    }
+
+    /// An `items` page fits its reservation too, whatever its features
+    /// carry: a 5000-vertex polygon, 40 property columns of escaped text
+    /// and URLs, and nested values.
+    #[test]
+    fn the_features_reservation_covers_the_page() {
+        let ring: Vec<Value> = (0..5000)
+            .map(|i| json!([-179.123_456_789_012 + i as f64 * 1e-3, -89.987_654_321_098]))
+            .collect();
+        let wide = |i: usize| {
+            let mut properties = serde_json::Map::new();
+            for c in 0..40 {
+                properties.insert(
+                    format!("p<{c}>"),
+                    json!(format!("\"{i}\" & <{c}>").repeat(8)),
+                );
+            }
+            properties.insert(
+                "url".into(),
+                json!(format!("https://example.org/a?b=1&c={i}")),
+            );
+            properties.insert("nested".into(), json!({"a": [1, 2, {"b": null}], "c": []}));
+            Value::Object(properties)
+        };
+        let feature = |i: usize, geometry: Value| {
+            json!({"type": "Feature", "id": format!("f{i}"), "geometry": geometry, "properties": wide(i),
+                "links": [{"href": format!("https://example.org/edr/collections/c/items/f{i}"), "rel": "self", "title": "This \"item\""},
+                          {"href": "https://example.org/edr/collections/c", "rel": "collection"}]})
+        };
+        let polygon = json!({"type": "Polygon", "coordinates": [ring]});
+        let point = json!({"type": "Point", "coordinates": [24.5, 60.25]});
+        let mut features = vec![feature(0, polygon.clone())];
+        features.extend((1..200).map(|i| feature(i, point.clone())));
+        let list = json!({"type": "FeatureCollection", "features": features, "numberMatched": 200,
+            "numberReturned": 200, "links": [{"href": "https://example.org/edr/collections/c/items?limit=200", "rel": "self"}]});
+        let single = feature(0, polygon);
+        let page = page();
+        let (head, tail) = page.shell();
+        for (doc, time_stamp) in [(&list, true), (&single, false)] {
+            let html = features_page(doc, &page, time_stamp);
+            let (features, columns) = features_layout(doc);
+            let reserved =
+                head.len() + features_estimate(doc, &features, &columns, &page) + tail.len();
+            assert!(html.len() <= reserved, "{} > {reserved}", html.len());
+            assert!(reserved < 2 * html.len(), "{reserved} vs {}", html.len());
+            // Built in the one reservation: the buffer never regrew.
+            assert_eq!(html.capacity(), reserved);
+        }
+    }
+
+    /// `json_html_len` measures exactly what `json_html` writes.
+    #[test]
+    fn json_html_len_is_exact() {
+        let value = json!({"a<b": ["x & y", 1.5e-300, -7, true, null],
+            "u": "https://example.org/?a=1&b=\"2\"", "o": [{"k": []}, [1, 2]],
+            "e": [], "n": null, "s": "it's <ok>"});
+        assert_eq!(json_html_len(&value), json_html(&value).len());
+        for v in value.as_object().unwrap().values() {
+            assert_eq!(json_html_len(v), json_html(v).len(), "{v}");
         }
     }
 
