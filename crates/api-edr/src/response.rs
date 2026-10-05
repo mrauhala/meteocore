@@ -640,9 +640,13 @@ impl serde::Serialize for LocationFeatures<'_> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.locations.len()))?;
         for loc in self.locations {
+            // Ids are free text (CSV station names with spaces and
+            // non-ASCII letters): encoded, the link is a valid RFC 3986 URI.
             let endpoint = format!(
                 "{}/edr/collections/{}/locations/{}",
-                self.ctx.base_url, self.ctx.collection_id, loc.id
+                self.ctx.base_url,
+                self.ctx.collection_id,
+                crate::geojson::encode_path_segment(&loc.id)
             );
             let title = format!("Data for {}", loc.label);
             sequence.serialize_element(&LocationFeature {
@@ -754,5 +758,34 @@ mod location_tests {
             filtered["links"],
             json!([{ "href": self_href, "rel": "self", "title": "Locations", "type": "application/geo+json" }])
         );
+    }
+
+    /// A free-text id (a CSV station name) is percent-encoded in the data
+    /// link and `edrqueryendpoint`, so both are valid RFC 3986 URIs; the
+    /// feature id and label keep the text.
+    #[test]
+    fn location_links_percent_encode_the_id() {
+        let params = vec!["t".into()];
+        let ctx = LocationsContext {
+            collection_id: "weather",
+            parameter_names: &params,
+            temporal_extent: None,
+            base_url: "https://example.org",
+        };
+        let location = Location {
+            id: "Alajärvi Möksy".into(),
+            label: "Alajärvi Möksy".into(),
+            latitude: 63.1,
+            longitude: 24.3,
+        };
+        let doc: Value =
+            serde_json::from_slice(&locations_to_json(&[location], &ctx).unwrap()).unwrap();
+        let feature = &doc["features"][0];
+        let endpoint =
+            "https://example.org/edr/collections/weather/locations/Alaj%C3%A4rvi%20M%C3%B6ksy";
+        assert_eq!(feature["properties"]["edrqueryendpoint"], endpoint);
+        assert_eq!(feature["links"][0]["href"], endpoint);
+        assert_eq!(feature["id"], "Alajärvi Möksy");
+        assert_eq!(feature["properties"]["label"], "Alajärvi Möksy");
     }
 }

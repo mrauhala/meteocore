@@ -233,19 +233,24 @@ fn budget_antimeridian_and_invalid_selections_fail_before_reading() {
             default,
         ),
         cube(bbox(0.0, 0.0, 1.0, 1.0), None, &["NOPE"], None, default),
-        cube(
-            bbox(0.0, 0.0, 1.0, 1.0),
-            Some((at(1), at(5))),
-            &["P0"],
-            None,
-            default,
-        ),
     ] {
         assert!(
             matches!(result, Err(DataServerError::InvalidParameter(_))),
             "{result:?}"
         );
     }
+    // No step inside the window is no data, a 404 (#967).
+    let empty = cube(
+        bbox(0.0, 0.0, 1.0, 1.0),
+        Some((at(1), at(5))),
+        &["P0"],
+        None,
+        default,
+    );
+    assert!(
+        matches!(&empty, Err(DataServerError::LocationNotFound(_))),
+        "{empty:?}"
+    );
     assert!(matches!(
         engine.query_cube(
             &bbox(0.0, 0.0, 1.0, 1.0),
@@ -288,9 +293,22 @@ fn datetime_selects_a_step_or_every_step_of_an_interval() {
     };
     // No datetime: the run's last step, as an area query answers.
     assert_eq!(times(None, None), [at(6)]);
-    // An instant snaps to the nearest step.
-    assert_eq!(times(Some((at(2), at(2))), None), [at(0)]);
-    assert_eq!(times(Some((at(5), at(5))), None), [at(6)]);
+    // An instant is the step valid at it, never the nearest one
+    // (`/req/core/datetime-response` A): between steps there is no data.
+    assert_eq!(times(Some((at(6), at(6))), None), [at(6)]);
+    for instant in [at(2), at(5)] {
+        assert!(matches!(
+            engine.query_cube(
+                &bbox(0.0, 0.0, 1.0, 1.0),
+                Some((instant, instant)),
+                Some(&["P1".to_string()]),
+                Some(&[850.0]),
+                CubeResolution::default(),
+                None,
+            ),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
     // An interval takes every step inside it, open ends included.
     assert_eq!(times(Some((at(0), at(6))), None), [at(0), at(6)]);
     assert_eq!(
@@ -304,6 +322,72 @@ fn datetime_selects_a_step_or_every_step_of_an_interval() {
     // The same through the run's instance.
     let open_start = Some((DateTime::<Utc>::MIN_UTC, at(3)));
     assert_eq!(times(open_start, Some(run_time())), [at(0)]);
+}
+
+/// An area over an interval (an open start here) has the cube's
+/// `[t, z, y, x]` layout, steps and values: the same selection, masked to
+/// the polygon (all of this bbox).
+#[test]
+fn an_area_interval_has_the_cube_layout() {
+    let (_source, engine) = fixture(Some(GribLevelType::Pressure));
+    let datetime = Some((DateTime::<Utc>::MIN_UTC, at(6)));
+    let params = ["P0".to_string(), "P1".to_string()];
+    let z = [1000.0, 500.0];
+    let area = grid(
+        engine
+            .query_area("0,0,1,1", datetime, Some(&params), Some(&z), None)
+            .unwrap(),
+    );
+    let cube = grid(
+        engine
+            .query_cube(
+                &bbox(0.0, 0.0, 1.0, 1.0),
+                datetime,
+                Some(&params),
+                Some(&z),
+                CubeResolution::default(),
+                None,
+            )
+            .unwrap(),
+    );
+    let DomainDescription::Grid {
+        x,
+        y,
+        t: Some(t),
+        z: Some(levels),
+    } = &area.domain
+    else {
+        panic!("expected t and z axes")
+    };
+    assert_eq!(t, &[at(0), at(6)]);
+    assert_eq!(levels.values, z);
+    let DomainDescription::Grid {
+        x: cube_x,
+        y: cube_y,
+        t: Some(cube_t),
+        ..
+    } = &cube.domain
+    else {
+        panic!("expected a cube grid")
+    };
+    assert_eq!((x, y, t), (cube_x, cube_y, cube_t));
+    for (param, name) in params.iter().enumerate() {
+        let range = &area.ranges[name];
+        assert_eq!(range.axis_names, ["t", "z", "y", "x"]);
+        assert_eq!(range.shape, [2, 2, 2, 2]);
+        assert_eq!(range.values, cube.ranges[name].values);
+        let mut values = range.values.iter();
+        for step in 0..2 {
+            for level in [0, 2] {
+                for cell in CELLS {
+                    assert_close(
+                        *values.next().unwrap(),
+                        Some(expected(param, level, step, cell)),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

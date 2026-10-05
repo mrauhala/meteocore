@@ -8,9 +8,9 @@ use chrono::{DateTime, Utc};
 
 use super::{DerivedKind, DerivedParameter, PairOutcome, WindFacts, WindPlan, WindSource};
 use crate::cube::CubeResolution;
-use crate::edr_engine::{EdrEngine, LocationFilter, TrajectoryShape};
+use crate::edr_engine::{EdrEngine, ItemRadius, LocationFilter, TrajectoryShape};
 use crate::error::DataServerError;
-use crate::feature::{Bbox, DatetimeInterval, MAX_AREA_VALUES};
+use crate::feature::{Bbox, DatetimeInterval, Feature, MAX_AREA_VALUES};
 use crate::instances::RunInfo;
 use crate::map_engine::{
     CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile, RasterValues,
@@ -633,6 +633,10 @@ impl EdrEngine for DerivedWind {
         intervals: &'a [DatetimeInterval],
     ) -> Option<LocationFilter<'a>> {
         self.edr.location_time_filter(intervals)
+    }
+
+    fn item_radius(&self, feature: &Feature) -> Option<ItemRadius> {
+        self.edr.item_radius(feature)
     }
 
     fn get_instances(&self) -> Vec<RunInfo> {

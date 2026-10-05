@@ -119,7 +119,19 @@ unlike GeoTIFF's one band per collection.
 
 Catalog keeps a `runs` map (`BTreeMap` keyed by reference time) and
 implements the shared `ds_core::instances` contract (see root CLAUDE.md).
-Nearest-step selection is limited to a run's published valid-time extent.
+Two selections, never mixed (#967):
+- **Maps** (`select_run_step` → `covering_run`, also M trajectories): the
+  newest run whose published valid-time extent covers the time, at its
+  nearest step. `resolve_time`/`resolve_reference_time` key the #507/#521
+  caches on it, so it must stay the render's own selection.
+- **EDR** (`resolve_run`, `grid_steps`; position, area, radius, cube, 2-D
+  and Z trajectories): by intersection (`/req/core/datetime-response` A, F).
+  An instant takes only the step valid at exactly that time, never the
+  nearest; a window every step inside it, open ends (`MIN_UTC`/`MAX_UTC`)
+  included. The run: the newest covering the window's start with a step
+  inside, else the newest with any step inside (`../end`). None inside is
+  `LocationNotFound` (404), which a datetime list skips.
+
 An incomplete newest run does not hide a covering older run; explicit run
 pins do not fall back. No requested datetime still selects the latest run.
 
@@ -240,8 +252,9 @@ rendering share `StepFile::default_message` so default labels/units agree.
 
 ## Trajectory queries (#926)
 
-- `trajectory.rs` selects the run (an M path's time window selects it like
-  a `datetime` window), steps, levels and parameters with the position
+- `trajectory.rs` selects the run (an M path's samples snap to the nearest
+  step, so its run is `covering_run` of its first time, as a map's is),
+  steps, levels and parameters with the position
   query's helpers (`resolve_run`, `position_parameters`, `selected_levels`)
   and leaves the path, time/level rules and layout to
   `ds_core::trajectory::TrajectoryPlan`. Densify at the published
@@ -264,10 +277,16 @@ rendering share `StepFile::default_message` so default labels/units agree.
   parameter/level jobs per admitted query. Keep deadline propagation, blocking
   cache waits and drain-on-error behavior in that scheduler. Area read failures
   are fatal; ordinary position field failures remain null samples.
-- Workers return small masked/converted subsets into fixed parameter/level
-  slots. Preserve requested level order and missing upper-air nulls regardless
+- Workers return small masked/converted subsets into fixed
+  step/parameter/level slots. Preserve requested level order and missing upper-air nulls regardless
   of completion order. Validate grid axes before extracting each subset.
 - Radius delegates to the same area path via the default EDR trait method.
+- Steps come from `grid_steps`: no datetime is the run's last step and an
+  instant its exact step, both a t-less `[z,]y,x` Grid; an interval every
+  step inside it on a `t` axis (`[t, z, y, x]` like cube), even one step.
+  The values budget counts steps × levels. A parameter some steps lack
+  (an aggregate at the analysis step) is null there; one no step has is
+  the canonical-level 400.
 - Run `cargo test -p engine-grib area::tests::area_latency_replay -- --ignored
   --nocapture` for a 32-field replay with simulated 150 ms GET latency and no
   decoded cache. It compares serial storage with four concurrent reads, checks
@@ -278,8 +297,9 @@ rendering share `StepFile::default_message` so default labels/units agree.
 - `query_cube` (#925, `cube.rs`) is offered only by the pressure and
   model-level views (`supported_query_types` adds `cube` when
   `vertical_kind()` is set). Output shape is always `[t, z, y, x]`.
-- Steps: no datetime or an instant selects the area query's single step;
-  an interval every step of the run inside it (`cube_steps`). Levels are
+- Steps: `resolve_run` + `grid_steps`, the area query's: no datetime the
+  run's last step, an instant its exact step, an interval every step of
+  the run inside it. Levels are
   `selected_levels` (exact); parameters default to every key of the view.
 - Check `check_cube_budget` before I/O with the known dimensions (both
   horizontal resolutions given ⇒ the full check), then again after the
