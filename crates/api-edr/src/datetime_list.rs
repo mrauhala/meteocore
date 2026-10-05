@@ -7,6 +7,10 @@
 //! identical to a request naming the instant alone; merging then puts the
 //! answers back together:
 //!
+//! - a `Grid` without `t`, the one-step grid a gridded engine answers an
+//!   instant with, first gets the one-step axis `[t]` at the listed instant
+//!   it answered, so the instants' grids join along `t` as a cube's do
+//!   (a single `datetime` keeps the engine's grid as it is);
 //! - coverages with a leading `t` axis (`PointSeries`, a `Grid` with `t`) that
 //!   agree on everything but time — same position, grid, `z` and parameters —
 //!   become one coverage whose `t` axis holds every instant's steps, ascending,
@@ -69,7 +73,8 @@ pub fn query_instants(
             return Err(DataServerError::DeadlineExceeded);
         }
         match query((t, t)) {
-            Ok(response) => {
+            Ok(mut response) => {
+                add_time_axis(&mut response, t);
                 values = values.saturating_add(count_values(&response));
                 if values > MAX_LIST_VALUES {
                     return Err(DataServerError::QueryTooLarge(format!(
@@ -91,6 +96,33 @@ pub fn query_instants(
         }));
     }
     Ok(merge(responses))
+}
+
+/// Give every `Grid` of `response` without a `t` axis the one-step axis
+/// `[t]`, leading each of its ranges, so it merges along `t` with the other
+/// instants' grids instead of being taken for a duplicate of the first.
+fn add_time_axis(response: &mut CoverageResponse, t: DateTime<Utc>) {
+    let coverages: &mut [QueryResult] = match response {
+        CoverageResponse::Single(q) => std::slice::from_mut(q),
+        CoverageResponse::Collection(v) => v,
+    };
+    for q in coverages {
+        let DomainDescription::Grid { t: axis, .. } = &mut q.domain else {
+            continue;
+        };
+        let whole_grids = q.ranges.values().all(|r| {
+            !r.axis_names.iter().any(|a| a == "t")
+                && r.shape.iter().product::<usize>() == r.values.len()
+        });
+        if axis.is_some() || !whole_grids {
+            continue;
+        }
+        *axis = Some(vec![t]);
+        for range in q.ranges.values_mut() {
+            range.axis_names.insert(0, "t".into());
+            range.shape.insert(0, 1);
+        }
+    }
 }
 
 fn count_values(response: &CoverageResponse) -> usize {
@@ -434,6 +466,40 @@ mod tests {
         }
     }
 
+    /// The one-step answer of a gridded engine: 2 × 2 cells, every cell
+    /// `v`, no `t` axis; with `levels`, a `[z, y, x]` grid on those levels.
+    fn timeless_grid(v: f64, levels: Option<&[f64]>) -> QueryResult {
+        let (z, shape, axis_names) = match levels {
+            Some(levels) => (
+                Some(VerticalCoord {
+                    kind: VerticalKind::Pressure,
+                    values: levels.to_vec(),
+                }),
+                vec![levels.len(), 2, 2],
+                vec!["z".into(), "y".into(), "x".into()],
+            ),
+            None => (None, vec![2, 2], vec!["y".into(), "x".into()]),
+        };
+        let cells = shape.iter().product();
+        QueryResult {
+            domain: DomainDescription::Grid {
+                x: vec![24.0, 25.0],
+                y: vec![60.0, 61.0],
+                t: None,
+                z,
+            },
+            parameters: param(),
+            ranges: HashMap::from([(
+                "temperature".to_string(),
+                NdArray {
+                    shape,
+                    axis_names,
+                    values: vec![Some(v); cells],
+                },
+            )]),
+        }
+    }
+
     fn profile(hour: u32) -> QueryResult {
         QueryResult {
             domain: DomainDescription::VerticalProfile {
@@ -455,6 +521,25 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    /// The response is valid CoverageJSON (root CLAUDE.md Critical Rule 12).
+    fn assert_valid_covjson(response: &CoverageResponse) {
+        let schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../schemas/coveragejson.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let json = crate::response::coverage_response_to_json(response);
+        let validator = jsonschema::Validator::new(&schema).unwrap();
+        let errors: Vec<String> = validator
+            .iter_errors(&json)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}\n{json}");
     }
 
     fn times(q: &QueryResult) -> Vec<DateTime<Utc>> {
@@ -508,6 +593,82 @@ mod tests {
         let mut expected = vec![Some(1.0); 4];
         expected.extend(vec![Some(2.0); 4]);
         assert_eq!(values(&q), expected);
+    }
+
+    /// A gridded engine answers each instant with a grid without `t`; the
+    /// list keeps every instant, joined along `t`, instead of taking the
+    /// later grids for duplicates of the first.
+    #[test]
+    fn timeless_grids_join_along_t_per_instant() {
+        let got = query_instants(
+            &[at(1), at(2), at(3)],
+            || false,
+            |(t, _)| {
+                if t == at(2) {
+                    return Err(DataServerError::LocationNotFound("no step".into()));
+                }
+                let v = f64::from(t.format("%H").to_string().parse::<u8>().unwrap());
+                Ok(CoverageResponse::Single(timeless_grid(v, None)))
+            },
+        )
+        .unwrap();
+        let CoverageResponse::Single(q) = got else {
+            panic!("expected one grid");
+        };
+        assert_eq!(times(&q), vec![at(1), at(3)]);
+        let range = &q.ranges["temperature"];
+        assert_eq!(range.shape, vec![2, 2, 2]);
+        assert_eq!(range.axis_names, ["t", "y", "x"]);
+        let mut expected = vec![Some(1.0); 4];
+        expected.extend(vec![Some(3.0); 4]);
+        assert_eq!(values(&q), expected);
+    }
+
+    #[test]
+    fn timeless_grids_with_levels_become_t_z_y_x() {
+        let levels = [850.0, 500.0];
+        let got = query_instants(
+            &[at(1), at(2)],
+            || false,
+            |(t, _)| {
+                let v = f64::from(t.format("%H").to_string().parse::<u8>().unwrap());
+                Ok(CoverageResponse::Single(timeless_grid(v, Some(&levels))))
+            },
+        )
+        .unwrap();
+        assert_valid_covjson(&got);
+        let CoverageResponse::Single(q) = got else {
+            panic!("expected one grid");
+        };
+        assert_eq!(times(&q), vec![at(1), at(2)]);
+        let range = &q.ranges["temperature"];
+        assert_eq!(range.shape, vec![2, 2, 2, 2]);
+        assert_eq!(range.axis_names, ["t", "z", "y", "x"]);
+        assert_eq!(range.values[..8], [Some(1.0); 8]);
+        assert_eq!(range.values[8..], [Some(2.0); 8]);
+    }
+
+    /// One answering instant still says which one it was.
+    #[test]
+    fn one_answering_instant_keeps_its_time() {
+        let got = query_instants(
+            &[at(1), at(2)],
+            || false,
+            |(t, _)| {
+                if t == at(1) {
+                    Err(DataServerError::LocationNotFound("no step".into()))
+                } else {
+                    Ok(CoverageResponse::Single(timeless_grid(2.0, None)))
+                }
+            },
+        )
+        .unwrap();
+        assert_valid_covjson(&got);
+        let CoverageResponse::Single(q) = got else {
+            panic!("expected one grid");
+        };
+        assert_eq!(times(&q), vec![at(2)]);
+        assert_eq!(q.ranges["temperature"].shape, vec![1, 2, 2]);
     }
 
     #[test]
