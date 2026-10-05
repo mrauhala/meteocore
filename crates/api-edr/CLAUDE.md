@@ -119,7 +119,7 @@ it:
 - `AlongPath` (default; GRIB, QueryData, Zarr): the handler parses the
   whole WKT with `ds_core::trajectory::TrajectoryPath` before dispatch and
   enforces EDR 1.2's exclusions (Z/ZM + `z`, M/ZM + `datetime` → 400);
-  CoverageJSON only — `params::query_formats` takes the shape, so the
+  CoverageJSON (and HTML) only — `params::query_formats` takes the shape, so the
   handler's negotiation (`f=PNG`/`GeoJSON` → 400 before the query runs) and
   `data_queries.trajectory` `output_formats` cannot disagree; runs on the
   query runtime's workers like position. Engines build the response with

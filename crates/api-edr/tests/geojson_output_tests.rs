@@ -540,7 +540,7 @@ async fn radius_geojson_lists_the_stations_in_the_circle() {
         .map(|f| f["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["helsinki", "tampere"]);
-    // Radius offers no PNG, so the only alternate is CoverageJSON.
+    // Radius offers no PNG: the alternates are CoverageJSON and HTML.
     let alternates: Vec<&str> = json["links"]
         .as_array()
         .unwrap()
@@ -548,7 +548,7 @@ async fn radius_geojson_lists_the_stations_in_the_circle() {
         .filter(|l| l["rel"] == "alternate")
         .map(|l| l["type"].as_str().unwrap())
         .collect();
-    assert_eq!(alternates, ["application/vnd.cov+json"]);
+    assert_eq!(alternates, ["application/vnd.cov+json", "text/html"]);
 
     // An empty circle is an empty FeatureCollection, like CoverageJSON's
     // empty CoverageCollection.
@@ -724,7 +724,7 @@ async fn a_location_list_is_one_feature_collection_in_request_order() {
         .filter(|l| l["rel"] == "alternate")
         .map(|l| l["type"].as_str().unwrap())
         .collect();
-    assert_eq!(alternates, ["application/vnd.cov+json"]);
+    assert_eq!(alternates, ["application/vnd.cov+json", "text/html"]);
 
     // Accept negotiates a list too, and never picks PNG for it.
     let (status, headers, _) = request(
@@ -862,14 +862,15 @@ async fn area_has_no_geojson_even_on_station_series() {
     let description = json["description"].as_str().unwrap();
     assert!(
         description.contains("GeoJSON output is not available for area queries")
-            && description.contains("available: CoverageJSON"),
+            && description.contains("available: CoverageJSON, HTML"),
         "{description}"
     );
-    // One format: Accept has nothing to choose, and the response doesn't vary.
+    // Accept cannot pick GeoJSON; it chooses between CoverageJSON and HTML,
+    // so the response varies on it.
     let (status, headers, _) = request(uri, Some("application/geo+json")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(content_type(&headers), "application/vnd.cov+json");
-    assert!(!varies_on_accept(&headers));
+    assert!(varies_on_accept(&headers));
 }
 
 #[tokio::test]
@@ -944,23 +945,32 @@ async fn metadata_advertises_geojson_where_it_is_served() {
     };
     assert_eq!(
         formats(&obs, "locations"),
-        json!(["CoverageJSON", "GeoJSON", "PNG"])
+        json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
     );
     assert_eq!(
         formats(&obs, "position"),
-        json!(["CoverageJSON", "GeoJSON", "PNG"])
+        json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
     );
-    assert_eq!(formats(&obs, "radius"), json!(["CoverageJSON", "GeoJSON"]));
-    assert_eq!(formats(&obs, "area"), json!(["CoverageJSON"]));
+    assert_eq!(
+        formats(&obs, "radius"),
+        json!(["CoverageJSON", "GeoJSON", "HTML"])
+    );
+    assert_eq!(formats(&obs, "area"), json!(["CoverageJSON", "HTML"]));
     assert_eq!(
         obs["output_formats"],
-        json!(["CoverageJSON", "GeoJSON", "PNG"])
+        json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
     );
 
     let (_, _, grid) = get_json("/collections/grid", None).await;
-    assert_eq!(formats(&grid, "position"), json!(["CoverageJSON", "PNG"]));
-    assert_eq!(formats(&grid, "radius"), json!(["CoverageJSON"]));
-    assert_eq!(grid["output_formats"], json!(["CoverageJSON", "PNG"]));
+    assert_eq!(
+        formats(&grid, "position"),
+        json!(["CoverageJSON", "PNG", "HTML"])
+    );
+    assert_eq!(formats(&grid, "radius"), json!(["CoverageJSON", "HTML"]));
+    assert_eq!(
+        grid["output_formats"],
+        json!(["CoverageJSON", "PNG", "HTML"])
+    );
 }
 
 #[tokio::test]
@@ -987,13 +997,16 @@ async fn api_documents_geojson_where_it_is_served() {
         assert_eq!(geojson_schema(&op(path)), schema_ref, "{path}");
         assert_eq!(
             f_enum(&op(path)),
-            Some(json!(["CoverageJSON", "GeoJSON", "PNG"])),
+            Some(json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])),
             "{path}"
         );
     }
     let radius = op("/edr/collections/obs/radius");
     assert_eq!(geojson_schema(&radius), schema_ref);
-    assert_eq!(f_enum(&radius), Some(json!(["CoverageJSON", "GeoJSON"])));
+    assert_eq!(
+        f_enum(&radius),
+        Some(json!(["CoverageJSON", "GeoJSON", "HTML"]))
+    );
     // Area, and every gridded route, stay CoverageJSON.
     for path in [
         "/edr/collections/obs/area",
@@ -1004,7 +1017,7 @@ async fn api_documents_geojson_where_it_is_served() {
     }
     assert_eq!(
         f_enum(&op("/edr/collections/grid/radius")),
-        Some(json!(["CoverageJSON"]))
+        Some(json!(["CoverageJSON", "HTML"]))
     );
 }
 
