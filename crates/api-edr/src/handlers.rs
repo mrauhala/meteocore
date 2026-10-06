@@ -1944,12 +1944,7 @@ pub async fn instances(
             // `instances` (each item a collection-shaped instance), not
             // `collections`.
             Json(json!({
-                "links": [{
-                    "href": self_href,
-                    "rel": "self",
-                    "type": "application/json",
-                    "title": format!("{} — instances", config.title)
-                }],
+                "links": instances_list_links(engine.as_ref(), config, base, &self_href),
                 "instances": instances,
             }))
             .into_response()
@@ -1990,6 +1985,50 @@ pub async fn instances(
             .into_response()
         }
     }))
+}
+
+/// The instances list's `links`, as EDR 1.2 `/req/core/rc-collection-info-
+/// links` A asks of it (ATS `/conf/instances/rc-md-success` step 1): `self`,
+/// the HTML `alternate`, the parent collection, and its query end points as
+/// `rel=data` — the collection document's own links, so the two cannot
+/// disagree. Those end points answer for the latest run; each run's own are in
+/// its entry of `instances`.
+fn instances_list_links(
+    engine: &dyn EdrEngine,
+    config: &CollectionConfig,
+    base: &str,
+    self_href: &str,
+) -> Vec<serde_json::Value> {
+    let mut links = vec![
+        json!({
+            "href": self_href,
+            "rel": "self",
+            "type": "application/json",
+            "title": format!("{} — instances", config.title)
+        }),
+        json!({
+            "href": format!("{self_href}?f=html"),
+            "rel": "alternate",
+            "type": "text/html",
+            "title": format!("{} — instances as HTML", config.title)
+        }),
+        json!({
+            "href": format!("{base}/edr/collections/{}", config.id),
+            "rel": "collection",
+            "type": "application/json",
+            "title": config.title
+        }),
+    ];
+    let collection = build_collection_metadata(engine, config, base, None, false);
+    if let Some(collection_links) = collection["links"].as_array() {
+        links.extend(
+            collection_links
+                .iter()
+                .filter(|l| l["rel"] == "data" && l["href"] != self_href)
+                .cloned(),
+        );
+    }
+    links
 }
 
 /// The HTML card for one model run: id = the instance id, title = the run's
@@ -2078,13 +2117,16 @@ pub async fn instance(
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = html_document(build_collection_metadata(
+            let mut metadata = html_document(build_collection_metadata(
                 engine.as_ref(),
                 config,
                 base,
                 Some(&run),
                 false,
             ));
+            // The page heading names the run; the JSON `title` is the
+            // collection's (`/req/instances/src-md-success` C).
+            metadata["title"] = json!(format!("{} — run {}", config.title, run.instance_id()));
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -3638,6 +3680,9 @@ fn build_collection_metadata(
         query["link"]["type"] = json!(query_media_type(query_type));
     }
 
+    // The run is named by the `self` link only: an instance document's
+    // `title` and `description` are its collection's (EDR 1.2
+    // `/req/instances/src-md-success` C).
     let self_title = match instance {
         Some(_) => format!("{} — run {self_id}", config.title),
         None => config.title.clone(),
@@ -3646,7 +3691,7 @@ fn build_collection_metadata(
         "href": query_base,
         "rel": "self",
         "type": "application/json",
-        "title": self_title.clone()
+        "title": self_title
     })];
     if instance.is_some() {
         // Link an instance document back to its parent collection.
@@ -3672,7 +3717,6 @@ fn build_collection_metadata(
 
     let mut fields = json!({
         "id": self_id,
-        "title": self_title,
         // No `itemType` and no `rel=items` link: EDR's `items` is a data
         // query (#928), advertised in `data_queries` like the others and
         // GeoJSON only, while Common Part 2 `itemType` and the workbench's
