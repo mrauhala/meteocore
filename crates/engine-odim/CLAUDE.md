@@ -98,8 +98,12 @@ around `ds-storage` calls (Critical Rules 6–7).
 
 - **Cross-sections:** `query_trajectory` returns a CoverageJSON `Section`
   (composite `[t,x,y]` axis + numeric `z` = height above antenna via the
-  4/3-Earth beam model). `z` selects the elevation-angle band. Vertical axis
-  is elevation angle (`VerticalKind::ElevationAngle`). The per-site view
+  4/3-Earth beam model). `z` selects sweeps exactly as position/area do
+  (`resolve_levels`, `SWEEP_MATCH_TOLERANCE_DEG`; none matching → 400), and
+  `volume_section` keeps only the cells whose nearest sweep is selected —
+  never the nearest *selected* sweep, and never a ±1° band around `z`
+  (#983, EDR 1.2 `/req/edr/z-response` B). Vertical axis is elevation angle
+  (`VerticalKind::ElevationAngle`). The per-site view
   declares `TrajectoryShape::CrossSection` (#926): api-edr then accepts a
   2-D `LINESTRING` only, offers the PNG heatmap, and dispatches on the
   blocking pool that `blocking_pixel_handle` expects. Not the gridded

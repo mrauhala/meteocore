@@ -138,9 +138,16 @@ impl EdrEngine for LimitMock {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        ["locations", "position", "area", "radius", "trajectory"]
-            .map(String::from)
-            .to_vec()
+        [
+            "locations",
+            "position",
+            "area",
+            "radius",
+            "trajectory",
+            "cube",
+        ]
+        .map(String::from)
+        .to_vec()
     }
 
     fn query_position(
@@ -179,6 +186,37 @@ impl EdrEngine for LimitMock {
                 .map(|i| coverage(20.0 + i as f64, 60.0))
                 .collect(),
         ))
+    }
+
+    /// One coverage per timestep, as an along-path trajectory over a
+    /// `datetime` window answers: a CoverageCollection `limit` can cap.
+    fn query_trajectory(
+        &self,
+        _: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Ok(CoverageResponse::Collection(
+            (0..AREA_COVERAGES)
+                .map(|i| coverage(20.0 + i as f64, 60.0))
+                .collect(),
+        ))
+    }
+
+    /// A cube is one coverage, which `limit` cannot page.
+    fn query_cube(
+        &self,
+        _: &ds_core::feature::Bbox,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: ds_core::cube::CubeResolution,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Self::check_run(reference_time)?;
+        Ok(CoverageResponse::Single(coverage(24.0, 60.0)))
     }
 }
 
@@ -253,6 +291,9 @@ impl App {
 const POLYGON: &str = "POLYGON((20%2059,30%2059,30%2070,20%2070,20%2059))";
 const CIRCLE: &str = "coords=POINT(24%2060)&within=10&within-units=km";
 
+const LINE: &str = "LINESTRING(20%2060,21%2061)";
+const CUBE: &str = "bbox=20,60,21,61";
+
 /// Five points at longitudes 1, 2, 3, 4, 5.
 const FIVE_POINTS: &str = "MULTIPOINT((1%2060),(2%2060),(3%2060),(4%2060),(5%2060))";
 
@@ -267,6 +308,9 @@ fn limited_routes() -> Vec<String> {
         format!("/collections/obs/instances/{RUN}/position?coords={FIVE_POINTS}"),
         format!("/collections/obs/instances/{RUN}/area?coords={POLYGON}"),
         format!("/collections/obs/instances/{RUN}/radius?{CIRCLE}"),
+        format!("/collections/obs/trajectory?coords={LINE}"),
+        format!("/collections/obs/cube?{CUBE}"),
+        format!("/collections/obs/instances/{RUN}/cube?{CUBE}"),
     ]
 }
 
@@ -615,6 +659,9 @@ async fn openapi_declares_limit_and_offset() {
         "/edr/collections/obs/instances/{instanceId}/position",
         "/edr/collections/obs/instances/{instanceId}/area",
         "/edr/collections/obs/instances/{instanceId}/radius",
+        "/edr/collections/obs/trajectory",
+        "/edr/collections/obs/cube",
+        "/edr/collections/obs/instances/{instanceId}/cube",
     ] {
         let limit = parameter(path, "limit").unwrap_or_else(|| panic!("{path}: no limit"));
         assert_eq!(limit["in"], "query", "{path}");
@@ -634,20 +681,45 @@ async fn openapi_declares_limit_and_offset() {
     }
 }
 
-/// Trajectory has no `limit` in EDR 1.2; carrying one is a 400, not a
-/// silently unlimited 200, now that every other data query honours it.
+/// EDR 1.2 `/req/edr/rc-core-query-parameters` L: `limit` is allowed on
+/// every data query. Trajectory and cube used to 400 on it; now a
+/// trajectory's CoverageCollection is capped like any other, and a cube's
+/// single coverage, which cannot page, is returned unchanged.
 #[tokio::test]
-async fn limit_on_trajectory_is_a_400() {
+async fn limit_on_trajectory_and_cube_is_accepted() {
     let app = app(1);
     let (status, json) = app
-        .get("/collections/obs/trajectory?coords=LINESTRING(20%2060,21%2061)&limit=5")
+        .get(&format!(
+            "/collections/obs/trajectory?coords={LINE}&limit=2"
+        ))
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
-    assert!(
-        json["description"]
-            .as_str()
-            .is_some_and(|d| d.contains("not supported on trajectory")),
-        "{json}"
-    );
-    assert_eq!(app.calls(), 0);
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(xs(&json), vec![20.0, 21.0]);
+    validate("coveragejson.json", &json);
+    let (status, json) = app
+        .get(&format!(
+            "/collections/obs/trajectory?coords={LINE}&limit=10000"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(xs(&json).len(), AREA_COVERAGES);
+
+    for route in [
+        format!("/collections/obs/cube?{CUBE}"),
+        format!("/collections/obs/instances/{RUN}/cube?{CUBE}"),
+    ] {
+        let (_, unlimited) = app.get(&route).await;
+        let (status, json) = app.get(&format!("{route}&limit=1")).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {json}");
+        assert_eq!(json["type"], "Coverage", "{route}");
+        assert_eq!(
+            json, unlimited,
+            "{route}: limit leaves one coverage unchanged"
+        );
+    }
+    // Still one cube parameter: a repeated limit is a 400 like any other.
+    let (status, _) = app
+        .get(&format!("/collections/obs/cube?{CUBE}&limit=1&limit=2"))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

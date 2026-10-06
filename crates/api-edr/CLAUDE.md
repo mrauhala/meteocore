@@ -212,7 +212,10 @@ and never under an instance.
   `meteocore:beamCoverage` **foreign member** on the domain (raw metres,
   one per node) — NOT an axis (the schema forbids extra axes) and NOT a
   parameter (naive clients would plot it as data); the `f=png` heatmap
-  draws it as a hatched-below "lowest beam" overlay line.
+  draws it as a hatched-below "lowest beam" overlay line. The PNG stacks one
+  panel per parameter; size it with `params::section_plot_dimensions`
+  (default height grows with the panels, a misfit is a 400 naming
+  `parameter-name`), never let `render_heatmap` fail it as a 500.
 - `f=png` time-series plots are why this crate (alone among API crates)
   depends on ds-render.
 - A location with no data in the requested window returns `LocationNotFound`
@@ -315,8 +318,12 @@ that returns CoverageJSON passes its result through `limit_coverages` (top-level
 coverages only); position also truncates the point list before dispatch, which
 is safe because an answered point always yields at least one coverage. A new
 data-query route must do the same and list `#/components/parameters/limit` in
-`api_definition()` — unless EDR 1.2 defines no `limit` for its query type
-(trajectory, cube): then a `limit` is a 400, never silently ignored. `/locations` without `limit` or a filter must stay byte-identical to
+`api_definition()`, trajectory and cube included: EDR 1.2
+`/req/edr/rc-core-query-parameters` L allows `limit` on every data query and
+has a format that cannot page ignore it (#983), so a valid `limit` is never a
+400. A single coverage passes `limit_coverages` unchanged; the cross-section
+PNG skips it (it plots the newest section). A malformed `limit` is still a 400
+everywhere, as a malformed `z` is. `/locations` without `limit` or a filter must stay byte-identical to
 the unpaged inventory (clients and ETags rely on it); with `limit` it pages
 through `ds_core::collection_search::page_window`, the `/collections`
 arithmetic, under the same `location_budget` writer.

@@ -446,6 +446,51 @@ pub fn plot_dimensions(width: Option<u32>, height: Option<u32>) -> (u32, u32) {
     (width.unwrap_or(800), height.unwrap_or(600))
 }
 
+/// Default height of one stacked panel in a cross-section PNG without
+/// `height`: one panel keeps the 600 px default, more grow the image up to
+/// [`ds_render::HEATMAP_MAX_HEIGHT_PX`].
+pub const SECTION_DEFAULT_PANEL_PX: u32 = 160;
+
+/// The `(width, height)` of a cross-section PNG stacking one heatmap panel
+/// per parameter. Without `height` the image grows with the panel count
+/// (600 px, or [`SECTION_DEFAULT_PANEL_PX`] per panel, up to
+/// [`ds_render::HEATMAP_MAX_HEIGHT_PX`]), so a volume's every parameter
+/// fits by default. A requested `height` too small for the panels, or more
+/// panels than the tallest image holds, is a 400 naming `height` and
+/// `parameter-name`, never the renderer's 500.
+pub fn section_plot_dimensions(
+    width: Option<u32>,
+    height: Option<u32>,
+    panels: usize,
+) -> Result<(u32, u32), DataServerError> {
+    use ds_render::{HEATMAP_MAX_HEIGHT_PX, HEATMAP_MIN_PANEL_PX};
+    let (width, default_height) = plot_dimensions(width, None);
+    let panels = u32::try_from(panels).unwrap_or(u32::MAX);
+    let height = height.unwrap_or_else(|| {
+        default_height
+            .max(panels.saturating_mul(SECTION_DEFAULT_PANEL_PX))
+            .min(HEATMAP_MAX_HEIGHT_PX)
+    });
+    let need = panels.saturating_mul(HEATMAP_MIN_PANEL_PX);
+    if need > HEATMAP_MAX_HEIGHT_PX {
+        return Err(DataServerError::InvalidParameter(format!(
+            "{panels} parameters do not fit one PNG cross-section: at most {} panels of \
+             {HEATMAP_MIN_PANEL_PX}px fit its {HEATMAP_MAX_HEIGHT_PX}px maximum height; \
+             name fewer with parameter-name",
+            HEATMAP_MAX_HEIGHT_PX / HEATMAP_MIN_PANEL_PX
+        )));
+    }
+    // The renderer clamps the height to 120..=2000 px before checking.
+    if height.clamp(120, HEATMAP_MAX_HEIGHT_PX) < need {
+        return Err(DataServerError::InvalidParameter(format!(
+            "height {height}px is too small for {panels} parameter panels, which need at \
+             least {need}px ({HEATMAP_MIN_PANEL_PX}px each): raise height or name fewer \
+             with parameter-name"
+        )));
+    }
+    Ok((width, height))
+}
+
 /// Largest `limit` honoured, the maximum of EDR 1.2
 /// `/req/edr/rc-limit-definition`. A larger value is clamped to it, not an
 /// error (`/req/edr/REQ_rc-limit-response` C).
@@ -742,11 +787,16 @@ pub struct CubeQueryParams {
     pub resolution_z: Option<String>,
     pub crs: Option<String>,
     pub f: Option<String>,
+    /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`]. A cube
+    /// is one coverage, which it leaves unchanged
+    /// (`/req/edr/rc-core-query-parameters` L).
+    pub limit: Option<String>,
 }
 
 /// The query parameters a cube request accepts, in the order the 1.2
-/// OpenAPI lists them.
-pub const CUBE_PARAMETERS: [&str; 9] = [
+/// OpenAPI lists them, then `limit`, which EDR 1.2 allows on every data
+/// query (`/req/edr/rc-core-query-parameters` L).
+pub const CUBE_PARAMETERS: [&str; 10] = [
     "bbox",
     "z",
     "datetime",
@@ -756,6 +806,7 @@ pub const CUBE_PARAMETERS: [&str; 9] = [
     "resolution-z",
     "crs",
     "f",
+    "limit",
 ];
 
 impl CubeQueryParams {
@@ -774,6 +825,7 @@ impl CubeQueryParams {
                 "resolution-z" => &mut params.resolution_z,
                 "crs" => &mut params.crs,
                 "f" => &mut params.f,
+                "limit" => &mut params.limit,
                 other => {
                     return Err(DataServerError::InvalidParameter(format!(
                         "Unknown cube query parameter '{other}'; accepted: {}",
@@ -953,8 +1005,9 @@ pub struct TrajectoryQueryParams {
     /// PNG image dimensions (ignored for CoverageJSON).
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// Not supported on trajectory, which EDR 1.2 gives no `limit`: read
-    /// only so a request carrying it is a 400, not a silently unlimited 200.
+    /// EDR 1.2 `limit` on top-level coverages; see [`parse_limit`]. A
+    /// single coverage or PNG image is returned unchanged
+    /// (`/req/edr/rc-core-query-parameters` L).
     pub limit: Option<String>,
 }
 
@@ -2283,6 +2336,31 @@ mod tests {
         ] {
             let err = check_crs(Some(bad)).unwrap_err().to_string();
             assert!(err.contains(CRS84), "{bad}: {err}");
+        }
+    }
+
+    /// A cross-section PNG grows its default height with the panel count,
+    /// and a height or panel count the renderer cannot draw is a 400.
+    #[test]
+    fn section_plot_dimensions_grow_and_reject() {
+        assert_eq!(section_plot_dimensions(None, None, 1).unwrap(), (800, 600));
+        assert_eq!(section_plot_dimensions(None, None, 3).unwrap(), (800, 600));
+        assert_eq!(section_plot_dimensions(None, None, 5).unwrap(), (800, 800));
+        // A 16-parameter volume fits by default: 125 px per panel.
+        assert_eq!(
+            section_plot_dimensions(None, None, 16).unwrap(),
+            (800, ds_render::HEATMAP_MAX_HEIGHT_PX)
+        );
+        assert_eq!(
+            section_plot_dimensions(Some(400), Some(300), 2).unwrap(),
+            (400, 300)
+        );
+        for (height, panels) in [(Some(600), 16), (Some(100), 2), (None, 32)] {
+            let err = section_plot_dimensions(None, height, panels).unwrap_err();
+            assert!(
+                matches!(&err, DataServerError::InvalidParameter(m) if m.contains("parameter-name")),
+                "{height:?} × {panels}: {err:?}"
+            );
         }
     }
 
