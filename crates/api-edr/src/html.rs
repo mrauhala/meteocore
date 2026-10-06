@@ -30,7 +30,7 @@ use ds_core::html::escape;
 use ds_core::model::{CoverageResponse, Location};
 use serde_json::Value;
 
-use crate::geojson::encode_path_segment;
+use crate::geojson::{encode_path_segment, FeatureSummary};
 use crate::response::{coverage_response_to_json, LocationsContext, COVERAGE_JSON_MEDIA_TYPE};
 
 /// The `Content-Type` of every HTML data page.
@@ -104,19 +104,83 @@ pub(crate) fn response(body: impl Into<axum::body::Body>) -> Response {
     ([(header::CONTENT_TYPE, CONTENT_TYPE)], body.into()).into_response()
 }
 
-/// The HTML page of a data query's result: its CoverageJSON, all of it.
-pub(crate) fn coverage_page(result: &CoverageResponse, page: &DataPage) -> String {
-    coverage_html(&coverage_response_to_json(result), page)
+/// The location identity of a station-series result (#988): what its EDR
+/// GeoJSON form says besides the series, one row per coverage in order, and
+/// `numberMatched` (`None` when uncounted; `numberReturned` is the rows).
+pub(crate) struct Locations {
+    pub rows: Vec<FeatureSummary>,
+    pub number_matched: Option<usize>,
 }
 
-fn coverage_html(doc: &Value, page: &DataPage) -> String {
+/// The HTML page of a data query's result: its CoverageJSON, all of it,
+/// and on a station collection which location each coverage is.
+pub(crate) fn coverage_page(
+    result: &CoverageResponse,
+    page: &DataPage,
+    locations: Option<&Locations>,
+) -> String {
+    coverage_html(&coverage_response_to_json(result), page, locations)
+}
+
+fn coverage_html(doc: &Value, page: &DataPage, locations: Option<&Locations>) -> String {
     let coverages: Vec<&Value> = match doc["coverages"].as_array() {
         Some(coverages) => coverages.iter().collect(),
         None => vec![doc],
     };
-    page.render_into(body_estimate(doc, &coverages, page), |body| {
-        coverage_body(body, doc, coverages, page)
+    let estimate = body_estimate(doc, &coverages, page) + locations.map_or(0, locations_len);
+    page.render_into(estimate, |body| {
+        coverage_body(body, doc, coverages, page, locations)
     })
+}
+
+/// The location table: per coverage its feature id, label, `datetime` and
+/// `edrqueryendpoint` as an `<a>`, with `numberMatched` and
+/// `numberReturned` — every identity member of the GeoJSON form
+/// (`/req/html/content` A).
+fn locations_panel(locations: &Locations) -> String {
+    let mut out = String::from("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Locations</h2></div><div class=\"panel-body\"><dl class=\"definition\">");
+    if let Some(matched) = locations.number_matched {
+        let _ = write!(out, "<dt><code>numberMatched</code></dt><dd>{matched}</dd>");
+    }
+    let _ = write!(
+        out,
+        "<dt><code>numberReturned</code></dt><dd>{}</dd></dl></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">Coverage</th><th scope=\"col\">Location id</th><th scope=\"col\">Label</th><th scope=\"col\">Datetime</th><th scope=\"col\">EDR query endpoint</th></tr></thead><tbody>",
+        locations.rows.len()
+    );
+    for (i, row) in locations.rows.iter().enumerate() {
+        let _ = write!(
+            out,
+            "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            i + 1,
+            escape(row.id.as_deref().unwrap_or_default()),
+            escape(&row.label),
+            escape(&row.datetime),
+            ui::anchor(&row.edrqueryendpoint, &row.edrqueryendpoint, "table-link")
+        );
+    }
+    out.push_str("</tbody></table></div></section>");
+    out
+}
+
+/// The bytes the location table and the coverage headings naming each
+/// location take, from above.
+fn locations_len(locations: &Locations) -> usize {
+    512 + locations
+        .rows
+        .iter()
+        .map(|row| {
+            let id = escaped_len(row.id.as_deref().unwrap_or_default());
+            let label = escaped_len(&row.label);
+            // The row, its anchor (href and text) and the coverage heading.
+            128 + id
+                + label
+                + escaped_len(&row.datetime)
+                + 34
+                + 2 * escaped_len(&row.edrqueryendpoint)
+                + 16
+                + label
+        })
+        .sum::<usize>()
 }
 
 /// The bytes a coverage page's body takes, from above: a value cell is at
@@ -124,12 +188,19 @@ fn coverage_html(doc: &Value, page: &DataPage) -> String {
 /// table adds a cell per axis coordinate and the row tags per value; the
 /// domain table lists every axis value. The request, links, parameters and
 /// any other member are measured ([`panels_estimate`], [`json_html_len`]);
-/// 16 KiB covers the fixed markup.
+/// 16 KiB covers the page's fixed markup, [`SECTION`] each coverage
+/// section's and [`TABLE`] each range table's.
 fn body_estimate(doc: &Value, coverages: &[&Value], page: &DataPage) -> usize {
     const CELL: usize = 33;
     const ROW: usize = 9;
     const AXIS_VALUE: usize = 40;
+    /// A coverage section's own markup: its heading, the domain table's
+    /// head and rows, the value notes.
+    const SECTION: usize = 2048;
+    /// A range table's head, caption and column headers.
+    const TABLE: usize = 512;
     let mut bytes: usize = 16 * 1024 + panels_estimate(page);
+    bytes = bytes.saturating_add(coverages.len().saturating_mul(SECTION));
     bytes += members_len(doc, &["coverages", "parameters", "domain", "ranges"]);
     // A parameter's row shows its label, unit and observed property, each
     // part of the parameter, then all of it.
@@ -156,6 +227,7 @@ fn body_estimate(doc: &Value, coverages: &[&Value], page: &DataPage) -> usize {
             .flatten()
             .map(|(_, r)| r)
         {
+            bytes = bytes.saturating_add(TABLE);
             let values = range["values"].as_array().map_or(0, Vec::len);
             let names: Vec<&str> = range["axisNames"]
                 .as_array()
@@ -178,7 +250,13 @@ fn body_estimate(doc: &Value, coverages: &[&Value], page: &DataPage) -> usize {
     bytes
 }
 
-fn coverage_body(body: &mut String, doc: &Value, coverages: Vec<&Value>, page: &DataPage) {
+fn coverage_body(
+    body: &mut String,
+    doc: &Value,
+    coverages: Vec<&Value>,
+    page: &DataPage,
+    locations: Option<&Locations>,
+) {
     let kind = doc["type"].as_str().unwrap_or("Coverage");
     body.push_str(&ui::page_heading(
         &page.title,
@@ -202,14 +280,22 @@ fn coverage_body(body: &mut String, doc: &Value, coverages: Vec<&Value>, page: &
         doc,
         &["coverages", "parameters", "domain", "ranges"],
     ));
+    if let Some(locations) = locations {
+        body.push_str(&locations_panel(locations));
+    }
     body.push_str(&parameters_panel(&doc["parameters"]));
     let total = coverages.len();
     for (i, coverage) in coverages.into_iter().enumerate() {
-        let heading = if total == 1 {
+        let mut heading = if total == 1 {
             "Coverage".to_owned()
         } else {
             format!("Coverage {} of {total}", i + 1)
         };
+        // Name the coverage's location, as its GeoJSON feature's label does.
+        if let Some(row) = locations.and_then(|l| l.rows.get(i)) {
+            heading.push_str(" · ");
+            heading.push_str(&row.label);
+        }
         coverage_section(body, &heading, coverage, &doc["parameters"]);
     }
 }
@@ -1123,7 +1209,7 @@ mod tests {
             "ranges": {"t2m": {"type": "NdArray", "dataType": "float", "axisNames": ["t", "y", "x"],
                 "shape": [2, 2, 3], "values": [1, 2, 3, 4, 5, 6, 7, 8, null, 10, 11, 12]}}
         });
-        let html = coverage_html(&doc, &page());
+        let html = coverage_html(&doc, &page(), None);
         assert_eq!(html.matches("<caption>").count(), 2, "{html}");
         for v in [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12] {
             assert!(html.contains(&format!("<td>{v}</td>")), "{v}");
@@ -1155,7 +1241,7 @@ mod tests {
             "ranges": {"DBZH": {"type": "NdArray", "dataType": "float", "axisNames": ["composite", "z"],
                 "shape": [2, 2], "values": [1.5, null, 3.5, 4.5]}}
         });
-        let html = coverage_html(&doc, &page());
+        let html = coverage_html(&doc, &page(), None);
         assert!(
             html.contains(
                 "<td>2026-01-01T00:00:00Z</td><td>25.5</td><td>60.75</td><td>1000</td><td>4.5</td>"
@@ -1192,13 +1278,62 @@ mod tests {
         let page = page();
         let (head, tail) = page.shell();
         for doc in [grid, series] {
-            let html = coverage_html(&doc, &page);
+            let html = coverage_html(&doc, &page, None);
             let reserved = head.len() + body_estimate(&doc, &[&doc], &page) + tail.len();
             assert!(html.len() <= reserved, "{} > {reserved}", html.len());
             assert_eq!(html.capacity(), reserved, "the buffer regrew");
             // And not wildly above it: within twice the page.
             assert!(reserved < 2 * html.len(), "{reserved} vs {}", html.len());
         }
+    }
+
+    /// The location table and the headings naming each coverage's station
+    /// (#988) fit the reservation too, and every label is escaped.
+    #[test]
+    fn the_locations_reservation_covers_the_page() {
+        let series = json!({
+            "type": "Coverage",
+            "domain": {"type": "Domain", "domainType": "PointSeries", "axes": {
+                "x": {"values": [1.0]}, "y": {"values": [2.0]},
+                "t": {"values": ["2026-01-01T00:00:00+00:00"]}}, "referencing": []},
+            "parameters": {},
+            "ranges": {"a": {"type": "NdArray", "dataType": "float", "axisNames": ["t"],
+                "shape": [1], "values": [1.5]}}
+        });
+        let n = 200;
+        let doc = json!({"type": "CoverageCollection", "parameters": {},
+            "coverages": vec![series; n]});
+        let label = "<&\"Ä station\"&>".repeat(20);
+        let locations = Locations {
+            rows: (0..n)
+                .map(|i| FeatureSummary {
+                    id: Some(format!("<id {i}>")),
+                    label: label.clone(),
+                    edrqueryendpoint: format!(
+                        "https://example.org/edr/collections/c/locations/%3Cid%20{i}%3E&x=\"{label}\""
+                    ),
+                    datetime: "2026-01-01T00:00:00+00:00/2026-01-01T02:00:00+00:00".into(),
+                })
+                .collect(),
+            number_matched: Some(n),
+        };
+        let page = page();
+        let coverages: Vec<&Value> = doc["coverages"].as_array().unwrap().iter().collect();
+        let (head, tail) = page.shell();
+        // Many small coverages: each section's own markup is reserved.
+        let bare = coverage_html(&doc, &page, None);
+        let bare_reserved = head.len() + body_estimate(&doc, &coverages, &page) + tail.len();
+        assert_eq!(bare.capacity(), bare_reserved, "the bare page regrew");
+        let html = coverage_html(&doc, &page, Some(&locations));
+        let reserved = head.len()
+            + body_estimate(&doc, &coverages, &page)
+            + locations_len(&locations)
+            + tail.len();
+        assert!(html.len() <= reserved, "{} > {reserved}", html.len());
+        assert_eq!(html.capacity(), reserved, "the buffer regrew");
+        assert!(html.contains(&format!("Coverage {n} of {n} · {}", escape(&label))));
+        assert!(html.contains("<code>&lt;id 7&gt;</code>"));
+        assert!(!html.contains("<id 7>") && !html.contains(&label));
     }
 
     /// An `items` page fits its reservation too, whatever its features

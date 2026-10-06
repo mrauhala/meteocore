@@ -325,6 +325,103 @@ impl EdrEngine for Section {
     }
 }
 
+/// A station collection (`serves_station_series`): each position, radius
+/// and location answer is a series at a listed location, so it is also
+/// offered as EDR GeoJSON naming each station.
+struct Stations {
+    /// Its location inventory cannot be read: the HTML page still answers.
+    inventory_down: bool,
+}
+
+impl Stations {
+    fn at(x: f64, y: f64) -> QueryResult {
+        coverage(
+            DomainDescription::PointSeries {
+                x,
+                y,
+                t: vec![t0(), t0() + Duration::hours(1)],
+                z: None,
+            },
+            &["t"],
+            &[2],
+            &[1.5, 2.5],
+        )
+    }
+}
+
+impl EdrEngine for Stations {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        if self.inventory_down {
+            return Err(DataServerError::Engine("inventory unavailable".into()));
+        }
+        Every.get_locations()
+    }
+
+    fn serves_station_series(&self) -> bool {
+        true
+    }
+
+    fn query_location(
+        &self,
+        id: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        match id {
+            "here" => Ok(CoverageResponse::Single(Self::at(25.0, 60.0))),
+            "a b" => Ok(CoverageResponse::Single(Self::at(26.0, 61.0))),
+            _ => Err(DataServerError::LocationNotFound(id.into())),
+        }
+    }
+
+    fn query_position(
+        &self,
+        coords: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let (lat, lon) = ds_core::feature::parse_point_coords(coords)?;
+        Ok(CoverageResponse::Single(Self::at(lon, lat)))
+    }
+
+    /// Both stations, whatever the area: the radius query's answer.
+    fn query_area(
+        &self,
+        _: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Ok(CoverageResponse::Collection(vec![
+            Self::at(25.0, 60.0),
+            Self::at(26.0, 61.0),
+        ]))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["temperature".to_string()]
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((t0(), t0() + Duration::hours(1)))
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([20.0, 58.0, 30.0, 62.0])
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        ["locations", "position", "area", "radius"]
+            .map(String::from)
+            .to_vec()
+    }
+}
+
 fn config(id: &str, title: &str) -> CollectionConfig {
     CollectionConfig {
         id: id.to_string(),
@@ -356,11 +453,28 @@ fn router() -> axum::Router {
     let mut engines: HashMap<String, Arc<dyn EdrEngine>> = HashMap::new();
     engines.insert("c".to_string(), every.clone());
     engines.insert("pvol".to_string(), Arc::new(Section));
+    engines.insert(
+        "obs".to_string(),
+        Arc::new(Stations {
+            inventory_down: false,
+        }),
+    );
+    engines.insert(
+        "obsdown".to_string(),
+        Arc::new(Stations {
+            inventory_down: true,
+        }),
+    );
     let mut feature_engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
     feature_engines.insert("c".to_string(), every);
     let collections = HashMap::from([
         ("c".to_string(), config("c", "Every <query> & \"more\"")),
         ("pvol".to_string(), config("pvol", "Radar site")),
+        ("obs".to_string(), config("obs", "Stations")),
+        (
+            "obsdown".to_string(),
+            config("obsdown", "Stations, inventory down"),
+        ),
     ]);
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
@@ -769,5 +883,125 @@ async fn output_formats_list_html() {
             formats.as_array().unwrap().iter().any(|f| f == "HTML"),
             "{name}: {formats}"
         );
+    }
+}
+
+/// The location panel is extra: when the inventory cannot be read, a station
+/// query's HTML page still answers with its CoverageJSON, without the panel.
+#[tokio::test]
+async fn station_pages_render_without_an_inventory() {
+    for uri in [
+        format!("/collections/obsdown/position?coords={POINT}&f=html"),
+        format!("/collections/obsdown/radius?coords={POINT}&within=500&within-units=km&f=html"),
+    ] {
+        let (status, headers, body) = get(&uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "{uri}"
+        );
+        assert!(!body.contains("<code>numberReturned</code>"), "{uri}");
+    }
+}
+
+/// `/req/html/content` A over the EDR GeoJSON schema of the same response
+/// (#988): a station collection's position, radius and location pages say
+/// which location each coverage is, with every identity member its GeoJSON
+/// features carry: id, label, `edrqueryendpoint` as an `<a>`, `datetime`,
+/// and `numberMatched` / `numberReturned`.
+#[tokio::test]
+async fn station_pages_name_each_coverage_as_the_geojson_does() {
+    use ds_core::html::escape;
+    for uri in [
+        format!("/collections/obs/position?coords={POINT}"),
+        "/collections/obs/position?coords=MULTIPOINT((25%2060),(26%2061))".to_string(),
+        format!("/collections/obs/radius?coords={POINT}&within=500&within-units=km"),
+        "/collections/obs/locations/here".to_string(),
+        "/collections/obs/locations/here,a%20b".to_string(),
+    ] {
+        let (status, _, geojson) = get(&with_f(&uri, "GeoJSON"), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {geojson}");
+        let geojson: Value = serde_json::from_str(&geojson).unwrap();
+        let (status, _, html) = get(&with_f(&uri, "html"), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let body = html.split_once("<body").map_or(&*html, |(_, b)| b);
+        assert!(body.contains("<h2>Locations</h2>"), "{uri}");
+        let features = geojson["features"].as_array().unwrap();
+        assert!(!features.is_empty(), "{uri}");
+        for (n, key) in ["numberMatched", "numberReturned"].iter().enumerate() {
+            let value = geojson[*key].as_u64().unwrap();
+            assert!(
+                body.contains(&format!("<dt><code>{key}</code></dt><dd>{value}</dd>")),
+                "{uri}: {key} ({n})"
+            );
+        }
+        for (i, f) in features.iter().enumerate() {
+            let props = &f["properties"];
+            let id = f["id"].as_str().unwrap();
+            let label = props["label"].as_str().unwrap();
+            let endpoint = props["edrqueryendpoint"].as_str().unwrap();
+            let datetime = props["datetime"].as_str().unwrap();
+            assert!(
+                body.contains(&format!("<code>{}</code>", escape(id))),
+                "{uri}: {id}"
+            );
+            assert!(body.contains(&escape(datetime)), "{uri}: {datetime}");
+            assert!(
+                body.contains(&format!("href=\"{}\"", escape(endpoint))),
+                "{uri}: {endpoint}"
+            );
+            // Each coverage's heading names its station.
+            let heading = if features.len() == 1 {
+                format!("Coverage · {}", escape(label))
+            } else {
+                format!(
+                    "Coverage {} of {} · {}",
+                    i + 1,
+                    features.len(),
+                    escape(label)
+                )
+            };
+            assert!(body.contains(&heading), "{uri}: {heading}");
+        }
+        // Labels are escaped, never markup.
+        assert!(!body.contains("<b>Here</b>"), "{uri}");
+    }
+    // A gridded collection has no GeoJSON form and no location table.
+    let (_, _, html) = get(
+        &format!("/collections/c/area?coords={POLYGON}&f=html"),
+        None,
+    )
+    .await;
+    assert!(!html.contains("<h2>Locations</h2>"));
+}
+
+/// EDR 1.2 `/req/edr/rc-core-query-parameters` L: an HTML page cannot be
+/// paged, so `limit` is ignored there and every coverage is shown.
+#[tokio::test]
+async fn html_ignores_limit() {
+    for uri in [
+        "/collections/obs/position?coords=MULTIPOINT((25%2060),(26%2061))".to_string(),
+        format!("/collections/obs/radius?coords={POINT}&within=500&within-units=km"),
+        "/collections/obs/locations/here,a%20b".to_string(),
+    ] {
+        let (_, _, all) = get(&with_f(&uri, "html"), None).await;
+        let (status, _, limited) = get(&with_f(&uri, "html&limit=1"), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(all.contains("Coverage 2 of 2"), "{uri}");
+        assert!(
+            limited.contains("Coverage 2 of 2"),
+            "{uri}: limit truncated the page"
+        );
+        assert!(
+            limited.contains("<dt><code>numberReturned</code></dt><dd>2</dd>"),
+            "{uri}"
+        );
+        // The JSON forms still page.
+        let (_, _, json) = get(&with_f(&uri, "GeoJSON&limit=1"), None).await;
+        let json: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["numberReturned"], 1, "{uri}");
     }
 }

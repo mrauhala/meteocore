@@ -189,45 +189,119 @@ impl GeoJsonRequest {
     }
 }
 
-/// Encode a station-series result as EDR GeoJSON (#929), naming each
-/// coverage's station: the requested location for `/locations/{id}`, else
-/// the one location at the coverage's exact coordinates.
+/// The station each coverage of a station-series result is: the requested
+/// location for `/locations/{id}` (each coverage's own id for a list), else
+/// the one location at the coverage's exact coordinates. The GeoJSON
+/// features and the HTML page's location table both name coverages here.
+struct StationNames<'r> {
+    index: LocationIndex,
+    location_ids: &'r [String],
+}
+
+impl StationNames<'_> {
+    fn identify(&self, i: usize, q: &ds_core::model::QueryResult) -> Option<FeatureIdentity<'_>> {
+        let named = match self.location_ids {
+            [] => None,
+            [only] => Some(only),
+            each => each.get(i),
+        };
+        if let Some(id) = named {
+            return Some(FeatureIdentity {
+                id,
+                label: self
+                    .index
+                    .by_id(id)
+                    .map_or(id.as_str(), |l| l.label.as_str()),
+            });
+        }
+        match q.domain {
+            ds_core::model::DomainDescription::PointSeries { x, y, .. } => {
+                self.index.at(x, y).map(|l| FeatureIdentity {
+                    id: &l.id,
+                    label: &l.label,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl GeoJsonRequest {
+    /// The names of this query's stations, from the engine's inventory.
+    fn station_names(&self) -> Result<StationNames<'_>, HandlerError> {
+        Ok(StationNames {
+            index: LocationIndex::new(
+                self.engine
+                    .get_locations()
+                    .map_err(|e| map_query_error(&e, "GeoJSON locations"))?,
+            ),
+            location_ids: &self.location_ids,
+        })
+    }
+
+    /// `{base}/edr/collections/{id}`: the root of each feature's
+    /// `edrqueryendpoint`.
+    fn collection_url(&self) -> String {
+        format!("{}/edr/collections/{}", self.base, self.collection_id)
+    }
+
+    /// The location table of this query's HTML page: on a query the
+    /// collection also answers as EDR GeoJSON, the identity members of
+    /// every feature that GeoJSON would carry, and its `numberMatched`
+    /// (`/req/html/content` A). `None` for any other query.
+    fn html_locations(
+        &self,
+        result: &CoverageResponse,
+        number_matched: Option<usize>,
+    ) -> Result<Option<crate::html::Locations>, HandlerError> {
+        if !self.offered.contains(&EdrFormat::GeoJson) {
+            return Ok(None);
+        }
+        // The identity panel is extra: a location inventory that cannot be
+        // read degrades the page to its CoverageJSON, as a broken station
+        // contract does below, instead of failing the HTML response.
+        let Ok(names) = self.station_names() else {
+            tracing::warn!(
+                collection = %self.collection_id,
+                "EDR HTML: location inventory unavailable, page without station identity"
+            );
+            return Ok(None);
+        };
+        match crate::geojson::feature_summaries(
+            result,
+            |i, q| names.identify(i, q),
+            &self.collection_url(),
+        ) {
+            Ok(rows) => Ok(Some(crate::html::Locations {
+                rows,
+                number_matched,
+            })),
+            // The engine broke its `serves_station_series` promise: the
+            // GeoJSON form is a 500, the page still shows the CoverageJSON.
+            Err(e) => {
+                tracing::error!(
+                    collection = %self.collection_id,
+                    "EDR HTML: no station identity for the result: {e:?}"
+                );
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Encode a station-series result as EDR GeoJSON (#929), each feature named
+/// by [`StationNames`].
 fn render_station_geojson(
     result: &CoverageResponse,
     number_matched: Option<usize>,
     req: &GeoJsonRequest,
 ) -> Result<Response, HandlerError> {
-    let index = LocationIndex::new(
-        req.engine
-            .get_locations()
-            .map_err(|e| map_query_error(&e, "GeoJSON locations"))?,
-    );
-    let named = |i: usize| {
-        let id = match req.location_ids.as_slice() {
-            [] => return None,
-            [only] => only,
-            each => each.get(i)?,
-        };
-        Some(FeatureIdentity {
-            id,
-            label: index.by_id(id).map_or(id.as_str(), |l| l.label.as_str()),
-        })
-    };
+    let names = req.station_names()?;
     let mut body = Vec::new();
     crate::geojson::write_station_series(
         result,
-        |i, q| {
-            named(i).or_else(|| match q.domain {
-                ds_core::model::DomainDescription::PointSeries { x, y, .. } => {
-                    index.at(x, y).map(|l| FeatureIdentity {
-                        id: &l.id,
-                        label: &l.label,
-                    })
-                }
-                _ => None,
-            })
-        },
-        &format!("{}/edr/collections/{}", req.base, req.collection_id),
+        |i, q| names.identify(i, q),
+        &req.collection_url(),
         &req.links(),
         number_matched,
         &mut body,
@@ -264,7 +338,8 @@ fn render_station_geojson(
 /// top-level coverages before `limit`, `None` when uncounted) as its
 /// `numberMatched`; `PNG` renders a vertical-profile or time-series plot
 /// (one stacked panel per parameter); `HTML` is a page of the CoverageJSON
-/// (#971). A response that can't be plotted (a gridded/area result) maps
+/// (#971), plus the GeoJSON's location identity where GeoJSON is offered.
+/// A response that can't be plotted (a gridded/area result) maps
 /// to 400.
 fn render_coverage_response(
     result: CoverageResponse,
@@ -286,10 +361,14 @@ fn render_coverage_response(
             })?;
             Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
         }
-        EdrFormat::Html => Ok(crate::html::response(crate::html::coverage_page(
-            &result,
-            &geojson.html_page(),
-        ))),
+        EdrFormat::Html => {
+            let locations = geojson.html_locations(&result, number_matched)?;
+            Ok(crate::html::response(crate::html::coverage_page(
+                &result,
+                &geojson.html_page(),
+                locations.as_ref(),
+            )))
+        }
     }
 }
 
@@ -335,9 +414,18 @@ pub(crate) fn bad_request(e: &DataServerError) -> HandlerError {
     )
 }
 
-/// The request's EDR 1.2 `limit` (`None` = no limit), or its 400.
-fn request_limit(raw: Option<&str>) -> Result<Option<usize>, HandlerError> {
-    parse_limit(raw).map_err(|e| bad_request(&e))
+/// The request's EDR 1.2 `limit` for a response in `format` (`None` = no
+/// limit), or its 400. Only CoverageJSON and GeoJSON count top-level objects
+/// a client can page through; a PNG plot is one image and an HTML page shows
+/// the whole result, so there `limit` is validated and then ignored
+/// (`/req/edr/rc-core-query-parameters` L). Both stay bounded by the
+/// query's value caps.
+fn request_limit(raw: Option<&str>, format: EdrFormat) -> Result<Option<usize>, HandlerError> {
+    let limit = parse_limit(raw).map_err(|e| bad_request(&e))?;
+    Ok(match format {
+        EdrFormat::CoverageJson | EdrFormat::GeoJson => limit,
+        EdrFormat::Png | EdrFormat::Html => None,
+    })
 }
 
 /// The 400 for a data query's `crs` naming a CRS other than the CRS84 every
@@ -1600,7 +1688,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
                     "style": "form",
                     "explode": false,
-                    "description": format!("Maximum number of top-level coverages in a CoverageCollection response. A single Coverage is one object and is returned unchanged, and a PNG image is one image: there limit is ignored, never an error (EDR 1.2 /req/edr/rc-core-query-parameters L), which is what a trajectory or cube answer usually is. A MULTIPOINT position keeps the first coverages in point order, then each point's own coverage order, and skips querying points past the limit. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: no limit, every other response budget still applies. CoverageJSON has no paging links: the remaining coverages are not returned.")
+                    "description": format!("Maximum number of top-level coverages in a CoverageCollection response. Applies to CoverageJSON and GeoJSON only. A single Coverage is one object and is returned unchanged, which is what a trajectory or cube answer usually is; a PNG image is one image and an HTML page shows the whole result, so for f=PNG and f=HTML limit is ignored, never an error (EDR 1.2 /req/edr/rc-core-query-parameters L), and every point and coverage is rendered. A MULTIPOINT position keeps the first coverages in point order, then each point's own coverage order, and skips querying points past the limit. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: no limit, every other response budget still applies. CoverageJSON has no paging links: the remaining coverages are not returned.")
                 },
                 "limit-locations": {
                     "name": "limit",
@@ -2379,7 +2467,7 @@ pub async fn location_query(
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
-    let limit = request_limit(params.limit.as_deref())?;
+    let limit = request_limit(params.limit.as_deref(), format.format)?;
 
     let mut geojson = GeoJsonRequest {
         engine: engine.clone(),
@@ -2729,7 +2817,8 @@ async fn run_position_query(
     // (#922): point order, then each point's own coverages (one per step
     // for a vertical profile). The response shape follows the request, so
     // a MULTIPOINT stays a CoverageCollection however few coverages remain.
-    let limit = request_limit(params.limit.as_deref())?.unwrap_or(usize::MAX);
+    // PNG and HTML show every point: there `limit` is `None`.
+    let limit = request_limit(params.limit.as_deref(), format.format)?.unwrap_or(usize::MAX);
     let single = points.len() == 1;
     // A point the engine answers yields at least one coverage (none is a
     // 404), so the points past the first `limit` cannot reach the response:
@@ -2896,7 +2985,7 @@ async fn run_area_query(
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
-    let limit = request_limit(params.limit.as_deref())?;
+    let limit = request_limit(params.limit.as_deref(), format.format)?;
 
     let page = request.geojson(&state, engine, config, "area");
     let engine = engine.clone();
@@ -3006,7 +3095,7 @@ async fn run_radius_query(
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
-    let limit = request_limit(params.limit.as_deref())?;
+    let limit = request_limit(params.limit.as_deref(), format.format)?;
 
     let geojson = request.geojson(&state, engine, config, "radius");
     let engine = engine.clone();
@@ -3137,7 +3226,7 @@ async fn run_cube_query(
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
     // `limit` as on every data query (`/req/edr/rc-core-query-parameters`
     // L): a cube is one Grid coverage, which it leaves unchanged.
-    let limit = request_limit(params.limit.as_deref())?;
+    let limit = request_limit(params.limit.as_deref(), format.format)?;
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -3205,11 +3294,6 @@ pub async fn trajectory_query(
     // consistent with the `api_definition` OpenAPI gating and the
     // `data_queries` collection metadata. Flagged by claude-review.
     require_query_type(engine, &id, "trajectory", "trajectory")?;
-    // EDR 1.2 `/req/edr/rc-core-query-parameters` L: `limit` is accepted on
-    // every data query. It counts the top-level coverages of a
-    // CoverageCollection, as on position and area; a single coverage and a
-    // PNG image cannot be paged, so there it is ignored.
-    let limit = request_limit(params.limit.as_deref())?;
     let shape = engine.trajectory_shape();
 
     // The formats `query_formats` offers for this engine's trajectory shape:
@@ -3225,6 +3309,11 @@ pub async fn trajectory_query(
     )?;
     let format = negotiated.format;
     request_crs(params.crs.as_deref())?;
+    // EDR 1.2 `/req/edr/rc-core-query-parameters` L: `limit` is accepted on
+    // every data query. It counts the top-level coverages of a
+    // CoverageCollection, as on position and area; a single coverage, a PNG
+    // image and an HTML page cannot be paged, so there it is ignored.
+    let limit = request_limit(params.limit.as_deref(), format)?;
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -3297,12 +3386,8 @@ pub async fn trajectory_query(
             },
         )
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
-        let result = if format == EdrFormat::Png {
-            result
-        } else {
-            limit_coverages(result, limit)
-        };
-        let html = page.map(|page| crate::html::coverage_page(&result, &page.html_page()));
+        let result = limit_coverages(result, limit);
+        let html = page.map(|page| crate::html::coverage_page(&result, &page.html_page(), None));
         Ok((result, html))
     })
     .await?;
