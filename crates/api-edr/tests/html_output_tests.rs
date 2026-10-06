@@ -328,7 +328,10 @@ impl EdrEngine for Section {
 /// A station collection (`serves_station_series`): each position, radius
 /// and location answer is a series at a listed location, so it is also
 /// offered as EDR GeoJSON naming each station.
-struct Stations;
+struct Stations {
+    /// Its location inventory cannot be read: the HTML page still answers.
+    inventory_down: bool,
+}
 
 impl Stations {
     fn at(x: f64, y: f64) -> QueryResult {
@@ -348,6 +351,9 @@ impl Stations {
 
 impl EdrEngine for Stations {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        if self.inventory_down {
+            return Err(DataServerError::Engine("inventory unavailable".into()));
+        }
         Every.get_locations()
     }
 
@@ -447,13 +453,28 @@ fn router() -> axum::Router {
     let mut engines: HashMap<String, Arc<dyn EdrEngine>> = HashMap::new();
     engines.insert("c".to_string(), every.clone());
     engines.insert("pvol".to_string(), Arc::new(Section));
-    engines.insert("obs".to_string(), Arc::new(Stations));
+    engines.insert(
+        "obs".to_string(),
+        Arc::new(Stations {
+            inventory_down: false,
+        }),
+    );
+    engines.insert(
+        "obsdown".to_string(),
+        Arc::new(Stations {
+            inventory_down: true,
+        }),
+    );
     let mut feature_engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
     feature_engines.insert("c".to_string(), every);
     let collections = HashMap::from([
         ("c".to_string(), config("c", "Every <query> & \"more\"")),
         ("pvol".to_string(), config("pvol", "Radar site")),
         ("obs".to_string(), config("obs", "Stations")),
+        (
+            "obsdown".to_string(),
+            config("obsdown", "Stations, inventory down"),
+        ),
     ]);
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
@@ -862,6 +883,27 @@ async fn output_formats_list_html() {
             formats.as_array().unwrap().iter().any(|f| f == "HTML"),
             "{name}: {formats}"
         );
+    }
+}
+
+/// The location panel is extra: when the inventory cannot be read, a station
+/// query's HTML page still answers with its CoverageJSON, without the panel.
+#[tokio::test]
+async fn station_pages_render_without_an_inventory() {
+    for uri in [
+        format!("/collections/obsdown/position?coords={POINT}&f=html"),
+        format!("/collections/obsdown/radius?coords={POINT}&within=500&within-units=km&f=html"),
+    ] {
+        let (status, headers, body) = get(&uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "{uri}"
+        );
+        assert!(!body.contains("<code>numberReturned</code>"), "{uri}");
     }
 }
 

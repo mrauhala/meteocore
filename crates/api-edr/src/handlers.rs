@@ -257,7 +257,16 @@ impl GeoJsonRequest {
         if !self.offered.contains(&EdrFormat::GeoJson) {
             return Ok(None);
         }
-        let names = self.station_names()?;
+        // The identity panel is extra: a location inventory that cannot be
+        // read degrades the page to its CoverageJSON, as a broken station
+        // contract does below, instead of failing the HTML response.
+        let Ok(names) = self.station_names() else {
+            tracing::warn!(
+                collection = %self.collection_id,
+                "EDR HTML: location inventory unavailable, page without station identity"
+            );
+            return Ok(None);
+        };
         match crate::geojson::feature_summaries(
             result,
             |i, q| names.identify(i, q),
