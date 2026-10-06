@@ -431,7 +431,8 @@ async fn instance_ids_are_rfc3339_in_ids_titles_and_links() {
         html.contains("href=\"/edr/collections/fc/instances/2026-06-07T12:00:00Z?f=html\""),
         "{html}"
     );
-    assert!(html.contains("Run 2026-06-07T12:00:00Z"), "{html}");
+    // Each card carries the instance's own title (`/req/html/content` A).
+    assert!(html.contains("fc — run 2026-06-07T12:00:00Z"), "{html}");
     assert!(!html.contains("%3A"), "{html}");
 }
 
@@ -678,11 +679,13 @@ async fn collection_and_instance_links_name_their_query_end_points() {
 }
 
 /// The HTML pages list the data queries from `data_queries`; the `rel=data`
-/// links are not repeated there as `?f=html` pages a data query is not.
+/// links are listed at their own href, never as `?f=html` pages a data
+/// query is not.
 #[tokio::test]
 async fn html_pages_do_not_open_data_queries_as_pages() {
     for uri in [
         "/collections/fc?f=html",
+        "/collections/fc/instances?f=html",
         "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
     ] {
         let (status, _, body) = get_raw(uri, None).await;

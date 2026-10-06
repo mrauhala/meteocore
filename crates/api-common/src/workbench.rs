@@ -393,6 +393,43 @@ pub fn property_table(properties: &Value) -> String {
     out
 }
 
+/// Every link of `links` as a table row with its relation, title and media
+/// type, and an `<a>` to the link's own href (OGC API - EDR
+/// `/req/html/content` A: all of a response's information in the body).
+/// Unlike [`document_links`] nothing is skipped or merged, and no href is
+/// rewritten to its HTML view: a `rel=data` query end point stays itself.
+pub fn link_table(links: &Value) -> String {
+    let mut out = String::from("<div class=\"table-scroll\"><table class=\"properties link-table\"><thead><tr><th scope=\"col\">Relation</th><th scope=\"col\">Title</th><th scope=\"col\">Type</th><th scope=\"col\">Link</th></tr></thead><tbody>");
+    for link in links.as_array().into_iter().flatten() {
+        let text = |key: &str| link[key].as_str().unwrap_or_default();
+        let href = text("href");
+        out.push_str(&format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape(text("rel")),
+            escape(text("title")),
+            escape(text("type")),
+            anchor(href, href, "table-link")
+        ));
+    }
+    out.push_str("</tbody></table></div>");
+    out
+}
+
+/// A document's members other than `links` as a property table, and its
+/// links as a [`link_table`], folded under a disclosure: the full content of
+/// one entry of a list page (a collection, an instance).
+fn entry_details(doc: &Value) -> String {
+    let mut members = doc.clone();
+    if let Some(m) = members.as_object_mut() {
+        m.remove("links");
+    }
+    format!(
+        "<details class=\"entry-details\"><summary>All metadata &amp; links</summary>{}{}</details>",
+        property_table(&members),
+        link_table(&doc["links"])
+    )
+}
+
 pub fn document_links(doc: &Value) -> String {
     let mut body = String::from("<div class=\"endpoint-list resource-links\">");
     // Relations are often advertised twice (short and registered URI form)
@@ -484,7 +521,7 @@ pub fn landing_document(
     };
     body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
     body.push_str("<section class=\"section-space\"><div class=\"section-header\"><h2>API definitions &amp; resource links</h2></div>");
-    body.push_str(&document_links(doc));
+    body.push_str(&link_table(&doc["links"]));
     body.push_str("</section>");
     Page {
         surface,
@@ -862,7 +899,24 @@ pub fn collection_html(
         body.push_str("<section class=\"panel enhanced\"><div class=\"panel-head\"><h2>Map legend</h2></div><div class=\"map-legend\"><span id=\"map-legend-status\">Legend will appear after the map loads.</span><a id=\"map-legend-link\" hidden><img id=\"map-legend-image\" alt=\"Selected map style legend\" hidden></a></div></section>");
     }
     body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
-    body.push_str(&document_links(doc));
+    // The data query end points are listed under "Request data" from
+    // `data_queries`, each with its documentation; this list would open
+    // their `rel=data` links bare as `?f=html` pages. The metadata tab's
+    // link table lists them, at their own href.
+    let query_hrefs: Vec<&str> = doc["data_queries"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, query)| query["link"]["href"].as_str())
+        .collect();
+    let resource_links: Vec<&Value> = links
+        .into_iter()
+        .flatten()
+        .filter(|l| {
+            !(l["rel"] == "data" && l["href"].as_str().is_some_and(|h| query_hrefs.contains(&h)))
+        })
+        .collect();
+    body.push_str(&document_links(&json!({ "links": resource_links })));
     body.push_str("</div></section></aside></div></section><section id=\"metadata\" class=\"collection-view metadata-section\" data-collection-view><section class=\"panel\"><div class=\"panel-head\"><h2>Coverage &amp; metadata</h2>");
     body.push_str(&anchor(&url, "View full JSON { }", "quiet"));
     body.push_str("</div>");
@@ -871,9 +925,11 @@ pub fn collection_html(
         m.remove("links");
     }
     body.push_str(&property_table(&metadata));
-    body.push_str("</section><section class=\"panel spaced\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
-    body.push_str(&document_links(doc));
-    body.push_str("</div></section></section>");
+    body.push_str(
+        "</section><section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div>",
+    );
+    body.push_str(&link_table(&doc["links"]));
+    body.push_str("</section></section>");
     Page {
         surface,
         title,
@@ -1222,6 +1278,7 @@ pub fn collections_html(
     matched: usize,
     docs: &[CollectionView<'_>],
     nav: &[LinkView],
+    links: &Value,
 ) -> String {
     let api = surface.api;
     let url = &format!("{}/collections", surface.root);
@@ -1345,7 +1402,6 @@ pub fn collections_html(
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .take(4)
             .map(|k| anchor(&query_edit(&json_url, "q", Some(k)), k, "chip"))
             .collect::<String>();
         let symbol = if doc["keywords"]
@@ -1360,7 +1416,7 @@ pub fn collections_html(
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(id);
-        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div class=\"collection-main\"><h3>{}</h3><span class=\"mono\">{}</span><p>{}</p>{}<div class=\"chip-row\">{keywords}</div>{}</div><a class=\"row-arrow\" href=\"{}\" aria-label=\"Open {}\">{}</a></article>",icon(symbol),anchor(&href,title,""),escape(id),escape(doc["description"].as_str().unwrap_or_default()),collection_facts(doc),license_html(view.license),escape(&href),escape(title),icon("arrow")));
+        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div class=\"collection-main\"><h3>{}</h3><span class=\"mono\">{}</span><p>{}</p>{}<div class=\"chip-row\">{keywords}</div>{}{}</div><a class=\"row-arrow\" href=\"{}\" aria-label=\"Open {}\">{}</a></article>",icon(symbol),anchor(&href,title,""),escape(id),escape(doc["description"].as_str().unwrap_or_default()),collection_facts(doc),license_html(view.license),entry_details(doc),escape(&href),escape(title),icon("arrow")));
     }
     body.push_str("</div><div class=\"pagination\">");
     body.push_str("<label class=\"per-page enhanced\">Per page<select data-page-size>");
@@ -1390,7 +1446,11 @@ pub fn collections_html(
         "</select></label><span class=\"page-indicator\">{page}</span>"
     ));
     body.push_str(&pagination(nav));
-    body.push_str("</div></section></div>");
+    body.push_str(
+        "</div><section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div>",
+    );
+    body.push_str(&link_table(links));
+    body.push_str("</section></section></div>");
     Page {
         surface,
         title: "Collections",
@@ -1428,15 +1488,12 @@ pub fn pagination(nav: &[LinkView]) -> String {
 }
 
 /// Model-run navigation uses the same shell without claiming collection search.
-/// `queries` holds each card's instance document, whose `data_queries`
-/// links are listed under it.
-pub fn instances_html(
-    surface: Surface<'_>,
-    title: &str,
-    cards: &[ds_core::html::CollectionCard],
-    queries: &[Value],
-    nav: &[LinkView],
-) -> String {
+/// `doc` is the instances list document, the JSON representation's value:
+/// each of its `instances` is a card with the instance's title, id,
+/// description and data query anchors, and all of its metadata and links
+/// under the card; the document's own links close the page (OGC API - EDR
+/// `/req/html/content` A).
+pub fn instances_html(surface: Surface<'_>, title: &str, doc: &Value, nav: &[LinkView]) -> String {
     let url = nav
         .iter()
         .find(|l| l.rel == "alternate")
@@ -1451,19 +1508,40 @@ pub fn instances_html(
         ));
     }
     body.push_str("<div class=\"collection-list\">");
-    for (i, card) in cards.iter().enumerate() {
+    let instances = doc["instances"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for instance in instances {
+        let id = instance["id"].as_str().unwrap_or_default();
+        let title = instance["title"]
+            .as_str()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(id);
+        let heading = instance["links"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|l| l["rel"] == "self")
+            .and_then(|l| l["href"].as_str())
+            .map(|href| anchor(&with_format(href, "html"), title, ""))
+            .unwrap_or_else(|| escape(title));
         body.push_str(&format!(
-            "<article class=\"collection-row\"><div class=\"collection-main\"><h2>{}</h2><code>{}</code><p>{}</p><div class=\"chip-row\">{}</div></div></article>",
-            anchor(&with_format(&card.self_href, "html"), &card.title, ""),
-            escape(&card.id),
-            escape(&card.description),
-            queries.get(i).map(data_query_links).unwrap_or_default()
+            "<article class=\"collection-row\"><div class=\"collection-main\"><h2>{heading}</h2><code>{}</code><p>{}</p><div class=\"chip-row\">{}</div>{}</div></article>",
+            escape(id),
+            escape(instance["description"].as_str().unwrap_or_default()),
+            data_query_links(instance),
+            entry_details(instance)
         ));
     }
-    if cards.is_empty() {
+    if instances.is_empty() {
         body.push_str("<p class=\"panel\">No model runs available.</p>");
     }
-    body.push_str("</div>");
+    body.push_str(
+        "</div><section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div>",
+    );
+    body.push_str(&link_table(&doc["links"]));
+    body.push_str("</section>");
     Page {
         surface,
         title,
@@ -1514,7 +1592,7 @@ mod tests {
         .unwrap();
         let search = query.parse().unwrap();
         let url = "https://example.test/proxy/maps/collections";
-        let html = collections_html(MAPS_PROXY, &query, &search, 3, &[], &[]);
+        let html = collections_html(MAPS_PROXY, &query, &search, 3, &[], &[], &json!([]));
         assert!(html.contains("3 matching collections"));
         assert!(html.contains("This page is outside the results."));
         assert!(html.contains("No page at offset 1000"));
@@ -1523,7 +1601,7 @@ mod tests {
         assert!(!html.contains("No collections match these filters."));
         let first = format!("{url}{}", query.query_string_with_format(12, 0, "html"));
         assert!(html.contains(&format!("href=\"{}\">Go to first page", escape(&first))));
-        let empty = collections_html(MAPS_PROXY, &query, &search, 0, &[], &[]);
+        let empty = collections_html(MAPS_PROXY, &query, &search, 0, &[], &[], &json!([]));
         assert!(empty.contains("No collections match these filters."));
         assert!(empty.contains("0 results"));
         assert!(!empty.contains("Go to first page"));
@@ -1966,5 +2044,96 @@ mod tests {
         assert!(html.contains("nested"));
         assert!(value_html(&json!([false, 0, null])).contains(">false</span>"));
         assert!(value_html(&json!([false, 0, null])).contains(">0</span>"));
+    }
+
+    /// `/req/html/content` A: a list page holds each entry in full — every
+    /// keyword, every member, each link's rel, type and title — and the
+    /// page's own links (#984).
+    #[test]
+    fn list_pages_hold_every_entry_in_full() {
+        let attack = "<b>x</b>";
+        let doc = json!({"id":"a","title":"A","keywords":["k1","k2","k3","k4","k5-last"],
+            "crs":["OGC:CRS84"],"output_formats":["CoverageJSON"],
+            "data_queries":{"position":{"link":{"href":"https://x/edr/collections/a/position","rel":"data",
+                "variables":{"title":"Position query","within_units":["km"]}}}},
+            "links":[{"rel":"self","href":"https://x/edr/collections/a","type":"application/json","title":attack},
+                {"rel":"data","href":"https://x/edr/collections/a/position","type":"application/vnd.cov+json","title":"Position query"}]});
+        let query = SearchQueryParams::from_pairs(Vec::new()).unwrap();
+        let search = query.parse().unwrap();
+        let page_links = json!([{"rel":"self","href":"https://x/edr/collections?f=html","type":"text/html","title":"This page"}]);
+        let html = collections_html(
+            MAPS_PROXY,
+            &query,
+            &search,
+            1,
+            &[CollectionView {
+                metadata: &doc,
+                license: None,
+            }],
+            &[],
+            &page_links,
+        );
+        for text in [
+            "k5-last",
+            "OGC:CRS84",
+            "Position query",
+            "within_units",
+            "This page",
+            "text/html",
+            "application/vnd.cov+json",
+        ] {
+            assert!(html.contains(text), "{text}");
+        }
+        assert!(html.contains(&escape(attack)) && !html.contains(attack));
+        // The data link is listed at its own href, not as an HTML page.
+        assert!(html.contains("href=\"https://x/edr/collections/a/position\">"));
+        assert!(!html.contains("position?f=html"));
+
+        let instance = json!({"id":"2026-01-01T00:00:00Z","title":"A — run 2026-01-01T00:00:00Z",
+            "description":"One run","extent":{"vertical":{"vrs":"VRS-WKT"}},
+            "links":[{"rel":"self","href":"https://x/edr/collections/a/instances/2026-01-01T00:00:00Z","type":"application/json","title":"This instance"}]});
+        let list = json!({"instances":[instance],"links":[{"rel":"self","href":"https://x/edr/collections/a/instances","type":"application/json","title":"A — instances"}]});
+        let html = instances_html(MAPS_PROXY, "A — instances", &list, &[]);
+        for text in [
+            "A — run 2026-01-01T00:00:00Z",
+            "One run",
+            "VRS-WKT",
+            "This instance",
+            "A — instances",
+            "application/json",
+        ] {
+            assert!(html.contains(text), "{text}");
+        }
+        assert!(html.contains(
+            "href=\"https://x/edr/collections/a/instances/2026-01-01T00:00:00Z?f=html\""
+        ));
+    }
+
+    /// The collection page's link table lists every link, `self`,
+    /// `alternate` and `rel=data` included, at its own href; the aside
+    /// leaves out the data links the page lists from `data_queries`.
+    #[test]
+    fn collection_page_lists_every_link_member() {
+        let doc = json!({"id":"c","data_queries":{"position":{"link":{"href":"https://x/edr/collections/c/position"}}},
+            "links":[{"rel":"self","href":"https://x/edr/collections/c","type":"application/json","title":"This collection"},
+                {"rel":"alternate","href":"https://x/edr/collections/c?f=html","type":"text/html","title":"This collection as HTML"},
+                {"rel":"data","href":"https://x/edr/collections/c/position","type":"application/vnd.cov+json","title":"Position query"}]});
+        let edr = Surface {
+            base: "https://x",
+            root: "https://x/edr",
+            api: "edr",
+        };
+        let html = collection_html(edr, &doc, None);
+        for text in [
+            "This collection as HTML",
+            "text/html",
+            "<code>self</code>",
+            "<code>alternate</code>",
+            "<td>Position query</td>",
+            "application/vnd.cov+json",
+        ] {
+            assert!(html.contains(text), "{text}");
+        }
+        assert!(!html.contains("position?f=html"));
     }
 }

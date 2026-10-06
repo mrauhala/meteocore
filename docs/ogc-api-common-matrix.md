@@ -418,6 +418,12 @@ and coverage; they do not become data-query predicates.
 
 HTML catalog headings use the shared request bar for URL/cURL copy actions.
 
+HTML list and detail pages hold their JSON's information (#984, for OGC API -
+EDR `/req/html/content`): each catalog card adds the collection's full metadata
+and links, keywords are not truncated, and landing, collection and list pages
+list every link with its relation, title and type at its own href. This is a
+presentation change in all four APIs; discovery and conformance are unchanged.
+
 Maps HTML collection overviews additionally preview actual data using the
 advertised map/style endpoints. This is API-specific data access; the page’s
 JSON representation remains collection metadata and Common discovery is unchanged.

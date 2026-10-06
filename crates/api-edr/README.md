@@ -800,6 +800,18 @@ Every `data_queries` link is an anchor (`/req/html/content`): instances,
 locations and items open their HTML view, the parameterised queries their
 endpoint. Catalog rows and model-run lists anchor them too.
 
+`/req/html/content` A asks for all of a response's information in the body
+(#984). The landing, collection and instance pages list every link in a table
+with its relation, title and type, `self` and `alternate` included; each link
+is an `<a>` to its own href, so a `rel=data` query end point is never opened
+as a bare `?f=html` page. The landing page's `self` is the HTML page, the JSON
+its `alternate`. The `/collections` and `/instances` lists keep their summary
+cards and add each entry in full under "All metadata & links": every member as
+the detail pages' property table (crs, output_formats, the whole extent,
+`data_queries` variables, every keyword) and its link table. Instance cards use
+the instance's own title and description. Each list page closes with its own
+link table.
+
 ### HTML data pages
 
 Every data query answers `f=html` / `Accept: text/html` with a workbench page
@@ -830,11 +842,14 @@ data explicitly.
   from the response's JSON value with no admission of its own; it is written
   into one buffer reserved from the value count, so it never holds a second
   copy of the page or regrows by doubling.
-- **`/locations`**: the list as a table (id, label, point, data links),
+- **`/locations`**: the list as a table (id, label, geometry type, point,
+  `edrqueryendpoint`, and each feature's link with its relation, title and
+  type),
   written into the GeoJSON's budgeted writer, so the same byte limit and
   memory admission apply (over it: the same 503, page with `limit`).
   `self`/`next`/`prev` link to their HTML pages.
-- **`items`**: a feature table (id, geometry, every property, every link),
+- **`items`**: a feature table (id, geometry, every property, every link
+  with its relation, title and type),
   the members (`numberMatched`, `numberReturned`, `timeStamp`), and the
   page links. The ETag hashes the page with `timeStamp` empty, like the
   GeoJSON's.
