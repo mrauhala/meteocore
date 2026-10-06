@@ -243,6 +243,16 @@ pub fn render_chart(panels: &[Panel], width: u32, height: u32) -> Result<Vec<u8>
     encode_png(&cv.buf, width, height)
 }
 
+/// The smallest height, in pixels, of one stacked [`render_heatmap`]
+/// panel: its top and bottom margins plus a few plot rows. A caller that
+/// sizes the image picks at least `panels ×` this, within the 2000 px
+/// height clamp, or [`render_heatmap`] fails.
+pub const HEATMAP_MIN_PANEL_PX: u32 = 64;
+
+/// The largest image height [`render_heatmap`] draws; a taller request is
+/// clamped to it.
+pub const HEATMAP_MAX_HEIGHT_PX: u32 = 2000;
+
 /// Render one or more [`Heatmap`]s (stacked vertically) to PNG bytes —
 /// the EDR cross-section (`Section`) plot. Each heatmap is colour-mapped
 /// with `colormap`; the value range for the colour bar comes from each
@@ -257,13 +267,13 @@ pub fn render_heatmap(
         return Err(DataServerError::Render("no heatmaps to plot".into()));
     }
     let width = width.clamp(160, 2000);
-    let height = height.clamp(120, 2000);
+    let height = height.clamp(120, HEATMAP_MAX_HEIGHT_PX);
 
     // Each stacked panel needs room for its top/bottom margins plus a few
     // plot rows; below that `draw_heatmap_panel` would silently skip
     // drawing and return an all-white PNG. Fail loudly with an actionable
     // message instead (raise `height` or filter to one parameter).
-    const MIN_PANEL_PX: u32 = 64;
+    const MIN_PANEL_PX: u32 = HEATMAP_MIN_PANEL_PX;
     let n = heatmaps.len() as u32;
     if height < n * MIN_PANEL_PX {
         return Err(DataServerError::Render(format!(

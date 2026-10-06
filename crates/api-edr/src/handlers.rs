@@ -24,9 +24,9 @@ use crate::geojson::{
 use crate::params::{
     check_crs, negotiate_edr_format, negotiate_list_format, parse_cube_bbox, parse_datetime,
     parse_edr_format, parse_limit, parse_locations_query, parse_resolution, parse_within_metres,
-    parse_z, plot_dimensions, query_formats, resolve_z_levels, split_location_ids,
-    split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector, EdrFormat,
-    LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
+    parse_z, plot_dimensions, query_formats, resolve_z_levels, section_plot_dimensions,
+    split_location_ids, split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector,
+    EdrFormat, LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
     TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, LOCATIONS_FORMATS, MAX_LIMIT,
     MAX_LOCATION_IDS, MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
 };
@@ -947,6 +947,7 @@ fn cube_operation(
         json!({"$ref": "#/components/parameters/resolution-z"}),
         json!({"$ref": "#/components/parameters/crs"}),
         data_format_parameter(formats),
+        json!({"$ref": "#/components/parameters/limit"}),
     ]);
     json!({
         "get": {
@@ -1226,7 +1227,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/parameter-name"},
                             {"$ref": "#/components/parameters/z"},
                             {"$ref": "#/components/parameters/crs"},
-                            data_format_parameter(trajectory_formats)
+                            data_format_parameter(trajectory_formats),
+                            {"$ref": "#/components/parameters/limit"}
                         ],
                         "responses": trajectory_responses(
                             "Coverage data: a CoverageJSON Trajectory coverage, or a CoverageCollection of them",
@@ -1247,7 +1249,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                                 {"$ref": "#/components/parameters/parameter-name"},
                                 {"$ref": "#/components/parameters/z-trajectory"},
                                 {"$ref": "#/components/parameters/crs"},
-                                format
+                                format,
+                                {"$ref": "#/components/parameters/limit"}
                             ],
                             "responses": trajectory_responses(
                                 "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
@@ -1597,7 +1600,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
                     "style": "form",
                     "explode": false,
-                    "description": format!("Maximum number of top-level coverages in a CoverageCollection response. A single Coverage is one object and is returned unchanged. A MULTIPOINT position keeps the first coverages in point order, then each point's own coverage order, and skips querying points past the limit. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: no limit, every other response budget still applies. CoverageJSON has no paging links: the remaining coverages are not returned.")
+                    "description": format!("Maximum number of top-level coverages in a CoverageCollection response. A single Coverage is one object and is returned unchanged, and a PNG image is one image: there limit is ignored, never an error (EDR 1.2 /req/edr/rc-core-query-parameters L), which is what a trajectory or cube answer usually is. A MULTIPOINT position keeps the first coverages in point order, then each point's own coverage order, and skips querying points past the limit. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: no limit, every other response budget still applies. CoverageJSON has no paging links: the remaining coverages are not returned.")
                 },
                 "limit-locations": {
                     "name": "limit",
@@ -1650,7 +1653,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), z=0.3/15 (a min/max interval → every advertised angle in range), z=../5 or z=5/.. (open intervals, reaching the lowest or highest advertised angle), or z=R4/0.5/1 (4 angles 1° apart from 0.5°, treated as a list). The selected angle window bounds which sweeps build the RHI; the rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
+                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), z=0.3/15 (a min/max interval → every advertised angle in range), z=../5 or z=5/.. (open intervals, reaching the lowest or highest advertised angle), or z=R4/0.5/1 (4 angles 1° apart from 0.5°, treated as a list). A requested angle selects a sweep within 0.05° of it, as on position and area; a z selecting no sweep is a 400. The section then shows only the selected sweeps: a cell is drawn where one of them is the sweep nearest its beam angle, and is null elsewhere. The rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
                 }
             },
             "responses": shared_responses_component(),
@@ -3132,6 +3135,9 @@ async fn run_cube_query(
     // `[t, z, y, x]` grids share x, y and z, so the merge joins them along t.
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
+    // `limit` as on every data query (`/req/edr/rc-core-query-parameters`
+    // L): a cube is one Grid coverage, which it leaves unchanged.
+    let limit = request_limit(params.limit.as_deref())?;
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -3165,7 +3171,14 @@ async fn run_cube_query(
             },
         )
         .map_err(|e| map_query_error(&e, "Cube"))?;
-        render_coverage_response(result, None, format.format, None, None, &page)
+        render_coverage_response(
+            limit_coverages(result, limit),
+            None,
+            format.format,
+            None,
+            None,
+            &page,
+        )
     })
     .await?;
 
@@ -3192,11 +3205,11 @@ pub async fn trajectory_query(
     // consistent with the `api_definition` OpenAPI gating and the
     // `data_queries` collection metadata. Flagged by claude-review.
     require_query_type(engine, &id, "trajectory", "trajectory")?;
-    if params.limit.is_some() {
-        return Err(bad_request_msg(
-            "limit is not supported on trajectory queries: EDR 1.2 defines no limit for them",
-        ));
-    }
+    // EDR 1.2 `/req/edr/rc-core-query-parameters` L: `limit` is accepted on
+    // every data query. It counts the top-level coverages of a
+    // CoverageCollection, as on position and area; a single coverage and a
+    // PNG image cannot be paged, so there it is ignored.
+    let limit = request_limit(params.limit.as_deref())?;
     let shape = engine.trajectory_shape();
 
     // The formats `query_formats` offers for this engine's trajectory shape:
@@ -3284,6 +3297,11 @@ pub async fn trajectory_query(
             },
         )
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
+        let result = if format == EdrFormat::Png {
+            result
+        } else {
+            limit_coverages(result, limit)
+        };
         let html = page.map(|page| crate::html::coverage_page(&result, &page.html_page()));
         Ok((result, html))
     })
@@ -3312,7 +3330,10 @@ pub async fn trajectory_query(
                     tracing::error!("Trajectory PNG section conversion error: {e}");
                     server_error()
                 })?;
-            let (w, h) = plot_dimensions(params.width, params.height);
+            // One panel per parameter: the default height grows with them,
+            // and a height they cannot fit is a 400 naming `parameter-name`.
+            let (w, h) = section_plot_dimensions(params.width, params.height, heatmaps.len())
+                .map_err(|e| bad_request(&e))?;
             let png = render_heatmap(&heatmaps, colormap.as_ref(), w, h).map_err(|e| {
                 tracing::error!("Trajectory PNG render error: {e}");
                 server_error()
