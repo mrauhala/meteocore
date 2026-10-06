@@ -1,6 +1,6 @@
 # MeteoCore
 
-A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/), and [OGC 3D Tiles 1.1](https://www.ogc.org/standard/3dtiles/) over the same data sources. OGC API - Maps, Tiles and Features are composed as building blocks of one shared OGC API at the server root — one landing page, conformance declaration, OpenAPI document and collection catalog, each collection linking every access mechanism it offers ([#789](https://github.com/mrauhala/meteocore/issues/789)). Each standard is also served as its own per-API service (`/edr`, `/features`, `/maps`, `/tiles`, `/wms`, `/3dtiles`). A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing; a bundled CesiumJS viewer serves volumetric 3D Tiles collections.
+A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.2](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/), and [OGC 3D Tiles 1.1](https://www.ogc.org/standard/3dtiles/) over the same data sources. OGC API - Maps, Tiles and Features are composed as building blocks of one shared OGC API at the server root — one landing page, conformance declaration, OpenAPI document and collection catalog, each collection linking every access mechanism it offers ([#789](https://github.com/mrauhala/meteocore/issues/789)). Each standard is also served as its own per-API service (`/edr`, `/features`, `/maps`, `/tiles`, `/wms`, `/3dtiles`). A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing; a bundled CesiumJS viewer serves volumetric 3D Tiles collections.
 
 ## Workspace Crates
 
@@ -39,7 +39,7 @@ baselines, with implementation gaps and evidence for standards experimentation.
 
 | Crate | Plugin | Conformance |
 |-------|--------|-------------|
-| `api-edr` | [OGC API - EDR 1.1](https://docs.ogc.org/is/19-086r6/19-086r6.html) | ogcapi-common-1: core, landing-page, oas30; ogcapi-edr-1: core, collections, json, edr-geojson, covjson |
+| `api-edr` | [OGC API - EDR 1.2](https://www.opengis.net/doc/IS/ogcapi-edr-1/1.2) | ogcapi-common-1: core, landing-page, oas30; ogcapi-common-2: collections, json, html; ogcapi-edr-1 1.2: core, collections, queries, instances, json, geojson, edr-geojson, covjson, html, oas30, each also as 1.1 except instances ([status](crates/api-edr/README.md)) |
 | `api-features` | [OGC API - Features 1.0](https://docs.ogc.org/is/17-069r4/17-069r4.html) | core, oas30, geojson |
 | `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, spatial-subsetting, scaling, datetime, crs, png, jpeg |
 | `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | ogcapi-tiles-1: core, tileset, tilesets-list, geodata-tilesets, datetime, png, jpeg, mvt; tms 2.0: tilematrixset, json-tilematrixset; at the shared root also ogcapi-maps-1: tilesets |
@@ -221,7 +221,7 @@ Four core traits, each corresponding to one or more APIs:
 
 | Trait | APIs | Description |
 |-------|------|-------------|
-| `EdrEngine` | OGC API - EDR 1.1 | Time-series queries (position, area, locations) returning CoverageJSON |
+| `EdrEngine` | OGC API - EDR 1.2 | Time-series queries (position, area, locations) returning CoverageJSON |
 | `FeatureEngine` | OGC API - Features 1.0, OGC API - Tiles 1.0 (MVT) | Paginated spatial feature queries returning GeoJSON; vector tiles are encoded from the same query via `ds-mvt` |
 | `MapEngine` | OGC API - Maps 1.0, OGC WMS 1.3.0, OGC API - Tiles 1.0 (raster) | Raster tile rendering returning PNG/JPEG/WebP |
 | `VolumeEngine` | OGC 3D Tiles 1.1 | Volumetric point clouds and voxel grids — radar polar volumes rendered as `.pnts`, glTF isosurfaces, echo-top meshes, and cylindrical voxels |

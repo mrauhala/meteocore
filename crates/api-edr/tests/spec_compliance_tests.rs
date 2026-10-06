@@ -1149,6 +1149,45 @@ async fn declares_edr_queries_html_oas30_classes() {
     }
 }
 
+// EDR 1.2 (19-086r9) adds `instances` to the same classes, declared next to
+// the 1.1 ones (#979). Its `/req/core/conformance` A names Common Part 1
+// core and Part 2 collections with `https://`; the `http://` forms the other
+// APIs share stay too. Every class is declared once.
+#[tokio::test]
+async fn declares_edr_1_2_classes_and_https_common_classes() {
+    let (_status, json) = get_json("/conformance").await;
+    let conforms_to = json["conformsTo"].as_array().unwrap();
+    let uris: Vec<&str> = conforms_to.iter().filter_map(|v| v.as_str()).collect();
+    for class in [
+        "core",
+        "collections",
+        "queries",
+        "instances",
+        "json",
+        "geojson",
+        "edr-geojson",
+        "covjson",
+        "html",
+        "oas30",
+    ] {
+        let uri = format!("https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/{class}");
+        assert!(uris.contains(&uri.as_str()), "must declare {uri}");
+    }
+    for class in [
+        "ogcapi-common-1/1.0/conf/core",
+        "ogcapi-common-2/1.0/conf/collections",
+    ] {
+        for scheme in ["https", "http"] {
+            let uri = format!("{scheme}://www.opengis.net/spec/{class}");
+            assert!(uris.contains(&uri.as_str()), "must declare {uri}");
+        }
+    }
+    let mut unique = uris.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), uris.len(), "a class declared twice: {uris:?}");
+}
+
 // ===========================================================================
 // FINDING 28: Landing page structure is valid
 // ===========================================================================

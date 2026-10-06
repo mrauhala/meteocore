@@ -1,4 +1,4 @@
-# api-edr — OGC API - Environmental Data Retrieval 1.1 status
+# api-edr — OGC API - EDR 1.2 status
 
 This page is the single source of truth for **what MeteoCore's EDR
 implementation supports and what it does not**, per query type and per
@@ -9,26 +9,36 @@ engine. It is written for integrators and for anyone planning EDR work.
 implementation / `supported_query_types` — must update the tables below in
 the same PR.** The `crates/api-edr/CLAUDE.md` rule points here.
 
-Spec: OGC API - EDR 1.1 (OGC 19-086r6), plus EDR 1.2's `limit`,
-locations paging (#922), several location ids in one locations query
-(#923) and the cube query with `resolution-z` (#925). Base route: `/edr`.
+Spec: OGC API - Environmental Data Retrieval 1.2 (OGC 19-086r9), declared
+next to EDR 1.1 (OGC 19-086r6). Base route: `/edr`.
 
 ## Conformance classes
 
-| Class | Declared | Notes |
-|---|---|---|
-| `core` | ✓ | |
-| `collections` | ✓ | |
-| `queries` | ✓ | one class for every query type; each collection's `data_queries` says which it supports |
-| `json` | ✓ | |
-| `covjson` | ✓ | every CoverageJSON body validates against `schemas/coveragejson.json` (`cargo test -p api-edr`) and is sent as `application/vnd.cov+json` (EDR 1.2's `/req/covjson/definition`, #920). The declared URI is still 1.1's, whose requirement names `application/prs.coverage+json`; that type is accepted in `f` but no longer sent. Moving the declaration to 1.2 is #930 |
-| `html` | ✓ | every metadata resource (landing, conformance, collections, collection, instances, instance) negotiates `?f=html` / `Accept`, and so does every data query (#971): position, area, radius, trajectory (along a path and cross-section), cube, their instance routes, `/locations/{id}` and id lists, the `/locations` list and `items`. See [HTML data pages](#html-data-pages). `/api` itself stays JSON; its HTML rendering is `/api/docs` (`rel=service-doc`) |
-| `oas30` | ✓ | `/edr/api` (hand-written `api_definition()`), sent as `application/vnd.oai.openapi+json;version=3.0`, the type the `service-desc` link names; Swagger UI at `/edr/api/docs`. See [API definition](#api-definition) |
-| `geojson` | ✓ | feature content is `application/geo+json`: the `/locations` list, `items`, and the point queries of station collections (see [GeoJSON output](#geojson-output)) |
-| `edr-geojson` | ✓ | those bodies are EDR GeoJSON: every feature's `properties` carries the `edrProperties` members `datetime`, `parameter-name`, `label` and `edrqueryendpoint`, on `items` too (#970, see [Items](#items)). Each route's body validates against the EDR 1.1 and 1.2 bundles' `application/geo+json` schema, a single item against the items list's feature schema, 1.2's `featureGeoJSON` (`tests/geojson_output_tests.rs`, `tests/items_tests.rs`, `crates/server/tests/edr_geojson.rs`) |
+`/edr/conformance` declares each class twice (#979): as EDR 1.2's
+`https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/<class>`, and as EDR
+1.1's `http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/<class>`, kept for
+clients that know only 1.1 (#930). `instances` is new in 1.2. The
+2026-10-05 requirement audit found the gaps that blocked the 1.2 declaration;
+#964 to #971 closed them.
+
+| Class | EDR 1.1 URI | EDR 1.2 URI | Notes |
+|---|---|---|---|
+| `core` | `…/1.1/conf/core` | `…/1.2/conf/core` | |
+| `collections` | `…/1.1/conf/collections` | `…/1.2/conf/collections` | |
+| `queries` | `…/1.1/conf/queries` | `…/1.2/conf/queries` | one class for every query type; each collection's `data_queries` says which it supports |
+| `instances` | – | `…/1.2/conf/instances` | forecast model runs, see [Instance-scoped routes](#instance-scoped-routes) |
+| `json` | `…/1.1/conf/json` | `…/1.2/conf/json` | |
+| `covjson` | `…/1.1/conf/covjson` | `…/1.2/conf/covjson` | every CoverageJSON body validates against `schemas/coveragejson.json` (`cargo test -p api-edr`) and is sent as `application/vnd.cov+json`, the type 1.2's `/req/covjson/definition` names (#920). 1.1's requirement names `application/prs.coverage+json`; that type is accepted in `f` but no longer sent |
+| `html` | `…/1.1/conf/html` | `…/1.2/conf/html` | every metadata resource (landing, conformance, collections, collection, instances, instance) negotiates `?f=html` / `Accept`, and so does every data query (#971): position, area, radius, trajectory (along a path and cross-section), cube, their instance routes, `/locations/{id}` and id lists, the `/locations` list and `items`. See [HTML data pages](#html-data-pages). `/api` itself stays JSON; its HTML rendering is `/api/docs` (`rel=service-doc`) |
+| `oas30` | `…/1.1/conf/oas30` | `…/1.2/conf/oas30` | `/edr/api` (hand-written `api_definition()`), sent as `application/vnd.oai.openapi+json;version=3.0`, the type the `service-desc` link names; Swagger UI at `/edr/api/docs`. See [API definition](#api-definition) |
+| `geojson` | `…/1.1/conf/geojson` | `…/1.2/conf/geojson` | feature content is `application/geo+json`: the `/locations` list, `items`, and the point queries of station collections (see [GeoJSON output](#geojson-output)) |
+| `edr-geojson` | `…/1.1/conf/edr-geojson` | `…/1.2/conf/edr-geojson` | those bodies are EDR GeoJSON: every feature's `properties` carries the `edrProperties` members `datetime`, `parameter-name`, `label` and `edrqueryendpoint`, on `items` too (#970, see [Items](#items)). Each route's body validates against the EDR 1.1 and 1.2 bundles' `application/geo+json` schema, a single item against the items list's feature schema, 1.2's `featureGeoJSON` (`tests/geojson_output_tests.rs`, `tests/items_tests.rs`, `crates/server/tests/edr_geojson.rs`) |
 
 Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
-Part 2 (collections, json, html). The landing page links `/conformance` and
+Part 2 (collections, json, html), as `http://www.opengis.net/spec/ogcapi-common-…`
+URIs like every other API's. EDR 1.2's `/req/core/conformance` A names
+Part 1 core and Part 2 collections with `https://`, so `/edr/conformance`
+lists those two forms as well, and only there. The landing page links `/conformance` and
 `/collections` with both the short `conformance`/`data` relations this standard
 requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
 / `…/data` relations Common Part 1 names. Collection discovery supports `bbox`,
@@ -56,7 +66,7 @@ for the specification baselines and remaining gaps.
 ### Schema validation
 
 Tests validate real router responses against both vendored EDR OpenAPI 3.0
-bundles, 1.1 and 1.2 (#919). 1.1 stays declared, so both must pass. Covered:
+bundles, 1.1 and 1.2 (#919). Both are declared, so both must pass. Covered:
 the landing page, `/conformance`, `/collections`, collection documents (with
 locations, position, area and radius queries, a vertical extent, and a
 satellite collection's per-parameter time axes), the instances list, one
