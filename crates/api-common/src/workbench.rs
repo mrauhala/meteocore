@@ -1518,13 +1518,19 @@ pub fn instances_html(surface: Surface<'_>, title: &str, doc: &Value, nav: &[Lin
             .as_str()
             .filter(|t| !t.trim().is_empty())
             .unwrap_or(id);
+        // The JSON `title` is the collection's on every run (EDR 1.2
+        // `/req/instances/src-md-success` C), so the card heading takes the
+        // run's own label from its self link's `title`.
         let heading = instance["links"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|l| l["rel"] == "self")
-            .and_then(|l| l["href"].as_str())
-            .map(|href| anchor(&with_format(href, "html"), title, ""))
+            .and_then(|l| l["href"].as_str().map(|href| (href, l["title"].as_str())))
+            .map(|(href, label)| {
+                let label = label.filter(|t| !t.trim().is_empty()).unwrap_or(title);
+                anchor(&with_format(href, "html"), label, "")
+            })
             .unwrap_or_else(|| escape(title));
         body.push_str(&format!(
             "<article class=\"collection-row\"><div class=\"collection-main\"><h2>{heading}</h2><code>{}</code><p>{}</p><div class=\"chip-row\">{}</div>{}</div></article>",
@@ -2107,6 +2113,26 @@ mod tests {
         assert!(html.contains(
             "href=\"https://x/edr/collections/a/instances/2026-01-01T00:00:00Z?f=html\""
         ));
+    }
+
+    /// Every run's JSON `title` is the collection's (EDR 1.2
+    /// `/req/instances/src-md-success` C), so each instance card is headed
+    /// by its self link's own title, which names the run.
+    #[test]
+    fn instance_cards_are_headed_by_their_run() {
+        let run = |id: &str| {
+            json!({"id": id, "title": "A", "description": "A",
+                "links": [{"rel": "self", "href": format!("https://x/edr/collections/a/instances/{id}"),
+                    "type": "application/json", "title": format!("A — run {id}")}]})
+        };
+        let list = json!({"instances": [run("2026-01-01T00:00:00Z"), run("2026-01-01T06:00:00Z")], "links": []});
+        let html = instances_html(MAPS_PROXY, "A — instances", &list, &[]);
+        for id in ["2026-01-01T00:00:00Z", "2026-01-01T06:00:00Z"] {
+            assert!(
+                html.contains(&format!("?f=html\">A — run {id}</a></h2>")),
+                "{id}"
+            );
+        }
     }
 
     /// The collection page's link table lists every link, `self`,
