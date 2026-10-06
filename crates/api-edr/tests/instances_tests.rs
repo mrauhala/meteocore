@@ -262,7 +262,7 @@ fn config(id: &str, engine_type: &str) -> CollectionConfig {
     CollectionConfig {
         id: id.to_string(),
         title: id.to_string(),
-        description: String::new(),
+        description: format!("The {id} collection"),
         data_path: None,
         apis: vec!["edr".to_string()],
         engine_type: engine_type.to_string(),
@@ -400,8 +400,9 @@ fn self_href(doc: &Value) -> &str {
 }
 
 /// MetOcean EDR profile `/req/nwp/collection_granularity` C: an instance id
-/// is an RFC 3339 datestamp, and the instance's title and every link use the
-/// same string with the colons unencoded (#947).
+/// is an RFC 3339 datestamp, and the instance's `self` link title and every
+/// link use the same string with the colons unencoded (#947). The document
+/// `title` is the collection's (EDR 1.2 `/req/instances/src-md-success` C).
 #[tokio::test]
 async fn instance_ids_are_rfc3339_in_ids_titles_and_links() {
     let (status, body) = get("/collections/fc/instances").await;
@@ -413,7 +414,14 @@ async fn instance_ids_are_rfc3339_in_ids_titles_and_links() {
         .zip(["2026-06-07T00:00:00Z", "2026-06-07T12:00:00Z"])
     {
         assert_eq!(instance["id"], id);
-        assert_eq!(instance["title"], format!("fc — run {id}"));
+        assert_eq!(instance["title"], "fc");
+        let self_link = instance["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "self")
+            .unwrap();
+        assert_eq!(self_link["title"], format!("fc — run {id}"));
         assert_eq!(
             self_href(instance),
             format!("/edr/collections/fc/instances/{id}")
@@ -703,4 +711,80 @@ async fn collection_advertises_instances_data_query() {
         .as_str()
         .expect("instances data_query present");
     assert!(href.ends_with("/collections/fc/instances"), "{href}");
+}
+
+/// EDR 1.2 `/req/instances/src-md-success` C: an instance's `title` and
+/// `description` are its collection's entry in `/collections`. The `id`
+/// clause cannot hold (instance ids differ from the collection id and from
+/// each other) and each run keeps its own `extent` (#982).
+#[tokio::test]
+async fn instance_title_and_description_are_the_collections() {
+    let (_, collections) = get("/collections").await;
+    let entry = collections["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "fc")
+        .unwrap()
+        .clone();
+    assert_eq!(entry["description"], "The fc collection");
+    let (_, list) = get("/collections/fc/instances").await;
+    let (_, one) = get("/collections/fc/instances/2026-06-07T00:00:00Z").await;
+    let listed = list["instances"].as_array().unwrap();
+    for instance in listed.iter().chain([&one]) {
+        assert_eq!(instance["title"], entry["title"], "{instance}");
+        assert_eq!(instance["description"], entry["description"], "{instance}");
+        assert_ne!(instance["id"], entry["id"]);
+    }
+    // The 00Z run's extent is its own, not the collection's (latest run).
+    assert_ne!(
+        one["extent"]["temporal"]["interval"],
+        entry["extent"]["temporal"]["interval"]
+    );
+    // The HTML page still names the run in its heading.
+    let (_, _, html) = get_raw(
+        "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
+        None,
+    )
+    .await;
+    assert!(html.contains("fc — run 2026-06-07T00:00:00Z"), "{html}");
+}
+
+/// ATS `/conf/instances/rc-md-success` step 1 holds the instances list to EDR
+/// 1.2 `/req/core/rc-collection-info-links`: `self`, an `alternate` for every
+/// other media type (HTML), and a link to a query end point; every link has
+/// `rel` and `type`. A collection without runs answers the same way.
+#[tokio::test]
+async fn instances_list_links_follow_collection_info_links() {
+    for id in ["fc", "obs"] {
+        let uri = format!("/collections/{id}/instances");
+        let (status, list) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let links = list["links"].as_array().unwrap();
+        let find = |rel: &str| {
+            links
+                .iter()
+                .find(|l| l["rel"] == rel)
+                .unwrap_or_else(|| panic!("{uri}: no {rel} link in {links:?}"))
+        };
+        let self_href = format!("/edr/collections/{id}/instances");
+        assert_eq!(find("self")["href"], self_href);
+        assert_eq!(find("self")["type"], "application/json");
+        let alternate = find("alternate");
+        assert_eq!(alternate["type"], "text/html");
+        assert_eq!(alternate["href"], format!("{self_href}?f=html"));
+        let (status, ctype, _) = get_raw(&format!("{uri}?f=html"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ctype.starts_with("text/html"), "{ctype}");
+        assert_eq!(find("collection")["href"], format!("/edr/collections/{id}"));
+
+        // The query end points are the collection's, less the list itself.
+        let (_, collection) = get(&format!("/collections/{id}")).await;
+        let expected: Vec<_> = data_links(&collection)
+            .into_iter()
+            .filter(|(href, _)| *href != self_href)
+            .collect();
+        assert!(!expected.is_empty(), "{id}");
+        assert_eq!(data_links(&list), expected, "{uri}");
+    }
 }

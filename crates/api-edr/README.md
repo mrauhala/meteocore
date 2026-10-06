@@ -211,6 +211,14 @@ instance pages leave the `rel=data` links out of their link lists: they
 already list the queries from `data_queries`, with the API reference for
 their inputs.
 
+The instances list `/collections/{id}/instances` carries the same kinds of
+links (#982), since ATS `/conf/instances/rc-md-success` step 1 holds it to
+`/req/core/rc-collection-info-links`: `self` (JSON), `alternate` to its HTML
+page, `collection`, and the collection's query end points as `rel=data`,
+taken from the collection document's own links (they answer for the latest
+run; each run's own end points are in its entry of `instances`). A
+collection without runs answers the same links around an empty list.
+
 ### Instance-scoped routes
 
 | Route | Status |
@@ -226,8 +234,8 @@ their inputs.
 An instance `id` is its run's reference time in RFC 3339 UTC,
 `2026-06-07T06:00:00Z`, as the MetOcean EDR profile requires
 (`/req/nwp/collection_granularity` C, #947): whole seconds always, a
-fraction only when the run has one. The instance title says `run
-2026-06-07T06:00:00Z`. Links carry the colons unencoded, which RFC 3986
+fraction only when the run has one. The instance's `self` link title and
+its HTML page heading say `run 2026-06-07T06:00:00Z`. Links carry the colons unencoded, which RFC 3986
 `pchar` allows: `/collections/{id}/instances/2026-06-07T06:00:00Z/position`.
 `{instanceId}` accepts:
 
@@ -239,6 +247,14 @@ fraction only when the run has one. The instance title says `run
 Links in a response always use the canonical id, whichever form the request
 named. Anything else is a 400; a well-formed id with no such run is a 404,
 and so is every id on a collection without instances.
+
+An instance document's `title` and `description` are its collection's
+(EDR 1.2 `/req/instances/src-md-success` C, #982). The same clause also
+asks for an identical `id` and `extent`. The `id` cannot be met by any
+server: an instance id must differ from the collection id and from every
+other instance of it, so we treat that part as a spec defect. Each run keeps
+its own `extent`, its valid times, which is what an instance is for; the
+collection's extent describes the latest run.
 
 ## Parameters
 
@@ -365,7 +381,7 @@ EUMETNET/OGC API - EDR Metocean Profile `/req/core/collection_parameter_names`
 | B | `label`, `description`, `unit` | partial | `label` and `description` always, and they differ: `description` is the full engine label plus the served unit (`2 metre temperature, in K`), or `… (unit not specified)`. `unit` only where the engine knows one (table below) |
 | C | `label` ≤ 50 characters | ✓ | a longer engine label is cut to 49 characters + `…`; the whole text stays in `description` and `observedProperty.label` |
 | D | `label` in English | partial | the built-in tables (ODIM quantities, GRIB WMO Code Table 4.2, BUFR SYNOP) are English; config- or source-given labels (CSV column names, GeoTIFF/PostGIS/Satellite config, Zarr `long_name`) are served as given, tagged `en` |
-| E | `unit.symbol.type` = `https://qudt.org/vocab/unit/<unit>`, `value` = `qudt:symbol` | partial | every unit `ds_core::units::qudt_unit` knows — `K`, `°C`, `Pa`, `hPa`, `m/s`, `km/h`, `m`, `km`, `cm`, `mm`, `mm/h`, `%`, `dB`, `°`, `kg/m²`, `kg/(m²·s)`, `kg/m³`, `kg/kg`, `J/kg`, `J/m²`, `W/m²`, `m²/s²`, `m³/m³`, `Pa/s`, `/s`, `s`, `min`, `h`, `DU`, `kA`, in their UCUM, CF/udunits and WMO spellings. Units with no faithful QUDT entry keep the engine's string typed as UCUM: `dBZ` (QUDT's `DeciB_Z` is acoustic Z-weighting, not reflectivity), `gpm`, `deg/km`, CF `1`, BUFR code tables. `unit.label` stays the engine's unit string |
+| E | `unit.symbol.type` = `https://qudt.org/vocab/unit/<unit>`, `value` = `qudt:symbol` | partial | every unit `ds_core::units::qudt_unit` knows — `K`, `°C`, `Pa`, `hPa`, `m/s`, `km/h`, `m`, `km`, `cm`, `mm`, `mm/h`, `%`, `dB`, `°`, `kg/m²`, `kg/(m²·s)`, `kg/m³`, `kg/kg`, `J/kg`, `J/m²`, `W/m²`, `m²/s²`, `m³/m³`, `Pa/s`, `/s`, `s`, `min`, `h`, `DU`, `kA`, in their UCUM, CF/udunits and WMO spellings. Units with no faithful QUDT entry keep the engine's string: typed `https://www.opengis.net/def/uom/UCUM/` when it is UCUM (`deg/km`, CF `1`; `ds_core::units::is_ucum`), else a plain-string `symbol` with no scheme, since EDR 1.2 `/req/edr/rc-parameters` G reserves the UCUM type for UCUM: `dBZ` (QUDT's `DeciB_Z` is acoustic Z-weighting, not reflectivity, and UCUM has no `dBZ`), `gpm`, BUFR code tables, udunits spellings with spaces that QUDT does not know (#982). `unit.label` stays the engine's unit string |
 | F | `observedProperty.id` = `https://vocab.nerc.ac.uk/standard_name/<name>` when CF, else `observedProperty.description` | partial | the CF URI when the engine knows the standard name (`ParameterDescription.standard_name`, only set from a CF `standard_name` attribute; a value with a CF modifier is not published). Otherwise `observedProperty.description` carries the description, and `observedProperty.id` is the engine's observed-property name (`DBZH`, `air_temperature`), in `parameter_names` as in CoverageJSON: EDR 1.2 `/req/edr/rc-parameters` F requires an `id` on every observed property (#964) |
 
 CoverageJSON parameters carry no parameter-level `label`: CoverageJSON asks
