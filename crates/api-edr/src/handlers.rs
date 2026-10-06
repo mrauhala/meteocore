@@ -620,7 +620,7 @@ pub async fn landing_page(
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
-    use ds_core::html::{LinkView, Wanted};
+    use ds_core::html::Wanted;
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
@@ -681,19 +681,26 @@ pub async fn landing_page(
                 .into_response()
         }
         Wanted::Html => {
-            let mut views: Vec<LinkView> = links
+            // Every link with its relation, type and title
+            // (`/req/html/content` A). This representation's `self` is the
+            // HTML page; the JSON one is its `alternate`.
+            let mut json_links: Vec<_> = links
                 .iter()
-                .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
+                .map(|(h, r, t, ti)| {
+                    if *r == "self" {
+                        json!({ "href": format!("{h}?f=html"), "rel": r, "type": "text/html", "title": ti })
+                    } else {
+                        json!({ "href": h, "rel": r, "type": t, "title": ti })
+                    }
+                })
                 .collect();
-            // rel="alternate" to the JSON representation (parity with the
-            // collection-detail HTML page), so the HTML landing page links to
-            // its machine-readable twin.
-            views.push(LinkView::new(
-                format!("{base}/edr/?f=json"),
-                "alternate",
-                Some("This document as JSON"),
-            ));
-            Html(api_common::workbench::landing_html(
+            json_links.push(json!({
+                "href": format!("{base}/edr/?f=json"),
+                "rel": "alternate",
+                "type": "application/json",
+                "title": "This document as JSON"
+            }));
+            Html(api_common::workbench::landing_document(
                 api_common::workbench::Surface {
                     base,
                     root: &format!("{base}{}", api_common::mounts::EDR),
@@ -701,7 +708,7 @@ pub async fn landing_page(
                 },
                 title,
                 description,
-                &views,
+                &json!({ "links": json_links }),
             ))
             .into_response()
         }
@@ -1885,13 +1892,7 @@ pub async fn collection(
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = html_document(build_collection_metadata(
-                engine.as_ref(),
-                config,
-                base,
-                None,
-                items,
-            ));
+            let metadata = build_collection_metadata(engine.as_ref(), config, base, None, items);
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -1914,7 +1915,7 @@ pub async fn instances(
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
-    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
@@ -1929,43 +1930,29 @@ pub async fn instances(
     // non-forecast collections, so conformant clients don't reach it).
     let runs = engine.get_instances();
     let self_href = format!("{base}/edr/collections/{}/instances", config.id);
+    // Each instance doc rebuilds the run-invariant bits (parameters,
+    // spatial extent) via build_collection_metadata. That's a handful
+    // of redundant clones (run count is bounded — a few to a few
+    // dozen) on a low-QPS discovery endpoint, not the `/collections`/
+    // `/api` hot paths #211 guards — kept simple over threading a
+    // precomputed-metadata variant through.
+    let instances: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run), false))
+        .collect();
+    // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
+    // `instances` (each item a collection-shaped instance), not
+    // `collections`. The HTML page renders this same document
+    // (`/req/html/content` A: all of its information).
+    let doc = json!({
+        "links": instances_list_links(engine.as_ref(), config, base, &self_href),
+        "instances": instances,
+    });
     Ok(with_vary(match wanted {
-        Wanted::Json => {
-            // Each instance doc rebuilds the run-invariant bits (parameters,
-            // spatial extent) via build_collection_metadata. That's a handful
-            // of redundant clones (run count is bounded — a few to a few
-            // dozen) on a low-QPS discovery endpoint, not the `/collections`/
-            // `/api` hot paths #211 guards — kept simple over threading a
-            // precomputed-metadata variant through.
-            let instances: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|run| {
-                    build_collection_metadata(engine.as_ref(), config, base, Some(run), false)
-                })
-                .collect();
-            // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
-            // `instances` (each item a collection-shaped instance), not
-            // `collections`.
-            Json(json!({
-                "links": instances_list_links(engine.as_ref(), config, base, &self_href),
-                "instances": instances,
-            }))
-            .into_response()
-        }
+        Wanted::Json => Json(doc).into_response(),
         Wanted::Html => {
             // EDR 1.1 `html` class: the instance resources negotiate like every
             // other metadata page (flagged on #669). One card per model run.
-            let cards: Vec<CollectionCard> = runs
-                .iter()
-                .map(|run| instance_card(config, base, run))
-                .collect();
-            // Each run's data queries, anchored under its card (#971).
-            let docs: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|run| {
-                    build_collection_metadata(engine.as_ref(), config, base, Some(run), false)
-                })
-                .collect();
             let nav = [
                 LinkView::new(format!("{self_href}?f=json"), "alternate", Some("JSON")),
                 LinkView::new(
@@ -1981,8 +1968,7 @@ pub async fn instances(
                     api: "edr",
                 },
                 &format!("{} — instances", config.title),
-                &cards,
-                &docs,
+                &doc,
                 &nav,
             ))
             .into_response()
@@ -2032,38 +2018,6 @@ fn instances_list_links(
         );
     }
     links
-}
-
-/// The HTML card for one model run: id = the instance id, title = the run's
-/// reference time (the same RFC 3339 string), description = the valid-time
-/// span.
-fn instance_card(
-    config: &CollectionConfig,
-    base: &str,
-    run: &ds_core::instances::RunInfo,
-) -> ds_core::html::CollectionCard {
-    let instance_id = run.instance_id();
-    let description = match (run.valid_times.first(), run.valid_times.last()) {
-        (Some(first), Some(last)) => format!(
-            "{} valid times, {} – {}",
-            run.valid_times.len(),
-            first.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            last.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        ),
-        _ => "no valid times".to_string(),
-    };
-    ds_core::html::CollectionCard {
-        title: format!("Run {instance_id}"),
-        description,
-        // The id's colons stay unencoded: RFC 3986 `pchar` allows `:`.
-        self_href: format!(
-            "{base}/edr/collections/{}/instances/{instance_id}",
-            config.id
-        ),
-        id: instance_id,
-        keywords: Vec::new(),
-        license: None,
-    }
 }
 
 /// `GET /collections/{id}/instances/{instanceId}` — one model run's metadata.
@@ -2120,13 +2074,8 @@ pub async fn instance(
         ))
         .into_response(),
         Wanted::Html => {
-            let mut metadata = html_document(build_collection_metadata(
-                engine.as_ref(),
-                config,
-                base,
-                Some(&run),
-                false,
-            ));
+            let mut metadata =
+                build_collection_metadata(engine.as_ref(), config, base, Some(&run), false);
             // The page heading names the run; the JSON `title` is the
             // collection's (`/req/instances/src-md-success` C).
             metadata["title"] = json!(format!("{} — run {}", config.title, run.instance_id()));
@@ -3780,15 +3729,4 @@ fn data_link(query_type: &str, link: &serde_json::Value) -> serde_json::Value {
         _ => link["variables"]["title"].as_str().unwrap_or(query_type),
     };
     json!({"href": link["href"], "rel": "data", "type": link["type"], "title": title})
-}
-
-/// The collection or instance document the HTML page renders, without its
-/// `rel=data` links: the page already lists the same end points from
-/// `data_queries`, each with its documentation, where a link list would open
-/// them bare as `?f=html`.
-fn html_document(mut metadata: serde_json::Value) -> serde_json::Value {
-    if let Some(links) = metadata["links"].as_array_mut() {
-        links.retain(|link| link["rel"] != "data");
-    }
-    metadata
 }

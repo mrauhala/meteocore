@@ -31,7 +31,7 @@ use ds_core::model::{CoverageResponse, Location};
 use serde_json::Value;
 
 use crate::geojson::encode_path_segment;
-use crate::response::{coverage_response_to_json, LocationsContext};
+use crate::response::{coverage_response_to_json, LocationsContext, COVERAGE_JSON_MEDIA_TYPE};
 
 /// The `Content-Type` of every HTML data page.
 pub(crate) const CONTENT_TYPE: &str = "text/html; charset=utf-8";
@@ -786,9 +786,8 @@ fn feature_row_len(feature: &Value, columns: &[&str]) -> usize {
         .into_iter()
         .flatten()
         .map(|l| {
-            let href = l["href"].as_str().unwrap_or_default();
-            let label = l["title"].as_str().or(l["rel"].as_str()).unwrap_or(href);
-            34 + escaped_len(href) + escaped_len(label) + 4
+            let text = |key: &str| l[key].as_str().unwrap_or_default();
+            feature_link_len(text("rel"), text("title"), text("type"), text("href")) + 4
         })
         .sum();
     48 + id_cell
@@ -797,6 +796,26 @@ fn feature_row_len(feature: &Value, columns: &[&str]) -> usize {
         + cells
         + 14
         + links
+}
+
+/// One link of a feature row: its relation, an `<a>` titled like the link
+/// (else by its href), and its media type — every member of the GeoJSON's
+/// link object (`/req/html/content` A).
+fn feature_link(rel: &str, title: &str, kind: &str, href: &str) -> String {
+    let label = if title.is_empty() { href } else { title };
+    format!(
+        "<code>{}</code> {} <code>{}</code>",
+        escape(rel),
+        ui::anchor(href, label, "table-link"),
+        escape(kind)
+    )
+}
+
+/// The bytes [`feature_link`] writes, at most: the anchor's href is
+/// measured unrewritten (`safe_href` only ever shortens it to `#`).
+fn feature_link_len(rel: &str, title: &str, kind: &str, href: &str) -> usize {
+    let label = if title.is_empty() { href } else { title };
+    32 + escaped_len(rel) + 34 + escaped_len(href) + escaped_len(label) + escaped_len(kind)
 }
 
 /// A feature's `self` link.
@@ -855,11 +874,11 @@ pub(crate) fn write_locations(
     }
     let _ = write!(
         body,
-        "<dt>Every location's <code>datetime</code></dt><dd>{}</dd><dt>Every location's <code>parameter-name</code></dt><dd>{}</dd></dl></div></section>",
+        "<dt>Every location's <code>type</code></dt><dd>Feature</dd><dt>Every location's <code>datetime</code></dt><dd>{}</dd><dt>Every location's <code>parameter-name</code></dt><dd>{}</dd></dl></div></section>",
         escape(&datetime),
         escape(&ctx.parameter_names.join(", "))
     );
-    body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Locations</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">label</th><th scope=\"col\">Longitude</th><th scope=\"col\">Latitude</th><th scope=\"col\">Data · edrqueryendpoint</th><th scope=\"col\">View</th></tr></thead><tbody>");
+    body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Locations</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">label</th><th scope=\"col\">geometry</th><th scope=\"col\">Longitude</th><th scope=\"col\">Latitude</th><th scope=\"col\">edrqueryendpoint</th><th scope=\"col\">links</th><th scope=\"col\">View</th></tr></thead><tbody>");
     w.write_all(body.as_bytes())?;
     for loc in locations {
         let endpoint = format!(
@@ -868,8 +887,16 @@ pub(crate) fn write_locations(
             ctx.collection_id,
             encode_path_segment(&loc.id)
         );
+        // The feature's one link, as the GeoJSON carries it
+        // (`LocationLink`): relation, title and type next to its anchor.
+        let link = feature_link(
+            "data",
+            &format!("Data for {}", loc.label),
+            COVERAGE_JSON_MEDIA_TYPE,
+            &endpoint,
+        );
         let row = format!(
-            "<tr><th scope=\"row\"><code>{}</code></th><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><th scope=\"row\"><code>{}</code></th><td>{}</td><td>Point</td><td>{}</td><td>{}</td><td>{}</td><td>{link}</td><td>{}</td></tr>",
             escape(&loc.id),
             escape(&loc.label),
             loc.longitude,
@@ -1041,9 +1068,8 @@ fn features_body(
             .into_iter()
             .flatten()
             .map(|l| {
-                let href = l["href"].as_str().unwrap_or_default();
-                let label = l["title"].as_str().or(l["rel"].as_str()).unwrap_or(href);
-                ui::anchor(href, label, "table-link")
+                let text = |key: &str| l[key].as_str().unwrap_or_default();
+                feature_link(text("rel"), text("title"), text("type"), text("href"))
             })
             .collect();
         let _ = write!(body, "<td>{}</td></tr>", links.join("<br>"));

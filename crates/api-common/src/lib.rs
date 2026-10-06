@@ -249,22 +249,24 @@ pub fn collections_response(
         Some(&format!("This page as {}", alternate.to_uppercase())),
     ));
 
+    // One link list for both representations: the HTML page lists it too
+    // (OGC API - EDR `/req/html/content` A).
+    let links: Vec<_> = nav
+        .iter()
+        .map(|link| {
+            let media_type = if link.rel == "alternate" {
+                alternate_type
+            } else {
+                media_type
+            };
+            json!({
+                "href": link.href, "rel": link.rel, "title": link.title,
+                "type": media_type
+            })
+        })
+        .collect();
     let mut response = match request.wanted {
         Wanted::Json => {
-            let links: Vec<_> = nav
-                .iter()
-                .map(|link| {
-                    let media_type = if link.rel == "alternate" {
-                        alternate_type
-                    } else {
-                        media_type
-                    };
-                    json!({
-                        "href": link.href, "rel": link.rel, "title": link.title,
-                        "type": media_type
-                    })
-                })
-                .collect();
             let collections: Vec<_> = result.page.iter().map(|&i| &entries[i].metadata).collect();
             Json(json!({
                 "collections": collections, "numberMatched": result.number_matched,
@@ -288,6 +290,7 @@ pub fn collections_response(
                 result.number_matched,
                 &metadata,
                 &nav,
+                &Value::Array(links),
             ))
             .into_response()
         }
