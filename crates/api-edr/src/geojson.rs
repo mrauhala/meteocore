@@ -155,6 +155,101 @@ struct Series<'a> {
     identity: Option<FeatureIdentity<'a>>,
 }
 
+/// Which location a feature's series is and where to query it: the members
+/// besides the series that EDR GeoJSON writes per feature, and that the HTML
+/// page of the same response lists (`/req/html/content` A). One builder for
+/// both, so they cannot drift.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureSummary {
+    /// The feature's `id`: the location's id, `None` when unnamed.
+    pub id: Option<String>,
+    pub label: String,
+    pub edrqueryendpoint: String,
+    /// `edrProperties.datetime`: the instant, or the period the series spans.
+    pub datetime: String,
+}
+
+impl<'a> Series<'a> {
+    /// Coverage `i` as a station series: a time series at one point without
+    /// `z`, named by `identify`.
+    fn new(
+        i: usize,
+        q: &'a QueryResult,
+        identify: &impl Fn(usize, &QueryResult) -> Option<FeatureIdentity<'a>>,
+    ) -> Result<Self, GeoJsonError> {
+        let (x, y, t) = match &q.domain {
+            DomainDescription::PointSeries { x, y, t, z: None } => (*x, *y, t),
+            DomainDescription::PointSeries { .. } => {
+                return Err(GeoJsonError::NotStationSeries("PointSeries with z"))
+            }
+            DomainDescription::Point { .. } => return Err(GeoJsonError::NotStationSeries("Point")),
+            DomainDescription::Grid { .. } => return Err(GeoJsonError::NotStationSeries("Grid")),
+            DomainDescription::VerticalProfile { .. } => {
+                return Err(GeoJsonError::NotStationSeries("VerticalProfile"))
+            }
+            DomainDescription::Section { .. } => {
+                return Err(GeoJsonError::NotStationSeries("Section"))
+            }
+            DomainDescription::Trajectory { .. } => {
+                return Err(GeoJsonError::NotStationSeries("Trajectory"))
+            }
+        };
+        Ok(Series {
+            x,
+            y,
+            times: t.iter().map(|t| t.to_rfc3339()).collect(),
+            result: q,
+            identity: identify(i, q),
+        })
+    }
+
+    /// The feature's identity members. An unnamed series is labelled by its
+    /// coordinates and points at the collection's location list.
+    fn summary(&self, collection_url: &str) -> FeatureSummary {
+        let datetime = match (self.times.first(), self.times.last()) {
+            (Some(first), Some(last)) if first != last => format!("{first}/{last}"),
+            (Some(only), _) => only.clone(),
+            _ => String::new(),
+        };
+        match self.identity {
+            Some(identity) => FeatureSummary {
+                id: Some(identity.id.to_string()),
+                label: identity.label.to_string(),
+                edrqueryendpoint: format!(
+                    "{collection_url}/locations/{}",
+                    encode_path_segment(identity.id)
+                ),
+                datetime,
+            },
+            None => FeatureSummary {
+                id: None,
+                label: format!("POINT({} {})", self.x, self.y),
+                edrqueryendpoint: format!("{collection_url}/locations"),
+                datetime,
+            },
+        }
+    }
+}
+
+/// The [`FeatureSummary`] of every coverage of a station-series result, in
+/// order: what [`write_station_series`] writes for each feature besides its
+/// series, for the response's HTML page.
+pub fn feature_summaries<'a>(
+    result: &'a CoverageResponse,
+    identify: impl Fn(usize, &QueryResult) -> Option<FeatureIdentity<'a>>,
+    collection_url: &str,
+) -> Result<Vec<FeatureSummary>, GeoJsonError> {
+    let coverages: &[QueryResult] = match result {
+        CoverageResponse::Single(q) => std::slice::from_ref(q),
+        CoverageResponse::Collection(v) => v,
+    };
+    coverages
+        .iter()
+        .enumerate()
+        .map(|(i, q)| Ok(Series::new(i, q, &identify)?.summary(collection_url)))
+        .collect()
+}
+
 /// Encode a station-series result as an EDR GeoJSON FeatureCollection.
 ///
 /// `identify` names the location each coverage (by index) belongs to; a
@@ -180,23 +275,7 @@ pub fn write_station_series<'a, W: Write>(
     // Parameters of every coverage, sorted: the collection's `parameters`.
     let mut parameters: BTreeMap<&str, Value> = BTreeMap::new();
     for (i, q) in coverages.iter().enumerate() {
-        let (x, y, t) = match &q.domain {
-            DomainDescription::PointSeries { x, y, t, z: None } => (*x, *y, t),
-            DomainDescription::PointSeries { .. } => {
-                return Err(GeoJsonError::NotStationSeries("PointSeries with z"))
-            }
-            DomainDescription::Point { .. } => return Err(GeoJsonError::NotStationSeries("Point")),
-            DomainDescription::Grid { .. } => return Err(GeoJsonError::NotStationSeries("Grid")),
-            DomainDescription::VerticalProfile { .. } => {
-                return Err(GeoJsonError::NotStationSeries("VerticalProfile"))
-            }
-            DomainDescription::Section { .. } => {
-                return Err(GeoJsonError::NotStationSeries("Section"))
-            }
-            DomainDescription::Trajectory { .. } => {
-                return Err(GeoJsonError::NotStationSeries("Trajectory"))
-            }
-        };
+        let s = Series::new(i, q, &identify)?;
         for name in q.ranges.keys().chain(q.parameters.keys()) {
             if RESERVED_PROPERTIES.contains(&name.as_str()) {
                 return Err(GeoJsonError::ReservedParameterName(name.clone()));
@@ -212,13 +291,7 @@ pub fn write_station_series<'a, W: Write>(
                 Value::Object(param)
             });
         }
-        series.push(Series {
-            x,
-            y,
-            times: t.iter().map(|t| t.to_rfc3339()).collect(),
-            result: q,
-            identity: identify(i, q),
-        });
+        series.push(s);
     }
     let features = Features {
         series: &series,
@@ -313,34 +386,14 @@ struct Properties<'a> {
 impl Serialize for Properties<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let s = self.series;
-        // `edrProperties.datetime`: the instant, or the period the series
-        // spans.
-        let datetime = match (s.times.first(), s.times.last()) {
-            (Some(first), Some(last)) if first != last => format!("{first}/{last}"),
-            (Some(only), _) => only.clone(),
-            _ => String::new(),
-        };
-        let (label, endpoint) = match s.identity {
-            Some(identity) => (
-                identity.label.to_string(),
-                format!(
-                    "{}/locations/{}",
-                    self.collection_url,
-                    encode_path_segment(identity.id)
-                ),
-            ),
-            None => (
-                format!("POINT({} {})", s.x, s.y),
-                format!("{}/locations", self.collection_url),
-            ),
-        };
+        let summary = s.summary(self.collection_url);
         let mut names: Vec<&String> = s.result.ranges.keys().collect();
         names.sort();
         let mut map = serializer.serialize_map(Some(5 + names.len()))?;
-        map.serialize_entry("datetime", &datetime)?;
-        map.serialize_entry("label", &label)?;
+        map.serialize_entry("datetime", &summary.datetime)?;
+        map.serialize_entry("label", &summary.label)?;
         map.serialize_entry("parameter-name", &names)?;
-        map.serialize_entry("edrqueryendpoint", &endpoint)?;
+        map.serialize_entry("edrqueryendpoint", &summary.edrqueryendpoint)?;
         map.serialize_entry("time", &s.times)?;
         for name in names {
             map.serialize_entry(name, &Values(&s.result.ranges[name].values))?;

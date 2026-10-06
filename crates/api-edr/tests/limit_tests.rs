@@ -283,6 +283,19 @@ impl App {
         (status, json)
     }
 
+    /// The status and raw body bytes.
+    async fn get_bytes(&self, uri: &str) -> (StatusCode, Vec<u8>) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec())
+    }
+
     fn calls(&self) -> usize {
         self.position_calls.load(Ordering::Relaxed)
     }
@@ -722,4 +735,66 @@ async fn limit_on_trajectory_and_cube_is_accepted() {
         .get(&format!("/collections/obs/cube?{CUBE}&limit=1&limit=2"))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// EDR 1.2 `/req/edr/rc-core-query-parameters` L: `limit` is ignored when
+/// the format cannot page (#988). A PNG plot is one image: a MULTIPOINT
+/// plots every point, byte for byte what it plots without `limit`, on the
+/// instance route too, and queries every point.
+#[tokio::test]
+async fn png_ignores_limit() {
+    let app = app(1);
+    for base in [
+        "/collections/obs".to_string(),
+        format!("/collections/obs/instances/{RUN}"),
+    ] {
+        let route = format!("{base}/position?coords={FIVE_POINTS}&f=PNG");
+        let (status, all) = app.get_bytes(&route).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        let before = app.calls();
+        let (status, limited) = app.get_bytes(&format!("{route}&limit=1")).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        assert_eq!(app.calls() - before, 5, "{route}: every point is queried");
+        assert!(all == limited, "{route}: limit changed the image");
+    }
+    // A malformed limit is still a 400.
+    let (status, _) = app
+        .get_bytes(&format!(
+            "/collections/obs/position?coords={FIVE_POINTS}&f=PNG&limit=0"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An HTML page shows the whole result: `limit` is ignored on every data
+/// query (#988), while the CoverageJSON of the same request is capped.
+#[tokio::test]
+async fn html_ignores_limit_on_every_route() {
+    let app = app(1);
+    let base = format!("/collections/obs/instances/{RUN}");
+    for (route, coverages) in [
+        (format!("/collections/obs/position?coords={FIVE_POINTS}"), 5),
+        (format!("{base}/position?coords={FIVE_POINTS}"), 5),
+        (
+            format!("/collections/obs/area?coords={POLYGON}"),
+            AREA_COVERAGES,
+        ),
+        (format!("{base}/area?coords={POLYGON}"), AREA_COVERAGES),
+        (format!("/collections/obs/radius?{CIRCLE}"), AREA_COVERAGES),
+        (format!("{base}/radius?{CIRCLE}"), AREA_COVERAGES),
+        ("/collections/obs/locations/s0?".to_string(), 3),
+        ("/collections/obs/locations/s0,s1?".to_string(), 4),
+        (
+            format!("/collections/obs/trajectory?coords={LINE}"),
+            AREA_COVERAGES,
+        ),
+    ] {
+        let (status, html) = app.get_bytes(&join(&route, "f=html&limit=1")).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        let html = String::from_utf8(html).unwrap();
+        let last = format!("Coverage {coverages} of {coverages}");
+        assert!(html.contains(&last), "{route}: no {last}");
+        let (_, json) = app.get(&join(&route, "limit=1")).await;
+        assert_eq!(xs(&json).len(), 1, "{route}: CoverageJSON still capped");
+    }
 }
