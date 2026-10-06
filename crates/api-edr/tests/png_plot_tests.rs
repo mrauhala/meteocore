@@ -294,3 +294,140 @@ async fn custom_dimensions_are_honored() {
     let h = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
     assert_eq!((w, h), (400, 300));
 }
+
+/// A radar cross-section engine whose `Section` carries `params` parameters,
+/// as a PVOL volume with every moment does: one stacked heatmap panel each.
+struct SectionEngine {
+    params: usize,
+}
+
+impl EdrEngine for SectionEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(vec![])
+    }
+    fn query_location(
+        &self,
+        _id: &str,
+        _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _p: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _rt: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::LocationNotFound("n/a".into()))
+    }
+    fn get_parameters(&self) -> Vec<String> {
+        (0..self.params).map(|i| format!("Q{i}")).collect()
+    }
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        None
+    }
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([24.0, 60.0, 25.0, 61.0])
+    }
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["trajectory".into()]
+    }
+    fn trajectory_shape(&self) -> ds_core::edr_engine::TrajectoryShape {
+        ds_core::edr_engine::TrajectoryShape::CrossSection
+    }
+    fn query_trajectory(
+        &self,
+        _coords: &str,
+        _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _p: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _rt: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let t = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let nodes = vec![(t, 24.0, 60.0), (t, 24.5, 60.5), (t, 25.0, 61.0)];
+        let mut parameters = HashMap::new();
+        let mut ranges = HashMap::new();
+        for name in self.get_parameters() {
+            parameters.insert(
+                name.clone(),
+                ParameterDescription {
+                    label: name.clone(),
+                    unit: "dBZ".into(),
+                    observed_property: name.clone(),
+                    standard_name: None,
+                },
+            );
+            ranges.insert(
+                name,
+                NdArray {
+                    shape: vec![3, 2],
+                    axis_names: vec!["composite".into(), "z".into()],
+                    values: vec![
+                        Some(10.0),
+                        Some(20.0),
+                        None,
+                        Some(15.0),
+                        Some(5.0),
+                        Some(25.0),
+                    ],
+                },
+            );
+        }
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Section {
+                nodes,
+                z: VerticalCoord {
+                    kind: VerticalKind::HeightAboveAntenna,
+                    values: vec![0.0, 1000.0],
+                },
+                coverage_floor: None,
+            },
+            parameters,
+            ranges,
+        }))
+    }
+}
+
+const SECTION: &str = "/collections/c/trajectory?coords=LINESTRING(24%2060,25%2061)&f=png";
+
+/// IHDR `(width, height)`, big-endian at bytes 16..24.
+fn png_size(body: &[u8]) -> (u32, u32) {
+    assert_eq!(&body[..8], &PNG_SIGNATURE);
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    (be(&body[16..20]), be(&body[20..24]))
+}
+
+/// A 16-parameter cross-section without `parameter-name` used to be a 500:
+/// 16 panels need 1024 px and the default image is 600 px. The default
+/// height now grows with the panel count; one panel keeps 600 px.
+#[tokio::test]
+async fn section_png_default_height_grows_with_parameters() {
+    let (status, ct, body) = request(Arc::new(SectionEngine { params: 16 }), SECTION).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(ct, "image/png");
+    assert_eq!(png_size(&body), (800, 2000));
+
+    let (status, _, body) = request(Arc::new(SectionEngine { params: 1 }), SECTION).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(png_size(&body), (800, 600));
+
+    // `limit` cannot page a PNG: ignored (EDR 1.2 rc-core-query-parameters L).
+    let (status, _, body) = request(
+        Arc::new(SectionEngine { params: 1 }),
+        &format!("{SECTION}&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(png_size(&body), (800, 600));
+}
+
+/// A height the panels cannot fit, or more panels than the tallest image
+/// holds, is a 400 naming `height` and `parameter-name`, not a 500.
+#[tokio::test]
+async fn section_png_that_cannot_fit_is_400() {
+    for (params, uri) in [
+        (16, format!("{SECTION}&height=600")),
+        (40, SECTION.to_string()),
+    ] {
+        let (status, _, body) = request(Arc::new(SectionEngine { params }), &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{params}: {uri}");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let description = json["description"].as_str().unwrap();
+        assert!(description.contains("parameter-name"), "{description}");
+    }
+}

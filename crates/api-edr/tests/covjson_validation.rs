@@ -1035,6 +1035,7 @@ fn coverage_parameters_follow_metocean_profile() {
             ("t2m", "K", vec![Some(271.5), None]),
             ("wind_speed", "m s-1", vec![Some(4.2), Some(5.0)]),
             ("DBZH", "dBZ", vec![Some(12.5), None]),
+            ("KDP", "deg/km", vec![Some(0.4), None]),
             ("RHOHV", "", vec![Some(0.98), Some(0.97)]),
         ],
     );
@@ -1075,10 +1076,13 @@ fn coverage_parameters_follow_metocean_profile() {
         "wind speed, in m/s"
     );
 
-    // QUDT has no radar-reflectivity unit: the UCUM form is kept.
+    // QUDT has no radar-reflectivity unit and `dBZ` is not UCUM: a
+    // plain-string symbol (EDR 1.2 `/req/edr/rc-parameters` G).
+    assert_eq!(params["DBZH"]["unit"]["symbol"], "dBZ");
+    // UCUM QUDT does not know: G's https UCUM type.
     assert_eq!(
-        params["DBZH"]["unit"]["symbol"],
-        serde_json::json!({"value": "dBZ", "type": "http://www.opengis.net/def/uom/UCUM/"})
+        params["KDP"]["unit"]["symbol"],
+        serde_json::json!({"value": "deg/km", "type": "https://www.opengis.net/def/uom/UCUM/"})
     );
 
     let rhohv = &params["RHOHV"];

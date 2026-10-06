@@ -729,6 +729,7 @@ mod collections {
                 HashMap::from([
                     desc("2 metre temperature", "K", "t2m", Some("air_temperature")),
                     desc("DBZH — Reflectivity (horizontal)", "dBZ", "DBZH", None),
+                    desc("Specific differential phase", "deg/km", "KDP", None),
                     desc(
                         "Water equivalent of accumulated snow depth (2 m above ground)",
                         "kg m-2",
@@ -775,7 +776,7 @@ mod collections {
                 None => &json,
             };
             let names = collection["parameter_names"].as_object().unwrap();
-            assert_eq!(names.len(), 5, "{uri}");
+            assert_eq!(names.len(), 6, "{uri}");
             for (name, param) in names {
                 let label = param["label"].as_str().unwrap();
                 let description = param["description"].as_str().unwrap();
@@ -797,14 +798,20 @@ mod collections {
             );
             assert!(t2m["observedProperty"].get("description").is_none());
 
-            // No QUDT unit for radar reflectivity: the UCUM form stays. No CF
-            // name: the engine's observed-property name identifies the
-            // property (EDR 1.2 `/req/edr/rc-parameters` F requires an id), as
-            // in CoverageJSON, and the description says what it is.
+            // No QUDT unit for radar reflectivity, and `dBZ` is not UCUM
+            // either: a plain-string symbol, never typed as UCUM (EDR 1.2
+            // `/req/edr/rc-parameters` G). No CF name: the engine's
+            // observed-property name identifies the property (F requires an
+            // id), as in CoverageJSON, and the description says what it is.
             let dbzh = &names["DBZH"];
+            assert_eq!(dbzh["unit"]["symbol"], "dBZ");
+            // A UCUM unit QUDT does not know carries G's https UCUM type.
             assert_eq!(
-                dbzh["unit"]["symbol"],
-                serde_json::json!({"value": "dBZ", "type": "http://www.opengis.net/def/uom/UCUM/"})
+                names["KDP"]["unit"]["symbol"],
+                serde_json::json!({
+                    "value": "deg/km",
+                    "type": "https://www.opengis.net/def/uom/UCUM/"
+                })
             );
             assert_eq!(dbzh["observedProperty"]["id"], "DBZH");
             assert_eq!(

@@ -1602,6 +1602,20 @@ fn pvol_edr_query_area_collects_sites() {
 // PolarVolumeEngine — EdrEngine (M4: trajectory cross-sections)
 // ---------------------------------------------------------------------------
 
+/// The view's advertised sweep angles in `lo..=hi`, as the API layer
+/// resolves a `z=lo/hi` interval: a cross-section `z` names sweeps, and an
+/// angle between them selects none (EDR 1.2 `/req/edr/z-response` B).
+fn sweeps_between(view: &engine_odim::PolarVolumeSiteView, lo: f64, hi: f64) -> Vec<f64> {
+    let vertical = EdrEngine::get_vertical_extent(view).expect("PVOL has a vertical extent");
+    let band: Vec<f64> = vertical
+        .levels
+        .into_iter()
+        .filter(|l| (lo..=hi).contains(l))
+        .collect();
+    assert!(!band.is_empty(), "the fixture has sweeps in {lo}..={hi}");
+    band
+}
+
 /// A trajectory query returns a `Section` coverage whose composite axis
 /// has one `(t, lon, lat)` triple per along-path node and whose `z`
 /// axis is height above antenna in metres. The range ndarray is
@@ -1619,15 +1633,17 @@ fn pvol_edr_query_trajectory_returns_section() {
     assert_eq!(view.trajectory_shape(), TrajectoryShape::CrossSection);
     // A ~65 km north-bound leg through Vihti (~24.50°E, 60.56°N), so the
     // path crosses the radar's lowest sweep coverage along its length.
-    // `z` here selects the 0.5°–5° elevation angle band (the
+    // `z` here selects the sweeps from 0.5° to 5°, as the API layer
+    // expands `z=0.5/5` into the advertised angles in range (the
     // cross-section's vertical axis is derived height).
     let coords = "LINESTRING(24.5 60.3, 24.5 60.9)";
+    let band = sweeps_between(&view, 0.5, 5.0);
     let response = EdrEngine::query_trajectory(
         &view,
         coords,
         None,
         Some(&["DBZH".to_string()]),
-        Some(&[0.5, 5.0]),
+        Some(&band),
         None,
     )
     .expect("trajectory query inside radar coverage");
@@ -1692,14 +1708,15 @@ fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
         return;
     };
     // A line near the antipode of FMI radars — every sample is out of
-    // range. `z` selects a low elevation-angle band.
+    // range. `z` selects the low sweeps.
     let coords = "LINESTRING(-150 -30, -150 -29)";
+    let band = sweeps_between(&view, 0.5, 3.0);
     match EdrEngine::query_trajectory(
         &view,
         coords,
         None,
         Some(&["DBZH".to_string()]),
-        Some(&[0.5, 3.0]),
+        Some(&band),
         None,
     ) {
         Ok(response) => {

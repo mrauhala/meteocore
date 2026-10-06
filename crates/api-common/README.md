@@ -203,6 +203,16 @@ collection and instance pages, in catalog rows and under each model run.
 Instances, locations and items link to their HTML view; parameterised queries
 link to their endpoint, next to the API reference button.
 
+Links are rendered in full (`link_table`, OGC API - EDR `/req/html/content`,
+#984): the landing page's "API definitions & resource links" and the collection
+page's metadata tab list every link with its relation, title and type, at its
+own href, `self`, `alternate` and duplicate relation forms included. The
+collection overview's resource list stays a navigation aid, without the
+`rel=data` links of `data_queries` end points listed under "Request data". The
+collection list adds each collection's full metadata and links under its card,
+lists every keyword, and closes with the page's links; EDR model-run lists do
+the same per instance.
+
 The HTML structure and theme styles follow the approved #744 mockup: API workspace
 selector and branded sidebar, grouped collection query controls, removable applied
 filters, metadata-rich result rows and cards, and collection overview/metadata tabs.

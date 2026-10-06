@@ -2162,11 +2162,21 @@ fn sample_sweep_moment_bilinear(
 /// The sweep whose elevation angle is nearest `target` degrees. `None`
 /// only when the volume has no sweeps.
 fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
-    volume.sweeps.iter().min_by(|a, b| {
-        (a.elangle - target)
-            .abs()
-            .total_cmp(&(b.elangle - target).abs())
-    })
+    nearest_sweep_index(volume, target).map(|i| &volume.sweeps[i])
+}
+
+/// The index in `volume.sweeps` of [`nearest_sweep`].
+fn nearest_sweep_index(volume: &PolarVolume, target: f64) -> Option<usize> {
+    volume
+        .sweeps
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (a.elangle - target)
+                .abs()
+                .total_cmp(&(b.elangle - target).abs())
+        })
+        .map(|(i, _)| i)
 }
 
 /// Resample one polar moment of a sweep into a Cartesian output grid.
@@ -2736,9 +2746,8 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
 
 /// The elevation-angle window `[lo, hi]` (degrees) for a cross-section.
 ///
-/// `z` carries the requested elevation angles (resolved by the API layer
-/// against the collection's advertised extent — an interval `0.3/15`
-/// arrives as the angles in range). `None`/empty selects the volume's
+/// `z` carries the selected sweep angles (`site_trajectory` matches the
+/// requested ones with [`resolve_levels`] first). `None`/empty selects the volume's
 /// full sweep span. The window is clamped to the volume's actual sweep
 /// range so a heterogeneous fleet (a site missing an advertised angle)
 /// degrades to nodata rather than fabricating data.
@@ -2748,9 +2757,10 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// - `InvalidParameter` when an explicit `z` list falls **entirely**
 ///   outside the surveyed range, e.g. `z=40,50` on a 0.5–25° radar — the
 ///   clamp would otherwise invert to `(40, 25)` and silently produce an
-///   all-nodata Section. (The interval form is already rejected earlier
-///   by `resolve_z_levels`; this guards the comma-list form, which the
-///   API layer passes through unvalidated.)
+///   all-nodata Section. `site_trajectory` passes the sweep angles
+///   `resolve_levels` matched in the site's catalog, so this trips only
+///   when the newest volume surveys none of them (an older scan
+///   strategy's angles).
 fn angle_window(z: Option<&[f64]>, volume: &PolarVolume) -> Result<(f64, f64), DataServerError> {
     let (smin, smax) = sweep_envelope(volume)
         .ok_or_else(|| DataServerError::Engine("PVOL volume has no finite sweep angles".into()))?;
@@ -2860,12 +2870,18 @@ fn sweep_envelope(volume: &PolarVolume) -> Option<(f64, f64)> {
 /// interim (used by position/area/Map paths) is untouched: the slant
 /// range here comes from the 4/3-Earth inversion in `volume_section`,
 /// not from a ground-range fixup.
+///
+/// `keep`, when given, is one flag per `volume.sweeps` entry: the sweeps a
+/// `z` selected (EDR 1.2 `/req/edr/z-response` B). A cell whose nearest
+/// sweep is not kept is `None` — never the nearest *kept* sweep, which
+/// would show one sweep's data at another sweep's beam angle.
 #[allow(clippy::too_many_arguments)]
 fn sample_polar_slant(
     volume: &PolarVolume,
     file_id: &str,
     pix: Pixels,
     envelope: (f64, f64),
+    keep: Option<&[bool]>,
     quantity: &str,
     slant_range_m: f64,
     azimuth_deg: f64,
@@ -2878,6 +2894,7 @@ fn sample_polar_slant(
         file_id,
         pix,
         envelope,
+        keep,
         quantity,
         slant_range_m,
         azimuth_deg,
@@ -2900,14 +2917,19 @@ fn sample_polar_slant_class(
     file_id: &str,
     pix: Pixels,
     envelope: (f64, f64),
+    keep: Option<&[bool]>,
     quantity: &str,
     slant_range_m: f64,
     azimuth_deg: f64,
     elangle_deg: f64,
 ) -> PixelClass {
-    let Some(sweep) = nearest_sweep(volume, elangle_deg) else {
+    let Some(index) = nearest_sweep_index(volume, elangle_deg) else {
         return PixelClass::Masked;
     };
+    if keep.is_some_and(|keep| !keep.get(index).copied().unwrap_or(false)) {
+        return PixelClass::Masked;
+    }
+    let sweep = &volume.sweeps[index];
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return PixelClass::Masked;
     }
@@ -2964,6 +2986,13 @@ fn sample_polar_slant_class(
 /// lower ceiling must not have a cell that inverts to (say) 20° matched
 /// to its 10° top sweep — intersecting per entry keeps each timestep
 /// honest about the angles it actually surveyed.
+///
+/// `levels` are the advertised sweep angles a `z` selected (`None`: every
+/// sweep). A cell then samples only when its nearest sweep is one of them
+/// (matched as position matches a level, by [`round_elevation`]), so the
+/// section shows exactly the selected sweeps' cells of the unfiltered
+/// section and nothing of the sweeps between them (EDR 1.2
+/// `/req/edr/z-response` B).
 fn volume_section(
     entry: &VolumeEntry,
     pix: Pixels,
@@ -2971,6 +3000,7 @@ fn volume_section(
     heights_m: &[f64],
     quantities: &[String],
     window: (f64, f64),
+    levels: Option<&[f64]>,
 ) -> Option<QueryResult> {
     if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
         return None;
@@ -2981,6 +3011,15 @@ fn volume_section(
     // (an inverted envelope rejects every beam angle).
     let entry_env = sweep_envelope(&entry.volume)?;
     let envelope = (window.0.max(entry_env.0), window.1.min(entry_env.1));
+    // One flag per sweep, built once per entry so the per-cell check is O(1).
+    let keep: Option<Vec<bool>> = levels.map(|levels| {
+        entry
+            .volume
+            .sweeps
+            .iter()
+            .map(|s| levels.contains(&round_elevation(s.elangle)))
+            .collect()
+    });
     let site = &entry.volume.site;
     let t = entry.volume.time;
     let nodes: Vec<(DateTime<Utc>, f64, f64)> =
@@ -3019,6 +3058,7 @@ fn volume_section(
                     &entry.id,
                     pix,
                     envelope,
+                    keep.as_deref(),
                     quantity,
                     r,
                     bearing,
@@ -3193,6 +3233,12 @@ fn resample_section_path(coords: &str) -> Result<Vec<(f64, f64)>, DataServerErro
 /// the path's farthest reach, and emits one `Section` per timestep
 /// (`Single` for one step, `Collection` otherwise). Shared by the network
 /// engine (after it picks the nearest site) and each per-site view.
+///
+/// `z` selects sweeps as on position and area ([`resolve_levels`] against
+/// the site's `canonical` sweep angles, within
+/// [`SWEEP_MATCH_TOLERANCE_DEG`]): a `z` matching no sweep is the same
+/// 400, and the section keeps only the matched sweeps' cells.
+#[allow(clippy::too_many_arguments)]
 fn site_trajectory(
     volumes: &[VolumeEntry],
     pix: Pixels,
@@ -3200,7 +3246,11 @@ fn site_trajectory(
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     parameters: Option<&[String]>,
     z: Option<&[f64]>,
+    canonical: Option<&[f64]>,
 ) -> Result<CoverageResponse, DataServerError> {
+    // EDR 1.2 `/req/edr/z-response` B: only sweeps whose angle intersects
+    // `z`. Validated before the time filter, as position does.
+    let levels = resolve_levels(canonical, z)?;
     let selected: Vec<&VolumeEntry> = match datetime {
         Some((start, end)) => volumes
             .iter()
@@ -3216,13 +3266,12 @@ fn site_trajectory(
 
     let quantities = resolve_quantities(&selected, parameters)?;
 
-    // `z` carries the requested elevation angles (resolved by the API
-    // layer against the advertised extent). Derive the angle window and
-    // the matching height axis from the most recent volume. An
-    // out-of-range `z` list surfaces as `InvalidParameter` (400) rather
-    // than a silently empty Section.
+    // The selected sweep angles bound the angle window; derive it and the
+    // matching height axis from the most recent volume. Selected angles
+    // the newest volume does not survey (an older scan strategy's) surface
+    // as `InvalidParameter` (400) rather than a silently empty Section.
     let ref_volume = &selected.last().unwrap().volume;
-    let window = angle_window(z, ref_volume)?;
+    let window = angle_window(levels.as_deref(), ref_volume)?;
     // The path's farthest ground distance from the radar sizes the
     // height-axis ceiling for the selected top angle.
     let max_ground_dist = path
@@ -3240,7 +3289,17 @@ fn site_trajectory(
 
     let coverages: Vec<QueryResult> = selected
         .iter()
-        .filter_map(|e| volume_section(e, pix, path, &heights, &quantities, window))
+        .filter_map(|e| {
+            volume_section(
+                e,
+                pix,
+                path,
+                &heights,
+                &quantities,
+                window,
+                levels.as_deref(),
+            )
+        })
         .collect();
     if coverages.is_empty() {
         return Err(DataServerError::LocationNotFound(
@@ -4739,7 +4798,12 @@ impl EdrEngine for PolarVolumeSiteView {
             source: &self.source,
             handle: handle.as_ref(),
         };
-        site_trajectory(volumes, pix, &path, datetime, parameters, z)
+        let canonical = catalog
+            .by_site_meta
+            .get(&self.nod)
+            .and_then(|meta| meta.vertical.as_ref())
+            .map(|v| v.levels.as_slice());
+        site_trajectory(volumes, pix, &path, datetime, parameters, z, canonical)
     }
 }
 
@@ -4976,6 +5040,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -4991,6 +5056,7 @@ mod tests {
                     TEST_FILE,
                     test_pixels(),
                     env,
+                    None,
                     "DBZH",
                     range_m,
                     azimuth,
@@ -5027,6 +5093,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -5038,6 +5105,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -5049,6 +5117,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -5062,6 +5131,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -5073,6 +5143,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -5087,6 +5158,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -5100,6 +5172,7 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
@@ -5219,6 +5292,89 @@ mod tests {
         assert_eq!(z.values, vec![0.5]);
     }
 
+    /// EDR 1.2 `/req/edr/z-response` B on the cross-section trajectory: a
+    /// `z` selects sweeps within `SWEEP_MATCH_TOLERANCE_DEG` as position
+    /// does (one between sweeps is the same 400), and the section shows
+    /// only the selected sweeps' cells. It used to treat `z` as an angle
+    /// band widened by ±1° and sample the nearest of *every* sweep, so
+    /// `z=0.7` returned 0.3°/0.4°/1.5° data and `z=1.1` a 200.
+    #[test]
+    fn site_view_trajectory_z_keeps_only_matching_sweeps() {
+        // Sweeps 0.3/0.4/0.7/1.5°, each a constant 3/4/7/15 so a cell
+        // tells which sweep it came from.
+        let base = synthetic_volume(25.0, 60.0);
+        let id = unique_file_id();
+        let mut vol = base.clone();
+        vol.sweeps = [(0.3, 3u16), (0.4, 4), (0.7, 7), (1.5, 15)]
+            .into_iter()
+            .map(|(el, value)| {
+                let mut sweep = base.sweeps[0].clone();
+                sweep.elangle = el;
+                let ds = format!("/dataset{value}/data1/data");
+                sweep.moments[0].dataset_path = ds.clone();
+                pixel_cache().insert(
+                    &id,
+                    &ds,
+                    Arc::new(RawPixels::U16(Array2::from_elem(
+                        (sweep.nrays, sweep.nbins),
+                        value,
+                    ))),
+                );
+                sweep
+            })
+            .collect();
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![VolumeEntry {
+                id,
+                volume: Arc::new(vol),
+            }],
+        );
+        let view = site_view_for(by_site, "fivih");
+        // Due north, 22–89 km: inside the 100 km range, low beams included.
+        let line = "LINESTRING(25.0 60.2, 25.0 60.8)";
+        let sources = |z: Option<&[f64]>| -> std::collections::BTreeSet<u64> {
+            let response = EdrEngine::query_trajectory(&view, line, None, None, z, None).unwrap();
+            let CoverageResponse::Single(cov) = response else {
+                panic!("one volume is one Section, got {response:?}");
+            };
+            cov.ranges["DBZH"]
+                .values
+                .iter()
+                .flatten()
+                .map(|v| *v as u64)
+                .collect()
+        };
+
+        let all = sources(None);
+        assert!(all.len() >= 3, "no z draws every sweep in range: {all:?}");
+        assert_eq!(
+            sources(Some(&[0.7])),
+            [7].into(),
+            "z=0.7 is that sweep only"
+        );
+        assert_eq!(
+            sources(Some(&[0.70001])),
+            [7].into(),
+            "within the tolerance names the same sweep"
+        );
+        let pair = sources(Some(&[0.3, 1.5]));
+        assert!(
+            !pair.is_empty() && pair.is_subset(&[3, 15].into()),
+            "a list keeps its sweeps and none between them: {pair:?}"
+        );
+        // Between sweeps, and outside every sweep: the position wording.
+        for z in [&[1.1][..], &[0.55], &[50.0]] {
+            match EdrEngine::query_trajectory(&view, line, None, None, Some(z), None) {
+                Err(DataServerError::InvalidParameter(m)) => {
+                    assert!(m.contains("selects none"), "{z:?}: {m}")
+                }
+                other => panic!("{z:?}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+    }
+
     /// A volume in the window without a sweep at the pinned angle (an older
     /// scan strategy) has no sample there, never its nearest sweep's.
     #[test]
@@ -5321,6 +5477,7 @@ mod tests {
             &heights,
             &["DBZH".to_string()],
             window,
+            None,
         )
         .expect("section produced");
         let nd = qr.ranges.get("DBZH").expect("DBZH range");

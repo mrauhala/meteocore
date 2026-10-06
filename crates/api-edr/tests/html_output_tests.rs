@@ -638,6 +638,97 @@ async fn collection_pages_anchor_their_data_queries() {
     }
 }
 
+/// The string leaves of a JSON document, with the member each sits under.
+fn string_leaves<'a>(value: &'a Value, key: &'a str, out: &mut Vec<(&'a str, &'a str)>) {
+    match value {
+        Value::String(s) => out.push((key, s)),
+        Value::Array(values) => values.iter().for_each(|v| string_leaves(v, key, out)),
+        Value::Object(members) => members.iter().for_each(|(k, v)| string_leaves(v, k, out)),
+        _ => {}
+    }
+}
+
+/// `/req/html/content` A, first bullet: the HTML of every metadata and
+/// list response holds all the information of its JSON. Every string the
+/// JSON carries is in the page body, as text or inside a JSON block —
+/// the list pages' collections and instances in full (#984), and every
+/// link's rel, type and title, not only its href.
+#[tokio::test]
+async fn html_pages_hold_every_json_string() {
+    use ds_core::html::escape;
+    for uri in [
+        "/",
+        "/collections",
+        "/collections/c",
+        "/collections/c/instances",
+        &*format!("/collections/c/instances/{INSTANCE}"),
+        "/collections/c/locations",
+        "/collections/c/items?limit=2",
+        "/collections/c/items/s1",
+    ] {
+        let (status, _, json) = get(uri, Some("application/json")).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let mut json: Value = serde_json::from_str(&json).unwrap();
+        // The document's own `self` and `alternate` describe the JSON
+        // representation; the page lists its own (the HTML as `self`).
+        if let Some(links) = json["links"].as_array_mut() {
+            links.retain(|l| l["rel"] != "self" && l["rel"] != "alternate");
+        }
+        let (status, _, html) = get(uri, Some(BROWSER)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let body = html.split_once("<body").map_or(&*html, |(_, b)| b);
+        let mut leaves = Vec::new();
+        string_leaves(&json, "", &mut leaves);
+        for (key, leaf) in leaves {
+            if key == "timeStamp" {
+                continue;
+            }
+            // A string inside a JSON block is JSON-escaped first.
+            let quoted = serde_json::to_string(leaf).unwrap();
+            let in_json = escape(&quoted[1..quoted.len() - 1]);
+            assert!(
+                body.contains(&escape(leaf)) || body.contains(&in_json),
+                "{uri}: {key} = {leaf}"
+            );
+        }
+    }
+}
+
+/// Links are listed with their relation, type and title, at their own
+/// href: a `rel=data` query end point is never opened as a bare `?f=html`
+/// page (#980, #984).
+#[tokio::test]
+async fn link_tables_keep_rel_type_and_title() {
+    let (_, _, body) = get("/?f=html", None).await;
+    for text in [
+        "http://www.opengis.net/def/rel/ogc/1.0/conformance",
+        "application/vnd.oai.openapi+json;version=3.0",
+    ] {
+        assert!(
+            body.contains(&format!("<td>{text}</td>"))
+                || body.contains(&format!("<code>{text}</code>")),
+            "{text}"
+        );
+    }
+    assert!(body.contains("<td>Conformance classes</td>"));
+    let base = "https://example.org/edr/collections/c";
+    let (_, _, body) = get("/collections/c?f=html", None).await;
+    assert!(body.contains(&format!(
+        "<tr><td><code>data</code></td><td>Instances (forecast model runs)</td><td>application/json</td><td><a class=\"table-link\" href=\"{base}/instances\">"
+    )));
+    assert!(body.contains(&format!("href=\"{base}/position\"")));
+    assert!(!body.contains("/position?f=html"));
+
+    // A location's link and geometry type, an item's link type.
+    let (_, _, body) = get("/collections/c/locations?f=html", None).await;
+    assert!(body.contains("<td>Point</td>"), "{body}");
+    assert!(body.contains(&format!(
+        "<code>data</code> <a class=\"table-link\" href=\"{base}/locations/here\">Data for &lt;b&gt;Here&lt;/b&gt;</a> <code>application/vnd.cov+json</code>"
+    )), "{body}");
+    let (_, _, body) = get("/collections/c/items?limit=2&f=html", None).await;
+    assert!(body.contains("<code>application/geo+json</code>"), "{body}");
+}
+
 /// An items page's `timeStamp` changes per request; its ETag does not.
 #[tokio::test]
 async fn items_html_etag_ignores_the_generation_time() {

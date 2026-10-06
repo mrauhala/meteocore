@@ -24,9 +24,9 @@ use crate::geojson::{
 use crate::params::{
     check_crs, negotiate_edr_format, negotiate_list_format, parse_cube_bbox, parse_datetime,
     parse_edr_format, parse_limit, parse_locations_query, parse_resolution, parse_within_metres,
-    parse_z, plot_dimensions, query_formats, resolve_z_levels, split_location_ids,
-    split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector, EdrFormat,
-    LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
+    parse_z, plot_dimensions, query_formats, resolve_z_levels, section_plot_dimensions,
+    split_location_ids, split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector,
+    EdrFormat, LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
     TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, LOCATIONS_FORMATS, MAX_LIMIT,
     MAX_LOCATION_IDS, MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
 };
@@ -620,7 +620,7 @@ pub async fn landing_page(
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
-    use ds_core::html::{LinkView, Wanted};
+    use ds_core::html::Wanted;
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
@@ -681,19 +681,26 @@ pub async fn landing_page(
                 .into_response()
         }
         Wanted::Html => {
-            let mut views: Vec<LinkView> = links
+            // Every link with its relation, type and title
+            // (`/req/html/content` A). This representation's `self` is the
+            // HTML page; the JSON one is its `alternate`.
+            let mut json_links: Vec<_> = links
                 .iter()
-                .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
+                .map(|(h, r, t, ti)| {
+                    if *r == "self" {
+                        json!({ "href": format!("{h}?f=html"), "rel": r, "type": "text/html", "title": ti })
+                    } else {
+                        json!({ "href": h, "rel": r, "type": t, "title": ti })
+                    }
+                })
                 .collect();
-            // rel="alternate" to the JSON representation (parity with the
-            // collection-detail HTML page), so the HTML landing page links to
-            // its machine-readable twin.
-            views.push(LinkView::new(
-                format!("{base}/edr/?f=json"),
-                "alternate",
-                Some("This document as JSON"),
-            ));
-            Html(api_common::workbench::landing_html(
+            json_links.push(json!({
+                "href": format!("{base}/edr/?f=json"),
+                "rel": "alternate",
+                "type": "application/json",
+                "title": "This document as JSON"
+            }));
+            Html(api_common::workbench::landing_document(
                 api_common::workbench::Surface {
                     base,
                     root: &format!("{base}{}", api_common::mounts::EDR),
@@ -701,7 +708,7 @@ pub async fn landing_page(
                 },
                 title,
                 description,
-                &views,
+                &json!({ "links": json_links }),
             ))
             .into_response()
         }
@@ -940,6 +947,7 @@ fn cube_operation(
         json!({"$ref": "#/components/parameters/resolution-z"}),
         json!({"$ref": "#/components/parameters/crs"}),
         data_format_parameter(formats),
+        json!({"$ref": "#/components/parameters/limit"}),
     ]);
     json!({
         "get": {
@@ -1219,7 +1227,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             {"$ref": "#/components/parameters/parameter-name"},
                             {"$ref": "#/components/parameters/z"},
                             {"$ref": "#/components/parameters/crs"},
-                            data_format_parameter(trajectory_formats)
+                            data_format_parameter(trajectory_formats),
+                            {"$ref": "#/components/parameters/limit"}
                         ],
                         "responses": trajectory_responses(
                             "Coverage data: a CoverageJSON Trajectory coverage, or a CoverageCollection of them",
@@ -1240,7 +1249,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                                 {"$ref": "#/components/parameters/parameter-name"},
                                 {"$ref": "#/components/parameters/z-trajectory"},
                                 {"$ref": "#/components/parameters/crs"},
-                                format
+                                format,
+                                {"$ref": "#/components/parameters/limit"}
                             ],
                             "responses": trajectory_responses(
                                 "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
@@ -1590,7 +1600,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
                     "style": "form",
                     "explode": false,
-                    "description": format!("Maximum number of top-level coverages in a CoverageCollection response. A single Coverage is one object and is returned unchanged. A MULTIPOINT position keeps the first coverages in point order, then each point's own coverage order, and skips querying points past the limit. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: no limit, every other response budget still applies. CoverageJSON has no paging links: the remaining coverages are not returned.")
+                    "description": format!("Maximum number of top-level coverages in a CoverageCollection response. A single Coverage is one object and is returned unchanged, and a PNG image is one image: there limit is ignored, never an error (EDR 1.2 /req/edr/rc-core-query-parameters L), which is what a trajectory or cube answer usually is. A MULTIPOINT position keeps the first coverages in point order, then each point's own coverage order, and skips querying points past the limit. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: no limit, every other response budget still applies. CoverageJSON has no paging links: the remaining coverages are not returned.")
                 },
                 "limit-locations": {
                     "name": "limit",
@@ -1643,7 +1653,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), z=0.3/15 (a min/max interval → every advertised angle in range), z=../5 or z=5/.. (open intervals, reaching the lowest or highest advertised angle), or z=R4/0.5/1 (4 angles 1° apart from 0.5°, treated as a list). The selected angle window bounds which sweeps build the RHI; the rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
+                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), z=0.3/15 (a min/max interval → every advertised angle in range), z=../5 or z=5/.. (open intervals, reaching the lowest or highest advertised angle), or z=R4/0.5/1 (4 angles 1° apart from 0.5°, treated as a list). A requested angle selects a sweep within 0.05° of it, as on position and area; a z selecting no sweep is a 400. The section then shows only the selected sweeps: a cell is drawn where one of them is the sweep nearest its beam angle, and is null elsewhere. The rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
                 }
             },
             "responses": shared_responses_component(),
@@ -1898,13 +1908,7 @@ pub async fn collection(
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = html_document(build_collection_metadata(
-                engine.as_ref(),
-                config,
-                base,
-                None,
-                items,
-            ));
+            let metadata = build_collection_metadata(engine.as_ref(), config, base, None, items);
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -1927,7 +1931,7 @@ pub async fn instances(
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
-    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
@@ -1942,48 +1946,29 @@ pub async fn instances(
     // non-forecast collections, so conformant clients don't reach it).
     let runs = engine.get_instances();
     let self_href = format!("{base}/edr/collections/{}/instances", config.id);
+    // Each instance doc rebuilds the run-invariant bits (parameters,
+    // spatial extent) via build_collection_metadata. That's a handful
+    // of redundant clones (run count is bounded — a few to a few
+    // dozen) on a low-QPS discovery endpoint, not the `/collections`/
+    // `/api` hot paths #211 guards — kept simple over threading a
+    // precomputed-metadata variant through.
+    let instances: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run), false))
+        .collect();
+    // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
+    // `instances` (each item a collection-shaped instance), not
+    // `collections`. The HTML page renders this same document
+    // (`/req/html/content` A: all of its information).
+    let doc = json!({
+        "links": instances_list_links(engine.as_ref(), config, base, &self_href),
+        "instances": instances,
+    });
     Ok(with_vary(match wanted {
-        Wanted::Json => {
-            // Each instance doc rebuilds the run-invariant bits (parameters,
-            // spatial extent) via build_collection_metadata. That's a handful
-            // of redundant clones (run count is bounded — a few to a few
-            // dozen) on a low-QPS discovery endpoint, not the `/collections`/
-            // `/api` hot paths #211 guards — kept simple over threading a
-            // precomputed-metadata variant through.
-            let instances: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|run| {
-                    build_collection_metadata(engine.as_ref(), config, base, Some(run), false)
-                })
-                .collect();
-            // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
-            // `instances` (each item a collection-shaped instance), not
-            // `collections`.
-            Json(json!({
-                "links": [{
-                    "href": self_href,
-                    "rel": "self",
-                    "type": "application/json",
-                    "title": format!("{} — instances", config.title)
-                }],
-                "instances": instances,
-            }))
-            .into_response()
-        }
+        Wanted::Json => Json(doc).into_response(),
         Wanted::Html => {
             // EDR 1.1 `html` class: the instance resources negotiate like every
             // other metadata page (flagged on #669). One card per model run.
-            let cards: Vec<CollectionCard> = runs
-                .iter()
-                .map(|run| instance_card(config, base, run))
-                .collect();
-            // Each run's data queries, anchored under its card (#971).
-            let docs: Vec<serde_json::Value> = runs
-                .iter()
-                .map(|run| {
-                    build_collection_metadata(engine.as_ref(), config, base, Some(run), false)
-                })
-                .collect();
             let nav = [
                 LinkView::new(format!("{self_href}?f=json"), "alternate", Some("JSON")),
                 LinkView::new(
@@ -1999,8 +1984,7 @@ pub async fn instances(
                     api: "edr",
                 },
                 &format!("{} — instances", config.title),
-                &cards,
-                &docs,
+                &doc,
                 &nav,
             ))
             .into_response()
@@ -2008,36 +1992,48 @@ pub async fn instances(
     }))
 }
 
-/// The HTML card for one model run: id = the instance id, title = the run's
-/// reference time (the same RFC 3339 string), description = the valid-time
-/// span.
-fn instance_card(
+/// The instances list's `links`, as EDR 1.2 `/req/core/rc-collection-info-
+/// links` A asks of it (ATS `/conf/instances/rc-md-success` step 1): `self`,
+/// the HTML `alternate`, the parent collection, and its query end points as
+/// `rel=data` — the collection document's own links, so the two cannot
+/// disagree. Those end points answer for the latest run; each run's own are in
+/// its entry of `instances`.
+fn instances_list_links(
+    engine: &dyn EdrEngine,
     config: &CollectionConfig,
     base: &str,
-    run: &ds_core::instances::RunInfo,
-) -> ds_core::html::CollectionCard {
-    let instance_id = run.instance_id();
-    let description = match (run.valid_times.first(), run.valid_times.last()) {
-        (Some(first), Some(last)) => format!(
-            "{} valid times, {} – {}",
-            run.valid_times.len(),
-            first.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            last.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        ),
-        _ => "no valid times".to_string(),
-    };
-    ds_core::html::CollectionCard {
-        title: format!("Run {instance_id}"),
-        description,
-        // The id's colons stay unencoded: RFC 3986 `pchar` allows `:`.
-        self_href: format!(
-            "{base}/edr/collections/{}/instances/{instance_id}",
-            config.id
-        ),
-        id: instance_id,
-        keywords: Vec::new(),
-        license: None,
+    self_href: &str,
+) -> Vec<serde_json::Value> {
+    let mut links = vec![
+        json!({
+            "href": self_href,
+            "rel": "self",
+            "type": "application/json",
+            "title": format!("{} — instances", config.title)
+        }),
+        json!({
+            "href": format!("{self_href}?f=html"),
+            "rel": "alternate",
+            "type": "text/html",
+            "title": format!("{} — instances as HTML", config.title)
+        }),
+        json!({
+            "href": format!("{base}/edr/collections/{}", config.id),
+            "rel": "collection",
+            "type": "application/json",
+            "title": config.title
+        }),
+    ];
+    let collection = build_collection_metadata(engine, config, base, None, false);
+    if let Some(collection_links) = collection["links"].as_array() {
+        links.extend(
+            collection_links
+                .iter()
+                .filter(|l| l["rel"] == "data" && l["href"] != self_href)
+                .cloned(),
+        );
     }
+    links
 }
 
 /// `GET /collections/{id}/instances/{instanceId}` — one model run's metadata.
@@ -2094,13 +2090,11 @@ pub async fn instance(
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = html_document(build_collection_metadata(
-                engine.as_ref(),
-                config,
-                base,
-                Some(&run),
-                false,
-            ));
+            let mut metadata =
+                build_collection_metadata(engine.as_ref(), config, base, Some(&run), false);
+            // The page heading names the run; the JSON `title` is the
+            // collection's (`/req/instances/src-md-success` C).
+            metadata["title"] = json!(format!("{} — run {}", config.title, run.instance_id()));
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -3157,6 +3151,9 @@ async fn run_cube_query(
     // `[t, z, y, x]` grids share x, y and z, so the merge joins them along t.
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
+    // `limit` as on every data query (`/req/edr/rc-core-query-parameters`
+    // L): a cube is one Grid coverage, which it leaves unchanged.
+    let limit = request_limit(params.limit.as_deref())?;
 
     let param_names: Option<Vec<String>> = params
         .parameter_name
@@ -3190,7 +3187,14 @@ async fn run_cube_query(
             },
         )
         .map_err(|e| map_query_error(&e, "Cube"))?;
-        render_coverage_response(result, None, format.format, None, None, &page)
+        render_coverage_response(
+            limit_coverages(result, limit),
+            None,
+            format.format,
+            None,
+            None,
+            &page,
+        )
     })
     .await?;
 
@@ -3217,11 +3221,11 @@ pub async fn trajectory_query(
     // consistent with the `api_definition` OpenAPI gating and the
     // `data_queries` collection metadata. Flagged by claude-review.
     require_query_type(engine, &id, "trajectory", "trajectory")?;
-    if params.limit.is_some() {
-        return Err(bad_request_msg(
-            "limit is not supported on trajectory queries: EDR 1.2 defines no limit for them",
-        ));
-    }
+    // EDR 1.2 `/req/edr/rc-core-query-parameters` L: `limit` is accepted on
+    // every data query. It counts the top-level coverages of a
+    // CoverageCollection, as on position and area; a single coverage and a
+    // PNG image cannot be paged, so there it is ignored.
+    let limit = request_limit(params.limit.as_deref())?;
     let shape = engine.trajectory_shape();
 
     // The formats `query_formats` offers for this engine's trajectory shape:
@@ -3309,6 +3313,11 @@ pub async fn trajectory_query(
             },
         )
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
+        let result = if format == EdrFormat::Png {
+            result
+        } else {
+            limit_coverages(result, limit)
+        };
         let html = page.map(|page| crate::html::coverage_page(&result, &page.html_page()));
         Ok((result, html))
     })
@@ -3337,7 +3346,10 @@ pub async fn trajectory_query(
                     tracing::error!("Trajectory PNG section conversion error: {e}");
                     server_error()
                 })?;
-            let (w, h) = plot_dimensions(params.width, params.height);
+            // One panel per parameter: the default height grows with them,
+            // and a height they cannot fit is a 400 naming `parameter-name`.
+            let (w, h) = section_plot_dimensions(params.width, params.height, heatmaps.len())
+                .map_err(|e| bad_request(&e))?;
             let png = render_heatmap(&heatmaps, colormap.as_ref(), w, h).map_err(|e| {
                 tracing::error!("Trajectory PNG render error: {e}");
                 server_error()
@@ -3654,6 +3666,9 @@ fn build_collection_metadata(
         query["link"]["type"] = json!(query_media_type(query_type));
     }
 
+    // The run is named by the `self` link only: an instance document's
+    // `title` and `description` are its collection's (EDR 1.2
+    // `/req/instances/src-md-success` C).
     let self_title = match instance {
         Some(_) => format!("{} — run {self_id}", config.title),
         None => config.title.clone(),
@@ -3662,7 +3677,7 @@ fn build_collection_metadata(
         "href": query_base,
         "rel": "self",
         "type": "application/json",
-        "title": self_title.clone()
+        "title": self_title
     })];
     if instance.is_some() {
         // Link an instance document back to its parent collection.
@@ -3688,7 +3703,6 @@ fn build_collection_metadata(
 
     let mut fields = json!({
         "id": self_id,
-        "title": self_title,
         // No `itemType` and no `rel=items` link: EDR's `items` is a data
         // query (#928), advertised in `data_queries` like the others and
         // GeoJSON only, while Common Part 2 `itemType` and the workbench's
@@ -3731,15 +3745,4 @@ fn data_link(query_type: &str, link: &serde_json::Value) -> serde_json::Value {
         _ => link["variables"]["title"].as_str().unwrap_or(query_type),
     };
     json!({"href": link["href"], "rel": "data", "type": link["type"], "title": title})
-}
-
-/// The collection or instance document the HTML page renders, without its
-/// `rel=data` links: the page already lists the same end points from
-/// `data_queries`, each with its documentation, where a link list would open
-/// them bare as `?f=html`.
-fn html_document(mut metadata: serde_json::Value) -> serde_json::Value {
-    if let Some(links) = metadata["links"].as_array_mut() {
-        links.retain(|link| link["rel"] != "data");
-    }
-    metadata
 }
