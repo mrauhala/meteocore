@@ -91,7 +91,7 @@ use crate::reader::{PixelClass, RawPixels};
 /// unset. One shared budget bounds resident decoded pixels across every
 /// PVOL collection, so the engine scales to a full radar network without
 /// holding every sweep stack in RAM (#289).
-const DEFAULT_PIXEL_CACHE_MB: u64 = 1024;
+pub(crate) const DEFAULT_PIXEL_CACHE_MB: u64 = 1024;
 
 /// Read the configured lazy-pixel cache size from the environment, or the
 /// default. `0` disables caching (every sample re-reads — diagnostic only).
@@ -1441,10 +1441,8 @@ fn parse_and_cache(
 /// transient background decode hiccup must not blacklist a moment for
 /// requests) and skips any moment already resident (a beyond-`max_files`
 /// volume re-fetched on a later poll keeps its primed pixels — see
-/// [`PixelCache::contains`]). Sweeps are stored elevation-ascending, so the
-/// first `n_sweeps` are the lowest tilts — the standard base-reflectivity
-/// animation view, all of their quantities. Overflow of the byte-bounded
-/// cache evicts by LRU like any other entry.
+/// [`PixelCache::contains`]). Which moments: see [`prewarm_requests`].
+/// Overflow of the byte-bounded cache evicts like any other entry.
 fn prewarm_pixels(
     source: &Source,
     file_id: &str,
@@ -1456,15 +1454,8 @@ fn prewarm_pixels(
         return;
     }
     let cache_id = pixel_cache_id(source, file_id);
-    let requests: Vec<(&str, usize, usize)> = volume
-        .sweeps
-        .iter()
-        .take(n_sweeps)
-        .flat_map(|s| {
-            s.moments
-                .iter()
-                .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
-        })
+    let requests: Vec<(&str, usize, usize)> = prewarm_requests(volume, n_sweeps)
+        .into_iter()
         // Skip moments a request (or an earlier poll) already cached, so a
         // re-fetched trimmed volume doesn't re-decode every poll. Advisory, not
         // a hard guard: a concurrent insert between this `contains` and the
@@ -1488,6 +1479,56 @@ fn prewarm_pixels(
         // the lazy request path; only the warm-ahead is lost.
         Err(e) => tracing::warn!("[pvol] pixel pre-warm skipped for `{file_id}`: {e}"),
     }
+}
+
+/// The moments [`prewarm_pixels`] decodes: the lowest `n_sweeps` sweeps
+/// (sweeps are stored elevation-ascending), and of those only the volume's
+/// default quantity ([`default_quantity_of`]), which is what an unqualified
+/// WMS/Maps/Tiles layer renders: the base-reflectivity animation view.
+///
+/// Not every moment of the base sweep (#992): an FMI base sweep carries
+/// about a dozen, so warming them all wrote several times the bytes any
+/// animation reads and pushed the reflectivity frames out of the pixel
+/// cache. Other quantities, other WMS layers and EDR read lazily on first
+/// use and are cached from then on.
+fn prewarm_requests(volume: &PolarVolume, n_sweeps: usize) -> Vec<(&str, usize, usize)> {
+    let mut quantities: Vec<&str> = volume
+        .sweeps
+        .iter()
+        .flat_map(|s| s.moments.iter().map(|m| m.quantity.as_str()))
+        .collect();
+    quantities.sort_unstable();
+    quantities.dedup();
+    let Some(quantity) = default_quantity_of(&quantities) else {
+        return Vec::new();
+    };
+    volume
+        .sweeps
+        .iter()
+        .take(n_sweeps)
+        .flat_map(|s| {
+            s.moments
+                .iter()
+                .filter(move |m| m.quantity == quantity)
+                .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
+        })
+        .collect()
+}
+
+/// The quantity an unqualified request renders, from a site's or volume's
+/// alphabetically sorted quantity list: corrected reflectivity `DBZH`, then
+/// total `TH`, else the first. One home for the rule, so the advertised
+/// default, the bare-layer render and the poll-time pre-warm cannot drift.
+fn default_quantity_of<Q: AsRef<str>>(sorted_quantities: &[Q]) -> Option<&str> {
+    ["DBZH", "TH"]
+        .into_iter()
+        .find_map(|preferred| {
+            sorted_quantities
+                .iter()
+                .map(AsRef::as_ref)
+                .find(|q| *q == preferred)
+        })
+        .or_else(|| sorted_quantities.first().map(AsRef::as_ref))
 }
 
 /// Group one parsed volume under its radar `nod`, applying the
@@ -1708,11 +1749,8 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     // clutter-correction quality field: defined across the *whole* volume
     // ("full cones") with near-zero values that wash out to white on the dBZ
     // colormap. Every quantity stays selectable; only the default changes.
-    let default_quantity = ["DBZH", "TH"]
-        .into_iter()
-        .find(|q| quantities.iter().any(|x| x == q))
+    let default_quantity = default_quantity_of(&quantities)
         .map(str::to_string)
-        .or_else(|| quantities.first().cloned())
         .unwrap_or_default();
     let default_unit = quantities::quantity_unit(&default_quantity).to_string();
     // 3D Tiles coverage region: the WGS84 coverage bbox (→ radians) plus a
@@ -3899,16 +3937,16 @@ impl MapEngine for PolarVolumeSiteView {
         // radar quantity (the bare quantity, no `<site>:` prefix). When no
         // quantity is named (a bare `LAYERS={site}` WMS request, or a Maps /
         // Tiles request with no `?parameter-name=`), default to the site's
-        // primary (first advertised) quantity — the same as
-        // `raster_info().parameter` — instead of erroring, matching the GRIB
-        // engine's default-parameter behaviour.
+        // advertised default quantity — the same as `raster_info().parameter`
+        // and what the poll-time pre-warm decodes — instead of erroring,
+        // matching the GRIB engine's default-parameter behaviour.
         let quantity = match parameter {
             Some(q) => q,
             None => catalog
                 .by_site_meta
                 .get(&self.nod)
-                .and_then(|m| m.quantities.first())
-                .map(|s| s.as_str())
+                .map(|m| m.volume_info.default_quantity.as_str())
+                .filter(|q| !q.is_empty())
                 .ok_or_else(|| {
                     DataServerError::InvalidParameter(format!(
                         "[{}] PVOL collection has no quantities to render",
@@ -5685,11 +5723,23 @@ mod tests {
         let file_id = "prewarm-461/202605191050_fivih_PVOL.h5";
         let cid = pixel_cache_id(&source, file_id);
 
-        let lowest = volume.sweeps[0].moments[0].dataset_path.clone();
-        let highest = volume.sweeps.last().unwrap().moments[0]
-            .dataset_path
-            .clone();
+        let dbzh_path = |s: &Sweep| {
+            s.moments
+                .iter()
+                .find(|m| m.quantity == "DBZH")
+                .map(|m| m.dataset_path.clone())
+                .expect("fivih sweeps carry DBZH")
+        };
+        let lowest = dbzh_path(&volume.sweeps[0]);
+        let highest = dbzh_path(volume.sweeps.last().unwrap());
         assert_ne!(lowest, highest, "sweeps must have distinct dataset paths");
+        // #992: only the default quantity is pre-warmed.
+        let other = volume.sweeps[0]
+            .moments
+            .iter()
+            .find(|m| m.quantity != "DBZH")
+            .map(|m| m.dataset_path.clone())
+            .expect("the base sweep carries more than DBZH");
 
         assert!(
             !pixel_cache().contains(&cid, &lowest),
@@ -5705,6 +5755,10 @@ mod tests {
         assert!(
             !pixel_cache().contains(&cid, &highest),
             "a sweep above n_sweeps must stay cold (pre-warm is bounded)"
+        );
+        assert!(
+            !pixel_cache().contains(&cid, &other),
+            "a non-default quantity of the base sweep must stay cold (#992)"
         );
 
         // n_sweeps = 0 is the disable switch: a fresh id warms nothing.
@@ -5732,6 +5786,122 @@ mod tests {
             pixel_cache().contains(&local_cid, &lowest),
             "a local source must pre-warm its lowest sweep (#472)"
         );
+    }
+
+    /// A synthetic volume with SMHI-like moment order: `CCORH` sorts before
+    /// `DBZH`, so an alphabetical default would pick the clutter field.
+    /// Two sweeps, each with `CCORH` (`/datasetN/data1/data`) and `DBZH`
+    /// (`/datasetN/data2/data`).
+    fn two_quantity_volume(lon: f64, lat: f64) -> PolarVolume {
+        let mut volume = synthetic_volume(lon, lat);
+        let base = volume.sweeps[0].clone();
+        volume.sweeps = (1..=2)
+            .map(|n| {
+                let mut sweep = base.clone();
+                sweep.elangle = if n == 1 { 0.5 } else { 1.5 };
+                let dbzh = sweep.moments[0].clone();
+                sweep.moments = vec![
+                    PolarMoment {
+                        quantity: "CCORH".to_string(),
+                        dataset_path: format!("/dataset{n}/data1/data"),
+                        ..dbzh.clone()
+                    },
+                    PolarMoment {
+                        dataset_path: format!("/dataset{n}/data2/data"),
+                        ..dbzh
+                    },
+                ];
+                sweep
+            })
+            .collect();
+        volume
+    }
+
+    /// #992: the pre-warm decodes only the default quantity of the lowest
+    /// `n_sweeps` sweeps, not every moment of them.
+    #[test]
+    fn prewarm_requests_take_only_the_default_quantity() {
+        let volume = two_quantity_volume(25.0, 60.0);
+        let paths = |n| -> Vec<&str> {
+            prewarm_requests(&volume, n)
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect()
+        };
+        assert_eq!(paths(1), vec!["/dataset1/data2/data"]);
+        assert_eq!(
+            paths(2),
+            vec!["/dataset1/data2/data", "/dataset2/data2/data"]
+        );
+        assert!(paths(0).is_empty());
+
+        // Without DBZH, total reflectivity TH, else the first quantity.
+        let mut th = volume.clone();
+        th.sweeps[0].moments[1].quantity = "TH".to_string();
+        th.sweeps[1].moments[1].quantity = "TH".to_string();
+        let th_paths: Vec<&str> = prewarm_requests(&th, 1)
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+        assert_eq!(th_paths, vec!["/dataset1/data2/data"]);
+        assert_eq!(default_quantity_of(&["CCORH", "VRADH"]), Some("CCORH"));
+        assert_eq!(default_quantity_of::<&str>(&[]), None);
+    }
+
+    /// The bare-layer render (no parameter) draws the advertised default
+    /// quantity, which is what the pre-warm decodes, not the alphabetically
+    /// first one.
+    #[test]
+    fn bare_render_draws_the_advertised_default_quantity() {
+        let id = unique_file_id();
+        let volume = two_quantity_volume(25.0, 60.0);
+        for sweep in &volume.sweeps {
+            // CCORH: all zeros. DBZH: the bin index (see `synthetic_raw`).
+            pixel_cache().insert(
+                &id,
+                &sweep.moments[0].dataset_path,
+                Arc::new(RawPixels::U16(Array2::zeros((sweep.nrays, sweep.nbins)))),
+            );
+            pixel_cache().insert(
+                &id,
+                &sweep.moments[1].dataset_path,
+                Arc::new(synthetic_raw()),
+            );
+        }
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "test".to_string(),
+            vec![VolumeEntry {
+                id: id.clone(),
+                volume: Arc::new(volume),
+            }],
+        );
+        let view = site_view_for(by_site, "test");
+        assert_eq!(view.raster_info().parameter, "DBZH");
+
+        let dlon =
+            50_000.0 / (EARTH_RADIUS_M * 60f64.to_radians().cos()) * 180.0 / std::f64::consts::PI;
+        let bbox = [25.0, 59.999, 25.0 + dlon, 60.001];
+        let render = |parameter: Option<&str>| -> Vec<Option<f64>> {
+            MapEngine::get_raster_tile(
+                &view,
+                bbox,
+                32,
+                4,
+                None,
+                &OutputCrs::Wgs84,
+                parameter,
+                None,
+                None,
+            )
+            .expect("render")
+            .values
+            .iter_values()
+            .collect()
+        };
+        let bare = render(None);
+        assert_eq!(bare, render(Some("DBZH")));
+        assert_ne!(bare, render(Some("CCORH")));
     }
 
     #[test]
