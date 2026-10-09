@@ -909,7 +909,7 @@ static PVOL_PIXEL_CACHE_INSERTS: LazyLock<DeltaCounter> = LazyLock::new(|| {
 static PVOL_PIXEL_READ_FAILURES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     DeltaCounter::new(
         "pvol_pixel_read_failures_total",
-        "PVOL lazy pixel reads that failed (I/O or decode) and degraded to nodata",
+        "PVOL lazy pixel reads that found no usable data (missing file, decode failure) and degraded to nodata; deadline and transient storage failures fail the request instead and are not counted",
     )
 });
 

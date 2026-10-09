@@ -981,6 +981,48 @@ mod tests {
         assert!(hits > 0, "overlapping viewport should hit cached tiles");
     }
 
+    /// #993: an engine error (a deadline, a transient read) fails the
+    /// render and caches nothing, so the retry renders the tiles. Only a tile
+    /// the engine returned as all-nodata becomes the no-TTL empty marker.
+    #[test]
+    fn engine_error_caches_no_tile_and_retry_renders() {
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        let bbox = [20.0, 58.0, 30.0, 64.0];
+        type TileFn<'a> =
+            &'a dyn Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>;
+        let render = |tile: TileFn| {
+            render_metatiled(
+                bbox,
+                &OutputCrs::WebMercator,
+                512,
+                512,
+                &prefix,
+                &SolidRed,
+                ImageFormat::Png,
+                None,
+                &cache,
+                tile,
+            )
+        };
+        let failed = render(&|_, _, _, _| Err(DataServerError::DeadlineExceeded));
+        assert!(matches!(failed, Err(DataServerError::DeadlineExceeded)));
+        assert!(cache.is_empty(), "a failed tile must not be cached");
+        let retry = render(&solid_tile).unwrap();
+        assert!(
+            matches!(retry, MetaTile::Image { .. }),
+            "the retry renders data, not a cached empty frame"
+        );
+    }
+
     #[test]
     fn all_nodata_returns_empty() {
         let cache = TilePixelCache::new(16);

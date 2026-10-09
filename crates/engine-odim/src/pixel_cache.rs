@@ -91,12 +91,14 @@ impl PixelCache {
     /// datasets in one batch. Retain the returned Arcs for the whole render:
     /// LRU eviction (or a disabled cache) must not cause rereads mid-volume.
     /// Returns the number of newly recorded read/decode failures as well.
-    pub(crate) fn load_many(
+    /// A `load` error (a deadline or transient fetch failure, #993) is
+    /// returned as is and marks nothing bad, so the next request retries.
+    pub(crate) fn load_many<E>(
         &self,
         file_id: &str,
         requests: &[MomentRequest<'_>],
-        load: impl FnOnce(&[MomentRequest<'_>]) -> Vec<(String, RawPixels)>,
-    ) -> (MomentPixels, usize) {
+        load: impl FnOnce(&[MomentRequest<'_>]) -> Result<Vec<(String, RawPixels)>, E>,
+    ) -> Result<(MomentPixels, usize), E> {
         self.with_file_load(file_id, || {
             let mut pixels = HashMap::new();
             let mut missing = Vec::new();
@@ -110,7 +112,7 @@ impl PixelCache {
             }
             let mut failures = 0;
             if !missing.is_empty() {
-                for (path, raw) in load(&missing) {
+                for (path, raw) in load(&missing)? {
                     let raw = Arc::new(raw);
                     self.insert(file_id, &path, raw.clone());
                     pixels.insert(path, raw);
@@ -121,7 +123,7 @@ impl PixelCache {
                     }
                 }
             }
-            (pixels, failures)
+            Ok((pixels, failures))
         })
     }
 
@@ -348,14 +350,18 @@ mod tests {
         let cache = PixelCache::new(0);
         let requests = [("/sweep1", 2, 2), ("/sweep2", 2, 2)];
         let mut reads = 0;
-        let (pixels, failures) = cache.load_many("volume", &requests, |missing| {
-            reads += 1;
-            assert_eq!(missing.len(), 2);
-            missing
-                .iter()
-                .map(|(path, _, _)| (path.to_string(), raw()))
-                .collect()
-        });
+        let (pixels, failures) = cache
+            .load_many("volume", &requests, |missing| {
+                reads += 1;
+                assert_eq!(missing.len(), 2);
+                Ok::<_, ()>(
+                    missing
+                        .iter()
+                        .map(|(path, _, _)| (path.to_string(), raw()))
+                        .collect(),
+                )
+            })
+            .unwrap();
         assert_eq!(reads, 1);
         assert_eq!(pixels.len(), 2);
         assert_eq!(failures, 0);
@@ -375,14 +381,17 @@ mod tests {
                 let start = start.clone();
                 scope.spawn(move || {
                     start.wait();
-                    let (pixels, failures) =
-                        cache.load_many("volume", &[("/a", 2, 2), ("/b", 2, 2)], |missing| {
+                    let (pixels, failures) = cache
+                        .load_many("volume", &[("/a", 2, 2), ("/b", 2, 2)], |missing| {
                             reads.fetch_add(1, Ordering::Relaxed);
-                            missing
-                                .iter()
-                                .map(|(path, _, _)| (path.to_string(), raw()))
-                                .collect()
-                        });
+                            Ok::<_, ()>(
+                                missing
+                                    .iter()
+                                    .map(|(path, _, _)| (path.to_string(), raw()))
+                                    .collect(),
+                            )
+                        })
+                        .unwrap();
                     assert_eq!(pixels.len(), 2);
                     assert_eq!(failures, 0);
                 });
@@ -396,13 +405,44 @@ mod tests {
     fn partial_batch_failure_is_not_refetched() {
         let cache = PixelCache::new(1);
         let requests = [("/good", 2, 2), ("/bad", 2, 2)];
-        let (pixels, failures) =
-            cache.load_many("volume", &requests, |_| vec![("/good".into(), raw())]);
+        let (pixels, failures) = cache
+            .load_many("volume", &requests, |_| {
+                Ok::<_, ()>(vec![("/good".into(), raw())])
+            })
+            .unwrap();
         assert_eq!(pixels.len(), 1);
         assert_eq!(failures, 1);
-        let (pixels, failures) =
-            cache.load_many("volume", &requests, |_| panic!("cached or known bad"));
+        let (pixels, failures) = cache
+            .load_many("volume", &requests, |_| -> Result<_, ()> {
+                panic!("cached or known bad")
+            })
+            .unwrap();
         assert_eq!(pixels.len(), 1);
+        assert_eq!(failures, 0);
+    }
+
+    /// #993: a load that fails (a deadline or transient fetch error) is the
+    /// caller's error and marks no moment bad, so the next request loads.
+    #[test]
+    fn failed_load_marks_nothing_bad_and_retries() {
+        let cache = PixelCache::new(1);
+        let requests = [("/a", 2, 2), ("/b", 2, 2)];
+        let result = cache.load_many("volume", &requests, |_| Err("deadline"));
+        assert_eq!(result.err(), Some("deadline"));
+        assert!(!cache.is_known_bad("volume", "/a"));
+        assert!(!cache.is_known_bad("volume", "/b"));
+        let (pixels, failures) = cache
+            .load_many("volume", &requests, |missing| {
+                assert_eq!(missing.len(), 2, "both moments are retried");
+                Ok::<_, &str>(
+                    missing
+                        .iter()
+                        .map(|(path, _, _)| (path.to_string(), raw()))
+                        .collect(),
+                )
+            })
+            .unwrap();
+        assert_eq!(pixels.len(), 2);
         assert_eq!(failures, 0);
     }
 }
