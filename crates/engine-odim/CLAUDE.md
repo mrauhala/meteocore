@@ -98,13 +98,46 @@ around `ds-storage` calls (Critical Rules 6–7).
   floored at ~31 × the 256 KiB entry estimate ⇒ ≥ ~3.9 MiB from 8 MiB up),
   and a 720 × 1000 f32 sweep (2.75 MiB) must fit — pinned by
   `full_f32_sweep_is_admitted_at_every_sensible_size`.
-- **Cold pixel batches (#293):** a request-time miss fetches and opens the
-  source-qualified file once, decoding the requested moment first and then
-  uncached siblings (same quantity first). Speculation is capped at a quarter
-  of the pixel-cache capacity, using a conservative four bytes/sample. The
-  visitor inserts one array at a time; no raw-file cache is retained. Per-file
-  locks coalesce concurrent misses and callers recheck caches under the lock.
-  Optional corrupt siblings never fail the requested moment.
+- **Multi-moment walks prefetch per file (#994).** Every walk over several
+  moments of one volume file — EDR `volume_profile`, `level_series`
+  (volume-major: one volume's batch at a time, all levels and quantities),
+  the cross-section (`volume_section`: gates computed once per cell, the
+  sweeps they hit prefetched), the point cloud and voxel grid
+  (`volume_moments`) — first resolves exactly the moments it will read with
+  `Pixels::prefetch`/`load_moments` (one GET + one HDF5 open through
+  `PixelCache::load_many`, #993 classification intact) and samples through
+  `Pixels::batched`. Never loop `Pixels::moment` cold over quantities ×
+  sweeps: each first miss of a quantity downloads the whole file again
+  (V × Q GETs per request). A batch read must name every moment the walk
+  samples — anything left out reads as nodata — so share the target helper
+  (`level_target`, `slant_cell_moment`) between prefetch and sampler.
+  Pinned by the `*_fetches_*_volume_file_once` tests (`file_fetches`).
+- **Cold single-moment misses (#293, #994):** only a map render reads one
+  moment at a time. A `Pixels::moment` miss fetches the source-qualified
+  file once, decodes **only the requested moment** on the caller's thread
+  and returns it. Speculation (`sibling_requests`) is the requested quantity
+  at the `MAX_SIBLING_SWEEPS` (2) nearest other sweeps — what a viewer
+  stepping `ELEVATION` reads next — within one sweep's worth of bytes (the
+  requested sweep's moment count × its array at four bytes/sample, at most
+  capacity/16); other quantities are not decoded ahead. A fixed-`ELEVATION`
+  animation never reads those siblings: two wasted inserts per cold frame
+  is the price, watch `pvol_pixel_cache_inserts_total`. It runs off the
+  request path (`spawn_sibling_decode`) as `spawn_blocking` on the
+  background poll runtime, which `PolarVolumeEngine::poll_loop` registers
+  (`set_sibling_decode_runtime`); before any poll loop starts, nothing is
+  decoded ahead. While it runs, the downloaded bytes are registered in
+  `PixelCache::held_bytes` (single flight per file, at most
+  `MAX_BACKGROUND_SIBLING_DECODES` files) and a miss on that file — single
+  or batch — decodes from them instead of downloading again; the guard is
+  dropped only after the last insert, so a miss that finds no held bytes
+  then sees every decoded sibling. Both paths snapshot held bytes BEFORE
+  their cache recheck (`load_many` passes its snapshot to the loader). A
+  miss on a sibling the background task has not reached yet decodes it
+  again on the request thread (bounded: at most two arrays). Per-file locks
+  still coalesce concurrent misses. A sibling that fails to decode is
+  skipped, never marked bad. Whole-volume speculation (the old capacity/4
+  batch) flooded the cache's insert ring and evicted pre-warmed sweeps — do
+  not reintroduce it on the request path.
 - **A read that fails is not bad data (#993).** `Pixels::moment` is
   `Ok(None)` only for unusable data (missing file/object, HDF5 open or decode
   failure), which `mark_bad` negatively caches and samplers draw as nodata.
@@ -170,7 +203,8 @@ in `crates/api-3dtiles/CLAUDE.md`.
 - Bounds: point cloud ≤ `MAX_POINTS` (8M); voxel grid ≤ `MAX_VOXELS` (32M
   cells).
 - Both samplers share `select_entry_and_quantity` and resample via the
-  envelope-guarded `sample_polar_slant` — never fabricate data across the
+  envelope guards of `slant_cell` (the voxel grid's `resolve_column` mirrors
+  them guard for guard) — never fabricate data across the
   cone of silence. Unknown quantity ⇒ `InvalidParameter` (→ 400).
 - `read_point_cloud`/`read_voxel_grid` are sync (blocking HDF5 I/O + long
   CPU loops); the API layer bounds them with its 3D Tiles content pool and

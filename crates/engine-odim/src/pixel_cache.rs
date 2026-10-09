@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use ds_cache::ByteBoundedCache;
+use ds_storage::bytes::Bytes;
 use quick_cache::sync::Cache;
 
 use crate::reader::RawPixels;
@@ -66,6 +67,31 @@ pub struct PixelCache {
     /// Only active file loads own locks; expired weak entries are pruned on
     /// the next miss. No raw file bytes or decoded arrays are retained here.
     loading: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// Downloaded volume files a background sibling decode is still working
+    /// through (#994), keyed like `loading`. A cold miss on such a file
+    /// decodes from these bytes instead of downloading it again. Each entry
+    /// lives only as long as its [`HeldBytes`] guard, and their number is
+    /// capped by the caller of [`Self::hold_bytes`].
+    held: Mutex<HashMap<String, Bytes>>,
+}
+
+/// One file's bytes registered in [`PixelCache::held_bytes`] for the life of
+/// a background sibling decode (#994). Dropping it unregisters them; the
+/// decoder drops it only after its last insert, so a miss that finds no held
+/// bytes is guaranteed to see every array the decode produced.
+pub(crate) struct HeldBytes<'a> {
+    cache: &'a PixelCache,
+    file_id: String,
+}
+
+impl Drop for HeldBytes<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.file_id);
+    }
 }
 
 impl PixelCache {
@@ -86,7 +112,41 @@ impl PixelCache {
             negative: Cache::new(NEGATIVE_CAPACITY_ITEMS),
             inserts: AtomicU64::new(0),
             loading: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The bytes of `file_id` a background sibling decode still holds, if
+    /// any (#994): a cold miss on that file decodes from them rather than
+    /// fetching the file again.
+    pub(crate) fn held_bytes(&self, file_id: &str) -> Option<Bytes> {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(file_id)
+            .cloned()
+    }
+
+    /// Register `bytes` as `file_id`'s held copy for a background sibling
+    /// decode (#994). `None`, and nothing registered, when that file already
+    /// has a decode in flight (single flight per file) or `max_held` files are
+    /// already held, which bounds the downloaded bytes kept alive after their
+    /// requests returned.
+    pub(crate) fn hold_bytes(
+        &self,
+        file_id: &str,
+        bytes: Bytes,
+        max_held: usize,
+    ) -> Option<HeldBytes<'_>> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held.len() >= max_held || held.contains_key(file_id) {
+            return None;
+        }
+        held.insert(file_id.to_owned(), bytes);
+        Some(HeldBytes {
+            cache: self,
+            file_id: file_id.to_owned(),
+        })
     }
 
     /// Look up a cached array, counting a hit for `/metrics`. A miss is **not**
@@ -113,16 +173,26 @@ impl PixelCache {
     /// Returns the number of newly recorded read/decode failures as well.
     /// A `load` error (a deadline or transient fetch failure, #993) is
     /// returned as is and marks nothing bad, so the next request retries.
+    ///
+    /// `load` receives the file's [held bytes](Self::held_bytes), if any,
+    /// snapshotted **before** the cache recheck (#994): a background sibling
+    /// decode drops its bytes only after its last insert, so with `None` the
+    /// recheck has already seen every array it decoded, and with `Some` the
+    /// loader decodes from them instead of downloading the file again.
     pub(crate) fn load_many<E>(
         &self,
         file_id: &str,
         requests: &[MomentRequest<'_>],
-        load: impl FnOnce(&[MomentRequest<'_>]) -> Result<Vec<(String, RawPixels)>, E>,
+        load: impl FnOnce(&[MomentRequest<'_>], Option<Bytes>) -> Result<Vec<(String, RawPixels)>, E>,
     ) -> Result<(MomentPixels, usize), E> {
         self.with_file_load(file_id, || {
+            let held = self.held_bytes(file_id);
             let mut pixels = HashMap::new();
             let mut missing = Vec::new();
             for &(path, nrays, nbins) in requests {
+                if pixels.contains_key(path) || missing.iter().any(|(p, _, _)| *p == path) {
+                    continue;
+                }
                 if let Some(raw) = self.get(file_id, path) {
                     pixels.insert(path.to_string(), raw);
                 } else if !self.is_known_bad(file_id, path) {
@@ -132,7 +202,7 @@ impl PixelCache {
             }
             let mut failures = 0;
             if !missing.is_empty() {
-                for (path, raw) in load(&missing)? {
+                for (path, raw) in load(&missing, held)? {
                     let raw = Arc::new(raw);
                     self.insert(file_id, &path, raw.clone());
                     pixels.insert(path, raw);
@@ -238,7 +308,8 @@ impl PixelCache {
         self.inner.stats()
     }
 
-    /// Cumulative inserts (request-time decodes + poll-time pre-warm).
+    /// Cumulative inserts (request-time decodes, their background sibling
+    /// decodes, and poll-time pre-warm).
     /// With `entries()` this makes LRU eviction pressure observable:
     /// sustained inserts while `entries`/`weight` stay flat at capacity ⇒
     /// the working set exceeds the cache and pre-warmed pixels are being
@@ -280,6 +351,30 @@ mod tests {
         assert_eq!(loads.load(Ordering::Relaxed), 1);
         cache.with_file_load("next-file", || {});
         assert!(cache.loading.lock().unwrap().len() <= 1);
+    }
+
+    #[test]
+    fn held_bytes_are_single_flight_bounded_and_released_on_drop() {
+        let cache = PixelCache::new(64);
+        let bytes = Bytes::from_static(b"volume");
+        assert!(cache.held_bytes("a").is_none());
+        let a = cache.hold_bytes("a", bytes.clone(), 2).expect("first hold");
+        assert_eq!(cache.held_bytes("a").as_deref(), Some(&b"volume"[..]));
+        assert!(
+            cache.hold_bytes("a", bytes.clone(), 2).is_none(),
+            "one background decode per file"
+        );
+        let b = cache
+            .hold_bytes("b", bytes.clone(), 2)
+            .expect("second file");
+        assert!(
+            cache.hold_bytes("c", bytes.clone(), 2).is_none(),
+            "at most `max_held` files are held"
+        );
+        drop(a);
+        assert!(cache.held_bytes("a").is_none());
+        assert!(cache.hold_bytes("c", bytes, 2).is_some());
+        drop(b);
     }
 
     #[test]
@@ -442,7 +537,7 @@ mod tests {
         let requests = [("/sweep1", 2, 2), ("/sweep2", 2, 2)];
         let mut reads = 0;
         let (pixels, failures) = cache
-            .load_many("volume", &requests, |missing| {
+            .load_many("volume", &requests, |missing, _| {
                 reads += 1;
                 assert_eq!(missing.len(), 2);
                 Ok::<_, ()>(
@@ -473,7 +568,7 @@ mod tests {
                 scope.spawn(move || {
                     start.wait();
                     let (pixels, failures) = cache
-                        .load_many("volume", &[("/a", 2, 2), ("/b", 2, 2)], |missing| {
+                        .load_many("volume", &[("/a", 2, 2), ("/b", 2, 2)], |missing, _| {
                             reads.fetch_add(1, Ordering::Relaxed);
                             Ok::<_, ()>(
                                 missing
@@ -497,19 +592,48 @@ mod tests {
         let cache = PixelCache::new(1);
         let requests = [("/good", 2, 2), ("/bad", 2, 2)];
         let (pixels, failures) = cache
-            .load_many("volume", &requests, |_| {
+            .load_many("volume", &requests, |_, _| {
                 Ok::<_, ()>(vec![("/good".into(), raw())])
             })
             .unwrap();
         assert_eq!(pixels.len(), 1);
         assert_eq!(failures, 1);
         let (pixels, failures) = cache
-            .load_many("volume", &requests, |_| -> Result<_, ()> {
+            .load_many("volume", &requests, |_, _| -> Result<_, ()> {
                 panic!("cached or known bad")
             })
             .unwrap();
         assert_eq!(pixels.len(), 1);
         assert_eq!(failures, 0);
+    }
+
+    /// #994: the loader gets the file's held bytes, snapshotted before the
+    /// recheck, and nothing once the guard is gone.
+    #[test]
+    fn batch_loader_receives_held_bytes() {
+        let cache = PixelCache::new(1);
+        let mut seen: Vec<Option<Bytes>> = Vec::new();
+        let mut load = |file: &str| {
+            cache
+                .load_many(file, &[("/a", 2, 2)], |missing, held| {
+                    seen.push(held);
+                    Ok::<_, ()>(
+                        missing
+                            .iter()
+                            .map(|(path, _, _)| (path.to_string(), raw()))
+                            .collect(),
+                    )
+                })
+                .unwrap();
+        };
+        let guard = cache
+            .hold_bytes("volume", Bytes::from_static(b"held"), 1)
+            .unwrap();
+        load("volume");
+        drop(guard);
+        load("other");
+        assert_eq!(seen[0].as_deref(), Some(&b"held"[..]));
+        assert!(seen[1].is_none());
     }
 
     /// #993: a load that fails (a deadline or transient fetch error) is the
@@ -518,12 +642,12 @@ mod tests {
     fn failed_load_marks_nothing_bad_and_retries() {
         let cache = PixelCache::new(1);
         let requests = [("/a", 2, 2), ("/b", 2, 2)];
-        let result = cache.load_many("volume", &requests, |_| Err("deadline"));
+        let result = cache.load_many("volume", &requests, |_, _| Err("deadline"));
         assert_eq!(result.err(), Some("deadline"));
         assert!(!cache.is_known_bad("volume", "/a"));
         assert!(!cache.is_known_bad("volume", "/b"));
         let (pixels, failures) = cache
-            .load_many("volume", &requests, |missing| {
+            .load_many("volume", &requests, |missing, _| {
                 assert_eq!(missing.len(), 2, "both moments are retried");
                 Ok::<_, &str>(
                     missing
