@@ -152,7 +152,28 @@ impl DataStore {
     /// (an unwritten chunk, an optional metadata file) as "use the fill value"
     /// / "not present", so the engine needs this distinction.
     pub fn get_opt(&self, path: &ObjectPath) -> Result<Option<Bytes>, DataServerError> {
-        let result = self.block_on(async {
+        self.get_opt_with(path, None)
+    }
+
+    /// [`Self::get_opt`] driven on an explicitly-provided runtime `Handle`, as
+    /// [`Self::get_on`] is to [`Self::get`]. A missing object is `Ok(None)`;
+    /// every other failure (deadline, network, 5xx) stays an `Err`, so a
+    /// caller tells "the object is gone" from "this read failed" without
+    /// matching error strings.
+    pub fn get_opt_on(
+        &self,
+        path: &ObjectPath,
+        handle: &tokio::runtime::Handle,
+    ) -> Result<Option<Bytes>, DataServerError> {
+        self.get_opt_with(path, Some(handle))
+    }
+
+    fn get_opt_with(
+        &self,
+        path: &ObjectPath,
+        handle: Option<&tokio::runtime::Handle>,
+    ) -> Result<Option<Bytes>, DataServerError> {
+        let result = self.block_on_with(handle, async {
             match self.inner.get(path).await {
                 Ok(res) => Ok(Some(res.bytes().await?)),
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -975,6 +996,41 @@ mod deadline_tests {
                 Ok(42)
             });
             assert_eq!(result.unwrap(), 42);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `get_opt_on` keeps "the object is gone" (`Ok(None)`) apart from "this
+    /// read failed" (`Err`): an expired deadline is `DeadlineExceeded`, never
+    /// a missing object, so a caller can negatively cache only the former.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_opt_on_separates_missing_from_deadline() {
+        use object_store::ObjectStoreExt;
+        let inner = object_store::memory::InMemory::new();
+        let present = ObjectPath::from("present.h5");
+        inner
+            .put(&present, object_store::PutPayload::from_static(b"data"))
+            .await
+            .unwrap();
+        let store = DataStore::new(Arc::new(inner));
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let missing = ObjectPath::from("missing.h5");
+            assert!(store.get_opt_on(&missing, &handle).unwrap().is_none());
+            assert_eq!(
+                store.get_opt_on(&present, &handle).unwrap().as_deref(),
+                Some(&b"data"[..])
+            );
+            let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
+            assert!(matches!(
+                store.get_opt_on(&missing, &handle),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+            assert!(matches!(
+                store.get_opt_on(&present, &handle),
+                Err(DataServerError::DeadlineExceeded)
+            ));
         })
         .await
         .unwrap();

@@ -111,9 +111,10 @@ pub(crate) fn pixel_cache() -> &'static PixelCache {
     &PIXEL_CACHE
 }
 
-/// Cumulative count of lazy pixel reads that failed (remote/local I/O or
-/// HDF5 decode) and so degraded to a transparent / nodata sample instead of
-/// real data. Before lazy loading a decode failure was a hard catalog
+/// Cumulative count of lazy pixel reads that failed (missing file or object,
+/// HDF5 open or decode) and so degraded to a transparent / nodata sample
+/// instead of real data. A deadline or transient storage failure fails the
+/// request instead and is not counted here (#993). Before lazy loading a decode failure was a hard catalog
 /// rejection at scan time; now the failure is per-request and otherwise
 /// silent, so this counter (surfaced as `pvol_pixel_read_failures_total` in
 /// `/metrics`) makes the degradation observable (PR #290 review).
@@ -523,34 +524,78 @@ pub(crate) fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
     tokio::runtime::Handle::try_current().ok()
 }
 
+/// Why a lazy pixel read produced no array (#993).
+#[derive(Debug)]
+enum PixelReadError {
+    /// The data itself is unusable: the file or object is gone, or its HDF5
+    /// does not open or decode. Negatively cached (`PixelCache::mark_bad`)
+    /// and sampled as nodata, so a per-cell loop does not storm the store.
+    Bad(String),
+    /// The request ran out of time, or the store failed in a way a retry can
+    /// heal (network, timeout, 5xx). Never negatively cached and never turned
+    /// into nodata: the request fails, so no cache keeps an empty tile for it
+    /// and the next request reads again. Always `DeadlineExceeded` or
+    /// `ResourceExhausted`, which every API answers with 503/504.
+    Abort(DataServerError),
+}
+
+impl PixelReadError {
+    /// Classify a storage-bridge error. A missing object never reaches here
+    /// (`get_opt*` returns it as `Ok(None)`), so every error is one a retry
+    /// can heal: the deadline stays itself, anything else is the transient
+    /// `ResourceExhausted` with the detail logged, not sent to the client.
+    fn from_storage(file_id: &str, e: DataServerError) -> Self {
+        match e {
+            e @ (DataServerError::DeadlineExceeded | DataServerError::ResourceExhausted) => {
+                PixelReadError::Abort(e)
+            }
+            e => {
+                tracing::warn!("PVOL pixel fetch of `{file_id}` failed, retryable: {e}");
+                PixelReadError::Abort(DataServerError::ResourceExhausted)
+            }
+        }
+    }
+}
+
 /// Re-fetch one volume file's raw bytes by its [`FileId`] — a local path
 /// read or an S3 `get`. Used by the lazy pixel reader on a cache miss.
 ///
 /// `handle` picks the async→sync bridge for a remote fetch by the caller's
 /// runtime context (see [`Pixels::handle`]): `Some(handle)` drives the fetch
 /// via `handle.block_on` (valid on a `spawn_blocking` pool thread, where
-/// `block_in_place` *panics*); `None` uses the plain [`DataStore::get`],
+/// `block_in_place` *panics*); `None` uses the plain `DataStore::get_opt`,
 /// whose `block_in_place` is valid on a multi-thread runtime worker. A local read
 /// never touches a runtime, so the handle is irrelevant there.
+///
+/// A missing file or object is [`PixelReadError::Bad`]; a deadline or any
+/// other storage failure is [`PixelReadError::Abort`] (#993).
 fn fetch_file_bytes(
     source: &Source,
     file_id: &str,
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, PixelReadError> {
     match source {
-        Source::Local { .. } => {
-            std::fs::read(file_id).map_err(|e| format!("read `{file_id}`: {e}"))
-        }
+        Source::Local { .. } => std::fs::read(file_id).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                PixelReadError::Bad(format!("read `{file_id}`: {e}"))
+            } else {
+                PixelReadError::from_storage(file_id, DataServerError::Io(e))
+            }
+        }),
         Source::Remote { store, .. } => {
             use ds_storage::object_store::path::Path as ObjectPath;
             let object = ObjectPath::from(file_id);
             let bytes = match handle {
-                Some(h) => store.get_on(&object, h),
-                None => store.get(&object),
+                Some(h) => store.get_opt_on(&object, h),
+                None => store.get_opt(&object),
             };
-            bytes
-                .map(|b| b.to_vec())
-                .map_err(|e| format!("get `{file_id}`: {e}"))
+            match bytes {
+                Ok(Some(b)) => Ok(b.to_vec()),
+                Ok(None) => Err(PixelReadError::Bad(format!(
+                    "get `{file_id}`: object not found"
+                ))),
+                Err(e) => Err(PixelReadError::from_storage(file_id, e)),
+            }
         }
     }
 }
@@ -612,7 +657,14 @@ fn cold_batch_requests<'a>(
 
 impl Pixels<'_> {
     /// All sweeps of the selected quantity share one file fetch and HDF5 open.
-    fn volume_moments(&self, volume: &PolarVolume, file_id: &str, quantity: &str) -> MomentPixels {
+    /// A deadline or transient storage failure is the request's error and
+    /// marks nothing bad (#993): an empty grid built from it would be cached.
+    fn volume_moments(
+        &self,
+        volume: &PolarVolume,
+        file_id: &str,
+        quantity: &str,
+    ) -> Result<MomentPixels, DataServerError> {
         let cache_id = pixel_cache_id(self.source, file_id);
         let requests: Vec<_> = volume
             .sweeps
@@ -626,27 +678,37 @@ impl Pixels<'_> {
             })
             .collect();
         let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing| {
-            fetch_file_bytes(self.source, file_id, self.handle)
-                .and_then(|bytes| {
-                    crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
-                        .map_err(|e| e.to_string())
-                })
-                .unwrap_or_else(|e| {
+            let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
+                crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
+                    .map_err(|e| PixelReadError::Bad(e.to_string()))
+            });
+            match decoded {
+                Ok(pixels) => Ok(pixels),
+                Err(PixelReadError::Abort(e)) => Err(e),
+                Err(PixelReadError::Bad(e)) => {
                     tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
-                    Vec::new()
-                })
-        });
+                    Ok(Vec::new())
+                }
+            }
+        })?;
         if failures > 0 {
             PIXEL_READ_FAILURES.fetch_add(failures as u64, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("PVOL batch pixel read for `{file_id}`: {failures} missing moment(s)");
         }
-        pixels
+        Ok(pixels)
     }
 
     /// Fetch a decoded moment, batching bounded uncached siblings from the
-    /// same file on a cold miss. Concurrent sibling misses share a file lock. `None` on any I/O / decode error (the caller treats a
-    /// missing array as nodata, so a single corrupt file degrades to
-    /// transparent rather than failing the whole request).
+    /// same file on a cold miss. Concurrent sibling misses share a file lock.
+    ///
+    /// `Ok(None)` when the data itself is unusable (missing file, HDF5 open or
+    /// decode failure): the caller samples nodata, so one corrupt file degrades
+    /// to transparent rather than failing the whole request, and the key is
+    /// negatively cached. `Err` when the read was cut off by the request
+    /// deadline (`DeadlineExceeded`) or the store failed transiently
+    /// (`ResourceExhausted`): nothing is negatively cached and the caller must
+    /// fail the request, so no tile cache keeps an empty frame for it and a
+    /// retry reads again (#993).
     fn moment(
         &self,
         file_id: &str,
@@ -654,29 +716,29 @@ impl Pixels<'_> {
         moment: &PolarMoment,
         nrays: usize,
         nbins: usize,
-    ) -> Option<Arc<RawPixels>> {
+    ) -> Result<Option<Arc<RawPixels>>, DataServerError> {
         if let Some(moments) = self.moments {
-            return moments.get(&moment.dataset_path).cloned();
+            return Ok(moments.get(&moment.dataset_path).cloned());
         }
         // Source-qualified key so two S3 sources can't collide in the global
         // cache (PR #290 review); the bare `file_id` stays the fetch path.
         let cache_id = pixel_cache_id(self.source, file_id);
         if let Some(p) = PIXEL_CACHE.get(&cache_id, &moment.dataset_path) {
-            return Some(p);
+            return Ok(Some(p));
         }
         // A previously-failed read degrades straight to nodata without
         // re-fetching — a per-cell sampler loop (e.g. `volume_section`) must
         // not storm the store, nor re-inflate the failure metric, on one bad
         // moment (PR #290 review).
         if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
-            return None;
+            return Ok(None);
         }
         PIXEL_CACHE.with_file_load(&cache_id, || {
             if let Some(p) = PIXEL_CACHE.get(&cache_id, &moment.dataset_path) {
-                return Some(p);
+                return Ok(Some(p));
             }
             if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
-                return None;
+                return Ok(None);
             }
             PIXEL_CACHE.record_miss();
             let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
@@ -692,19 +754,23 @@ impl Pixels<'_> {
                     }
                     Err(e) => tracing::debug!("PVOL cold batch skipped `{path}`: {e}"),
                 })
-                .map_err(|e| format!("open volume: {e}"))?;
-                requested.ok_or_else(|| format!("decode `{}` failed", moment.dataset_path))
+                .map_err(|e| PixelReadError::Bad(format!("open volume: {e}")))?;
+                requested.ok_or_else(|| {
+                    PixelReadError::Bad(format!("decode `{}` failed", moment.dataset_path))
+                })
             });
             match decoded {
-                Ok(pixels) => Some(pixels),
-                Err(e) => {
+                Ok(pixels) => Ok(Some(pixels)),
+                // Not the data's fault: fail this request, remember nothing.
+                Err(PixelReadError::Abort(e)) => Err(e),
+                Err(PixelReadError::Bad(e)) => {
                     // Count + log once per key; subsequent cells short-circuit on
                     // `is_known_bad` above.
                     if PIXEL_CACHE.mark_bad(&cache_id, &moment.dataset_path) {
                         PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!("PVOL lazy pixel read failed for `{file_id}`: {e}");
                     }
-                    None
+                    Ok(None)
                 }
             }
         })
@@ -2303,10 +2369,11 @@ fn polar_sample(
 
     // Lazily fetch this one moment's pixel array (cache hit, or read the
     // single dataset from the re-fetched file bytes) — once, before the
-    // per-pixel loop. A read failure yields an all-transparent tile rather
+    // per-pixel loop. Unusable data yields an all-transparent tile rather
     // than a 500: the file may have rotated out from under us, and the next
-    // poll/request recovers.
-    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
+    // poll/request recovers. A deadline or transient fetch failure is the
+    // render's error instead, so no tile cache keeps the frame empty (#993).
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins)? else {
         return Ok(RasterTile {
             width,
             height,
@@ -2529,7 +2596,7 @@ fn volume_profile(
     lon: f64,
     lat: f64,
     quantities: &[String],
-) -> Option<QueryResult> {
+) -> Result<Option<QueryResult>, DataServerError> {
     // A radar may run split cuts — two sweeps at the same nominal
     // elevation angle (e.g. separate surveillance and Doppler scans),
     // so the raw per-sweep angles can repeat (FMI volumes carry two
@@ -2555,37 +2622,39 @@ fn volume_profile(
     // with an empty z axis, which the CoverageJSON schema rejects
     // (`numericValuesAxis.values` has `minItems: 1`).
     if levels.is_empty() {
-        return None;
+        return Ok(None);
     }
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
     for quantity in quantities {
-        let values: Vec<Option<f64>> = levels
-            .iter()
-            .map(|&level| {
-                // For a split cut (two sweeps at the same nominal angle, e.g.
-                // a surveillance and a Doppler cut), the *first* sweep that
-                // carries the quantity is authoritative — its sample stands
-                // even when nodata, so a genuine no-echo is not silently
-                // replaced by the sibling's measurement.
-                entry
-                    .volume
-                    .sweeps
+        let mut values: Vec<Option<f64>> = Vec::with_capacity(levels.len());
+        for &level in &levels {
+            // For a split cut (two sweeps at the same nominal angle, e.g.
+            // a surveillance and a Doppler cut), the *first* sweep that
+            // carries the quantity is authoritative — its sample stands
+            // even when nodata, so a genuine no-echo is not silently
+            // replaced by the sibling's measurement.
+            let target = entry.volume.sweeps.iter().find_map(|s| {
+                if round_elevation(s.elangle) != level {
+                    return None;
+                }
+                s.moments
                     .iter()
-                    .find(|s| {
-                        round_elevation(s.elangle) == level
-                            && s.moments.iter().any(|m| m.quantity == *quantity)
-                    })
-                    .and_then(|sweep| {
-                        let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
-                        let pixels =
-                            pix.moment(&entry.id, &entry.volume, moment, sweep.nrays, sweep.nbins)?;
+                    .find(|m| m.quantity == *quantity)
+                    .map(|m| (s, m))
+            });
+            let value = match target {
+                Some((sweep, moment)) => pix
+                    .moment(&entry.id, &entry.volume, moment, sweep.nrays, sweep.nbins)?
+                    .and_then(|pixels| {
                         sample_sweep_moment(sweep, moment, &pixels, site_lon, site_lat, lon, lat)
-                    })
-            })
-            .collect();
+                    }),
+                None => None,
+            };
+            values.push(value);
+        }
         ranges.insert(
             quantity.clone(),
             NdArray {
@@ -2597,7 +2666,7 @@ fn volume_profile(
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    Some(QueryResult {
+    Ok(Some(QueryResult {
         domain: DomainDescription::VerticalProfile {
             x: lon,
             y: lat,
@@ -2609,7 +2678,7 @@ fn volume_profile(
         },
         parameters: param_descs,
         ranges,
-    })
+    }))
 }
 
 /// One `PointSeries` coverage pinned to the advertised elevation angle
@@ -2634,27 +2703,29 @@ fn level_series(
     level: f64,
     quantities: &[String],
     times: &[DateTime<Utc>],
-) -> (QueryResult, bool) {
+) -> Result<(QueryResult, bool), DataServerError> {
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
     let mut measured = false;
     for quantity in quantities {
-        let values: Vec<Option<f64>> = selected
-            .iter()
-            .map(|e| {
-                let class = e
-                    .volume
-                    .sweeps
+        let mut values: Vec<Option<f64>> = Vec::with_capacity(selected.len());
+        for e in selected {
+            // A deadline stops the series at the volume it reached (#993).
+            ds_core::deadline::check()?;
+            let target = e.volume.sweeps.iter().find_map(|s| {
+                if round_elevation(s.elangle) != level {
+                    return None;
+                }
+                s.moments
                     .iter()
-                    .find(|s| {
-                        round_elevation(s.elangle) == level
-                            && s.moments.iter().any(|m| &m.quantity == quantity)
-                    })
-                    .and_then(|sweep| {
-                        let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
-                        let pixels =
-                            pix.moment(&e.id, &e.volume, moment, sweep.nrays, sweep.nbins)?;
-                        Some(sample_sweep_moment_class(
+                    .find(|m| &m.quantity == quantity)
+                    .map(|m| (s, m))
+            });
+            let class = match target {
+                Some((sweep, moment)) => pix
+                    .moment(&e.id, &e.volume, moment, sweep.nrays, sweep.nbins)?
+                    .map(|pixels| {
+                        sample_sweep_moment_class(
                             sweep,
                             moment,
                             &pixels,
@@ -2662,22 +2733,23 @@ fn level_series(
                             e.volume.site.lat,
                             lon,
                             lat,
-                        ))
+                        )
                     })
-                    .unwrap_or(PixelClass::Masked);
-                match class {
-                    PixelClass::Value(v) => {
-                        measured = true;
-                        Some(v)
-                    }
-                    PixelClass::Undetect => {
-                        measured = true;
-                        None
-                    }
-                    PixelClass::Masked => None,
+                    .unwrap_or(PixelClass::Masked),
+                None => PixelClass::Masked,
+            };
+            values.push(match class {
+                PixelClass::Value(v) => {
+                    measured = true;
+                    Some(v)
                 }
-            })
-            .collect();
+                PixelClass::Undetect => {
+                    measured = true;
+                    None
+                }
+                PixelClass::Masked => None,
+            });
+        }
         ranges.insert(
             quantity.clone(),
             NdArray {
@@ -2702,7 +2774,7 @@ fn level_series(
         parameters: param_descs,
         ranges,
     };
-    (result, measured)
+    Ok((result, measured))
 }
 
 // ---------------------------------------------------------------------------
@@ -2924,23 +2996,25 @@ fn sample_polar_slant(
     slant_range_m: f64,
     azimuth_deg: f64,
     elangle_deg: f64,
-) -> Option<f64> {
+) -> Result<Option<f64>, DataServerError> {
     // Point-cloud / EDR path: only real values; clear-air `Undetect` and
     // `Masked` both collapse to `None` (no point), unchanged from before #360.
-    match sample_polar_slant_class(
-        volume,
-        file_id,
-        pix,
-        envelope,
-        keep,
-        quantity,
-        slant_range_m,
-        azimuth_deg,
-        elangle_deg,
-    ) {
-        PixelClass::Value(v) => Some(v),
-        PixelClass::Undetect | PixelClass::Masked => None,
-    }
+    Ok(
+        match sample_polar_slant_class(
+            volume,
+            file_id,
+            pix,
+            envelope,
+            keep,
+            quantity,
+            slant_range_m,
+            azimuth_deg,
+            elangle_deg,
+        )? {
+            PixelClass::Value(v) => Some(v),
+            PixelClass::Undetect | PixelClass::Masked => None,
+        },
+    )
 }
 
 /// Like [`sample_polar_slant`] but **classifies** the cell (#360): an out-of-
@@ -2960,16 +3034,16 @@ fn sample_polar_slant_class(
     slant_range_m: f64,
     azimuth_deg: f64,
     elangle_deg: f64,
-) -> PixelClass {
+) -> Result<PixelClass, DataServerError> {
     let Some(index) = nearest_sweep_index(volume, elangle_deg) else {
-        return PixelClass::Masked;
+        return Ok(PixelClass::Masked);
     };
     if keep.is_some_and(|keep| !keep.get(index).copied().unwrap_or(false)) {
-        return PixelClass::Masked;
+        return Ok(PixelClass::Masked);
     }
     let sweep = &volume.sweeps[index];
     if sweep.nrays == 0 || sweep.nbins == 0 {
-        return PixelClass::Masked;
+        return Ok(PixelClass::Masked);
     }
     // Reject targets outside the sweep envelope (see the constant's doc
     // for the rationale). Pre-computed envelope keeps this O(1) per cell.
@@ -2978,7 +3052,7 @@ fn sample_polar_slant_class(
         || elangle_deg < min_el - SWEEP_ENVELOPE_TOL_DEG
         || elangle_deg > max_el + SWEEP_ENVELOPE_TOL_DEG
     {
-        return PixelClass::Masked;
+        return Ok(PixelClass::Masked);
     }
     // A malformed sweep with `rscale <= 0` would silently mis-sample:
     // `rscale = 0` makes the divisor zero (a NaN cast to `i64` becomes
@@ -2988,27 +3062,27 @@ fn sample_polar_slant_class(
     // defensive guard here is cheap and keeps a corrupted file from
     // ever surfacing fabricated values.
     if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
-        return PixelClass::Masked;
+        return Ok(PixelClass::Masked);
     }
     let Some(moment) = sweep.moments.iter().find(|m| m.quantity == *quantity) else {
-        return PixelClass::Masked;
+        return Ok(PixelClass::Masked);
     };
     let bin = ((slant_range_m - sweep.rstart) / sweep.rscale).floor() as i64;
     if bin < 0 || bin >= sweep.nbins as i64 {
-        return PixelClass::Masked;
+        return Ok(PixelClass::Masked);
     }
     let ray = (azimuth_deg / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
-    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
-        return PixelClass::Masked;
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins)? else {
+        return Ok(PixelClass::Masked);
     };
-    pixels.sample_class(
+    Ok(pixels.sample_class(
         ray,
         bin as usize,
         moment.gain,
         moment.offset,
         moment.nodata,
         Some(moment.undetect),
-    )
+    ))
 }
 
 /// Build one `Section` coverage: the volume's polar field resampled on
@@ -3039,15 +3113,17 @@ fn volume_section(
     quantities: &[String],
     window: (f64, f64),
     levels: Option<&[f64]>,
-) -> Option<QueryResult> {
+) -> Result<Option<QueryResult>, DataServerError> {
     if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Per-entry effective envelope: the selected window clamped to this
     // volume's surveyed sweep range. A volume with no finite sweeps is
     // skipped; one that doesn't cover the window yields all-nodata cells
     // (an inverted envelope rejects every beam angle).
-    let entry_env = sweep_envelope(&entry.volume)?;
+    let Some(entry_env) = sweep_envelope(&entry.volume) else {
+        return Ok(None);
+    };
     let envelope = (window.0.max(entry_env.0), window.1.min(entry_env.1));
     // One flag per sweep, built once per entry so the per-cell check is O(1).
     let keep: Option<Vec<bool>> = levels.map(|levels| {
@@ -3101,7 +3177,7 @@ fn volume_section(
                     r,
                     bearing,
                     el,
-                ));
+                )?);
             }
         }
         ranges.insert(
@@ -3115,7 +3191,7 @@ fn volume_section(
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    Some(QueryResult {
+    Ok(Some(QueryResult {
         domain: DomainDescription::Section {
             nodes,
             z: VerticalCoord {
@@ -3126,7 +3202,7 @@ fn volume_section(
         },
         parameters: param_descs,
         ranges,
-    })
+    }))
 }
 
 /// Build the EDR coverages for one radar site at WGS84 `(lon, lat)`.
@@ -3163,16 +3239,21 @@ fn site_coverages(
     let quantities = resolve_quantities(&selected, parameters)?;
 
     match levels {
-        None => Ok(selected
+        // `transpose` + `filter_map` drop volumes that produced no plottable
+        // profile (every elangle non-finite — `volume_profile` returns
+        // `Ok(None)`); the `Result` collect stops at the first deadline or
+        // transient read error and returns it (#993).
+        None => selected
             .iter()
-            // `filter_map` drops volumes that produced no plottable profile
-            // (every elangle non-finite — `volume_profile` returns `None`).
-            .filter_map(|e| volume_profile(e, pix, lon, lat, &quantities))
-            .collect()),
+            .map(|e| {
+                ds_core::deadline::check()?;
+                volume_profile(e, pix, lon, lat, &quantities)
+            })
+            .filter_map(Result::transpose)
+            .collect(),
         Some(lvls) => {
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
-            Ok(lvls
-                .iter()
+            lvls.iter()
                 // Drop a level only when the point was never *measured*
                 // there — every sample `Masked` (out of the sweep's range,
                 // or no sweep at the level carries the quantity).
@@ -3182,12 +3263,13 @@ fn site_coverages(
                 // 404 made "no rain at this point for an hour" an error.
                 // With every level dropped, `finalize_single_site` turns the
                 // empty result into a 404.
-                .filter_map(|&lvl| {
+                .map(|&lvl| {
                     let (qr, measured) =
-                        level_series(&selected, pix, lon, lat, lvl, &quantities, &times);
-                    measured.then_some(qr)
+                        level_series(&selected, pix, lon, lat, lvl, &quantities, &times)?;
+                    Ok(measured.then_some(qr))
                 })
-                .collect())
+                .filter_map(Result::transpose)
+                .collect()
         }
     }
 }
@@ -3325,9 +3407,13 @@ fn site_trajectory(
         ));
     }
 
+    // The first deadline or transient read error ends the walk and is the
+    // response (504/503): the volumes after it are never read, let alone
+    // marked bad (#993).
     let coverages: Vec<QueryResult> = selected
         .iter()
-        .filter_map(|e| {
+        .map(|e| {
+            ds_core::deadline::check()?;
             volume_section(
                 e,
                 pix,
@@ -3338,7 +3424,8 @@ fn site_trajectory(
                 levels.as_deref(),
             )
         })
-        .collect();
+        .filter_map(Result::transpose)
+        .collect::<Result<_, _>>()?;
     if coverages.is_empty() {
         return Err(DataServerError::LocationNotFound(
             "No PVOL volumes produced a section for the requested path".into(),
@@ -4013,7 +4100,10 @@ fn volume_point_cloud(
         let Some(moment) = sweep.moments.iter().find(|m| m.quantity == quantity) else {
             continue;
         };
-        let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
+        // A 3D render resolves its quantity up front (`volume_moments`, which
+        // fails the request on a deadline or transient read), so this lookup
+        // never fetches; an absent moment is unusable data.
+        let Ok(Some(pixels)) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
             continue;
         };
         let deg_per_ray = 360.0 / sweep.nrays as f64;
@@ -4173,7 +4263,8 @@ fn resolve_column(
     if bin < 0 || bin >= sweep.nbins as i64 {
         return ColumnTarget::Masked;
     }
-    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
+    // Prefetched by `volume_moments` like the point cloud's: never a fetch.
+    let Ok(Some(pixels)) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
         return ColumnTarget::Masked;
     };
     ColumnTarget::Gate {
@@ -4419,7 +4510,7 @@ impl PolarVolumeSiteView {
                 source: &self.source,
                 handle,
             };
-            let moments = pix.volume_moments(&entry.volume, &entry.id, quantity);
+            let moments = pix.volume_moments(&entry.volume, &entry.id, quantity)?;
             let pix = Pixels {
                 moments: Some(&moments),
                 ..pix
@@ -4449,7 +4540,7 @@ impl VolumeEngine for PolarVolumeSiteView {
             source: &self.source,
             handle: handle.as_ref(),
         };
-        let moments = pix.volume_moments(&entry.volume, &entry.id, &quantity);
+        let moments = pix.volume_moments(&entry.volume, &entry.id, &quantity)?;
         let pix = Pixels {
             moments: Some(&moments),
             ..pix
@@ -5083,7 +5174,8 @@ mod tests {
             range_m,
             azimuth,
             elangle,
-        );
+        )
+        .unwrap();
         assert!(v.is_some(), "well-formed sweep must sample");
 
         for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
@@ -5100,6 +5192,7 @@ mod tests {
                     azimuth,
                     elangle
                 )
+                .unwrap()
                 .is_none(),
                 "rscale={bad} must yield None, not fabricated data"
             );
@@ -5137,6 +5230,7 @@ mod tests {
             azimuth,
             0.5
         )
+        .unwrap()
         .is_some());
         assert!(sample_polar_slant(
             &vol,
@@ -5149,6 +5243,7 @@ mod tests {
             azimuth,
             1.4
         )
+        .unwrap()
         .is_some());
         assert!(sample_polar_slant(
             &vol,
@@ -5161,6 +5256,7 @@ mod tests {
             azimuth,
             -0.4
         )
+        .unwrap()
         .is_some());
 
         // Just outside the window — None.
@@ -5175,6 +5271,7 @@ mod tests {
             azimuth,
             1.6
         )
+        .unwrap()
         .is_none());
         assert!(sample_polar_slant(
             &vol,
@@ -5187,6 +5284,7 @@ mod tests {
             azimuth,
             -0.6
         )
+        .unwrap()
         .is_none());
 
         // Far outside — None (the 90° overhead case that bit the
@@ -5202,6 +5300,7 @@ mod tests {
             azimuth,
             90.0
         )
+        .unwrap()
         .is_none());
 
         // Non-finite el — None.
@@ -5216,6 +5315,7 @@ mod tests {
             azimuth,
             f64::NAN
         )
+        .unwrap()
         .is_none());
     }
 
@@ -5517,6 +5617,7 @@ mod tests {
             window,
             None,
         )
+        .unwrap()
         .expect("section produced");
         let nd = qr.ranges.get("DBZH").expect("DBZH range");
         // Layout is row-major [node][height]; the far node is index 1, so
@@ -5838,14 +5939,17 @@ mod tests {
         let id = path.to_str().unwrap();
         let pixels = test_pixels();
         let first = &volume.sweeps[0];
-        let raw = pixels.moment(id, &volume, &first.moments[0], 4, 8).unwrap();
+        let raw = pixels
+            .moment(id, &volume, &first.moments[0], 4, 8)
+            .unwrap()
+            .unwrap();
         assert_eq!(raw.shape(), (4, 8));
         // The source disappears: every sibling must still be available from
         // the single cold load, including the higher sweep.
         std::fs::remove_file(&path).unwrap();
         for sweep in &volume.sweeps {
             for moment in &sweep.moments {
-                assert!(pixels.moment(id, &volume, moment, 4, 8).is_some());
+                assert!(pixels.moment(id, &volume, moment, 4, 8).unwrap().is_some());
             }
         }
     }
@@ -5885,6 +5989,7 @@ mod tests {
         let pix = test_pixels();
         assert!(pix
             .moment(&file_id, &synthetic_volume(24.5, 60.3), &mom, 360, 100)
+            .unwrap()
             .is_none());
         assert!(
             pixel_cache().is_known_bad(&file_id, &mom.dataset_path),
@@ -5893,7 +5998,287 @@ mod tests {
         // Repeat returns None via the negative-cache short-circuit.
         assert!(pix
             .moment(&file_id, &synthetic_volume(24.5, 60.3), &mom, 360, 100)
+            .unwrap()
             .is_none());
+    }
+
+    /// A remote source over an in-memory store holding the cold-batch fixture
+    /// under a fresh key, plus that key and the parsed volume (#993).
+    fn remote_fixture() -> (Source, String, PolarVolume) {
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let bytes: &'static [u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let volume = crate::pvol::read_polar_volume(bytes).unwrap();
+        let key = unique_file_id();
+        let inner = ds_storage::object_store::memory::InMemory::new();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(inner.put(
+                &ds_storage::object_store::path::Path::from(key.as_str()),
+                PutPayload::from_static(bytes),
+            ))
+            .unwrap();
+        let source = Source::Remote {
+            store: ds_storage::DataStore::new(Arc::new(inner)),
+            endpoint: "https://s3.example.com".to_string(),
+            bucket: "deadline-test".to_string(),
+            prefix_pattern: "%Y/".to_string(),
+            time_window: None,
+        };
+        (source, key, volume)
+    }
+
+    /// A request deadline that already passed: every storage read fails with
+    /// `DeadlineExceeded` before it is sent.
+    fn expired_deadline() -> ds_core::deadline::Guard {
+        ds_core::deadline::enter(Some(std::time::Instant::now()))
+    }
+
+    /// #993: a cold read cut off by the request deadline is the request's
+    /// error, not unusable data. It marks nothing bad, so the next request
+    /// fetches again and serves the moment.
+    #[test]
+    fn moment_deadline_is_an_error_and_a_retry_reads() {
+        let (source, key, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let cache_id = pixel_cache_id(&source, &key).into_owned();
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+        {
+            let _deadline = expired_deadline();
+            let result = pix.moment(&key, &volume, moment, sweep.nrays, sweep.nbins);
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "a deadline must fail the read, got {result:?}"
+            );
+        }
+        for s in &volume.sweeps {
+            for m in &s.moments {
+                assert!(
+                    !pixel_cache().is_known_bad(&cache_id, &m.dataset_path),
+                    "a deadline must not mark `{}` bad",
+                    m.dataset_path
+                );
+            }
+        }
+        let raw = pix
+            .moment(&key, &volume, moment, sweep.nrays, sweep.nbins)
+            .unwrap()
+            .expect("the retry reads the moment");
+        assert_eq!(raw.shape(), (sweep.nrays, sweep.nbins));
+    }
+
+    /// #993: the 3D batch read fails the request on a deadline instead of
+    /// returning an empty set (which the voxel-grid cache would keep).
+    #[test]
+    fn volume_moments_deadline_is_an_error_and_a_retry_reads() {
+        let (source, key, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let quantity = volume.sweeps[0].moments[0].quantity.clone();
+        {
+            let _deadline = expired_deadline();
+            assert!(matches!(
+                pix.volume_moments(&volume, &key, &quantity),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+        }
+        let moments = pix.volume_moments(&volume, &key, &quantity).unwrap();
+        assert!(!moments.is_empty(), "the retry reads the quantity's sweeps");
+    }
+
+    /// #993: a missing object is unusable data (nodata, negatively cached),
+    /// unlike a deadline.
+    #[test]
+    fn moment_missing_object_is_known_bad_nodata() {
+        let (source, _, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let missing = unique_file_id();
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+        assert!(pix
+            .moment(&missing, &volume, moment, sweep.nrays, sweep.nbins)
+            .unwrap()
+            .is_none());
+        let cache_id = pixel_cache_id(&source, &missing);
+        assert!(pixel_cache().is_known_bad(&cache_id, &moment.dataset_path));
+    }
+
+    /// #993: any storage failure other than a missing object is retryable:
+    /// it surfaces as 503 (`ResourceExhausted`), never as nodata, and the
+    /// detail stays in the log.
+    #[test]
+    fn storage_failures_classify_as_retryable() {
+        for (err, want_deadline) in [
+            (DataServerError::DeadlineExceeded, true),
+            (DataServerError::ResourceExhausted, false),
+            (DataServerError::Storage("HTTP 503 SlowDown".into()), false),
+            (
+                DataServerError::Io(std::io::Error::other("connection reset")),
+                false,
+            ),
+        ] {
+            match PixelReadError::from_storage("k", err) {
+                PixelReadError::Abort(DataServerError::DeadlineExceeded) => assert!(want_deadline),
+                PixelReadError::Abort(DataServerError::ResourceExhausted) => {
+                    assert!(!want_deadline)
+                }
+                other => panic!("expected a retryable abort, got {other:?}"),
+            }
+        }
+    }
+
+    /// #993: a map render whose pixel read hits the deadline fails (503)
+    /// instead of returning an empty tile the tile caches would keep.
+    #[test]
+    fn polar_sample_deadline_fails_the_render() {
+        let (source, key, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let quantity = volume.sweeps[0].moments[0].quantity.clone();
+        let (lon, lat) = (volume.site.lon, volume.site.lat);
+        let bbox = [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5];
+        let render = || {
+            polar_sample(
+                &volume,
+                &key,
+                pix,
+                &quantity,
+                bbox,
+                8,
+                8,
+                &OutputCrs::Wgs84,
+                None,
+                ResamplingMethod::Nearest,
+            )
+        };
+        {
+            let _deadline = expired_deadline();
+            assert!(matches!(render(), Err(DataServerError::DeadlineExceeded)));
+        }
+        let cache_id = pixel_cache_id(&source, &key);
+        let path = &volume.sweeps[0].moments[0].dataset_path;
+        assert!(!pixel_cache().is_known_bad(&cache_id, path));
+        render().expect("the retry renders");
+        assert!(
+            pixel_cache().capacity() == 0 || pixel_cache().contains(&cache_id, path),
+            "the retry read the moment"
+        );
+    }
+
+    /// Remote site volumes nothing has read yet: each sample is a fetch.
+    fn unread_remote_volumes(n: usize) -> (Source, Vec<VolumeEntry>) {
+        let source = dummy_remote("deadline-walk");
+        let volumes = (0..n)
+            .map(|i| {
+                let mut volume = synthetic_volume(25.0, 60.0);
+                volume.time = Utc::now() - chrono::Duration::minutes(5 * (n - i) as i64);
+                VolumeEntry {
+                    id: unique_file_id(),
+                    volume: Arc::new(volume),
+                }
+            })
+            .collect();
+        (source, volumes)
+    }
+
+    fn assert_none_marked_bad(source: &Source, volumes: &[VolumeEntry]) {
+        for e in volumes {
+            let cache_id = pixel_cache_id(source, &e.id);
+            for s in &e.volume.sweeps {
+                for m in &s.moments {
+                    assert!(
+                        !pixel_cache().is_known_bad(&cache_id, &m.dataset_path),
+                        "`{}` of `{}` was marked bad",
+                        m.dataset_path,
+                        e.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// #993: the cross-section walk returns the deadline (504) instead of
+    /// answering empty sections and marking every remaining sweep bad.
+    #[test]
+    fn trajectory_deadline_stops_the_walk_without_marking_sweeps_bad() {
+        let (source, volumes) = unread_remote_volumes(3);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let path = vec![(25.0, 60.0), (25.2, 60.0)];
+        {
+            let _deadline = expired_deadline();
+            let result = site_trajectory(&volumes, pix, &path, None, None, None, None);
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "got {:?}",
+                result.map(|_| ())
+            );
+            // The section itself propagates a read cut off by the deadline.
+            let section = volume_section(
+                &volumes[0],
+                pix,
+                &path,
+                &[0.0, 500.0],
+                &["DBZH".to_string()],
+                (0.0, 1.0),
+                None,
+            );
+            assert!(matches!(section, Err(DataServerError::DeadlineExceeded)));
+        }
+        assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// #993: position queries (time series at a level, and profiles) return
+    /// the deadline instead of nulls with the sweeps marked bad.
+    #[test]
+    fn position_deadline_is_an_error_without_marking_sweeps_bad() {
+        let (source, volumes) = unread_remote_volumes(3);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let (lon, lat) = (25.1, 60.0);
+        let _deadline = expired_deadline();
+        for levels in [Some(&[0.5][..]), None] {
+            let result = site_coverages(&volumes, pix, lon, lat, None, None, levels);
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "levels {levels:?}: got {:?}",
+                result.map(|c| c.len())
+            );
+        }
+        let series = level_series(
+            &volumes.iter().collect::<Vec<_>>(),
+            pix,
+            lon,
+            lat,
+            0.5,
+            &["DBZH".to_string()],
+            &volumes.iter().map(|e| e.volume.time).collect::<Vec<_>>(),
+        );
+        assert!(matches!(series, Err(DataServerError::DeadlineExceeded)));
+        let profile = volume_profile(&volumes[0], pix, lon, lat, &["DBZH".to_string()]);
+        assert!(matches!(profile, Err(DataServerError::DeadlineExceeded)));
+        assert_none_marked_bad(&source, &volumes);
     }
 
     /// A dummy file source for the lazy-pixel context; never actually read,
@@ -6920,6 +7305,7 @@ mod tests {
             site_lat,
             &["DBZH".to_string(), "VRADH".to_string()],
         )
+        .unwrap()
         .expect("finite sweeps must produce a coverage");
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
@@ -6973,6 +7359,7 @@ mod tests {
             site_lat,
             &["DBZH".to_string()],
         )
+        .unwrap()
         .expect("one finite sweep remains, so a coverage is produced");
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
@@ -7004,7 +7391,8 @@ mod tests {
             site_lon,
             site_lat,
             &["DBZH".to_string()],
-        );
+        )
+        .unwrap();
         assert!(result.is_none(), "expected None, got {result:?}");
     }
 

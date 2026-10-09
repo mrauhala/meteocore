@@ -105,6 +105,18 @@ around `ds-storage` calls (Critical Rules 6–7).
   visitor inserts one array at a time; no raw-file cache is retained. Per-file
   locks coalesce concurrent misses and callers recheck caches under the lock.
   Optional corrupt siblings never fail the requested moment.
+- **A read that fails is not bad data (#993).** `Pixels::moment` is
+  `Ok(None)` only for unusable data (missing file/object, HDF5 open or decode
+  failure), which `mark_bad` negatively caches and samplers draw as nodata.
+  A request deadline (`DeadlineExceeded`) or any other storage failure
+  (`ResourceExhausted`, detail logged) is `Err`: never `mark_bad`, never
+  nodata. Every sampler propagates it (`?`), so WMS/Maps/Tiles answer 503 and
+  the meta-tile / rendered caches store nothing (they cache only `Ok` tiles),
+  and EDR walks over volumes stop at the first such error (504/503). A
+  missing remote object is told apart through `DataStore::get_opt[_on]`
+  (typed `NotFound`), never by matching error strings. A cold fetch the
+  deadline cuts off is discarded; finishing it in the background is not
+  implemented.
 - Undetect vs nodata: `RawPixels::sample_class` (`src/reader.rs`)
   distinguishes `Value`/`Undetect`/`Masked` — clear air (`undetect`) is a
   measurement, the cone of silence (`nodata`) is not. `voxel_grid_from_volume`
@@ -139,7 +151,9 @@ around `ds-storage` calls (Critical Rules 6–7).
   through one file fetch and HDF5 open. `PixelCache::load_many` serializes
   same-file batches and rechecks the shared cache before decoding. The render
   retains decoded Arcs so eviction or a disabled cache cannot cause rereads
-  inside its sampling loop. Failed moments keep the existing known-bad policy.
+  inside its sampling loop. Unusable moments keep the known-bad policy; a
+  deadline or storage failure fails `volume_moments` (#993), so the voxel-grid
+  cache never keeps an empty grid for it.
 
 
 Encoder-side rules live in `crates/ds-3dtiles/CLAUDE.md`; API routes/caching
