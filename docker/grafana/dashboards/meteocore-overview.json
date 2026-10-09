@@ -1660,7 +1660,7 @@
     {
       "type": "timeseries",
       "title": "PVOL pixel cache — eviction pressure (#476)",
-      "description": "The #461/#472 pre-warm keeps every advertised timestep's lowest sweep resident — IF it fits. Sustained inserts/s while entries stay flat at capacity = LRU churn: pre-warmed frames evicted, and the next animation pays burst S3/disk re-reads (the 11 s fikan renders). Fix: raise MC_PVOL_PIXEL_CACHE_MB above the working set (sites × window/cadence × ~4 MB).",
+      "description": "The #461/#472 pre-warm keeps every advertised timestep's lowest-sweep default quantity (DBZH) resident — IF it fits. Unread inserts share half the budget (#992 hot allocation 0.5), first in, first out. Sustained inserts/s while entries stay flat at capacity = churn: pre-warmed frames evicted, and the next animation pays burst S3/disk re-reads (the 11 s fikan renders). Fix: raise MC_PVOL_PIXEL_CACHE_MB to twice the working set (sites × window/cadence × one sweep, ~0.2–0.4 MB FMI).",
       "id": 26,
       "gridPos": {
         "h": 8,

@@ -29,6 +29,23 @@ fn weigh_pixels(key: &PixelKey, val: &Arc<RawPixels>) -> u64 {
     val.size_bytes() as u64 + key.0.len() as u64 + key.1.len() as u64 + 64
 }
 
+/// Share of each cache shard's budget targeted for `quick_cache`'s "hot"
+/// ring (#992). The library default, `0.97`, suits caches filled by reads,
+/// but this one is filled ahead of reads by the poll-time pre-warm: under the
+/// default the hot ring stays full of whatever was inserted first after
+/// start, and every pre-warmed sweep competes for the remaining 3 % cold
+/// ring, where it was evicted within minutes. At `0.5` half the budget is
+/// cold, so a pre-warmed sweep stays resident about 16× longer, and entries
+/// read while cold still move to the hot ring and displace the stale ones.
+///
+/// Not lower, because the hot target also caps the largest entry the cache
+/// admits: `0.5 × capacity / shards`. Shards are halved until each holds
+/// about 31 × 256 KiB, so for any capacity of 8 MiB or more an entry up to
+/// about 3.9 MiB is admitted whatever the CPU count, which covers a full
+/// 720 × 1000 f32 sweep (2.75 MiB). At `0.3` that floor would be 2.3 MiB,
+/// and such a sweep would miss on every request on a many-core host.
+const PIXEL_CACHE_HOT_ALLOCATION: f64 = 0.5;
+
 /// Count cap on the negative (known-bad) cache. Bounds the memory a burst of
 /// distinct failing keys can pin; entries age out by LRU so a transient
 /// failure is retried once evicted.
@@ -57,11 +74,14 @@ impl PixelCache {
     /// no-op — so a misconfiguration can't silently hold one giant entry.
     pub fn new(capacity_mb: u64) -> Self {
         // One FMI moment ≈ 360×500×2 ≈ 360 KB; estimate items at ~256 KB.
+        // The estimate also sets the shard floor that bounds the largest
+        // admitted entry (see `PIXEL_CACHE_HOT_ALLOCATION`).
         PixelCache {
-            inner: ByteBoundedCache::new(
+            inner: ByteBoundedCache::new_with_hot_allocation(
                 capacity_mb.saturating_mul(ds_cache::MIB),
                 256 * 1024,
                 weigh_pixels,
+                PIXEL_CACHE_HOT_ALLOCATION,
             ),
             negative: Cache::new(NEGATIVE_CAPACITY_ITEMS),
             inserts: AtomicU64::new(0),
@@ -339,6 +359,77 @@ mod tests {
             assert!(!c.mark_bad("k", "/d"));
         }
     }
+    /// A full 720-ray × 1000-bin f32 sweep (2.75 MiB), the largest moment
+    /// the pixel cache must hold.
+    fn large_f32_sweep() -> Arc<RawPixels> {
+        Arc::new(RawPixels::F32(ndarray::Array2::zeros((720, 1000))))
+    }
+
+    /// #992: the hot target caps the largest admitted entry, so a lower hot
+    /// allocation must still admit a full f32 sweep, at the default size and
+    /// down to 8 MiB. From 8 MiB up the item estimate keeps every shard at
+    /// 8 MiB or more, so 64 and 256 MiB are the worst case of a many-core
+    /// host on any machine.
+    #[test]
+    fn full_f32_sweep_is_admitted_at_every_sensible_size() {
+        let sweep = large_f32_sweep();
+        assert_eq!(sweep.size_bytes(), 720 * 1000 * 4);
+        for mb in [
+            8,
+            16,
+            64,
+            256,
+            crate::volume_engine::DEFAULT_PIXEL_CACHE_MB,
+            4096,
+        ] {
+            let cache = PixelCache::new(mb);
+            cache.insert("volume", "/dataset1/data1/data", sweep.clone());
+            assert!(
+                cache.contains("volume", "/dataset1/data1/data"),
+                "a 720×1000 f32 sweep must be cached at {mb} MiB"
+            );
+        }
+    }
+
+    /// #992: pre-warmed sweeps must survive the inserts that follow them. The
+    /// cache is first filled to twice its budget with unread 360×500 u8
+    /// sweeps (the steady state in production: nothing promoted, the hot ring
+    /// full of old entries), then one site-hour of pre-warm (12 sweeps) is
+    /// inserted, then another 10 % of the budget. Under the default 0.97 hot
+    /// target each 8 MiB shard has a cold ring of about one such sweep, so the
+    /// later inserts evict the pre-warmed ones; at 0.5 the cold ring holds
+    /// about 23 per shard against about 6 expected arrivals.
+    #[test]
+    fn prewarmed_sweeps_survive_later_inserts() {
+        let mb = 64;
+        let cache = PixelCache::new(mb);
+        let sweep = Arc::new(RawPixels::U8(ndarray::Array2::zeros((360, 500))));
+        let budget = mb * ds_cache::MIB;
+        let per_entry = sweep.size_bytes() as u64;
+        let insert_run = |prefix: &str, bytes: u64| {
+            for i in 0..bytes / per_entry {
+                cache.insert(
+                    &format!("{prefix}-{i}"),
+                    "/dataset1/data1/data",
+                    sweep.clone(),
+                );
+            }
+        };
+        insert_run("old", 2 * budget);
+        for i in 0..12 {
+            cache.insert(
+                &format!("prewarm-{i}"),
+                "/dataset1/data1/data",
+                sweep.clone(),
+            );
+        }
+        insert_run("later", budget / 10);
+        let resident = (0..12)
+            .filter(|i| cache.contains(&format!("prewarm-{i}"), "/dataset1/data1/data"))
+            .count();
+        assert_eq!(resident, 12, "pre-warmed sweeps evicted by later inserts");
+    }
+
     fn raw() -> RawPixels {
         RawPixels::U8(ndarray::Array2::zeros((2, 2)))
     }
