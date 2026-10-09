@@ -103,7 +103,48 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// is only a hash-map sizing hint (expected typical entry weight); the
     /// eviction budget is always `capacity_bytes`.
     pub fn new(capacity_bytes: u64, approx_entry_bytes: u64, weigh: fn(&K, &V) -> u64) -> Self {
-        Self::build(capacity_bytes, approx_entry_bytes, weigh, None)
+        Self::build(capacity_bytes, approx_entry_bytes, weigh, None, None)
+    }
+
+    /// Like [`Self::new`], but with `hot_allocation` (in `(0, 1]`) of each
+    /// shard's budget as the target for the "hot" ring instead of
+    /// `quick_cache`'s default `0.97`.
+    ///
+    /// `quick_cache` is not a plain LRU. An insert enters the hot ring only
+    /// while the hot ring is under its target; otherwise it enters the cold
+    /// ring, which holds the rest of the budget and evicts first-in,
+    /// first-out unless an entry was read while there (it is then promoted
+    /// to hot). Under the default, once the first 97 % of the budget has
+    /// been inserted, every later entry that is not read soon competes for
+    /// the remaining 3 %. A cache filled ahead of reads (a background
+    /// pre-warm) needs a lower value so fresh entries survive until they
+    /// are wanted (#992).
+    ///
+    /// The cost: `quick_cache` never admits an entry heavier than the hot
+    /// target of its shard, `hot_allocation × capacity / shards`. Shards are
+    /// halved until each one's item estimate reaches 32, so with
+    /// `capacity_bytes ≥ 32 × approx_entry_bytes` a shard holds at least
+    /// about `31 × approx_entry_bytes`, and the largest admitted entry is at
+    /// least about `hot_allocation × 31 × approx_entry_bytes` whatever the
+    /// CPU count. Below that the cache is one shard and the bound is
+    /// `hot_allocation × capacity_bytes`.
+    pub fn new_with_hot_allocation(
+        capacity_bytes: u64,
+        approx_entry_bytes: u64,
+        weigh: fn(&K, &V) -> u64,
+        hot_allocation: f64,
+    ) -> Self {
+        assert!(
+            hot_allocation > 0.0 && hot_allocation <= 1.0,
+            "hot_allocation must be in (0, 1], got {hot_allocation}"
+        );
+        Self::build(
+            capacity_bytes,
+            approx_entry_bytes,
+            weigh,
+            None,
+            Some(hot_allocation),
+        )
     }
 
     /// Like [`Self::new`], but the whole budget is one LRU. `quick_cache`
@@ -118,7 +159,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         approx_entry_bytes: u64,
         weigh: fn(&K, &V) -> u64,
     ) -> Self {
-        Self::build(capacity_bytes, approx_entry_bytes, weigh, Some(1))
+        Self::build(capacity_bytes, approx_entry_bytes, weigh, Some(1), None)
     }
 
     fn build(
@@ -126,6 +167,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         approx_entry_bytes: u64,
         weigh: fn(&K, &V) -> u64,
         shards: Option<usize>,
+        hot_allocation: Option<f64>,
     ) -> Self {
         // `max(16)` keeps a small/zero capacity valid (a near-disabled cache
         // that holds nothing still needs a non-zero item estimate).
@@ -136,6 +178,9 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             .weight_capacity(capacity_bytes.max(1));
         if let Some(shards) = shards {
             options.shards(shards);
+        }
+        if let Some(hot_allocation) = hot_allocation {
+            options.hot_allocation(hot_allocation);
         }
         ByteBoundedCache {
             cache: quick_cache::sync::Cache::with_options(
@@ -425,6 +470,68 @@ mod tests {
         cache.insert("x".to_string(), vec![0u8; 35]);
         assert!(cache.weight() <= 64 * 100);
         assert!(keys.iter().any(|key| !cache.contains_key(key)));
+    }
+
+    /// Weight = the value itself, so tests can model large entries without
+    /// allocating them.
+    #[allow(clippy::ptr_arg)]
+    fn weigh_declared(_key: &String, val: &u64) -> u64 {
+        *val
+    }
+
+    /// Fill a one-shard cache past its budget without reading anything (the
+    /// hot ring is then full of the oldest entries), insert 10 fresh entries,
+    /// then 30 more, and count the fresh entries still resident.
+    fn fresh_survivors(hot_allocation: Option<f64>) -> usize {
+        let cache =
+            ByteBoundedCache::build(100 * 1000, 1000, weigh_declared, Some(1), hot_allocation);
+        for i in 0..300 {
+            cache.insert(format!("old{i}"), 1000);
+        }
+        for i in 0..10 {
+            cache.insert(format!("fresh{i}"), 1000);
+        }
+        for i in 0..30 {
+            cache.insert(format!("later{i}"), 1000);
+        }
+        (0..10)
+            .filter(|i| cache.contains_key(&format!("fresh{i}")))
+            .count()
+    }
+
+    /// #992: under the default 0.97 hot target, unread inserts share a cold
+    /// ring of 3 % of the budget, so 30 % of the budget inserted later evicts
+    /// them all. At 0.5 the cold ring is half the budget and they stay.
+    #[test]
+    fn hot_allocation_keeps_fresh_unread_inserts_resident() {
+        assert_eq!(fresh_survivors(None), 0, "default policy evicts them");
+        assert_eq!(fresh_survivors(Some(0.5)), 10, "0.5 keeps them");
+    }
+
+    /// The hot target bounds the largest admitted entry per shard. Asking for
+    /// 1024 shards forces the item-count floor (`32` items of
+    /// `approx_entry_bytes` per shard): 1 GiB / 256 KiB = 4096 items gives
+    /// 128 shards of 8 MiB, so at 0.5 the largest entry is 4 MiB (the
+    /// documented floor, `0.5 × 31 × approx_entry_bytes`, is just below).
+    #[test]
+    fn hot_allocation_bounds_the_largest_admitted_entry() {
+        let cache = ByteBoundedCache::build(
+            1024 * MIB,
+            256 * 1024,
+            weigh_declared,
+            Some(1024),
+            Some(0.5),
+        );
+        cache.insert("fits".to_string(), 4 * MIB);
+        assert!(cache.contains_key(&"fits".to_string()));
+        cache.insert("too-big".to_string(), 4 * MIB + 1);
+        assert!(!cache.contains_key(&"too-big".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "hot_allocation must be in (0, 1]")]
+    fn zero_hot_allocation_is_rejected() {
+        let _ = ByteBoundedCache::new_with_hot_allocation(MIB, 1024, weigh_declared, 0.0);
     }
 
     #[test]

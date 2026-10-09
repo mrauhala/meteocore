@@ -2166,10 +2166,12 @@ pub struct OdimConfig {
     /// whole-`.h5` read on a render-semaphore permit — the cause of dropped
     /// frames on remote sources (#461) and of off-peak p99 spikes on local
     /// ones, whose page cache is reclaimed between renders (#472). Default `1`
-    /// (the lowest sweep — the standard base-reflectivity animation view, all
-    /// of its quantities). Set higher to warm more tilts, `0` to disable.
-    /// Bounded by the pixel-cache byte budget (`MC_PVOL_PIXEL_CACHE_MB`);
-    /// pre-warmed entries that overflow it evict by LRU like any other.
+    /// (the lowest sweep — the standard base-reflectivity animation view).
+    /// Only the volume's default quantity (`DBZH`, else `TH`, else the first)
+    /// is warmed, the one an unqualified layer renders; other quantities read
+    /// on first use (#992). Set higher to warm more tilts, `0` to disable.
+    /// Bounded by the pixel-cache byte budget (`MC_PVOL_PIXEL_CACHE_MB`), half
+    /// of which holds pre-warmed entries until they are read.
     #[serde(default = "default_prewarm_sweeps")]
     pub prewarm_sweeps: usize,
 }

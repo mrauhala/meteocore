@@ -76,11 +76,28 @@ around `ds-storage` calls (Critical Rules 6–7).
   poll loop already holds each new volume's bytes; `prewarm_pixels` (called
   from BOTH arms of `build_catalog` — remote AND local; local page cache is
   reclaimed off-peak, #472) decodes the lowest `prewarm_sweeps` sweeps'
-  moments straight from those bytes on the background runtime into
-  `PIXEL_CACHE`. Best-effort + additive (never marks known-bad;
-  `PixelCache::contains` skips already-resident moments); bounded by the
-  pixel-cache byte LRU (`MC_PVOL_PIXEL_CACHE_MB`). `0` disables; default `1`
-  warms the base tilt (the standard reflectivity animation view).
+  **default quantity only** (`prewarm_requests`: `DBZH`, else `TH`, else
+  the first — `default_quantity_of`, the same rule as the advertised
+  `default_quantity` and the bare-layer render, #992) straight from those
+  bytes on the background runtime into `PIXEL_CACHE`. Warming every moment
+  of the base sweep wrote ~a dozen arrays per volume and evicted the
+  reflectivity frames; other quantities and EDR read lazily. Best-effort +
+  additive (never marks known-bad; `PixelCache::contains` skips
+  already-resident moments); bounded by the pixel-cache byte budget
+  (`MC_PVOL_PIXEL_CACHE_MB`). `0` disables; default `1` warms the base tilt
+  (the standard reflectivity animation view).
+- **Pixel cache policy (#992).** `PIXEL_CACHE` is filled ahead of reads, so
+  it is built with `ByteBoundedCache::new_with_hot_allocation(…, 0.5)`
+  (`PIXEL_CACHE_HOT_ALLOCATION`), not quick_cache's default 0.97. Under the
+  default the hot ring kept whatever was inserted first after start, and
+  every pre-warmed sweep shared a 3 % cold ring: evicted within minutes, so
+  animation frames were cold multi-second reads against the 3 s render
+  deadline. At 0.5 unread inserts get half the budget, first in, first out;
+  a read promotes an entry to hot. Do not go below ~0.4: the hot target
+  also caps the largest admitted entry (`0.5 × capacity / shards`, shards
+  floored at ~31 × the 256 KiB entry estimate ⇒ ≥ ~3.9 MiB from 8 MiB up),
+  and a 720 × 1000 f32 sweep (2.75 MiB) must fit — pinned by
+  `full_f32_sweep_is_admitted_at_every_sensible_size`.
 - **Cold pixel batches (#293):** a request-time miss fetches and opens the
   source-qualified file once, decoding the requested moment first and then
   uncached siblings (same quantity first). Speculation is capped at a quarter

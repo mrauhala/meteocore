@@ -251,6 +251,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   into equal per-shard slices, so entries that fit the total can still be
   evicted: a caller that plans what stays resident uses
   `new_single_shard` / `from_env_single_shard` (engine-satellite's scans).
+  quick_cache keeps 97 % of a shard for entries inserted first or read, so
+  unread fresh inserts share 3 %: a cache filled ahead of reads (a
+  pre-warm) uses `new_with_hot_allocation` (engine-odim's `PIXEL_CACHE`,
+  0.5, #992). The hot share also caps the largest entry a shard admits.
 - **API crates depend on ds-core and api-common** (shared Common HTTP glue),
   plus ds-executor for bounded render execution,
   ds-render for
