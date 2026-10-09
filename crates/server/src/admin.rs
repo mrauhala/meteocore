@@ -4356,26 +4356,35 @@ pub fn validate_style_colormaps(
     Ok(())
 }
 
-/// Update the health gauges from the current health vector.
-pub fn update_health_gauges(health: &[CollectionHealth]) {
-    let total = health.len() as i64;
-    let healthy = health
-        .iter()
-        .filter(|h| h.status == CollectionStatus::Ready)
-        .count() as i64;
-    let degraded = health
-        .iter()
-        .filter(|h| h.status == CollectionStatus::Degraded)
-        .count() as i64;
-    let failed = health
-        .iter()
-        .filter(|h| h.status == CollectionStatus::Failed)
-        .count() as i64;
+/// Per-status collection counts — what the `collections_*` gauges report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthCounts {
+    pub total: i64,
+    pub healthy: i64,
+    pub degraded: i64,
+    pub failed: i64,
+}
 
-    COLLECTIONS_TOTAL.set(total);
-    COLLECTIONS_HEALTHY.set(healthy);
-    COLLECTIONS_DEGRADED.set(degraded);
-    COLLECTIONS_FAILED.set(failed);
+impl HealthCounts {
+    pub fn of(health: &[CollectionHealth]) -> Self {
+        let count = |status| health.iter().filter(|h| h.status == status).count() as i64;
+        HealthCounts {
+            total: health.len() as i64,
+            healthy: count(CollectionStatus::Ready),
+            degraded: count(CollectionStatus::Degraded),
+            failed: count(CollectionStatus::Failed),
+        }
+    }
+}
+
+/// Update the health gauges from a health vector, returning what was set.
+pub fn update_health_gauges(health: &[CollectionHealth]) -> HealthCounts {
+    let counts = HealthCounts::of(health);
+    COLLECTIONS_TOTAL.set(counts.total);
+    COLLECTIONS_HEALTHY.set(counts.healthy);
+    COLLECTIONS_DEGRADED.set(counts.degraded);
+    COLLECTIONS_FAILED.set(counts.failed);
+    counts
 }
 
 // ---------------------------------------------------------------------------
@@ -5158,8 +5167,15 @@ fn apply_load(
     })
 }
 
-/// GET /health — per-collection health status with data staleness info.
-pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
+/// The health `/health` reports and the `collections_*` gauges count: the
+/// load/reload snapshot with every live signal applied on top (#990). One
+/// function so the endpoint and the gauges cannot drift — the gauges used to
+/// keep the boot snapshot until the next reload.
+///
+/// Cheap enough for every `/metrics` scrape: one clone of the snapshot plus
+/// O(collections) atomic/`ArcSwap` reads, no I/O. Each lock is taken and
+/// released on its own, never nested.
+pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
     let mut health = state
         .health
         .read()
@@ -5250,6 +5266,40 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             }
         }
     }
+
+    // Nowcast: the boot `Degraded ("waiting for first nowcast generation")`
+    // flips to `Ready` once a generation exists.
+    {
+        let engines = state
+            .nowcast_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let has_data: HashMap<&str, bool> = engines
+            .iter()
+            .map(|e| (e.collection_id(), e.has_data()))
+            .collect();
+        for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
+            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
+                h.status = CollectionStatus::Ready;
+                h.error = None;
+            }
+        }
+    }
+
+    health
+}
+
+/// Set the `collections_*` gauges from [`effective_health`] — the same live
+/// view `/health` reports, so a collection degraded at boot leaves the count
+/// once it recovers rather than at the next reload (#990). Every `/metrics`
+/// scrape calls this.
+pub(crate) fn refresh_health_gauges(state: &ServerState) -> HealthCounts {
+    update_health_gauges(&effective_health(state))
+}
+
+/// GET /health — per-collection health status with data staleness info.
+pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    let health = effective_health(&state);
 
     // Build per-collection metadata from concrete engine types.
     // Uses EDR-style temporal extent format: { interval, values? }
@@ -5394,28 +5444,19 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 
     {
         // Nowcast engines: `data_age_secs` is the age of the latest
-        // generation's anchor frame; the boot `Degraded ("waiting for first
-        // nowcast generation")` flips to `Ready` once a generation exists.
+        // generation's anchor frame (the Ready flip is in `effective_health`).
         let engines = state
             .nowcast_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let mut has_data: HashMap<&str, bool> = HashMap::new();
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            has_data.insert(engine.collection_id(), engine.has_data());
             if let Some(age) = engine.catalog_age() {
                 data_ages.insert(id.clone(), age.num_seconds());
             }
             let times = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).times;
             if let Some(temporal) = temporal_from_times(&times) {
                 temporal_info.insert(id, temporal);
-            }
-        }
-        for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
-            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
-                h.status = CollectionStatus::Ready;
-                h.error = None;
             }
         }
     }
@@ -5469,6 +5510,9 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 /// Updates gauge-style metrics from engine/cache state before gathering,
 /// so Prometheus always gets a fresh snapshot.
 pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    // First, before any metrics lock.
+    refresh_health_gauges(&state);
+
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
@@ -8429,5 +8473,178 @@ colormap = "no_such_map"
             assert!(warning.contains("restart to apply"), "{warning}");
         }
         assert!(super::init_render_concurrency(Some(4)).is_err());
+    }
+
+    /// #990 harness: one file-fed CAP collection (live `Ready` once its
+    /// source loaded) and one WIS2-fed one (live `Degraded` while no broker
+    /// session exists; tests run no poll loop).
+    fn live_health_state() -> (tempfile::TempDir, super::AdminState) {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/cap");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"cap-file\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"cap\"\napis = [\"features\"]\n\
+                 [collections.cap]\ndata_path = \"{fixture}\"\n\
+                 [[collections]]\nid = \"cap-wis2\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"cap\"\napis = [\"features\"]\n\
+                 [collections.cap]\n[collections.cap.wis2]\n\
+                 topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n"
+            ),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        (dir, state)
+    }
+
+    /// Overwrite one entry of the load/reload snapshot — what the boot
+    /// recorded before the engine's live status moved on.
+    fn set_snapshot(
+        state: &super::AdminState,
+        id: &str,
+        status: super::CollectionStatus,
+        error: Option<&str>,
+    ) {
+        let mut health = state.health.write().unwrap();
+        let h = health.iter_mut().find(|h| h.id == id).unwrap();
+        h.status = status;
+        h.error = error.map(str::to_string);
+    }
+
+    async fn health_json(state: &super::AdminState) -> serde_json::Value {
+        use axum::response::IntoResponse;
+        let response = super::health_handler(axum::extract::State(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn health_status<'a>(json: &'a serde_json::Value, id: &str) -> &'a str {
+        json["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no /health entry for {id}"))["status"]
+            .as_str()
+            .unwrap()
+    }
+
+    fn counts(total: i64, healthy: i64, degraded: i64, failed: i64) -> super::HealthCounts {
+        super::HealthCounts {
+            total,
+            healthy,
+            degraded,
+            failed,
+        }
+    }
+
+    /// `/health` serializes exactly the [`super::effective_health`] entries.
+    fn assert_health_matches(json: &serde_json::Value, effective: &[super::CollectionHealth]) {
+        let entries = json["collections"].as_array().unwrap();
+        assert_eq!(entries.len(), effective.len());
+        for (entry, h) in entries.iter().zip(effective) {
+            assert_eq!(entry["id"], h.id.as_str());
+            assert_eq!(entry["status"], serde_json::to_value(h.status).unwrap());
+            assert_eq!(
+                entry.get("error").and_then(|e| e.as_str()),
+                h.error.as_deref()
+            );
+        }
+    }
+
+    /// #990: a collection degraded in the boot snapshot whose engine now
+    /// reports live `Ready` is counted healthy by the `/metrics` gauges, and
+    /// `/health` agrees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_gauges_count_boot_degraded_collection_live_ready() {
+        use super::{CollectionStatus, HealthCounts};
+        let (_dir, state) = live_health_state();
+        assert_eq!(state.cap_engines.read().unwrap().len(), 2);
+        // The WIS2 collection is degraded at load (no broker session yet);
+        // the file-fed one is recorded degraded as if its first load failed.
+        set_snapshot(
+            &state,
+            "cap-file",
+            CollectionStatus::Degraded,
+            Some("initial load failed (will retry on poll)"),
+        );
+        // What the gauges reported before #990: the snapshot alone.
+        assert_eq!(
+            HealthCounts::of(&state.health.read().unwrap()),
+            counts(2, 0, 2, 0)
+        );
+
+        let effective = super::effective_health(&state);
+        let file = effective.iter().find(|h| h.id == "cap-file").unwrap();
+        assert_eq!(
+            (file.status, file.error.as_deref()),
+            (CollectionStatus::Ready, None)
+        );
+        assert_eq!(super::refresh_health_gauges(&state), counts(2, 1, 1, 0));
+
+        let json = health_json(&state).await;
+        assert_eq!(health_status(&json, "cap-file"), "ready");
+        assert_health_matches(&json, &effective);
+        // The overlay never writes back into the recorded snapshot.
+        let snapshot = state.health.read().unwrap();
+        let file = snapshot.iter().find(|h| h.id == "cap-file").unwrap();
+        assert_eq!(file.status, CollectionStatus::Degraded);
+    }
+
+    /// #990: a collection recorded ready whose engine now reports live
+    /// `Degraded` is counted degraded by the gauges, and `/health` agrees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_gauges_count_live_degraded_collection() {
+        use super::{CollectionStatus, HealthCounts};
+        let (_dir, state) = live_health_state();
+        set_snapshot(&state, "cap-wis2", CollectionStatus::Ready, None);
+        assert_eq!(
+            HealthCounts::of(&state.health.read().unwrap()),
+            counts(2, 2, 0, 0)
+        );
+
+        let effective = super::effective_health(&state);
+        let wis2 = effective.iter().find(|h| h.id == "cap-wis2").unwrap();
+        assert_eq!(
+            (wis2.status, wis2.error.as_deref()),
+            (
+                CollectionStatus::Degraded,
+                Some("connecting to WIS2 broker")
+            )
+        );
+        assert_eq!(super::refresh_health_gauges(&state), counts(2, 1, 1, 0));
+
+        let json = health_json(&state).await;
+        assert_eq!(health_status(&json, "cap-wis2"), "degraded");
+        assert_eq!(json["status"], "degraded");
+        assert_health_matches(&json, &effective);
+    }
+
+    /// #990: a collection without a live engine (failed at load) keeps its
+    /// snapshot status in both views — the overlay only replaces what an
+    /// engine reports.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_gauges_keep_snapshot_without_live_engine() {
+        use super::{CollectionHealth, CollectionStatus};
+        let (_dir, state) = live_health_state();
+        state.health.write().unwrap().push(CollectionHealth {
+            id: "gone".into(),
+            engine_type: "cap".into(),
+            status: CollectionStatus::Failed,
+            error: Some("config error".into()),
+        });
+        assert_eq!(super::refresh_health_gauges(&state), counts(3, 1, 1, 1));
+        let json = health_json(&state).await;
+        assert_eq!(health_status(&json, "gone"), "failed");
+        assert_eq!(health_status(&json, "cap-file"), "ready");
+        assert_eq!(health_status(&json, "cap-wis2"), "degraded");
     }
 }
