@@ -722,6 +722,30 @@ pub trait MapEngine: Send + Sync {
         self.resolve_time(time, reference_time)
     }
 
+    /// [`Self::resolve_reference_time`] for one parameter: the exact model
+    /// run this engine would render `parameter` from at `time`, the run
+    /// that must key the rendered caches (#521). `None` parameter means the
+    /// one `get_raster_tile` renders by default. The API layers resolve the
+    /// run with this first, then pass it to
+    /// [`Self::resolve_parameter_time`] and the render.
+    ///
+    /// An engine that retains runs and whose run selection depends on the
+    /// parameter MUST override this with the selection `get_raster_tile`
+    /// uses. GRIB does (#1005): an hour-window aggregate missing from the
+    /// newest run's first steps renders from an older run that has it at
+    /// that time, so the parameter-blind run would key the wrong pixels.
+    /// Default: [`Self::resolve_reference_time`]. **O(log n) from a
+    /// snapshot**, before the cache lookup.
+    fn resolve_parameter_reference_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let _ = parameter;
+        self.resolve_reference_time(time, reference_time)
+    }
+
     /// [`Self::resolve_parameter_time`] for parameters rendered together,
     /// such as an RGB composite's bands: the one timestep
     /// [`Self::get_raster_tiles`] renders them all from. The API layer must
@@ -891,10 +915,15 @@ mod tests {
             default_request_time(&Engine(Some(at(5))), &info, Some("late")),
             Some(at(5))
         );
-        // The default resolution is `resolve_time`'s identity.
+        // The default resolution is `resolve_time`'s identity, and the run
+        // `resolve_reference_time`'s.
         assert_eq!(
             plain.resolve_parameter_time(Some("late"), Some(at(2)), None),
             Some(at(2))
+        );
+        assert_eq!(
+            plain.resolve_parameter_reference_time(Some("late"), Some(at(2)), Some(at(1))),
+            Some(at(1))
         );
     }
 

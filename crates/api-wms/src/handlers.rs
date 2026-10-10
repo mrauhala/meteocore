@@ -372,8 +372,11 @@ pub async fn wms_handler(
             // selection such as GRIB's cross-run fallback — a valid time the
             // newest run doesn't cover resolves to (and keys) the older run
             // actually rendered. Engines without runs keep the identity
-            // default (`None` stays `None`).
-            let reference_time = engine.resolve_reference_time(time, requested_run);
+            // default (`None` stays `None`). The run is the parameter's:
+            // GRIB renders an aggregate the newest run lacks at that time
+            // from an older run that has it (#1005).
+            let reference_time =
+                engine.resolve_parameter_reference_time(parameter.as_deref(), time, requested_run);
 
             // #507: snap that instant to the exact timestep the engine will
             // actually render, BEFORE any cache key is built. Engines that
