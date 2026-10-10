@@ -1448,6 +1448,7 @@ name = "engine-geotiff"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "axum",
  "bytes",
  "chrono",

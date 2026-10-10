@@ -45,6 +45,12 @@ apply here.
   mtime and inode. A dynamic source passes no `max_files` to the scan:
   `do_scan` trims after the metadata pass, so a file that fails to parse
   does not cost a slot.
+- **Remote header read (#1003):** `TiffMetadata::from_header_read` returns
+  `Err` when the range read fails and `Ok(None)` when the bytes are not a
+  COG header. Only `Ok(None)` takes the full-download fallback. On `Err`
+  the scan leaves the file out of the catalog, so the next poll reads its
+  header again. A timeout is not a non-COG, and a full download from the
+  same stalled storage only stalls longer.
 
 ## STAC metadata loading (#90)
 

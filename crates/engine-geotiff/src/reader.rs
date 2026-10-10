@@ -618,22 +618,38 @@ impl TiffMetadata {
     /// parses the IFD. Also extracts tile offsets, byte counts, compression,
     /// and sample type for on-demand tile reading.
     ///
-    /// Returns `None` if parsing fails (caller should fall back to full download).
+    /// The two failures mean different things (#1003):
+    /// - `Err`: the range read itself failed: a timeout, a body cut short,
+    ///   an object gone since the listing. That says nothing about the
+    ///   file's layout, and a full download would go to the same storage,
+    ///   so the caller retries the header read later.
+    /// - `Ok(None)`: the bytes arrived but are not a COG header this reader
+    ///   handles: the IFD lies past the first `HEADER_READ_SIZE` bytes, the
+    ///   compression is unsupported, or the object is empty. The caller
+    ///   falls back to a full download.
     pub fn from_header_read(
         store: &ds_storage::DataStore,
         path: &ds_storage::object_store::path::Path,
         file_size: u64,
-    ) -> Option<(Self, RemoteTileInfo)> {
+    ) -> Result<Option<(Self, RemoteTileInfo)>, DataServerError> {
         let read_size = HEADER_READ_SIZE.min(file_size as usize);
-        let header_bytes = store.get_range(path, 0..read_size).ok()?;
+        if read_size == 0 {
+            return Ok(None);
+        }
+        let header_bytes = store.get_range(path, 0..read_size)?;
+        Ok(Self::parse_header(
+            header_bytes,
+            format!("<remote:{}>", path),
+        ))
+    }
+
+    /// Parse the metadata and tile layout from the first bytes of a COG, or
+    /// `None` when they are not a COG header this reader handles.
+    fn parse_header(header_bytes: Bytes, source_name: String) -> Option<(Self, RemoteTileInfo)> {
         let cursor = Cursor::new(SharedBytes::Heap(header_bytes));
         let mut decoder = DecoderWrapper(Decoder::new(cursor).ok()?);
-
-        let metadata =
-            Self::from_decoder_wrapper(&mut decoder, format!("<remote:{}>", path)).ok()?;
-
+        let metadata = Self::from_decoder_wrapper(&mut decoder, source_name).ok()?;
         let tile_info = extract_tile_info(&mut decoder, &metadata)?;
-
         Some((metadata, tile_info))
     }
 
@@ -667,11 +683,7 @@ impl TiffMetadata {
             return None;
         }
         let header_bytes = resp.bytes().await.ok()?;
-        let cursor = Cursor::new(SharedBytes::Heap(header_bytes));
-        let mut decoder = DecoderWrapper(Decoder::new(cursor).ok()?);
-        let metadata = Self::from_decoder_wrapper(&mut decoder, format!("<http:{}>", url)).ok()?;
-        let tile_info = extract_tile_info(&mut decoder, &metadata)?;
-        Some((metadata, tile_info))
+        Self::parse_header(header_bytes, format!("<http:{}>", url))
     }
 
     /// Apply scale/offset to convert raw value to physical value.
@@ -3236,6 +3248,7 @@ mod tests {
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
         let (header_meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .expect("the header range read succeeds")
             .expect("from_header_read should succeed on test COG");
 
         // Metadata should match
@@ -3270,8 +3283,9 @@ mod tests {
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
-        let (header_meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let (header_meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
 
         let remote_source = DataSource::Remote {
             store: store.clone(),
@@ -3310,8 +3324,9 @@ mod tests {
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
-        let (meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let (meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
 
         let remote_source = DataSource::Remote {
             store: store.clone(),
@@ -3372,6 +3387,7 @@ mod tests {
             &obj_path,
             std::fs::metadata(&tif_path).unwrap().len(),
         )
+        .unwrap()
         .unwrap();
         let read_before = store.bytes_read();
         let remote = DataSource::Remote {
@@ -3867,8 +3883,9 @@ mod tests {
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
-        let (header_meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let (header_meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
 
         let remote_source = DataSource::Remote {
             store: store.clone(),
@@ -4462,8 +4479,9 @@ mod tests {
         let filename = tif_path.file_name().unwrap().to_str().unwrap();
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
-        let (meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let (meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
         let source = DataSource::Remote {
             store: store.clone(),
             path: obj_path,

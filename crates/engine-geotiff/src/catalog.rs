@@ -405,9 +405,11 @@ pub type FailedPrefix = (ObjectPath, DataServerError);
 /// [`MAX_REMOTE_FILE_SIZE`] are skipped. `spec.label` is the collection id
 /// the log lines name.
 ///
-/// Uses COG-style byte-range reads to fetch only the IFD metadata (first 64 KB)
-/// instead of downloading entire files. Falls back to full download if the
-/// header-only parse fails (e.g., non-COG layout or unsupported compression).
+/// Uses COG-style byte-range reads to fetch only the IFD metadata (the first
+/// 512 KB) instead of downloading entire files. Falls back to full download
+/// only if the header bytes do not parse as a COG (e.g., non-COG layout or
+/// unsupported compression). A storage error on the header read instead
+/// leaves the file out of this catalog, so the next scan retries it (#1003).
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
 /// Files with unchanged size reuse their cached entry (no re-download).
@@ -488,32 +490,57 @@ fn load_remote(
         }
 
         // Try COG range read first (header only)
-        if let Some((metadata, tile_info)) =
-            TiffMetadata::from_header_read(store, location, file_size)
-        {
-            tracing::debug!("[{}] {} — range read OK", collection_id, key);
-            let source = DataSource::Remote {
-                store: store.clone(),
-                path: location.clone(),
-                tile_info,
-            };
-            entries.insert(
-                datetime,
-                FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
-            );
-            continue;
+        match TiffMetadata::from_header_read(store, location, file_size) {
+            Ok(Some((metadata, tile_info))) => {
+                tracing::debug!("[{}] {} — range read OK", collection_id, key);
+                let source = DataSource::Remote {
+                    store: store.clone(),
+                    path: location.clone(),
+                    tile_info,
+                };
+                entries.insert(
+                    datetime,
+                    FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
+                );
+                continue;
+            }
+            // The header arrived but is not a COG: download it whole below.
+            Ok(None) => {
+                tracing::warn!(
+                    "[{}] {} — header is not a COG, falling back to full download ({}). \
+                     Convert to COG for faster serving.",
+                    collection_id,
+                    key,
+                    super::format_bytes(file_size)
+                );
+            }
+            // A source that ignores Range answers the header read with the
+            // whole object, which object_store rejects. Only a full download
+            // can serve it, as before #1003.
+            Err(e) if range_not_honoured(&e) => {
+                tracing::warn!(
+                    "[{}] {} — the source ignores range requests, falling back to full download ({})",
+                    collection_id,
+                    key,
+                    super::format_bytes(file_size)
+                );
+            }
+            // The storage failed, not the format (#1003): a full download
+            // would go to the same storage and could stall the same way.
+            // The file stays out of this catalog, so the next scan retries
+            // its header read.
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] {} — header read failed, retrying next poll: {e}",
+                    collection_id,
+                    key
+                );
+                continue;
+            }
         }
 
-        // Fallback: download full file — this means the file is not a valid COG
-        // (missing tiled layout or non-standard IFD). Full downloads are much slower
-        // and cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
-        tracing::warn!(
-            "[{}] {} — COG range read failed, falling back to full download ({}). \
-             Convert to COG for faster serving.",
-            collection_id,
-            key,
-            super::format_bytes(file_size)
-        );
+        // Fallback: download the full file. Full downloads are much slower and
+        // cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
         let data = match store.get(location) {
             Ok(d) => d,
             Err(e) => {
@@ -556,6 +583,15 @@ fn load_remote(
 /// This is called at engine startup. The catalog has no entries but carries
 /// the spatial and temporal extent from the STAC collection metadata.
 /// Items are fetched on-demand when queries arrive.
+/// Whether a header range read failed because the source answered with the
+/// whole object instead of the range (object_store's `NotPartial`, raised by
+/// an HTTP origin that ignores `Range`). ds-storage flattens object_store
+/// errors to text, so this matches object_store's message for that case.
+pub(crate) fn range_not_honoured(e: &DataServerError) -> bool {
+    e.to_string()
+        .contains("non-partial response when range requested")
+}
+
 pub fn init_stac_from_extent(extent: &crate::stac::StacExtent) -> Catalog {
     let temporal_extent = extent.temporal_start.map(|start| {
         let end = extent.temporal_end.unwrap_or_else(Utc::now);

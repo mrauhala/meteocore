@@ -6,6 +6,8 @@ mod parse;
 mod range_batch;
 mod reader;
 #[cfg(test)]
+mod remote_header_tests;
+#[cfg(test)]
 mod stac_preload_tests;
 
 /// Snapshot of the process-global decoded-chunk cache (#463) for `/metrics`:
