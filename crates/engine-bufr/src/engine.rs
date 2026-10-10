@@ -243,9 +243,7 @@ impl BufrEngine {
             Ok(d) => d,
             Err(e) => {
                 // No BUFR magic at all — the whole object is not a message.
-                self.health
-                    .decode_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.health.record_decode_failure(e.kind());
                 tracing::debug!("[{}] bufr: '{label}' not decoded: {e}", self.collection_id);
                 return Err(e);
             }
@@ -253,20 +251,8 @@ impl BufrEngine {
         // Per-message failures: the other messages of a concatenated file
         // still ingest below.
         for e in &decoded.failed {
-            match e {
-                DecodeError::Unsupported(m) => {
-                    self.health
-                        .decode_unsupported_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("[{}] bufr: '{label}' unsupported: {m}", self.collection_id);
-                }
-                e => {
-                    self.health
-                        .decode_failures_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("[{}] bufr: '{label}' failed: {e}", self.collection_id);
-                }
-            }
+            self.health.record_decode_failure(e.kind());
+            tracing::debug!("[{}] bufr: '{label}' failed: {e}", self.collection_id);
         }
         self.health
             .subsets_skipped_total

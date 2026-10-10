@@ -22,6 +22,14 @@ pub struct DataReader<'a, R: Read> {
     /// Current offset set by the "Change scale" operator
     scale_offset: i8,
     character_width: Option<u32>,
+    /// Widths pushed by "Add associated field" (`204YYY`); nested operators
+    /// add up and `204000` cancels the most recent one.
+    associated_widths: smallvec::SmallVec<[u8; 2]>,
+    /// `203YYY` (YYY in 1..=254) is open: each following element descriptor
+    /// reads a YYY-bit new reference value until `203255`.
+    reference_definition_width: Option<u8>,
+    /// Reference values redefined by `203YYY`, until `203000` cancels them.
+    new_references: smallvec::SmallVec<[(XY, i32); 4]>,
 }
 
 /// Data specification for reading BUFR data section.
@@ -63,6 +71,9 @@ impl<'a, R: Read> DataReader<'a, R> {
             scale_offset: 0,
             width_offset: 0,
             character_width: None,
+            associated_widths: smallvec::SmallVec::new(),
+            reference_definition_width: None,
+            new_references: smallvec::SmallVec::new(),
         })
     }
 
@@ -167,6 +178,9 @@ impl<'a, R: Read> DataReader<'a, R> {
             self.width_offset = 0;
             self.scale_offset = 0;
             self.character_width = None;
+            self.associated_widths.clear();
+            self.reference_definition_width = None;
+            self.new_references.clear();
             self.stack
                 .push(StackEntry::new_sequence(&self.data_spec.root_descriptors));
             let subset_idx = self.current_subset_index;
@@ -229,6 +243,15 @@ impl<'a, R: Read> DataReader<'a, R> {
 
     // f = 0
     fn handle_data_descriptor(&mut self, idx: u16, b: &TableBEntry) -> Result<DataEvent, Error> {
+        // Between `203YYY` and `203255` an element defines a reference value.
+        if let Some(width) = self.reference_definition_width {
+            return self.define_reference(idx, b, width);
+        }
+        // An associated field precedes every element except class 31 (the
+        // `031021` significance right after `204YYY` included).
+        if b.xy.x != 31 && !self.associated_widths.is_empty() {
+            self.skip_associated_field()?;
+        }
         if b.unit == "CCITT IA5" {
             let width = self.character_width.unwrap_or(u32::from(b.bits));
             if !width.is_multiple_of(8) {
@@ -280,8 +303,14 @@ impl<'a, R: Read> DataReader<'a, R> {
             } else {
                 0
             };
+        let reference_value = self
+            .new_references
+            .iter()
+            .rev()
+            .find(|(xy, _)| *xy == b.xy)
+            .map_or(b.reference_value, |&(_, r)| r);
         let value = |raw: u128| {
-            let mantissa = raw as i128 + i128::from(b.reference_value);
+            let mantissa = raw as i128 + i128::from(reference_value);
             if scale == 0 {
                 Value::Integer(mantissa)
             } else {
@@ -331,14 +360,85 @@ impl<'a, R: Read> DataReader<'a, R> {
         }
     }
 
+    /// Inside `203YYY` … `203255` an element descriptor carries no data: it
+    /// reads a YYY-bit new reference value for that element, negative when
+    /// the leftmost bit is set (sign and magnitude, not two's complement).
+    fn define_reference(
+        &mut self,
+        idx: u16,
+        b: &TableBEntry,
+        width: u8,
+    ) -> Result<DataEvent, Error> {
+        if self.data_spec.is_compressed {
+            return Err(Error::NotSupported(
+                "Operator 203 (change reference values) in compressed data".into(),
+            ));
+        }
+        if width > 32 || matches!(b.unit, "CCITT IA5" | "Code table" | "Flag table") {
+            return Err(Error::NotSupported(format!(
+                "Operator 203 with a {width}-bit reference for a {} element",
+                b.unit
+            )));
+        }
+        let raw: u64 = self.reader.read_var(u32::from(width))?;
+        let sign = 1u64 << (width - 1);
+        let magnitude = (raw & (sign - 1)) as i64;
+        let reference = if raw & sign != 0 {
+            -magnitude
+        } else {
+            magnitude
+        };
+        let reference = i32::try_from(reference)
+            .map_err(|_| Error::Invalid("Redefined reference value out of range".into()))?;
+        self.new_references.push((b.xy, reference));
+        Ok(DataEvent::OperatorHandled {
+            idx,
+            x: 3,
+            value: reference,
+        })
+    }
+
+    /// Consume the associated field (`204YYY`) in front of an element. Its
+    /// value (typically a quality flag whose meaning `031021` gives) is not
+    /// surfaced; reading it keeps the following element aligned. In
+    /// compressed data it is compressed like a numeric element.
+    fn skip_associated_field(&mut self) -> Result<(), Error> {
+        let width: u32 = self.associated_widths.iter().map(|&w| u32::from(w)).sum();
+        if width > 64 {
+            return Err(Error::NotSupported(format!(
+                "Associated field width {width} exceeds 64 bits"
+            )));
+        }
+        let _reference: u64 = self.reader.read_var(width)?;
+        if self.data_spec.is_compressed {
+            let increment_width = self.reader.read::<6, u8>()?;
+            if increment_width > 0 {
+                for _ in 0..self.data_spec.number_of_subsets {
+                    let _inc: u64 = self.reader.read_var(u32::from(increment_width))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn read_string(&mut self, bytes: usize) -> Result<Value, Error> {
         let bytes = self.reader.read_to_vec(bytes)?;
-        if bytes.iter().all(|&b| b == 0xff) {
+        // Missing is all bits set. Some producers set only the bytes before
+        // a NUL padding (kz-kazhydromet station names); ecCodes reads the
+        // field as a C string and reports those missing too.
+        let content = bytes.split(|&b| b == 0).next().unwrap_or_default();
+        if bytes.iter().all(|&b| b == 0xff)
+            || (!content.is_empty() && content.iter().all(|&b| b == 0xff))
+        {
             return Ok(Value::Missing);
         }
-        String::from_utf8(bytes)
-            .map(Value::String)
-            .map_err(|_| Error::Invalid("Invalid character data".into()))
+        // CCITT IA5 is 7-bit ASCII, yet producers put national characters
+        // in station names in unknown 8-bit encodings (cl-meteochile). One
+        // such byte must not fail the whole message: it becomes U+FFFD.
+        Ok(Value::String(match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }))
     }
 
     // f = 1
@@ -350,12 +450,35 @@ impl<'a, R: Read> DataReader<'a, R> {
         delayed_bits: u8,
     ) -> Result<DataEvent, Error> {
         let count = match y {
-            0 => self.reader.read_var::<u16>(delayed_bits as u32)?,
+            0 => self.read_delayed_factor(u32::from(delayed_bits))?,
             _ => y as u16,
         };
         self.stack
             .push(StackEntry::new_replication(elements, count));
         Ok(DataEvent::ReplicationStart { idx, count })
+    }
+
+    /// The delayed replication factor (`031000`/`031001`/`031002`). In
+    /// compressed data it is compressed like any element: the value, then
+    /// a six-bit increment width, then one increment per subset. Every
+    /// subset shares one replication structure, so the increments must
+    /// all be zero (ecCodes rejects a non-constant factor the same way).
+    fn read_delayed_factor(&mut self, bits: u32) -> Result<u16, Error> {
+        let count = self.reader.read_var::<u16>(bits)?;
+        if self.data_spec.is_compressed {
+            let increment_width = self.reader.read::<6, u8>()?;
+            if increment_width > 0 {
+                for _ in 0..self.data_spec.number_of_subsets {
+                    let inc: u64 = self.reader.read_var(u32::from(increment_width))?;
+                    if inc != 0 {
+                        return Err(Error::NotSupported(
+                            "Compressed delayed replication factor differs between subsets".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 
     // f = 2
@@ -367,6 +490,19 @@ impl<'a, R: Read> DataReader<'a, R> {
             // Change scale
             (2, 0) => self.scale_offset = 0,
             (2, y) => self.scale_offset = ((y as i16) - 128) as i8,
+            // Change reference values: 203YYY opens a definition list,
+            // 203255 closes it, 203000 cancels every redefinition.
+            (3, 0) => {
+                self.reference_definition_width = None;
+                self.new_references.clear();
+            }
+            (3, 255) => self.reference_definition_width = None,
+            (3, y) => self.reference_definition_width = Some(y),
+            // Add associated field; zero cancels the most recent one.
+            (4, 0) => {
+                self.associated_widths.pop();
+            }
+            (4, y) => self.associated_widths.push(y),
             // All local descriptors must already have resolved Table B entries.
             // Their widths come from those entries; 206 does not let this reader
             // skip unknown local descriptors (resolution rejects those first).
@@ -377,7 +513,8 @@ impl<'a, R: Read> DataReader<'a, R> {
             // Not supported
             _ => {
                 return Err(Error::NotSupported(format!(
-                    "Operator descriptor {xy:#?} not supported yet.",
+                    "Operator descriptor 2{:02}{:03} not supported",
+                    xy.x, xy.y
                 )));
             }
         }
@@ -630,5 +767,208 @@ mod format_regressions {
         };
         assert!(values(b"\0\0\x04\0\x37777", &spec).is_err());
         assert!(values(b"\0\0\x03\0", &spec).is_err());
+    }
+
+    // #1008: live WIS2 SYNOP layouts the decoder misread.
+
+    const SIGNIFICANCE: TableBEntry = TableBEntry {
+        xy: XY { x: 31, y: 21 },
+        unit: "Code table",
+        bits: 6,
+        reference_value: 0,
+        ..NUM
+    };
+    const HEIGHT: TableBEntry = TableBEntry {
+        xy: XY { x: 7, y: 30 },
+        unit: "m",
+        bits: 8,
+        reference_value: 0,
+        ..NUM
+    };
+
+    fn delayed(descriptors: Vec<ResolvedDescriptor<'static>>) -> ResolvedDescriptor<'static> {
+        ResolvedDescriptor::Replication {
+            y: 0,
+            delayed_bits: 8,
+            descriptors,
+        }
+    }
+
+    #[test]
+    fn compressed_delayed_replication_factor_carries_an_increment_width() {
+        // ru/kz/by/ca SYNOP: compressed data with delayed replication. The
+        // factor is compressed too (value + six-bit width), so reading only
+        // the value shifted everything after it by six bits.
+        let spec = DataSpec {
+            number_of_subsets: 2,
+            is_compressed: true,
+            root_descriptors: vec![
+                delayed(vec![ResolvedDescriptor::Data(&CODE)]),
+                ResolvedDescriptor::Data(&CODE),
+            ],
+        };
+        for increments in [false, true] {
+            let bytes = section(|w| {
+                w.write::<8, u8>(2).unwrap();
+                if increments {
+                    // A non-zero width whose increments are all zero.
+                    w.write::<6, u8>(3).unwrap();
+                    w.write::<3, u8>(0).unwrap();
+                    w.write::<3, u8>(0).unwrap();
+                } else {
+                    w.write::<6, u8>(0).unwrap();
+                }
+                for v in [7u8, 8, 9] {
+                    w.write::<8, u8>(v).unwrap();
+                    w.write::<6, u8>(0).unwrap();
+                }
+            });
+            let ints = |v: i128| vec![Value::Integer(v), Value::Integer(v)];
+            assert_eq!(
+                values(&bytes, &spec).unwrap(),
+                vec![ints(7), ints(8), ints(9)]
+            );
+        }
+        // Subsets with different replication counts cannot share one
+        // compressed layout.
+        let bytes = section(|w| {
+            w.write::<8, u8>(2).unwrap();
+            w.write::<6, u8>(1).unwrap();
+            w.write::<2, u8>(0b01).unwrap();
+        });
+        assert!(matches!(values(&bytes, &spec), Err(Error::NotSupported(_))));
+    }
+
+    #[test]
+    fn associated_fields_precede_every_element_but_class_31() {
+        // cy-dom 307092: 204018 031021 … 204000. The significance itself
+        // and anything after the cancellation carry no associated field.
+        let mut spec = DataSpec {
+            number_of_subsets: 1,
+            is_compressed: false,
+            root_descriptors: vec![
+                ResolvedDescriptor::Operator(XY { x: 4, y: 2 }),
+                ResolvedDescriptor::Data(&SIGNIFICANCE),
+                ResolvedDescriptor::Data(&CODE),
+                ResolvedDescriptor::Data(&STRING),
+                ResolvedDescriptor::Operator(XY { x: 4, y: 0 }),
+                ResolvedDescriptor::Data(&CODE),
+            ],
+        };
+        let bytes = section(|w| {
+            w.write::<6, u8>(21).unwrap();
+            w.write::<2, u8>(3).unwrap();
+            w.write::<8, u8>(7).unwrap();
+            w.write::<2, u8>(1).unwrap();
+            w.write::<8, u8>(b'A').unwrap();
+            w.write::<8, u8>(8).unwrap();
+        });
+        let expected = vec![
+            vec![Value::Integer(21)],
+            vec![Value::Integer(7)],
+            vec![Value::String("A".into())],
+            vec![Value::Integer(8)],
+        ];
+        assert_eq!(values(&bytes, &spec).unwrap(), expected);
+
+        // Compressed: the associated field is compressed like an element.
+        spec.number_of_subsets = 2;
+        spec.is_compressed = true;
+        let bytes = section(|w| {
+            w.write::<6, u8>(21).unwrap();
+            w.write::<6, u8>(0).unwrap();
+            w.write::<2, u8>(0).unwrap();
+            w.write::<6, u8>(1).unwrap();
+            w.write::<1, u8>(1).unwrap();
+            w.write::<1, u8>(0).unwrap();
+            w.write::<8, u8>(7).unwrap();
+            w.write::<6, u8>(0).unwrap();
+            w.write::<2, u8>(0).unwrap();
+            w.write::<6, u8>(0).unwrap();
+            w.write::<8, u8>(b'A').unwrap();
+            w.write::<6, u8>(0).unwrap();
+            w.write::<8, u8>(8).unwrap();
+            w.write::<6, u8>(0).unwrap();
+        });
+        let twice = |v: Value| vec![v.clone(), v];
+        assert_eq!(
+            values(&bytes, &spec).unwrap(),
+            expected
+                .into_iter()
+                .map(|v| twice(v[0].clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn changed_reference_values_apply_until_cancelled() {
+        // il-ims: 203014 007030 007031 203255 lowers the height references
+        // for stations below sea level. Each definition is sign-magnitude.
+        let mut spec = DataSpec {
+            number_of_subsets: 1,
+            is_compressed: false,
+            root_descriptors: vec![
+                ResolvedDescriptor::Operator(XY { x: 3, y: 10 }),
+                ResolvedDescriptor::Data(&HEIGHT),
+                ResolvedDescriptor::Operator(XY { x: 3, y: 255 }),
+                ResolvedDescriptor::Data(&HEIGHT),
+                ResolvedDescriptor::Operator(XY { x: 3, y: 0 }),
+                ResolvedDescriptor::Data(&HEIGHT),
+            ],
+        };
+        let bytes = section(|w| {
+            w.write::<10, u16>((1 << 9) | 100).unwrap();
+            w.write::<8, u8>(50).unwrap();
+            w.write::<8, u8>(50).unwrap();
+        });
+        assert_eq!(
+            values(&bytes, &spec).unwrap(),
+            vec![vec![Value::Integer(-50)], vec![Value::Integer(50)]]
+        );
+        // Every subset reads its own definitions.
+        spec.number_of_subsets = 2;
+        spec.root_descriptors.drain(4..);
+        let bytes = section(|w| {
+            w.write::<10, u16>(20).unwrap();
+            w.write::<8, u8>(1).unwrap();
+            w.write::<10, u16>((1 << 9) | 20).unwrap();
+            w.write::<8, u8>(1).unwrap();
+        });
+        assert_eq!(
+            values(&bytes, &spec).unwrap(),
+            vec![vec![Value::Integer(21)], vec![Value::Integer(-19)]]
+        );
+        spec.is_compressed = true;
+        assert!(matches!(values(&bytes, &spec), Err(Error::NotSupported(_))));
+    }
+
+    #[test]
+    fn nul_padded_missing_and_non_ascii_strings_decode() {
+        const NAME: TableBEntry = TableBEntry { bits: 32, ..STRING };
+        let spec = DataSpec {
+            number_of_subsets: 1,
+            is_compressed: false,
+            root_descriptors: vec![
+                ResolvedDescriptor::Data(&NAME),
+                ResolvedDescriptor::Data(&NAME),
+                ResolvedDescriptor::Data(&NAME),
+            ],
+        };
+        let bytes = section(|w| {
+            // kz-kazhydromet: all-ones up to NUL padding is missing.
+            w.write_bytes(&[0xff, 0xff, 0, 0]).unwrap();
+            // cl-meteochile: one byte outside ASCII and UTF-8.
+            w.write_bytes(b"agr\xdb").unwrap();
+            // Plain NUL padding is still a (blank) string, as before.
+            w.write_bytes(b"AB\0\0").unwrap();
+        });
+        assert_eq!(
+            values(&bytes, &spec).unwrap(),
+            vec![
+                vec![Value::Missing],
+                vec![Value::String("agr\u{fffd}".into())],
+                vec![Value::String("AB\0\0".into())],
+            ]
+        );
     }
 }

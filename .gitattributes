@@ -5,3 +5,4 @@
 *.tif binary
 *.tiff binary
 *.grib2 binary
+*.bufr binary

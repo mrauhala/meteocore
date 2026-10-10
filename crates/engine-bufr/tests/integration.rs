@@ -457,21 +457,9 @@ fn concatenated_file_keeps_the_good_messages_around_a_bad_one() {
 
     // Through the engine: both good reports ingest, one failure counted.
     let e = engine();
-    let before = e
-        .health
-        .decode_failures_total
-        .load(std::sync::atomic::Ordering::Relaxed)
-        + e.health
-            .decode_unsupported_total
-            .load(std::sync::atomic::Ordering::Relaxed);
+    let before = e.health.decode_failures_total();
     assert_eq!(e.ingest_bytes(&file, "bulletin", t0800()), 2);
-    let after = e
-        .health
-        .decode_failures_total
-        .load(std::sync::atomic::Ordering::Relaxed)
-        + e.health
-            .decode_unsupported_total
-            .load(std::sync::atomic::Ordering::Relaxed);
+    let after = e.health.decode_failures_total();
     assert_eq!(after - before, 1);
 }
 
@@ -568,4 +556,194 @@ fn dwd_local_descriptors_are_scoped_to_centre_and_version() {
     let decoded = decoder.decode(&bytes).unwrap();
     assert_eq!(decoded.failed.len(), 1);
     assert!(decoded.reports.is_empty());
+}
+
+// ---- #1008: live WIS2 SYNOP messages that used to fail ---------------------
+//
+// `testdata/bufr-regressions/`: real messages from the WIS2 Global Cache
+// (2026-10-09/10). Expected values are ecCodes 2.47.0 `bufr_dump -p` of the
+// same file; its README lists provenance and the cause of each failure.
+
+fn regression(name: &str) -> Vec<u8> {
+    std::fs::read(fixtures().join("../bufr-regressions").join(name)).unwrap()
+}
+
+/// Decode a regression fixture that must decode cleanly.
+fn decode_clean(name: &str) -> engine_bufr::decode::Decoded {
+    let decoded = Decoder::new().decode(&regression(name)).unwrap();
+    assert!(decoded.failed.is_empty(), "{name}: {:?}", decoded.failed);
+    decoded
+}
+
+fn value(report: &engine_bufr::ObsReport, code: &str) -> Option<f64> {
+    report.value(xy_from_code(code).unwrap(), None)
+}
+
+fn close(a: Option<f64>, b: f64) -> bool {
+    a.is_some_and(|a| (a - b).abs() < 1e-6)
+}
+
+#[test]
+fn compressed_synop_with_delayed_replication() {
+    // ca-eccc-msc 307091, three compressed subsets behind a GTS heading.
+    let d = decode_clean("ca-eccc-msc_307091_compressed.bufr");
+    let ids: Vec<&str> = d.reports.iter().map(|r| r.station_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["0-20000-0-71522", "0-20000-0-71615", "0-20000-0-71641"]
+    );
+    let names: Vec<_> = d.reports.iter().map(|r| r.name.as_deref()).collect();
+    assert_eq!(
+        names,
+        [
+            Some("CHUTE-DES-PASSES"),
+            Some("KUUJJUARAPIK"),
+            Some("SALLUIT")
+        ]
+    );
+    assert!((d.reports[2].lat - 62.1797).abs() < 1e-4);
+    assert!((d.reports[2].lon + 75.6701).abs() < 1e-4);
+    assert_eq!(value(&d.reports[0], "012101"), None);
+    assert!(close(value(&d.reports[1], "012101"), 276.59));
+    assert!(close(value(&d.reports[2], "011002"), 1.5));
+
+    // kz-kazhydromet 307080, one compressed subset whose name is all-ones up
+    // to NUL padding (missing, as ecCodes reads it) and whose position is
+    // missing: decoded, then skipped for want of a position.
+    let d = decode_clean("kz-kazhydromet_307080_compressed_nul-padded-name.bufr");
+    assert!(d.reports.is_empty());
+    assert_eq!(d.skipped, [engine_bufr::decode::SkipReason::NoPosition]);
+}
+
+#[test]
+fn older_master_table_version_uses_its_own_widths() {
+    // jp-jma SYOWA, master table 13: the 302045 radiation elements were
+    // narrower before version 14, so the current widths overran the data.
+    let d = decode_clean("jp-jma_307080_master-v13.bufr");
+    let r = &d.reports[0];
+    assert_eq!(r.station_id, "0-20000-0-89532");
+    assert_eq!(r.name.as_deref(), Some("SYOWA"));
+    assert_eq!(r.time, Utc.with_ymd_and_hms(2026, 10, 9, 21, 0, 0).unwrap());
+    assert!(close(value(r, "010051"), 97790.0));
+    assert!(close(value(r, "012101"), 266.45));
+    assert!(close(value(r, "011002"), 11.8));
+}
+
+#[test]
+fn ra_iii_sequence_307083() {
+    // bb-barbadosmetservices: the generated Table D lacked 307083's
+    // leading 301090 302031.
+    let d = decode_clean("bb-barbadosmetservices_307083.bufr");
+    let r = &d.reports[0];
+    assert_eq!(r.station_id, "0-52-130-78954");
+    assert!((r.lat - 13.0733).abs() < 1e-4 && (r.lon + 59.5).abs() < 1e-4);
+    assert_eq!(r.elevation, Some(56.6));
+    assert!(close(value(r, "010004"), 100470.0));
+    assert!(close(value(r, "010051"), 101240.0));
+    assert!(close(value(r, "012101"), 301.6));
+    assert!(close(value(r, "012103"), 297.6));
+    assert!(close(value(r, "020001"), 30000.0));
+    assert!(close(value(r, "011001"), 80.0));
+}
+
+#[test]
+fn associated_fields_and_changed_reference_values() {
+    // cy-dom 307092 (204018 … 204000), one subset extracted by ecCodes.
+    let d = decode_clean("cy-dom_307092_associated-fields.bufr");
+    let r = &d.reports[0];
+    assert_eq!(r.station_id, "0-196-0-01727");
+    assert_eq!(
+        r.time,
+        Utc.with_ymd_and_hms(2026, 10, 9, 20, 40, 0).unwrap()
+    );
+    assert!((r.lat - 34.9116).abs() < 1e-4 && (r.lon - 33.6301).abs() < 1e-4);
+    assert!(close(value(r, "012101"), 295.95));
+    assert_eq!(r.name.as_deref(), Some("FANEROMENI"));
+    assert!(close(value(r, "013011"), 0.0));
+
+    // il-ims: 203014 redefines the 007030/007031 reference to -5000, so
+    // this station's raw height reads -200 m (the table reference gives
+    // -100 m).
+    let d = decode_clean("il-ims_203-changed-reference.bufr");
+    let r = &d.reports[0];
+    assert_eq!(r.station_id, "0-376-0-621");
+    assert_eq!(r.name.as_deref(), Some("Zemah"));
+    assert_eq!(r.elevation, Some(-200.0));
+    assert!(close(value(r, "012101"), 298.42));
+    assert!(close(value(r, "011002"), 1.2));
+}
+
+#[test]
+fn non_ascii_station_name_does_not_fail_the_message() {
+    let d = decode_clean("cl-meteochile_non-ascii-name.bufr");
+    let r = &d.reports[0];
+    assert_eq!(r.station_id, "0-152-0-320049");
+    assert_eq!(r.name.as_deref(), Some("Chincolco Liceo agr\u{fffd}"));
+    assert!(close(value(r, "012101"), 292.03));
+}
+
+#[test]
+fn dwd_local_template_and_supplement_merge() {
+    // A local-version-8 message using 004214/004215 and further DWD
+    // elements (020193, 020199, 052210, …).
+    let d = decode_clean("de-dwd_local-v8.bufr");
+    let r = &d.reports[0];
+    assert_eq!(r.station_id, "0-20000-0-10818");
+    assert_eq!(r.name.as_deref(), Some("Klippeneck"));
+    assert!(close(value(r, "012101"), 281.25));
+    assert!(close(value(r, "020237"), 39502.0));
+    assert!(close(value(r, "011002"), 4.9));
+
+    // A bulletin's SYNOP message (local version 0) followed by its national
+    // supplement (local version 8, 020193 first) for the same station and
+    // time: one report carrying both. Before #1008 the supplement failed;
+    // decoded alone it would replace the SYNOP row in the store.
+    let d = decode_clean("de-dwd_synop-and-supplement.bufr");
+    assert_eq!(d.messages, 2);
+    assert_eq!(d.reports.len(), 1);
+    let r = &d.reports[0];
+    assert_eq!(r.station_id, "0-20000-0-10022");
+    assert_eq!(
+        r.time,
+        Utc.with_ymd_and_hms(2026, 10, 10, 3, 30, 0).unwrap()
+    );
+    assert!(close(value(r, "012101"), 283.65)); // SYNOP
+    assert!(close(value(r, "010051"), 100130.0)); // SYNOP
+    assert!(close(value(r, "020237"), 56613.0)); // supplement (local)
+    assert!(close(value(r, "012130"), 283.95)); // supplement soil temperature
+
+    // Through the engine: one row with the SYNOP's parameters intact.
+    let e = engine();
+    let t = Utc.with_ymd_and_hms(2026, 10, 10, 3, 30, 0).unwrap();
+    assert_eq!(
+        e.ingest_bytes(&regression("de-dwd_synop-and-supplement.bufr"), "dwd", t),
+        1
+    );
+    assert_eq!(e.health.decode_failures_total(), 0);
+}
+
+#[test]
+fn failures_are_counted_by_kind() {
+    use engine_bufr::decode::FailureKind;
+    let e = engine();
+    // A NIL bulletin (cy-dom) is not BUFR at all.
+    assert_eq!(e.ingest_bytes(b"NIL", "nil", t0800()), 0);
+    // A message cut short inside its data section.
+    let jma = regression("jp-jma_307080_master-v13.bufr");
+    let start = jma.windows(4).position(|w| w == b"BUFR").unwrap();
+    let mut cut = jma[start..jma.len() - 40].to_vec();
+    let len = (cut.len() as u32).to_be_bytes();
+    cut[4..7].copy_from_slice(&len[1..]);
+    assert_eq!(e.ingest_bytes(&cut, "cut", t0800()), 0);
+    // An unregistered local element: DWD's 020193 under local version 1.
+    let mut dwd = regression("de-dwd_local-v8.bufr");
+    assert_eq!(dwd[22], 8);
+    dwd[22] = 1;
+    assert_eq!(e.ingest_bytes(&dwd, "dwd-v1", t0800()), 0);
+    assert_eq!(e.health.decode_failures(FailureKind::NotBufr), 1);
+    assert_eq!(e.health.decode_failures(FailureKind::Truncated), 1);
+    assert_eq!(e.health.decode_failures(FailureKind::UnknownDescriptor), 1);
+    assert_eq!(e.health.decode_failures_total(), 3);
+    let counters = e.health.counters();
+    assert_eq!(counters[7..], [1, 1, 1, 0, 0]);
 }
