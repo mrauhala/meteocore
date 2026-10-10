@@ -23,7 +23,8 @@ pub enum LiveStatus {
     /// it started empty, or was restored from a snapshot older than the
     /// warm-up, so whatever the feed published meanwhile is missing.
     /// Reported as degraded, with how much has arrived, until the engine's
-    /// warm-up period is over. `items` names what is counted (`"alerts"`).
+    /// warm-up period is over. `items` names what is counted (`"alerts"`,
+    /// `"reports"`).
     WarmingUp {
         received: u64,
         items: &'static str,

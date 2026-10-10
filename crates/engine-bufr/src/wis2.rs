@@ -10,16 +10,22 @@
 //!
 //! Runs from `BufrEngine::poll_loop` on the background runtime — the
 //! pipeline is started here, never in the constructor.
+//!
+//! Warm-up (#1002): the store holds what arrived since it began filling
+//! from empty, so a cold start serves a partial history until it has
+//! filled for `[bufr.wis2] warmup` (default: the collection's
+//! `retention`) — `/health` says so ([`LiveStatus::WarmingUp`]). The clock
+//! ([`WarmupClock`]) travels in the store snapshot (`persist.rs`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::config::Wis2Config;
-use ds_core::health::LiveStatus;
+use ds_core::health::{LiveStatus, WarmupCause};
 use ds_poll::{FirstTick, Shutdown};
 use ds_wis2::{Notification, Resolved, Status, StatusSnapshot};
 
@@ -37,6 +43,18 @@ const RESPAWN_DELAY: Duration = Duration::from_secs(30);
 const FAILURE_SUMMARY_INTERVAL: Duration = Duration::from_secs(3600);
 /// Centre/kind pairs named in one summary line; the rest are totalled.
 const FAILURE_SUMMARY_TOP: usize = 20;
+/// What `LiveStatus::WarmingUp` counts.
+const WARMUP_ITEMS: &str = "reports";
+
+/// The warm-up clock (#1002): when the store began filling from empty —
+/// set the first time the subscription is up, kept across reconnects and,
+/// through the snapshot, across restarts — and why it is warming up.
+/// `filling_since: None` = not started yet (still warming).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WarmupClock {
+    pub(crate) filling_since: Option<DateTime<Utc>>,
+    pub(crate) cause: WarmupCause,
+}
 
 pub struct Wis2Source {
     config: Wis2Config,
@@ -51,6 +69,14 @@ pub struct Wis2Source {
     warned: Mutex<HashSet<(String, FailureKind)>>,
     /// Failures per `(centre, kind)` since the last summary.
     failures: Mutex<HashMap<(String, FailureKind), u64>>,
+    /// `[bufr.wis2] warmup`: how long after the store began filling from
+    /// empty `/health` reports `WarmingUp`.
+    warmup: chrono::Duration,
+    clock: Mutex<WarmupClock>,
+    /// Bumped when [`Self::mark_filling`] starts the clock: part of the
+    /// state snapshot's revision, so a started clock is written even before
+    /// the first report arrives.
+    clock_changes: AtomicU64,
 }
 
 /// Which `(station, time)` rows each `data_id` is responsible for, so a
@@ -113,7 +139,11 @@ impl Produced {
 }
 
 impl Wis2Source {
-    pub fn new(config: Wis2Config, stale_after: chrono::Duration) -> Self {
+    pub fn new(
+        config: Wis2Config,
+        stale_after: chrono::Duration,
+        warmup: chrono::Duration,
+    ) -> Self {
         let degrade_after = Duration::from_secs(config.degrade_after_secs.max(1));
         Wis2Source {
             config,
@@ -123,6 +153,63 @@ impl Wis2Source {
             produced: Mutex::new(Produced::default()),
             warned: Mutex::new(HashSet::new()),
             failures: Mutex::new(HashMap::new()),
+            warmup,
+            clock: Mutex::new(WarmupClock::default()),
+            clock_changes: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn warmup(&self) -> chrono::Duration {
+        self.warmup
+    }
+
+    pub(crate) fn warmup_clock(&self) -> WarmupClock {
+        *self.clock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Restore the clock from a snapshot (`BufrEngine::new_with_state`).
+    pub(crate) fn set_warmup_clock(&self, clock: WarmupClock) {
+        *self.clock.lock().unwrap_or_else(|e| e.into_inner()) = clock;
+    }
+
+    /// Start the warm-up clock at `now` unless it is running: the
+    /// subscription is up, so the store is filling. Called from the poll
+    /// loop's snapshot tick.
+    pub(crate) fn mark_filling(&self, now: DateTime<Utc>) {
+        let mut clock = self.clock.lock().unwrap_or_else(|e| e.into_inner());
+        if clock.filling_since.is_none() {
+            clock.filling_since = Some(now);
+            self.clock_changes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn clock_changes(&self) -> u64 {
+        self.clock_changes.load(Ordering::Relaxed)
+    }
+
+    /// Install a broker status without a pipeline (tests drive it by hand).
+    #[cfg(test)]
+    pub(crate) fn set_status(&self, status: Arc<Status>) {
+        self.status.store(Arc::new(Some(status)));
+    }
+
+    /// `Ready`, or `WarmingUp` while the store is inside `warmup` of an
+    /// empty start or of a restore after a long outage. `reports` = rows
+    /// held.
+    fn ready_or_warming(&self, reports: u64, now: DateTime<Utc>) -> LiveStatus {
+        let clock = self.warmup_clock();
+        let warm = clock
+            .filling_since
+            .and_then(|t| t.checked_add_signed(self.warmup))
+            .is_some_and(|end| now >= end);
+        if warm {
+            LiveStatus::Ready
+        } else {
+            LiveStatus::WarmingUp {
+                received: reports,
+                items: WARMUP_ITEMS,
+                cause: clock.cause,
+            }
         }
     }
 
@@ -138,8 +225,10 @@ impl Wis2Source {
     /// Ready once subscribed, the session is not down for longer than
     /// `degrade_after_secs`, and a notification has been accepted within
     /// `stale_after` (a quiet observation feed is not healthy — unlike a
-    /// quiet warning feed).
-    pub fn live_status(&self, health: &Health) -> LiveStatus {
+    /// quiet warning feed) — and, past those, `WarmingUp` instead of Ready
+    /// until the store has filled for `warmup` (a broker blip does not end
+    /// a warm-up). `reports` = rows held, for the warm-up message.
+    pub fn live_status(&self, health: &Health, reports: u64, now: DateTime<Utc>) -> LiveStatus {
         let guard = self.status.load();
         let Some(status) = guard.as_ref().as_ref() else {
             return LiveStatus::Degraded {
@@ -152,7 +241,7 @@ impl Wis2Source {
                 Some(secs) if secs >= self.degrade_after.as_secs() => LiveStatus::Degraded {
                     reason: "WIS2 broker disconnected",
                 },
-                Some(_) if health.is_probed() => LiveStatus::Ready,
+                Some(_) if health.is_probed() => self.ready_or_warming(reports, now),
                 _ => LiveStatus::Degraded {
                     reason: "connecting to WIS2 broker",
                 },
@@ -166,7 +255,7 @@ impl Wis2Source {
         match snap.last_message_age_secs {
             None => {
                 if health.is_probed() {
-                    LiveStatus::Ready
+                    self.ready_or_warming(reports, now)
                 } else {
                     LiveStatus::Degraded {
                         reason: "waiting for first WIS2 notification",
@@ -179,7 +268,7 @@ impl Wis2Source {
             // Fresh notifications alone are not health: a topic whose every
             // payload fails to decode would otherwise stay green with nothing
             // served. `probed` flips on the first successfully decoded report.
-            Some(_) if health.is_probed() => LiveStatus::Ready,
+            Some(_) if health.is_probed() => self.ready_or_warming(reports, now),
             Some(_) => LiveStatus::Degraded {
                 reason: "no BUFR reports decoded from WIS2 yet",
             },
@@ -226,7 +315,17 @@ impl Wis2Source {
                         break 'session;
                     }
                     _ = prune.tick() => engine.prune_now(),
-                    _ = snap.tick() => engine.snapshot_if_dirty(),
+                    _ = snap.tick() => {
+                        if pipeline.status.is_subscribed() {
+                            // Starts the warm-up clock of an empty start.
+                            self.mark_filling(Utc::now());
+                        }
+                        engine.snapshot_if_dirty();
+                        // At most every five minutes (the write policy);
+                        // a blocking store call is fine on the poll
+                        // runtime, the only place this loop runs.
+                        engine.write_state(false);
+                    }
                     _ = summary.tick() => self.log_failure_summary(&label),
                     r = pipeline.receiver.recv() => match r {
                         Some(r) => self.apply(engine, r),
@@ -386,6 +485,7 @@ mod tests {
                         "cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop"
                             .into(),
                     ],
+                    warmup: Some("PT1H".into()),
                     ..Wis2Config::default()
                 }),
                 poll_interval_secs: 60,
@@ -621,19 +721,21 @@ mod tests {
         let Source::Wis2(src) = e.source() else {
             panic!()
         };
+        // Warm: the store began filling longer than `warmup` (PT1H) ago.
+        src.mark_filling(Utc::now() - chrono::Duration::hours(2));
         let status = Arc::new(Status::new());
         src.status.store(Arc::new(Some(status.clone())));
         // Connected but no SUBACK yet.
         status.set_connected();
         assert_eq!(
-            src.live_status(&e.health),
+            src.live_status(&e.health, 0, Utc::now()),
             LiveStatus::Degraded {
                 reason: "WIS2 subscription not acknowledged"
             }
         );
         status.set_subscribed();
         assert_eq!(
-            src.live_status(&e.health),
+            src.live_status(&e.health, 0, Utc::now()),
             LiveStatus::Degraded {
                 reason: "waiting for first WIS2 notification"
             }
@@ -641,27 +743,28 @@ mod tests {
         // Notifications flowing but nothing decoded yet is not Ready.
         status.record_accepted(1);
         assert_eq!(
-            src.live_status(&e.health),
+            src.live_status(&e.health, 0, Utc::now()),
             LiveStatus::Degraded {
                 reason: "no BUFR reports decoded from WIS2 yet"
             }
         );
         e.health.mark_probed();
-        assert_eq!(src.live_status(&e.health), LiveStatus::Ready);
+        assert_eq!(src.live_status(&e.health, 0, Utc::now()), LiveStatus::Ready);
         // A short disconnect keeps serving; a long one degrades.
         status.set_disconnected();
-        assert_eq!(src.live_status(&e.health), LiveStatus::Ready);
+        assert_eq!(src.live_status(&e.health, 0, Utc::now()), LiveStatus::Ready);
         let long = Wis2Source::new(
             Wis2Config {
                 degrade_after_secs: 1,
                 ..src.config.clone()
             },
             chrono::Duration::hours(2),
+            src.warmup(),
         );
         long.status.store(Arc::new(Some(status.clone())));
         std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(
-            long.live_status(&e.health),
+            long.live_status(&e.health, 0, Utc::now()),
             LiveStatus::Degraded {
                 reason: "WIS2 broker disconnected"
             }
@@ -669,11 +772,15 @@ mod tests {
         // Stale feed: reconnect, but the last message is older than stale_after.
         status.set_connected();
         status.set_subscribed();
-        let stale = Wis2Source::new(src.config.clone(), chrono::Duration::seconds(0));
+        let stale = Wis2Source::new(
+            src.config.clone(),
+            chrono::Duration::seconds(0),
+            src.warmup(),
+        );
         stale.status.store(Arc::new(Some(status.clone())));
         std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(
-            stale.live_status(&e.health),
+            stale.live_status(&e.health, 0, Utc::now()),
             LiveStatus::Degraded {
                 reason: "no WIS2 notification within stale_after"
             }

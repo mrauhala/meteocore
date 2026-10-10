@@ -3438,7 +3438,11 @@ pub fn load_collections(
                         );
                         e
                     }
-                    None => match engine_bufr::BufrEngine::new(bufr_config, &collection.id) {
+                    None => match engine_bufr::BufrEngine::new_with_state(
+                        bufr_config,
+                        &collection.id,
+                        state_store(),
+                    ) {
                         Ok(e) => Arc::new(e),
                         Err(e) => {
                             tracing::error!(
@@ -8682,13 +8686,14 @@ colormap = "no_such_map"
         assert!(super::init_render_concurrency(Some(4)).is_err());
     }
 
-    /// #1000: `[server] state_dir` reaches the CAP engines `load_collections`
-    /// builds — a WIS2 collection snapshots into it. Runs in a child process:
-    /// the state directory is process-global and fixed at boot.
+    /// #1000, #1002: `[server] state_dir` reaches the CAP and BUFR engines
+    /// `load_collections` builds — a WIS2 collection snapshots into it.
+    /// Runs in a child process: the state directory is process-global and
+    /// fixed at boot.
     #[test]
-    fn state_dir_reaches_wis2_cap_engines() {
+    fn state_dir_reaches_wis2_engines() {
         const CHILD: &str = "MC_TEST_SERVER_STATE_DIR_CHILD";
-        const NAME: &str = "admin::tests::state_dir_reaches_wis2_cap_engines";
+        const NAME: &str = "admin::tests::state_dir_reaches_wis2_engines";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture"])
@@ -8706,7 +8711,11 @@ colormap = "no_such_map"
              [[collections]]\nid = \"cap-wis2\"\ntitle = \"t\"\ndescription = \"d\"\n\
              engine_type = \"cap\"\napis = [\"features\"]\n\
              [collections.cap]\n[collections.cap.wis2]\n\
-             topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n",
+             topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n\
+             [[collections]]\nid = \"obs-wis2\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"bufr\"\napis = [\"edr\", \"features\"]\n\
+             [collections.bufr]\nretention = \"P36500D\"\n[collections.bufr.wis2]\n\
+             topics = [\"cache/a/wis2/test/data/core/weather/surface-based-observations/synop\"]\n",
         )
         .unwrap();
         let (config, _) =
@@ -8748,6 +8757,24 @@ colormap = "no_such_map"
         // clock, which a cold start would have lost — and flushes it back.
         load().cap_engines[0].shutdown();
         assert_eq!(read()["filling_since"], filling_since);
+
+        // A WIS2 BUFR store likewise, under `<state_dir>/obs-wis2.bufr.state`
+        // (gzip-compressed): the next build serves its reports at once.
+        assert_eq!(result.bufr_engines.len(), 1);
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/bufr-synop/synop_se-smhi_20260912T0800Z.bufr"
+        ))
+        .unwrap();
+        let bufr = &result.bufr_engines[0];
+        let ingested = bufr.ingest_bytes(&fixture, "fixture", chrono::Utc::now());
+        assert!(ingested > 0);
+        bufr.shutdown();
+        let file = dir.join("obs-wis2.bufr.state");
+        assert!(std::fs::read(&file).unwrap().starts_with(&[0x1f, 0x8b]));
+        let restored = load();
+        assert_eq!(restored.bufr_engines[0].gauges(), (1, ingested));
+        restored.bufr_engines[0].shutdown();
     }
 
     #[test]

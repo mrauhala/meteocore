@@ -1076,7 +1076,10 @@ pub struct BufrConfig {
     pub data_path: Option<String>,
     /// WIS2 subscription (typically
     /// `cache/a/wis2/<centre-id>/data/core/weather/surface-based-observations/synop`).
-    /// Mutually exclusive with `data_path`.
+    /// Mutually exclusive with `data_path`. Only this mode snapshots its
+    /// store into `[server] state_dir` across restarts (#1002) — a
+    /// `data_path` source re-reads its files — and only it has warm-up
+    /// health; its `warmup` defaults to `retention`.
     #[serde(default)]
     pub wis2: Option<Wis2Config>,
     /// `data_path` mode: seconds between directory scans (default 60).
@@ -1154,14 +1157,6 @@ pub fn validate_bufr(id: &str, cfg: &BufrConfig) -> Result<(), crate::error::Dat
     }
     if let Some(w) = &cfg.wis2 {
         validate_wis2(id, "bufr.wis2", w)?;
-        // Parsed by the shared Wis2Config, honoured by CAP only: the BUFR
-        // store has no warm-up health (#1002). Reject rather than ignore.
-        if w.warmup.is_some() {
-            return Err(Config(format!(
-                "Collection '{id}': [bufr.wis2].warmup is not supported (only [cap.wis2] has \
-                 warm-up health)"
-            )));
-        }
     }
     if cfg.poll_interval_secs == 0 {
         return Err(Config(format!(
@@ -1823,16 +1818,18 @@ pub struct Wis2Config {
     /// reported `degraded` (default 120).
     #[serde(default = "default_wis2_degrade_after_secs")]
     pub degrade_after_secs: u64,
-    /// Health after a cold start (#1000): a collection whose in-memory store
-    /// starts empty (no `[server] state_dir` snapshot restored) reports
-    /// `degraded` ("warming up after cold start: N alerts received") for
-    /// this long after its subscription first comes up — standing warnings
-    /// only return as their producers republish them. A snapshot last
-    /// written longer than this ago (the server was down that long) is
-    /// restored but restarts the warm-up ("warming up after a long
-    /// outage"). ISO 8601 duration,
-    /// default [`DEFAULT_WIS2_WARMUP`] (`PT24H`). `[cap.wis2]` only for now;
-    /// `[bufr.wis2]` rejects it.
+    /// Health after a cold start (#1000, #1002): a collection whose
+    /// in-memory store starts empty (no `[server] state_dir` snapshot
+    /// restored) reports `degraded` ("warming up after cold start: N alerts
+    /// received", "… N reports received") for this long after its
+    /// subscription first comes up — standing warnings only return as their
+    /// producers republish them, and observations are never republished, so
+    /// a store's history is complete again only after a full window. A
+    /// snapshot last written longer than this ago (the server was down that
+    /// long) is restored but restarts the warm-up ("warming up after a long
+    /// outage"). ISO 8601 duration. Default: [`DEFAULT_WIS2_WARMUP`]
+    /// (`PT24H`) for `[cap.wis2]` ([`Self::warmup_duration`]); the
+    /// collection's `retention` for `[bufr.wis2]`.
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub warmup: Option<String>,
 }
@@ -4524,16 +4521,22 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             .is_err());
     }
 
-    /// `warmup` lives on the shared Wis2Config but only CAP honours it: a
-    /// BUFR collection must reject it rather than parse and ignore it.
+    /// `warmup` is honoured by both WIS2 engines (#1002): a BUFR collection
+    /// accepts a valid one and rejects a malformed one like CAP does.
     #[test]
-    fn bufr_wis2_rejects_cap_only_warmup() {
+    fn bufr_wis2_accepts_warmup() {
+        let cfg =
+            bufr_collection("[collections.bufr.wis2]\ntopics = [\"cache/a\"]\nwarmup = \"PT1H\"\n");
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
         let err =
-            bufr_collection("[collections.bufr.wis2]\ntopics = [\"cache/a\"]\nwarmup = \"PT1H\"\n")
+            bufr_collection("[collections.bufr.wis2]\ntopics = [\"cache/a\"]\nwarmup = \"1h\"\n")
                 .validate()
                 .unwrap_err()
                 .to_string();
-        assert!(err.contains("[bufr.wis2].warmup is not supported"), "{err}");
+        assert!(
+            err.contains("[bufr.wis2].warmup is not a valid positive ISO 8601 duration"),
+            "{err}"
+        );
     }
 
     #[test]

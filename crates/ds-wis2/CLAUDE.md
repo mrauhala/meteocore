@@ -62,10 +62,11 @@ serde data); everything with a socket lives here.
 - **No replay across restarts.** A new process is a new session (random
   client id), so whatever an engine accumulated is gone unless it persists
   it: engines snapshot through the server's `ds_core::state::StateStore`
-  (`[server] state_dir`, #1000; engine-cap is the reference) and report
-  `LiveStatus::WarmingUp` after a cold start or a long outage (`[….wis2]
-  warmup`, parsed here in `Wis2Config` but honoured only where the engine
-  implements it — `[bufr.wis2]` rejects it).
+  (`[server] state_dir`, #1000; engine-cap is the reference, engine-bufr
+  the second, #1002) and report `LiveStatus::WarmingUp` after a cold start
+  or a long outage (`[….wis2] warmup`, parsed here in `Wis2Config`; its
+  default is the engine's: PT24H for CAP, the collection's `retention` for
+  BUFR).
 - **Backpressure, not drops:** the subscriber→resolver and resolver→engine
   channels are bounded (1024); a slow consumer stops the MQTT read loop and
   the broker queues (2000/client) rather than us losing messages.
