@@ -80,7 +80,7 @@ new ol.layer.Tile({
 
 | Operation | Description |
 |-----------|-------------|
-| `GetCapabilities` | Returns XML document listing available layers, CRS, extents, time dimension, and styles |
+| `GetCapabilities` | Returns XML document listing available layers, CRS, extents, time dimension, and styles; `<Service>` advertises the GetMap limits (`LayerLimit`, `MaxWidth`, `MaxHeight`) |
 | `GetMap` | Returns a rendered map image (PNG or JPEG) |
 | `GetLegendGraphic` | Returns a legend image showing the colormap scale |
 
@@ -238,11 +238,12 @@ All GetMap responses include an `ETag` header derived from the request parameter
 
 | Limit | Value | Purpose |
 |-------|-------|---------|
-| Max image pixels | 16,777,216 | Prevents memory exhaustion from large renders |
-| Max dimension | 4,096 px | Limits width and height individually |
-| Concurrent renders | 8 | Semaphore prevents CPU/memory exhaustion |
+| Max image pixels | 64,000,000 | `WIDTH × HEIGHT` cap (`params::MAX_MAP_PIXELS`); the render memory budget `MC_RENDER_MEMORY_MB` admits fewer at its default |
+| Max dimension | 8,000 px | Limits width and height individually (`params::MAX_MAP_DIMENSION`); advertised in GetCapabilities as `<MaxWidth>`/`<MaxHeight>` |
+| Max layers | 1 | One `LAYERS` name per GetMap (`params::LAYER_LIMIT`); advertised as `<LayerLimit>` |
+| Concurrent renders | `[server] render_concurrency` | Render slots shared by WMS, Maps, Tiles and 3D Tiles (default 2× CPUs, min 8) |
 | CRS whitelist | 5 CRS | Only supported projections accepted |
-| Format whitelist | PNG, JPEG | No unexpected format handling |
+| Format whitelist | PNG, JPEG, WebP | No unexpected format handling |
 | No external SLD | — | Eliminates SSRF risk from style references |
 | XML output | quick-xml Writer | Prevents XML injection in GetCapabilities/errors |
 

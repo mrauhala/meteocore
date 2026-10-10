@@ -1547,7 +1547,7 @@ observed_property = "air_temperature"
 
 A single `/wms/` endpoint dispatches on the `REQUEST` query parameter:
 
-- **GetCapabilities** — XML capabilities listing layers, CRS, extents, time dimension, and styles
+- **GetCapabilities** — XML capabilities listing layers, CRS, extents, time dimension, and styles. Its `<Service>` advertises the GetMap limits as `<LayerLimit>1</LayerLimit>`, `<MaxWidth>8000</MaxWidth>` and `<MaxHeight>8000</MaxHeight>`, so a client can size its requests.
 - **GetMap** — render a map image as PNG, JPEG, or WebP
 - **GetLegendGraphic** — render a colormap legend strip
 
