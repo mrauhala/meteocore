@@ -1992,6 +1992,13 @@ OpenAPI specs are generated dynamically from configured collections. WMS uses XM
 
 Returns HTTP 503 only when all collections have failed.
 
+Entries can also carry the collection's temporal extent and two ages in seconds:
+
+| Field | Meaning |
+|-------|---------|
+| `data_age_secs` | Now minus the newest data the collection serves: the newest timestep (GeoTIFF), the newest run's origin time (QueryData), the newest report (BUFR), the newest scan (satellite), the latest generation's anchor frame (nowcast). The `collection_data_age_seconds` gauge reports the same value. It keeps growing when a feeder stalls even though the old files are still found |
+| `poll_age_secs` | GeoTIFF and QueryData: time since the last poll that found data. It grows while the source is unreachable or empty |
+
 ### Prometheus Metrics
 
 `GET /metrics` returns Prometheus text format. Path labels are the matched route template (e.g. `/edr/collections/{id}/position`), not the raw URL, so cardinality stays bounded. The `api` label names the serving API: a per-API route's mount (`edr`, `features`, `maps`, `tiles`, `wms`, `3dtiles`), or for the shared OGC API root the building block that served it (`maps`, `tiles`, `features`) and `common` for its discovery resources; empty for operational routes.
@@ -2012,6 +2019,7 @@ Returns HTTP 503 only when all collections have failed.
 | `collections_healthy` | gauge | — | Collections in ready state |
 | `collections_degraded` | gauge | — | Collections in degraded state |
 | `collections_failed` | gauge | — | Collections in failed state |
+| `collection_data_age_seconds` | gauge | collection | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that report one |
 
 **GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs):
 
