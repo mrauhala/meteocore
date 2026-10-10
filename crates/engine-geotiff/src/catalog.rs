@@ -578,11 +578,6 @@ fn load_remote(
     }
 }
 
-/// Create a catalog seeded from STAC collection extent — no items fetched.
-///
-/// This is called at engine startup. The catalog has no entries but carries
-/// the spatial and temporal extent from the STAC collection metadata.
-/// Items are fetched on-demand when queries arrive.
 /// Whether a header range read failed because the source answered with the
 /// whole object instead of the range (object_store's `NotPartial`, raised by
 /// an HTTP origin that ignores `Range`). ds-storage flattens object_store
@@ -592,6 +587,11 @@ pub(crate) fn range_not_honoured(e: &DataServerError) -> bool {
         .contains("non-partial response when range requested")
 }
 
+/// Create a catalog seeded from STAC collection extent — no items fetched.
+///
+/// This is called at engine startup. The catalog has no entries but carries
+/// the spatial and temporal extent from the STAC collection metadata.
+/// Items are fetched on-demand when queries arrive.
 pub fn init_stac_from_extent(extent: &crate::stac::StacExtent) -> Catalog {
     let temporal_extent = extent.temporal_start.map(|start| {
         let end = extent.temporal_end.unwrap_or_else(Utc::now);

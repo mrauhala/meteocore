@@ -82,10 +82,12 @@ impl ObjectStore for FlakyStore {
                         source: "Received non-partial response when range requested".into(),
                     });
                 }
-                let fail = self
-                    .fail_ranges
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok();
+                // Tests drive one read at a time, so load-then-decrement is
+                // race-free here.
+                let fail = self.fail_ranges.load(Ordering::SeqCst) > 0;
+                if fail {
+                    self.fail_ranges.fetch_sub(1, Ordering::SeqCst);
+                }
                 if fail {
                     return Err(object_store::Error::Generic {
                         store: "S3",
