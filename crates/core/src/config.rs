@@ -574,7 +574,8 @@ pub struct WmsConfig {
     /// Parameters not listed here use the top-level `colormap`/`min`/`max`.
     #[serde(default)]
     pub parameters: Vec<WmsParameterConfig>,
-    /// Rendered image cache size in MB. Default: 128.
+    /// Rendered image cache size in MB. Default:
+    /// [`DEFAULT_RENDERED_CACHE_MB`].
     ///
     /// NOTE: like the meta-tile cache, this is actually a *global* shared cache,
     /// not per-collection; it lives here for backward compatibility. New global
@@ -647,8 +648,20 @@ pub struct ColorStop {
     pub color: String,
 }
 
+/// Default size of the shared rendered-image cache, in MB, when no
+/// collection's `[wms] rendered_cache_mb` sets it (#1010).
+///
+/// Sized on a day of WMS GetMaps from a live deployment (85 000 requests,
+/// all viewports; 4 % repeated an earlier request exactly). Replaying those
+/// repeats through the cache served 1 900 of them at 128 MB, 2 300 at
+/// 256 MB and 2 200 at 512 MB. 256 MB holds roughly the last 25 minutes of
+/// renders, and about 1 hit in 8 reuses an older image, so the step down
+/// from 512 MB costs at most that share. The meta-tile cache (`[server]
+/// metatile_cache_mb`) is the one whose hit rate grows with memory.
+pub const DEFAULT_RENDERED_CACHE_MB: u64 = 256;
+
 fn default_rendered_cache_mb() -> u64 {
-    512
+    DEFAULT_RENDERED_CACHE_MB
 }
 
 fn default_metatile_cache_mb() -> u64 {
@@ -5941,6 +5954,19 @@ description = "X"
         // No webp_quality: WebP stays lossless.
         assert_eq!(wms.webp_quality, None);
         assert_eq!(config.collections[0].webp_quality(), None);
+    }
+
+    /// #1010: the rendered-image cache defaults to 256 MB; a collection can
+    /// still size it.
+    #[test]
+    fn wms_rendered_cache_defaults_to_256_mb() {
+        let cfg = collection_with("[collections.wms]\n");
+        let wms = cfg.collections[0].wms.as_ref().unwrap();
+        assert_eq!(wms.rendered_cache_mb, 256);
+        assert_eq!(DEFAULT_RENDERED_CACHE_MB, 256);
+        let cfg = collection_with("[collections.wms]\nrendered_cache_mb = 512\n");
+        let wms = cfg.collections[0].wms.as_ref().unwrap();
+        assert_eq!(wms.rendered_cache_mb, 512);
     }
 
     #[test]

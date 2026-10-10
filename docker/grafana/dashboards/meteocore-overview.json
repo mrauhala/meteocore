@@ -1019,7 +1019,7 @@
     {
       "type": "timeseries",
       "title": "Rendered-output cache — hit ratio and fill",
-      "description": "Exact-request repeats (fixed-viewport animation loops). Low hit% is EXPECTED with diverse clients — it only pays for loopers. Bimodal by design (#202).",
+      "description": "Exact-request repeats: a WMS view requested again unchanged (a fixed display cycling its animation frames, a client's default view) and Tiles z/x/y. A few % is EXPECTED with viewport WMS clients, whose shared work the meta-tile cache holds (#202). Fill pinned at 100% with a low ratio is not a sizing signal: replayed traffic gained no hits above the 256 MB default (#1010).",
       "id": 20,
       "gridPos": {
         "h": 8,

@@ -3937,14 +3937,15 @@ pub fn load_collections(
         );
     }
 
-    // Determine rendered cache size from first WMS collection config, or default
+    // Determine rendered cache size from first WMS collection config, or the
+    // same default a `[wms]` block without `rendered_cache_mb` gets (#1010).
     let rendered_cache_mb = map_collections
         .values()
         .chain(maps_collections.values())
         .filter_map(|c| c.wms.as_ref())
         .map(|w| w.rendered_cache_mb)
         .next()
-        .unwrap_or(128);
+        .unwrap_or(ds_core::config::DEFAULT_RENDERED_CACHE_MB);
 
     // Meta-tile pixel cache size (#202) is a server-wide setting
     // (`[server] metatile_cache_mb`) — the cache is global to all WMS
@@ -7010,6 +7011,26 @@ mod tests {
     }
 
     // --- reload preserves the warm render caches (ReusableCaches) ---
+
+    /// #1010: with no `[wms]` block to size it, the rendered-image cache gets
+    /// the same default as a `[wms]` block that omits `rendered_cache_mb`.
+    #[test]
+    fn rendered_cache_defaults_without_a_wms_block() {
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[],
+            &[],
+            "http://x",
+            false,
+            64,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        assert_eq!(
+            result.wms_state.rendered_cache.capacity(),
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB * 1024 * 1024
+        );
+    }
 
     #[test]
     fn reload_reuses_render_caches_when_size_unchanged() {

@@ -83,7 +83,8 @@ budget and its client-visible failure.
 - **Tile cache:** compressed bytes in an LRU (default 256 MB), **remote
   sources only** — local files get compressed bytes free from the mmap/page
   cache.
-- **Rendered image cache** (default 512 MB) shared across WMS/Maps/Tiles.
+- **Rendered image cache** (default 256 MB, `[wms] rendered_cache_mb`) shared
+  across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of
   *decoded* native source tiles for local files **and** remote COGs
   (`MC_GEOTIFF_DECODED_CHUNK_CACHE_MB`, default 512, 0 disables; one shared

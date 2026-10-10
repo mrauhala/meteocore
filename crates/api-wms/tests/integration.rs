@@ -3942,6 +3942,48 @@ fn png_pixels(bytes: &[u8]) -> Vec<[u8; 4]> {
     }
 }
 
+/// #1010: a meta-tiled EPSG:3857 viewport is cached on its first render,
+/// though its bbox and size match no tile grid. Such viewports are the views
+/// a live deployment saw repeated (a fixed display cycling its frames, a
+/// client's default view), so admitting only tile-aligned views, or only a
+/// view's second render, would forfeit the hits this cache earns.
+#[tokio::test]
+async fn meta_tiled_viewport_is_cached_on_its_first_render() {
+    use std::sync::atomic::Ordering;
+    let (app, calls) = build_half_data_router();
+    let view = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&STYLES=\
+                &CRS=EPSG:3857&BBOX=1113194,7361866,3339584,11068715\
+                &WIDTH=96&HEIGHT=160&FORMAT=image/png";
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let x_cache = resp.headers()["x-cache"].to_str().unwrap().to_string();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (x_cache, body)
+        }
+    };
+
+    let (x, first) = get(view.to_string()).await;
+    assert_eq!(x, "MISS");
+    let rendered = calls.load(Ordering::Relaxed);
+    assert!(rendered > 0);
+
+    // Meta-tiled: an opaque copy of the view is another rendered-cache key,
+    // yet it is assembled from the meta-tiles cached above.
+    let (x, _) = get(format!("{view}&TRANSPARENT=FALSE")).await;
+    assert_eq!(x, "MISS");
+    assert_eq!(calls.load(Ordering::Relaxed), rendered, "meta-tiled view");
+
+    let (x, second) = get(view.to_string()).await;
+    assert_eq!(x, "HIT", "cached on its first render");
+    assert_eq!(second, first);
+}
+
 /// TRANSPARENT=FALSE paints nodata with BGCOLOR and returns an opaque image;
 /// the default keeps nodata transparent — on both render paths.
 #[tokio::test]
