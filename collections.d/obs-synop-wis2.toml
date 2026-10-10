@@ -34,3 +34,10 @@ topics = [
 # download_allowlist = ["https://wis2.smhi.se/"]
 # broker = "mqtts://globalbroker.meteo.fr:8883"   # default
 # username = "everyone"; password = "everyone"   # defaults (public)
+# warmup = "PT24H"   # default = retention: after a cold start (no [server]
+                     # state_dir snapshot) /health reports "warming up after
+                     # cold start: N reports received" until the store holds a
+                     # full window. With state_dir the store survives restarts
+                     # in <state_dir>/obs-synop-wis2.bufr.state; a snapshot
+                     # older than this (a long outage) keeps the reports still
+                     # inside retention but restarts the warm-up.

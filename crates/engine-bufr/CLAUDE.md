@@ -146,8 +146,9 @@ no opt-out, as for GRIB; a client wanting kelvin converts back.
   `poll_runtime()`: scan every `poll_interval_secs`, prune every 60 s,
   snapshot every 10 s when dirty. `live_health()` degrades after 3
   consecutive failed scans. Wired in `server/src/admin.rs` (`"bufr" =>
-  ["edr", "features"]`), boot spawn + shutdown in `main.rs`,
-  `rotate_poll_loops!` on reload.
+  ["edr", "features"]`, built by `new_with_state(…, state_store())`), boot
+  spawn + shutdown in `main.rs` (`shutdown()` flushes the WIS2 state
+  snapshot), `rotate_poll_loops!` on reload.
 - `source.rs` uses `ds-storage` (`list` + `get_many`, bounded concurrency,
   16 MiB per file): **poll runtime only** (Critical Rule 7), never from a
   request handler, never inside `spawn_blocking`. `scan()` fetches in
@@ -185,8 +186,10 @@ fact, download policy). Engine-side specifics:
   `degrade_after_secs` ∧ a notification accepted within `stale_after`
   (default PT2H — hourly SYNOP with slack) ∧ at least one report ever
   decoded (fresh notifications whose payloads all fail to decode are
-  `Degraded`, not green-with-nothing-served). A quiet CAP feed is healthy;
-  a quiet observation feed is not, hence the extra knob.
+  `Degraded`, not green-with-nothing-served) ∧ past the warm-up (below).
+  A quiet CAP feed is healthy; a quiet observation feed is not, hence the
+  extra knob. Restored reports do not count as decoded: `probed` means
+  this process's pipeline produced one.
 - **Lifecycle:** `Wis2Source::run` is a `'session` loop like engine-cap's
   `wis2_loop` — if the pipeline cannot start or ends on its own it is
   marked disconnected (so `/health` degrades) and respawned after 30 s;
@@ -200,8 +203,83 @@ fact, download policy). Engine-side specifics:
   producer whose notification metadata disagrees with its data cannot
   split a station in two. Subsets without an id or position are skipped
   and counted (`bufr_reports_total{result="skipped"}`, ~0.1 % live).
-- A cold boot starts empty until the next synoptic hour (H+20 typically);
-  there is no Global Cache backfill (follow-up).
+- Without a state snapshot a boot starts empty until the next synoptic
+  hour (H+20 typically); there is no Global Cache backfill (follow-up).
+
+## Persistence across restarts (WIS2 mode, #1002, `src/persist.rs`)
+
+Only WIS2 mode persists: nothing replays a broker's past notifications,
+so the retention window (~270k reports globally) was lost at every
+restart and took a day to refill. A `data_path` source re-reads its files
+at boot and ignores the state store.
+
+- With `[server] state_dir` the engine snapshots the store as one blob
+  under `<id>.bufr` through `ds_core::state` (an `Arc<dyn StateStore>`,
+  never a path; the file backend writes `<state_dir>/<id>.bufr.state`; see
+  `crates/server/CLAUDE.md`), engine-cap's design: written on the poll
+  runtime from the 10 s snapshot tick when `state_revision()` moved (the
+  metadata `version`, bumped after every store change, plus the warm-up
+  clock starting), at most every five minutes, an unchanged store every
+  quarter of `warmup` (5 min–1 h, `state_policy`), and always from
+  `shutdown()`. The encode runs under the store's READ lock, straight from
+  the rows (no copy): requests keep reading, and the only writer is the
+  same poll loop.
+- Restored by `new_with_state` before the first metadata build, so the
+  restored reports are served at once (still `connecting` until the session
+  is up). Restore applies the CURRENT config: `ObsStore::prune` drops rows
+  older than `retention` and stations beyond `max_stations`, and snapshot
+  columns are mapped onto the current parameter table by their whole
+  definition (name, descriptors, source unit, stored unit, period): a
+  column the config dropped or redefined loses its values (logged), a new
+  one is missing in restored rows. Never map by name alone — a changed unit
+  or period would serve old values under the new meaning.
+- Anything wrong with the snapshot (unreadable, not gzip, truncated, CRC,
+  another `format`/`version`/`collection`, a bad value, unsorted or
+  mismatched times, a duplicate station) rejects the WHOLE snapshot: WARN +
+  cold start, and the next write replaces it.
+- **Format** (measured in the module doc and `realistic_store_snapshot_size`):
+  gzip (fast level, flate2 already in the tree via ds-wis2) over JSON,
+  stations sorted by id (same state ⇒ same bytes); per station its row
+  `times` in epoch seconds and each row as ONE string of comma-separated
+  values, missing = empty, trailing missing dropped (`"8.2,-1.5,,1013.2"`).
+  Values are written with Rust's shortest round-trip `f32` `Display` and
+  read with `f32::from_str` — bit-exact, never through `f64`; station
+  coordinates use serde_json's `float_roundtrip` (enabled in `Cargo.toml`).
+  270k reports ≈ 7.7 MB, ~0.25 s to encode, ~0.18 s to decode (release).
+  Keep the `BufWriter` in front of the `GzEncoder`: serde_json writes
+  few-byte fragments, and deflating each made the encode 4× slower.
+  `persist::VERSION` bumps on any non-additive change.
+- The `rel=deletion` index (`Produced`) is NOT persisted: it covers only
+  the last ~200k `data_id`s (≈ 5 h), whose ~100-character ids alone are
+  about as large as the store's whole JSON, and observation feeds rarely
+  withdraw. A deletion of a
+  `data_id` received before the restart is a no-op; its rows age out.
+- **Warm-up health.** A store that began filling less than `[bufr.wis2]
+  warmup` ago reports `LiveStatus::WarmingUp` — `/health` "warming up after
+  cold start: N reports received", degraded — wherever it would otherwise
+  be `Ready` (a broker blip inside `degrade_after_secs` stays warming). The
+  default is the collection's `retention`, not CAP's fixed PT24H: the store
+  is complete once it holds a full retention window, and observations are
+  never republished (the two agree at the default PT24H). The clock
+  (`WarmupClock` in `wis2.rs`) starts on the first snapshot tick with the
+  subscription up and travels in the snapshot: a restart mid warm-up keeps
+  warming; a snapshot written longer than `warmup` ago keeps the rows still
+  inside `retention` but restarts the warm-up (`WarmupCause::LongOutage`,
+  "warming up after a long outage", written back at the first tick).
+  Without a state store every start is cold.
+- **The outage threshold is `warmup` (CAP's rule), and the reports
+  published while the server was down are never filled in.** With the
+  default `warmup` = `retention`, an outage shorter than `retention` is
+  `Ready` at once with that gap in the window until it ages out, and a
+  longer one leaves practically nothing inside `retention` to restore
+  (only rows up to the 1 h future slack). Set `warmup` shorter than
+  `retention` for a long outage to show as "warming up after a long
+  outage".
+- A reload that rebuilds the collection restores from the last periodic
+  snapshot (≤ 5 min old); the replaced engine's `shutdown()` then writes
+  its final state, which the new engine overwrites at its next write, so
+  the reports the replaced engine received since its last periodic write
+  are lost (as for CAP).
 
 ## Smoke test
 
@@ -217,4 +295,8 @@ curl -s localhost:8000/metrics | grep ^bufr_
 cargo run -p server -- --collections=obs-synop-wis2
 curl 'localhost:8000/edr/collections/obs-synop-wis2/locations'      # Swedish WIGOS ids
 curl -s localhost:8000/metrics | grep -E '^(wis2_|bufr_)'          # duplicates ≈ 5× accepted
+# Persistence: with [server] state_dir set, stop the server (Ctrl-C flushes
+# <state_dir>/obs-synop-wis2.bufr.state), start it again: /locations answers
+# at once, and the log says "restored N report(s) at M station(s)".
+gunzip -c state/obs-synop-wis2.bufr.state | jq '.stations | length'
 ```

@@ -1,10 +1,10 @@
 //! Engine state snapshots (#1000): a backend-neutral store and the write
 //! policy every engine shares.
 //!
-//! An engine that accumulates state in memory from a push feed (CAP over
-//! WIS2 today, the BUFR WIS2 store next, #1002) cannot re-read that state
-//! from its source after a restart: the broker does not replay what it
-//! already delivered. Such an engine snapshots the state through a
+//! An engine that accumulates state in memory from a push feed (the CAP
+//! accumulator and the BUFR report store over WIS2, #1002) cannot re-read
+//! that state from its source after a restart: the broker does not replay
+//! what it already delivered. Such an engine snapshots the state through a
 //! [`StateStore`] under a key of its own ([`collection_key`]:
 //! `<collection id>.<kind>`, `kind` = `cap`, `bufr`, …) and restores it when
 //! it is built.

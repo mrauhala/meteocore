@@ -12,6 +12,12 @@ ds-wis2 = { path = "../ds-wis2" }
 ds-bufr = { path = "../ds-bufr" }
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# The WIS2 store snapshot (#1002, `src/persist.rs`): gzip-compressed JSON.
+# flate2 is already in the tree through ds-wis2; `float_roundtrip` reads
+# station coordinates back bit for bit (as engine-cap).
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 thiserror = "2"

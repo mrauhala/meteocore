@@ -665,7 +665,7 @@ one never implies the other.
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
+| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
 
 ## Config Format
 
@@ -686,9 +686,11 @@ port = 8000
                                  # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,
                                  # GDAL color-relief .txt/.clr, SLD .sld (ColorMap). Re-read on reload;
                                  # missing dir = hard error; other extensions skipped.
-# state_dir = "/var/lib/meteocore"  # optional, engine state snapshots (#1000): a WIS2 CAP
-                                 # collection keeps its alert set in <state_dir>/<id>.cap.state
-                                 # across restarts. Relative = to the config file's dir;
+# state_dir = "/var/lib/meteocore"  # optional, engine state snapshots (#1000, #1002): a WIS2
+                                 # CAP collection keeps its alert set in <state_dir>/<id>.cap.state,
+                                 # a WIS2 BUFR collection its report store in <id>.bufr.state
+                                 # (gzip JSON, ~8 MB global), across restarts. File-fed sources
+                                 # re-read their files instead. Relative = to the config file's dir;
                                  # created at boot; needs a WRITABLE mount (a failed write is
                                  # a rate-limited WARN, never a load error). Unset = no
                                  # persistence. Fixed at boot (reload WARNs, restart to change).
@@ -880,6 +882,12 @@ position_radius_km = 25.0      # EDR position → nearest station within this
 #                              # ["013011"], unit, period_hours for accumulations)
 # [collections.bufr.wis2]      # push instead of poll; most SYNOP arrives inline
 # topics = ["cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop"]
+# warmup = "PT24H"             # default = retention: after a cold start /health says
+#                              # "warming up after cold start: N reports received" until
+#                              # the store has filled one window; with [server] state_dir
+#                              # the store survives restarts (a snapshot older than warmup
+#                              # keeps the rows still inside retention but restarts the
+#                              # warm-up)
 
 # CAP warnings pushed over WMO WIS2 (third cap source mode, XOR with
 # data_path / feed_url). `[….wis2]` is the shared ds-wis2 subscription
@@ -907,7 +915,7 @@ topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnin
                      # (degraded) this long after the subscription first comes up;
                      # a snapshot older than this restores its alerts but restarts
                      # the warm-up ("warming up after a long outage").
-                     # CAP only: [bufr.wis2] rejects it.
+                     # [bufr.wis2] has it too, defaulting to the collection's retention.
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs`

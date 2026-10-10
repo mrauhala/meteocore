@@ -265,13 +265,16 @@ need no reload pruning.
   Icechunk read admission. Re-enabling preserves the current view; the explicit
   "Zoom to extent" action remains animated.
 
-## Engine state store (`[server] state_dir`, #1000)
+## Engine state store (`[server] state_dir`, #1000, #1002)
 
 Engines that accumulate state from a push feed snapshot it into the
-server's state store and restore it when the collection is built — today
-the WIS2 CAP accumulator (see `crates/engine-cap/CLAUDE.md`); the BUFR WIS2
-store is next (#1002) and reuses the same trait with the key
-`<collection id>.bufr`. The plumbing is `ds_core::state` (std only):
+server's state store and restore it when the collection is built: the WIS2
+CAP accumulator under `<collection id>.cap` (see
+`crates/engine-cap/CLAUDE.md`) and the WIS2 BUFR report store under
+`<collection id>.bufr` (gzip-compressed JSON, ~7.7 MB for a global 270k-
+report store; see `crates/engine-bufr/CLAUDE.md`). File-fed collections
+re-read their source and ignore the store. The plumbing is
+`ds_core::state` (std only):
 
 - `StateStore`, the object-safe backend trait: `load(key)`, `save(key,
   bytes)` (an atomic whole-blob replace), `describe(key)` for log lines.
@@ -287,11 +290,11 @@ store is next (#1002) and reuses the same trait with the key
   `prepare()` creates the directory and sweeps temps a crash left behind
   (older than an hour) at boot.
 - `StateWriter`, the write policy, backend-independent: write when the
-  engine's revision moved, at most every `min_interval` (CAP: 5 min);
-  rewrite an unchanged state every `refresh_interval` (CAP: a quarter of
-  `warmup`, 5 min–1 h) so the snapshot's own timestamp says when the server
-  was last alive; always write when forced (the shutdown flush); report
-  failures at most every `warn_interval` (15 min).
+  engine's revision moved, at most every `min_interval` (CAP and BUFR:
+  5 min); rewrite an unchanged state every `refresh_interval` (both: a
+  quarter of `warmup`, 5 min–1 h) so the snapshot's own timestamp says when
+  the server was last alive; always write when forced (the shutdown flush);
+  report failures at most every `warn_interval` (15 min).
 - **Adding a backend** (Redis, …): implement `StateStore` and select it in
   `admin::init_state_store` by a NEW `[server]` key (e.g. a backend name
   plus its URL), keeping `state_dir` as the file backend. Engines and the
@@ -314,10 +317,10 @@ Wiring:
   wrote (at most five minutes old); the replaced engine's `shutdown()` then
   writes its final state, which the new engine overwrites at its next
   write. An unchanged collection keeps its live engine and state.
-- Graceful shutdown: `shutdown()` on each CAP engine (the block at the end of
-  `main`) flushes the snapshot, so a redeploy loses nothing and the snapshot
-  records when the server went down. A crash loses at most the last five
-  minutes.
+- Graceful shutdown: `shutdown()` on each CAP and BUFR engine (the block at
+  the end of `main`) flushes the snapshot, so a redeploy loses nothing and
+  the snapshot records when the server went down. A crash loses at most
+  the last five minutes.
 - Deployment: the directory needs a writable mount (the image's `/data` is
   the config mount, often read-only). The image creates
   `/var/lib/meteocore` owned by its non-root `dataserver` user, so a named
@@ -327,8 +330,8 @@ Wiring:
   persistence. A removed collection's snapshot stays on disk; delete it by
   hand. Never point two replicas at one `state_dir`.
 - In the server's unit tests the state store is process-global: a test
-  that needs it runs in a child process
-  (`state_dir_reaches_wis2_cap_engines`).
+  that needs it runs in a child process (`state_dir_reaches_wis2_engines`,
+  which covers both engines).
 
 ## Remote radar startup recovery (#190)
 
