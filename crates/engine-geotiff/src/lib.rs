@@ -211,7 +211,9 @@ pub struct GeoTiffEngine {
     stac_consecutive_failures: AtomicU32,
     /// Circuit breaker: last STAC API attempt time.
     stac_last_attempt: Mutex<Option<std::time::Instant>>,
-    /// Tracks when the catalog was last successfully updated.
+    /// When the engine loaded or a poll last swapped in a catalog that
+    /// found files ([`Self::poll_age`]). Not the data's age: a poll that finds
+    /// the same files again stamps it too (#1007).
     catalog_updated_at: Mutex<Option<DateTime<Utc>>>,
 }
 
@@ -353,7 +355,6 @@ impl GeoTiffEngine {
         }
     }
 
-    /// How long ago the catalog was last successfully updated.
     /// The collection ID this engine serves.
     pub fn collection_id(&self) -> &str {
         &self.collection_id
@@ -383,8 +384,22 @@ impl GeoTiffEngine {
         }
     }
 
-    /// Returns `None` if the catalog has never been updated after initial load.
-    pub fn catalog_age(&self) -> Option<chrono::Duration> {
+    /// Age of the newest timestep, for `/health` `data_age_secs` and the
+    /// `collection_data_age_seconds` gauge (#1007): now minus the newest
+    /// timestamp in the catalog. It keeps growing while the feeder is
+    /// stalled, even though every poll still finds the old files. Negative
+    /// when the newest timestep lies in the future; `None` while the
+    /// catalog is empty.
+    pub fn data_age(&self) -> Option<chrono::Duration> {
+        let newest = *self.catalog.load().entries.keys().next_back()?;
+        Some(Utc::now() - newest)
+    }
+
+    /// Time since the engine loaded or a poll last found files, for
+    /// `/health` `poll_age_secs`. It grows while the scan fails or comes back
+    /// empty (the old catalog is kept), not while the files merely stop
+    /// changing: that is [`Self::data_age`].
+    pub fn poll_age(&self) -> Option<chrono::Duration> {
         let updated_at = self
             .catalog_updated_at
             .lock()
@@ -1180,11 +1195,15 @@ impl GeoTiffEngine {
                 self.catalog.store(Arc::new(new_catalog));
                 // Rebuild the cached RasterInfo off the request path (#211).
                 self.refresh_raster_info();
-                // Track successful catalog update time
-                *self
-                    .catalog_updated_at
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+                // Stamp the poll age only when the scan found files: an
+                // empty scan over a catalog that was already empty must not
+                // reset it (#1007).
+                if count > 0 {
+                    *self
+                        .catalog_updated_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+                }
                 let (hits, misses) = self.tile_cache.stats();
                 tracing::debug!(
                     "[{}] Poll: {} files ({}), tile cache: {} hits / {} misses",
@@ -2777,6 +2796,73 @@ mod tests {
         let engine = GeoTiffEngine::new("radar", dir.to_str(), &config).unwrap();
         let times: Vec<_> = engine.catalog.load().entries.keys().copied().collect();
         assert_eq!(times, [utc("2026-03-24T23:15:00Z").unwrap()]);
+    }
+
+    /// #1007: `data_age` is now minus the newest timestep, not the time
+    /// since the last poll. A stalled feeder leaves its files in place, so
+    /// every poll still finds them: that resets `poll_age` but not
+    /// `data_age`, which drops only once a newer file is catalogued.
+    #[test]
+    fn data_age_follows_the_newest_timestep_not_the_last_poll() {
+        let src = ["testdata/radar-tm35fin", "../../testdata/radar-tm35fin"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar-tm35fin fixture")
+            .join("radar_tm35_20260406T0640Z.tif");
+        let dir = TempDir::new("data_age_test");
+        std::fs::copy(&src, dir.0.join("radar_tm35_20260406T0640Z.tif")).unwrap();
+        let engine = GeoTiffEngine::new("radar", dir.0.to_str(), &tm35fin_test_config()).unwrap();
+
+        // `data_age` is now minus `newest`, bracketed by clock reads.
+        let assert_data_age = |newest: &str| {
+            let newest = utc(newest).unwrap();
+            let before = Utc::now();
+            let age = engine.data_age().expect("a catalogued timestep");
+            let after = Utc::now();
+            assert!(
+                before - newest <= age && age <= after - newest,
+                "data age {age} is not now minus {newest}"
+            );
+        };
+        assert_data_age("2026-04-06T06:40:00Z");
+
+        // The feeder stalls: a poll finds the same file. It resets the poll
+        // age, set an hour back here, and leaves the data age growing.
+        *engine.catalog_updated_at.lock().unwrap() = Some(Utc::now() - chrono::Duration::hours(1));
+        engine.poll_once();
+        let poll_age = engine.poll_age().unwrap();
+        assert!(
+            poll_age < chrono::Duration::minutes(1),
+            "poll age {poll_age}"
+        );
+        assert_data_age("2026-04-06T06:40:00Z");
+
+        // A newer file arrives. The scan takes a new file once its size held
+        // for two more polls.
+        std::fs::copy(&src, dir.0.join("radar_tm35_20260406T0645Z.tif")).unwrap();
+        for _ in 0..3 {
+            engine.poll_once();
+        }
+        assert_data_age("2026-04-06T06:45:00Z");
+    }
+
+    /// #1007: a poll that finds no files leaves `poll_age` growing, also
+    /// when the catalog was empty already, and there is no data age.
+    #[test]
+    fn poll_age_grows_while_the_source_stays_empty() {
+        let dir = TempDir::new("poll_age_empty_test");
+        let engine = GeoTiffEngine::new("radar", dir.0.to_str(), &tm35fin_test_config()).unwrap();
+        assert!(engine.data_age().is_none());
+
+        *engine.catalog_updated_at.lock().unwrap() = Some(Utc::now() - chrono::Duration::hours(1));
+        engine.poll_once();
+        let poll_age = engine.poll_age().unwrap();
+        assert!(
+            poll_age >= chrono::Duration::hours(1),
+            "poll age {poll_age}"
+        );
+        assert!(engine.data_age().is_none());
     }
 
     #[test]

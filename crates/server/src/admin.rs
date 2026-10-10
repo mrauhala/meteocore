@@ -376,6 +376,15 @@ static COLLECTIONS_FAILED: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+// Freshness per collection (#1007): `/health`'s `data_age_secs`, set each
+// scrape by `refresh_data_age_gauge` from the same `collection_data_ages`.
+static COLLECTION_DATA_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "collection_data_age_seconds",
+        "Seconds since the newest data a collection serves (its /health data_age_secs)",
+    )
+});
+
 static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -5298,13 +5307,111 @@ pub(crate) fn refresh_health_gauges(state: &ServerState) -> HealthCounts {
     update_health_gauges(&effective_health(state))
 }
 
+/// What `/health` reports as `data_age_secs` and `/metrics` as
+/// `collection_data_age_seconds`, per collection id (#1007): now minus the
+/// newest data the collection serves, in whole seconds. Never the time since
+/// a poll: a stalled feeder leaves its files in place, and a poll that finds
+/// them again says nothing about how old they are. Per engine:
+///
+/// - GeoTIFF: the newest timestep in the catalog.
+/// - QueryData: the newest run's origin (reference) time.
+/// - BUFR: the newest report held.
+/// - Satellite: the newest scan start.
+/// - Nowcast: the latest generation's anchor frame.
+///
+/// Other engines, and one with no data yet, are absent. An age is negative
+/// when the newest data lies in the future. One function so the endpoint and
+/// the gauge cannot drift: O(collections) snapshot reads, no I/O, each lock
+/// taken and released on its own.
+pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<(String, i64)> {
+    let now = chrono::Utc::now();
+    let mut ages = Vec::new();
+    let mut push = |id: &str, age: Option<chrono::Duration>| {
+        if let Some(age) = age {
+            ages.push((id.to_owned(), age.num_seconds()));
+        }
+    };
+    for e in state
+        .geotiff_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .querydata_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .bufr_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.latest_report().map(|t| now - t));
+    }
+    for e in state
+        .satellite_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .nowcast_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.catalog_age());
+    }
+    ages
+}
+
+/// Set `collection_data_age_seconds` from [`collection_data_ages`], the
+/// `/health` source, and drop the series of every collection that stopped
+/// reporting an age (removed by a reload, or its data gone). Only those are
+/// removed, never the whole family, so a concurrent scrape cannot gather it
+/// half filled. Every `/metrics` scrape calls this; returns what it set.
+pub(crate) fn refresh_data_age_gauge(state: &ServerState) -> Vec<(String, i64)> {
+    static REPORTED: Mutex<std::collections::BTreeSet<String>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    // Read the ages under the lock: two scrapes racing a reload must not let
+    // the older read set a removed collection's series again after the newer
+    // one dropped it.
+    let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    let ages = collection_data_ages(state);
+    let live: std::collections::BTreeSet<String> = ages.iter().map(|(id, _)| id.clone()).collect();
+    for gone in reported.difference(&live) {
+        // Err = no such series.
+        let _ = COLLECTION_DATA_AGE_SECONDS.remove_label_values(&[gone.as_str()]);
+    }
+    for (id, age) in &ages {
+        COLLECTION_DATA_AGE_SECONDS
+            .with_label_values(&[id.as_str()])
+            .set(*age);
+    }
+    *reported = live;
+    ages
+}
+
 /// GET /health — per-collection health status with data staleness info.
 pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let health = effective_health(&state);
 
     // Build per-collection metadata from concrete engine types.
     // Uses EDR-style temporal extent format: { interval, values? }
-    let mut data_ages: HashMap<String, i64> = HashMap::new();
+    // `data_age_secs` comes from the source the `/metrics` gauge reads;
+    // `poll_age_secs` is the time since the last poll that found data, for
+    // the engines that track it (GeoTIFF, QueryData; #1007).
+    let data_ages: HashMap<String, i64> = collection_data_ages(&state).into_iter().collect();
+    let mut poll_ages: HashMap<String, i64> = HashMap::new();
     let mut temporal_info: HashMap<String, serde_json::Value> = HashMap::new();
 
     // Helper: build temporal extent { interval, values? } from a sorted
@@ -5344,8 +5451,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(age) = engine.catalog_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
+            if let Some(age) = engine.poll_age() {
+                poll_ages.insert(id.clone(), age.num_seconds());
             }
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
@@ -5359,8 +5466,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(age) = engine.data_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
+            if let Some(age) = engine.poll_age() {
+                poll_ages.insert(id.clone(), age.num_seconds());
             }
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
@@ -5368,13 +5475,10 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         }
     }
     {
-        // BUFR: data age = newest report held; temporal extent from the store.
+        // BUFR: temporal extent from the store.
         let engines = state.bufr_engines.read().unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(latest) = engine.latest_report() {
-                data_ages.insert(id.clone(), (chrono::Utc::now() - latest).num_seconds());
-            }
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
             }
@@ -5414,9 +5518,6 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(age) = engine.data_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
-            }
             if let Some(temporal) = temporal_from_times(&engine.times()) {
                 temporal_info.insert(id, temporal);
             }
@@ -5444,17 +5545,13 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     }
 
     {
-        // Nowcast engines: `data_age_secs` is the age of the latest
-        // generation's anchor frame (the Ready flip is in `effective_health`).
+        // Nowcast engines (the Ready flip is in `effective_health`).
         let engines = state
             .nowcast_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(age) = engine.catalog_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
-            }
             let times = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).times;
             if let Some(temporal) = temporal_from_times(&times) {
                 temporal_info.insert(id, temporal);
@@ -5469,6 +5566,9 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             let mut entry = serde_json::to_value(h).unwrap_or_default();
             if let Some(age_secs) = data_ages.get(&h.id) {
                 entry["data_age_secs"] = json!(*age_secs);
+            }
+            if let Some(age_secs) = poll_ages.get(&h.id) {
+                entry["poll_age_secs"] = json!(*age_secs);
             }
             if let Some(temporal) = temporal_info.get(&h.id) {
                 entry["extent"] = json!({ "temporal": temporal });
@@ -5513,6 +5613,7 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
     // First, before any metrics lock.
     refresh_health_gauges(&state);
+    refresh_data_age_gauge(&state);
 
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
@@ -8667,5 +8768,117 @@ colormap = "no_such_map"
         assert_eq!(health_status(&json, "gone"), "failed");
         assert_eq!(health_status(&json, "cap-file"), "ready");
         assert_eq!(health_status(&json, "cap-wis2"), "degraded");
+    }
+
+    /// #1007 harness: a local GeoTIFF and a QueryData collection over the
+    /// committed fixtures, with the time of the newest data each serves:
+    /// the GeoTIFF's newest timestep and the QueryData run's origin time.
+    fn data_age_state() -> (
+        tempfile::TempDir,
+        super::AdminState,
+        [(&'static str, chrono::DateTime<chrono::Utc>); 2],
+    ) {
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"age-geotiff\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{testdata}/radar-tm35fin\"\nengine_type = \"geotiff\"\n\
+                 apis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n\
+                 [[collections]]\nid = \"age-querydata\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{testdata}/ecmwf-kenya\"\nengine_type = \"querydata\"\n\
+                 apis = [\"edr\"]\n"
+            ),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let utc = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let newest = [
+            ("age-geotiff", utc("2026-04-06T06:40:00Z")),
+            ("age-querydata", utc("2026-04-04T06:00:00Z")),
+        ];
+        (dir, state, newest)
+    }
+
+    /// The `collection_data_age_seconds` series of `/metrics`, by collection.
+    fn data_age_series() -> HashMap<String, i64> {
+        use super::Encoder as _;
+        let mut text = Vec::new();
+        super::TextEncoder::new()
+            .encode(&super::REGISTRY.gather(), &mut text)
+            .unwrap();
+        String::from_utf8(text)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("collection_data_age_seconds{collection=\"")?;
+                let (id, value) = rest.split_once("\"} ")?;
+                Some((id.to_owned(), value.parse().unwrap()))
+            })
+            .collect()
+    }
+
+    /// #1007: `/health` `data_age_secs` and the `collection_data_age_seconds`
+    /// gauge are now minus the newest data the collection serves, not the
+    /// time since its last poll, which `poll_age_secs` reports; a
+    /// collection that leaves the registry drops its series.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn data_age_is_the_newest_data_in_health_and_the_gauge() {
+        let (_dir, state, newest) = data_age_state();
+        assert_eq!(state.geotiff_engines.read().unwrap().len(), 1);
+        assert_eq!(state.querydata_engines.read().unwrap().len(), 1);
+
+        let before = chrono::Utc::now();
+        let json = health_json(&state).await;
+        let set = super::refresh_data_age_gauge(&state);
+        let series = data_age_series();
+        let after = chrono::Utc::now();
+
+        for (id, time) in newest {
+            // Read between `before` and `after`, so within these bounds.
+            let ages = (before - time).num_seconds()..=(after - time).num_seconds();
+            let entry = json["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap_or_else(|| panic!("no /health entry for {id}"));
+            let data_age = entry["data_age_secs"].as_i64().unwrap();
+            assert!(ages.contains(&data_age), "{id}: data_age_secs {data_age}");
+            // Both engines loaded moments ago: that is the poll age.
+            let poll_age = entry["poll_age_secs"].as_i64().unwrap();
+            assert!(
+                (0..60).contains(&poll_age),
+                "{id}: poll_age_secs {poll_age}"
+            );
+
+            let gauge = set.iter().find(|(c, _)| c == id).map(|(_, age)| *age);
+            assert!(
+                gauge.is_some_and(|age| ages.contains(&age)),
+                "{id}: {gauge:?}"
+            );
+            assert_eq!(series.get(id).copied(), gauge, "{id} in /metrics");
+        }
+
+        // A reload removes the GeoTIFF collection: its series goes with it,
+        // the other stays.
+        state.geotiff_engines.write().unwrap().clear();
+        let set = super::refresh_data_age_gauge(&state);
+        assert_eq!(
+            set.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["age-querydata"]
+        );
+        let series = data_age_series();
+        assert!(!series.contains_key("age-geotiff"), "{series:?}");
+        assert!(series.contains_key("age-querydata"), "{series:?}");
     }
 }
