@@ -638,7 +638,10 @@ impl TiffMetadata {
         if read_size == 0 {
             return Ok(None);
         }
-        let header_bytes = store.get_range(path, 0..read_size)?;
+        // Only the poll scan reads headers before cataloguing, so a stalled
+        // attempt may retry under the background budget (#1011).
+        let header_bytes =
+            store.get_range_with_budget(path, 0..read_size, ds_storage::FetchBudget::Background)?;
         Ok(Self::parse_header(
             header_bytes,
             format!("<remote:{}>", path),

@@ -121,6 +121,12 @@ Violating these has caused production incidents. Never break them.
      Icechunk uses its own persistent I/O runtime and supports `RenderJob`
      blocking workers; concurrent shard reads through that executor are
      covered in `crates/engine-zarr/src/icechunk/tests.rs`.
+   - A whole-object download on the poll runtime passes
+     `FetchBudget::Background` (`get_with_budget` / `get_many_with_budget`,
+     120 s), so object_store's own retry of a stalled 30 s attempt can run.
+     Anything a request can wait on, a single-flight cache fill included,
+     keeps `FetchBudget::Request` (30 s or the render deadline). See
+     `crates/storage/README.md` (#1011).
 8. **SQL safety:** every identifier goes through `quote_ident`, every value
    is a `$N` bind, no SQL text inside `format!()`.
    `scripts/check_sql_safety.sh` enforces this in CI.

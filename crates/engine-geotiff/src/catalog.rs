@@ -422,6 +422,27 @@ pub fn scan_remote(
     spec: &ScanSpec<'_>,
     existing: &HashMap<&Path, &FileEntry>,
 ) -> Result<(Catalog, Vec<FailedPrefix>), DataServerError> {
+    scan_remote_within(
+        store,
+        prefixes,
+        spec,
+        existing,
+        ds_storage::DataStore::BACKGROUND_TIMEOUT,
+    )
+}
+
+/// [`scan_remote`] with `read_budget`: the time one scan may spend reading
+/// new files' metadata before it defers the rest to the next poll. Those
+/// reads run one file at a time under the background fetch budget (#1011),
+/// so without a bound a storage stall across many new files would hold the
+/// poll for files × that budget. Already-catalogued files never read.
+pub(crate) fn scan_remote_within(
+    store: &ds_storage::DataStore,
+    prefixes: &[ObjectPath],
+    spec: &ScanSpec<'_>,
+    existing: &HashMap<&Path, &FileEntry>,
+    read_budget: std::time::Duration,
+) -> Result<(Catalog, Vec<FailedPrefix>), DataServerError> {
     let collection_id = spec.label;
     let spec = ScanSpec {
         max_size: Some(MAX_REMOTE_FILE_SIZE),
@@ -460,7 +481,10 @@ pub fn scan_remote(
         }
     }
 
-    Ok((load_remote(store, files, existing, collection_id), failed))
+    Ok((
+        load_remote(store, files, existing, collection_id, read_budget),
+        failed,
+    ))
 }
 
 /// Build the catalog of the files a remote scan kept, reading each one's
@@ -470,9 +494,12 @@ fn load_remote(
     files: Vec<RemoteFile>,
     existing: &HashMap<&Path, &FileEntry>,
     collection_id: &str,
+    read_budget: std::time::Duration,
 ) -> Catalog {
     // Parse metadata (range read, falling back to full download)
     let mut entries = BTreeMap::new();
+    let started = std::time::Instant::now();
+    let mut deferred = 0usize;
 
     for file in &files {
         let datetime = file.time;
@@ -487,6 +514,13 @@ fn load_remote(
                 entries.insert(datetime, (*entry).clone());
                 continue;
             }
+        }
+
+        // The scan's read budget is spent: leave the remaining new files to
+        // the next poll, which retries them, instead of stalling this one.
+        if started.elapsed() >= read_budget {
+            deferred += 1;
+            continue;
         }
 
         // Try COG range read first (header only)
@@ -541,7 +575,9 @@ fn load_remote(
 
         // Fallback: download the full file. Full downloads are much slower and
         // cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
-        let data = match store.get(location) {
+        // The poll runtime (or engine construction) waits on this, not a
+        // request: the background budget lets a stalled attempt retry (#1011).
+        let data = match store.get_with_budget(location, ds_storage::FetchBudget::Background) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("[{}] Failed to download {}: {e}", collection_id, key);
@@ -561,6 +597,13 @@ fn load_remote(
         entries.insert(
             datetime,
             FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
+        );
+    }
+    if deferred > 0 {
+        tracing::warn!(
+            "[{}] {deferred} new file(s) left to the next poll: this scan spent over {}s reading remote metadata",
+            collection_id,
+            read_budget.as_secs()
         );
     }
 

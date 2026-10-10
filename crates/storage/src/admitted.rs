@@ -12,7 +12,7 @@ impl DataStore {
         path: &ObjectPath,
         admit: impl FnOnce(u64) -> Result<(), DataServerError>,
     ) -> Result<Option<Bytes>, DataServerError> {
-        let bytes = self.block_on_result(None, async {
+        let bytes = self.block_on_result(None, FetchBudget::Request, async {
             let result = match self.inner.get(path).await {
                 Ok(result) => result,
                 Err(object_store::Error::NotFound { .. }) => return Ok(None),
