@@ -578,13 +578,16 @@ fn load_remote(
     }
 }
 
-/// Whether a header range read failed because the source answered with the
-/// whole object instead of the range (object_store's `NotPartial`, raised by
-/// an HTTP origin that ignores `Range`). ds-storage flattens object_store
-/// errors to text, so this matches object_store's message for that case.
+/// Whether a header range read failed because the source does not honour
+/// `Range`. object_store reports it in two ways: its HTTP store as
+/// "Range request not supported by <path>" (`NotSupported`, pinned against
+/// a real origin in `remote_header_tests`), its other clients as
+/// "Received non-partial response when range requested" (`NotPartial`).
+/// ds-storage flattens object_store errors to text, so this matches both.
 pub(crate) fn range_not_honoured(e: &DataServerError) -> bool {
-    e.to_string()
-        .contains("non-partial response when range requested")
+    let text = e.to_string();
+    text.contains("Range request not supported")
+        || text.contains("non-partial response when range requested")
 }
 
 /// Create a catalog seeded from STAC collection extent — no items fetched.

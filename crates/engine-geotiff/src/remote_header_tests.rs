@@ -282,3 +282,29 @@ fn a_source_that_ignores_range_still_takes_the_full_download() {
     );
     assert_eq!(flaky.counts(), (1, 1));
 }
+
+/// The shipped object_store HTTP client against a real origin that ignores
+/// `Range` and answers 200 with the whole object: its error is the one
+/// `range_not_honoured` matches. Pins the match against the client itself,
+/// not against the mock above, so a reworded error after a dependency bump
+/// fails here instead of leaving such a source uncatalogued.
+#[tokio::test(flavor = "multi_thread")]
+async fn object_store_reports_an_origin_ignoring_range_as_range_not_honoured() {
+    let bytes = std::fs::read(FIXTURE).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/d/radar.tif",
+        axum::routing::get(move || {
+            let bytes = bytes.clone();
+            async move { bytes }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (store, path) = ds_storage::build_http_store(&format!("{base}/d/radar.tif")).unwrap();
+    let err = store
+        .get_range(&path, 0..1024)
+        .expect_err("a 200 answer to a range request is an error");
+    assert!(catalog::range_not_honoured(&err), "unexpected error: {err}");
+}
