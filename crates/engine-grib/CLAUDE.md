@@ -271,8 +271,10 @@ ones only in the legacy layout.
   `MapEngine::resolve_parameter_reference_time`, which the API layers call
   instead of `resolve_reference_time`. Pinning the run it returns must
   re-select the same step at the request and at that step's time:
-  `resolved_keys_render_the_same_pixels_as_the_request` sweeps it. That is
-  why rule 2 checks "inside the data" against every run, not the pinned one.
+  `resolved_keys_render_the_same_pixels_as_the_request` sweeps it. So with
+  a pin, rule 2 accepts a time outside the pinned run's own steps only when
+  the unpinned selection chooses that run; any other pin outside its steps
+  is the default layer's 400, never the pinned run's edge step.
 - `fetch_grid`: a parameter the run lacks is `InvalidParameter`; a step
   without its field at the requested level (a pressure view's `z`) is
   `LocationNotFound`.

@@ -200,6 +200,22 @@ fn a_map_renders_the_nearest_step_that_carries_the_parameter() {
         value(&engine, Some("TCDC_avg_3h"), Some(at(6)), Some(at(0))).unwrap(),
         30.0
     );
+    // A pin outside its run's steps, at a time only another run answers,
+    // is the default layer's error: never the pinned run's edge step.
+    assert!(matches!(
+        value(&engine, Some("TCDC_avg_3h"), Some(at(10)), Some(at(0))),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        value(&engine, None, Some(at(10)), Some(at(0))),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+    // The run the unpinned selection chose still serves the time when the
+    // API layers pin it, though the time lies outside that run's steps.
+    assert_eq!(
+        value(&engine, Some("TMAX"), Some(at(0)), Some(at(6))).unwrap(),
+        26.85
+    );
     // A run without the parameter is missing data, a 404, not a bad request.
     assert!(matches!(
         value(&engine, Some("TMAX"), Some(at(3)), Some(at(0))),

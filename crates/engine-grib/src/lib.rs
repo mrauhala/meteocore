@@ -1270,10 +1270,23 @@ fn select_run_step<'a>(
     if let Some(found) = spanning {
         return Ok(found);
     }
-    // Any run, not only the pinned one: a pinned run must render what the
-    // unpinned selection chose of it, the run the API layers pin (#521).
     let within = |run: &ForecastRun| catalog::CarriedSteps::Every(run).covers(time);
-    if !catalog.runs.values().any(within) {
+    let outside = match pinned {
+        None => !catalog.runs.values().any(within),
+        // A pinned run serves a time outside its own steps only where the
+        // unpinned selection chooses that run: the API layers resolve the
+        // run first and pin it (#521), so the pinned render must reproduce
+        // that choice. Any other pin keeps the default layer's error rather
+        // than snapping to a step of a run that cannot answer the time.
+        Some(pin) => {
+            !within(pin)
+                && !matches!(
+                    select_run_step(catalog, parameters, None, Some(time)),
+                    Ok((run, ..)) if run.reference_time == pin.reference_time
+                )
+        }
+    };
+    if outside {
         // Outside the data: the default layer's errors.
         return Err(DataServerError::InvalidParameter(match pinned {
             Some(_) => format!("No forecast step for time {time}"),
