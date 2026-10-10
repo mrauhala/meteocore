@@ -1781,6 +1781,84 @@ fn render_concurrency_reload_warning(configured: Option<usize>) -> Option<String
     })
 }
 
+/// The engine state store (#1000), fixed at boot by [`init_state_store`]:
+/// the `[server] state_dir` it was built from and the store itself. Unset
+/// (tests, a config without it) means no engine persistence.
+struct StateBackend {
+    dir: Option<std::path::PathBuf>,
+    store: Option<Arc<dyn ds_core::state::StateStore>>,
+}
+
+static STATE: std::sync::OnceLock<StateBackend> = std::sync::OnceLock::new();
+
+/// Temp files a crash mid-save left in the state directory are removed at
+/// boot once they are this old (a live save never is).
+const STATE_STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Build the process-wide engine state store (#1000): today the file
+/// backend over `[server] state_dir`. Another backend would be chosen here,
+/// by a `[server]` key of its own; engines only ever see the
+/// `Arc<dyn StateStore>` that [`state_store`] hands out. Boot calls this
+/// before the first [`load_collections`]; a reload cannot replace it (the
+/// engines it would rebuild could not restore what the live ones wrote
+/// elsewhere). A directory that cannot be created is a WARN, not a boot
+/// failure: persistence is best effort, and each failed write warns again
+/// (rate-limited).
+pub fn init_state_store(dir: Option<std::path::PathBuf>) {
+    let store = dir.as_ref().map(|d| {
+        let file = ds_core::state::FileStateStore::new(d);
+        match file.prepare(STATE_STALE_TEMP_AGE) {
+            Ok(removed) => info!(
+                "State directory: {} (engine snapshots; restart to change){}",
+                d.display(),
+                if removed > 0 {
+                    format!(", removed {removed} stale temp file(s)")
+                } else {
+                    String::new()
+                }
+            ),
+            Err(e) => tracing::warn!(
+                "[server] state_dir '{}' cannot be created: {e} — snapshot writes will \
+                 fail until it is writable",
+                d.display()
+            ),
+        }
+        Arc::new(file) as Arc<dyn ds_core::state::StateStore>
+    });
+    if STATE.set(StateBackend { dir, store }).is_err() {
+        tracing::warn!("[server] state store was already initialised; keeping the first one");
+    }
+}
+
+/// The boot-time engine state store, if any.
+pub(crate) fn state_store() -> Option<Arc<dyn ds_core::state::StateStore>> {
+    STATE.get().and_then(|s| s.store.clone())
+}
+
+/// The boot-time `[server] state_dir`, if any.
+fn state_dir() -> Option<&'static std::path::Path> {
+    STATE.get().and_then(|s| s.dir.as_deref())
+}
+
+/// A reload re-reads `[server] state_dir` but cannot move it: the restart
+/// warning to log when the reloaded value differs from the live one.
+fn state_dir_reload_warning(
+    live: Option<&std::path::Path>,
+    wanted: Option<&std::path::Path>,
+) -> Option<String> {
+    (live != wanted).then(|| {
+        let show = |d: Option<&std::path::Path>| {
+            d.map_or_else(|| "unset".to_string(), |d| format!("'{}'", d.display()))
+        };
+        format!(
+            "[server] state_dir now resolves to {}, but a reload cannot move the live state \
+             directory ({}); restart to apply",
+            show(wanted),
+            show(live)
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
 pub fn load_collections(
     style_ctx: &ds_render::StyleContext,
@@ -2783,9 +2861,7 @@ pub fn load_collections(
                 // first poll has not run yet.
                 let (status, error) = match engine.live_health() {
                     Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
-                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
-                        (CollectionStatus::Degraded, Some(reason.to_string()))
-                    }
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
                     None => (CollectionStatus::Degraded, None),
                 };
                 health.push(CollectionHealth {
@@ -3230,7 +3306,11 @@ pub fn load_collections(
                         );
                         e
                     }
-                    None => match engine_cap::CapEngine::new(cap_config, &collection.id) {
+                    None => match engine_cap::CapEngine::new_with_state(
+                        cap_config,
+                        &collection.id,
+                        state_store(),
+                    ) {
                         Ok(e) => Arc::new(e),
                         Err(e) => {
                             tracing::error!(
@@ -3318,9 +3398,7 @@ pub fn load_collections(
                 // overriding the boot snapshot at runtime.
                 let (status, error) = match engine.live_health() {
                     Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
-                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
-                        (CollectionStatus::Degraded, Some(reason.to_string()))
-                    }
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
                     None if engine.is_loaded() => (CollectionStatus::Ready, None),
                     None => (
                         CollectionStatus::Degraded,
@@ -3403,9 +3481,7 @@ pub fn load_collections(
                 // source); `health_handler` keeps the live status current.
                 let (status, error) = match engine.live_health() {
                     Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
-                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
-                        (CollectionStatus::Degraded, Some(reason.to_string()))
-                    }
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
                     None if engine.is_loaded() => (CollectionStatus::Ready, None),
                     None => (
                         CollectionStatus::Degraded,
@@ -4543,6 +4619,15 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     if let Some(warning) = render_concurrency_reload_warning(config.server.render_concurrency) {
         tracing::warn!("{warning}");
     }
+    if let Some(warning) = state_dir_reload_warning(
+        state_dir(),
+        config
+            .server
+            .state_dir_path(std::path::Path::new(&state.config_path))
+            .as_deref(),
+    ) {
+        tracing::warn!("{warning}");
+    }
 
     // Rebuild the palette registry (built-ins + [[colormaps]] +
     // colormaps_dir) and run the same colormap-name validation as startup:
@@ -5269,9 +5354,9 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
                     h.status = CollectionStatus::Ready;
                     h.error = None;
                 }
-                Some(ds_core::health::LiveStatus::Degraded { reason }) => {
+                Some(&live) => {
                     h.status = CollectionStatus::Degraded;
-                    h.error = Some(reason.to_string());
+                    h.error = live.degraded_reason();
                 }
                 None => {}
             }
@@ -8595,6 +8680,86 @@ colormap = "no_such_map"
             assert!(warning.contains("restart to apply"), "{warning}");
         }
         assert!(super::init_render_concurrency(Some(4)).is_err());
+    }
+
+    /// #1000: `[server] state_dir` reaches the CAP engines `load_collections`
+    /// builds — a WIS2 collection snapshots into it. Runs in a child process:
+    /// the state directory is process-global and fixed at boot.
+    #[test]
+    fn state_dir_reaches_wis2_cap_engines() {
+        const CHILD: &str = "MC_TEST_SERVER_STATE_DIR_CHILD";
+        const NAME: &str = "admin::tests::state_dir_reaches_wis2_cap_engines";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{NAME} failed in its child process");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nhost = \"127.0.0.1\"\nport = 8000\nstate_dir = \"var/state\"\n\
+             [[collections]]\nid = \"cap-wis2\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"cap\"\napis = [\"features\"]\n\
+             [collections.cap]\n[collections.cap.wis2]\n\
+             topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n",
+        )
+        .unwrap();
+        let (config, _) =
+            ds_core::config::ServerConfig::from_file(config_path.to_str().unwrap()).unwrap();
+        let dir = tmp.path().join("var/state");
+        super::init_state_store(config.server.state_dir_path(&config_path));
+        assert!(dir.is_dir(), "state_dir is created at boot");
+        assert_eq!(super::state_dir(), Some(dir.as_path()));
+        assert!(super::state_store().is_some());
+
+        let load = || {
+            super::load_collections(
+                &ds_render::StyleContext::with_builtins(),
+                &config.collections,
+                &[],
+                "http://x",
+                false,
+                0,
+                super::ReusableCaches::default(),
+                super::EngineReuse::default(),
+            )
+        };
+        let result = load();
+        assert_eq!(result.cap_engines.len(), 1);
+        // A WIS2 engine flushes its accumulator on shutdown, under the
+        // collection's key: `<state_dir>/cap-wis2.cap.state`.
+        let filling_since = "2020-01-01T00:00:00Z";
+        result.cap_engines[0]
+            .wis2_source()
+            .unwrap()
+            .mark_filling(filling_since.parse().unwrap());
+        result.cap_engines[0].shutdown();
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.join("cap-wis2.cap.state")).unwrap()).unwrap()
+        };
+        assert_eq!(read()["collection"], "cap-wis2");
+        assert_eq!(read()["filling_since"], filling_since);
+        // The next build restores it — a fresh snapshot keeps its warm-up
+        // clock, which a cold start would have lost — and flushes it back.
+        load().cap_engines[0].shutdown();
+        assert_eq!(read()["filling_since"], filling_since);
+    }
+
+    #[test]
+    fn state_dir_reload_warning_asks_for_a_restart_only_on_change() {
+        use std::path::Path;
+        let a = Some(Path::new("/var/lib/mc"));
+        assert_eq!(super::state_dir_reload_warning(a, a), None);
+        assert_eq!(super::state_dir_reload_warning(None, None), None);
+        for (live, wanted) in [(a, Some(Path::new("/srv/mc"))), (a, None), (None, a)] {
+            let warning = super::state_dir_reload_warning(live, wanted).unwrap();
+            assert!(warning.contains("restart to apply"), "{warning}");
+        }
     }
 
     /// #990 harness: one file-fed CAP collection (live `Ready` once its

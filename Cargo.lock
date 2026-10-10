@@ -1414,6 +1414,7 @@ dependencies = [
  "futures",
  "quick-xml 0.42.0",
  "rstar",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

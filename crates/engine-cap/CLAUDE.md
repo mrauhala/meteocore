@@ -166,6 +166,59 @@ memory. Things that differ from the pull sources:
   between rebuilds with everything else identical — even a corrected
   outline with the same vertex count and bbox — and the MVT tile cache /
   Feature ETags key on it.
+- **Persistence across restarts (#1000, `src/persist.rs`).** Nothing
+  replays the accumulator after a restart (random client id, session expiry,
+  `rel=geometry` links dead after ~1 h), so with a state store (`[server]
+  state_dir`) the engine snapshots it as one blob under the key
+  `<id>.cap` through `ds_core::state` — an `Arc<dyn StateStore>`, never a
+  path (the file backend writes `<state_dir>/<id>.cap.state`; see
+  `crates/server/CLAUDE.md`): alerts with their hints, both tombstone maps,
+  `filling_since` and the warm-up cause; the `data_id` index is rebuilt.
+  Written on the poll runtime from the 5 s rebuild tick when the source's
+  `revision` moved (every ingest, deletion and eviction bumps it), at most
+  every five minutes (`SNAPSHOT_WRITE_INTERVAL`); an unchanged accumulator
+  is rewritten every quarter of `warmup`, 5 min–1 h
+  (`snapshot_policy`), so `written_at` tracks when the server was last
+  alive; and `shutdown()` always flushes it.
+  Restored by `new_with_state` BEFORE the first catalog build, and the
+  restored catalog is published at once (still `connecting` until the
+  session is up). Restore applies the CURRENT config: past validity + grace
+  at restore time, `status_filter` misses and hints `geometry_links` /
+  `bbox_fallback` no longer allow are dropped; tombstones are pruned as on a
+  rebuild. Anything wrong with the snapshot (unreadable, truncated, another
+  `format`/`version`/`collection`, a dangling geometry or area index) rejects
+  the WHOLE snapshot: WARN + cold start, and the next write replaces it — a
+  partially restored set would claim completeness. Directory/feed sources
+  ignore the store. JSON, sorted (same state ⇒ same bytes), hint polygons
+  deduplicated into one `geometries` table (MeteoAlarm repeats each zone per
+  `<info>` language; restored areas share one `Arc`). The alert structs'
+  serde derives ARE the format: a non-additive change to `parser.rs`'s
+  `CapAlert`/`CapInfo`/`CapArea`/`CapCircle` bumps `persist::VERSION`.
+  Coordinates read back bit for bit, so a restored catalog keeps its
+  `data_version`. That needs serde_json's `float_roundtrip` feature, which
+  `Cargo.toml` enables: without it a full-precision coordinate can read back
+  one ulp off (pinned by `full_precision_coordinates_round_trip_bit_exactly`
+  and `meteoalarm_alert_and_zone_polygon_survive_a_restart`).
+- **Warm-up health (#1000).** An accumulator that began filling less than
+  `[cap.wis2] warmup` (default `PT24H`) ago reports `LiveStatus::WarmingUp`
+  — `/health` "warming up after cold start: N alerts received", degraded —
+  after every session/capacity check and once loaded; a broker blip inside
+  `degrade_after_secs` stays `WarmingUp`, never `ready`. The clock is
+  `Wis2CapSource::filling_since`: set by `wis2_loop` the first time the
+  subscription is up (`mark_filling`; a reconnect does not restart it) and
+  carried in the snapshot, so a restart mid warm-up keeps warming and a
+  recent snapshot whose fill began more than `warmup` ago is `ready` at
+  once. Without a state store every start is cold.
+- **Long outage (#1000).** A snapshot whose `written_at` is more than
+  `warmup` before the restore (the server was down that long) keeps its
+  restored alerts but restarts the warm-up: `restore_snapshot` clears the
+  clock and sets `WarmupCause::LongOutage`, so `/health` says "warming up
+  after a long outage: N alerts received" for `warmup` after the
+  subscription comes up, and the restore logs a WARN. The restarted
+  warm-up is written at the first tick (the writer is not marked restored),
+  and the cause travels in the snapshot, so a restart during it keeps the
+  wording. The refresh above bounds the error of "down that long" by the
+  refresh interval; the shutdown flush makes it exact for a graceful stop.
 - If the broker pipeline ends on its own, `wis2_loop` marks the session
   disconnected and respawns it after 30 s — an unchanged-config reload
   reuses the engine, so nothing else would restart it.
@@ -305,5 +358,7 @@ health tracks refresh failures/recovery instead of keeping boot status. Demo:
 `collections.d/cap-alerts.toml` over `testdata/cap/`.
 
 Out of scope (follow-ups): XML-DSig verification, per-`event` sub-layers,
-conditional-GET feed caching, Global Cache backfill
-on a cold WIS2 boot (the accumulator starts empty until alerts arrive).
+conditional-GET feed caching, Global Cache backfill on a cold WIS2 boot. A
+cold start (no state store, or no usable snapshot) still begins empty;
+`[server] state_dir` carries the set across restarts and the warm-up health
+says so while it refills (see "WIS2 mode").

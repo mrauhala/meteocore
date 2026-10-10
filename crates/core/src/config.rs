@@ -117,6 +117,18 @@ pub struct ServerSettings {
     /// survive reloads, so a change needs a restart.
     #[serde(default)]
     pub render_concurrency: Option<usize>,
+    /// Directory for engine state snapshots (#1000): the file backend of
+    /// `ds_core::state::StateStore`. A WIS2-fed CAP collection writes its
+    /// alert accumulator under the key `<collection id>.cap`, the file
+    /// `<state_dir>/<collection id>.cap.state`, and restores it when the
+    /// collection is built, so a restart does not empty the warning set.
+    /// Resolved relative to the parent directory of the main config file,
+    /// like `collections_dir`, and created at boot.
+    /// Unset (default) = no persistence. Needs a writable mount: a failed
+    /// write is a rate-limited WARN, never a load failure. Fixed at boot: a
+    /// reload that changes it logs a warning; restart to apply.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub state_dir: Option<String>,
 }
 
 /// Upper bound for `[server] render_concurrency`. Each slot runs its render
@@ -136,6 +148,16 @@ impl ServerSettings {
             Some(url) => url.trim_end_matches('/').to_string(),
             None => format!("http://{}:{}", self.host, self.port),
         }
+    }
+
+    /// `state_dir` resolved against the directory of the config file at
+    /// `config_path` (an absolute `state_dir` stays as it is).
+    pub fn state_dir_path(&self, config_path: &std::path::Path) -> Option<std::path::PathBuf> {
+        let dir = self.state_dir.as_deref()?;
+        let parent = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Some(parent.join(dir))
     }
 }
 
@@ -161,6 +183,7 @@ impl ServerConfig {
                 watch_debounce_ms: default_watch_debounce_ms(),
                 trust_proxy_headers: false,
                 render_concurrency: None,
+                state_dir: None,
             },
             collections: Vec::new(),
             style_bundles: Vec::new(),
@@ -1130,6 +1153,14 @@ pub fn validate_bufr(id: &str, cfg: &BufrConfig) -> Result<(), crate::error::Dat
     }
     if let Some(w) = &cfg.wis2 {
         validate_wis2(id, "bufr.wis2", w)?;
+        // Parsed by the shared Wis2Config, honoured by CAP only: the BUFR
+        // store has no warm-up health (#1002). Reject rather than ignore.
+        if w.warmup.is_some() {
+            return Err(Config(format!(
+                "Collection '{id}': [bufr.wis2].warmup is not supported (only [cap.wis2] has \
+                 warm-up health)"
+            )));
+        }
     }
     if cfg.poll_interval_secs == 0 {
         return Err(Config(format!(
@@ -1791,7 +1822,23 @@ pub struct Wis2Config {
     /// reported `degraded` (default 120).
     #[serde(default = "default_wis2_degrade_after_secs")]
     pub degrade_after_secs: u64,
+    /// Health after a cold start (#1000): a collection whose in-memory store
+    /// starts empty (no `[server] state_dir` snapshot restored) reports
+    /// `degraded` ("warming up after cold start: N alerts received") for
+    /// this long after its subscription first comes up — standing warnings
+    /// only return as their producers republish them. A snapshot last
+    /// written longer than this ago (the server was down that long) is
+    /// restored but restarts the warm-up ("warming up after a long
+    /// outage"). ISO 8601 duration,
+    /// default [`DEFAULT_WIS2_WARMUP`] (`PT24H`). `[cap.wis2]` only for now;
+    /// `[bufr.wis2]` rejects it.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub warmup: Option<String>,
 }
+
+/// Default `[….wis2] warmup`: a day covers the daily republication cycle
+/// of standing warnings.
+pub const DEFAULT_WIS2_WARMUP: &str = "PT24H";
 
 impl Default for Wis2Config {
     fn default() -> Self {
@@ -1808,11 +1855,19 @@ impl Default for Wis2Config {
             max_download_bytes: default_wis2_max_download_bytes(),
             dedup_window: default_wis2_dedup_window(),
             degrade_after_secs: default_wis2_degrade_after_secs(),
+            warmup: None,
         }
     }
 }
 
 impl Wis2Config {
+    /// The resolved `warmup` (default [`DEFAULT_WIS2_WARMUP`]).
+    pub fn warmup_duration(&self) -> Result<chrono::Duration, crate::error::DataServerError> {
+        crate::datetime::parse_iso8601_duration(
+            self.warmup.as_deref().unwrap_or(DEFAULT_WIS2_WARMUP),
+        )
+    }
+
     /// Split `broker` into `(tls, host, port)`. Only valid after
     /// [`validate_wis2`] has accepted the config.
     pub fn broker_parts(&self) -> Option<(bool, String, u16)> {
@@ -1930,6 +1985,13 @@ pub fn validate_wis2(
         return Err(Config(format!(
             "Collection '{id}': [{section}].degrade_after_secs must be > 0"
         )));
+    }
+    if let Some(w) = &cfg.warmup {
+        crate::datetime::parse_iso8601_duration(w).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': [{section}].warmup is not a valid positive ISO 8601 duration: {e}"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -3397,6 +3459,12 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // Trimmed at load: an all-whitespace value arrives here as "".
+        if self.server.state_dir.as_deref() == Some("") {
+            return Err(crate::error::DataServerError::Config(
+                "[server] state_dir must not be empty; omit it to disable state snapshots".into(),
+            ));
+        }
         // Zero slots would stall every uncached render until its deadline.
         if let Some(n) = self.server.render_concurrency {
             if !(1..=MAX_RENDER_CONCURRENCY).contains(&n) {
@@ -4448,6 +4516,18 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             .is_err());
     }
 
+    /// `warmup` lives on the shared Wis2Config but only CAP honours it: a
+    /// BUFR collection must reject it rather than parse and ignore it.
+    #[test]
+    fn bufr_wis2_rejects_cap_only_warmup() {
+        let err =
+            bufr_collection("[collections.bufr.wis2]\ntopics = [\"cache/a\"]\nwarmup = \"PT1H\"\n")
+                .validate()
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("[bufr.wis2].warmup is not supported"), "{err}");
+    }
+
     #[test]
     fn bufr_field_validation() {
         let bad = |body: &str| {
@@ -4625,6 +4705,21 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             &wis2("download_allowlist = [\"https://gc.example/\"]\ntopics = [\"cache/a\"]\n")
         )
         .is_ok());
+        // warmup: a positive ISO 8601 duration.
+        assert!(bad("warmup = \"24h\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("warmup = \"PT0S\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("warmup = \"P1M\"\ntopics = [\"cache/a\"]\n"));
+    }
+
+    #[test]
+    fn wis2_warmup_defaults_to_a_day() {
+        let cfg = wis2("topics = [\"cache/a\"]\n");
+        assert_eq!(cfg.warmup, None);
+        assert_eq!(cfg.warmup_duration().unwrap(), chrono::Duration::hours(24));
+        let cfg = wis2("topics = [\"cache/a\"]\nwarmup = \" PT6H \"\n");
+        assert!(validate_wis2("c", "cap.wis2", &cfg).is_ok());
+        assert_eq!(cfg.warmup_duration().unwrap(), chrono::Duration::hours(6));
+        assert_eq!(Wis2Config::default().warmup, None);
     }
 
     #[test]
@@ -5053,6 +5148,40 @@ description = "A test"
         assert_eq!(
             load_render_concurrency("render_concurrency = 512"),
             Ok(Some(MAX_RENDER_CONCURRENCY))
+        );
+    }
+
+    #[test]
+    fn state_dir_is_optional_and_resolves_against_the_config_dir() {
+        let load = |line: &str| {
+            let tmp = TempDir::new().unwrap();
+            let toml = format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{line}\n");
+            let path = write_config(tmp.path(), "config.toml", &toml);
+            ServerConfig::from_file(path.to_str().unwrap())
+                .map(|(config, _)| config.server.state_dir_path(&path))
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(load(""), Ok(None));
+        assert_eq!(ServerConfig::default_for_auto().server.state_dir, None);
+        let resolved = load("state_dir = \"state\"").unwrap().unwrap();
+        assert!(
+            resolved.is_absolute() && resolved.ends_with("state"),
+            "{resolved:?}"
+        );
+        let abs = std::env::temp_dir().join("mc-state");
+        let line = format!("state_dir = {:?}", abs.to_str().unwrap());
+        assert_eq!(load(&line), Ok(Some(abs)));
+        let err = load("state_dir = \"  \"").unwrap_err();
+        assert!(err.contains("state_dir must not be empty"), "{err}");
+        // A bare relative config path resolves against the working directory.
+        let settings = ServerConfig::default_for_auto().server;
+        let settings = ServerSettings {
+            state_dir: Some("state".into()),
+            ..settings
+        };
+        assert_eq!(
+            settings.state_dir_path(std::path::Path::new("config.toml")),
+            Some(std::path::PathBuf::from("state"))
         );
     }
 

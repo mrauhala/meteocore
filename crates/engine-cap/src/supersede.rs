@@ -4,11 +4,12 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::parser::CapAlert;
 
 /// A producer's identifier, shared by its in-place revisions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct AlertKey {
     pub sender: String,
     pub identifier: String,
@@ -38,7 +39,8 @@ impl AlertKey {
 
 /// Full CAP message identity. Missing sent is tolerated for renderable input,
 /// but a cancellation must supply all three mandatory reference components.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Serialized in WIS2 accumulator snapshots (tombstones, `crate::persist`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct MessageKey {
     pub alert: AlertKey,
     pub sent: Option<DateTime<Utc>>,

@@ -432,6 +432,7 @@ port = 8000
 # collections_dir = "collections.d"     # optional, load per-collection .toml files from directory
 # metatile_cache_mb = 1024              # optional, global WMS meta-tile cache (MB); 0 disables meta-tiling
 # render_concurrency = 24              # optional, render CPU slots (default 2× CPUs, min 8); restart to change
+# state_dir = "/var/lib/meteocore"      # optional, writable dir for engine state snapshots (WIS2 CAP alert sets)
 
 [[collections]]
 id = "weather"
@@ -489,6 +490,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `watch_collections_dir` | no | `false` | Auto-reload when files in `collections_dir` are added, changed, or removed. Debounced; runs on the background runtime. See trust-model note in [Per-File Collection Configs](#per-file-collection-configs). |
 | `watch_debounce_ms` | no | `500` | Coalesce-window in milliseconds for the filesystem watcher (only used when `watch_collections_dir = true`). |
 | `metatile_cache_mb` | no | `1024` | Size (MB) of the global EPSG:3857/3067/3035 meta-tile cache. Server-wide, not per-collection. `0` disables meta-tiling (projected GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
+| `state_dir` | no | — | Writable directory for engine state snapshots. A WIS2-fed CAP collection keeps its alert set (alerts, zone polygons, withdrawals) in `<state_dir>/<collection id>.cap.state`: written atomically at most every five minutes when it changed, at least hourly when it did not, and on graceful shutdown; restored when the collection is built (alerts that expired meanwhile are dropped). Without it, every restart starts the alert set empty and the collection reports `degraded` ("warming up after cold start: N alerts received") for `[cap.wis2] warmup` (default `PT24H`). A snapshot older than `warmup` (the server was down that long) keeps its alerts but restarts the warm-up ("warming up after a long outage"). Resolved relative to the config file's directory; created at boot. The Docker image provides `/var/lib/meteocore` owned by its non-root user, so a named volume mounted there is writable. A failed write is a rate-limited warning, never a load error; a corrupt snapshot is a cold start. Fixed at boot: restart to change. |
 | `render_concurrency` | no | 2× CPUs, min 8 | Render CPU slots shared by WMS, Maps, Tiles and 3D Tiles; `MC_RENDER_QUEUE_CAPACITY` defaults to 3× this. Lower it for CPU-bound deployments, raise it when renders mostly wait on remote reads. Must be 1–512. Fixed at boot: a reload cannot resize the slots and logs a warning instead; restart to change. The effective value is logged at startup and exported as `render_semaphore_total`. |
 
 ### Collection Config Fields

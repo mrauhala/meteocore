@@ -22,6 +22,7 @@ mod catalog;
 mod engine;
 mod geocode;
 mod parser;
+mod persist;
 mod source;
 mod supersede;
 pub mod wis2;

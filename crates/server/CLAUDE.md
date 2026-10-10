@@ -265,6 +265,71 @@ need no reload pruning.
   Icechunk read admission. Re-enabling preserves the current view; the explicit
   "Zoom to extent" action remains animated.
 
+## Engine state store (`[server] state_dir`, #1000)
+
+Engines that accumulate state from a push feed snapshot it into the
+server's state store and restore it when the collection is built — today
+the WIS2 CAP accumulator (see `crates/engine-cap/CLAUDE.md`); the BUFR WIS2
+store is next (#1002) and reuses the same trait with the key
+`<collection id>.bufr`. The plumbing is `ds_core::state` (std only):
+
+- `StateStore`, the object-safe backend trait: `load(key)`, `save(key,
+  bytes)` (an atomic whole-blob replace), `describe(key)` for log lines.
+  Engines receive an `Option<Arc<dyn StateStore>>` and form their key with
+  `state::collection_key(id, kind)` = `<collection id>.<kind>` (`cap`,
+  `bufr`); they never see a path. **Snapshots are whole blobs per
+  collection key**: loaded once at build, rewritten whole, never appended
+  to or patched — a backend needs nothing beyond get/set of one value.
+- `FileStateStore`, the only backend: `<state_dir>/<escaped key>.state`
+  (key bytes outside `[A-Za-z0-9_-]` percent-encoded, a leading `.`
+  too, so no key escapes the directory or hides a file), saved through a
+  temp file in the same directory + fsync + rename + directory fsync.
+  `prepare()` creates the directory and sweeps temps a crash left behind
+  (older than an hour) at boot.
+- `StateWriter`, the write policy, backend-independent: write when the
+  engine's revision moved, at most every `min_interval` (CAP: 5 min);
+  rewrite an unchanged state every `refresh_interval` (CAP: a quarter of
+  `warmup`, 5 min–1 h) so the snapshot's own timestamp says when the server
+  was last alive; always write when forced (the shutdown flush); report
+  failures at most every `warn_interval` (15 min).
+- **Adding a backend** (Redis, …): implement `StateStore` and select it in
+  `admin::init_state_store` by a NEW `[server]` key (e.g. a backend name
+  plus its URL), keeping `state_dir` as the file backend. Engines and the
+  write policy do not change. The backend must keep `save` atomic per key
+  and must not be shared by two servers that serve the same collection ids.
+
+Wiring:
+
+- `state_dir` is resolved against the config file's directory
+  (`ServerSettings::state_dir_path`); `admin::init_state_store` builds the
+  store in `main` BEFORE the first `load_collections` (engines restore while
+  being built); it creates the directory and only WARNs when it cannot.
+  Engines get it through `admin::state_store()` — a process-global
+  `OnceLock`, like the render slots, so the 20-odd `load_collections`
+  callers need no new argument and tests (which never set it) run without
+  persistence.
+- A reload re-reads the key but cannot replace the store: a changed value
+  logs `state_dir_reload_warning` ("restart to apply"). A reload that
+  rebuilds a collection restores from the snapshot the replaced engine last
+  wrote (at most five minutes old); the replaced engine's `shutdown()` then
+  writes its final state, which the new engine overwrites at its next
+  write. An unchanged collection keeps its live engine and state.
+- Graceful shutdown: `shutdown()` on each CAP engine (the block at the end of
+  `main`) flushes the snapshot, so a redeploy loses nothing and the snapshot
+  records when the server went down. A crash loses at most the last five
+  minutes.
+- Deployment: the directory needs a writable mount (the image's `/data` is
+  the config mount, often read-only). The image creates
+  `/var/lib/meteocore` owned by its non-root `dataserver` user, so a named
+  volume mounted there is writable as is; a bind mount needs a host
+  directory that user can write. Unwritable ⇒ every write fails with a
+  WARN at most every 15 min and the server serves on, exactly as without
+  persistence. A removed collection's snapshot stays on disk; delete it by
+  hand. Never point two replicas at one `state_dir`.
+- In the server's unit tests the state store is process-global: a test
+  that needs it runs in a child process
+  (`state_dir_reaches_wis2_cap_engines`).
+
 ## Remote radar startup recovery (#190)
 
 Remote COMP/PVOL sources whose startup scan fails keep `failed` health (503
