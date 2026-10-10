@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
+use ds_core::temp_files;
 use ds_storage::discovery::{self, FilenameError, FilenameMatcher, ScanSpec, Symlinks};
 use tracing::warn;
 
@@ -82,15 +83,18 @@ impl Location {
 /// source directory holds years of history.
 ///
 /// Non-recursive — only files directly in `dir`. A symlink to a file is
-/// followed; directories, symlinks to directories, and files whose names
-/// don't match the matcher are silently skipped.
+/// followed; directories, symlinks to directories, publisher temporary
+/// files and files whose names don't match the matcher are silently
+/// skipped.
 pub fn scan_local_directory(
     dir: &Path,
     matcher: &FilenameMatcher,
     time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
     max_files: Option<usize>,
 ) -> Result<Vec<CatalogEntry>, CatalogError> {
+    let exclude = temp_files::partial_exclude_patterns();
     let spec = ScanSpec {
+        exclude: &exclude,
         time_filter,
         max_files,
         symlinks: Symlinks::Follow,
@@ -151,7 +155,9 @@ pub fn scan_remote(
         .iter()
         .map(|prefix| ObjectPath::from(prefix.as_str()))
         .collect();
+    let exclude = temp_files::partial_exclude_patterns();
     let spec = ScanSpec {
+        exclude: &exclude,
         time_filter,
         max_files,
         max_size: Some(MAX_REMOTE_FILE_SIZE),
@@ -341,6 +347,39 @@ mod tests {
                 .map(|e| e.location.id().rsplit('/').next().unwrap().to_string())
                 .collect();
             assert_eq!(names, ["OPERA@20260515T0000@0@DBZH.h5"]);
+        }
+    }
+
+    /// COMP has no `exclude_patterns` setting, and an explicit pattern is
+    /// used as written: unanchored, it matches a hidden in-progress file
+    /// and a temp-suffixed one inside their names. Both scans still
+    /// catalogue only the finished composite (#1009).
+    #[test]
+    fn scans_skip_in_progress_names_with_an_unanchored_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "20260515T0000_radar_fi.h5",
+            ".20260515T0005_radar_fi.h5",
+            "20260515T0010_radar_fi.h5.tmp",
+            "20260515T0015_radar_fi.h5.part",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let matcher = FilenameMatcher::from_pattern(
+            r"(?P<timestamp>\d{8}T\d{4})_radar_fi\.h5",
+            "%Y%m%dT%H%M",
+        )
+        .unwrap();
+        let (store, _) = ds_storage::build_store(dir.path().to_str().unwrap()).unwrap();
+
+        let local = scan_local_directory(dir.path(), &matcher, None, None).unwrap();
+        let remote = scan_remote(&store, &["".to_string()], &matcher, None, None).unwrap();
+        for entries in [local, remote] {
+            let names: Vec<_> = entries
+                .iter()
+                .map(|e| e.location.id().rsplit('/').next().unwrap().to_string())
+                .collect();
+            assert_eq!(names, ["20260515T0000_radar_fi.h5"]);
         }
     }
 

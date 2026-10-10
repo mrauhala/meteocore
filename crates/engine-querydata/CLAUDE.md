@@ -13,6 +13,9 @@ runtime).
   re-parsed). Each run is an EDR instance / `RasterInfo.reference_times`
   entry; the latest run is the default for un-pinned queries. Implements the
   shared `ds_core::instances` contract (root CLAUDE.md).
+  `list_sqd_files` skips temporary names (`ds_core::temp_files::is_temporary`):
+  a publisher writes `.name.sqd` and renames it, and parsing it mid-write
+  logged a spurious ERROR and read up to 1 GB (#1009).
 - **Grids:** WGS84, Rotated Lat-Lon, Stereographic, Lambert Conformal Conic
   (MEPS: tangent cone, `lat1 == lat2`). `GridInfo::new` derives the
   GeoTransform once; per-pixel code reads it, never re-projects corners.

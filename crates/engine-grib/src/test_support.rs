@@ -119,11 +119,22 @@ impl TestSource {
     }
 
     pub fn write(&self, name: &str, records: &[(&str, &str, Vec<u8>)], step: u32) {
+        let forecast = format!("{step} hour fcst");
+        let records: Vec<_> = records
+            .iter()
+            .map(|(param, level, bytes)| (*param, *level, forecast.as_str(), bytes.clone()))
+            .collect();
+        self.write_run(name, "2026040500", &records);
+    }
+
+    /// One step file of the run `date` (`YYYYMMDDHH`), each record with its
+    /// own wgrib2 forecast field: `anl`, `3 hour fcst`, `0-6 hour ave fcst`.
+    pub fn write_run(&self, name: &str, date: &str, records: &[(&str, &str, &str, Vec<u8>)]) {
         let mut data = Vec::new();
         let mut index = String::new();
-        for (i, (param, level, bytes)) in records.iter().enumerate() {
+        for (i, (param, level, forecast, bytes)) in records.iter().enumerate() {
             index.push_str(&format!(
-                "{}:{}:d=2026040500:{param}:{level}:{step} hour fcst:\n",
+                "{}:{}:d={date}:{param}:{level}:{forecast}:\n",
                 i + 1,
                 data.len()
             ));

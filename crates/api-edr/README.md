@@ -739,7 +739,12 @@ is that valid time minus the duration. A source parameter filter such as
 advertised qualified keys. Missing windows at a step are null. Values use the
 source WMO unit and existing display conversion (precipitation kg/m² → mm);
 there is no implicit division by duration or conversion of energy into flux.
-ECMWF JSON naming remains unchanged.
+ECMWF JSON naming remains unchanged. A key some steps lack, such as a window
+or a `TMAX`/`TMIN` the analysis lacks, carries its own `extent.temporal` in
+`parameter_names`: the valid times of the steps that have it, over the
+retained runs (#1005). The collection's temporal extent stays the union of all
+steps; queries still match `datetime` exactly, so an instant a key lacks is
+null for it.
 
 GRIB sources can opt into `level_types = ["single", "pressure", "model"]`.
 The server publishes only present/enabled families as `{id}-single`,

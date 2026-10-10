@@ -344,7 +344,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `get_raster_tile` uses (`None` ⇒ the concrete run it would render,
    including any cross-run fallback) — the caches key the run axis on it
    (#521). Skipping this freezes the first-rendered run's pixels when a
-   newer run re-covers the same valid times.
+   newer run re-covers the same valid times. If the run also depends on
+   the parameter (GRIB: an hour-window aggregate the newest run lacks at
+   that time renders from an older run, #1005), override
+   `resolve_parameter_reference_time` with that selection too: the API
+   layers resolve the run with it, then pass that run to
+   `resolve_parameter_time` and the render.
    **If the engine's content for a fixed `(time, reference_time)` can be
    revised in place** (a push-fed alert set: a warning published later is
    active at instants already rendered), it MUST override
@@ -523,6 +528,15 @@ one never implies the other.
 - **`ds_core::cf`** — CF grid mapping → `Crs` and coordinate-unit scale,
   shared by NetCDF readers. Unsupported mappings and missing earth figures
   are errors, never a WGS84 guess.
+- **`ds_core::temp_files`** — the names a data scan never reads (#1009): a
+  hidden `.name` (written, then renamed into place) or a `PARTIAL_SUFFIXES`
+  ending (`.tmp` / `.part`, the default `exclude_patterns`). An engine that
+  enumerates a directory or prefix itself filters with `is_temporary` /
+  `is_temporary_key`; the shared `ds_storage::discovery` scan skips hidden
+  names always and leaves the suffixes to `ScanSpec.exclude`
+  (`exclude_patterns`, or `partial_exclude_patterns()` for an engine
+  without that setting). A new engine's file listing does the same. A
+  store-internal listing (Zarr v2's `.zarray`) is not a data scan.
 - **`ds_core::instances`** — model-run (forecast reference time) machinery
   shared by ALL forecast engines (#337), so run selection, instance lists and
   instance-id encoding are identical everywhere:
@@ -637,7 +651,7 @@ one never implies the other.
 | CSV | `EdrEngine` + `FeatureEngine` | EDR (locations, area, radius), Features |
 | GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles; derived wind speed + direction from u/v (`ds_core::wind`) |
+| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles; derived wind speed + direction from u/v (`ds_core::wind`); hour-window aggregates on their own time axes (#1005) |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; derived wind speed from u/v, direction on lat/lon areas (newbase's grid-relative convention) |

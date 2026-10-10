@@ -87,8 +87,10 @@ error images never are. Measured on a day of a live deployment's GetMaps
   layer (`coll/param`) re-declares `<Dimension name="time">` with its own
   values and default — WMS 1.3.0 Table 7 makes Dimension inheritance
   "replace". GetMap settles the parameter (`LAYERS=coll/param`, then the
-  style's) before defaulting TIME and snaps with `resolve_parameter_time`,
-  so the caches key the parameter's own timestep.
+  style's) before defaulting TIME, resolves the run with
+  `resolve_parameter_reference_time` (GRIB's run depends on the parameter,
+  #1005) and snaps with `resolve_parameter_time`, so the caches key the
+  parameter's own run and timestep.
 - **ELEVATION** — advertised when the collection has a vertical extent
   (`RasterInfo.vertical`); rejected with 400 otherwise.
 - **`reference_time` (forecast model run, #337/#345):** forecast layers

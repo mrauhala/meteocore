@@ -2474,8 +2474,10 @@ async fn render_tile(
     // the no-TTL rendered cache keyed on `None` would keep serving the
     // first-rendered run's pixels after a newer run re-covers the same valid
     // times; asking the engine preserves GRIB's cross-run fallback). Engines
-    // without runs keep the identity default (`None` stays `None`).
-    let reference_time = engine.resolve_reference_time(time, None);
+    // without runs keep the identity default (`None` stays `None`). The run
+    // is the parameter's (#1005), as in api-maps.
+    let reference_time =
+        engine.resolve_parameter_reference_time(effective_parameter.as_deref(), time, None);
     // #507: snap to the exact timestep the engine will render before the
     // cache key is built — a not-yet-ingested datetime must cache the
     // previous timestep's pixels under the PREVIOUS timestep's key. A

@@ -553,6 +553,25 @@ impl MapEngine for DerivedWind {
         self.map.resolve_reference_time(time, reference_time)
     }
 
+    /// A derived parameter renders from its u component's run: u and v are
+    /// written together at every step of the sources wrapped. Were they
+    /// not, `resolve_parameter_time` still picks the step both have within
+    /// that run, so the cache key keeps naming what is rendered.
+    fn resolve_parameter_reference_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let plan = self.plan();
+        let parameter = match parameter.and_then(|p| plan.get(p)) {
+            Some(d) => Some(d.u.as_str()),
+            None => parameter,
+        };
+        self.map
+            .resolve_parameter_reference_time(parameter, time, reference_time)
+    }
+
     fn content_version(&self) -> u64 {
         self.map.content_version()
     }
