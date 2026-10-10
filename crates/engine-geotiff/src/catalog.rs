@@ -541,7 +541,9 @@ fn load_remote(
 
         // Fallback: download the full file. Full downloads are much slower and
         // cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
-        let data = match store.get(location) {
+        // The poll runtime (or engine construction) waits on this, not a
+        // request: the background budget lets a stalled attempt retry (#1011).
+        let data = match store.get_with_budget(location, ds_storage::FetchBudget::Background) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("[{}] Failed to download {}: {e}", collection_id, key);

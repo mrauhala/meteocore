@@ -16,6 +16,28 @@ separate S3 connector retains its existing redirect behavior. Call
 prefix. This policy does not claim to prevent DNS
 rebinding or validate arbitrary operator-configured source hosts.
 
+# Fetch budgets
+
+object_store gives each attempt of a request its own 30-second timeout (its
+`ClientOptions` default for S3, the client above for HTTP). When a body read
+stalls, that timeout fails the attempt and object_store retries after a short
+backoff, asking only for the bytes still missing. The bridge's overall limit
+decides whether that retry gets to run, so a whole-object fetch names its
+`FetchBudget` (#1011):
+
+- `FetchBudget::Request`, 30 seconds or the request deadline: every method
+  without a budget argument, and every read a request waits on. A stalled
+  attempt fails the call; a retry would not fit a render deadline anyway.
+- `FetchBudget::Background`, 120 seconds: whole-object downloads on the poll
+  runtime, which nobody waits on (satellite scan ingest, the PVOL catalog
+  scan, GeoTIFF full downloads). Room for the stalled attempt, its retry and
+  one more. A request deadline in scope still applies.
+
+`get_with_budget` and `get_many_with_budget` take the budget; `get` and
+`get_many` are the request budget. Don't pass the background budget where a
+request can wait on the result, directly or through a single-flight cache
+fill.
+
 # Catalog discovery
 
 `discovery` holds what every engine that polls one file per timestep needs:

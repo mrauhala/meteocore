@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::object_store::ObjectMeta;
-use ds_storage::DataStore;
+use ds_storage::{DataStore, FetchBudget};
 
 use crate::naming::Naming;
 
@@ -115,23 +115,32 @@ impl Source {
 
     /// The whole files at `paths`, in order: a tiled scan's tiles are
     /// fetched [`TILE_FETCH_CONCURRENCY`] at a time, and any failure fails
-    /// the scan (the next poll retries it).
+    /// the scan (the next poll retries it). `budget` limits each file:
+    /// [`FetchBudget::Background`] for the poll's ingest, which nobody waits
+    /// on, so a stalled attempt is retried instead of skipping the scan
+    /// until the next poll (#1011); [`FetchBudget::Request`] wherever a
+    /// request may wait.
     ///
     /// Called from the poll loop (background runtime), from render jobs
     /// (blocking workers) and from EDR queries (async request workers) when
-    /// a scan was evicted. `DataStore::get` and `get_many` serve all three:
-    /// their bridge yields an async worker via `block_in_place` and runs
-    /// directly on a blocking one — the plain-Zarr exception to Critical
-    /// Rule 7. An explicit `get_on` handle would panic on the EDR path.
-    pub fn fetch(&self, paths: &[ObjectPath]) -> Result<Vec<Vec<u8>>, DataServerError> {
+    /// a scan was evicted. `DataStore::get_with_budget` and
+    /// `get_many_with_budget` serve all three: their bridge yields an async
+    /// worker via `block_in_place` and runs directly on a blocking one — the
+    /// plain-Zarr exception to Critical Rule 7. An explicit `get_on` handle
+    /// would panic on the EDR path.
+    pub fn fetch(
+        &self,
+        paths: &[ObjectPath],
+        budget: FetchBudget,
+    ) -> Result<Vec<Vec<u8>>, DataServerError> {
         let store = match self {
             Source::Bucket { store } | Source::Directory { store, .. } => store,
         };
         if let [path] = paths {
-            return Ok(vec![store.get(path)?.to_vec()]);
+            return Ok(vec![store.get_with_budget(path, budget)?.to_vec()]);
         }
         store
-            .get_many(paths, TILE_FETCH_CONCURRENCY, None)?
+            .get_many_with_budget(paths, TILE_FETCH_CONCURRENCY, None, budget)?
             .into_iter()
             .map(|file| file.map(|bytes| bytes.to_vec()))
             .collect()

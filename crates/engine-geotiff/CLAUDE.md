@@ -195,5 +195,6 @@ produce nodata gaps.
 Interactive render deadlines propagate through Rayon tile fetching to both
 object-store and direct HTTP range/body reads. All retries share one absolute
 end time; deadline errors stop retries and fail the request with 503 rather
-than becoming nodata gaps. Background scans have no render deadline and retain
-their existing storage timeout/retry policy.
+than becoming nodata gaps. Background scans have no render deadline. Their
+full-download fallback uses `FetchBudget::Background` (120 s), so
+object_store's retry of a stalled body gets to run (#1011).

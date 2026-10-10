@@ -63,10 +63,18 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     downloads. `/metrics` also has `satellite_frame_window_bytes` and
     `satellite_frame_window_resident_bytes` per collection.
   - A scan still evicted is fetched again by `Source::fetch` →
-    `DataStore::get`, from a render job (blocking worker) or an EDR query
-    (async request worker). That bridge serves both — the plain-Zarr
-    exception to Critical Rule 7 — where an explicit `get_on` handle panics
-    on the async worker. ISatSS tiles come `get_many`-concurrently.
+    `DataStore::get_with_budget`, from a render job (blocking worker) or an
+    EDR query (async request worker). That bridge serves both — the
+    plain-Zarr exception to Critical Rule 7 — where an explicit `get_on`
+    handle panics on the async worker. ISatSS tiles come
+    `get_many_with_budget`-concurrently.
+  - **Fetch budgets (#1011).** Only the poll's ingest of a new scan uses
+    `FetchBudget::Background` (120 s per file): no request can wait on a
+    scan the catalog does not hold yet, and 30 s left object_store's retry
+    of a stalled 24–30 MB body no time to run, skipping the scan until the
+    next poll. The poll's re-download keeps `FetchBudget::Request`: it holds
+    the scan's single-flight fill, which a request may be waiting on. So do
+    the request-time fetches.
   - `tests/refetch.rs` runs both call sites with zero-size caches (`0` also
     turns re-downloading off). `tests/window_capacity.rs`, on a 1 MB cache,
     pins the thrash guard, its WARN and the recovery; `lib.rs` tests pin the

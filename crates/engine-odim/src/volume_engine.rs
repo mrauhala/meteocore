@@ -1621,10 +1621,18 @@ fn build_catalog(
     // parsed into compact `PolarVolume`s and the chunk's bytes freed before
     // the next chunk is fetched. This parallelises the dominant scan cost —
     // the per-file S3 download — turning a sequential ~N×RTT stall into
-    // ~N/concurrency.
+    // ~N/concurrency. The scan runs on the poll runtime or at engine
+    // construction, never for a request, so each file gets the background
+    // budget: a stalled attempt is retried instead of dropping the volume
+    // until the next poll (#1011).
     for chunk in remote_fetch.chunks(FETCH_CONCURRENCY) {
         let paths: Vec<ObjectPath> = chunk.iter().map(|(_, p)| p.clone()).collect();
-        let results = match store.get_many(&paths, FETCH_CONCURRENCY, Some(MAX_REMOTE_FILE_SIZE)) {
+        let results = match store.get_many_with_budget(
+            &paths,
+            FETCH_CONCURRENCY,
+            Some(MAX_REMOTE_FILE_SIZE),
+            ds_storage::FetchBudget::Background,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("[{collection_id}] PVOL batch fetch failed: {e}");

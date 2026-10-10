@@ -36,6 +36,38 @@ fn to_u64(range: Range<usize>) -> Range<u64> {
     range.start as u64..range.end as u64
 }
 
+/// How long one whole-object fetch may take overall, object_store's own
+/// retries included. The caller picks it by where it runs (#1011).
+///
+/// object_store gives each attempt its own 30 s timeout (its `ClientOptions`
+/// default, and what [`build_http_store`]'s client sets). When a body read
+/// stalls, that timeout fails the attempt and object_store retries after a
+/// short backoff, asking only for the bytes it is still missing. An overall
+/// limit of 30 s fires at the same moment as the first attempt's timeout,
+/// so the retry never runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchBudget {
+    /// A request waits on the fetch: 30 s, or the request deadline when one
+    /// is in scope. Every [`DataStore`] method without a budget argument
+    /// uses this one.
+    Request,
+    /// A background fetch on the poll runtime, which nobody waits on:
+    /// 120 s. That is room for the first attempt to stall until its 30 s
+    /// timeout and for object_store's retry to finish, with margin for one
+    /// more. A request deadline in scope still applies.
+    Background,
+}
+
+impl FetchBudget {
+    /// The overall limit when no request deadline is in scope.
+    pub const fn timeout(self) -> std::time::Duration {
+        match self {
+            FetchBudget::Request => DataStore::REQUEST_TIMEOUT,
+            FetchBudget::Background => DataStore::BACKGROUND_TIMEOUT,
+        }
+    }
+}
+
 /// Synchronous wrapper around an `ObjectStore`.
 ///
 /// Methods use `tokio::runtime::Handle::current().block_on()` to bridge
@@ -56,27 +88,50 @@ impl DataStore {
         }
     }
 
-    /// Get the entire contents of an object.
-    #[allow(clippy::needless_question_mark)]
+    /// Get the entire contents of an object, under [`FetchBudget::Request`].
     pub fn get(&self, path: &ObjectPath) -> Result<Bytes, DataServerError> {
-        let result = self.block_on(async {
-            let result = self.inner.get(path).await?;
-            Ok(result.bytes().await?)
-        })?;
+        self.get_with_budget(path, FetchBudget::Request)
+    }
+
+    /// [`Self::get`] under an explicit `budget`. A poll-runtime caller
+    /// downloading a whole object passes [`FetchBudget::Background`], so a
+    /// stalled attempt is retried instead of failing the fetch.
+    pub fn get_with_budget(
+        &self,
+        path: &ObjectPath,
+        budget: FetchBudget,
+    ) -> Result<Bytes, DataServerError> {
+        let result = self.block_on_with(None, budget, self.whole(path))?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
     }
 
-    /// Get a byte range from an object.
-    #[allow(clippy::needless_question_mark)]
+    /// The whole object at `path`, body included.
+    async fn whole(&self, path: &ObjectPath) -> Result<Bytes, object_store::Error> {
+        self.inner.get(path).await?.bytes().await
+    }
+
+    /// Get a byte range from an object, under [`FetchBudget::Request`].
     pub fn get_range(
         &self,
         path: &ObjectPath,
         range: Range<usize>,
     ) -> Result<Bytes, DataServerError> {
-        let result =
-            self.block_on(async { Ok(self.inner.get_range(path, to_u64(range)).await?) })?;
+        self.get_range_with_budget(path, range, FetchBudget::Request)
+    }
+
+    /// [`Self::get_range`] under an explicit `budget`. A poll-runtime caller
+    /// reading a header before an object is catalogued passes
+    /// [`FetchBudget::Background`], so a stalled attempt is retried instead
+    /// of leaving the object out until the next poll.
+    pub fn get_range_with_budget(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+        budget: FetchBudget,
+    ) -> Result<Bytes, DataServerError> {
+        let result = self.block_on_with(None, budget, self.inner.get_range(path, to_u64(range)))?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
@@ -96,7 +151,7 @@ impl DataStore {
         range: Range<usize>,
         handle: &tokio::runtime::Handle,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on_with(Some(handle), async {
+        let result = self.block_on_with(Some(handle), FetchBudget::Request, async {
             self.inner.get_range(path, to_u64(range)).await
         })?;
         self.bytes_read
@@ -112,16 +167,12 @@ impl DataStore {
     /// Must NOT be called from within a running
     /// future on a request worker (an async execution context — `handle.block_on`
     /// panics there); use [`Self::get`] for that.
-    #[allow(clippy::needless_question_mark)]
     pub fn get_on(
         &self,
         path: &ObjectPath,
         handle: &tokio::runtime::Handle,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on_with(Some(handle), async {
-            let result = self.inner.get(path).await?;
-            Ok(result.bytes().await?)
-        })?;
+        let result = self.block_on_with(Some(handle), FetchBudget::Request, self.whole(path))?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
@@ -173,7 +224,7 @@ impl DataStore {
         path: &ObjectPath,
         handle: Option<&tokio::runtime::Handle>,
     ) -> Result<Option<Bytes>, DataServerError> {
-        let result = self.block_on_with(handle, async {
+        let result = self.block_on_with(handle, FetchBudget::Request, async {
             match self.inner.get(path).await {
                 Ok(res) => Ok(Some(res.bytes().await?)),
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -219,6 +270,9 @@ impl DataStore {
     /// a handle create a temporary runtime; parallel callers should instead
     /// drive async storage with a supplied handle. Current-thread async tasks
     /// and `LocalSet` are unsupported.
+    ///
+    /// Each object gets [`FetchBudget::Request`]'s 30 s;
+    /// [`Self::get_many_with_budget`] picks another budget.
     #[allow(clippy::type_complexity)]
     pub fn get_many(
         &self,
@@ -226,65 +280,84 @@ impl DataStore {
         concurrency: usize,
         max_bytes: Option<u64>,
     ) -> Result<Vec<Result<Bytes, DataServerError>>, DataServerError> {
+        self.get_many_with_budget(paths, concurrency, max_bytes, FetchBudget::Request)
+    }
+
+    /// [`Self::get_many`] with `budget`'s timeout on each object. A
+    /// poll-runtime caller downloading whole objects passes
+    /// [`FetchBudget::Background`], so a stalled attempt is retried instead
+    /// of failing its slot. The request deadline does not apply here, as
+    /// in [`Self::get_many`].
+    #[allow(clippy::type_complexity)]
+    pub fn get_many_with_budget(
+        &self,
+        paths: &[ObjectPath],
+        concurrency: usize,
+        max_bytes: Option<u64>,
+        budget: FetchBudget,
+    ) -> Result<Vec<Result<Bytes, DataServerError>>, DataServerError> {
+        // Drive the batch with NO overall timeout — the budget applies PER
+        // object. A whole-batch cap would fail the entire chunk once the
+        // combined transfer exceeds it (e.g. a dozen multi-MB volumes on a
+        // constrained link), losing every object instead of the one that
+        // actually stalled.
+        let results =
+            self.block_on_untimed(self.fetch_many(paths, concurrency, max_bytes, budget))?;
+        let total: u64 = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|b| b.len() as u64)
+            .sum();
+        self.bytes_read.fetch_add(total, Ordering::Relaxed);
+        Ok(results)
+    }
+
+    /// The batch [`Self::get_many_with_budget`] drives: one result per
+    /// path, in input order, each object limited to `budget`.
+    async fn fetch_many(
+        &self,
+        paths: &[ObjectPath],
+        concurrency: usize,
+        max_bytes: Option<u64>,
+        budget: FetchBudget,
+    ) -> Vec<Result<Bytes, DataServerError>> {
         use futures::StreamExt;
 
         let conc = concurrency.max(1);
         let inner = &self.inner;
-        // Drive the batch with NO overall timeout — the 30s budget is
-        // applied PER object below. A whole-batch cap would fail the entire
-        // chunk once the combined transfer exceeds 30s (e.g. a dozen
-        // multi-MB volumes on a constrained link), losing every object
-        // instead of the one that actually stalled.
-        let ordered: Vec<(usize, Result<Bytes, DataServerError>)> =
-            self.block_on_untimed(async {
-                let mut results: Vec<(usize, Result<Bytes, DataServerError>)> =
-                    futures::stream::iter(paths.iter().enumerate().map(|(i, p)| async move {
-                        let fetch = async {
-                            if let Some(cap) = max_bytes {
-                                let meta = inner
-                                    .head(p)
-                                    .await
-                                    .map_err(|e| DataServerError::from(StorageError::from(e)))?;
-                                if meta.size > cap {
-                                    return Err(DataServerError::Storage(format!(
-                                        "object `{p}` is {} bytes — exceeds the {cap}-byte limit",
-                                        meta.size
-                                    )));
-                                }
-                            }
-                            let res = inner
-                                .get(p)
-                                .await
-                                .map_err(|e| DataServerError::from(StorageError::from(e)))?;
-                            let bytes = res
-                                .bytes()
-                                .await
-                                .map_err(|e| DataServerError::from(StorageError::from(e)))?;
-                            Ok::<Bytes, DataServerError>(bytes)
-                        };
-                        let r = match tokio::time::timeout(Self::REQUEST_TIMEOUT, fetch).await {
-                            Ok(r) => r,
-                            Err(_) => Err(DataServerError::Storage(format!(
-                                "fetch of `{p}` timed out after {}s",
-                                Self::REQUEST_TIMEOUT.as_secs()
-                            ))),
-                        };
-                        (i, r)
-                    }))
-                    .buffer_unordered(conc)
-                    .collect()
-                    .await;
-                results.sort_by_key(|(i, _)| *i);
-                results
-            })?;
-
-        let total: u64 = ordered
-            .iter()
-            .filter_map(|(_, r)| r.as_ref().ok())
-            .map(|b| b.len() as u64)
-            .sum();
-        self.bytes_read.fetch_add(total, Ordering::Relaxed);
-        Ok(ordered.into_iter().map(|(_, r)| r).collect())
+        let mut results: Vec<(usize, Result<Bytes, DataServerError>)> =
+            futures::stream::iter(paths.iter().enumerate().map(|(i, p)| async move {
+                let fetch = async {
+                    if let Some(cap) = max_bytes {
+                        let meta = inner
+                            .head(p)
+                            .await
+                            .map_err(|e| DataServerError::from(StorageError::from(e)))?;
+                        if meta.size > cap {
+                            return Err(DataServerError::Storage(format!(
+                                "object `{p}` is {} bytes — exceeds the {cap}-byte limit",
+                                meta.size
+                            )));
+                        }
+                    }
+                    self.whole(p)
+                        .await
+                        .map_err(|e| DataServerError::from(StorageError::from(e)))
+                };
+                let r = match tokio::time::timeout(budget.timeout(), fetch).await {
+                    Ok(r) => r,
+                    Err(_) => Err(DataServerError::Storage(format!(
+                        "fetch of `{p}` timed out after {}s",
+                        budget.timeout().as_secs()
+                    ))),
+                };
+                (i, r)
+            }))
+            .buffer_unordered(conc)
+            .collect()
+            .await;
+        results.sort_by_key(|(i, _)| *i);
+        results.into_iter().map(|(_, r)| r).collect()
     }
 
     /// Probe many object keys concurrently with `head`, returning one
@@ -396,22 +469,33 @@ impl DataStore {
         Ok(ordered.into_iter().map(|(_, r)| r).collect())
     }
 
-    /// Default timeout for individual storage operations (30 seconds).
-    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    /// object_store's timeout on each attempt: its `ClientOptions` default,
+    /// and what [`build_http_store`]'s client sets. A retry gets a fresh one.
+    const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// [`FetchBudget::Request`]: the overall limit on a storage operation a
+    /// request waits on (30 seconds).
+    const REQUEST_TIMEOUT: std::time::Duration = Self::ATTEMPT_TIMEOUT;
+
+    /// [`FetchBudget::Background`]: four attempts' worth, so a first attempt
+    /// that stalls until its timeout leaves room for object_store's retry
+    /// (after a backoff that starts at 0.1 s) and for one more.
+    const BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     /// Bridge async to sync. Uses `block_in_place` when inside a tokio runtime
     /// (releases a multi-threaded scheduler worker), or creates a
     /// temporary runtime otherwise (for use in non-async contexts like startup).
-    /// All operations are subject to a 30-second timeout to prevent hung connections.
+    /// All operations are subject to [`FetchBudget::Request`]'s 30-second
+    /// timeout to prevent hung connections.
     fn block_on<F, T>(&self, future: F) -> Result<T, DataServerError>
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
-        self.block_on_with(None, future)
+        self.block_on_with(None, FetchBudget::Request, future)
     }
 
     /// Drive `future` to completion on the appropriate runtime — like
-    /// [`Self::block_on`] but with **no** overall 30s timeout and an
+    /// [`Self::block_on`] but with **no** overall timeout and an
     /// unconstrained output type. For batch helpers (e.g. [`Self::get_many`])
     /// whose total wall-time legitimately exceeds a single request's budget
     /// and which apply their own per-item timeouts; a batch-wide cap would
@@ -440,15 +524,18 @@ impl DataStore {
     /// `Runtime::new`. With `None` it uses `block_in_place` around the ambient
     /// handle: this yields an async worker or runs directly on a blocking-pool
     /// worker. With no handle it creates a temporary runtime (tests / CLI).
+    /// The future is limited to the request deadline in scope, else to
+    /// `budget` ([`within`]).
     fn block_on_with<F, T>(
         &self,
         handle: Option<&tokio::runtime::Handle>,
+        budget: FetchBudget,
         future: F,
     ) -> Result<T, DataServerError>
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
-        self.block_on_result(handle, async {
+        self.block_on_result(handle, budget, async {
             future
                 .await
                 .map_err(|e| DataServerError::from(StorageError::from(e)))
@@ -458,6 +545,7 @@ impl DataStore {
     fn block_on_result<F, T>(
         &self,
         handle: Option<&tokio::runtime::Handle>,
+        budget: FetchBudget,
         future: F,
     ) -> Result<T, DataServerError>
     where
@@ -465,30 +553,11 @@ impl DataStore {
     {
         let deadline = ds_core::deadline::current();
         ds_core::deadline::check()?;
-        let timed = async {
-            let end = deadline.unwrap_or_else(|| std::time::Instant::now() + Self::REQUEST_TIMEOUT);
-            match tokio::time::timeout_at(end.into(), future).await {
-                Ok(result) => result,
-                Err(_) if deadline.is_some() => Err(DataServerError::DeadlineExceeded),
-                Err(_) => Err(DataServerError::Storage(
-                    "Request timed out after 30s".into(),
-                )),
-            }
-        };
-        let result = match handle {
+        let timed = within(budget, deadline, future);
+        match handle {
             Some(h) => h.block_on(timed),
-            None => match tokio::runtime::Handle::try_current() {
-                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(timed)),
-                Err(_) => {
-                    // No runtime — create a temporary one (e.g., tests / CLI tools)
-                    let rt = tokio::runtime::Runtime::new().map_err(|e| {
-                        DataServerError::Storage(format!("Cannot create runtime: {e}"))
-                    })?;
-                    rt.block_on(timed)
-                }
-            },
-        };
-        result
+            None => self.block_on_untimed(timed)?,
+        }
     }
 
     /// Get the underlying async ObjectStore for use in async contexts
@@ -501,6 +570,30 @@ impl DataStore {
 impl std::fmt::Debug for DataStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DataStore").finish()
+    }
+}
+
+/// `future`, limited to the request `deadline` when one is in scope (an
+/// expiry is [`DataServerError::DeadlineExceeded`]), else to `budget`.
+async fn within<F, T>(
+    budget: FetchBudget,
+    deadline: Option<std::time::Instant>,
+    future: F,
+) -> Result<T, DataServerError>
+where
+    F: std::future::Future<Output = Result<T, DataServerError>>,
+{
+    let end = match deadline {
+        Some(deadline) => deadline.into(),
+        None => tokio::time::Instant::now() + budget.timeout(),
+    };
+    match tokio::time::timeout_at(end, future).await {
+        Ok(result) => result,
+        Err(_) if deadline.is_some() => Err(DataServerError::DeadlineExceeded),
+        Err(_) => Err(DataServerError::Storage(format!(
+            "Request timed out after {}s",
+            budget.timeout().as_secs()
+        ))),
     }
 }
 
@@ -738,7 +831,7 @@ pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), Data
         .redirect(reqwest::redirect::Policy::none())
         .https_only(url.scheme() != "http")
         .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(DataStore::REQUEST_TIMEOUT)
+        .timeout(DataStore::ATTEMPT_TIMEOUT)
         .no_gzip()
         .no_brotli()
         .no_zstd()
@@ -979,22 +1072,26 @@ mod deadline_tests {
                 std::time::Instant::now() + std::time::Duration::from_millis(30),
             ));
             let dropped = Dropped(cancelled.clone());
-            let result: Result<(), _> = store.block_on_with(Some(&handle), async {
-                let _dropped = dropped;
-                std::future::pending().await
-            });
+            let result: Result<(), _> =
+                store.block_on_with(Some(&handle), FetchBudget::Request, async {
+                    let _dropped = dropped;
+                    std::future::pending().await
+                });
             assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
             assert!(cancelled.load(Ordering::SeqCst));
             // Expired requests must not start another source operation/retry.
             let result: Result<(), _> =
-                store.block_on_with(Some(&handle), async { panic!("expired I/O was polled") });
+                store.block_on_with(Some(&handle), FetchBudget::Request, async {
+                    panic!("expired I/O was polled")
+                });
             assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
             drop(scope);
             assert!(ds_core::deadline::current().is_none());
-            let result: Result<u8, _> = store.block_on_with(Some(&handle), async {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                Ok(42)
-            });
+            let result: Result<u8, _> =
+                store.block_on_with(Some(&handle), FetchBudget::Request, async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(42)
+                });
             assert_eq!(result.unwrap(), 42);
         })
         .await
@@ -1034,5 +1131,140 @@ mod deadline_tests {
         })
         .await
         .unwrap();
+    }
+}
+
+/// Fetch budgets (#1011): a background fetch outlasts object_store's
+/// retry of a stalled attempt; a request fetch does not wait for it.
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use object_store::{BackoffConfig, ClientConfigKey, ClientOptions, PutPayload};
+    use std::time::Duration;
+
+    /// `ATTEMPT_TIMEOUT` is object_store's own per-attempt default, and the
+    /// background budget holds a stalled attempt plus a whole retry.
+    #[test]
+    fn background_budget_holds_a_stalled_attempt_and_a_whole_retry() {
+        assert_eq!(
+            ClientOptions::default()
+                .get_config_value(&ClientConfigKey::Timeout)
+                .as_deref(),
+            Some("30s")
+        );
+        let backoff = BackoffConfig::default().init_backoff;
+        assert!(
+            FetchBudget::Background.timeout() >= 2 * DataStore::ATTEMPT_TIMEOUT + backoff,
+            "the background budget must outlast a stalled attempt and its retry"
+        );
+        assert_eq!(FetchBudget::Request.timeout(), Duration::from_secs(30));
+    }
+
+    /// A store whose first attempt stalls until object_store's per-attempt
+    /// timeout, then backs off and lets the retry deliver the rest in 1 s.
+    async fn stalled_store(path: &ObjectPath) -> DataStore {
+        let inner = object_store::memory::InMemory::new();
+        inner
+            .put(path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        let stall = DataStore::ATTEMPT_TIMEOUT
+            + BackoffConfig::default().init_backoff
+            + Duration::from_secs(1);
+        DataStore::new(Arc::new(crate::test_store::StalledBody { inner, stall }))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_get_completes_on_the_background_budget_only() {
+        let path = ObjectPath::from("scan.nc");
+        let store = stalled_store(&path).await;
+        let get = |budget| {
+            within(budget, None, async {
+                store
+                    .whole(&path)
+                    .await
+                    .map_err(|e| DataServerError::from(StorageError::from(e)))
+            })
+        };
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            get(FetchBudget::Background).await.unwrap(),
+            &b"0123456789"[..]
+        );
+        assert!(started.elapsed() > DataStore::ATTEMPT_TIMEOUT);
+
+        match get(FetchBudget::Request).await {
+            Err(DataServerError::Storage(message)) => {
+                assert_eq!(message, "Request timed out after 30s")
+            }
+            other => panic!("the request budget must time out, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_batch_object_completes_on_the_background_budget_only() {
+        let path = ObjectPath::from("volume.h5");
+        let store = stalled_store(&path).await;
+        let paths = [path.clone()];
+
+        let fetched = store
+            .fetch_many(&paths, 1, Some(10), FetchBudget::Background)
+            .await;
+        assert_eq!(fetched[0].as_ref().unwrap(), &b"0123456789"[..]);
+
+        let fetched = store
+            .fetch_many(&paths, 1, None, FetchBudget::Request)
+            .await;
+        match &fetched[0] {
+            Err(DataServerError::Storage(message)) => {
+                assert_eq!(message, "fetch of `volume.h5` timed out after 30s")
+            }
+            other => panic!("the request budget must time out, got {other:?}"),
+        }
+    }
+
+    /// A request deadline in scope still bounds a background fetch.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_deadline_bounds_the_background_budget() {
+        let path = ObjectPath::from("scan.nc");
+        let store = stalled_store(&path).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let result = within(FetchBudget::Background, Some(deadline), async {
+            store
+                .whole(&path)
+                .await
+                .map_err(|e| DataServerError::from(StorageError::from(e)))
+        })
+        .await;
+        assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
+    }
+
+    /// The public entry points pass their budget through and count bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn budgeted_entry_points_fetch_and_count_bytes() {
+        let inner = object_store::memory::InMemory::new();
+        let path = ObjectPath::from("scan.nc");
+        inner
+            .put(&path, PutPayload::from_static(b"abc"))
+            .await
+            .unwrap();
+        let store = DataStore::new(Arc::new(inner));
+        assert_eq!(
+            store
+                .get_with_budget(&path, FetchBudget::Background)
+                .unwrap(),
+            &b"abc"[..]
+        );
+        let many = store
+            .get_many_with_budget(
+                std::slice::from_ref(&path),
+                4,
+                None,
+                FetchBudget::Background,
+            )
+            .unwrap();
+        assert_eq!(many[0].as_ref().unwrap(), &b"abc"[..]);
+        assert_eq!(store.bytes_read(), 6);
     }
 }
