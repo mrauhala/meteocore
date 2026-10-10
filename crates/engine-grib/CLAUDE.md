@@ -11,7 +11,9 @@ unlike GeoTIFF's one band per collection.
 
 - Discovers data via **index sidecar files** on S3/HTTP or a local
   directory; fetches messages via byte-range reads. The engine NEVER builds
-  indexes itself.
+  indexes itself. A listed index with a temporary name
+  (`ds_core::temp_files::is_temporary_key`, e.g. a publisher's
+  `.name.index`) is never fetched or marked known (#1009).
 - **Data source (mutually exclusive):** remote
   `endpoint`+`bucket`+`prefix_pattern` (S3 with strftime/run-hour date
   templating), or local `data_path` (a directory of `.grib2` + index

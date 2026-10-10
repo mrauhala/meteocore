@@ -20,8 +20,8 @@
 //!    template or an explicit regex (#817).
 //! 4. [`scan_remote`] / [`scan_local`] — the catalog scan: list the
 //!    prefixes, at most [`MAX_CONCURRENT_LISTS`] at a time, or read the
-//!    directory, then exclude, match, window, dedup and cap into
-//!    `(key, timestamp)` entries (#817). [`list_prefixes`] is its bounded
+//!    directory, then skip hidden names (#1009), exclude, match, window,
+//!    dedup and cap into `(key, timestamp)` entries (#817). [`list_prefixes`] is its bounded
 //!    concurrent LIST, for an engine that recognises files without a
 //!    matcher.
 //!
@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use ds_core::error::DataServerError;
+use ds_core::temp_files;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectMeta;
 use regex::Regex;
@@ -917,13 +918,18 @@ pub const MAX_FILENAME_LEN: usize = 255;
 /// What a catalog scan keeps. [`ScanSpec::new`] sets no limits; set the
 /// optional ones with struct-update syntax.
 ///
-/// A scan keeps a file when its basename is not `exclude`d, matches the
+/// A scan keeps a file when its basename is not hidden
+/// ([`ds_core::temp_files::is_hidden`]), not `exclude`d, matches the
 /// [`FilenameMatcher`] and has a timestamp inside `time_filter`. It then
 /// returns the kept files oldest first, one per timestamp, capped to the
 /// newest `max_files` timestamps. Of files that share a timestamp, the
 /// greatest key or path wins, and each file dropped for it is logged at
-/// WARN. An excluded file is dropped before any of that, so it never wins
-/// a timestamp or takes a `max_files` slot.
+/// WARN. A hidden or excluded file is dropped before any of that, so it
+/// never wins a timestamp or takes a `max_files` slot.
+///
+/// A hidden name is skipped whatever `exclude` holds: it is the temporary
+/// name of a file written and then renamed into place, which an unanchored
+/// `filename_pattern` would otherwise match mid-write (#1009).
 #[derive(Debug, Clone, Copy)]
 pub struct ScanSpec<'a> {
     /// Recognises the collection's files and reads their timestamps. A
@@ -991,7 +997,10 @@ impl<'a> ScanSpec<'a> {
 
     /// The timestamp of a file this scan keeps by name, or `None`.
     fn timestamp(&self, name: &str) -> Option<DateTime<Utc>> {
-        if name.len() > MAX_FILENAME_LEN || is_excluded(name, self.exclude) {
+        if name.len() > MAX_FILENAME_LEN
+            || temp_files::is_hidden(name)
+            || is_excluded(name, self.exclude)
+        {
             return None;
         }
         let time = match self.matcher.match_timestamp(name)? {
@@ -1798,6 +1807,49 @@ mod scan_tests {
             ["d/radar_20260324T2310Z.tif", "d/radar_20260324T2315Z.tif"]
         );
         assert_eq!(scan.prefixes[0].listed.as_ref().ok(), Some(&4));
+    }
+
+    /// A publisher writing `.name` and renaming it into place: the hidden
+    /// file holds the newest timestamp, which an unanchored pattern
+    /// matches. It is skipped with no `exclude` at all, so it neither
+    /// becomes the newest entry nor takes the `max_files` slot (#1009).
+    const HIDDEN_LAYOUT: [&str; 3] = [
+        "radar_20260324T2310Z.tif",
+        "radar_20260324T2315Z.tif",
+        ".radar_20260324T2320Z.tif",
+    ];
+
+    #[test]
+    fn local_scan_skips_hidden_names_without_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in HIDDEN_LAYOUT {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let matcher = FilenameMatcher::from_pattern(UNANCHORED, "%Y%m%dT%H%MZ").unwrap();
+        let spec = ScanSpec {
+            max_files: Some(1),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        assert_eq!(
+            local_names(&scan_local(dir.path(), &spec).unwrap()),
+            ["radar_20260324T2315Z.tif"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_scan_skips_hidden_names_without_excludes() {
+        let keys = HIDDEN_LAYOUT.map(|name| format!("d/{name}"));
+        let probe = ListProbe::default()
+            .with_objects(&keys.iter().map(String::as_str).collect::<Vec<_>>())
+            .await;
+        let store = DataStore::new(Arc::new(probe));
+        let matcher = FilenameMatcher::from_pattern(UNANCHORED, "%Y%m%dT%H%MZ").unwrap();
+        let spec = ScanSpec {
+            max_files: Some(1),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        let scan = scan_remote(&store, &[ObjectPath::from("d")], &spec).unwrap();
+        assert_eq!(remote_keys(&scan), ["d/radar_20260324T2315Z.tif"]);
     }
 
     /// A name over `MAX_FILENAME_LEN` is skipped even when it matches.

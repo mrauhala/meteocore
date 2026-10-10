@@ -563,6 +563,12 @@ time_window = "PT12H"
 
 ## Data Engines
 
+Every engine that polls a directory or object prefix skips a publisher's
+temporary files: hidden names (`.name`, written and then renamed into place)
+always, and names ending in `.tmp` or `.part`. A partial file is therefore
+never parsed; the finished file is picked up under its own name on the next
+poll. GeoTIFF leaves the suffixes to its `exclude_patterns`.
+
 ### CSV
 
 Fixed columns: `location, latitude, longitude, time` (in that order). All remaining columns become parameters. Parameter units are mapped in `engine-csv/src/loader.rs`.
@@ -702,7 +708,7 @@ Values are converted to `f64` internally. Physical values: `physical = raw * sca
 The engine polls for new files at a configurable interval (`poll_interval_secs`, default 30s):
 
 - **Local files:** New files are held in a "pending" state for one poll cycle to confirm they are fully written (size stability check).
-- **Excluded files:** Local files and remote objects whose names match `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped before the filename is matched, so a partial upload never replaces the finished file of the same timestamp or counts toward `max_files`.
+- **Excluded files:** Local files and remote objects whose names match `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped before the filename is matched, so a partial upload never replaces the finished file of the same timestamp or counts toward `max_files`. Hidden files (`.name`) are skipped whatever `exclude_patterns` holds.
 - **Remote files:** Uses COG byte-range reads to fetch only the 64 KB IFD header for metadata. Falls back to full download if header-only parse fails.
 - **Metadata caching:** Files with unchanged size reuse their cached metadata across poll cycles.
 - **Failure handling:** If a poll cycle fails, the old catalog is preserved. Zero-file results when the old catalog had files are treated as transient failures.
@@ -1081,7 +1087,7 @@ FMI QueryData (.sqd) binary format for NWP gridded data. Implements `EdrEngine` 
 - **Binary format** with text header. Magic bytes: `@$°£Q`. Version 6.0+ only, little-endian.
 - **Memory-mapped** file access via `memmap2` for zero-copy reads.
 - **Multi-parameter:** Exposes all parameters from the file. `wms_parameter` config selects which to render for WMS/Maps/Tiles.
-- **Polls directory** for latest `.sqd` file, atomically swaps via `ArcSwap`.
+- **Polls directory** for latest `.sqd` file, atomically swaps via `ArcSwap`. Hidden (`.name.sqd`) and `.tmp` / `.part` files are never loaded.
 - **EDR position queries** use bilinear interpolation across grid points.
 - **Map rendering** uses nearest-neighbor resampling.
 - **Missing value sentinel:** 32700.0 (treated as `None`).

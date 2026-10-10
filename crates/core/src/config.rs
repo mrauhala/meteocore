@@ -866,7 +866,8 @@ pub struct GeoTiffConfig {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
     /// Glob patterns for files to exclude (e.g. temporary files).
-    /// Default: ["*.tmp", "*.part"]
+    /// Default: ["*.tmp", "*.part"] ([`crate::temp_files::PARTIAL_SUFFIXES`]).
+    /// Hidden (`.name`) files are skipped whatever this holds (#1009).
     #[serde(default = "default_exclude_patterns")]
     pub exclude_patterns: Vec<String>,
     /// Maximum number of files to keep in the catalog (most recent by timestamp).
@@ -946,7 +947,7 @@ fn default_querydata_max_runs() -> usize {
 }
 
 fn default_exclude_patterns() -> Vec<String> {
-    vec!["*.tmp".to_string(), "*.part".to_string()]
+    crate::temp_files::partial_exclude_patterns()
 }
 
 fn default_engine_type() -> String {
@@ -4183,6 +4184,13 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// The documented default, built from the shared partial-upload
+    /// suffixes so the two cannot drift (#1009).
+    #[test]
+    fn default_exclude_patterns_are_the_partial_suffixes() {
+        assert_eq!(default_exclude_patterns(), ["*.tmp", "*.part"]);
+    }
 
     #[test]
     fn default_for_auto_is_loopback_and_empty() {

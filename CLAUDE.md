@@ -523,6 +523,15 @@ one never implies the other.
 - **`ds_core::cf`** — CF grid mapping → `Crs` and coordinate-unit scale,
   shared by NetCDF readers. Unsupported mappings and missing earth figures
   are errors, never a WGS84 guess.
+- **`ds_core::temp_files`** — the names a data scan never reads (#1009): a
+  hidden `.name` (written, then renamed into place) or a `PARTIAL_SUFFIXES`
+  ending (`.tmp` / `.part`, the default `exclude_patterns`). An engine that
+  enumerates a directory or prefix itself filters with `is_temporary` /
+  `is_temporary_key`; the shared `ds_storage::discovery` scan skips hidden
+  names always and leaves the suffixes to `ScanSpec.exclude`
+  (`exclude_patterns`, or `partial_exclude_patterns()` for an engine
+  without that setting). A new engine's file listing does the same. A
+  store-internal listing (Zarr v2's `.zarray`) is not a data scan.
 - **`ds_core::instances`** — model-run (forecast reference time) machinery
   shared by ALL forecast engines (#337), so run selection, instance lists and
   instance-id encoding are identical everywhere:

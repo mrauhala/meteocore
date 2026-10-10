@@ -128,6 +128,9 @@ no opt-out, as for GRIB; a client wanting kelvin converts back.
   (the engine decodes + ingests it right there), so a 50 k-file backlog is
   never resident at once — `get_many` buffers a whole batch, which is why
   its doc says "a chunk, not thousands of paths" (engine-odim convention).
+  A listed file with a temporary basename (`ds_core::temp_files::
+  is_temporary_key`, e.g. a publisher's in-progress `.name.bufr`) is never
+  fetched (#1009).
 - The fixture retention in `collections.d/obs-bufr-local.toml` is
   `P36500D` only because the fixtures are dated; production keeps `PT24H`.
 

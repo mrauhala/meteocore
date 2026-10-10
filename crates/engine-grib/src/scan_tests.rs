@@ -158,3 +158,28 @@ async fn index_scan_latency_replay() {
         );
     }
 }
+
+/// A publisher's in-progress index (`.name.idx`) is never fetched or
+/// marked known (#1009): parsed before its rename, it would point at a
+/// data file that does not exist under that name yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hidden_indexes_are_never_fetched() {
+    let (_source, engine, store) = engine_with_indexes(2, "wgrib2", Duration::ZERO).await;
+    store
+        .inner
+        .put(&Path::from(".f002.idx"), index_body("wgrib2", 2).into())
+        .await
+        .unwrap();
+    engine.scan_once().unwrap();
+
+    let attempts = store.reads.lock().unwrap().attempts.clone();
+    assert!(!attempts.contains_key(".f002.idx"), "{attempts:?}");
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), 2);
+    assert_eq!(
+        origins(&engine),
+        [
+            ("f000.grib2".to_string(), 0),
+            ("f001.grib2".to_string(), 200)
+        ]
+    );
+}

@@ -35,6 +35,7 @@ use ds_core::error::DataServerError;
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::model::*;
+use ds_core::temp_files;
 
 use crate::cache::{DecodedGrid, GridCache};
 use crate::catalog::{Catalog, ForecastRun, ParameterKey, ParameterKeys, StepFile};
@@ -517,7 +518,10 @@ impl GribEngine {
                 Ok(objects) => {
                     for obj in objects {
                         let loc = obj.location.as_ref();
-                        if !loc.ends_with(index_suffix) {
+                        // A publisher's in-progress `.name.index` is not an
+                        // index yet: once parsed it would be marked known
+                        // under its temporary name (#1009).
+                        if !loc.ends_with(index_suffix) || temp_files::is_temporary_key(loc) {
                             continue;
                         }
                         if let Some(needle) = filename_contains {
