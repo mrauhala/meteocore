@@ -318,7 +318,9 @@ fn remote_decode_size(
 
 /// Validate attacker-controlled encoded byte counts before admission or I/O.
 /// The encoded input coexists with decompressed and boxed output buffers.
-fn remote_chunk_layout(
+/// `(raw, reservation, offset, encoded length)`; the poll-cycle pre-warm
+/// (#1004) plans its reads through it too.
+pub(crate) fn remote_chunk_layout(
     info: &RemoteTileInfo,
     samples: u32,
     index: usize,
@@ -1361,6 +1363,26 @@ fn read_http_range(
     match handle {
         Some(h) => h.block_on(fut),
         None => block_on_async(fut),
+    }
+}
+
+/// Fetch an encoded byte range of a remote COG for the poll-cycle pre-warm
+/// (#1004), on a blocking-pool thread of the runtime `handle` belongs to:
+/// the explicit-handle storage bridge for an object store, the direct HTTP
+/// range read for a STAC asset. No request deadline is in scope there, so the
+/// background timeouts apply (the store's own, the STAC client's). Local and
+/// in-memory sources have nothing to fetch.
+pub(crate) fn fetch_encoded_range(
+    source: &DataSource,
+    range: std::ops::Range<usize>,
+    handle: &tokio::runtime::Handle,
+) -> Result<Bytes, DataServerError> {
+    match source {
+        DataSource::Remote { store, path, .. } => store.get_range_on(path, range, handle),
+        DataSource::HttpDirect { url, http, .. } => read_http_range(http, url, range, Some(handle)),
+        DataSource::LocalFile { .. } | DataSource::InMemory(_) => Err(DataServerError::Engine(
+            "Encoded range reads need a remote source".into(),
+        )),
     }
 }
 
@@ -3667,6 +3689,85 @@ mod tests {
             "batching works without a cache"
         );
         assert_eq!(calls.lock().unwrap()[0], 0..268);
+    }
+
+    /// #1004: a render cut off by its deadline keeps the tiles it already
+    /// fetched, so the client's retry fetches only the rest.
+    #[test]
+    fn a_deadline_cut_read_keeps_fetched_tiles_for_the_retry() {
+        let (meta, info, bytes) = batch_fixture();
+        let cache = crate::cache::TileCache::new(4096);
+        let file = Path::new("deadline-fixture");
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let slow = 204..268; // tile 3
+        let calls = std::sync::Mutex::new(Vec::new());
+        let cut = |range: std::ops::Range<usize>| {
+            calls.lock().unwrap().push(range.clone());
+            if range == slow {
+                // This read outlives the deadline: the others land first, as
+                // on a store, then the storage bridge reports the deadline.
+                let waited = std::time::Instant::now();
+                while (0..3).any(|chunk| !cache.contains_untracked(file, chunk, 0))
+                    && waited.elapsed() < std::time::Duration::from_secs(10)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                return Err(DataServerError::DeadlineExceeded);
+            }
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let result = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            None,
+            file,
+            0,
+            0,
+            None,
+            1,
+            &cut,
+        );
+        assert!(
+            matches!(result, Err(DataServerError::DeadlineExceeded)),
+            "the deadline fails the read"
+        );
+        for chunk in 0..3 {
+            assert!(
+                cache.contains_untracked(file, chunk, 0),
+                "tile {chunk} kept"
+            );
+        }
+        assert!(!cache.contains_untracked(file, 3, 0));
+
+        calls.lock().unwrap().clear();
+        let retry = |range: std::ops::Range<usize>| {
+            calls.lock().unwrap().push(range.clone());
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let tiles = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            None,
+            file,
+            0,
+            0,
+            None,
+            1,
+            &retry,
+        )
+        .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [slow],
+            "the retry fetches the rest only"
+        );
+        for (_, col, tile) in tiles {
+            assert_eq!(tile_samples(&tile), Some(vec![col as f64 + 1.0; 64]));
+        }
     }
 
     #[test]

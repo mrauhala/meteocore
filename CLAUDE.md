@@ -956,7 +956,10 @@ no `url` are rejected.
   rebuild, and their cached tiles are evicted per collection. See
   `crates/server/CLAUDE.md` for the rules.
 - **Health:** `GET /health` — per-collection ready/degraded/failed status.
-  HTTP 503 only when all collections failed.
+  HTTP 503 only when all collections failed. `data_age_secs` (and the
+  `collection_data_age_seconds` gauge) is now minus the newest data a
+  collection serves, never the time since its last poll (#1007); see
+  `crates/server/CLAUDE.md`.
 - **Metrics:** `GET /metrics` — Prometheus format. Path labels use route
   patterns, never raw URLs (cardinality explosion).
 - **Grafana dashboards live in this repo:**
