@@ -122,10 +122,12 @@ unlike GeoTIFF's one band per collection.
 Catalog keeps a `runs` map (`BTreeMap` keyed by reference time) and
 implements the shared `ds_core::instances` contract (see root CLAUDE.md).
 Two selections, never mixed (#967):
-- **Maps** (`select_run_step` → `covering_run`, also M trajectories): the
-  newest run whose published valid-time extent covers the time, at its
-  nearest step. `resolve_time`/`resolve_reference_time` key the #507/#521
-  caches on it, so it must stay the render's own selection.
+- **Maps** (`select_run_step`): without a parameter (the default layer;
+  M trajectories use its `covering_run`) the newest run whose published
+  valid-time extent covers the time, at its nearest step; with one, only
+  the steps carrying it (#1005, below). `get_raster_tile(s)` and every
+  `resolve_*` override go through it: they key the #507/#521 caches, so it
+  must stay the render's own selection.
 - **EDR** (`resolve_run`, `grid_steps`; position, area, radius, cube, 2-D
   and Z trajectories): by intersection (`/req/core/datetime-response` A, F).
   An instant takes only the step valid at exactly that time, never the
@@ -238,6 +240,51 @@ cube) return `default_parameters` instead, every parameter of the view
 (EDR 1.2 `/req/edr/parameter-name-response` A, #966): every key of a
 pressure/model view, else the products of the selected steps, near-surface
 ones only in the legacy layout.
+
+## Per-parameter time axes (#1005)
+
+- Hour-window aggregates (`PRATE_avg_6h`) and maxima absent from the
+  analysis (`TMAX`) exist at some steps only. `Catalog::refresh_metadata`
+  records per run the steps carrying each parameter some steps lack
+  (`partial_steps`, one pass over the messages) and each advertised
+  parameter's valid times over the retained runs, kept where they differ
+  from the collection's (`parameter_times`). A step carries a parameter at
+  its run's canonical key; in a pressure/model family at any level.
+- `MapEngine::parameter_times` and `EdrEngine::get_parameter_available_times`
+  read that snapshot (an `Arc` clone). The API layers then give the WMS
+  child layer its own `time` dimension and default, and Maps/Tiles/EDR
+  `parameter_names` its own `extent.temporal`. `RasterInfo.times` stays the
+  union. The advertised parameters are still the newest run's: while it
+  has only its analysis, its windows are no layer and a request naming one
+  is a 400, although older runs could serve it.
+- Map selection of a parameter (`select_run_step`, `CarriedSteps`), over
+  the pinned run, else the runs newest first:
+  1. the first whose carrying steps span the time, at the nearest of them;
+  2. else, the time inside any run's steps, the carrying step nearest it
+     in any of them, the newer run's on a tie (WMS `nearestValue`);
+  3. else the time is outside the data: the default layer's 400.
+
+  No carrying step is `LocationNotFound` (404); `None` is the newest
+  carrying run's last carrying step. Several parameters
+  (`get_raster_tiles`, `resolve_parameters_time`, DerivedWind's u/v) use
+  the steps carrying all of them.
+- The run depends on the parameter: an aggregate the newest run lacks at
+  that time renders from an older run. Hence
+  `MapEngine::resolve_parameter_reference_time`, which the API layers call
+  instead of `resolve_reference_time`. Pinning the run it returns must
+  re-select the same step at the request and at that step's time:
+  `resolved_keys_render_the_same_pixels_as_the_request` sweeps it. So with
+  a pin, rule 2 accepts a time outside the pinned run's own steps only when
+  the unpinned selection chooses that run; any other pin outside its steps
+  is the default layer's 400, never the pinned run's edge step.
+- `fetch_grid`: a parameter the run lacks is `InvalidParameter`; a step
+  without its field at the requested level (a pressure view's `z`) is
+  `LocationNotFound`.
+- Tests: `parameter_times_tests.rs` (two synthetic runs, and the real GFS
+  2026-04-08 f000/f003/f006 sidecars in `testdata/gfs`), and
+  `server/tests/grib_parameter_times.rs` (WMS capabilities and GetMap cache
+  keys, Maps, EDR metadata, through `DerivedWind`; with two runs, the run
+  WMS, Maps and Tiles render and key where the newest lacks the window).
 
 ## Position queries
 

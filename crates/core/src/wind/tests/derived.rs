@@ -149,6 +149,19 @@ impl MapEngine for Mock {
         Some(hour(0))
     }
 
+    /// `10u` renders from another run than the other parameters.
+    fn resolve_parameter_reference_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        match parameter {
+            Some("10u") => Some(hour(1)),
+            _ => self.resolve_reference_time(time, reference_time),
+        }
+    }
+
     fn content_version(&self) -> u64 {
         42
     }
@@ -494,6 +507,19 @@ fn every_other_method_delegates() {
         Some(hour(7))
     );
     assert_eq!(wind.resolve_reference_time(None, None), Some(hour(0)));
+    // A derived speed renders from its u component's run (#1005).
+    assert_eq!(
+        wind.resolve_parameter_reference_time(Some("10si"), None, None),
+        Some(hour(1))
+    );
+    assert_eq!(
+        wind.resolve_parameter_reference_time(Some("2t"), None, None),
+        Some(hour(0))
+    );
+    assert_eq!(
+        wind.resolve_parameter_reference_time(None, None, None),
+        Some(hour(0))
+    );
     assert_eq!(wind.content_version(), 42);
     assert_eq!(wind.default_time(), Some(hour(5)));
     assert!(wind.composites().is_empty());
