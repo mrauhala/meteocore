@@ -471,7 +471,7 @@ max_files = 24
 
 [collections.wms]
 colormap = "radar_dbz"          # built-in colormap (or use color_stops for custom)
-# rendered_cache_mb = 128       # optional, default 128 MB
+# rendered_cache_mb = 256       # optional, default 256 MB
 # webp_quality = 80             # optional, default WebP quality 1-100 (100 = lossless,
                                 # the default); lossy suits continuous-tone layers
 ```
@@ -1780,7 +1780,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `max` | no | from colormap | Maximum value for the default style's range |
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
-| `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. (Global cache; lives under `[wms]` for backward compatibility — see note.) |
+| `rendered_cache_mb` | no | `256` | Shared rendered-image cache size in MB. Set to 0 to disable. (Global cache; lives under `[wms]` for backward compatibility — see note.) |
 | `webp_quality` | no | lossless | Default quality, 1–100, for this collection's `image/webp` maps and tiles in WMS, Maps and Tiles: 1–99 lossy, 100 lossless. A request's own `QUALITY` / `quality` wins, including 100 for lossless. Not applied to JPEG. Validated at load. Collection-level only; style bundles do not carry it. |
 
 ### Limits
@@ -1932,7 +1932,8 @@ When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against 
 
 Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP bytes. Shared across WMS, Maps, and Tiles APIs.
 
-- Default size: 512 MB (configurable via `rendered_cache_mb`)
+- Default size: 256 MB (configurable via `rendered_cache_mb`). On a live deployment's WMS traffic, a replay of a day's repeated requests gained nothing from 512 MB, and most hits reuse an image rendered within the last 25 minutes, which 256 MB holds ([#1010](https://github.com/mrauhala/meteocore/issues/1010)).
+- Every successful render is inserted on its first render. Hits come from views requested again: a fixed display cycling its animation frames, a client's default view, Tiles `z/x/y`, and a `TIME` that resolves to a timestep already rendered for the same view, such as a frame not ingested yet. With viewport WMS clients a few % is expected; the meta-tile cache below holds the work they share.
 - Cache key: quantized bbox (6 decimal places) + layer + style + format with its encoder quality + width + height + CRS + time + parameter
 - Lock-free concurrent LRU (uses `quick_cache`)
 - No TTL — immutable data. Cache invalidated on collection reload.
