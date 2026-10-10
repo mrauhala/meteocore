@@ -1855,6 +1855,191 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
 }
 
 // ---------------------------------------------------------------------------
+// `<Service>` request limits (#1012)
+// ---------------------------------------------------------------------------
+
+/// The children of the capabilities' `<Service>` element in document order:
+/// each element's name and its text, or for `<OnlineResource>` its
+/// `xlink:href`.
+fn service_children(xml: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    // Depth below `<Service>`: `Some(0)` = directly inside it.
+    let mut depth: Option<usize> = None;
+    let mut children: Vec<(String, String)> = Vec::new();
+    loop {
+        match reader.read_event().expect("capabilities XML parses") {
+            Event::Start(e) => {
+                let name = e.name().as_ref().to_owned();
+                match depth {
+                    None if name == "Service" => depth = Some(0),
+                    None => {}
+                    Some(d) => {
+                        if d == 0 {
+                            children.push((name, String::new()));
+                        }
+                        depth = Some(d + 1);
+                    }
+                }
+            }
+            Event::Empty(e) if depth == Some(0) => {
+                let name = e.name().as_ref().to_owned();
+                let href = e
+                    .try_get_attribute("xlink:href")
+                    .expect("attributes parse")
+                    .map(|a| a.value.into_owned())
+                    .unwrap_or_default();
+                children.push((name, href));
+            }
+            Event::Text(t) if depth == Some(1) => {
+                children.last_mut().unwrap().1.push_str(&t);
+            }
+            Event::End(_) => match depth {
+                Some(0) => break,
+                Some(d) => depth = Some(d - 1),
+                None => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    children
+}
+
+/// The value of the `<Service>` child `name`, parsed as an integer.
+fn service_limit(children: &[(String, String)], name: &str) -> usize {
+    let (_, value) = children
+        .iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("<Service> has no <{name}>; got {children:?}"));
+    value
+        .parse()
+        .unwrap_or_else(|_| panic!("<{name}> {value:?} is not an integer"))
+}
+
+/// One WMS request through `app`: its status and body.
+async fn wms_get(app: &axum::Router, query: &str) -> (StatusCode, String) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/?SERVICE=WMS&VERSION=1.3.0&{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// `<Service>` advertises the limits GetMap enforces — `LayerLimit`,
+/// `MaxWidth`, `MaxHeight` — and its mandatory `OnlineResource`, in the
+/// element order of the WMS 1.3.0 schema's `Service` sequence (Name, Title,
+/// Abstract, KeywordList, OnlineResource, ContactInformation, Fees,
+/// AccessConstraints, LayerLimit, MaxWidth, MaxHeight).
+#[test]
+fn capabilities_service_advertises_getmap_limits_in_schema_order() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    engines.insert("radar".to_string(), Arc::new(PopulatedMockMapEngine));
+    let mut collections = HashMap::new();
+    collections.insert("radar".to_string(), site_collection_config("radar"));
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        "https://wms.example",
+    );
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    let children = service_children(&xml);
+    let names: Vec<&str> = children.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "Name",
+            "Title",
+            "Abstract",
+            "OnlineResource",
+            "LayerLimit",
+            "MaxWidth",
+            "MaxHeight"
+        ],
+        "<Service> children out of WMS 1.3.0 schema order; got:\n{xml}"
+    );
+    assert_eq!(children[0].1, "WMS");
+    assert_eq!(children[3].1, "https://wms.example/wms");
+    assert_eq!(service_limit(&children, "LayerLimit"), 1);
+    assert_eq!(
+        service_limit(&children, "LayerLimit"),
+        api_wms::params::LAYER_LIMIT
+    );
+    for side in ["MaxWidth", "MaxHeight"] {
+        assert_eq!(
+            service_limit(&children, side),
+            api_wms::params::MAX_MAP_DIMENSION as usize,
+            "<{side}>"
+        );
+    }
+}
+
+/// A client sizing GetMap from the advertised limits is served at them and
+/// refused one past them: the capabilities and the GetMap validation read
+/// the same constants.
+#[tokio::test]
+async fn getmap_is_served_at_the_advertised_limits_and_refused_past_them() {
+    let app = build_populated_router();
+    let (status, caps) = wms_get(&app, "REQUEST=GetCapabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    let children = service_children(&caps);
+    let max_width = service_limit(&children, "MaxWidth");
+    let max_height = service_limit(&children, "MaxHeight");
+    let layer_limit = service_limit(&children, "LayerLimit");
+
+    let get_map = |layers: usize, width: usize, height: usize| {
+        let layers = vec!["radar"; layers].join(",");
+        format!(
+            "REQUEST=GetMap&LAYERS={layers}&STYLES=&CRS=CRS:84&BBOX=10,55,30,70\
+             &WIDTH={width}&HEIGHT={height}&FORMAT=image/png"
+        )
+    };
+    for (what, query, expected) in [
+        ("WIDTH = MaxWidth", get_map(1, max_width, 1), StatusCode::OK),
+        (
+            "WIDTH = MaxWidth + 1",
+            get_map(1, max_width + 1, 1),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "HEIGHT = MaxHeight",
+            get_map(1, 1, max_height),
+            StatusCode::OK,
+        ),
+        (
+            "HEIGHT = MaxHeight + 1",
+            get_map(1, 1, max_height + 1),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "LayerLimit layers",
+            get_map(layer_limit, 64, 64),
+            StatusCode::OK,
+        ),
+        (
+            "LayerLimit + 1 layers",
+            get_map(layer_limit + 1, 64, 64),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, body) = wms_get(&app, &query).await;
+        assert_eq!(status, expected, "{what}: {query}\n{body}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Forecast `reference_time` dimension (#337 Phase 2)
 // ---------------------------------------------------------------------------
 

@@ -142,6 +142,12 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 
 ## Capabilities niceties
 
+- `<Service>` follows the WMS 1.3.0 schema sequence: `Name`, `Title`,
+  `Abstract`, the mandatory `OnlineResource` (`{base_url}/wms`), then the
+  limits GetMap enforces, read from the constants that enforce them (#1012):
+  `<LayerLimit>` = `params::LAYER_LIMIT` (1: GetMap renders one layer),
+  `<MaxWidth>`/`<MaxHeight>` = `params::MAX_MAP_DIMENSION`. Change a limit
+  there and capabilities follows; never hard-code the numbers in the XML.
 - Collection `keywords` → `<KeywordList>` (after `<Abstract>`, WMS 1.3.0
   schema order); license → `<Attribution>` (after `<Dimension>` elements).
 - ODIM per-site layers: `<Title>` is prefixed with the site place name via
