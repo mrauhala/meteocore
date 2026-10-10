@@ -1543,9 +1543,12 @@ pub fn instances_html(surface: Surface<'_>, title: &str, doc: &Value, nav: &[Lin
     if instances.is_empty() {
         body.push_str("<p class=\"panel\">No model runs available.</p>");
     }
-    body.push_str(
-        "</div><section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div>",
-    );
+    body.push_str("</div>");
+    // A long run axis pages (EDR, #1006): the pager follows `prev`/`next`.
+    if nav.iter().any(|l| l.rel == "prev" || l.rel == "next") {
+        body.push_str(&pagination(nav));
+    }
+    body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div>");
     body.push_str(&link_table(&doc["links"]));
     body.push_str("</section>");
     Page {

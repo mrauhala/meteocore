@@ -70,9 +70,10 @@ bundles, 1.1 and 1.2 (#919). Both are declared, so both must pass. Covered:
 the landing page, `/conformance`, `/collections`, collection documents (with
 locations, position, area and radius queries, a vertical extent, and a
 satellite collection's per-parameter time axes), the instances list, one
-instance document, and the `/locations` GeoJSON. A negative control drops one
-data query link's `title`, which only 1.2 requires, and expects 1.2 to reject
-it. Both bundles' own `parameter_names` schema constrains no entry, so the
+instance document, a collection with a long run axis and a page of its
+instances list (#1006), and the `/locations` GeoJSON. A negative control drops
+one data query link's `title`, which only 1.2 requires, and expects 1.2 to
+reject it. Both bundles' own `parameter_names` schema constrains no entry, so the
 helper also checks each entry against their parameter schema; a second
 negative control drops an entry's `observedProperty`. CoverageJSON data
 responses validate against `schemas/coveragejson.json` instead: the 1.2 OpenAPI 3.0 bundle's NdArray schema rejects valid float
@@ -123,7 +124,7 @@ No executable documentation assets or validation requests use a CDN (#587).
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG and GeoJSON rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667); PNG rejected; EDR GeoJSON too on station collections |
 | `trajectory` | `/collections/{id}/trajectory` | ✓ | gridded engines (GRIB, QueryData, Zarr): values sampled along a WKT `LINESTRING`, `LINESTRING Z`, `M` or `ZM` (Z = level, M = Unix epoch seconds), CoverageJSON `Trajectory` only (PNG and GeoJSON → 400), see [Trajectory](#trajectory-926); PVOL sites: a 2-D `LINESTRING` is a *vertical cross-section* (`Section`, also PNG, never GeoJSON). `MULTILINESTRING` not supported |
-| `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); the id is the run's RFC 3339 reference time, e.g. `2026-06-07T06:00:00Z` (see [Instance ids](#instance-ids)); instance-scoped queries: position, area, radius, cube |
+| `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); the id is the run's RFC 3339 reference time, e.g. `2026-06-07T06:00:00Z` (see [Instance ids](#instance-ids)); instance-scoped queries: position, area, radius, cube; the list pages with `limit` + `offset`, and on its own past 500 runs (see [Long run axes](#long-run-axes)) |
 | `cube` | `/collections/{id}/cube` | ✓ | `bbox` required: CRS84, four numbers, or six whose vertical pair is a `z` interval that an explicit `z` overrides. `z` optional, in the full `z` grammar below: absent → every level; ignored, like the six-number pair, on a collection without a vertical extent. `datetime` as on every query, a list included: one cube per instant, joined along `t` into one `Grid`. `resolution-x`/`-y`/`-z` (`resolution-z` without a vertical extent is a 400), `crs` (CRS84 only), `f` (CoverageJSON or HTML: `PNG` and `GeoJSON` are 400). An unknown or repeated query parameter is a 400 naming the accepted ones. Response: a `Grid` with `t`, `z`, `y`, `x` axes, ≤ 1M values across timesteps × levels × cells × parameters → 400. `data_queries.cube.link.variables.height_units` is the vertical axis unit. Only collections with vertical levels offer it: GRIB pressure and model-level views (#925) |
 | `corridor` | — | ✗ | not in the trait or the router (`corridor-width`/`-height` documented as follow-up on trajectory) |
 | `items` | `/collections/{id}/items`, `/items/{itemId}` | ✓ | GeoJSON features of the collection's `FeatureEngine`, for EDR collections whose engine has one (see [Items](#items)); `bbox`, `datetime`, `limit` + `offset` paging |
@@ -229,6 +230,43 @@ taken from the collection document's own links (they answer for the latest
 run; each run's own end points are in its entry of `instances`). A
 collection without runs answers the same links around an empty list.
 
+### Long run axes
+
+An archive store can expose every historical run as an instance: one had
+about 7300, and its instances list was a 95 MB document built on a request
+worker (#1006). A run axis longer than 500 runs
+(`ds_core::time_axis::MAX_LISTED_VALUES`, the limit WMS lists to as well)
+therefore pages its instances list instead of answering every run at once:
+
+- **Paging.** 100 runs a page without `limit`, ascending by
+  reference time, with `numberMatched`, `numberReturned`, `self` and
+  `alternate` naming the page, and `next`/`prev` links, as `/locations` and
+  `/collections` page. `limit` (1 to 500; larger values are clamped to 500)
+  and `offset` page any list, a short one included; `offset` without `limit`
+  is a 400, and so is any other parameter but `f`. EDR 1.2 defines no
+  paging for this resource; the parameters are the `/collections` paging
+  extension, documented in `/api`. Without `limit` a list of at most 500 runs
+  is answered whole, byte-identical to before. The HTML page has a pager.
+- **Cost.** Only the page's runs are built: the handler reads the run axis
+  without any valid times (`EdrEngine::instance_reference_times`, which
+  GRIB, QueryData, Zarr and the nowcast answer from the keys of their run
+  map) and each page run with `find_instance`, and what every run shares
+  (parameters, extents, query types) is read from the engine once per
+  request, not once per run.
+- **The collection document** does not describe the run axis, at any
+  length: it links to the instances list, and its extent is the latest
+  run's, as for every forecast collection. It reads nothing per run, so its
+  cost does not grow with the archive. Every run resolves by its instance id,
+  `/instances/{instanceId}`, as before.
+
+Not done: advertising the run axis as an EDR custom dimension
+(`extent.custom`, id `reference_time`). EDR makes a custom dimension's `id` a
+query parameter of every data query (`/req/edr/custom-dimension-response`),
+and the data queries do not take `reference_time`: a run is selected by its
+instance path, `/instances/{instanceId}/position` and so on. Accepting it
+there would come first. WMS writes a long `time` or `reference_time` axis as
+Annex C ranges.
+
 ### Instance-scoped routes
 
 | Route | Status |
@@ -279,8 +317,8 @@ collection's extent describes the latest run.
 | `crs` | partial | every data query reads it (`/req/edr/REQ_rc-crs-definition`, #965): position, area, radius, cube, trajectory, `/locations/{locId}` and the instance routes. The CRS84 URI, `CRS84` or `OGC:CRS84` are accepted, anything else is a 400 naming the CRS served (`/req/edr/REQ_rc-crs-response` C); before #965 only cube read it and the others ignored any value. Data are served in CRS84 only, which every `data_queries` link advertises in `crs_details` (#918); other CRSs are #84. The `/locations` list takes no `crs`, as the 1.2 OpenAPI defines none, so there it is an unknown parameter, a 400. `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | partial | cube only: `n` evenly spaced positions from the bbox's west/south edge to its east/north edge (for `z`, from the lowest to the highest selected level), both ends included, each taking the nearest native value; a position more than half a cell off the grid is null. `0` or absent is the native resolution; a whole number up to 1 000 000, else 400 stating that range. Area does not take `resolution-x`/`-y` |
-| `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. A list of location ids does the same in id order; the ids past the limit are not queried, but an unknown one is still a 404. On `/locations` it pages the list, below. Trajectory and cube accept it too (#983, `/req/edr/rc-core-query-parameters` L: a data query may carry `limit`, and a format that cannot page ignores it; both used to answer 400): a trajectory's CoverageCollection, one coverage per timestep, is capped like the others, while a single Section, Trajectory or cube Grid coverage is returned unchanged. `limit` applies to CoverageJSON and GeoJSON only (#988): a PNG plot is one image and an HTML page has no paging links, so on every data query `f=PNG` and `f=HTML` ignore it (validated, then unused) and render every point and coverage, bounded by the values caps; a MULTIPOINT plot with `limit=1` is byte-identical to the one without. `/api` declares `limit` on both, instance cube included. `items` (#928) pages with the Features default of 10. `/collections` pages with Common's default and maximum of 1000 |
-| `offset` | ✓ | `/locations` with `limit`, as on `/collections`: the offset pagination extension. `offset` without `limit` on `/locations` is a 400. `/locations` takes only `limit`, `offset`, `bbox`, `datetime` and `f`; any other parameter is a 400 naming them. Its `f` names GeoJSON (`GeoJSON`, `application/geo+json`, `json` or `application/json`) or its HTML page (`HTML`, `text/html`, #971), case-insensitively, the one list `params::LOCATIONS_FORMATS` that `items` and `/api` share; any other value is a 400 (#965; it used to be ignored). `bbox` and `datetime` filter before paging (#932) |
+| `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. A list of location ids does the same in id order; the ids past the limit are not queried, but an unknown one is still a 404. On `/locations` it pages the list, below. Trajectory and cube accept it too (#983, `/req/edr/rc-core-query-parameters` L: a data query may carry `limit`, and a format that cannot page ignores it; both used to answer 400): a trajectory's CoverageCollection, one coverage per timestep, is capped like the others, while a single Section, Trajectory or cube Grid coverage is returned unchanged. `limit` applies to CoverageJSON and GeoJSON only (#988): a PNG plot is one image and an HTML page has no paging links, so on every data query `f=PNG` and `f=HTML` ignore it (validated, then unused) and render every point and coverage, bounded by the values caps; a MULTIPOINT plot with `limit=1` is byte-identical to the one without. `/api` declares `limit` on both, instance cube included. `items` (#928) pages with the Features default of 10. `/collections` pages with Common's default and maximum of 1000. `/instances` pages its runs with `limit` + `offset`, at most 500 a page and 100 by default once the run axis is longer than 500 (#1006, see [Long run axes](#long-run-axes)) |
+| `offset` | ✓ | `/locations` with `limit`, as on `/collections`: the offset pagination extension. `offset` without `limit` on `/locations` is a 400. `/locations` takes only `limit`, `offset`, `bbox`, `datetime` and `f`; any other parameter is a 400 naming them. Its `f` names GeoJSON (`GeoJSON`, `application/geo+json`, `json` or `application/json`) or its HTML page (`HTML`, `text/html`, #971), case-insensitively, the one list `params::LOCATIONS_FORMATS` that `items` and `/api` share; any other value is a 400 (#965; it used to be ignored). `bbox` and `datetime` filter before paging (#932). `/instances` takes `offset` the same way, and only `limit`, `offset` and `f` (#1006) |
 
 Data queries execute on a dedicated, bounded runtime, including radius and
 instance routes. Admission is capped at 2–8 concurrent queries (available CPUs,
@@ -845,7 +883,7 @@ cards and add each entry in full under "All metadata & links": every member as
 the detail pages' property table (crs, output_formats, the whole extent,
 `data_queries` variables, every keyword) and its link table. Instance cards use
 the instance's own title and description. Each list page closes with its own
-link table.
+link table; a paged instances list (#1006) has a previous/next pager above it.
 
 ### HTML data pages
 

@@ -194,6 +194,10 @@ impl EdrEngine for Mock {
         true
     }
 
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        vec![hour(0), hour(6)]
+    }
+
     fn query_location(
         &self,
         _: &str,
@@ -498,6 +502,7 @@ fn every_other_method_delegates() {
     assert_eq!(wind.default_time(), Some(hour(5)));
     assert!(wind.composites().is_empty());
     assert!(wind.has_instances());
+    assert_eq!(wind.instance_reference_times(), [hour(0), hour(6)]);
     assert_eq!(wind.supported_query_types(), ["position", "cube"]);
     assert_eq!(wind.trajectory_shape(), TrajectoryShape::CrossSection);
     assert_eq!(wind.get_temporal_extent(), Some((hour(0), hour(2))));

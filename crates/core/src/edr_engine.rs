@@ -84,6 +84,23 @@ pub trait EdrEngine: Send + Sync {
             .find(|r| r.reference_time == reference_time)
     }
 
+    /// The reference times of [`Self::get_instances`], ascending: the run
+    /// axis without any run's valid times (#1006).
+    ///
+    /// Only the instances list reads it, to count and page the runs
+    /// ([`crate::time_axis::is_long`]), then builds just the page's runs
+    /// with [`Self::find_instance`]; collection metadata never does. An
+    /// archive can keep thousands of runs, so forecast engines override this
+    /// with the keys of their run map: one timestamp copied per run, never a
+    /// run's valid times. The default derives it from `get_instances`, which
+    /// costs nothing on the non-forecast engines that take it.
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.get_instances()
+            .into_iter()
+            .map(|r| r.reference_time)
+            .collect()
+    }
+
     /// Execute a query for a named location.
     ///
     /// `z` selects vertical levels: `None` returns every level (a profile),

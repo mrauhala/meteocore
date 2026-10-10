@@ -647,6 +647,10 @@ impl EdrEngine for DerivedWind {
         self.edr.has_instances()
     }
 
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.edr.instance_reference_times()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         self.edr.find_instance(reference_time)
     }

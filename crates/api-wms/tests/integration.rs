@@ -5230,3 +5230,195 @@ async fn legend_graphic_ignores_quality() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(webp_chunk(&body), b"VP8L", "legends stay lossless");
 }
+
+// ---------------------------------------------------------------------------
+// Long time and run axes as Annex C ranges (#1006)
+// ---------------------------------------------------------------------------
+
+fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// The two runs the archive is missing.
+const ARCHIVE_GAP: [&str; 2] = ["2022-01-01T00:00:00Z", "2022-01-01T06:00:00Z"];
+
+/// An archive store's run axis: six-hourly from 2021-05-01 to
+/// 2026-10-09T18Z, less [`ARCHIVE_GAP`] — 7950 runs, which WMS once listed
+/// in a 200 KB `<Dimension>`.
+fn archive_runs() -> Vec<chrono::DateTime<chrono::Utc>> {
+    let gap = ARCHIVE_GAP.map(utc);
+    let mut runs = Vec::new();
+    let mut rt = utc("2021-05-01T00:00:00Z");
+    while rt <= utc("2026-10-09T18:00:00Z") {
+        if !gap.contains(&rt) {
+            runs.push(rt);
+        }
+        rt += chrono::Duration::hours(6);
+    }
+    runs
+}
+
+/// 600 five-minute valid times: longer than one list.
+fn archive_times() -> Vec<chrono::DateTime<chrono::Utc>> {
+    let start = utc("2026-10-08T00:00:00Z");
+    (0..600)
+        .map(|i| start + chrono::Duration::minutes(5 * i))
+        .collect()
+}
+
+/// [`ForecastMockMapEngine`] over the archive's axes.
+struct ArchiveMockMapEngine {
+    calls: RunRecorder,
+}
+
+impl MapEngine for ArchiveMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        ForecastMockMapEngine {
+            calls: self.calls.clone(),
+        }
+        .get_raster_tile(
+            bbox,
+            width,
+            height,
+            time,
+            output_crs,
+            parameter,
+            z,
+            reference_time,
+        )
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            times: archive_times(),
+            reference_times: archive_runs(),
+            ..ForecastMockMapEngine {
+                calls: self.calls.clone(),
+            }
+            .raster_info()
+        }
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        reference_time.or_else(|| archive_runs().last().copied())
+    }
+}
+
+fn archive_capabilities() -> String {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    engines.insert(
+        "ecmwf-fc".to_string(),
+        Arc::new(ArchiveMockMapEngine {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+    );
+    let mut collections = HashMap::new();
+    collections.insert(
+        "ecmwf-fc".to_string(),
+        CollectionConfig {
+            id: "ecmwf-fc".to_string(),
+            title: "Archive".to_string(),
+            description: "Archive fixture for #1006".into(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "zarr".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            nowcast: None,
+            bufr: None,
+            satellite: None,
+            preview: None,
+            derive_wind: None,
+        },
+    );
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    String::from_utf8(xml).expect("capabilities XML is UTF-8")
+}
+
+/// A long run axis is written as WMS 1.3.0 Annex C `min/max/resolution`
+/// ranges, one per stretch without a missing run, and a long valid-time axis
+/// likewise; the defaults are unchanged. Short axes keep their lists (see
+/// `capabilities_emit_reference_time_dimension_for_forecast`).
+#[test]
+fn capabilities_describe_long_axes_as_annex_c_ranges() {
+    let xml = archive_capabilities();
+    assert!(
+        xml.contains(
+            "<Dimension name=\"reference_time\" units=\"ISO8601\" \
+             default=\"2026-10-09T18:00:00+00:00\">\
+             2021-05-01T00:00:00+00:00/2021-12-31T18:00:00+00:00/PT6H,\
+             2022-01-01T12:00:00+00:00/2026-10-09T18:00:00+00:00/PT6H</Dimension>"
+        ),
+        "{xml}"
+    );
+    assert!(
+        xml.contains(
+            "<Dimension name=\"time\" units=\"ISO8601\" \
+             default=\"2026-10-10T01:55:00+00:00\" nearestValue=\"1\">\
+             2026-10-08T00:00:00+00:00/2026-10-10T01:55:00+00:00/PT5M</Dimension>"
+        ),
+        "{xml}"
+    );
+    // The whole document, not 200 KB of run list.
+    assert!(xml.len() < 4_000, "{} bytes", xml.len());
+}
+
+/// Every run a range names validates as it did listed: one inside a range
+/// renders, pinned; a missing run between the ranges and an instant off the
+/// cadence are `InvalidDimensionValue`, never rendered.
+#[tokio::test]
+async fn getmap_resolves_a_run_inside_an_advertised_range() {
+    let calls: RunRecorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine: Arc<dyn MapEngine> = Arc::new(ArchiveMockMapEngine {
+        calls: calls.clone(),
+    });
+    let app = build_forecast_router_with_engine(engine);
+    let get = |run: &str| {
+        let app = app.clone();
+        let uri = format!("{FC_GETMAP_URI}&DIM_REFERENCE_TIME={run}");
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+    let resp = get("2023-03-04T12:00:00Z").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec![Some(utc("2023-03-04T12:00:00Z"))]
+    );
+    for run in [ARCHIVE_GAP[1], "2023-03-04T13:00:00Z"] {
+        let resp = get(run).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{run}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("InvalidDimensionValue"), "{run}: {xml}");
+    }
+    assert_eq!(calls.lock().unwrap().len(), 1, "no invalid run rendered");
+}

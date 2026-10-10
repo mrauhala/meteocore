@@ -352,8 +352,9 @@ fn write_layer(
     let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
 }
 
-/// Write a `time` dimension listing `times` (nothing when empty), with
-/// `default` as its default value.
+/// Write a `time` dimension for `times` (nothing when empty), with `default`
+/// as its default value. A long axis is written as Annex C ranges
+/// ([`ds_core::time_axis::wms_extent`], #1006); a short one stays the list.
 fn write_time_dimension(
     writer: &mut Writer<Vec<u8>>,
     times: &[DateTime<Utc>],
@@ -370,8 +371,8 @@ fn write_time_dimension(
     }
     dim.push_attribute(("nearestValue", "1"));
     let _ = writer.write_event(Event::Start(dim));
-    let time_values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
-    let _ = writer.write_event(Event::Text(BytesText::new(&time_values.join(","))));
+    let extent = ds_core::time_axis::wms_extent(times);
+    let _ = writer.write_event(Event::Text(BytesText::new(&extent)));
     let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
 }
 
@@ -449,6 +450,8 @@ fn write_layer_metadata(
     // requested as `DIM_REFERENCE_TIME`). Default = latest run. No
     // `nearestValue` — the run must match an advertised value exactly (the
     // handler validates membership and the engine requires an exact match).
+    // An archive's long run axis is written as Annex C ranges (#1006): every
+    // value a range names is a run, so it validates as it did listed.
     if !info.reference_times.is_empty() {
         let mut dim = BytesStart::new("Dimension");
         dim.push_attribute(("name", "reference_time"));
@@ -458,12 +461,8 @@ fn write_layer_metadata(
         }
         let _ = writer.write_event(Event::Start(dim));
 
-        let run_values: Vec<String> = info
-            .reference_times
-            .iter()
-            .map(|t| t.to_rfc3339())
-            .collect();
-        let _ = writer.write_event(Event::Text(BytesText::new(&run_values.join(","))));
+        let extent = ds_core::time_axis::wms_extent(&info.reference_times);
+        let _ = writer.write_event(Event::Text(BytesText::new(&extent)));
 
         let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
     }

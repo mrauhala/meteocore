@@ -644,6 +644,16 @@ mod tests {
         let valid = old + chrono::Duration::hours(12);
         assert_eq!(single.get_instances()[0].reference_time, new);
         assert_eq!(pressure.get_instances()[0].reference_time, old);
+        // The run axis read without valid times is each view's own (#1006).
+        for view in [single, pressure] {
+            let runs: Vec<_> = view
+                .get_instances()
+                .iter()
+                .map(|r| r.reference_time)
+                .collect();
+            assert_eq!(view.instance_reference_times(), runs);
+        }
+        assert_eq!(single.instance_reference_times()[0], new);
         assert_eq!(pressure.get_temporal_extent(), Some((old, valid)));
         assert_eq!(
             pressure.resolve_reference_time(Some(valid), None),

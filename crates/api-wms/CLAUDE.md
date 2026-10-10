@@ -102,6 +102,16 @@ error images never are. Measured on a day of a live deployment's GetMaps
   `get_raster_tile` and into the rendered + meta-tile cache keys
   (`CacheKey.reference_time`, `TileKeyPrefix.reference_time`) so distinct
   runs don't collide.
+- **Long axes (#1006).** `time` and `reference_time` values come from
+  `ds_core::time_axis::wms_extent`: up to `MAX_LISTED_VALUES` (500) values
+  the comma-separated list, byte-identical to before; past it, Annex C
+  `min/max/resolution` ranges, one per stretch of at least three values one
+  whole-second step apart, other values listed between them in axis order. An
+  archive's 7300-run axis was a 206 810-character `<Dimension>`; it is now one
+  range per gap. Lossless: every value a range names is on the axis, and
+  GetMap validates `DIM_REFERENCE_TIME` against `RasterInfo.reference_times`
+  itself (`binary_search`, the list is ascending by contract), never the
+  advertised text. Never hand-format a time dimension's values.
 - **Content version.** Both keys also carry the engine's
   `MapEngine::content_version()` (`CacheKey.content_version`,
   `TileKeyPrefix.content_version`), read right after `resolve_time`. It is

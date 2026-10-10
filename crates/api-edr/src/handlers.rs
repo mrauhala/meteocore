@@ -23,12 +23,13 @@ use crate::geojson::{
 };
 use crate::params::{
     check_crs, negotiate_edr_format, negotiate_list_format, parse_cube_bbox, parse_datetime,
-    parse_edr_format, parse_limit, parse_locations_query, parse_resolution, parse_within_metres,
-    parse_z, plot_dimensions, query_formats, resolve_z_levels, section_plot_dimensions,
-    split_location_ids, split_position_coords, AreaQueryParams, CubeQueryParams, DatetimeSelector,
-    EdrFormat, LocationQueryParams, NegotiatedFormat, PositionQueryParams, RadiusQueryParams,
-    TrajectoryQueryParams, ZSelector, CRS84_WKT, DATA_QUERY_CRS, LOCATIONS_FORMATS, MAX_LIMIT,
-    MAX_LOCATION_IDS, MAX_LOCATION_LOOKUPS, MAX_LOCATION_VALUES, WITHIN_UNITS,
+    parse_edr_format, parse_instances_query, parse_limit, parse_locations_query, parse_resolution,
+    parse_within_metres, parse_z, plot_dimensions, query_formats, resolve_z_levels,
+    section_plot_dimensions, split_location_ids, split_position_coords, AreaQueryParams,
+    CubeQueryParams, DatetimeSelector, EdrFormat, LocationQueryParams, NegotiatedFormat,
+    PositionQueryParams, RadiusQueryParams, TrajectoryQueryParams, ZSelector, CRS84_WKT,
+    DATA_QUERY_CRS, LOCATIONS_FORMATS, MAX_LIMIT, MAX_LOCATION_IDS, MAX_LOCATION_LOOKUPS,
+    MAX_LOCATION_VALUES, WITHIN_UNITS,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
@@ -1380,7 +1381,11 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "summary": format!("List model runs (instances) for {}", config.title),
                     "operationId": format!("getInstances_{id}"),
                     "tags": [id],
-                    "parameters": [format_parameter()],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/limit-instances"},
+                        {"$ref": "#/components/parameters/offset-instances"},
+                        format_parameter()
+                    ],
                     "responses": responses(
                         metadata_ok("Available instances (model runs)"),
                         METADATA_ERRORS,
@@ -1699,6 +1704,24 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "explode": false,
                     "description": format!("Page size of the location list, in the collection's inventory order. With limit the response carries numberMatched, numberReturned and self, next and prev links that repeat the other query parameters. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: the complete inventory in one response, without paging members.")
                 },
+                // The instances list's paging (#1006). EDR 1.2 gives
+                // `/instances` only `f`; these are the `/locations` pair.
+                "limit-instances": {
+                    "name": "limit",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "integer", "minimum": 1, "maximum": ds_core::time_axis::MAX_LISTED_VALUES},
+                    "style": "form",
+                    "explode": false,
+                    "description": format!("Page size of the instances list, ascending by reference time. A page carries numberMatched, numberReturned and self, next and prev links. Without limit, a collection with at most {max} runs answers every run in one response, without paging members; a longer one pages {INSTANCES_PAGE_SIZE} runs at a time from the oldest run, and its next links walk every run. Values above {max} are clamped to {max}; zero, negative and non-integer values are 400.", max = ds_core::time_axis::MAX_LISTED_VALUES)
+                },
+                "offset-instances": {
+                    "name": "offset",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "integer", "minimum": 0, "default": 0},
+                    "description": "Number of runs to skip before the page (offset pagination extension, as on /collections). Requires limit."
+                },
                 "offset-locations": {
                     "name": "offset",
                     "in": "query",
@@ -2011,16 +2034,56 @@ pub async fn collection(
     }))
 }
 
+/// Runs on one page of an instances list that pages without `limit`: a run
+/// axis longer than [`ds_core::time_axis::MAX_LISTED_VALUES`] (#1006).
+pub const INSTANCES_PAGE_SIZE: usize = 100;
+
+/// One page of the instances list: `limit` runs from `offset`, in the list's
+/// ascending order.
+#[derive(Debug, Clone, Copy)]
+struct InstancesPage {
+    limit: usize,
+    offset: usize,
+}
+
+impl InstancesPage {
+    /// The list's href for the page at `offset`, with `f` when given. As on
+    /// `/locations`, `offset` is left out when 0.
+    fn href(&self, list: &str, offset: usize, f: Option<&str>) -> String {
+        let mut query = vec![format!("limit={}", self.limit)];
+        if offset > 0 {
+            query.push(format!("offset={offset}"));
+        }
+        if let Some(f) = f {
+            query.push(format!("f={f}"));
+        }
+        format!("{list}?{}", query.join("&"))
+    }
+}
+
 /// `GET /collections/{id}/instances` — list the collection's forecast model runs
 /// as OGC API - EDR instances. Empty `collections` for non-forecast engines.
+///
+/// A run axis of at most [`ds_core::time_axis::MAX_LISTED_VALUES`] runs is
+/// listed whole, as it always was, unless `limit` asks for a page. A longer
+/// one pages, [`INSTANCES_PAGE_SIZE`] runs at a time by default (#1006): an
+/// archive store once answered 95 MB here. A page carries `numberMatched`,
+/// `numberReturned` and `next`/`prev` links, as `/locations` does (EDR 1.2
+/// defines no paging for this resource; these are the `/collections` paging
+/// extension). Only the page's runs are built, from their reference times
+/// ([`EdrEngine::instance_reference_times`]) and [`EdrEngine::find_instance`];
+/// what every run shares is read once ([`CollectionMetadata`]). The
+/// collection document does not describe the run axis: it links here.
 pub async fn instances(
     Path(id): Path<String>,
     State(state): State<AppState>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    query: Result<Query<Vec<(String, String)>>, axum::extract::rejection::QueryRejection>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::{LinkView, Wanted};
-    let wanted = negotiate(fp.f.as_deref(), &headers)?;
+    let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid query string"))?;
+    let request = parse_instances_query(pairs).map_err(|e| bad_request(&e))?;
+    let wanted = negotiate(request.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &request_base_url(&state, &headers);
@@ -2032,39 +2095,109 @@ pub async fn instances(
     // instances") permits a stricter 404 here; the lenient 200-empty is the
     // deliberate, self-consistent choice (the resource is never advertised for
     // non-forecast collections, so conformant clients don't reach it).
-    let runs = engine.get_instances();
-    let self_href = format!("{base}/edr/collections/{}/instances", config.id);
-    // Each instance doc rebuilds the run-invariant bits (parameters,
-    // spatial extent) via build_collection_metadata. That's a handful
-    // of redundant clones (run count is bounded — a few to a few
-    // dozen) on a low-QPS discovery endpoint, not the `/collections`/
-    // `/api` hot paths #211 guards — kept simple over threading a
-    // precomputed-metadata variant through.
-    let instances: Vec<serde_json::Value> = runs
-        .iter()
-        .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run), false))
-        .collect();
+    let reference_times = engine.instance_reference_times();
+    let page = match request.limit {
+        // `limit` past the longest whole list is clamped to it, as EDR 1.2
+        // clamps `limit` past a server's maximum.
+        Some(limit) => Some(InstancesPage {
+            limit: limit.min(ds_core::time_axis::MAX_LISTED_VALUES),
+            offset: request.offset,
+        }),
+        None if ds_core::time_axis::is_long(&reference_times) => Some(InstancesPage {
+            limit: INSTANCES_PAGE_SIZE,
+            offset: 0,
+        }),
+        None => None,
+    };
+    let paging = page.map(|page| {
+        let window =
+            ds_core::collection_search::page_window(reference_times.len(), page.offset, page.limit);
+        (page, window)
+    });
+    let list_href = format!("{base}/edr/collections/{}/instances", config.id);
+    // This list's href at `offset` (ignored unpaged) with `f`: a page names
+    // its `limit` and `offset`.
+    let href = |offset: usize, f: Option<&str>| match (paging, f) {
+        (Some((page, _)), f) => page.href(&list_href, offset, f),
+        (None, Some(f)) => format!("{list_href}?f={f}"),
+        (None, None) => list_href.clone(),
+    };
+    let offset = page.map_or(0, |page| page.offset);
+    let metadata = CollectionMetadata::new(engine.as_ref(), config, base, false);
     // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
     // `instances` (each item a collection-shaped instance), not
     // `collections`. The HTML page renders this same document
     // (`/req/html/content` A: all of its information).
-    let doc = json!({
-        "links": instances_list_links(engine.as_ref(), config, base, &self_href),
-        "instances": instances,
-    });
+    let instances: Vec<serde_json::Value> = match paging {
+        // The whole list, read as it always was.
+        None => engine
+            .get_instances()
+            .iter()
+            .map(|run| metadata.build(Some(run)))
+            .collect(),
+        // A run removed since the reference times were read is left out.
+        Some((_, window)) => reference_times[window.range()]
+            .iter()
+            .filter_map(|&rt| engine.find_instance(rt))
+            .map(|run| metadata.build(Some(&run)))
+            .collect(),
+    };
+    let mut links = vec![
+        json!({
+            "href": href(offset, None),
+            "rel": "self",
+            "type": "application/json",
+            "title": format!("{} — instances", config.title)
+        }),
+        json!({
+            "href": href(offset, Some("html")),
+            "rel": "alternate",
+            "type": "text/html",
+            "title": format!("{} — instances as HTML", config.title)
+        }),
+    ];
+    links.extend(instances_list_links(&metadata, &list_href));
+    let mut nav = vec![
+        LinkView::new(href(offset, Some("json")), "alternate", Some("JSON")),
+        LinkView::new(
+            format!("{base}/edr/collections/{}", config.id),
+            "collection",
+            Some(&config.title),
+        ),
+    ];
+    if let Some((_, window)) = paging {
+        // The `/collections` paging links, JSON in `links` and their HTML
+        // pages in the HTML page's pager.
+        for (has, page_offset, rel, title) in [
+            (window.has_next, window.next_offset, "next", "Next page"),
+            (window.has_prev, window.prev_offset, "prev", "Previous page"),
+        ] {
+            if has {
+                links.push(json!({
+                    "href": href(page_offset, None),
+                    "rel": rel,
+                    "type": "application/json",
+                    "title": title
+                }));
+                nav.push(LinkView::new(
+                    href(page_offset, Some("html")),
+                    rel,
+                    Some(title),
+                ));
+            }
+        }
+    }
+    let mut doc = json!({ "links": links, "instances": instances });
+    if paging.is_some() {
+        let returned = doc["instances"].as_array().map_or(0, Vec::len);
+        doc["numberMatched"] = json!(reference_times.len());
+        doc["numberReturned"] = json!(returned);
+    }
     Ok(with_vary(match wanted {
         Wanted::Json => Json(doc).into_response(),
         Wanted::Html => {
             // EDR 1.1 `html` class: the instance resources negotiate like every
             // other metadata page (flagged on #669). One card per model run.
-            let nav = [
-                LinkView::new(format!("{self_href}?f=json"), "alternate", Some("JSON")),
-                LinkView::new(
-                    format!("{base}/edr/collections/{}", config.id),
-                    "collection",
-                    Some(&config.title),
-                ),
-            ];
             Html(api_common::workbench::instances_html(
                 api_common::workbench::Surface {
                     base,
@@ -2080,44 +2213,29 @@ pub async fn instances(
     }))
 }
 
-/// The instances list's `links`, as EDR 1.2 `/req/core/rc-collection-info-
-/// links` A asks of it (ATS `/conf/instances/rc-md-success` step 1): `self`,
-/// the HTML `alternate`, the parent collection, and its query end points as
-/// `rel=data` — the collection document's own links, so the two cannot
-/// disagree. Those end points answer for the latest run; each run's own are in
-/// its entry of `instances`.
+/// The instances list's `links` after its own `self` and `alternate`, as EDR
+/// 1.2 `/req/core/rc-collection-info-links` A asks of it (ATS
+/// `/conf/instances/rc-md-success` step 1): the parent collection, and its
+/// query end points as `rel=data` — the collection document's own links, so
+/// the two cannot disagree. Those end points answer for the latest run; each
+/// run's own are in its entry of `instances`.
 fn instances_list_links(
-    engine: &dyn EdrEngine,
-    config: &CollectionConfig,
-    base: &str,
-    self_href: &str,
+    metadata: &CollectionMetadata<'_>,
+    list_href: &str,
 ) -> Vec<serde_json::Value> {
-    let mut links = vec![
-        json!({
-            "href": self_href,
-            "rel": "self",
-            "type": "application/json",
-            "title": format!("{} — instances", config.title)
-        }),
-        json!({
-            "href": format!("{self_href}?f=html"),
-            "rel": "alternate",
-            "type": "text/html",
-            "title": format!("{} — instances as HTML", config.title)
-        }),
-        json!({
-            "href": format!("{base}/edr/collections/{}", config.id),
-            "rel": "collection",
-            "type": "application/json",
-            "title": config.title
-        }),
-    ];
-    let collection = build_collection_metadata(engine, config, base, None, false);
+    let config = metadata.config;
+    let mut links = vec![json!({
+        "href": format!("{}/edr/collections/{}", metadata.base_url, config.id),
+        "rel": "collection",
+        "type": "application/json",
+        "title": config.title
+    })];
+    let collection = metadata.build(None);
     if let Some(collection_links) = collection["links"].as_array() {
         links.extend(
             collection_links
                 .iter()
-                .filter(|l| l["rel"] == "data" && l["href"] != self_href)
+                .filter(|l| l["rel"] == "data" && l["href"] != list_href)
                 .cloned(),
         );
     }
@@ -3586,229 +3704,283 @@ fn build_collection_metadata(
     instance: Option<&ds_core::instances::RunInfo>,
     items: bool,
 ) -> serde_json::Value {
-    let param_descs = engine.get_parameter_descriptions();
-    // Advertise a CRS84-domain extent: engine bounds can be grid cell edges
-    // past the domain, or an empty-accumulator sentinel.
-    let spatial = engine
-        .get_spatial_extent()
-        .and_then(ds_core::geo::crs84_extent);
+    CollectionMetadata::new(engine, config, base_url, items).build(instance)
+}
 
-    let coll_id = &config.id;
-    // The self id and the base path every data-query href hangs off — scoped to
-    // the instance when one is given.
-    let (self_id, query_base) = match instance {
-        Some(run) => {
-            // RFC 3339 (#947); its colons are valid in a path segment (RFC 3986
-            // `pchar`), so the hrefs carry them unencoded.
-            let iid = run.instance_id();
-            let base = format!("{base_url}/edr/collections/{coll_id}/instances/{iid}");
-            (iid, base)
+/// What a collection document and its instance documents share, read from
+/// the engine once (#1006). An instances page builds one document per run
+/// with [`Self::build`], which for a run asks the engine nothing more: the
+/// parameters, extents and query types do not change from run to run.
+struct CollectionMetadata<'a> {
+    engine: &'a dyn EdrEngine,
+    config: &'a CollectionConfig,
+    base_url: &'a str,
+    items: bool,
+    /// `get_parameter_descriptions`, sorted by name: serde_json's
+    /// workspace-enabled `preserve_order` makes insertion order the wire
+    /// order, and the engine builds a fresh HashMap per call — unsorted,
+    /// byte-identical requests would serialize differently and the
+    /// content-derived ETag would never revalidate (#499).
+    parameters: Vec<(String, ds_core::model::ParameterDescription)>,
+    /// A CRS84-domain extent: engine bounds can be grid cell edges past the
+    /// domain, or an empty-accumulator sentinel.
+    spatial: Option<[f64; 4]>,
+    vertical: Option<ds_core::vertical::VerticalDimension>,
+    query_types: Vec<String>,
+    station_series: bool,
+    trajectory: TrajectoryShape,
+    has_instances: bool,
+    /// The instance documents' `parameter_names`, the same for every run:
+    /// built by the first instance document, cloned by the rest.
+    instance_parameter_names: std::cell::OnceCell<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl<'a> CollectionMetadata<'a> {
+    fn new(
+        engine: &'a dyn EdrEngine,
+        config: &'a CollectionConfig,
+        base_url: &'a str,
+        items: bool,
+    ) -> Self {
+        let mut parameters: Vec<_> = engine.get_parameter_descriptions().into_iter().collect();
+        parameters.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Self {
+            engine,
+            config,
+            base_url,
+            items,
+            parameters,
+            spatial: engine
+                .get_spatial_extent()
+                .and_then(ds_core::geo::crs84_extent),
+            vertical: engine.get_vertical_extent(),
+            query_types: engine.supported_query_types(),
+            station_series: engine.serves_station_series(),
+            trajectory: engine.trajectory_shape(),
+            has_instances: engine.has_instances(),
+            instance_parameter_names: std::cell::OnceCell::new(),
         }
-        None => (
-            coll_id.clone(),
-            format!("{base_url}/edr/collections/{coll_id}"),
-        ),
-    };
-
-    // Temporal extent + advertised timesteps: the run's for an instance, the
-    // engine's (latest run) for the collection.
-    let temporal = match instance {
-        Some(run) => run.temporal_extent(),
-        None => engine.get_temporal_extent(),
-    };
-
-    let mut extent = serde_json::Map::new();
-    if let Some(bbox) = spatial {
-        extent.insert(
-            "spatial".to_string(),
-            json!({ "bbox": [bbox], "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84" }),
-        );
     }
-    if let Some((start, end)) = temporal {
-        // Include individual timesteps if available (the run's valid times for
-        // an instance, the engine's for the collection).
-        let times = match instance {
-            Some(run) => (!run.valid_times.is_empty()).then(|| run.valid_times.clone()),
-            None => engine.get_available_times(),
+
+    /// `parameter_names`. A parameter on its own time axis (a satellite
+    /// product) carries its own temporal extent in the collection document;
+    /// the collection's is the union (#819). Instances keep the run's axis.
+    fn parameter_names(&self, instance: bool) -> serde_json::Map<String, serde_json::Value> {
+        let build = |own_times: bool| -> serde_json::Map<String, serde_json::Value> {
+            self.parameters
+                .iter()
+                .map(|(name, desc)| {
+                    let mut param = collection_parameter_json(desc);
+                    let times = own_times
+                        .then(|| self.engine.get_parameter_available_times(name))
+                        .flatten();
+                    if let Some(times) = times {
+                        if let (Some(&start), Some(&end)) = (times.first(), times.last()) {
+                            param["extent"] = json!({
+                                "temporal": temporal_extent_json(start, end, Some(&times))
+                            });
+                        }
+                    }
+                    (name.clone(), param)
+                })
+                .collect()
         };
-        extent.insert(
-            "temporal".to_string(),
-            temporal_extent_json(start, end, times.as_deref()),
-        );
+        if instance {
+            self.instance_parameter_names
+                .get_or_init(|| build(false))
+                .clone()
+        } else {
+            build(true)
+        }
     }
 
-    // Vertical extent — advertise the available levels so a client knows
-    // what `z` values it may request.
-    //
-    // OGC EDR 1.1 requires `interval` items, `values` items, and `vrs`
-    // — and `interval`/`values` are typed as STRINGS in the schema
-    // (lines 670–676 of `schemas/ogcapi-edr-1.1-bundled.json`), not
-    // numbers. Floats round-trip through `Display` so a client can
-    // parse them back when needed. `vrs` is taken from the kind's
-    // built-in WKT/URI so a radar collection still validates against
-    // the EDR schema.
-    let vertical_extent = engine.get_vertical_extent();
-    if let Some(vertical) = &vertical_extent {
-        let mut vertical_obj = serde_json::Map::new();
-        if let Some((lo, hi)) = vertical.extent() {
-            vertical_obj.insert(
-                "interval".to_string(),
-                json!([[lo.to_string(), hi.to_string()]]),
+    /// The collection document (`None`) or one run's instance document.
+    fn build(&self, instance: Option<&ds_core::instances::RunInfo>) -> serde_json::Value {
+        let (engine, config, base_url) = (self.engine, self.config, self.base_url);
+        let coll_id = &config.id;
+        // The self id and the base path every data-query href hangs off — scoped to
+        // the instance when one is given.
+        let (self_id, query_base) = match instance {
+            Some(run) => {
+                // RFC 3339 (#947); its colons are valid in a path segment (RFC 3986
+                // `pchar`), so the hrefs carry them unencoded.
+                let iid = run.instance_id();
+                let base = format!("{base_url}/edr/collections/{coll_id}/instances/{iid}");
+                (iid, base)
+            }
+            None => (
+                coll_id.clone(),
+                format!("{base_url}/edr/collections/{coll_id}"),
+            ),
+        };
+
+        // Temporal extent + advertised timesteps: the run's for an instance, the
+        // engine's (latest run) for the collection.
+        let temporal = match instance {
+            Some(run) => run.temporal_extent(),
+            None => engine.get_temporal_extent(),
+        };
+
+        let mut extent = serde_json::Map::new();
+        if let Some(bbox) = self.spatial {
+            extent.insert(
+                "spatial".to_string(),
+                json!({ "bbox": [bbox], "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84" }),
             );
         }
-        let values: Vec<String> = vertical.levels.iter().map(|v| v.to_string()).collect();
-        vertical_obj.insert("values".to_string(), json!(values));
-        vertical_obj.insert("vrs".to_string(), json!(vertical.kind.vrs()));
-        extent.insert("vertical".to_string(), json!(vertical_obj));
-    }
+        if let Some((start, end)) = temporal {
+            // Include individual timesteps if available (the run's valid times for
+            // an instance, the engine's for the collection).
+            let times = match instance {
+                Some(run) => (!run.valid_times.is_empty()).then(|| run.valid_times.clone()),
+                None => engine.get_available_times(),
+            };
+            extent.insert(
+                "temporal".to_string(),
+                temporal_extent_json(start, end, times.as_deref()),
+            );
+        }
 
-    // Sorted iteration: serde_json's workspace-enabled `preserve_order` makes
-    // insertion order the wire order, and `get_parameter_descriptions` builds
-    // a fresh HashMap per call — unsorted, byte-identical requests would
-    // serialize differently and the content-derived ETag would never
-    // revalidate (#499).
-    let mut sorted_descs: Vec<_> = param_descs.iter().collect();
-    sorted_descs.sort_by_key(|(name, _)| *name);
-    let parameter_names: serde_json::Map<String, serde_json::Value> = sorted_descs
-        .into_iter()
-        .map(|(name, desc)| {
-            let mut param = collection_parameter_json(desc);
-            // A parameter on its own time axis (a satellite product) carries
-            // its own temporal extent; the collection's is the union (#819).
-            // Instances keep the run's axis.
-            let own_times = instance
-                .is_none()
-                .then(|| engine.get_parameter_available_times(name))
-                .flatten();
-            if let Some(times) = own_times {
-                if let (Some(&start), Some(&end)) = (times.first(), times.last()) {
-                    param["extent"] =
-                        json!({ "temporal": temporal_extent_json(start, end, Some(&times)) });
-                }
+        // Vertical extent — advertise the available levels so a client knows
+        // what `z` values it may request.
+        //
+        // OGC EDR 1.1 requires `interval` items, `values` items, and `vrs`
+        // — and `interval`/`values` are typed as STRINGS in the schema
+        // (lines 670–676 of `schemas/ogcapi-edr-1.1-bundled.json`), not
+        // numbers. Floats round-trip through `Display` so a client can
+        // parse them back when needed. `vrs` is taken from the kind's
+        // built-in WKT/URI so a radar collection still validates against
+        // the EDR schema.
+        if let Some(vertical) = &self.vertical {
+            let mut vertical_obj = serde_json::Map::new();
+            if let Some((lo, hi)) = vertical.extent() {
+                vertical_obj.insert(
+                    "interval".to_string(),
+                    json!([[lo.to_string(), hi.to_string()]]),
+                );
             }
-            (name.clone(), param)
-        })
-        .collect();
-
-    // Data queries hang off `query_base` (instance-scoped when applicable).
-    // Under an instance only the run-queryable types get routes.
-    let query_types: Vec<String> = if instance.is_some() {
-        engine
-            .supported_query_types()
-            .into_iter()
-            .filter(|qt| INSTANCE_QUERY_TYPES.contains(&qt.as_str()))
-            .collect()
-    } else {
-        engine.supported_query_types()
-    };
-    let station_series = engine.serves_station_series();
-    let mut data_queries = serde_json::Map::new();
-    for qt in &query_types {
-        // Every routed query type's path segment is its name.
-        let Some(mut variables) =
-            data_query_variables(qt, station_series, engine.trajectory_shape())
-        else {
-            continue;
-        };
-        if qt == "cube" {
-            // EDR 1.2 `/req/edr/rc-cube-variables` B: the units `z` is given
-            // in — the collection's vertical axis unit.
-            let units: Vec<&str> = vertical_extent.iter().map(|v| v.unit()).collect();
-            variables["height_units"] = json!(units);
+            let values: Vec<String> = vertical.levels.iter().map(|v| v.to_string()).collect();
+            vertical_obj.insert("values".to_string(), json!(values));
+            vertical_obj.insert("vrs".to_string(), json!(vertical.kind.vrs()));
+            extent.insert("vertical".to_string(), json!(vertical_obj));
         }
-        data_queries.insert(
-            qt.clone(),
-            json!({
-                "link": {
-                    "href": format!("{query_base}/{qt}"),
-                    "rel": "data",
-                    "variables": variables
-                }
-            }),
-        );
-    }
-    // The collection's features (#928), not scoped to a model run.
-    if instance.is_none() && items {
-        data_queries.insert("items".to_string(), crate::items::data_query(&query_base));
-    }
-    // Advertise the model runs (forecast reference times) as EDR instances on
-    // the collection itself (not on an instance document).
-    if instance.is_none() && engine.has_instances() {
-        data_queries.insert(
-            "instances".to_string(),
-            json!({
-                "link": {
-                    "href": format!("{base_url}/edr/collections/{coll_id}/instances"),
-                    "rel": "data",
-                    "variables": { "query_type": "instances" }
-                }
-            }),
-        );
-    }
-    // Every query link names the media type its end point answers
-    // (`/req/core/rc-md-query-links` B).
-    for (query_type, query) in data_queries.iter_mut() {
-        query["link"]["type"] = json!(query_media_type(query_type));
-    }
 
-    // The run is named by the `self` link only: an instance document's
-    // `title` and `description` are its collection's (EDR 1.2
-    // `/req/instances/src-md-success` C).
-    let self_title = match instance {
-        Some(_) => format!("{} — run {self_id}", config.title),
-        None => config.title.clone(),
-    };
-    let mut links = vec![json!({
-        "href": query_base,
-        "rel": "self",
-        "type": "application/json",
-        "title": self_title
-    })];
-    if instance.is_some() {
-        // Link an instance document back to its parent collection.
-        links.push(json!({
-            "href": format!("{base_url}/edr/collections/{coll_id}"),
-            "rel": "collection",
-            "type": "application/json",
-            "title": config.title
-        }));
-    }
-    // EDR 1.2 `/req/core/rc-collection-info-links` A and
-    // `/req/core/rc-md-query-links` A: the collection's own `links` name its
-    // query end points, and a forecast collection's instances, not only
-    // `data_queries`. Copied from it, so the two cannot disagree.
-    links.extend(
-        data_queries
+        let parameter_names = self.parameter_names(instance.is_some());
+
+        // Data queries hang off `query_base` (instance-scoped when applicable).
+        // Under an instance only the run-queryable types get routes.
+        let query_types = self
+            .query_types
             .iter()
-            .map(|(query_type, query)| data_link(query_type, &query["link"])),
-    );
-    // `/req/edr/rc-collection-info` J: with a radius link in `links`, the
-    // collection lists the `within-units` it accepts.
-    let radius = data_queries.contains_key("radius");
-
-    let mut fields = json!({
-        "id": self_id,
-        // No `itemType` and no `rel=items` link: EDR's `items` is a data
-        // query (#928), advertised in `data_queries` like the others and
-        // GeoJSON only, while Common Part 2 `itemType` and the workbench's
-        // `items` link mean a Features-style resource with an HTML view.
-        // EDR collections are also not all coverage data (CSV/PostGIS serve
-        // discrete observations), so no single itemType applies. Omitted
-        // rather than mislabelled (review on #298).
-        "extent": extent,
-        "data_queries": data_queries,
-        "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
-        "parameter_names": parameter_names,
-        "output_formats": if station_series {
-            json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
-        } else {
-            json!(["CoverageJSON", "PNG", "HTML"])
+            .filter(|qt| instance.is_none() || INSTANCE_QUERY_TYPES.contains(&qt.as_str()));
+        let mut data_queries = serde_json::Map::new();
+        for qt in query_types {
+            // Every routed query type's path segment is its name.
+            let Some(mut variables) =
+                data_query_variables(qt, self.station_series, self.trajectory)
+            else {
+                continue;
+            };
+            if qt == "cube" {
+                // EDR 1.2 `/req/edr/rc-cube-variables` B: the units `z` is given
+                // in — the collection's vertical axis unit.
+                let units: Vec<&str> = self.vertical.iter().map(|v| v.unit()).collect();
+                variables["height_units"] = json!(units);
+            }
+            data_queries.insert(
+                qt.clone(),
+                json!({
+                    "link": {
+                        "href": format!("{query_base}/{qt}"),
+                        "rel": "data",
+                        "variables": variables
+                    }
+                }),
+            );
         }
-    });
-    if radius {
-        fields["within_units"] = json!(WITHIN_UNITS);
+        // The collection's features (#928), not scoped to a model run.
+        if instance.is_none() && self.items {
+            data_queries.insert("items".to_string(), crate::items::data_query(&query_base));
+        }
+        // Advertise the model runs (forecast reference times) as EDR instances on
+        // the collection itself (not on an instance document).
+        if instance.is_none() && self.has_instances {
+            data_queries.insert(
+                "instances".to_string(),
+                json!({
+                    "link": {
+                        "href": format!("{base_url}/edr/collections/{coll_id}/instances"),
+                        "rel": "data",
+                        "variables": { "query_type": "instances" }
+                    }
+                }),
+            );
+        }
+        // Every query link names the media type its end point answers
+        // (`/req/core/rc-md-query-links` B).
+        for (query_type, query) in data_queries.iter_mut() {
+            query["link"]["type"] = json!(query_media_type(query_type));
+        }
+
+        // The run is named by the `self` link only: an instance document's
+        // `title` and `description` are its collection's (EDR 1.2
+        // `/req/instances/src-md-success` C).
+        let self_title = match instance {
+            Some(_) => format!("{} — run {self_id}", config.title),
+            None => config.title.clone(),
+        };
+        let mut links = vec![json!({
+            "href": query_base,
+            "rel": "self",
+            "type": "application/json",
+            "title": self_title
+        })];
+        if instance.is_some() {
+            // Link an instance document back to its parent collection.
+            links.push(json!({
+                "href": format!("{base_url}/edr/collections/{coll_id}"),
+                "rel": "collection",
+                "type": "application/json",
+                "title": config.title
+            }));
+        }
+        // EDR 1.2 `/req/core/rc-collection-info-links` A and
+        // `/req/core/rc-md-query-links` A: the collection's own `links` name its
+        // query end points, and a forecast collection's instances, not only
+        // `data_queries`. Copied from it, so the two cannot disagree.
+        links.extend(
+            data_queries
+                .iter()
+                .map(|(query_type, query)| data_link(query_type, &query["link"])),
+        );
+        // `/req/edr/rc-collection-info` J: with a radius link in `links`, the
+        // collection lists the `within-units` it accepts.
+        let radius = data_queries.contains_key("radius");
+
+        let mut fields = json!({
+            "id": self_id,
+            // No `itemType` and no `rel=items` link: EDR's `items` is a data
+            // query (#928), advertised in `data_queries` like the others and
+            // GeoJSON only, while Common Part 2 `itemType` and the workbench's
+            // `items` link mean a Features-style resource with an HTML view.
+            // EDR collections are also not all coverage data (CSV/PostGIS serve
+            // discrete observations), so no single itemType applies. Omitted
+            // rather than mislabelled (review on #298).
+            "extent": extent,
+            "data_queries": data_queries,
+            "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
+            "parameter_names": parameter_names,
+            "output_formats": if self.station_series {
+                json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
+            } else {
+                json!(["CoverageJSON", "PNG", "HTML"])
+            }
+        });
+        if radius {
+            fields["within_units"] = json!(WITHIN_UNITS);
+        }
+        api_common::collection_metadata(config, fields, links)
     }
-    api_common::collection_metadata(config, fields, links)
 }
 
 /// The media type the end point of a `data_queries` entry answers by

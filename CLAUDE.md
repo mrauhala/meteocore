@@ -538,7 +538,9 @@ one never implies the other.
   - `build_instances(&runs, |rt, run| valid_times)`.
   - Engine contract: store runs in `BTreeMap<DateTime<Utc>, _>` keyed by
     reference time; implement `EdrEngine::get_instances()` (default empty =
-    non-forecast); honour the trailing `reference_time` parameter on query
+    non-forecast), with `has_instances`, `find_instance` and
+    `instance_reference_times` (the map's keys, #1006) from the same
+    snapshot; honour the trailing `reference_time` parameter on query
     methods and `MapEngine::get_raster_tile` (`None` ⇒ latest); populate
     `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores)
     and Nowcast (generations = runs, #661) implement this; other engines
@@ -548,6 +550,12 @@ one never implies the other.
     non-empty; no-instance routes default to the latest run. WMS exposes
     `DIM_REFERENCE_TIME` (see `crates/api-wms/CLAUDE.md`). Maps/Tiles still
     pass `reference_time: None` (follow-up).
+- **`ds_core::time_axis`** — the one rule for long time axes (#1006): up to
+  `MAX_LISTED_VALUES` (500) values a list, byte-identical to before; past it,
+  ranges of equally spaced values, lossless. WMS writes them as Annex C
+  `min/max/res` (`time`, `reference_time`); EDR pages `/instances` past the
+  same threshold and keeps the run axis out of collection metadata. See
+  `crates/api-wms/CLAUDE.md` and `crates/api-edr/CLAUDE.md`.
 - **Vertical dimension** — `ds_core::vertical::VerticalDimension`, surfaced
   on `RasterInfo.vertical` and `EdrEngine::get_vertical_extent`.
   `MapEngine::get_raster_tile` takes `z: Option<f64>` (one rendered layer);

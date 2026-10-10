@@ -484,6 +484,8 @@ fn forecast_runs_are_instances_and_selectable() {
     let run1 = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
 
     assert!(e.has_instances());
+    // The run axis without any run's valid times (#1006).
+    assert_eq!(e.instance_reference_times(), vec![run0, run1]);
     let inst = e.get_instances();
     assert_eq!(
         inst.iter().map(|r| r.reference_time).collect::<Vec<_>>(),
