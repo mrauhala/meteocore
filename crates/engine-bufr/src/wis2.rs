@@ -23,6 +23,7 @@ use ds_core::health::LiveStatus;
 use ds_poll::{FirstTick, Shutdown};
 use ds_wis2::{Notification, Resolved, Status, StatusSnapshot};
 
+use crate::decode::{DecodeError, FailureKind};
 use crate::engine::BufrEngine;
 use crate::health::Health;
 
@@ -32,6 +33,10 @@ const MAX_REMEMBERED: usize = 200_000;
 /// Back-off between attempts to (re)start the broker pipeline after it
 /// failed to start or ended on its own.
 const RESPAWN_DELAY: Duration = Duration::from_secs(30);
+/// Cadence of the per-centre decode-failure summary WARN.
+const FAILURE_SUMMARY_INTERVAL: Duration = Duration::from_secs(3600);
+/// Centre/kind pairs named in one summary line; the rest are totalled.
+const FAILURE_SUMMARY_TOP: usize = 20;
 
 pub struct Wis2Source {
     config: Wis2Config,
@@ -39,10 +44,13 @@ pub struct Wis2Source {
     degrade_after: Duration,
     status: ArcSwap<Option<Arc<Status>>>,
     produced: Mutex<Produced>,
-    /// `(centre, reason)` pairs already logged at WARN — every further
-    /// failure of that kind is counted only (a centre with an unsupported
-    /// template would otherwise WARN on every report).
-    warned: Mutex<HashSet<(String, &'static str)>>,
+    /// `(centre, kind)` pairs already logged at WARN with a sample
+    /// `data_id` — every further failure of that kind is counted only (a
+    /// centre with an unsupported template would otherwise WARN on every
+    /// report) and summarised hourly.
+    warned: Mutex<HashSet<(String, FailureKind)>>,
+    /// Failures per `(centre, kind)` since the last summary.
+    failures: Mutex<HashMap<(String, FailureKind), u64>>,
 }
 
 /// Which `(station, time)` rows each `data_id` is responsible for, so a
@@ -114,6 +122,7 @@ impl Wis2Source {
             status: ArcSwap::from_pointee(None),
             produced: Mutex::new(Produced::default()),
             warned: Mutex::new(HashSet::new()),
+            failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -188,6 +197,7 @@ impl Wis2Source {
         let label = engine.collection_id().to_string();
         let mut snap = shutdown.ticker(BufrEngine::SNAPSHOT_INTERVAL, FirstTick::Skip);
         let mut prune = shutdown.ticker(BufrEngine::PRUNE_INTERVAL, FirstTick::Skip);
+        let mut summary = shutdown.ticker(FAILURE_SUMMARY_INTERVAL, FirstTick::Skip);
         'session: loop {
             let pipeline_shutdown = Arc::new(Shutdown::new());
             let mut pipeline =
@@ -217,6 +227,7 @@ impl Wis2Source {
                     }
                     _ = prune.tick() => engine.prune_now(),
                     _ = snap.tick() => engine.snapshot_if_dirty(),
+                    _ = summary.tick() => self.log_failure_summary(&label),
                     r = pipeline.receiver.recv() => match r {
                         Some(r) => self.apply(engine, r),
                         None => {
@@ -251,12 +262,12 @@ impl Wis2Source {
         let outcome = match engine.ingest_bytes_keyed(&payload.bytes, &n.data_id, Utc::now()) {
             Ok(o) => o,
             Err(e) => {
-                self.warn_once(engine, &n, &e);
+                self.record_failure(engine, &n, &e);
                 return;
             }
         };
         for e in &outcome.failed {
-            self.warn_once(engine, &n, e);
+            self.record_failure(engine, &n, e);
         }
         // Ready only once this feed has produced a report the decoder
         // understood — a payload that failed (or a bulletin whose every
@@ -274,26 +285,45 @@ impl Wis2Source {
             .record(n.data_id, keys);
     }
 
-    /// WARN once per (centre, failure kind) — a centre whose payloads hit a
-    /// decoder gap (#693) would otherwise log every message; later ones are
-    /// counted only (`bufr_decode_failures_total`).
-    fn warn_once(&self, engine: &BufrEngine, n: &Notification, e: &crate::decode::DecodeError) {
+    /// Count a failure for the hourly per-centre summary, and WARN the
+    /// first one of each `(centre, kind)` with its `data_id` — a sample to
+    /// fetch from a Global Cache. A centre whose payloads hit a decoder gap
+    /// (#693, #1008) would otherwise log every message.
+    fn record_failure(&self, engine: &BufrEngine, n: &Notification, e: &DecodeError) {
         let centre = n.centre_id.clone().unwrap_or_default();
-        let kind = match e {
-            crate::decode::DecodeError::Unsupported(_) => "unsupported",
-            _ => "error",
-        };
+        let kind = e.kind();
+        *self
+            .failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((centre.clone(), kind))
+            .or_default() += 1;
         let first = self
             .warned
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert((centre.clone(), kind));
         if first {
+            let kind = kind.label();
             tracing::warn!(
                 "[{}] bufr/wis2: {centre} payload {} not decoded ({kind}: {e}) — \
                  further {kind} failures from {centre} are counted only",
                 engine.collection_id(),
                 n.data_id
+            );
+        }
+    }
+
+    /// WARN the failures counted since the last summary, by centre and
+    /// kind, largest first — the per-centre attribution the
+    /// `bufr_decode_failures_total{kind}` metric deliberately leaves out.
+    fn log_failure_summary(&self, label: &str) {
+        let failures =
+            std::mem::take(&mut *self.failures.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(line) = failure_summary(failures) {
+            tracing::warn!(
+                "[{label}] bufr/wis2: decode failures in the last {} min: {line}",
+                FAILURE_SUMMARY_INTERVAL.as_secs() / 60
             );
         }
     }
@@ -312,6 +342,31 @@ impl Wis2Source {
             );
         }
     }
+}
+
+/// `"124 total — it-meteoam truncated=120, cy-dom not_bufr=4, … (+N more:
+/// M)"`, largest first, or `None` when nothing failed.
+fn failure_summary(failures: HashMap<(String, FailureKind), u64>) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    let mut rows: Vec<_> = failures.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let total: u64 = rows.iter().map(|(_, n)| n).sum();
+    let mut line = rows
+        .iter()
+        .take(FAILURE_SUMMARY_TOP)
+        .map(|((centre, kind), n)| format!("{centre} {}={n}", kind.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if rows.len() > FAILURE_SUMMARY_TOP {
+        let rest: u64 = rows[FAILURE_SUMMARY_TOP..].iter().map(|(_, n)| n).sum();
+        line.push_str(&format!(
+            " (+{} more: {rest})",
+            rows.len() - FAILURE_SUMMARY_TOP
+        ));
+    }
+    Some(format!("{total} total — {line}"))
 }
 
 #[cfg(test)]
@@ -435,7 +490,8 @@ mod tests {
 
         // A garbage payload is counted, not fatal.
         src.apply(&e, resolved("junk", Some(b"not bufr".to_vec())));
-        assert_eq!(e.health.decode_failures_total.load(Ordering::Relaxed), 1);
+        assert_eq!(e.health.decode_failures(FailureKind::NotBufr), 1);
+        assert_eq!(e.health.decode_failures_total(), 1);
 
         // Deleting the SMHI data_id removes only its row.
         src.apply(&e, resolved("se-smhi/a", None));
@@ -496,6 +552,24 @@ mod tests {
     }
 
     #[test]
+    fn failure_summary_orders_by_count_and_bounds_the_line() {
+        assert_eq!(failure_summary(HashMap::new()), None);
+        let mut f = HashMap::new();
+        f.insert(("cy-dom".to_string(), FailureKind::NotBufr), 4);
+        f.insert(("it-meteoam".to_string(), FailureKind::Truncated), 120);
+        assert_eq!(
+            failure_summary(f).as_deref(),
+            Some("124 total — it-meteoam truncated=120, cy-dom not_bufr=4")
+        );
+        let many: HashMap<_, _> = (0..FAILURE_SUMMARY_TOP as u64 + 3)
+            .map(|i| ((format!("c{i:02}"), FailureKind::Invalid), 100 - i))
+            .collect();
+        let line = failure_summary(many).unwrap();
+        assert_eq!(line.matches("invalid=").count(), FAILURE_SUMMARY_TOP);
+        assert!(line.ends_with(" (+3 more: 237)"), "{line}");
+    }
+
+    #[test]
     fn undecodable_payload_does_not_probe_and_warns_once_per_centre() {
         // A valid BUFR message whose first descriptor is the unassigned
         // 3-63-255: `decode()` yields one per-message failure, no reports.
@@ -515,9 +589,21 @@ mod tests {
             "failures alone must not mark the feed probed"
         );
         assert_eq!(e.health.files_total.load(Ordering::Relaxed), 3);
-        assert_eq!(e.health.decode_failures_total.load(Ordering::Relaxed), 3);
-        // Three failures of one kind ("error") from one centre: one warning.
-        assert_eq!(src.warned.lock().unwrap().len(), 1);
+        assert_eq!(e.health.decode_failures_total(), 3);
+        assert_eq!(e.health.decode_failures(FailureKind::UnknownDescriptor), 2);
+        assert_eq!(e.health.decode_failures(FailureKind::NotBufr), 1);
+        // Two kinds from one centre: one warning each, however many repeat.
+        assert_eq!(src.warned.lock().unwrap().len(), 2);
+        // Every failure is counted for the hourly summary, which drains.
+        {
+            let failures = src.failures.lock().unwrap();
+            assert_eq!(
+                failures[&("se-smhi".to_string(), FailureKind::UnknownDescriptor)],
+                2
+            );
+        }
+        src.log_failure_summary("test");
+        assert!(src.failures.lock().unwrap().is_empty());
         // One decoded report flips it.
         src.apply(
             &e,

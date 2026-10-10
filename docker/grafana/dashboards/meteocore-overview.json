@@ -2982,9 +2982,9 @@
           "legendFormat": "{{collection}} {{result}}"
         },
         {
-          "expr": "sum by (collection, reason) (rate(bufr_decode_failures_total[1h]) * 3600)",
+          "expr": "sum by (collection, kind) (rate(bufr_decode_failures_total[1h]) * 3600)",
           "refId": "B",
-          "legendFormat": "{{collection}} decode {{reason}}"
+          "legendFormat": "{{collection}} decode {{kind}}"
         },
         {
           "expr": "rate(bufr_scans_total{result=\"failed\"}[1h]) * 3600",

@@ -798,8 +798,9 @@ static BUFR_REPORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static BUFR_DECODE_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     pg_int_counter(
         "bufr_decode_failures_total",
-        "BUFR payloads that could not be decoded, by reason (error, unsupported)",
-        &["collection", "reason"],
+        "BUFR messages that could not be decoded, by reason (error, unsupported) and kind \
+         (not_bufr, truncated, unknown_descriptor, invalid, unsupported)",
+        &["collection", "reason", "kind"],
     )
 });
 
@@ -1168,7 +1169,7 @@ struct CacheCounterState {
     /// evicted valid).
     cap: HashMap<String, [u64; 8]>,
     /// BUFR engine counters per collection (`Health::counters` order).
-    bufr: HashMap<String, [u64; 9]>,
+    bufr: HashMap<String, [u64; engine_bufr::health::COUNTERS]>,
 }
 
 static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -6001,12 +6002,11 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             BUFR_REPORTS_TOTAL
                 .with_label_values(&[cid, "skipped"])
                 .inc_by(d[6]);
-            BUFR_DECODE_FAILURES_TOTAL
-                .with_label_values(&[cid, "error"])
-                .inc_by(d[7]);
-            BUFR_DECODE_FAILURES_TOTAL
-                .with_label_values(&[cid, "unsupported"])
-                .inc_by(d[8]);
+            for (kind, n) in engine_bufr::decode::FailureKind::ALL.iter().zip(&d[7..]) {
+                BUFR_DECODE_FAILURES_TOTAL
+                    .with_label_values(&[cid, kind.reason(), kind.label()])
+                    .inc_by(*n);
+            }
             if let Some(snap) = engine.wis2_status() {
                 scrape_wis2_status(&mut counter_state.wis2, cid, &snap);
             }
