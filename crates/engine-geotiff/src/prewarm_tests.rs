@@ -241,7 +241,9 @@ fn remote_frame() -> (
     let (store, _) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
     let path = ObjectPath::from(FRAMES[0]);
     let size = std::fs::metadata(dir.join(FRAMES[0])).unwrap().len();
-    let (metadata, tile_info) = TiffMetadata::from_header_read(&store, &path, size).unwrap();
+    let (metadata, tile_info) = TiffMetadata::from_header_read(&store, &path, size)
+        .expect("the header range read succeeds")
+        .expect("the fixture is a COG");
     let source = Arc::new(DataSource::Remote {
         store: store.clone(),
         path,
@@ -511,7 +513,9 @@ async fn benchmark_first_view_over_latency() {
     let engine = || {
         let mut engine = GeoTiffEngine::new("bench", local.0.to_str(), &config()).unwrap();
         let path = ObjectPath::from("frame.tif");
-        let (metadata, tile_info) = TiffMetadata::from_header_read(&store, &path, size).unwrap();
+        let (metadata, tile_info) = TiffMetadata::from_header_read(&store, &path, size)
+            .expect("the header range read succeeds")
+            .expect("the fixture is a COG");
         let source = DataSource::Remote {
             store: store.clone(),
             path,
