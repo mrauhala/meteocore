@@ -731,6 +731,76 @@ pub fn parse_offset(raw: Option<&str>) -> Result<usize, DataServerError> {
         })
 }
 
+/// Query parameters `/instances` accepts (#1006): the paging pair
+/// `limit`/`offset`, as on `/locations`, and `f`.
+pub const INSTANCES_PARAMETERS: [&str; 3] = ["limit", "offset", "f"];
+
+/// A parsed `/instances` request. Whether the list pages is the handler's
+/// decision: with `limit`, or when the collection has more runs than one
+/// response lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstancesQuery {
+    /// `f`, which the handler negotiates with `Accept`.
+    pub f: Option<String>,
+    /// [`parse_limit`]'s value clamped to
+    /// [`ds_core::time_axis::MAX_LISTED_VALUES`], `None` when absent.
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+/// Parse the `/instances` query. A parameter outside
+/// [`INSTANCES_PARAMETERS`], a repeated one, an invalid `limit` or `offset`,
+/// or an `offset` without a `limit` is a 400, as on `/locations`, so a typo
+/// cannot return the first page as if it worked (#605). `f` is checked by the
+/// handler's negotiation.
+pub fn parse_instances_query(
+    pairs: Vec<(String, String)>,
+) -> Result<InstancesQuery, DataServerError> {
+    let (mut f, mut limit, mut offset) = (None, None, None);
+    for (name, value) in pairs {
+        let slot = match name.as_str() {
+            "f" => &mut f,
+            "limit" => &mut limit,
+            "offset" => &mut offset,
+            _ => {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "Unknown query parameter '{name}' for /instances; valid parameters: {}",
+                    INSTANCES_PARAMETERS.join(", ")
+                )));
+            }
+        };
+        if slot.is_some() {
+            return Err(DataServerError::InvalidParameter(format!(
+                "Duplicate query parameter '{name}'"
+            )));
+        }
+        *slot = Some(value);
+    }
+    // `parse_limit`'s grammar, but this list's own range: a page holds at
+    // most `MAX_LISTED_VALUES` runs, not `MAX_LIMIT`.
+    let max = ds_core::time_axis::MAX_LISTED_VALUES;
+    let parsed_limit = parse_limit(limit.as_deref())
+        .map_err(|_| {
+            DataServerError::InvalidParameter(format!(
+                "Invalid limit '{}': expected an integer from 1 to {max} \
+                 (larger values are clamped to {max})",
+                limit.as_deref().unwrap_or_default().trim()
+            ))
+        })?
+        .map(|l| l.min(max));
+    let parsed_offset = parse_offset(offset.as_deref())?;
+    if parsed_limit.is_none() && offset.is_some_and(|o| !o.trim().is_empty()) {
+        return Err(DataServerError::InvalidParameter(
+            "offset pages the instances list and requires limit".into(),
+        ));
+    }
+    Ok(InstancesQuery {
+        f,
+        limit: parsed_limit,
+        offset: parsed_offset,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AreaQueryParams {
     pub coords: String,

@@ -73,6 +73,36 @@ owns the instance-id string form:
   `{instanceId}` also accepts other RFC 3339 offsets and the pre-#947
   compact `20260607T0600Z` stamp.
 
+### Long run axes (#1006)
+
+An archive can keep thousands of runs; its instances list was once 95 MB.
+`ds_core::time_axis` decides what is long (`MAX_LISTED_VALUES`, 500, shared
+with WMS):
+
+- `/instances` never builds every run of a long axis: it reads
+  `EdrEngine::instance_reference_times` (keys only), pages it
+  (`INSTANCES_PAGE_SIZE` 100 without `limit`, `limit` clamped to 500,
+  `offset`, `page_window`, `numberMatched`/`numberReturned`, `next`/`prev`)
+  and builds the page's runs with `find_instance`. Without `limit` a list of
+  at most 500 runs is answered whole via `get_instances`, byte-identical to
+  before. `params::parse_instances_query` 400s anything but `f`, `limit`,
+  `offset`, and `offset` without `limit`.
+- What every run's document shares is read from the engine once per request:
+  `CollectionMetadata::new`, then `build(Some(run))` per run. Never call
+  `build_collection_metadata` in a per-run loop.
+- Collection metadata never describes the run axis: no `extent.custom`, and
+  nothing in `CollectionMetadata` reads `instance_reference_times` or
+  `get_instances` (`instances_tests`' `archive-doc` mock panics on either), so a
+  collection document stays O(1) in the run count. EDR makes a custom
+  dimension's `id` a data-query parameter
+  (`/req/edr/custom-dimension-response`), and the data queries do not take
+  `reference_time`: advertising the run axis as a custom dimension waits for
+  that parameter. Repeating intervals in `extent.temporal.values` fail the
+  EDR 1.1 bundle, which types its items as date-times, while 1.1 is declared.
+- A forecast engine overriding `get_instances` overrides
+  `instance_reference_times` too, from its run map's keys; the default clones
+  every run's valid times.
+
 ## Output formats and GeoJSON (#929)
 
 - `params::query_formats(query_type, engine.serves_station_series())` is

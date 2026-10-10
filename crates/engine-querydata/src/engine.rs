@@ -230,6 +230,10 @@ impl EdrEngine for QueryDataEngine {
         !self.runs.load().runs.is_empty()
     }
 
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.runs.load().runs.keys().copied().collect()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let set = self.runs.load();
         set.runs.get(&reference_time).map(|e| RunInfo {
@@ -1838,8 +1842,11 @@ mod tests {
         let instances = engine.get_instances();
         // The fixture dir has at least one .sqd → at least one run/instance.
         assert!(!instances.is_empty());
-        // raster_info advertises the same runs as reference times.
+        // raster_info advertises the same runs as reference times, and so
+        // does the run axis read without the valid times (#1006).
         assert_eq!(engine.raster_info().reference_times.len(), instances.len());
+        let runs: Vec<_> = instances.iter().map(|r| r.reference_time).collect();
+        assert_eq!(engine.instance_reference_times(), runs);
         // An un-pinned position query (reference_time = None) serves the latest
         // run; pinning the latest run's reference time returns the same series.
         let latest_rt = instances.last().unwrap().reference_time;

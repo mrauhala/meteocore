@@ -1474,6 +1474,10 @@ impl EdrEngine for GribEngine {
         !self.catalog().runs.is_empty()
     }
 
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.catalog().runs.keys().copied().collect()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let catalog = self.catalog();
         catalog.runs.get(&reference_time).map(|run| RunInfo {

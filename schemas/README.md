@@ -88,8 +88,9 @@ cargo test --locked -p server --test satellite_edr
 They validate real router responses against the 1.1 and 1.2 bundles: the
 landing page, `/conformance`, `/collections`, collection documents (with
 locations, position, area and radius queries, vertical extents and
-per-parameter time axes), the instances list, one instance document, and
-the `/locations` GeoJSON. Neither bundle has an `/instances/{instanceId}`
+per-parameter time axes), the instances list, one instance document, a
+collection with a long run axis and a page of its instances list, and the
+`/locations` GeoJSON. Neither bundle has an `/instances/{instanceId}`
 path; an instance document is validated against the instances list's item
 schema. A negative control removes one data query link's `title`, which 1.2
 requires and 1.1 does not, and expects 1.2 to reject the document.
@@ -110,6 +111,12 @@ schema alone checks no parameter. The helper therefore also validates each
 validates extent dimensions against the UAD schema. A second negative control
 drops one entry's required `observedProperty` and expects both versions to
 reject the document.
+
+The 1.1 bundle gives every `extent.temporal.values` item `format:
+date-time`, which its own description and example
+(`R12/2022-01-14T09:00Z/PT1H`) contradict; the 1.2 bundle drops the format.
+With format validation on, a repeating interval there fails 1.1, so time
+values stay lists of instants while 1.1 is declared (#1006).
 
 These are response-shape checks, not a conformance assessment, and both EDR
 versions stay checked while 1.1 conformance is declared. To update the

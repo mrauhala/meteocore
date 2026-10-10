@@ -244,6 +244,10 @@ impl EdrEngine for ZarrEngine {
         !self.catalog.load().runs.is_empty()
     }
 
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.catalog.load().runs.keys().copied().collect()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let cat = self.catalog.load();
         cat.runs.get(&reference_time).map(|&idx| RunInfo {

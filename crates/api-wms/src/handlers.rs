@@ -307,7 +307,9 @@ pub async fn wms_handler(
                         "Layer '{collection_id}' has no reference_time dimension"
                     )));
                 }
-                if !info.reference_times.contains(&rt) {
+                // Ascending by the `RasterInfo` contract; an archive keeps
+                // thousands of runs (#1006).
+                if info.reference_times.binary_search(&rt).is_err() {
                     return Err(WmsError::InvalidDimensionValue(format!(
                         "reference_time '{}' is not an available model run for layer \
                          '{collection_id}'",

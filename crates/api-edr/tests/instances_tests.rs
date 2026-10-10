@@ -258,6 +258,122 @@ impl EdrEngine for NonForecastMock {
     }
 }
 
+/// An archive store exposing every historical run (#1006): six-hourly from
+/// 2021-05-01 to 2026-10-09T18Z, less the two runs of 2022-01-01 00Z and 06Z,
+/// 7950 runs. Every run has two days of hourly valid times; the collection's
+/// own time axis is 30 days of hourly steps. Like the real forecast engines
+/// it answers [`EdrEngine::instance_reference_times`] and
+/// [`EdrEngine::find_instance`] from its run map; `get_instances` panics, so
+/// no request may enumerate every run with its valid times.
+struct ArchiveMock {
+    /// Whether [`EdrEngine::instance_reference_times`] answers. The
+    /// `archive-doc` collection's does not: it panics, so a collection
+    /// document that copied the run axis would fail its request.
+    run_axis: bool,
+}
+
+/// Valid times per archive run: two days, hourly.
+const ARCHIVE_LEADS: i64 = 49;
+
+/// The archive collection's time axis: 30 days, hourly, to its latest run's
+/// last valid time.
+const ARCHIVE_STEPS: i64 = 721;
+
+impl ArchiveMock {
+    fn first_run() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2021, 5, 1, 0, 0, 0).unwrap()
+    }
+
+    /// The two runs missing from the archive.
+    fn gap() -> [DateTime<Utc>; 2] {
+        let start = Utc.with_ymd_and_hms(2022, 1, 1, 0, 0, 0).unwrap();
+        [start, start + chrono::Duration::hours(6)]
+    }
+
+    fn runs() -> Vec<DateTime<Utc>> {
+        let last = Utc.with_ymd_and_hms(2026, 10, 9, 18, 0, 0).unwrap();
+        let mut runs = Vec::new();
+        let mut rt = Self::first_run();
+        while rt <= last {
+            if !Self::gap().contains(&rt) {
+                runs.push(rt);
+            }
+            rt += chrono::Duration::hours(6);
+        }
+        runs
+    }
+
+    fn valid_times(rt: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+        (0..ARCHIVE_LEADS)
+            .map(|h| rt + chrono::Duration::hours(h))
+            .collect()
+    }
+
+    fn collection_times() -> Vec<DateTime<Utc>> {
+        let end = *Self::valid_times(*Self::runs().last().unwrap())
+            .last()
+            .unwrap();
+        (0..ARCHIVE_STEPS)
+            .rev()
+            .map(|h| end - chrono::Duration::hours(h))
+            .collect()
+    }
+}
+
+impl EdrEngine for ArchiveMock {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(vec![])
+    }
+    fn get_instances(&self) -> Vec<RunInfo> {
+        panic!("a request enumerated every run of a long run axis with its valid times");
+    }
+    fn has_instances(&self) -> bool {
+        true
+    }
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        assert!(
+            self.run_axis,
+            "collection metadata copied the run axis: O(runs) per request"
+        );
+        Self::runs()
+    }
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        Self::runs()
+            .binary_search(&reference_time)
+            .ok()
+            .map(|_| RunInfo {
+                reference_time,
+                valid_times: Self::valid_times(reference_time),
+            })
+    }
+    fn query_location(
+        &self,
+        _: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::InvalidParameter("no locations".into()))
+    }
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["temperature".to_string()]
+    }
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let times = Self::collection_times();
+        Some((times[0], *times.last().unwrap()))
+    }
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        Some(Self::collection_times())
+    }
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([-180.0, -90.0, 180.0, 90.0])
+    }
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["position".to_string()]
+    }
+}
+
 fn config(id: &str, engine_type: &str) -> CollectionConfig {
     CollectionConfig {
         id: id.to_string(),
@@ -293,6 +409,16 @@ fn state() -> api_edr::handlers::AppState {
     collections.insert("obs".to_string(), config("obs", "geotiff"));
     engines.insert("st".to_string(), Arc::new(StationForecastMock));
     collections.insert("st".to_string(), config("st", "csv"));
+    engines.insert(
+        "archive".to_string(),
+        Arc::new(ArchiveMock { run_axis: true }),
+    );
+    collections.insert("archive".to_string(), config("archive", "zarr"));
+    engines.insert(
+        "archive-doc".to_string(),
+        Arc::new(ArchiveMock { run_axis: false }),
+    );
+    collections.insert("archive-doc".to_string(), config("archive-doc", "zarr"));
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         feature_engines: HashMap::new(),
@@ -786,5 +912,221 @@ async fn instances_list_links_follow_collection_info_links() {
             .collect();
         assert!(!expected.is_empty(), "{id}");
         assert_eq!(data_links(&list), expected, "{uri}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A long run axis (#1006)
+// ---------------------------------------------------------------------------
+
+/// The href of a document's link with `rel`, if any.
+fn link<'a>(doc: &'a Value, rel: &str) -> Option<&'a str> {
+    doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == rel)
+        .and_then(|l| l["href"].as_str())
+}
+
+/// A long run axis is not described in collection metadata: the collection
+/// links to its paged instances list, and its extent is the latest run's, as
+/// for any forecast. The `archive-doc` engine panics if its run axis is read,
+/// so neither the collection document, in JSON or HTML, nor the
+/// `/collections` list copies thousands of run keys per request. Every run
+/// still resolves by its instance id, and a missing one is a 404.
+#[tokio::test]
+async fn a_long_run_axis_stays_out_of_collection_metadata() {
+    let (status, collection) = get("/collections/archive-doc").await;
+    assert_eq!(status, StatusCode::OK);
+    let keys: Vec<&str> = collection["extent"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["spatial", "temporal"]);
+    assert_eq!(
+        collection["data_queries"]["instances"]["link"]["href"],
+        "/edr/collections/archive-doc/instances"
+    );
+    let (status, _, _) = get_raw("/collections/archive-doc?f=html", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, list) = get("/collections").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == "archive-doc"));
+
+    let runs = ArchiveMock::runs();
+    for rt in [runs[0], runs[979], runs[980], *runs.last().unwrap()] {
+        let id = ds_core::instances::format_instance_id(rt);
+        let (status, doc) = get(&format!("/collections/archive-doc/instances/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{id}");
+        assert_eq!(doc["id"], id);
+    }
+    for missing in ArchiveMock::gap() {
+        let id = ds_core::instances::format_instance_id(missing);
+        let (status, _) = get(&format!("/collections/archive-doc/instances/{id}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+    }
+}
+
+/// A long run axis pages its instances list, 100 runs a page without
+/// `limit`, with `numberMatched`, `numberReturned` and `next`/`prev` links
+/// that walk it in ascending order. The archive once answered 95 MB here;
+/// a page is bounded, and `ArchiveMock::get_instances` panics, so only the
+/// page's runs are built.
+#[tokio::test]
+async fn a_long_run_axis_pages_the_instances_list() {
+    let runs = ArchiveMock::runs();
+    let app = api_edr::router(state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/collections/archive/instances")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    // About 3 KB a run, two days of hourly valid times included.
+    assert!(bytes.len() < 400_000, "{} bytes", bytes.len());
+    let first: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(first["numberMatched"], runs.len());
+    assert_eq!(
+        first["numberReturned"],
+        api_edr::handlers::INSTANCES_PAGE_SIZE
+    );
+    let ids: Vec<&str> = first["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 100);
+    assert_eq!(ids[0], "2021-05-01T00:00:00Z");
+    assert_eq!(ids[99], ds_core::instances::format_instance_id(runs[99]));
+    let list = "/edr/collections/archive/instances";
+    assert_eq!(link(&first, "self"), Some(&*format!("{list}?limit=100")));
+    assert_eq!(
+        link(&first, "alternate"),
+        Some(&*format!("{list}?limit=100&f=html"))
+    );
+    assert_eq!(
+        link(&first, "next"),
+        Some(&*format!("{list}?limit=100&offset=100"))
+    );
+    assert_eq!(link(&first, "prev"), None);
+    edr_schema::assert_valid(
+        "/collections/{collectionId}/instances",
+        edr_schema::JSON,
+        &first,
+        "archive instances page",
+    );
+
+    // The last page, reached by offset: the newest runs, a `prev` link and
+    // no `next`.
+    let offset = runs.len() - 30;
+    let (status, last) = get(&format!(
+        "/collections/archive/instances?limit=100&offset={offset}"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(last["numberReturned"], 30);
+    assert_eq!(
+        last["instances"].as_array().unwrap().last().unwrap()["id"],
+        "2026-10-09T18:00:00Z"
+    );
+    assert_eq!(link(&last, "next"), None);
+    assert_eq!(
+        link(&last, "prev"),
+        Some(&*format!("{list}?limit=100&offset={}", offset - 100))
+    );
+
+    // A `limit` past the longest whole list is clamped to it.
+    let (status, clamped) = get("/collections/archive/instances?limit=10000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        clamped["numberReturned"],
+        ds_core::time_axis::MAX_LISTED_VALUES
+    );
+    assert_eq!(link(&clamped, "self"), Some(&*format!("{list}?limit=500")));
+
+    // The HTML page has a pager over the same pages.
+    let (status, _, html) = get_raw("/collections/archive/instances?f=html", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("rel=\"next\" href=\"/edr/collections/archive/instances?limit=100&amp;offset=100&amp;f=html\""),
+        "{html}"
+    );
+}
+
+/// `limit` pages a short list too, and an invalid request is a 400 naming
+/// the problem, never the whole list as if it worked.
+#[tokio::test]
+async fn instances_paging_parameters() {
+    let (status, page) = get("/collections/fc/instances?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["numberMatched"], 2);
+    assert_eq!(page["numberReturned"], 1);
+    assert_eq!(page["instances"][0]["id"], "2026-06-07T00:00:00Z");
+    assert_eq!(
+        link(&page, "next"),
+        Some("/edr/collections/fc/instances?limit=1&offset=1")
+    );
+    let (_, second) = get("/collections/fc/instances?limit=1&offset=1").await;
+    assert_eq!(second["instances"][0]["id"], "2026-06-07T12:00:00Z");
+    assert_eq!(link(&second, "next"), None);
+    // Without `limit` a short list stays whole, without paging members.
+    let (_, whole) = get("/collections/fc/instances").await;
+    assert!(whole.get("numberMatched").is_none(), "{whole}");
+
+    for (uri, needle) in [
+        (
+            "/collections/fc/instances?limt=1",
+            "Unknown query parameter 'limt'",
+        ),
+        ("/collections/fc/instances?offset=1", "requires limit"),
+        // The range this list pages in, not the data queries' 10000.
+        (
+            "/collections/fc/instances?limit=0",
+            "Invalid limit '0': expected an integer from 1 to 500",
+        ),
+        ("/collections/fc/instances?limit=1&limit=2", "Duplicate"),
+        (
+            "/collections/fc/instances?limit=1&offset=-1",
+            "Invalid offset",
+        ),
+    ] {
+        let (status, body) = get(uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        let description = body["description"].as_str().unwrap();
+        assert!(description.contains(needle), "{uri}: {description}");
+    }
+}
+
+/// The archive's collection and instance documents and a page of an
+/// instances list validate against both EDR bundles.
+#[tokio::test]
+async fn long_axis_documents_validate_against_edr_bundles() {
+    for (uri, path) in [
+        ("/collections/archive", "/collections/{collectionId}"),
+        (
+            "/collections/archive/instances/2026-10-09T18:00:00Z",
+            edr_schema::INSTANCE,
+        ),
+        (
+            "/collections/fc/instances?limit=1",
+            "/collections/{collectionId}/instances",
+        ),
+    ] {
+        let (status, body) = get(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        edr_schema::assert_valid(path, edr_schema::JSON, &body, uri);
     }
 }
