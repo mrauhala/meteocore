@@ -89,7 +89,8 @@ budget and its client-visible failure.
 - **Tile cache:** compressed bytes in an LRU (default 256 MB), **remote
   sources only** — local files get compressed bytes free from the mmap/page
   cache.
-- **Rendered image cache** (default 512 MB) shared across WMS/Maps/Tiles.
+- **Rendered image cache** (default 256 MB, `[wms] rendered_cache_mb`) shared
+  across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of
   *decoded* native source tiles for local files **and** remote COGs
   (`MC_GEOTIFF_DECODED_CHUNK_CACHE_MB`, default 512, 0 disables; one shared
@@ -119,7 +120,37 @@ budget and its client-visible failure.
   tests reduce request count but do not establish a latency win. See
   `docs/performance/cog-range-batching.md`.
 - Remote tile fetch concurrency: `MC_COG_TILE_CONCURRENCY` (default 16,
-  clamp [1,1024]). It's I/O-bound — size by RTT, not cores.
+  clamp [1,1024]). It's I/O-bound — size by RTT, not cores. It bounds the
+  fetches of all concurrent renders together. A projected (meta-tiled) WMS
+  render asks for only the new source tiles of one meta-tile at a time, so
+  a larger pool does not shorten its first view; a whole-viewport
+  `get_raster_tile` (WMS EPSG:4326, Maps) fetches every missing tile at once
+  and does wait on the pool. Raise it (32–64) when cold renders queue on a
+  high-RTT store.
+- **First-view pre-warm (#1004, `src/prewarm.rs`):** the WMS meta-tile loop
+  is sequential, so a cold remote frame pays one storage round trip for
+  every meta-tile that reaches a source tile no earlier one fetched
+  (`docs/performance/cog-first-frame.md`). `prewarm_new_frames` therefore
+  reads the encoded tiles of the frames a poll discovers (object store and
+  STAC) into the compressed tile cache: the newest `PREWARM_MAX_FRAMES`
+  absent from the previous catalog, levels coarsest first while the frame
+  stays within `prewarm::frame_cap` (`MC_COG_PREWARM_MB`, default 32 MiB,
+  0 off, at most 1/8 of the tile cache), coalesced by `range_batch::plan`,
+  4 reads in flight on the poll runtime's blocking pool through the
+  explicit-handle bridges, within `PREWARM_BUDGET`. `poll_loop` warms the
+  startup catalog before its first sleep. It fills the compressed cache
+  only: a decoded OPERA frame is ~100 MB of the shared decoded-chunk
+  cache. Each read holds `decode_budget::BUDGET.try_reserve_background`,
+  which leaves half the budget to requests and is not a counted rejection.
+  While requests hold more, a read waits up to `prewarm::BUSY_WAIT` (2 s)
+  and is then left to them: never skip at the first refusal, or a render
+  burst at poll time leaves the new frame cold. It logs `Pre-warmed N new
+  frame(s) for first views: …` per poll, and a WARN for reads that failed,
+  were cut off by `PREWARM_BUDGET` or gave up on a busy budget.
+- A render cut off by its deadline keeps every tile it already fetched:
+  each tile is cached as it lands and only in-flight reads are dropped, so
+  the client's retry fetches the rest
+  (`a_deadline_cut_read_keeps_fetched_tiles_for_the_retry`).
 
 ## Rendering gotchas (hard-won)
 

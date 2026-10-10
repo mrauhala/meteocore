@@ -205,7 +205,7 @@ Styles are listed in GetCapabilities and include LegendURL links.
 ```toml
 [collections.wms]
 colormap = "radar_dbz"
-rendered_cache_mb = 512    # Default: 512 MB. Set to 0 to disable.
+rendered_cache_mb = 256    # Default: 256 MB. Set to 0 to disable.
 
 [server]
 metatile_cache_mb = 1024   # Global (server-wide). Default: 1024 MB. 0 disables meta-tiling.

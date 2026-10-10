@@ -66,8 +66,10 @@ pub struct QueryDataEngine {
     max_runs: usize,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
-    /// Tracks when data was last successfully loaded/updated.
-    data_updated_at: Mutex<Option<DateTime<Utc>>>,
+    /// When the engine loaded or a poll last found a loadable run set
+    /// ([`Self::poll_age`]). Not the data's age: a poll that finds the same
+    /// files again stamps it too (#1007).
+    polled_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl QueryDataEngine {
@@ -100,7 +102,7 @@ impl QueryDataEngine {
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             max_runs,
             shutdown: Shutdown::new(),
-            data_updated_at: Mutex::new(Some(Utc::now())),
+            polled_at: Mutex::new(Some(Utc::now())),
         })
     }
 
@@ -129,15 +131,12 @@ impl QueryDataEngine {
         let new_set = build_runset(&files, self.max_runs, &prev, &self.collection_id);
         if new_set.runs.is_empty() {
             return; // nothing loadable (e.g. all files corrupt) — keep old data
-                    // and do NOT stamp freshness; data_age keeps growing.
+                    // and do NOT stamp the poll; poll_age keeps growing.
         }
 
-        // We have a usable run set — stamp freshness (reflects loadable data, not
+        // We have a usable run set — stamp the poll (reflects loadable data, not
         // merely a readable directory).
-        *self
-            .data_updated_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+        *self.polled_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
 
         // Swap only when the retained file set actually changed (add/remove).
         let prev_paths: BTreeSet<&Path> = prev.runs.values().map(|e| e.path.as_path()).collect();
@@ -190,13 +189,27 @@ impl QueryDataEngine {
         &self.collection_id
     }
 
-    /// How long ago the data was last successfully loaded/updated.
+    /// Age of the newest run, for `/health` `data_age_secs` and the
+    /// `collection_data_age_seconds` gauge (#1007): now minus its origin
+    /// time, the reference time in the file header that keys the run and is
+    /// its EDR instance id. An analysis file's origin time is its analysis
+    /// time, so analysis-only data needs no other rule; a forecast's newest
+    /// valid time lies in the future and would say nothing about the feeder.
+    /// It keeps growing while the feeder is stalled, even though every poll
+    /// still finds the old files.
     pub fn data_age(&self) -> Option<chrono::Duration> {
-        let updated_at = self
-            .data_updated_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        updated_at.map(|t| Utc::now() - t)
+        let newest = *self.runs.load().runs.keys().next_back()?;
+        Some(Utc::now() - newest)
+    }
+
+    /// Time since the engine loaded or a poll last found a loadable run set,
+    /// for `/health` `poll_age_secs`. It grows while the directory is
+    /// unreadable, empty or holds only unloadable files (the old runs are
+    /// kept), not while the files merely stop changing: that is
+    /// [`Self::data_age`].
+    pub fn poll_age(&self) -> Option<chrono::Duration> {
+        let polled_at = self.polled_at.lock().unwrap_or_else(|e| e.into_inner());
+        polled_at.map(|t| Utc::now() - t)
     }
 }
 
@@ -1731,6 +1744,46 @@ mod tests {
         assert!(!files.is_empty());
         let latest = files.last().unwrap();
         assert!(latest.to_string_lossy().ends_with(".sqd"));
+    }
+
+    /// #1007: `data_age` is now minus the newest run's origin time, not the
+    /// time since the last poll. A stalled feeder leaves its files in place,
+    /// so every poll still finds them: that resets `poll_age` but not
+    /// `data_age`.
+    #[test]
+    fn data_age_is_the_newest_runs_origin_time_not_the_last_poll() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        let origin = chrono::DateTime::parse_from_rfc3339("2026-04-04T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            engine.get_instances().last().unwrap().reference_time,
+            origin
+        );
+
+        // `data_age` is now minus the origin time, bracketed by clock reads.
+        let assert_data_age = || {
+            let before = Utc::now();
+            let age = engine.data_age().expect("a loaded run");
+            let after = Utc::now();
+            assert!(
+                before - origin <= age && age <= after - origin,
+                "data age {age} is not now minus {origin}"
+            );
+        };
+        assert_data_age();
+
+        // The feeder stalls: a poll finds the same file. It resets the poll
+        // age, set an hour back here, and leaves the data age growing.
+        *engine.polled_at.lock().unwrap() = Some(Utc::now() - chrono::Duration::hours(1));
+        engine.poll_once();
+        let poll_age = engine.poll_age().unwrap();
+        assert!(
+            poll_age < chrono::Duration::minutes(1),
+            "poll age {poll_age}"
+        );
+        assert_data_age();
     }
 
     #[test]

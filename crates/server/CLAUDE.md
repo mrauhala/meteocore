@@ -196,6 +196,31 @@ served render ran. No `collection` label: queue wait belongs to the shared
 slots, the per-collection tail is `render_duration_seconds`, and fixed labels
 need no reload pruning.
 
+## Health: data age and poll age (#1007)
+
+- `/health` `data_age_secs` and the `/metrics` gauge
+  `collection_data_age_seconds{collection}` are one number from one source,
+  `admin::collection_data_ages`: now minus the newest data the collection
+  serves, in whole seconds. GeoTIFF: the newest catalog timestep. QueryData:
+  the newest run's origin time, the header's reference time that keys the
+  run and is its instance id. An analysis file's origin time is its analysis
+  time, and a forecast's newest valid time lies in the future. BUFR: the
+  newest report. Satellite: the newest scan start. Nowcast: the latest
+  generation's anchor frame. Other engines report none. Negative when the
+  newest data lies in the future.
+- Never the time since a poll. A stalled feeder leaves its files in place,
+  every poll still finds them, and a poll-stamped age stayed near the poll
+  interval while the served latest got minutes older. An engine gaining a
+  data age adds it to `collection_data_ages`; `/health` and the gauge follow.
+- `poll_age_secs` (GeoTIFF, QueryData): time since the engine loaded or a
+  poll last found data. It grows while the source is unreachable, empty or
+  unloadable, the old data kept. Both growing: the source fails. Only
+  `data_age_secs` growing: the feeder delivers nothing new.
+- The gauge is set each scrape by `refresh_data_age_gauge`, which removes
+  only the series of a collection that stopped reporting an age (reloaded
+  away, data gone), never the family. Alert per collection: a 5-minute radar
+  and a 6-hourly model run need different thresholds.
+
 ## Operational notes
 
 - A brief "no images" period right after a deploy is the expected readiness

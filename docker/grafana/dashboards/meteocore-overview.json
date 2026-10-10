@@ -1019,7 +1019,7 @@
     {
       "type": "timeseries",
       "title": "Rendered-output cache — hit ratio and fill",
-      "description": "Exact-request repeats (fixed-viewport animation loops). Low hit% is EXPECTED with diverse clients — it only pays for loopers. Bimodal by design (#202).",
+      "description": "Exact-request repeats: a WMS view requested again unchanged (a fixed display cycling its animation frames, a client's default view) and Tiles z/x/y. A few % is EXPECTED with viewport WMS clients, whose shared work the meta-tile cache holds (#202). Fill pinned at 100% with a low ratio is not a sizing signal: replayed traffic gained no hits above the 256 MB default (#1010).",
       "id": 20,
       "gridPos": {
         "h": 8,
@@ -3722,6 +3722,54 @@
         },
         "tooltip": {
           "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 78,
+      "type": "timeseries",
+      "title": "Data age — per collection",
+      "description": "Seconds since the newest data each collection serves, the /health data_age_secs: GeoTIFF newest timestep, QueryData newest run's origin time, BUFR newest report, satellite newest scan, nowcast anchor frame. A sawtooth is normal: it climbs between deliveries and drops when new data lands, with the feed's cadence (minutes for radar, hours for model runs). Bad: a line climbing past its usual peak. The feeder has stalled while the collection still reports ready and serves an ever older latest. Alert per collection, since a radar and a model run need different thresholds. Negative = the newest data lies in the future.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 246
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "collection_data_age_seconds",
+          "legendFormat": "{{collection}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       }
     }
