@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.11.0](https://github.com/mrauhala/meteocore/compare/v0.10.0...v0.11.0) (2026-10-10)
+
+
+### Features
+
+* **edr:** repeating datetime interval Rn/date-time/duration ([#957](https://github.com/mrauhala/meteocore/issues/957)) ([c3970f4](https://github.com/mrauhala/meteocore/commit/c3970f43bcc91ccebc08f17edc05df76f237c8c2))
+* **wind:** derive wind speed and direction from u/v components ([#960](https://github.com/mrauhala/meteocore/issues/960)) ([1b9b2cc](https://github.com/mrauhala/meteocore/commit/1b9b2cc9c45d2c961296b06fb89c0b2826804a57))
+* **edr:** HTML for every data query, the location list and items ([#978](https://github.com/mrauhala/meteocore/issues/978)) ([83ad8a8](https://github.com/mrauhala/meteocore/commit/83ad8a89e8f3efe2992be9bbd8ba94d75ae08e71))
+* **edr:** HTML pages hold all their JSON information and link members ([#987](https://github.com/mrauhala/meteocore/issues/987)) ([1d4aa0d](https://github.com/mrauhala/meteocore/commit/1d4aa0dcab3cc264809ad1cf6f39cf085450d5ab))
+* **edr:** declare the EDR 1.2 conformance classes ([#981](https://github.com/mrauhala/meteocore/issues/981)) ([9800188](https://github.com/mrauhala/meteocore/commit/98001888363b1e97fafd21a1824021f69b4dfb32))
+* **engine-cap:** persist the WIS2 alert set across restarts ([#1031](https://github.com/mrauhala/meteocore/issues/1031)) ([733ba56](https://github.com/mrauhala/meteocore/commit/733ba5624a8cb2ef666949139ddd0b3afec5b254))
+* **engine-bufr:** persist the WIS2 report store across restarts ([#1035](https://github.com/mrauhala/meteocore/issues/1035)) ([70fc760](https://github.com/mrauhala/meteocore/commit/70fc760672eb073293ffe11fe66083efb1e28c59))
+
+
+### Bug Fixes
+
+* **edr:** filter /locations by bbox and datetime before paging ([#959](https://github.com/mrauhala/meteocore/issues/959)) ([2b4f3a2](https://github.com/mrauhala/meteocore/commit/2b4f3a295d2c3ce5ce67f04653f1819bc4854e25))
+* **edr:** z returns only intersecting levels and caps z lists ([#973](https://github.com/mrauhala/meteocore/issues/973)) ([b885913](https://github.com/mrauhala/meteocore/commit/b88591312ab40675f038308f4ac633ce537a6eac))
+* **edr:** complete /edr/api status codes, gate locations, crs on every data query ([#975](https://github.com/mrauhala/meteocore/issues/975)) ([d45f8fd](https://github.com/mrauhala/meteocore/commit/d45f8fd5bb895b9f829e3cce8ce46646fb89b7ca))
+* **edr:** serve items as EDR GeoJSON and percent-encode location links ([#976](https://github.com/mrauhala/meteocore/issues/976)) ([a5dff53](https://github.com/mrauhala/meteocore/commit/a5dff5311d6c5a171b4b9540059dc88cb92f5011))
+* **edr:** GRIB and Satellite datetime selects only intersecting steps ([#974](https://github.com/mrauhala/meteocore/issues/974)) ([7974784](https://github.com/mrauhala/meteocore/commit/7974784a2a94df00845115c8117bbecbbab55155))
+* **edr:** collection links to query end points, typed license link, observedProperty id ([#980](https://github.com/mrauhala/meteocore/issues/980)) ([25a12b0](https://github.com/mrauhala/meteocore/commit/25a12b03c2c5f92096514d9bb69b8472f9dbac48))
+* **edr:** keep every datetime-list instant on grids, no-step engines and CSV areas ([#972](https://github.com/mrauhala/meteocore/issues/972)) ([1cbd164](https://github.com/mrauhala/meteocore/commit/1cbd1646b2bab0eae0d62d280fae0337af904968))
+* **edr:** return only cells that meet the area, every parameter by default ([#977](https://github.com/mrauhala/meteocore/issues/977)) ([b0ad41f](https://github.com/mrauhala/meteocore/commit/b0ad41f554bcacaf567262a638d33c79b1db15ee))
+* **edr:** UCUM unit type, instances list links and instance titles ([#985](https://github.com/mrauhala/meteocore/issues/985)) ([d90179d](https://github.com/mrauhala/meteocore/commit/d90179d1a9da142195000acc4879e3169990f19e))
+* **edr:** accept limit on trajectory and cube, PVOL cross-section z selects sweeps ([#986](https://github.com/mrauhala/meteocore/issues/986)) ([b24e357](https://github.com/mrauhala/meteocore/commit/b24e3571211e1e10769c1045cec1b7e86e08b85c))
+* **edr:** ignore limit for PNG and HTML, name stations on data-query HTML pages ([#989](https://github.com/mrauhala/meteocore/issues/989)) ([839469d](https://github.com/mrauhala/meteocore/commit/839469dd27f32d49e7103a8e8210ca01ae2b23da))
+* **metrics:** collection health gauges follow live status ([#991](https://github.com/mrauhala/meteocore/issues/991)) ([3508923](https://github.com/mrauhala/meteocore/commit/3508923d561537299d671098f139ab1c0ae88ebe))
+* **odim:** a deadline or storage failure fails the PVOL read instead of blanking it ([#996](https://github.com/mrauhala/meteocore/issues/996)) ([3d1cfa5](https://github.com/mrauhala/meteocore/commit/3d1cfa527c11473eb1acf194fee1bd434b90738e))
+* **engine-cap:** keep standard CAP properties filterable with no alerts loaded ([#1013](https://github.com/mrauhala/meteocore/issues/1013)) ([ec7f9ee](https://github.com/mrauhala/meteocore/commit/ec7f9ee18c212464c7bee51a8ef9e5cf7f75b27d))
+* **health:** data_age_secs is the age of the newest data, not of the last poll ([#1017](https://github.com/mrauhala/meteocore/issues/1017)) ([9aee370](https://github.com/mrauhala/meteocore/commit/9aee370b289fcceefc44cf61defd8ed5e722bb08))
+* **bufr:** decode the WIS2 SYNOP messages that still failed ([#1021](https://github.com/mrauhala/meteocore/issues/1021)) ([67a4434](https://github.com/mrauhala/meteocore/commit/67a44343a95e1960e540ced936f3d77ca2e34de6))
+* **api-wms:** advertise MaxWidth, MaxHeight and LayerLimit in GetCapabilities ([#1014](https://github.com/mrauhala/meteocore/issues/1014)) ([82ef4cc](https://github.com/mrauhala/meteocore/commit/82ef4cc8e0b9276139e402bfa7597c1a8377a9b4))
+* **discovery:** never load a publisher's in-progress dotfiles or temp files ([#1015](https://github.com/mrauhala/meteocore/issues/1015)) ([dc5c16f](https://github.com/mrauhala/meteocore/commit/dc5c16f70eb5c2355736963fe8c6d81c628ed8f3))
+* **engine-grib:** give hour-window aggregates their own time axes ([#1019](https://github.com/mrauhala/meteocore/issues/1019)) ([f377fa4](https://github.com/mrauhala/meteocore/commit/f377fa43c20d696c54a99510c54216f4ab063f83))
+* **engine-geotiff:** retry a failed remote COG header read next poll, not by full download ([#1020](https://github.com/mrauhala/meteocore/issues/1020)) ([d667dad](https://github.com/mrauhala/meteocore/commit/d667dadf29c36763dfcbfc30a043841f546dc04c))
+* **storage:** give background whole-object fetches room for object_store's retry ([#1034](https://github.com/mrauhala/meteocore/issues/1034)) ([27b2f52](https://github.com/mrauhala/meteocore/commit/27b2f52b6123fe99c1a754233a4d53b89a9eef85))
+
+
+### Performance Improvements
+
+* **odim:** keep pre-warmed PVOL sweeps in the pixel cache ([#997](https://github.com/mrauhala/meteocore/issues/997)) ([eacafae](https://github.com/mrauhala/meteocore/commit/eacafaefca48db5a56823c24c533949e0ca3657c))
+* **odim:** a cold PVOL pixel miss decodes only the requested moment ([#998](https://github.com/mrauhala/meteocore/issues/998)) ([0a34c82](https://github.com/mrauhala/meteocore/commit/0a34c82e763b440ba25abf739a000aa61d699508))
+* **wms:** default the rendered-image cache to 256 MB ([#1016](https://github.com/mrauhala/meteocore/issues/1016)) ([fe2cdca](https://github.com/mrauhala/meteocore/commit/fe2cdcae6e9b0825b6f4e75e087ea29f06a1cbf8))
+* **engine-geotiff:** pre-warm new remote COG frames for their first view ([#1018](https://github.com/mrauhala/meteocore/issues/1018)) ([e79939c](https://github.com/mrauhala/meteocore/commit/e79939c0a89817a87157c3bc0521ef6e29e3d09a))
+* **edr,wms:** describe long run axes as ranges and page /instances ([#1032](https://github.com/mrauhala/meteocore/issues/1032)) ([1f5d350](https://github.com/mrauhala/meteocore/commit/1f5d350e29c2ee36b0a9fa339afc93f11c3a4645))
+
 ## [0.10.0](https://github.com/mrauhala/meteocore/compare/v0.9.0...v0.10.0) (2026-10-01)
 
 
