@@ -1556,6 +1556,7 @@ dependencies = [
  "ds-core",
  "ds-poll",
  "memmap2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

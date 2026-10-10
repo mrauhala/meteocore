@@ -1437,8 +1437,11 @@ async fn render_map(
     // nowcast generations, latent for NWP). Asking the engine (not
     // `reference_times.last()`) preserves GRIB's cross-run fallback when the
     // newest run doesn't cover the valid time yet. Engines without runs keep
-    // the identity default (`None` stays `None`).
-    let reference_time = engine.resolve_reference_time(time, None);
+    // the identity default (`None` stays `None`). The run is the
+    // parameter's: GRIB renders an aggregate the newest run lacks at that
+    // time from an older run (#1005).
+    let reference_time =
+        engine.resolve_parameter_reference_time(effective_parameter.as_deref(), time, None);
     // #507: snap to the exact timestep the engine will render before the
     // cache key is built — a not-yet-ingested datetime must cache the
     // previous timestep's pixels under the PREVIOUS timestep's key. A

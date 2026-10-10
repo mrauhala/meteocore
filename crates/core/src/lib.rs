@@ -26,6 +26,7 @@ pub mod resample;
 pub mod satellite_recipes;
 pub mod significance;
 pub mod state;
+pub mod temp_files;
 pub mod trajectory;
 pub mod units;
 pub mod vertical;
