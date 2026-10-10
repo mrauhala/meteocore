@@ -13,6 +13,7 @@ use ds_core::feature::{FeatureQuery, Geometry};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::health::LiveStatus;
 use ds_core::map_engine::MapEngine;
+use ds_core::state::{FileStateStore, StateStore};
 use ds_wis2::{parse_notification, Notification, Payload, PayloadSource, Resolved};
 use engine_cap::wis2::{hint_from_bytes, hint_key};
 use engine_cap::CapEngine;
@@ -671,5 +672,55 @@ fn multi_zone_area_renders_the_union_of_its_per_feature_hints() {
         .unwrap();
     assert!(
         matches!(&*g.geometry, Geometry::MultiPolygon { polygons } if polygons.len() == expected)
+    );
+}
+
+/// #1000: a real MeteoAlarm alert and its `rel=geometry` zone polygon
+/// survive a restart through the state store (`[server] state_dir`) — the same features and
+/// the same content version (the polygon round-trips exactly, so no cache
+/// is invalidated), served at build, before any broker session exists.
+#[test]
+fn meteoalarm_alert_and_zone_polygon_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Option<Arc<dyn StateStore>> = Some(Arc::new(FileStateStore::new(dir.path())));
+    let cfg = config(None, false);
+    let first = CapEngine::new_with_state(&cfg, "cap-wis2", store.clone()).unwrap();
+    let n = notification("meteoalarm-mk-notification.json");
+    let (info_idx, area_idx, _) = hint_key(&n).unwrap();
+    let hint = hint_from_bytes(&n, &fixture("meteoalarm-mk-area.geojson")).unwrap();
+    // Valid until 2099, so the wall-clock restore keeps it.
+    let xml = String::from_utf8(fixture("meteoalarm-mk-alert.xml"))
+        .unwrap()
+        .replace("2026-09-12T18:16:00+02:00", "2099-09-12T18:16:00+02:00");
+    first.wis2_source().unwrap().apply_with_hint(
+        resolved(n, xml.into_bytes()),
+        Some((info_idx, area_idx, hint)),
+        "cap-wis2",
+        Utc::now(),
+    );
+    first.refresh().unwrap();
+    assert_eq!(first.feature_count(), 2);
+    // A graceful stop writes the snapshot.
+    first.shutdown();
+
+    let second = CapEngine::new_with_state(&cfg, "cap-wis2", store.clone()).unwrap();
+    assert_eq!(second.feature_count(), 2);
+    assert_eq!(second.data_version(), first.data_version());
+    let hinted = second.get_feature(&format!("{MK_IDENTIFIER}.1.0")).unwrap();
+    assert!(
+        matches!(&*hinted.geometry, Geometry::Polygon { exterior, .. } if exterior.len() == 82)
+    );
+    assert_eq!(
+        hinted
+            .properties
+            .get("geometry_source")
+            .and_then(|v| v.as_str()),
+        Some("notification")
+    );
+    assert_eq!(
+        second.live_health(),
+        Some(LiveStatus::Degraded {
+            reason: "connecting to WIS2 broker"
+        })
     );
 }

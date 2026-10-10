@@ -470,6 +470,12 @@ async fn main() {
         tracing::error!("{e}");
         std::process::exit(1);
     }
+    // Likewise: engines restore their snapshots from it while being built.
+    admin::init_state_store(
+        config
+            .server
+            .state_dir_path(std::path::Path::new(&config_path)),
+    );
 
     let result = admin::load_collections(
         &style_ctx,

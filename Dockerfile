@@ -102,6 +102,10 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r dataserver && useradd -r -g dataserver dataserver
+# Where `[server] state_dir` points in the documented examples (#1000). A
+# named volume mounted here starts with this ownership, so the non-root
+# runtime user can write its snapshots.
+RUN mkdir -p /var/lib/meteocore && chown dataserver:dataserver /var/lib/meteocore
 
 COPY --from=builder /build/target/release/server /usr/local/bin/dataserver
 

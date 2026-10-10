@@ -672,6 +672,16 @@ port = 8000
                                  # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,
                                  # GDAL color-relief .txt/.clr, SLD .sld (ColorMap). Re-read on reload;
                                  # missing dir = hard error; other extensions skipped.
+# state_dir = "/var/lib/meteocore"  # optional, engine state snapshots (#1000): a WIS2 CAP
+                                 # collection keeps its alert set in <state_dir>/<id>.cap.state
+                                 # across restarts. Relative = to the config file's dir;
+                                 # created at boot; needs a WRITABLE mount (a failed write is
+                                 # a rate-limited WARN, never a load error). Unset = no
+                                 # persistence. Fixed at boot (reload WARNs, restart to change).
+                                 # Shared plumbing: ds_core::state — engines get an
+                                 # Arc<dyn StateStore> + key "<id>.<kind>", never a path; the
+                                 # StateWriter write policy is backend-independent — reuse
+                                 # both, never hand-roll a writer (crates/server/CLAUDE.md).
 
 # Optional Model Context Protocol endpoint at /mcp (off unless present and
 # enabled). Top-level config.toml only. There is deliberately no default
@@ -878,6 +888,12 @@ topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnin
 # broker = "mqtts://globalbroker.meteo.fr:8883"   # default
 # username = "everyone"; password = "everyone"   # defaults (public); or password_env
 # download_allowlist = ["https://…/"]            # strict mode (recommended for origin/ topics)
+# warmup = "PT24H"   # default; after a cold start (no state_dir snapshot restored)
+                     # /health says "warming up after cold start: N alerts received"
+                     # (degraded) this long after the subscription first comes up;
+                     # a snapshot older than this restores its alerts but restarts
+                     # the warm-up ("warming up after a long outage").
+                     # CAP only: [bufr.wis2] rejects it.
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs`

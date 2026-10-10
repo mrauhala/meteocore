@@ -8,6 +8,9 @@ colormaps_dir = "colormaps.d"
 # Derive each request's absolute link base from reverse-proxy headers
 # (Forwarded / X-Forwarded-*). Default false; enable only behind a trusted proxy.
 # trust_proxy_headers = true
+# Keep engine state across restarts (the WIS2 CAP alert set, #1000): snapshots
+# go to <state_dir>/<collection id>.cap.state. Needs a writable directory.
+# state_dir = "state"
 
 # Shared WMS style bundles. Collections reference these by id from their
 # [wms] style_bundle field to avoid duplicating the same default + extras
