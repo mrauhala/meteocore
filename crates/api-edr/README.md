@@ -807,10 +807,14 @@ selected steps (near-surface ones only without `level_types`). The 1M-value
 budget counts them all, so a large default area is a 400 asking to narrow
 the parameters.
 
-BUFR decoding supports compressed character fields, operator 208, and numeric
-fields through 64 bits. Unsupported operators or unknown national descriptors
-skip the affected message (counted in `bufr_decode_failures_total`); other
-messages in the same file remain available. See
+BUFR decoding supports compressed character fields and delayed replication,
+operators 203 (uncompressed), 204 and 208, numeric fields through 64 bits,
+SYNOP radiation widths of master tables before version 14, and DWD local
+tables 1–8 (#1008). Station reports of one station, time and position from
+several messages of one bulletin merge into one row. Unsupported operators or unknown
+national descriptors skip the affected message (counted in
+`bufr_decode_failures_total` by `kind`); other messages in the same file
+remain available. See
 [`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).
 
 ### HTML workbench

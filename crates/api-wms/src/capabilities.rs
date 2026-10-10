@@ -33,7 +33,7 @@ pub fn get_capabilities_xml(
     let _ = writer.write_event(Event::Start(root));
 
     // Service section
-    write_service(&mut writer);
+    write_service(&mut writer, base_url);
 
     // Capability section
     let _ = writer.write_event(Event::Start(BytesStart::new("Capability")));
@@ -91,11 +91,27 @@ pub fn get_capabilities_xml(
     writer.into_inner()
 }
 
-fn write_service(writer: &mut Writer<Vec<u8>>) {
+/// Write the `<Service>` section in WMS 1.3.0 schema order: `Name`, `Title`,
+/// `Abstract`, the mandatory `OnlineResource`, then the limits GetMap
+/// enforces — `LayerLimit`, `MaxWidth`, `MaxHeight` — read from the same
+/// constants as [`params::WmsQuery::validate_get_map`], so the advertised
+/// limits cannot drift from the ones GetMap applies (#1012).
+fn write_service(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     let _ = writer.write_event(Event::Start(BytesStart::new("Service")));
     write_text_element(writer, "Name", "WMS");
     write_text_element(writer, "Title", "MeteoCore - WMS");
     write_text_element(writer, "Abstract", "Metocean Data Server — OGC WMS 1.3.0");
+
+    let service_url = format!("{base_url}/wms");
+    let mut or = BytesStart::new("OnlineResource");
+    or.push_attribute(("xlink:type", "simple"));
+    or.push_attribute(("xlink:href", service_url.as_str()));
+    let _ = writer.write_event(Event::Empty(or));
+
+    write_text_element(writer, "LayerLimit", &params::LAYER_LIMIT.to_string());
+    let max_dimension = params::MAX_MAP_DIMENSION.to_string();
+    write_text_element(writer, "MaxWidth", &max_dimension);
+    write_text_element(writer, "MaxHeight", &max_dimension);
     let _ = writer.write_event(Event::End(BytesEnd::new("Service")));
 }
 

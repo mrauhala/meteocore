@@ -12,3 +12,6 @@ tracing = "0.1"
 memmap2 = "0.9"
 arc-swap = "1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"

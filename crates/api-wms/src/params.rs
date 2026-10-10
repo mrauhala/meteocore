@@ -22,7 +22,14 @@ pub const MAX_MAP_PIXELS: u64 = 64_000_000;
 /// equals MAX_MAP_PIXELS — a square at the per-dim cap doesn't trip the
 /// pixel cap with a confusing second error. Tripping it is HTTP 400
 /// `InvalidParameterValue` "WIDTH and HEIGHT must not exceed 8000".
+/// GetCapabilities advertises it as the `<Service>`'s `<MaxWidth>` and
+/// `<MaxHeight>` (#1012).
 pub const MAX_MAP_DIMENSION: u32 = 8000;
+
+/// Most layers one GetMap may name in `LAYERS`, advertised as the
+/// `<Service>`'s `<LayerLimit>`. GetMap renders exactly one layer — it reads
+/// only the first name — so raise this only together with layer composition.
+pub const LAYER_LIMIT: usize = 1;
 
 /// Supported CRS identifiers.
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
@@ -187,13 +194,14 @@ impl WmsQuery {
             )));
         }
 
-        // LAYERS — exactly one layer (Phase 1)
+        // LAYERS — exactly one layer (`LAYER_LIMIT`; `split` yields at
+        // least one name, so only too many can fail here).
         let layers_str = self
             .layers
             .as_deref()
             .ok_or(WmsError::missing_parameter("LAYERS"))?;
         let layers: Vec<&str> = layers_str.split(',').collect();
-        if layers.len() != 1 {
+        if layers.len() > LAYER_LIMIT {
             return Err(WmsError::invalid_parameter(
                 "Exactly one LAYERS value is supported",
             ));
