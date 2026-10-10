@@ -308,3 +308,41 @@ async fn object_store_reports_an_origin_ignoring_range_as_range_not_honoured() {
         .expect_err("a 200 answer to a range request is an error");
     assert!(catalog::range_not_honoured(&err), "unexpected error: {err}");
 }
+
+/// A scan whose metadata read budget is spent leaves new files to the next
+/// poll without reading them, while a file it already catalogued stays
+/// (#1011): a storage stall across many new files cannot hold one poll for
+/// files × the background fetch budget.
+#[test]
+fn a_spent_read_budget_defers_new_files_to_the_next_poll() {
+    let cog = std::fs::read(FIXTURE).unwrap();
+    let flaky = FlakyStore::with_object(cog);
+    let store = DataStore::new(flaky.clone());
+    let matcher = FilenameMatcher::from_template("radar_%Y%m%dT%H%MZ.tif").unwrap();
+    let scan = |previous: &Catalog, budget: std::time::Duration| {
+        let index: HashMap<&Path, &FileEntry> = previous
+            .entries
+            .values()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+        catalog::scan_remote_within(
+            &store,
+            &[ObjectPath::from("d")],
+            &ScanSpec::new(&matcher, "radar"),
+            &index,
+            budget,
+        )
+        .unwrap()
+        .0
+    };
+
+    let deferred = scan(&Catalog::empty(), std::time::Duration::ZERO);
+    assert!(deferred.entries.is_empty(), "the new file waits");
+    assert_eq!(flaky.counts(), (0, 0), "and nothing was read for it");
+
+    let first = scan(&Catalog::empty(), std::time::Duration::from_secs(60));
+    assert!(only_source(&first).is_some());
+    let reused = scan(&first, std::time::Duration::ZERO);
+    assert!(only_source(&reused).is_some(), "a catalogued file stays");
+    assert_eq!(flaky.counts(), (1, 0), "without another read");
+}

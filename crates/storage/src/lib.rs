@@ -480,7 +480,7 @@ impl DataStore {
     /// [`FetchBudget::Background`]: four attempts' worth, so a first attempt
     /// that stalls until its timeout leaves room for object_store's retry
     /// (after a backoff that starts at 0.1 s) and for one more.
-    const BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    pub const BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     /// Bridge async to sync. Uses `block_in_place` when inside a tokio runtime
     /// (releases a multi-threaded scheduler worker), or creates a
