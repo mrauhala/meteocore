@@ -3,6 +3,9 @@ mod catalog;
 pub mod decode_budget;
 mod decoded_cache;
 mod parse;
+mod prewarm;
+#[cfg(test)]
+mod prewarm_tests;
 mod range_batch;
 mod reader;
 #[cfg(test)]
@@ -228,6 +231,15 @@ const STAC_PRELOAD_CONCURRENCY: usize = 4;
 /// delays the next catalog poll by at most this. Unfinished items are left to
 /// the request path.
 const STAC_PRELOAD_BUDGET: Duration = Duration::from_secs(60);
+
+/// Most newly discovered remote frames one poll cycle pre-warms (#1004),
+/// newest first: the frames a client animates first. A cold start or a poll
+/// after an outage can discover a backlog; older frames load on first view.
+const PREWARM_MAX_FRAMES: usize = 4;
+/// Wall-clock cap on one poll cycle's pre-warm (#1004): a stalling store
+/// delays the next catalog poll by at most this. Unfinished reads are left
+/// to the request path.
+const PREWARM_BUDGET: Duration = Duration::from_secs(60);
 
 /// Circuit breaker threshold: number of consecutive failures before opening.
 const STAC_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
@@ -1109,6 +1121,9 @@ impl GeoTiffEngine {
     /// failing remote. Resets to base interval on first success.
     pub async fn poll_loop(&self) {
         let base = self.poll_interval;
+        // No poll has warmed what the startup scan catalogued: warm its
+        // newest frames before the first sleep (#1004).
+        self.prewarm_new_frames(&Catalog::empty()).await;
 
         loop {
             let failures = self.consecutive_poll_failures.load(Ordering::Relaxed);
@@ -1133,12 +1148,104 @@ impl GeoTiffEngine {
     }
 
     /// One poll cycle: rescan, then preload metadata for the STAC items the
-    /// scan discovered (#90). The preload is a no-op for other sources, whose
-    /// scan already parses every header.
+    /// scan discovered (#90), then pre-warm the tiles of the remote frames it
+    /// discovered (#1004). The preload is a no-op for other sources, whose
+    /// scan already parses every header; the pre-warm for local ones.
     async fn poll_cycle(&self) {
         let previous = self.catalog.load_full();
         self.poll_once();
         self.preload_stac_metadata(&previous).await;
+        self.prewarm_new_frames(&previous).await;
+    }
+
+    /// Read the encoded tiles of the newest remote frames absent from
+    /// `previous` into the tile cache (#1004), so the first view of a new
+    /// frame decodes from memory instead of paying a storage round trip per
+    /// meta-tile. At most `PREWARM_MAX_FRAMES` frames, within the per-frame
+    /// cap of [`prewarm::frame_cap`] and `PREWARM_BUDGET`; runs on the poll
+    /// runtime with bounded concurrency, see [`prewarm`]. Returns the paths
+    /// of the frames it had tiles to fetch for.
+    async fn prewarm_new_frames(&self, previous: &Catalog) -> Vec<PathBuf> {
+        if matches!(self.store_mode, StoreMode::Local { .. }) || self.shutdown.is_shutdown() {
+            return Vec::new();
+        }
+        let cap = prewarm::frame_cap(self.tile_cache.capacity());
+        if cap == 0 {
+            return Vec::new();
+        }
+        let plans: Vec<prewarm::FramePlan> = {
+            let catalog = self.catalog.load();
+            catalog
+                .entries
+                .iter()
+                .rev()
+                .filter(|(ts, _)| !previous.entries.contains_key(*ts))
+                .filter_map(|(_, entry)| {
+                    prewarm::plan_frame(
+                        &entry.path,
+                        entry.metadata()?,
+                        entry.source()?,
+                        &self.tile_cache,
+                        cap,
+                    )
+                })
+                .take(PREWARM_MAX_FRAMES)
+                .filter(|plan| !plan.is_empty())
+                .collect()
+        };
+        if plans.is_empty() {
+            return Vec::new();
+        }
+        let started = std::time::Instant::now();
+        let outcome = prewarm::warm(&plans, &self.tile_cache, PREWARM_BUDGET, || {
+            self.shutdown.is_shutdown()
+        })
+        .await;
+        let capped = if outcome.capped_levels > 0 {
+            format!(
+                "; {} finest level(s) over the {} per-frame cap left to requests",
+                outcome.capped_levels,
+                format_bytes(cap as u64)
+            )
+        } else {
+            String::new()
+        };
+        if outcome.reads > 0 {
+            tracing::info!(
+                "[{}] Pre-warmed {} new frame(s) for first views: {} tiles, {} in {} range reads, {} ms{}",
+                self.collection_id,
+                outcome.frames,
+                outcome.tiles,
+                format_bytes(outcome.bytes as u64),
+                outcome.reads,
+                started.elapsed().as_millis(),
+                capped
+            );
+        }
+        if outcome.failed > 0 || outcome.unfinished > 0 || outcome.busy > 0 {
+            tracing::warn!(
+                "[{}] Pre-warm left tiles to first views: {} range read(s) failed, {} cut off after {}s, \
+                 {} skipped while requests held over half the decode budget{}",
+                self.collection_id,
+                outcome.failed,
+                outcome.unfinished,
+                PREWARM_BUDGET.as_secs(),
+                outcome.busy,
+                outcome
+                    .first_error
+                    .as_deref()
+                    .map(|e| format!(" (first error: {e})"))
+                    .unwrap_or_default()
+            );
+        }
+        if outcome.deferred > 0 {
+            tracing::debug!(
+                "[{}] Pre-warm skipped {} range read(s): shutting down, or a read over half the decode budget",
+                self.collection_id,
+                outcome.deferred
+            );
+        }
+        plans.iter().map(|plan| plan.path().to_path_buf()).collect()
     }
 
     fn poll_once(&self) {
