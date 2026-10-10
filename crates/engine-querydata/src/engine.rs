@@ -15,6 +15,7 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
+use ds_core::temp_files;
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
 
@@ -794,6 +795,11 @@ impl MapEngine for QueryDataEngine {
 /// List `.sqd` files in a directory, sorted ascending by filename (lexicographic
 /// ≈ chronological for the usual `…YYYYMMDDHHMM.sqd` naming, so the last entry is
 /// the latest run). Returns empty on a directory read error.
+///
+/// A temporary name ([`temp_files::is_temporary`]) is never listed: a publisher
+/// writes a run as a hidden `.name.sqd` and renames it once complete, and a
+/// poll in between would parse a truncated file of up to a GB, logging a
+/// spurious ERROR (#1009). The finished file is listed on the next poll.
 fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         // A read failure (e.g. a permissions regression) is indistinguishable
@@ -808,6 +814,8 @@ fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("sqd"))
+                && p.file_name()
+                    .is_some_and(|name| !temp_files::is_temporary(&name.to_string_lossy()))
         })
         .collect();
     entries.sort();
@@ -1744,6 +1752,43 @@ mod tests {
         assert!(!files.is_empty());
         let latest = files.last().unwrap();
         assert!(latest.to_string_lossy().ends_with(".sqd"));
+    }
+
+    const FIXTURE: &str = "202604042019_202604040600_ecmwf_kenya_surface.sqd";
+
+    /// A publisher's in-progress run, `.name.sqd` holding the first bytes of
+    /// the file, next to a finished one: only the finished run is listed
+    /// (#1009). Temp-suffixed copies are skipped too.
+    #[test]
+    fn list_sqd_files_skips_in_progress_names() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let bytes = std::fs::read(test_dir().join(FIXTURE)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let finished = dir.path().join(FIXTURE);
+        std::fs::write(&finished, &bytes).unwrap();
+        let hidden = format!(".2026-10-09T00:00:00Z_{FIXTURE}");
+        std::fs::write(dir.path().join(&hidden), &bytes[..bytes.len() / 10]).unwrap();
+        std::fs::write(dir.path().join(format!("{FIXTURE}.tmp")), &bytes).unwrap();
+        std::fs::write(dir.path().join(format!("{FIXTURE}.part")), &bytes).unwrap();
+
+        assert_eq!(list_sqd_files(dir.path()), [finished]);
+    }
+
+    /// A hidden run is never parsed, even when all its bytes are there: the
+    /// engine finds nothing to load in a directory holding only `.name.sqd`.
+    #[test]
+    fn engine_never_loads_a_hidden_run() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            test_dir().join(FIXTURE),
+            dir.path().join(format!(".{FIXTURE}")),
+        )
+        .unwrap();
+        let Err(err) = QueryDataEngine::new(dir.path(), "test", None, 30, 4) else {
+            panic!("a hidden .sqd must not be loaded as a run");
+        };
+        assert!(err.to_string().contains("No loadable .sqd files"), "{err}");
     }
 
     /// #1007: `data_age` is now minus the newest run's origin time, not the

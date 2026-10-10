@@ -69,6 +69,7 @@ use ds_core::model::{
     VerticalCoord,
 };
 use ds_core::resample::ProjectionGrid;
+use ds_core::temp_files;
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::volume::{
     CellProduct, CellQuery, VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid,
@@ -1275,7 +1276,20 @@ fn within_window_by_name(id: &str, filter: Option<TimeRange>) -> bool {
     }
 }
 
-/// Enumerate `.h5` files directly in a local directory. Non-recursive.
+/// Whether `basename` names a polar volume a scan reads: a `.h5` file
+/// (any case) that is not a publisher's temporary name. A volume written
+/// as a hidden `.name.h5` and renamed once complete would otherwise be
+/// HDF5-parsed truncated (#1009). Shared by [`enumerate_local`] and
+/// [`enumerate_remote`].
+fn is_volume_name(basename: &str) -> bool {
+    let bytes = basename.as_bytes();
+    bytes.len() >= 3
+        && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".h5")
+        && !temp_files::is_temporary(basename)
+}
+
+/// Enumerate `.h5` files directly in a local directory, skipping
+/// temporary names ([`is_volume_name`]). Non-recursive.
 fn enumerate_local(
     collection_id: &str,
     data_dir: &std::path::Path,
@@ -1290,11 +1304,10 @@ fn enumerate_local(
     let mut pending = Vec::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
-        let is_h5 = path
-            .extension()
-            .map(|e| e.eq_ignore_ascii_case("h5"))
-            .unwrap_or(false);
-        if !is_h5 || !path.is_file() {
+        let is_volume = path
+            .file_name()
+            .is_some_and(|name| is_volume_name(&name.to_string_lossy()));
+        if !is_volume || !path.is_file() {
             continue;
         }
         let id = path.display().to_string();
@@ -1436,7 +1449,7 @@ fn enumerate_remote(
         };
         for obj in listed {
             let key = obj.location.to_string();
-            if !key.to_ascii_lowercase().ends_with(".h5") {
+            if !is_volume_name(key.rsplit('/').next().unwrap_or(&key)) {
                 continue;
             }
             let ts = parse_key_timestamp(&key);
@@ -7759,6 +7772,44 @@ mod tests {
             ],
             "Bootstrap keeps exactly the newest volume per site"
         );
+    }
+
+    /// A publisher's in-progress volume (`.name.h5`, truncated) and
+    /// temp-suffixed copies next to a finished volume: both enumerations
+    /// return only the finished one, so the partial file is never fetched
+    /// or HDF5-parsed (#1009).
+    #[test]
+    fn enumerations_skip_in_progress_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "202605150000_fivih_PVOL.h5",
+            ".202605150005_fivih_PVOL.h5",
+            "202605150010_fivih_PVOL.h5.part",
+            "202605150010_fivih_PVOL.H5.tmp",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let root = dir.path().canonicalize().unwrap();
+        let basename = |id: &str| id.rsplit('/').next().unwrap().to_string();
+
+        let local = enumerate_local("t", &root).unwrap();
+        let local: Vec<String> = local.iter().map(|p| basename(&p.id)).collect();
+        assert_eq!(local, ["202605150000_fivih_PVOL.h5"]);
+
+        let (store, _) = ds_storage::build_store(root.to_str().unwrap()).unwrap();
+        let (remote, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Full).unwrap();
+        let remote: Vec<String> = remote.iter().map(|p| basename(&p.id)).collect();
+        assert_eq!(remote, ["202605150000_fivih_PVOL.h5"]);
+    }
+
+    #[test]
+    fn volume_names_are_h5_files_that_are_not_temporary() {
+        assert!(is_volume_name("202605150000_fivih_PVOL.h5"));
+        assert!(is_volume_name("dkste_202512150405.vol.H5"));
+        assert!(!is_volume_name(".202605150000_fivih_PVOL.h5"));
+        assert!(!is_volume_name("202605150000_fivih_PVOL.h5.part"));
+        assert!(!is_volume_name("202605150000_fivih_PVOL.hdf"));
+        assert!(!is_volume_name("h5"));
     }
 
     /// The pre-fetch window filter hinges on reading a timestamp from

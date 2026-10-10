@@ -287,6 +287,14 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   `list` per prefix in a loop, but not the matcher scan: many sites share a
   timestamp, so dedup and cap would drop volumes. Its bootstrap
   newest-per-stream reduction stays here.
+- Both PVOL enumerations (`enumerate_local`, `enumerate_remote`) keep a
+  basename only when `is_volume_name` accepts it: `.h5`, and not a
+  temporary name (`ds_core::temp_files`), so a volume written as `.name.h5`
+  is never HDF5-parsed truncated (#1009). The COMP scans get the hidden-name
+  skip from the shared catalog scan and pass
+  `temp_files::partial_exclude_patterns()` as `ScanSpec.exclude`: COMP has
+  no `exclude_patterns` setting, and an unanchored explicit pattern matches
+  inside `….h5.part`.
 
 ## Retention & fixtures
 
