@@ -44,6 +44,36 @@ path can leave the WMS symptom unchanged (#448 vs #452).
 - Meta-tiling is engine-agnostic and WMS-only; keep it enabled (it is the pan
   substrate — 86% marginal tile hit rate in production).
 
+## Rendered-image cache (#1010)
+
+`ds_render::RenderedCache`, shared with Maps and Tiles, holds encoded images
+under the exact request (`CacheKey`). Every successful non-empty render is
+inserted on its first render, a meta-tiled viewport included; empty and
+error images never are. Measured on a day of a live deployment's GetMaps
+(85 000, every one an EPSG:3857 viewport, none tile-shaped):
+
+- **Who hits.** 4 % repeated an earlier request URL exactly: fixed views
+  such as a display cycling the same animation frames, a client's default
+  view, a fixed NWP view. About a third of hits are not exact repeats: the
+  key carries the timestep `resolve_parameter_time` picks, so a TIME that
+  snaps to a step already rendered for the view (a frame not ingested yet
+  snaps to the latest) reuses that step's image.
+  Tiles `z/x/y` keys repeat by construction; Maps traffic was negligible.
+- **Do not gate inserts.** Admitting only tile-aligned views would drop
+  every one of those hits. Admitting a view on its second render was
+  replayed through the cache with the day's exact repeats and served ~1 450
+  of them at any size, against ~2 300 for inserting all at 256 MB: most
+  repeating URLs come exactly twice, and `quick_cache` already evicts
+  never-read entries first. A snapped TIME needs the first render cached too.
+- **Size.** 256 MB, the default (`ds_core::config::DEFAULT_RENDERED_CACHE_MB`),
+  holds roughly 25 minutes of that traffic's renders. The replay of exact
+  repeats gained nothing at 512 MB; about 1 hit in 8 reuses an older image,
+  so halving from 512 MB costs at most that share. A miss on a meta-tiled
+  view usually costs assembly and encoding (~40 ms), not an engine read:
+  give spare memory to `metatile_cache_mb`.
+- A hit ratio of a few % with the fill pinned at 100 % is expected with
+  viewport clients and is not a sizing signal.
+
 ## Dimensions
 
 - **TIME** — valid-time axis from `RasterInfo.times`. A TIME-less GetMap

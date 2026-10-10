@@ -1,5 +1,6 @@
 //! The BUFR edition 4 tables
 
+mod corrections;
 pub mod local;
 mod table_b;
 mod table_c;
@@ -84,5 +85,37 @@ fn make_table_d() -> HashMap<XY, &'static TableDEntry> {
     for entry in &table_d::TABLE_D {
         map.insert(entry.xy, entry);
     }
+    for entry in &corrections::TABLE_D {
+        map.insert(entry.xy, entry);
+    }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sequence(tables: &Tables, y: u8) -> Vec<(u8, u8, u8)> {
+        tables.table_d[&XY { x: 7, y }]
+            .elements
+            .iter()
+            .map(|d| (d.f, d.x, d.y))
+            .collect()
+    }
+
+    #[test]
+    fn synop_ra_sequences_carry_their_identification_and_pressure_groups() {
+        // The generated table dropped `301090 302031` from 307083 and lost
+        // 307082 (#1008); both start like 307080 and its RA siblings.
+        let tables = Tables::default();
+        for y in [80, 81, 82, 83, 84, 86] {
+            assert_eq!(
+                sequence(&tables, y)[..2],
+                [(3, 1, 90), (3, 2, 31)],
+                "3-07-0{y}"
+            );
+        }
+        assert_eq!(sequence(&tables, 82).len(), 15);
+        assert_eq!(sequence(&tables, 83).len(), 14);
+    }
 }

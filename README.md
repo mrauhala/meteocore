@@ -171,7 +171,8 @@ not re-scan the auto roots.
 | `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | GeoTIFF decoded-chunk cache for local and remote sources, in MB. `0` disables. |
 | `MC_SATELLITE_FRAME_CACHE_MB` | `1024` | Satellite scans held in memory (the compressed NetCDF file plus its overview, ~30 MB per 2 km full disk), in MB, shared by every satellite collection. Size it above the scans in the `time_window` of **all** satellite collections together (see [Satellite](#satellite)). While they fit, a poll downloads back any in-window scan evicted here; when they do not, it logs a WARN with the sizes and requests download the missing scans themselves. |
 | `MC_SATELLITE_STRIP_CACHE_MB` | `256` | Satellite decoded blocks (GOES-R: strips of 24 full-width rows, ~260 KB each at 2 km; GMGSI: 793 × 1322 chunks, ~2 MB each), in MB. |
-| `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool. Raise for high-latency object stores; value must be ≥ 1. |
+| `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
+| `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. `0` turns the pre-warm off. Restart to change. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
 
 ### Sizing render memory on larger hosts
@@ -471,7 +472,7 @@ max_files = 24
 
 [collections.wms]
 colormap = "radar_dbz"          # built-in colormap (or use color_stops for custom)
-# rendered_cache_mb = 128       # optional, default 128 MB
+# rendered_cache_mb = 256       # optional, default 256 MB
 # webp_quality = 80             # optional, default WebP quality 1-100 (100 = lossless,
                                 # the default); lossy suits continuous-tone layers
 ```
@@ -1786,7 +1787,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `max` | no | from colormap | Maximum value for the default style's range |
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
-| `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. (Global cache; lives under `[wms]` for backward compatibility — see note.) |
+| `rendered_cache_mb` | no | `256` | Shared rendered-image cache size in MB. Set to 0 to disable. (Global cache; lives under `[wms]` for backward compatibility — see note.) |
 | `webp_quality` | no | lossless | Default quality, 1–100, for this collection's `image/webp` maps and tiles in WMS, Maps and Tiles: 1–99 lossy, 100 lossless. A request's own `QUALITY` / `quality` wins, including 100 for lossless. Not applied to JPEG. Validated at load. Collection-level only; style bundles do not carry it. |
 
 ### Limits
@@ -1938,7 +1939,8 @@ When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against 
 
 Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP bytes. Shared across WMS, Maps, and Tiles APIs.
 
-- Default size: 512 MB (configurable via `rendered_cache_mb`)
+- Default size: 256 MB (configurable via `rendered_cache_mb`). On a live deployment's WMS traffic, a replay of a day's repeated requests gained nothing from 512 MB, and most hits reuse an image rendered within the last 25 minutes, which 256 MB holds ([#1010](https://github.com/mrauhala/meteocore/issues/1010)).
+- Every successful render is inserted on its first render. Hits come from views requested again: a fixed display cycling its animation frames, a client's default view, Tiles `z/x/y`, and a `TIME` that resolves to a timestep already rendered for the same view, such as a frame not ingested yet. With viewport WMS clients a few % is expected; the meta-tile cache below holds the work they share.
 - Cache key: quantized bbox (6 decimal places) + layer + style + format with its encoder quality + width + height + CRS + time + parameter
 - Lock-free concurrent LRU (uses `quick_cache`)
 - No TTL — immutable data. Cache invalidated on collection reload.
@@ -1998,6 +2000,13 @@ OpenAPI specs are generated dynamically from configured collections. WMS uses XM
 
 Returns HTTP 503 only when all collections have failed.
 
+Entries can also carry the collection's temporal extent and two ages in seconds:
+
+| Field | Meaning |
+|-------|---------|
+| `data_age_secs` | Now minus the newest data the collection serves: the newest timestep (GeoTIFF), the newest run's origin time (QueryData), the newest report (BUFR), the newest scan (satellite), the latest generation's anchor frame (nowcast). The `collection_data_age_seconds` gauge reports the same value. It keeps growing when a feeder stalls even though the old files are still found |
+| `poll_age_secs` | GeoTIFF and QueryData: time since the last poll that found data. It grows while the source is unreachable or empty |
+
 ### Prometheus Metrics
 
 `GET /metrics` returns Prometheus text format. Path labels are the matched route template (e.g. `/edr/collections/{id}/position`), not the raw URL, so cardinality stays bounded. The `api` label names the serving API: a per-API route's mount (`edr`, `features`, `maps`, `tiles`, `wms`, `3dtiles`), or for the shared OGC API root the building block that served it (`maps`, `tiles`, `features`) and `common` for its discovery resources; empty for operational routes.
@@ -2018,6 +2027,7 @@ Returns HTTP 503 only when all collections have failed.
 | `collections_healthy` | gauge | — | Collections in ready state |
 | `collections_degraded` | gauge | — | Collections in degraded state |
 | `collections_failed` | gauge | — | Collections in failed state |
+| `collection_data_age_seconds` | gauge | collection | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that report one |
 
 **GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs):
 

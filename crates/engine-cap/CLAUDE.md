@@ -217,8 +217,9 @@ memory. Things that differ from the pull sources:
   MeteoAlarm feeds expect them, and the flat shape is what the MVT tag
   encoder and `<property>=value` filters need. A repeated name
   (MeteoAlarm's `impacts`, one per bullet) becomes a List in document
-  order. A name colliding with a standard CAP property is namespaced
-  `parameter:<valueName>` instead of shadowing it. `<eventCode>`s (terse
+  order. A name that is a standard property (`STANDARD_PROPERTIES`, see
+  below) is namespaced `parameter:<valueName>` instead of taking it, even
+  on an alert that omits that field. `<eventCode>`s (terse
   system ids: MeteoAlarm `OET` event terms, NWS `SAME`) are always
   namespaced `eventCode:<valueName>`. Values are passed through verbatim —
   the original fields are never normalized. An additional `awareness_type_code`
@@ -229,7 +230,21 @@ memory. Things that differ from the pull sources:
   `awareness_type_code` goes under `parameter:awareness_type_code` even when
   no valid derived code exists. Filtering `awareness_type_code=1,3,5` uses the
   shared matcher's numeric alternatives; original text filters stay exact.
-  The derived field stays in `filterables` even for an empty catalog.
+- **`filterables` = the fixed schema ∪ the producer names in the data**
+  (#1001). `STANDARD_PROPERTIES` in `catalog.rs` lists every name
+  `build_properties` can emit from the CAP alert/info/area fields plus the
+  derived ones (`active_until`, `radius_km`, `geometry_source`,
+  `awareness_type_code`); it is advertised for every catalog, empty or not,
+  so `status=Actual&scope=Public` on an empty collection is 200 with zero
+  features, never a 400 that comes and goes with the data (a map client's
+  warnings layer once got 400s for ~20 min after each restart, until the
+  first alert arrived). Producer `<parameter>` / `parameter:*` /
+  `eventCode:*` names are added from the held alerts at build time. A new
+  standard key in `build_properties` goes into the list too: a
+  `debug_assert!` there trips on an unlisted key in any test whose alert
+  carries the field, and
+  `standard_properties_are_exactly_what_a_complete_alert_emits` catches a
+  listed name nothing emits.
 
 ## Time semantics
 

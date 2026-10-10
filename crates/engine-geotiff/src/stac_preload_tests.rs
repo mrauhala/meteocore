@@ -66,6 +66,16 @@ async fn mock_stac(count: usize) -> (String, String, Vec<DateTime<Utc>>) {
 }
 
 fn stac_engine(items_url: String, allowlist: String) -> GeoTiffEngine {
+    stac_engine_with_cache(items_url, allowlist, 0)
+}
+
+/// A STAC engine whose tile cache holds `tile_cache_mb`; 0 also turns the
+/// poll-time tile pre-warm (#1004) off.
+fn stac_engine_with_cache(
+    items_url: String,
+    allowlist: String,
+    tile_cache_mb: u64,
+) -> GeoTiffEngine {
     let config = GeoTiffConfig {
         filename_template: None,
         filename_pattern: None,
@@ -75,7 +85,7 @@ fn stac_engine(items_url: String, allowlist: String) -> GeoTiffEngine {
         poll_interval_secs: 3600,
         exclude_patterns: vec![],
         max_files: None,
-        tile_cache_mb: 0,
+        tile_cache_mb,
         band: 1,
         nodata: None,
         scale: None,
@@ -185,4 +195,74 @@ async fn preload_skips_an_item_a_request_is_loading() {
     // The preload neither parks on that claim nor fetches the item again.
     assert_eq!(loaded_times(&engine), vec![times[0]]);
     drop(request);
+}
+
+/// #1004: the poll pre-warms the tiles of the STAC items it preloads, read
+/// through the direct HTTP source, so their first render misses nothing in
+/// the tile cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poll_prewarms_the_tiles_of_new_stac_items() {
+    let (items_url, allowlist, times) = mock_stac(2).await;
+    let engine = Arc::new(stac_engine_with_cache(items_url, allowlist, 64));
+
+    engine.poll_cycle().await;
+
+    assert_eq!(loaded_times(&engine), times);
+    for time in &times {
+        let catalog = engine.catalog.load();
+        let entry = &catalog.entries[time];
+        let (metadata, source) = (entry.metadata().unwrap(), entry.source().unwrap());
+        let reader::DataSource::HttpDirect { tile_info, .. } = source.as_ref() else {
+            panic!("a STAC item reads over direct HTTP");
+        };
+        let levels = std::iter::once((0u16, tile_info)).chain(
+            metadata
+                .overviews
+                .iter()
+                .filter_map(|ov| Some((ov.ifd_index as u16, ov.tile_info.as_ref()?))),
+        );
+        let mut tiles = 0;
+        for (ifd, info) in levels {
+            for (chunk, _) in info
+                .tile_byte_counts
+                .iter()
+                .enumerate()
+                .filter(|(_, &count)| count > 0)
+            {
+                tiles += 1;
+                assert!(
+                    engine
+                        .tile_cache
+                        .contains_untracked(&entry.path, chunk as u32, ifd),
+                    "{time}: IFD {ifd} tile {chunk} warm"
+                );
+            }
+        }
+        assert!(tiles > 0);
+    }
+
+    let (hits, misses) = engine.tile_cache_stats();
+    let newest = *times.last().unwrap();
+    let render = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        render.get_raster_tile(
+            [20.0, 60.0, 30.0, 70.0],
+            64,
+            64,
+            Some(newest),
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
+    })
+    .await
+    .unwrap()
+    .expect("renders the pre-warmed item");
+    let after = engine.tile_cache_stats();
+    assert!(after.0 > hits, "the render read tiles");
+    assert_eq!(
+        after.1, misses,
+        "the first render finds every tile it reads in the cache"
+    );
 }

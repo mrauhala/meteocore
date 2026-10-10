@@ -7,13 +7,15 @@ feature per station). Source: a polled directory / object-store prefix of
 BUFR files (`data_path`) or a WIS2 Global Broker subscription
 (`[bufr.wis2]`, `src/wis2.rs`). Real fixtures: `testdata/bufr-synop/` (8
 reports captured from the WIS2 Global Broker, values cross-checked with
-ecCodes `bufr_dump`).
+ecCodes `bufr_dump`) and `testdata/bufr-regressions/` (one small message per
+live decode failure fixed in #1008; its README names the cause of each).
 
 ## The decoder boundary
 
 - **`src/decode.rs` is the only module that imports `ds_bufr`.** Keep it
-  that way: if a real feed hits an unsupported operator (203/204/207/22x) the fix is to vendor or
-  replace the decoder behind `Decoder::decode`, not to spread the API.
+  that way: if a real feed hits an unsupported operator (207/22x, or 203 in
+  compressed data) the fix is in `ds-bufr` behind `Decoder::decode`, not
+  to spread the API.
 - `Tables::default()` rebuilds three hash maps from ~1 MB of statics —
   build **once per engine** (`Decoder::new`), never per message.
 - `Value::Decimal(v, s)` means `v · 10^s` with `s` negative for fractions.
@@ -22,19 +24,44 @@ ecCodes `bufr_dump`).
   its own message (`Decoded::failed`): the reports of the messages before
   and after it survive, and only a stream with no `BUFR` magic at all is
   an `Err`. Pinned by `concatenated_file_keeps_the_good_messages_around_a_bad_one`.
-- Unsupported operators / features are `DecodeError::Unsupported`
-  (counted per message in `bufr_decode_failures_total{reason="unsupported"}`),
-  other failures `reason="error"`; neither is fatal to the file or the scan.
-  `ds-bufr` supports compressed character fields, operator 208 (including
-  cancellation), and numeric widths through 64 bits (#693). Regression
-  fixtures in `testdata/bufr-decoder/` are generated independently by ecCodes.
-  This does not establish complete coverage of every live centre/template.
+- Every failure has a `FailureKind` (`DecodeError::kind`), counted per
+  message in `bufr_decode_failures_total{reason, kind}`: `kind` is
+  `not_bufr` (no BUFR magic: NIL bulletins), `truncated` (`failed to fill
+  whole buffer`: an element read with the wrong width ran past the data
+  section, or a short message), `unknown_descriptor` (no table entry: an
+  unregistered local element), `invalid` or `unsupported`; `reason` keeps
+  the older `error`/`unsupported` split. None is fatal to the file or the
+  scan. The WIS2 source WARNs the first failure of each `(centre, kind)`
+  with its `data_id` (a sample to fetch from a Global Cache) and an hourly
+  per-centre summary (`decode failures in the last 60 min: …`); the metric
+  stays per collection, since centres are unbounded.
+- `ds-bufr` supports compressed character fields and delayed replication,
+  operators 203 (uncompressed), 204 and 208, and numeric widths through 64
+  bits (#693, #1008). Regression fixtures in `testdata/bufr-decoder/` are
+  generated independently by ecCodes; `testdata/bufr-regressions/` are live
+  messages checked element by element against ecCodes `bufr_dump`. This
+  does not establish complete coverage of every live centre/template.
+- **Master-table versions.** The generated tables are the current version.
+  `LEGACY_MASTER_TABLE_B` gives messages of master version ≤ 13 the
+  narrower 302045 radiation widths (it-meteoam, jp-jma, il-ims still encode
+  13); without it every 307080/307086 with radiation ran past its data.
+  Extend it only from ecCodes `bufr/tables/0/wmo/<version>/element.table`.
 - National local descriptors have no width in the master tables, so one
-  unknown element misaligns the whole message. `LOCAL_TABLE_B` in
-  `decode.rs` registers DWD 020237/238/239 only for centre 78/local version 8,
-  and 004214 for centre 78/local versions 2–8. Never install national entries
+  unknown element misaligns the whole message. `DWD_LOCAL_TABLE_B` in
+  `decode.rs` registers the DWD (centre 78) elements seen live, each from
+  the first local version that defines it, for local versions 1–8, verified
+  against ecCodes' centre-78 local tables. Never install national entries
   globally: the same number can mean a different width at another centre.
   Extend centre/version selection only from a verified published local table.
+- **One observation, several messages.** A DWD bulletin carries a station's
+  SYNOP and its national supplement (020193 …: visibility, soil
+  temperature, precipitation) as separate messages for the same station
+  and time. `decode()` merges reports of one `(station, time)` at the same
+  position (within 0.01°) within one stream, earlier elements first, so the
+  supplement adds values instead of replacing the SYNOP row in the store.
+  Reports at different positions never merge: anonymised vessels share the
+  call sign `SHIP`. Across payloads a later report still replaces the row
+  (a correction).
 
 ## Extraction rules (template-agnostic)
 

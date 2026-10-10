@@ -1,4 +1,5 @@
-//! Follow links from source CAP XML through the real engine and Features router.
+//! CAP through the real engine and Features router: links followed from source
+//! CAP XML, and the standard property filters of an empty catalog (#1001).
 use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
@@ -80,13 +81,9 @@ async fn get(app: &Router, href: &str) -> String {
     .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn cap_identifiers_round_trip_through_json_and_html_links() {
-    let dir = tempfile::tempdir().unwrap();
-    for (i, id) in IDS.iter().enumerate() {
-        std::fs::write(dir.path().join(format!("{i}.xml")), cap_xml(id)).unwrap();
-    }
-    let cfg: CapConfig = serde_json::from_value(json!({"data_path": dir.path()})).unwrap();
+/// The real CAP engine over `dir`, served as collection `cap` under `/features`.
+fn features_app(dir: &std::path::Path) -> (Router, Arc<dyn FeatureEngine>) {
+    let cfg: CapConfig = serde_json::from_value(json!({"data_path": dir})).unwrap();
     let engine: Arc<dyn FeatureEngine> = Arc::new(engine_cap::CapEngine::new(&cfg, "cap").unwrap());
     let config: CollectionConfig = serde_json::from_value(json!({
         "id": "cap", "title": "Warnings", "description": "CAP link contract", "apis": ["features"]
@@ -104,6 +101,52 @@ async fn cap_identifiers_round_trip_through_json_and_html_links() {
             },
         ))),
     );
+    (app, engine)
+}
+
+/// #1001: before the first alert arrives, the standard CAP fields are still
+/// accepted as `/items` filters (an empty page, not a 400) and advertised as
+/// `/items` parameters in the OpenAPI document.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_catalog_accepts_and_advertises_standard_cap_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = features_app(dir.path());
+    let page: Value = serde_json::from_str(
+        &get(
+            &app,
+            "/features/collections/cap/items?status=Actual&scope=Public&f=json",
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(page["numberMatched"], 0);
+    assert_eq!(page["features"].as_array().unwrap().len(), 0);
+
+    let api: Value = serde_json::from_str(&get(&app, "/features/api").await).unwrap();
+    let (_, items) = api["paths"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(path, _)| path.ends_with("/collections/cap/items"))
+        .expect("cap /items operation");
+    let names: Vec<&str> = items["get"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    for name in ["status", "scope", "msgType"] {
+        assert!(names.contains(&name), "{name} not in {names:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cap_identifiers_round_trip_through_json_and_html_links() {
+    let dir = tempfile::tempdir().unwrap();
+    for (i, id) in IDS.iter().enumerate() {
+        std::fs::write(dir.path().join(format!("{i}.xml")), cap_xml(id)).unwrap();
+    }
+    let (app, engine) = features_app(dir.path());
     let listing: Value =
         serde_json::from_str(&get(&app, "/features/collections/cap/items?f=json").await).unwrap();
     let features = listing["features"].as_array().unwrap();

@@ -184,10 +184,21 @@ coordinates against it. Note that WMS here takes EPSG:3035 `BBOX` easting first.
   references), `storageCrsCoordinateEpoch`, 3D CRSs (CRS84h).
 
 `/features/api` lists the accepted property parameters per collection from
-cached engine catalogs. CAP, GeoJSON and PostGIS advertise names present in
+cached engine catalogs. GeoJSON and PostGIS advertise names present in
 at least one loaded record (including null values), refreshed with the data.
 CSV, BUFR and ODIM use fixed schemas; Nowcast includes optional property groups
-only when their sources are wired. Reserved API controls (`bbox`, `datetime`,
+only when their sources are wired. CAP combines both: every standard CAP
+alert/info/area property it can emit (`identifier`, `sender`, `sent`,
+`status`, `msgType`, `scope`, `language`, `category`, `event`,
+`responseType`, `urgency`, `severity`, `certainty`, `effective`, `onset`,
+`expires`, `senderName`, `headline`, `description`, `instruction`, `web`,
+`areaDesc`) and its derived `active_until`, `radius_km`, `geometry_source`
+and `awareness_type_code` are always advertised, even with no alerts loaded,
+so a filter on a field no held alert carries returns 200 with no matches
+rather than a 400 (#1001); producer `<parameter>` and `eventCode:*` names are
+added from the loaded alerts. A producer parameter named like a standard
+property is `parameter:<valueName>` even on an alert that omits that field.
+Reserved API controls (`bbox`, `datetime`,
 `limit`, `offset`, `sortby`, `f`, `crs`, `bbox-crs`, `filter`, `filter-lang`,
 `filter-crs`, `properties`) take precedence over source property names and
 cannot be used as property filters. Duplicate control parameters return 400.
@@ -206,8 +217,9 @@ prefix of MeteoAlarm's `code; label` convention. Original `awareness_type`
 values remain unchanged. Repeated awareness types produce a list of numeric
 codes; malformed values contribute no code. A producer parameter named
 `awareness_type_code` is preserved as `parameter:awareness_type_code`.
-The derived code remains queryable when the collection has no valid codes or
-no alerts, returning no matches rather than an unknown-property error.
+Like the standard properties, the derived code remains queryable when the
+collection has no valid codes or no alerts, returning no matches rather than
+an unknown-property error.
 
 One request selects three types across label capitalization variants:
 `/features/collections/cap-meteoalarm-wis2/items?awareness_type_code=1,3,5`.
@@ -253,7 +265,7 @@ layer but has no effect on this engine.
 |---|---|---|---|---|---|---|---|---|
 | CSV | one station per distinct location (Point) | station point inside box | stations with at least one observation row in the interval; EDR `/locations?datetime=` lists the same stations, from the same code (#932) | – (400) | ✓ name, latitude, longitude | – | ✓ (first/last observation) | 0 (static) |
 | GeoJSON file | file features as loaded | feature geometry intersects query box (R-tree candidates, then a point / polygon-edge / containment test; `west > east` split at the antimeridian) | – (400: no time dimension) | – (400) | ✓ all loaded property names | ✓ | – | ✓ |
-| CAP | one alert area (Polygon / MultiPolygon / null geometry); `properties.geometry_source` = `inline`/`geocode`/`notification`/`bbox`; producer `<parameter>`s as top-level properties under their valueName (MeteoAlarm `awareness_level`, `awareness_type`; repeats → list; `impacts`), `<eventCode>`s as `eventCode:<valueName>`. Identity is scoped to sender; canonical IDs include a length-prefixed sender, and old identifier-only URLs resolve only when unambiguous. Status filtering precedes exact sender/identifier/sent Update/Cancel resolution (at ingest for WIS2, on rebuild for directory/feed). Failed documents retain their last good data while successfully fetched documents update. A WIS2 source holds at most `max_alerts` (10 000) alerts: past it, still-valid alerts are dropped from `/items` and the map, not-yet-active and lowest severity first, and the collection reports `degraded` in `/health` (#805) | area bbox intersects query box; crossing bboxes split at the antimeridian; null-geometry areas excluded when `bbox` is set | alert active window intersects the interval | – (400) | ✓ standard + producer property names (including lists) | ✓ | ✓ (union of active windows; `None` when fully open) | ✓ |
+| CAP | one alert area (Polygon / MultiPolygon / null geometry); `properties.geometry_source` = `inline`/`geocode`/`notification`/`bbox`; producer `<parameter>`s as top-level properties under their valueName (MeteoAlarm `awareness_level`, `awareness_type`; repeats → list; `impacts`), `<eventCode>`s as `eventCode:<valueName>`. Identity is scoped to sender; canonical IDs include a length-prefixed sender, and old identifier-only URLs resolve only when unambiguous. Status filtering precedes exact sender/identifier/sent Update/Cancel resolution (at ingest for WIS2, on rebuild for directory/feed). Failed documents retain their last good data while successfully fetched documents update. A WIS2 source holds at most `max_alerts` (10 000) alerts: past it, still-valid alerts are dropped from `/items` and the map, not-yet-active and lowest severity first, and the collection reports `degraded` in `/health` (#805) | area bbox intersects query box; crossing bboxes split at the antimeridian; null-geometry areas excluded when `bbox` is set | alert active window intersects the interval | – (400) | ✓ every standard CAP property, even with no alerts loaded (#1001), + producer names from the loaded alerts (including lists) | ✓ | ✓ (union of active windows; `None` when fully open) | ✓ |
 | PostGIS stations | one station (Point) from the cached location set | station point inside box (in memory, not SQL) | – (400: no time dimension) | – (400) | ✓ cached station property names | ✓ | – | ✓ |
 | PostGIS events | — no `FeatureEngine` (EDR area + WMS only; Features items = #503) — | | | | — | | | |
 | BUFR | one station (Point) from the observation store; properties `wigos_station_identifier`, `name`, `elevation`, `first_report`, `last_report`, `report_count` | station point inside box | station has ≥ 1 report inside the interval; EDR `/locations?datetime=` lists the same stations, from the same code (#932) | ✓ last_report, first_report, report_count, name | ✓ name, wigos_station_identifier, elevation, first_report, last_report, report_count | ✓ | ✓ (oldest → newest report held) | ✓ (snapshot version) |
@@ -326,10 +338,14 @@ latitude. `area_km2`, severity and flash density use that physical area;
 tracking distances and speeds use local latitude. Working resolution depends
 on the source and configured pixel budget.
 
-BUFR decoding supports compressed character fields, operator 208, and numeric
-fields through 64 bits. Unsupported operators or unknown national descriptors
-skip the affected message (counted in `bufr_decode_failures_total`); other
-messages in the same file remain available. See
+BUFR decoding supports compressed character fields and delayed replication,
+operators 203 (uncompressed), 204 and 208, numeric fields through 64 bits,
+SYNOP radiation widths of master tables before version 14, and DWD local
+tables 1–8 (#1008). Station reports of one station, time and position from
+several messages of one bulletin merge into one row. Unsupported operators or unknown
+national descriptors skip the affected message (counted in
+`bufr_decode_failures_total` by `kind`); other messages in the same file
+remain available. See
 [`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).
 
 ### HTML workbench
