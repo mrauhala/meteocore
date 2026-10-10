@@ -652,6 +652,32 @@ fn empty_source_is_loaded_but_has_no_records() {
     assert_eq!(eng.feature_count(), 0);
 }
 
+/// #1001: before the first alert arrives, the standard CAP fields are still
+/// filterable — a query on them is an empty match, not an unknown property.
+#[test]
+fn empty_source_keeps_standard_cap_fields_filterable() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-empty").unwrap();
+    let filterables = eng.filterables();
+    for name in [
+        "status", "msgType", "scope", "severity", "event", "areaDesc",
+    ] {
+        assert!(filterables.contains(name), "{name}");
+    }
+    let page = eng
+        .get_features(&FeatureQuery {
+            property_filters: vec![
+                ("status".into(), "Actual".into()),
+                ("scope".into(), "Public".into()),
+            ],
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.number_matched, 0);
+    assert_eq!(page.number_returned, 0);
+}
+
 fn instant(t: DateTime<Utc>) -> DatetimeInterval {
     DatetimeInterval {
         start: Some(t),

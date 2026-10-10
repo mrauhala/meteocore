@@ -21,6 +21,61 @@ use crate::supersede::AlertKey;
 /// Cap on advertised TIME-dimension values (keeps WMS GetCapabilities bounded).
 const MAX_TIME_VALUES: usize = 256;
 
+/// Every property name [`build_properties`] can emit from the fixed CAP
+/// schema, plus the engine's derived fields (#1001). These stay filterable
+/// whatever alerts the catalog holds: a standard field that no held alert
+/// carries matches nothing (200, zero features), never an unknown-property
+/// 400. Producer `<parameter>`s and `<eventCode>`s add their names from the
+/// data on top. A producer parameter never takes one of these names, even on
+/// an alert that omits the field: it is namespaced `parameter:<valueName>`.
+/// Adding a standard key to `build_properties` means adding it here: a debug
+/// assertion there rejects an unlisted key, and
+/// `standard_properties_are_exactly_what_a_complete_alert_emits` rejects a
+/// listed name nothing emits.
+const STANDARD_PROPERTIES: &[&str] = &[
+    // <alert>
+    "identifier",
+    "sender",
+    "sent",
+    "status",
+    "msgType",
+    "scope",
+    // <info>
+    "language",
+    "category",
+    "event",
+    "responseType",
+    "urgency",
+    "severity",
+    "certainty",
+    "effective",
+    "onset",
+    "expires",
+    "senderName",
+    "headline",
+    "description",
+    "instruction",
+    "web",
+    // <area>
+    "areaDesc",
+    // derived by this engine
+    "active_until",
+    "radius_km",
+    "geometry_source",
+    "awareness_type_code",
+];
+
+/// [`STANDARD_PROPERTIES`] as the shared catalog type, built once.
+static STANDARD_FILTERABLES: std::sync::LazyLock<ds_core::feature::FilterableProperties> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(
+            STANDARD_PROPERTIES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        )
+    });
+
 /// Resolved engine knobs passed into [`Catalog::build`].
 #[derive(Debug, Clone)]
 pub struct BuildConfig {
@@ -125,7 +180,7 @@ impl Catalog {
     pub fn empty(parameter: &str, as_of: DateTime<Utc>) -> Self {
         Catalog {
             records: Vec::new(),
-            filterables: Arc::new(["awareness_type_code".to_string()].into_iter().collect()),
+            filterables: STANDARD_FILTERABLES.clone(),
             id_index: HashMap::new(),
             tree: RTree::new(),
             spatial_extent: None,
@@ -261,11 +316,12 @@ impl Catalog {
         let temporal_extent = compute_temporal_extent(&records, as_of);
         let info = Arc::new(base_raster_info(parameter, spatial_extent, times));
 
+        // Producer names come from the data; the standard schema (including
+        // the derived `awareness_type_code`) stays queryable even when no held
+        // alert carries a field, or the collection is empty (#1001).
         let mut filterables =
             ds_core::feature::property_names(records.iter().map(|r| r.properties.as_ref()));
-        // A derived, known property stays queryable even when no current
-        // alerts have a valid code (or the collection is empty).
-        Arc::make_mut(&mut filterables).insert("awareness_type_code".into());
+        Arc::make_mut(&mut filterables).extend(STANDARD_FILTERABLES.iter().cloned());
         Catalog {
             filterables,
             records,
@@ -560,9 +616,9 @@ fn circle_ring(c: &CapCircle, segments: u32) -> Vec<[f64; 2]> {
 }
 
 /// Every standard property goes in here, BEFORE the producer pairs at the
-/// end — the pairs' anti-shadowing check is `p.contains_key`, so a standard
-/// key inserted by a caller afterwards would silently overwrite a parameter
-/// of the same name.
+/// end, and its name in [`STANDARD_PROPERTIES`]: that list is both the
+/// always-advertised filterables and the names a producer parameter is
+/// namespaced away from, present on this alert or not.
 fn build_properties(
     alert: &CapAlert,
     info: &CapInfo,
@@ -638,6 +694,16 @@ fn build_properties(
         };
         p.insert("awareness_type_code".into(), value);
     }
+    // Every key so far is a standard one. A key missing from the list would
+    // drop out of the filterables whenever no held alert carries it (#1001);
+    // this trips in any debug test that builds an alert with that field.
+    debug_assert!(
+        p.keys().all(|k| STANDARD_PROPERTIES.contains(&k.as_str())),
+        "build_properties emitted a standard key missing from STANDARD_PROPERTIES: {:?}",
+        p.keys()
+            .filter(|k| !STANDARD_PROPERTIES.contains(&k.as_str()))
+            .collect::<Vec<_>>()
+    );
 
     // Producer-defined valueName/value pairs (CAP §3.2.2). `<parameter>`s
     // are exposed under their own valueName — MeteoAlarm clients expect
@@ -646,13 +712,14 @@ fn build_properties(
     // too. `<eventCode>`s are namespaced (`eventCode:<valueName>`) because
     // their names are terse system ids (`OET`, `SAME`). A name that repeats
     // (MeteoAlarm's `impacts`) becomes a List in document order; a parameter
-    // whose name collides with a standard property above is namespaced as
-    // `parameter:<valueName>` rather than shadowing it.
+    // whose name is a standard property (even one this alert omits:
+    // `headline=` always filters the CAP headline) or an event code key is
+    // namespaced as `parameter:<valueName>` rather than taking it.
     for (key, value) in group_pairs(&info.event_codes, |n| format!("eventCode:{n}")) {
         p.insert(key, value);
     }
     for (key, value) in group_pairs(&info.parameters, |n| n.to_string()) {
-        let key = if p.contains_key(&key) || key == "awareness_type_code" {
+        let key = if p.contains_key(&key) || STANDARD_PROPERTIES.contains(&key.as_str()) {
             format!("parameter:{key}")
         } else {
             key
@@ -1121,6 +1188,97 @@ mod tests {
         assert_eq!(
             empty.records[0].properties["parameter:awareness_type_code"],
             PropertyValue::String("3".into())
+        );
+    }
+
+    /// Every CAP field `build_properties` reads, once, plus a circle area
+    /// (`radius_km`, `geometry_source`) and an awareness type.
+    const COMPLETE_DOC: &str = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+      <identifier>FULL-1</identifier><sender>warnings@example.test</sender>
+      <sent>2026-06-15T09:00:00Z</sent><status>Actual</status><msgType>Alert</msgType>
+      <scope>Public</scope>
+      <info><language>en</language><category>Met</category><event>Storm</event>
+        <responseType>Prepare</responseType><urgency>Expected</urgency>
+        <severity>Severe</severity><certainty>Likely</certainty>
+        <effective>2026-06-15T09:00:00Z</effective><onset>2026-06-15T10:00:00Z</onset>
+        <expires>2026-06-15T16:00:00Z</expires><senderName>Example Met Service</senderName>
+        <headline>Storm warning</headline><description>Strong winds.</description>
+        <instruction>Stay indoors.</instruction><web>https://example.test/w/1</web>
+        <parameter><valueName>awareness_type</valueName><value>1; Wind</value></parameter>
+        <area><areaDesc>Ring</areaDesc><circle>60.0,24.0 10.0</circle></area>
+      </info></alert>"#;
+
+    fn standard_names() -> BTreeSet<String> {
+        STANDARD_PROPERTIES.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The drift guard for #1001: the always-advertised list is exactly the
+    /// non-producer keys a complete alert gets — a new standard key missing
+    /// from `STANDARD_PROPERTIES`, or a listed name nothing emits, fails here.
+    #[test]
+    fn standard_properties_are_exactly_what_a_complete_alert_emits() {
+        let alerts = parse_document(COMPLETE_DOC).unwrap();
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        let emitted: BTreeSet<String> = cat.records[0]
+            .properties
+            .keys()
+            .filter(|k| *k != "awareness_type")
+            .cloned()
+            .collect();
+        assert_eq!(emitted, standard_names());
+        assert_eq!(
+            standard_names().len(),
+            STANDARD_PROPERTIES.len(),
+            "duplicates"
+        );
+    }
+
+    /// #1001: an empty catalog, and one whose alerts omit optional fields,
+    /// still advertise the whole standard schema, with producer names on top.
+    #[test]
+    fn standard_schema_stays_filterable_whatever_the_alerts_carry() {
+        let as_of = at(2026, 6, 15, 12);
+        let empty = Catalog::empty("severity", as_of);
+        assert_eq!(*empty.filterables, standard_names());
+        let built_empty = Catalog::build(&[], &cfg(), "cap", "severity", as_of);
+        assert_eq!(*built_empty.filterables, standard_names());
+
+        let mut alerts = parse_document(DOC).unwrap();
+        alerts[0].infos[0].parameters =
+            vec![("awareness_level".into(), "2; yellow; Moderate".into())];
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", as_of);
+        for absent in [
+            "msgType",
+            "scope",
+            "web",
+            "radius_km",
+            "awareness_type_code",
+        ] {
+            assert!(!cat.records[0].properties.contains_key(absent), "{absent}");
+        }
+        assert!(cat.filterables.is_superset(&standard_names()));
+        assert!(cat.filterables.contains("awareness_level"));
+    }
+
+    /// A standard name is advertised as the CAP field, so a producer
+    /// parameter cannot take it on an alert that omits the field.
+    #[test]
+    fn producer_parameter_never_takes_an_absent_standard_name() {
+        let mut alerts = parse_document(DOC).unwrap();
+        alerts[0].infos[0].parameters = vec![
+            ("headline".into(), "producer text".into()),
+            ("awareness_level".into(), "2; yellow; Moderate".into()),
+        ];
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        let properties = &cat.records[0].properties;
+        assert!(!properties.contains_key("headline"));
+        assert_eq!(
+            properties["parameter:headline"],
+            PropertyValue::String("producer text".into())
+        );
+        assert_eq!(
+            properties["awareness_level"],
+            PropertyValue::String("2; yellow; Moderate".into())
         );
     }
 
