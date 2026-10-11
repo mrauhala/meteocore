@@ -259,7 +259,7 @@ at boot and ignores the state store.
   cold start: N reports received", degraded — wherever it would otherwise
   be `Ready` (a broker blip inside `degrade_after_secs` stays warming).
 - **The default `warmup` is the shorter of `retention` and CAP's PT24H**
-  (`wis2_warmup` in `engine.rs`, decided 2026-10-11). The store is
+  (`wis2_warmup` in `engine.rs`, #1053). The store is
   complete only once it holds a full retention window (observations are
   never republished), but defaulting to `retention` kept a 7-day store
   `degraded` for about a week after every cold start. So with a retention
