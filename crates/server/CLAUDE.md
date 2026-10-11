@@ -265,8 +265,8 @@ need no reload pruning.
   Icechunk read admission. Re-enabling preserves the current view; the explicit
   "Zoom to extent" action remains animated.
 - `GET /robots.txt` (`src/robots.rs`) lets crawlers reach the landing pages,
-  the collection lists and each collection's page, at `/` and under `/edr`,
-  and nothing below a collection or anywhere else. A new crawlable root or
+  `/api`, `/conformance`, the collection lists and each collection's page, at
+  `/` and under `/edr`, and nothing below a collection or anywhere else. A new crawlable root or
   catalog needs its rules there; the tests check each path with Google's
   matcher (the `robotstxt` crate).
 

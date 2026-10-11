@@ -357,7 +357,7 @@ the shared root serves all three):
 /admin/collections/reload                      POST: reload config and swap engines
 /health                                        Per-collection health status
 /metrics                                       Prometheus metrics (text format)
-/robots.txt                                    Crawler rules: landing pages, collection lists and collection pages only
+/robots.txt                                    Crawler rules: landing pages, API, conformance, collection lists and collection pages only
 ```
 
 ### Map requests (OGC API - Maps)

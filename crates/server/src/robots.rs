@@ -1,10 +1,11 @@
-//! `GET /robots.txt`: crawlers may index the landing pages, the collection
-//! catalogs and each collection's own page, at the shared OGC API root and
-//! under `/edr`. Everything below a collection is off limits: items, data
-//! queries, model runs, maps and tiles are generated per request, and an
-//! archive store's run list alone links thousands of them. So is every other
-//! path, including the per-API services the landing page no longer
-//! advertises, WMS, 3D Tiles, `/preview`, `/health` and `/metrics`.
+//! `GET /robots.txt`: crawlers may index the landing pages, the API
+//! definitions, the conformance declarations, the collection catalogs and
+//! each collection's own page, at the shared OGC API root and under `/edr`.
+//! Everything below a collection is off limits: items, data queries, model
+//! runs, maps and tiles are generated per request, and an archive store's run
+//! list alone links thousands of them. So is every other path, including the
+//! per-API services the landing page no longer advertises, WMS, 3D Tiles,
+//! `/preview`, `/health` and `/metrics`.
 //!
 //! The paths assume the server answers at the host root, as robots.txt
 //! itself must. When adding a crawlable root or catalog, add its rules here
@@ -18,13 +19,16 @@ use axum::response::{IntoResponse, Response};
 /// `Disallow`s come before the `Allow`s that also match those paths, and
 /// the catch-all `Disallow: /` comes last.
 pub const ROBOTS_TXT: &str = "\
-# MeteoCore: crawl the landing pages, the collection lists and each
-# collection's own page, nothing below a collection and nothing else.
+# MeteoCore: crawl the landing pages, API definitions, conformance, the
+# collection lists and each collection's own page, nothing below a
+# collection and nothing else.
 User-agent: *
 Disallow: /collections/*/
 Disallow: /edr/collections/*/
 Allow: /$
 Allow: /?
+Allow: /api
+Allow: /conformance
 Allow: /collections$
 Allow: /collections?
 Allow: /collections/
@@ -32,6 +36,8 @@ Allow: /edr$
 Allow: /edr?
 Allow: /edr/$
 Allow: /edr/?
+Allow: /edr/api
+Allow: /edr/conformance
 Allow: /edr/collections$
 Allow: /edr/collections?
 Allow: /edr/collections/
@@ -63,10 +69,15 @@ mod tests {
     }
 
     #[test]
-    fn landing_pages_catalogs_and_collection_pages_are_crawlable() {
+    fn landing_pages_documents_catalogs_and_collection_pages_are_crawlable() {
         for path in [
             "/",
             "/?f=json",
+            "/api",
+            "/api?f=html",
+            "/api/docs",
+            "/conformance",
+            "/conformance?f=json",
             "/collections",
             "/collections?f=html",
             "/collections?q=radar&f=html",
@@ -75,6 +86,10 @@ mod tests {
             "/edr",
             "/edr/",
             "/edr?f=json",
+            "/edr/api",
+            "/edr/api/docs",
+            "/edr/conformance",
+            "/edr/conformance?f=html",
             "/edr/collections",
             "/edr/collections?f=json",
             "/edr/collections/dwd-icon-eu",
@@ -107,16 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn other_services_and_documents_are_not_crawlable() {
+    fn other_services_are_not_crawlable() {
         for path in [
-            "/api",
-            "/api/docs",
-            "/conformance",
             "/tileMatrixSets",
             "/collectionsx",
-            "/edr/api",
-            "/edr/conformance",
             "/edrx",
+            "/features/api",
+            "/features/conformance",
             "/features/collections",
             "/features/collections/cap-alerts",
             "/maps/collections/radar",
