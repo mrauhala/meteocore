@@ -264,6 +264,11 @@ need no reload pruning.
   the initial flight requests intermediate zoom levels and can exhaust cold
   Icechunk read admission. Re-enabling preserves the current view; the explicit
   "Zoom to extent" action remains animated.
+- `GET /robots.txt` (`src/robots.rs`) lets crawlers reach the landing pages,
+  `/api`, `/conformance`, the collection lists and each collection's page, at
+  `/` and under `/edr`, and nothing below a collection or anywhere else. A new crawlable root or
+  catalog needs its rules there; the tests check each path with Google's
+  matcher (the `robotstxt` crate).
 
 ## Engine state store (`[server] state_dir`, #1000, #1002)
 
