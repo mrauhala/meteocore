@@ -15,7 +15,7 @@
 # the pair again.
 # Keep the Rust version current with the stable toolchain CI and local
 # builds use, at the newest `rust:<x.y>-slim-trixie` tag published.
-FROM rust:1.98-slim-trixie AS chef
+FROM rust:1.99-slim-trixie AS chef
 WORKDIR /build
 RUN cargo install cargo-chef --locked --version 0.1.71
 
