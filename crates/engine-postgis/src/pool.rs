@@ -101,6 +101,8 @@ pub fn normalize_dsn(dsn: &str) -> Result<(PgConfig, PoolKey, Option<String>), R
         .first()
         .map(|h| match h {
             Host::Tcp(s) => s.clone(),
+            // tokio-postgres has Unix-socket hosts only on Unix targets.
+            #[cfg(unix)]
             Host::Unix(p) => p.to_string_lossy().into_owned(),
         })
         .unwrap_or_else(|| "localhost".to_string());
