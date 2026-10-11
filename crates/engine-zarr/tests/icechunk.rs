@@ -6,7 +6,6 @@
 
 #![cfg(feature = "icechunk")]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
@@ -38,7 +37,8 @@ async fn write_repo(dir: &std::path::Path) {
     let storage = icechunk::new_local_filesystem_storage(dir)
         .await
         .expect("local icechunk storage");
-    let repo = Repository::create(None, storage, HashMap::new(), Default::default(), true)
+    let repo = Repository::create(storage)
+        .execute()
         .await
         .expect("create repo");
     let store = Arc::new(AsyncIcechunkStore::new(
@@ -206,7 +206,8 @@ async fn probe_aifs_schema() {
     )
     .await
     .expect("s3 storage");
-    let repo = Repository::open(None, storage, HashMap::new())
+    let repo = Repository::open(storage)
+        .execute()
         .await
         .expect("open repo");
     let session = repo

@@ -62,7 +62,14 @@ impl Source {
                 }),
                 ..Default::default()
             };
-            Repository::open(Some(options), storage, HashMap::new())
+            // An empty credential map authorizes no virtual chunk container,
+            // so chunks a repo references in other buckets stay unreadable.
+            // It is also the builder's default; spelled out so a changed
+            // upstream default cannot widen access.
+            Repository::open(storage)
+                .config(options)
+                .authorize_virtual_chunk_access(HashMap::new())
+                .execute()
                 .await
                 .map_err(|e| cfg_err(format!("failed to open Icechunk repository: {e}")))
         })?;
