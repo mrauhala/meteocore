@@ -1071,8 +1071,8 @@ async fn a_long_run_axis_pages_the_instances_list() {
     );
 }
 
-/// The instances list runs newest first across page boundaries (decided
-/// 2026-10-11: on an archive the newest run was on the last page). A
+/// The instances list runs newest first across page boundaries (#1054:
+/// on an archive the newest run was on the last page). A
 /// boundary that falls on the archive's gap, reached through `next`: the
 /// page before it ends with the run after the gap, the page after it starts
 /// with the run before the gap, every id strictly older than the one before

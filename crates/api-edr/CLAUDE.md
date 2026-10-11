@@ -66,7 +66,7 @@ owns the instance-id string form:
   non-empty.
 - Unknown instance id → 404 (`select_run` returns `None`).
 - `/instances` lists runs **newest first** (descending reference time,
-  decided 2026-10-11: on an archive the latest run was on the last page).
+  #1054: on an archive the latest run was on the last page).
   Engines keep answering ascending (`get_instances`,
   `instance_reference_times`, `build_instances`), and WMS `reference_time`
   (`RasterInfo.reference_times`) stays ascending; run selection
