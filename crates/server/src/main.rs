@@ -2,6 +2,7 @@ mod admin;
 mod auto;
 mod colormaps;
 mod preview;
+mod robots;
 mod sld;
 mod watcher;
 
@@ -835,6 +836,7 @@ async fn main() {
             "/edr/",
             get(api_edr::handlers::landing_page).with_state(edr_swap),
         )
+        .route("/robots.txt", get(robots::handler))
         .route(
             "/health",
             get(admin::health_handler).with_state(server_state.clone()),
