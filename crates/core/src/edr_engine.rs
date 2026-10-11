@@ -40,7 +40,9 @@ pub trait EdrEngine: Send + Sync {
     }
 
     /// The forecast model runs this engine exposes as OGC API - EDR
-    /// *instances*, ascending by reference time (latest last).
+    /// *instances*, ascending by reference time (latest last). The EDR
+    /// `/instances` list sorts them newest first itself; engines keep this
+    /// order.
     ///
     /// Default: empty — the engine has no model-run concept and exposes only a
     /// single time axis (observations, analyses, a single forecast). Forecast
@@ -85,7 +87,8 @@ pub trait EdrEngine: Send + Sync {
     }
 
     /// The reference times of [`Self::get_instances`], ascending: the run
-    /// axis without any run's valid times (#1006).
+    /// axis without any run's valid times (#1006). The instances list sorts
+    /// them newest first before paging.
     ///
     /// Only the instances list reads it, to count and page the runs
     /// ([`crate::time_axis::is_long`]), then builds just the page's runs

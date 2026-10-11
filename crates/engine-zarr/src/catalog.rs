@@ -149,7 +149,7 @@ impl Catalog {
         }
         // The shared selection rule (`None` ⇒ latest, `Some` ⇒ exact) — the
         // same call GRIB and QueryData make, so "latest" cannot drift from
-        // what `/instances` lists last.
+        // what `/instances` lists first.
         match instances::select_run(&self.runs, reference_time) {
             Some((_, &idx)) => Ok(Some(idx)),
             None => Err(DataServerError::ReferenceTimeNotFound(format!(

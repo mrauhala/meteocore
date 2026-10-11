@@ -506,10 +506,11 @@ async fn instances_list_has_both_runs() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    // Ascending by reference time, latest last (the build_instances contract).
+    // Newest first, descending by reference time, although the engine
+    // answers ascending (the build_instances contract).
     assert_eq!(
         ids,
-        ["2026-06-07T00:00:00Z", "2026-06-07T12:00:00Z"],
+        ["2026-06-07T12:00:00Z", "2026-06-07T00:00:00Z"],
         "order: {ids:?}"
     );
 }
@@ -537,7 +538,7 @@ async fn instance_ids_are_rfc3339_in_ids_titles_and_links() {
         .as_array()
         .unwrap()
         .iter()
-        .zip(["2026-06-07T00:00:00Z", "2026-06-07T12:00:00Z"])
+        .zip(["2026-06-07T12:00:00Z", "2026-06-07T00:00:00Z"])
     {
         assert_eq!(instance["id"], id);
         assert_eq!(instance["title"], "fc");
@@ -976,9 +977,9 @@ async fn a_long_run_axis_stays_out_of_collection_metadata() {
 
 /// A long run axis pages its instances list, 100 runs a page without
 /// `limit`, with `numberMatched`, `numberReturned` and `next`/`prev` links
-/// that walk it in ascending order. The archive once answered 95 MB here;
-/// a page is bounded, and `ArchiveMock::get_instances` panics, so only the
-/// page's runs are built.
+/// that walk it newest first, toward the oldest run. The archive once
+/// answered 95 MB here; a page is bounded, and `ArchiveMock::get_instances`
+/// panics, so only the page's runs are built.
 #[tokio::test]
 async fn a_long_run_axis_pages_the_instances_list() {
     let runs = ArchiveMock::runs();
@@ -1009,8 +1010,12 @@ async fn a_long_run_axis_pages_the_instances_list() {
         .map(|i| i["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids.len(), 100);
-    assert_eq!(ids[0], "2021-05-01T00:00:00Z");
-    assert_eq!(ids[99], ds_core::instances::format_instance_id(runs[99]));
+    // The first page holds the latest runs, newest first.
+    assert_eq!(ids[0], "2026-10-09T18:00:00Z");
+    assert_eq!(
+        ids[99],
+        ds_core::instances::format_instance_id(runs[runs.len() - 100])
+    );
     let list = "/edr/collections/archive/instances";
     assert_eq!(link(&first, "self"), Some(&*format!("{list}?limit=100")));
     assert_eq!(
@@ -1029,7 +1034,7 @@ async fn a_long_run_axis_pages_the_instances_list() {
         "archive instances page",
     );
 
-    // The last page, reached by offset: the newest runs, a `prev` link and
+    // The last page, reached by offset: the oldest runs, a `prev` link and
     // no `next`.
     let offset = runs.len() - 30;
     let (status, last) = get(&format!(
@@ -1040,7 +1045,7 @@ async fn a_long_run_axis_pages_the_instances_list() {
     assert_eq!(last["numberReturned"], 30);
     assert_eq!(
         last["instances"].as_array().unwrap().last().unwrap()["id"],
-        "2026-10-09T18:00:00Z"
+        "2021-05-01T00:00:00Z"
     );
     assert_eq!(link(&last, "next"), None);
     assert_eq!(
@@ -1066,6 +1071,85 @@ async fn a_long_run_axis_pages_the_instances_list() {
     );
 }
 
+/// The instances list runs newest first across page boundaries (decided
+/// 2026-10-11: on an archive the newest run was on the last page). A
+/// boundary that falls on the archive's gap, reached through `next`: the
+/// page before it ends with the run after the gap, the page after it starts
+/// with the run before the gap, every id strictly older than the one before
+/// it, and `prev` leads back to the same page. The HTML page lists its runs
+/// in the same order.
+#[tokio::test]
+async fn instances_pages_run_newest_first_across_page_boundaries() {
+    let newest_first: Vec<String> = ArchiveMock::runs()
+        .into_iter()
+        .rev()
+        .map(ds_core::instances::format_instance_id)
+        .collect();
+    let ids = |page: &Value| -> Vec<String> {
+        page["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // The run just before the gap, 2022-01-01 00Z and 06Z.
+    let before_gap = newest_first
+        .iter()
+        .position(|id| id == "2021-12-31T18:00:00Z")
+        .unwrap();
+    assert_eq!(newest_first[before_gap - 1], "2022-01-01T12:00:00Z");
+
+    let offset = before_gap - 10;
+    let (status, newer) = get(&format!(
+        "/collections/archive/instances?limit=10&offset={offset}"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&newer), newest_first[offset..before_gap]);
+    assert_eq!(ids(&newer).last().unwrap(), "2022-01-01T12:00:00Z");
+
+    // Follow `next`, as a client walks the list.
+    let next = link(&newer, "next").expect("a next page");
+    let (status, older) = get(next.strip_prefix("/edr").unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&older), newest_first[before_gap..before_gap + 10]);
+    assert_eq!(ids(&older)[0], "2021-12-31T18:00:00Z");
+
+    // Descending through the boundary: each run older than the one before.
+    let walked: Vec<DateTime<Utc>> = ids(&newer)
+        .iter()
+        .chain(&ids(&older))
+        .map(|id| ds_core::instances::parse_instance_id(id).unwrap())
+        .collect();
+    assert!(
+        walked.windows(2).all(|w| w[0] > w[1]),
+        "not newest first: {walked:?}"
+    );
+
+    // `prev` from the older page is the newer page again.
+    assert_eq!(link(&older, "prev"), link(&newer, "self"));
+
+    // The HTML page lists the same runs in the same order.
+    let (status, _, html) = get_raw(
+        &format!("/collections/archive/instances?limit=10&offset={offset}&f=html"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let positions: Vec<usize> = ids(&newer)
+        .iter()
+        .map(|id| {
+            html.find(&format!("<code>{id}</code>"))
+                .unwrap_or_else(|| panic!("{id} not on the page"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "HTML order differs from JSON: {positions:?}"
+    );
+}
+
 /// `limit` pages a short list too, and an invalid request is a 400 naming
 /// the problem, never the whole list as if it worked.
 #[tokio::test]
@@ -1074,13 +1158,14 @@ async fn instances_paging_parameters() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page["numberMatched"], 2);
     assert_eq!(page["numberReturned"], 1);
-    assert_eq!(page["instances"][0]["id"], "2026-06-07T00:00:00Z");
+    // Newest first: the latest run is the first page.
+    assert_eq!(page["instances"][0]["id"], "2026-06-07T12:00:00Z");
     assert_eq!(
         link(&page, "next"),
         Some("/edr/collections/fc/instances?limit=1&offset=1")
     );
     let (_, second) = get("/collections/fc/instances?limit=1&offset=1").await;
-    assert_eq!(second["instances"][0]["id"], "2026-06-07T12:00:00Z");
+    assert_eq!(second["instances"][0]["id"], "2026-06-07T00:00:00Z");
     assert_eq!(link(&second, "next"), None);
     // Without `limit` a short list stays whole, without paging members.
     let (_, whole) = get("/collections/fc/instances").await;

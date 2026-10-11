@@ -124,7 +124,7 @@ No executable documentation assets or validation requests use a CDN (#587).
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG and GeoJSON rejected |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667); PNG rejected; EDR GeoJSON too on station collections |
 | `trajectory` | `/collections/{id}/trajectory` | ✓ | gridded engines (GRIB, QueryData, Zarr): values sampled along a WKT `LINESTRING`, `LINESTRING Z`, `M` or `ZM` (Z = level, M = Unix epoch seconds), CoverageJSON `Trajectory` only (PNG and GeoJSON → 400), see [Trajectory](#trajectory-926); PVOL sites: a 2-D `LINESTRING` is a *vertical cross-section* (`Section`, also PNG, never GeoJSON). `MULTILINESTRING` not supported |
-| `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); the id is the run's RFC 3339 reference time, e.g. `2026-06-07T06:00:00Z` (see [Instance ids](#instance-ids)); instance-scoped queries: position, area, radius, cube; the list pages with `limit` + `offset`, and on its own past 500 runs (see [Long run axes](#long-run-axes)) |
+| `instances` | `/collections/{id}/instances`, `/instances/{instanceId}` | ✓ | forecast model runs (`ds_core::instances`); the id is the run's RFC 3339 reference time, e.g. `2026-06-07T06:00:00Z` (see [Instance ids](#instance-ids)); instance-scoped queries: position, area, radius, cube; the list runs newest first (see [Instance order](#instance-order)) and pages with `limit` + `offset`, and on its own past 500 runs (see [Long run axes](#long-run-axes)) |
 | `cube` | `/collections/{id}/cube` | ✓ | `bbox` required: CRS84, four numbers, or six whose vertical pair is a `z` interval that an explicit `z` overrides. `z` optional, in the full `z` grammar below: absent → every level; ignored, like the six-number pair, on a collection without a vertical extent. `datetime` as on every query, a list included: one cube per instant, joined along `t` into one `Grid`. `resolution-x`/`-y`/`-z` (`resolution-z` without a vertical extent is a 400), `crs` (CRS84 only), `f` (CoverageJSON or HTML: `PNG` and `GeoJSON` are 400). An unknown or repeated query parameter is a 400 naming the accepted ones. Response: a `Grid` with `t`, `z`, `y`, `x` axes, ≤ 1M values across timesteps × levels × cells × parameters → 400. `data_queries.cube.link.variables.height_units` is the vertical axis unit. Only collections with vertical levels offer it: GRIB pressure and model-level views (#925) |
 | `corridor` | — | ✗ | not in the trait or the router (`corridor-width`/`-height` documented as follow-up on trajectory) |
 | `items` | `/collections/{id}/items`, `/items/{itemId}` | ✓ | GeoJSON features of the collection's `FeatureEngine`, for EDR collections whose engine has one (see [Items](#items)); `bbox`, `datetime`, `limit` + `offset` paging |
@@ -230,6 +230,23 @@ taken from the collection document's own links (they answer for the latest
 run; each run's own end points are in its entry of `instances`). A
 collection without runs answers the same links around an empty list.
 
+### Instance order
+
+The instances list runs newest first: descending by reference time, the
+latest run first, whether it is answered whole or paged. Its first page
+holds the latest runs, `next` walks toward the oldest and `prev` back, and
+the HTML page lists the runs in the same order. Through 0.11.0 the list
+was oldest first, so on an archive the latest run was on the last page; a
+client that took the last entry as the latest run now finds it first.
+
+Only this list changed order. The engines still answer their runs ascending
+(`EdrEngine::get_instances` and `instance_reference_times`, built with
+`ds_core::instances::build_instances`), and the handler sorts them
+descending for the list alone. Run selection (`None` ⇒ the latest run, for
+every query without an instance) picks by reference time and has no order;
+the WMS `reference_time` dimension and its Annex C ranges
+(`RasterInfo.reference_times`) stay ascending.
+
 ### Long run axes
 
 An archive store can expose every historical run as an instance: one had
@@ -238,15 +255,17 @@ worker (#1006). A run axis longer than 500 runs
 (`ds_core::time_axis::MAX_LISTED_VALUES`, the limit WMS lists to as well)
 therefore pages its instances list instead of answering every run at once:
 
-- **Paging.** 100 runs a page without `limit`, ascending by
-  reference time, with `numberMatched`, `numberReturned`, `self` and
-  `alternate` naming the page, and `next`/`prev` links, as `/locations` and
-  `/collections` page. `limit` (1 to 500; larger values are clamped to 500)
-  and `offset` page any list, a short one included; `offset` without `limit`
-  is a 400, and so is any other parameter but `f`. EDR 1.2 defines no
-  paging for this resource; the parameters are the `/collections` paging
-  extension, documented in `/api`. Without `limit` a list of at most 500 runs
-  is answered whole, byte-identical to before. The HTML page has a pager.
+- **Paging.** 100 runs a page without `limit`, newest first (see
+  [Instance order](#instance-order)), with `numberMatched`,
+  `numberReturned`, `self` and `alternate` naming the page, and
+  `next`/`prev` links, as `/locations` and `/collections` page. `limit`
+  (1 to 500; larger values are clamped to 500) and `offset` page any list,
+  a short one included; `offset` counts from the latest run. `offset`
+  without `limit` is a 400, and so is any other parameter but `f`. EDR 1.2
+  defines no paging for this resource; the parameters are the
+  `/collections` paging extension, documented in `/api`. Without `limit` a
+  list of at most 500 runs is answered whole, newest first like a page.
+  The HTML page has a pager.
 - **Cost.** Only the page's runs are built: the handler reads the run axis
   without any valid times (`EdrEngine::instance_reference_times`, which
   GRIB, QueryData, Zarr and the nowcast answer from the keys of their run

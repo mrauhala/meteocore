@@ -107,6 +107,11 @@ pub fn select_run<T>(
 /// Build the [`RunInfo`] list (ascending by reference time, latest last) from a
 /// reference-time-keyed run map, deriving each run's valid times via `valid_times`.
 ///
+/// Keep it ascending: engines answer
+/// [`EdrEngine::get_instances`](crate::edr_engine::EdrEngine::get_instances)
+/// with it, and only the EDR `/instances` list shows the runs newest first,
+/// sorting them itself.
+///
 /// Engines differ only in how they enumerate a run's valid times (GRIB:
 /// `reference_time + step`; QueryData: the file's time axis), so they pass that
 /// as a closure and share everything else.
