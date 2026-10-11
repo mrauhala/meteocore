@@ -45,8 +45,10 @@ thiserror = "2"
 # reuse the same `object_store` crate `ds-storage` already links. The
 # backend-forwarding features were published in zarrs_icechunk 0.5.1; 2.1.0 is
 # the first release carrying the `object-store-s3`-without-`s3` build fix
-# (earth-mover/icechunk#2190).
-icechunk = { version = "2.1", optional = true, default-features = false, features = [
+# (earth-mover/icechunk#2190). 2.3.0 replaced `Repository::open(config,
+# storage, credentials)` with the `RepositoryBuilder` this crate now uses
+# (earth-mover/icechunk#2445), so it is the floor.
+icechunk = { version = "2.3", optional = true, default-features = false, features = [
     "object-store-s3",
     "object-store-fs",
 ] }

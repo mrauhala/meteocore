@@ -30,8 +30,8 @@ async fn fixture_with_codecs(
     codecs: Vec<Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>>,
 ) -> Repository {
     let storage = icechunk::new_local_filesystem_storage(dir).await.unwrap();
-    let repo = Repository::create(
-        Some(RepositoryConfig {
+    let repo = Repository::create(storage)
+        .config(RepositoryConfig {
             inline_chunk_threshold_bytes: Some(0),
             caching: Some(icechunk::config::CachingConfig {
                 // The reader's cache_mb=0 must override this persisted setting.
@@ -39,14 +39,10 @@ async fn fixture_with_codecs(
                 ..Default::default()
             }),
             ..Default::default()
-        }),
-        storage,
-        HashMap::new(),
-        Default::default(),
-        true,
-    )
-    .await
-    .unwrap();
+        })
+        .execute()
+        .await
+        .unwrap();
     let store = Arc::new(AsyncIcechunkStore::new(
         repo.writable_session("main").await.unwrap(),
     ));
@@ -291,15 +287,12 @@ async fn cache_override_preserves_persisted_repository_settings() {
                 .unwrap(),
             )
             .unwrap();
-        let repo = Repository::create(
-            Some(persisted),
-            storage.clone(),
-            HashMap::new(),
-            Some(version),
-            true,
-        )
-        .await
-        .unwrap();
+        let repo = Repository::create(storage.clone())
+            .config(persisted)
+            .spec_version(version)
+            .execute()
+            .await
+            .unwrap();
         let original = repo.config().clone();
         drop(repo);
 
@@ -312,9 +305,7 @@ async fn cache_override_preserves_persisted_repository_settings() {
             assert_eq!(source.repo.config(), &expected);
         }
         // Opening a reader must not persist its per-server cache override.
-        let reopened = Repository::open(None, storage, HashMap::new())
-            .await
-            .unwrap();
+        let reopened = Repository::open(storage).execute().await.unwrap();
         assert_eq!(reopened.config(), &original);
     }
 }
