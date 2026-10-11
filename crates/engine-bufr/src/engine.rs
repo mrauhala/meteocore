@@ -125,12 +125,7 @@ impl BufrEngine {
             (None, Some(w)) => Source::Wis2(Box::new(Wis2Source::new(
                 w.clone(),
                 parse_iso8601_duration(&config.stale_after)?,
-                // The store is complete again once it has filled for one
-                // retention window; an explicit `warmup` overrides.
-                match &w.warmup {
-                    Some(_) => w.warmup_duration()?,
-                    None => retention,
-                },
+                wis2_warmup(w, retention)?,
             ))),
             _ => {
                 return Err(DataServerError::Config(format!(
@@ -674,6 +669,24 @@ impl BufrEngine {
             ranges,
         }))
     }
+}
+
+/// The resolved `[bufr.wis2] warmup`: as configured, else the shorter of
+/// `retention` and [`ds_core::config::DEFAULT_WIS2_WARMUP`] (`PT24H`,
+/// CAP's default). The store is complete only once it holds a full
+/// retention window, but waiting for that kept a collection with a 7-day
+/// retention `degraded` for about a week after a cold start; a retention
+/// under a day still warms up for its own window. An explicit `warmup`
+/// keeps its value, even longer than a day or than `retention`.
+fn wis2_warmup(
+    w: &Wis2Config,
+    retention: chrono::Duration,
+) -> Result<chrono::Duration, DataServerError> {
+    let warmup = w.warmup_duration()?;
+    Ok(match w.warmup {
+        Some(_) => warmup,
+        None => warmup.min(retention),
+    })
 }
 
 /// The state snapshot write policy of a WIS2 collection with warm-up
@@ -1317,12 +1330,76 @@ mod tests {
         status
     }
 
+    /// The default `warmup` is the shorter of `retention` and a day; an
+    /// explicit one keeps its value, whatever the retention.
     #[test]
-    fn warmup_defaults_to_the_retention_window() {
-        let e = BufrEngine::new(&wis2_config("PT6H", None), ID).unwrap();
-        assert_eq!(wis2(&e).warmup(), chrono::Duration::hours(6));
-        let e = BufrEngine::new(&wis2_config("PT6H", Some("PT2H")), ID).unwrap();
-        assert_eq!(wis2(&e).warmup(), chrono::Duration::hours(2));
+    fn warmup_defaults_to_the_shorter_of_retention_and_a_day() {
+        let warmup = |retention: &str, warmup: Option<&str>| {
+            let e = BufrEngine::new(&wis2_config(retention, warmup), ID).unwrap();
+            wis2(&e).warmup()
+        };
+        let hours = chrono::Duration::hours;
+        // A retention longer than a day: a day.
+        assert_eq!(warmup("P7D", None), hours(24));
+        assert_eq!(warmup("PT36H", None), hours(24));
+        // A day or shorter: the retention window itself.
+        assert_eq!(warmup("PT24H", None), hours(24));
+        assert_eq!(warmup("PT6H", None), hours(6));
+        // Explicit: kept, shorter or longer than the default.
+        assert_eq!(warmup("P7D", Some("PT2H")), hours(2));
+        assert_eq!(warmup("P7D", Some("P7D")), hours(7 * 24));
+        assert_eq!(warmup("PT6H", Some("PT12H")), hours(12));
+    }
+
+    /// The default drives health: with a 7-day retention a cold start is
+    /// `Ready` a day after the subscription came up, not a week later, and
+    /// a snapshot written more than a day ago restarts the warm-up.
+    #[test]
+    fn a_week_of_retention_warms_up_for_a_day_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config("P7D", None);
+        let a = BufrEngine::new(&cfg, ID).unwrap();
+        connected(&a);
+        put(&a, "A", hours_ago(30), 280.0);
+        let t0 = Utc::now();
+        wis2(&a).mark_filling(t0);
+        let later = |h| t0 + chrono::Duration::hours(h);
+        assert_eq!(
+            a.live_health_at(later(23)),
+            warming(1, WarmupCause::ColdStart)
+        );
+        assert_eq!(a.live_health_at(later(25)), Some(LiveStatus::Ready));
+
+        let warm_since = Utc::now() - chrono::Duration::hours(48);
+        let restore = |written_hours_ago: i64| {
+            let bytes = persist::encode(
+                ID,
+                &a.store.read().unwrap(),
+                &a.table,
+                WarmupClock {
+                    filling_since: Some(warm_since),
+                    cause: WarmupCause::ColdStart,
+                },
+                Utc::now() - chrono::Duration::hours(written_hours_ago),
+            )
+            .unwrap();
+            FileStateStore::new(dir.path())
+                .save(&format!("{ID}.bufr"), &bytes)
+                .unwrap();
+            let e = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+            assert_eq!(e.gauges(), (1, 1), "rows inside retention are kept");
+            wis2(&e).warmup_clock()
+        };
+        // Down for 20 hours: the clock is kept.
+        assert_eq!(restore(20).filling_since, Some(warm_since));
+        // Down for 30 hours: longer than the warm-up, which restarts.
+        assert_eq!(
+            restore(30),
+            WarmupClock {
+                filling_since: None,
+                cause: WarmupCause::LongOutage,
+            }
+        );
     }
 
     #[test]

@@ -1079,7 +1079,8 @@ pub struct BufrConfig {
     /// Mutually exclusive with `data_path`. Only this mode snapshots its
     /// store into `[server] state_dir` across restarts (#1002) — a
     /// `data_path` source re-reads its files — and only it has warm-up
-    /// health; its `warmup` defaults to `retention`.
+    /// health; its `warmup` defaults to the shorter of `retention` and
+    /// [`DEFAULT_WIS2_WARMUP`] (`PT24H`).
     #[serde(default)]
     pub wis2: Option<Wis2Config>,
     /// `data_path` mode: seconds between directory scans (default 60).
@@ -1824,18 +1825,23 @@ pub struct Wis2Config {
     /// received", "… N reports received") for this long after its
     /// subscription first comes up — standing warnings only return as their
     /// producers republish them, and observations are never republished, so
-    /// a store's history is complete again only after a full window. A
+    /// a store's history is complete again only after a full window (for
+    /// CAP, and for BUFR when `warmup` equals `retention`). A
     /// snapshot last written longer than this ago (the server was down that
     /// long) is restored but restarts the warm-up ("warming up after a long
     /// outage"). ISO 8601 duration. Default: [`DEFAULT_WIS2_WARMUP`]
-    /// (`PT24H`) for `[cap.wis2]` ([`Self::warmup_duration`]); the
-    /// collection's `retention` for `[bufr.wis2]`.
+    /// (`PT24H`) for `[cap.wis2]` ([`Self::warmup_duration`]); for
+    /// `[bufr.wis2]` the shorter of that and the collection's `retention`,
+    /// so a retention longer than a day is still filling its older part
+    /// when the warm-up ends (a week-long one would otherwise report
+    /// `degraded` for a week). An explicit value is used as given.
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub warmup: Option<String>,
 }
 
 /// Default `[….wis2] warmup`: a day covers the daily republication cycle
-/// of standing warnings.
+/// of standing warnings. `[bufr.wis2]` caps it at the collection's
+/// `retention` (engine-bufr resolves that).
 pub const DEFAULT_WIS2_WARMUP: &str = "PT24H";
 
 impl Default for Wis2Config {
@@ -1859,7 +1865,9 @@ impl Default for Wis2Config {
 }
 
 impl Wis2Config {
-    /// The resolved `warmup` (default [`DEFAULT_WIS2_WARMUP`]).
+    /// The configured `warmup`, else [`DEFAULT_WIS2_WARMUP`]: CAP's
+    /// warm-up. `[bufr.wis2]` caps the default at `retention` on top
+    /// (engine-bufr).
     pub fn warmup_duration(&self) -> Result<chrono::Duration, crate::error::DataServerError> {
         crate::datetime::parse_iso8601_duration(
             self.warmup.as_deref().unwrap_or(DEFAULT_WIS2_WARMUP),

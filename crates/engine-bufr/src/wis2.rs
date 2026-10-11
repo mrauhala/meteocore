@@ -12,10 +12,12 @@
 //! pipeline is started here, never in the constructor.
 //!
 //! Warm-up (#1002): the store holds what arrived since it began filling
-//! from empty, so a cold start serves a partial history until it has
-//! filled for `[bufr.wis2] warmup` (default: the collection's
-//! `retention`) — `/health` says so ([`LiveStatus::WarmingUp`]). The clock
-//! ([`WarmupClock`]) travels in the store snapshot (`persist.rs`).
+//! from empty, so a cold start serves a partial history; `/health` says so
+//! ([`LiveStatus::WarmingUp`]) until it has filled for `[bufr.wis2]
+//! warmup` (default: the shorter of the collection's `retention` and a
+//! day, so a longer retention window is still incomplete when the warm-up
+//! ends). The clock ([`WarmupClock`]) travels in the store snapshot
+//! (`persist.rs`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

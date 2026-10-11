@@ -882,12 +882,13 @@ position_radius_km = 25.0      # EDR position → nearest station within this
 #                              # ["013011"], unit, period_hours for accumulations)
 # [collections.bufr.wis2]      # push instead of poll; most SYNOP arrives inline
 # topics = ["cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop"]
-# warmup = "PT24H"             # default = retention: after a cold start /health says
-#                              # "warming up after cold start: N reports received" until
-#                              # the store has filled one window; with [server] state_dir
-#                              # the store survives restarts (a snapshot older than warmup
-#                              # keeps the rows still inside retention but restarts the
-#                              # warm-up)
+# warmup = "PT24H"             # default = the shorter of retention and PT24H: after a
+#                              # cold start /health says "warming up after cold start:
+#                              # N reports received" this long (a longer retention is
+#                              # still filling its older part after it); with [server]
+#                              # state_dir the store survives restarts (a snapshot older
+#                              # than warmup keeps the rows still inside retention but
+#                              # restarts the warm-up)
 
 # CAP warnings pushed over WMO WIS2 (third cap source mode, XOR with
 # data_path / feed_url). `[….wis2]` is the shared ds-wis2 subscription
@@ -915,7 +916,8 @@ topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnin
                      # (degraded) this long after the subscription first comes up;
                      # a snapshot older than this restores its alerts but restarts
                      # the warm-up ("warming up after a long outage").
-                     # [bufr.wis2] has it too, defaulting to the collection's retention.
+                     # [bufr.wis2] has it too, defaulting to the shorter of the
+                     # collection's retention and PT24H.
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs`

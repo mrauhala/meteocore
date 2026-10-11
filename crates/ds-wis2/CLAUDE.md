@@ -65,8 +65,8 @@ serde data); everything with a socket lives here.
   (`[server] state_dir`, #1000; engine-cap is the reference, engine-bufr
   the second, #1002) and report `LiveStatus::WarmingUp` after a cold start
   or a long outage (`[….wis2] warmup`, parsed here in `Wis2Config`; its
-  default is the engine's: PT24H for CAP, the collection's `retention` for
-  BUFR).
+  default is the engine's: PT24H for CAP, the shorter of the collection's
+  `retention` and PT24H for BUFR).
 - **Backpressure, not drops:** the subscriber→resolver and resolver→engine
   channels are bounded (1024); a slow consumer stops the MQTT read loop and
   the broker queues (2000/client) rather than us losing messages.
