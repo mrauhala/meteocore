@@ -1379,6 +1379,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             collection_paths[&instances_path] = json!({
                 "get": {
                     "summary": format!("List model runs (instances) for {}", config.title),
+                    "description": "Model runs, newest first: descending by reference time.",
                     "operationId": format!("getInstances_{id}"),
                     "tags": [id],
                     "parameters": [
@@ -1713,14 +1714,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "integer", "minimum": 1, "maximum": ds_core::time_axis::MAX_LISTED_VALUES},
                     "style": "form",
                     "explode": false,
-                    "description": format!("Page size of the instances list, ascending by reference time. A page carries numberMatched, numberReturned and self, next and prev links. Without limit, a collection with at most {max} runs answers every run in one response, without paging members; a longer one pages {INSTANCES_PAGE_SIZE} runs at a time from the oldest run, and its next links walk every run. Values above {max} are clamped to {max}; zero, negative and non-integer values are 400.", max = ds_core::time_axis::MAX_LISTED_VALUES)
+                    "description": format!("Page size of the instances list, newest first: descending by reference time, so the first page holds the latest runs. A page carries numberMatched, numberReturned and self, next and prev links. Without limit, a collection with at most {max} runs answers every run in one response, without paging members; a longer one pages {INSTANCES_PAGE_SIZE} runs at a time from the latest run, and its next links walk toward the oldest run; a run published during the walk can repeat one run at a page boundary. Values above {max} are clamped to {max}; zero, negative and non-integer values are 400.", max = ds_core::time_axis::MAX_LISTED_VALUES)
                 },
                 "offset-instances": {
                     "name": "offset",
                     "in": "query",
                     "required": false,
                     "schema": {"type": "integer", "minimum": 0, "default": 0},
-                    "description": "Number of runs to skip before the page (offset pagination extension, as on /collections). Requires limit."
+                    "description": "Number of runs to skip before the page, counted from the latest run (offset pagination extension, as on /collections). Requires limit."
                 },
                 "offset-locations": {
                     "name": "offset",
@@ -2039,7 +2040,7 @@ pub async fn collection(
 pub const INSTANCES_PAGE_SIZE: usize = 100;
 
 /// One page of the instances list: `limit` runs from `offset`, in the list's
-/// ascending order.
+/// newest-first order.
 #[derive(Debug, Clone, Copy)]
 struct InstancesPage {
     limit: usize,
@@ -2064,8 +2065,13 @@ impl InstancesPage {
 /// `GET /collections/{id}/instances` — list the collection's forecast model runs
 /// as OGC API - EDR instances. Empty `collections` for non-forecast engines.
 ///
+/// The runs are listed newest first, descending by reference time: the
+/// first page holds the latest runs and `next` walks toward older ones. The
+/// engines answer ascending ([`EdrEngine::get_instances`], the order WMS
+/// and run selection share), so only this list sorts the runs descending.
+///
 /// A run axis of at most [`ds_core::time_axis::MAX_LISTED_VALUES`] runs is
-/// listed whole, as it always was, unless `limit` asks for a page. A longer
+/// listed whole, newest first, unless `limit` asks for a page. A longer
 /// one pages, [`INSTANCES_PAGE_SIZE`] runs at a time by default (#1006): an
 /// archive store once answered 95 MB here. A page carries `numberMatched`,
 /// `numberReturned` and `next`/`prev` links, as `/locations` does (EDR 1.2
@@ -2095,7 +2101,13 @@ pub async fn instances(
     // instances") permits a stricter 404 here; the lenient 200-empty is the
     // deliberate, self-consistent choice (the resource is never advertised for
     // non-forecast collections, so conformant clients don't reach it).
-    let reference_times = engine.instance_reference_times();
+    // Newest first: on an archive the latest run was otherwise on the last
+    // page. Paging indexes this descending axis, so `offset` 0 is the latest
+    // run and `next` walks toward the oldest. Sorted rather than reversed so
+    // the order holds whatever an engine answers; the ascending axis every
+    // engine returns sorts in one pass.
+    let mut reference_times = engine.instance_reference_times();
+    reference_times.sort_unstable_by(|a, b| b.cmp(a));
     let page = match request.limit {
         // `limit` past the longest whole list is clamped to it, as EDR 1.2
         // clamps `limit` past a server's maximum.
@@ -2129,12 +2141,12 @@ pub async fn instances(
     // `collections`. The HTML page renders this same document
     // (`/req/html/content` A: all of its information).
     let instances: Vec<serde_json::Value> = match paging {
-        // The whole list, read as it always was.
-        None => engine
-            .get_instances()
-            .iter()
-            .map(|run| metadata.build(Some(run)))
-            .collect(),
+        // The whole list, newest first like a page.
+        None => {
+            let mut runs = engine.get_instances();
+            runs.sort_unstable_by_key(|run| std::cmp::Reverse(run.reference_time));
+            runs.iter().map(|run| metadata.build(Some(run))).collect()
+        }
         // A run removed since the reference times were read is left out.
         Some((_, window)) => reference_times[window.range()]
             .iter()

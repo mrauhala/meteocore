@@ -65,6 +65,16 @@ owns the instance-id string form:
   advertises the instance paths — both gated on `get_instances()` being
   non-empty.
 - Unknown instance id → 404 (`select_run` returns `None`).
+- `/instances` lists runs **newest first** (descending reference time,
+  #1054: on an archive the latest run was on the last page).
+  Engines keep answering ascending (`get_instances`,
+  `instance_reference_times`, `build_instances`), and WMS `reference_time`
+  (`RasterInfo.reference_times`) stays ascending; run selection
+  (`select_run`, `None` ⇒ latest) picks by key and has no order. Only the `instances` handler sorts
+  descending, before paging, so `offset` 0 is the latest run and `next`
+  walks toward the oldest. Never reverse it in an engine or in
+  `build_instances`. Pinned by `instances_tests`
+  `instances_pages_run_newest_first_across_page_boundaries`.
 - The id is `ds_core::instances::format_instance_id`: RFC 3339 UTC,
   `2026-06-07T06:00:00Z` (MetOcean EDR profile, #947). Links carry its
   colons unencoded (RFC 3986 `pchar`): never pass it through
@@ -83,10 +93,10 @@ with WMS):
   `EdrEngine::instance_reference_times` (keys only), pages it
   (`INSTANCES_PAGE_SIZE` 100 without `limit`, `limit` clamped to 500,
   `offset`, `page_window`, `numberMatched`/`numberReturned`, `next`/`prev`)
-  and builds the page's runs with `find_instance`. Without `limit` a list of
-  at most 500 runs is answered whole via `get_instances`, byte-identical to
-  before. `params::parse_instances_query` 400s anything but `f`, `limit`,
-  `offset`, and `offset` without `limit`.
+  and builds the page's runs with `find_instance`, newest first. Without
+  `limit` a list of at most 500 runs is answered whole via `get_instances`,
+  sorted newest first like a page. `params::parse_instances_query` 400s
+  anything but `f`, `limit`, `offset`, and `offset` without `limit`.
 - What every run's document shares is read from the engine once per request:
   `CollectionMetadata::new`, then `build(Some(run))` per run. Never call
   `build_collection_metadata` in a per-run loop.

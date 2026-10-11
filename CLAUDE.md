@@ -565,13 +565,14 @@ one never implies the other.
     `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores)
     and Nowcast (generations = runs, #661) implement this; other engines
     accept-and-ignore.
-  - API surface: EDR `/instances`, `/instances/{id}`,
+  - API surface: EDR `/instances` (listed newest first: the handler sorts
+    it, engines and `build_instances` stay ascending), `/instances/{id}`,
     `/instances/{id}/{position,area}` — gated on `get_instances()` being
     non-empty; no-instance routes default to the latest run. WMS exposes
     `DIM_REFERENCE_TIME` (see `crates/api-wms/CLAUDE.md`). Maps/Tiles still
     pass `reference_time: None` (follow-up).
 - **`ds_core::time_axis`** — the one rule for long time axes (#1006): up to
-  `MAX_LISTED_VALUES` (500) values a list, byte-identical to before; past it,
+  `MAX_LISTED_VALUES` (500) values a list, WMS byte-identical to before; past it,
   ranges of equally spaced values, lossless. WMS writes them as Annex C
   `min/max/res` (`time`, `reference_time`); EDR pages `/instances` past the
   same threshold and keeps the run axis out of collection metadata. See
