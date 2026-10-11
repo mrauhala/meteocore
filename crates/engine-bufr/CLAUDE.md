@@ -257,24 +257,36 @@ at boot and ignores the state store.
 - **Warm-up health.** A store that began filling less than `[bufr.wis2]
   warmup` ago reports `LiveStatus::WarmingUp` — `/health` "warming up after
   cold start: N reports received", degraded — wherever it would otherwise
-  be `Ready` (a broker blip inside `degrade_after_secs` stays warming). The
-  default is the collection's `retention`, not CAP's fixed PT24H: the store
-  is complete once it holds a full retention window, and observations are
-  never republished (the two agree at the default PT24H). The clock
-  (`WarmupClock` in `wis2.rs`) starts on the first snapshot tick with the
-  subscription up and travels in the snapshot: a restart mid warm-up keeps
-  warming; a snapshot written longer than `warmup` ago keeps the rows still
-  inside `retention` but restarts the warm-up (`WarmupCause::LongOutage`,
-  "warming up after a long outage", written back at the first tick).
-  Without a state store every start is cold.
+  be `Ready` (a broker blip inside `degrade_after_secs` stays warming).
+- **The default `warmup` is the shorter of `retention` and CAP's PT24H**
+  (`wis2_warmup` in `engine.rs`, decided 2026-10-11). The store is
+  complete only once it holds a full retention window (observations are
+  never republished), but defaulting to `retention` kept a 7-day store
+  `degraded` for about a week after every cold start. So with a retention
+  over a day, `Ready` means at least a day of history, not a full window:
+  the older part fills as time passes. A retention of a day or less warms
+  up for its whole window. An explicit `warmup` is used as given, longer
+  than a day included (`warmup` = the retention brings back the
+  full-window rule). Pinned by
+  `warmup_defaults_to_the_shorter_of_retention_and_a_day` and
+  `a_week_of_retention_warms_up_for_a_day_by_default`.
+- The clock (`WarmupClock` in `wis2.rs`) starts on the first snapshot tick
+  with the subscription up and travels in the snapshot: a restart mid
+  warm-up keeps warming; a snapshot written longer than `warmup` ago keeps
+  the rows still inside `retention` but restarts the warm-up
+  (`WarmupCause::LongOutage`, "warming up after a long outage", written
+  back at the first tick). Without a state store every start is cold.
 - **The outage threshold is `warmup` (CAP's rule), and the reports
-  published while the server was down are never filled in.** With the
-  default `warmup` = `retention`, an outage shorter than `retention` is
-  `Ready` at once with that gap in the window until it ages out, and a
-  longer one leaves practically nothing inside `retention` to restore
-  (only rows up to the 1 h future slack). Set `warmup` shorter than
-  `retention` for a long outage to show as "warming up after a long
-  outage".
+  published while the server was down are never filled in.** An outage
+  shorter than `warmup` is `Ready` at once, with that gap in the window
+  until it ages out. A longer one restores the rows still inside
+  `retention` and warms up again for `warmup`; the gap stays in the window
+  either way. With the default and a retention of a day or less, such an
+  outage outlasts the window and leaves practically nothing inside
+  `retention` to restore (only rows up to the 1 h future slack); a 7-day
+  store down for two days keeps the other five.
+  Set `warmup` shorter for a shorter outage to show as "warming up after a
+  long outage".
 - A reload that rebuilds the collection restores from the last periodic
   snapshot (≤ 5 min old); the replaced engine's `shutdown()` then writes
   its final state, which the new engine overwrites at its next write, so
