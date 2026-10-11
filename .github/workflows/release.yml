@@ -343,8 +343,11 @@ jobs:
             echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           fi
 
+  # Every platform's binary (Linux, macOS, Windows) comes from the reusable
+  # build-binaries.yml, which also builds on pull requests that touch the
+  # release build or Cargo.lock, so a platform break shows before a release.
   build-binary:
-    name: binary ${{ matrix.target }}
+    name: binaries
     needs: resolve-target
     # `always() &&` is mandatory, not stylistic: on the
     # `workflow_dispatch` backfill path the `release` job is skipped,
@@ -355,93 +358,9 @@ jobs:
     if: always() && needs.resolve-target.result == 'success'
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          ref: ${{ needs.resolve-target.outputs.tag }}
-
-      - name: Install system dependencies
-        # cmake/clang are needed by `libaec-sys` (GRIB CCSDS support).
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake clang pkg-config libssl-dev
-
-      # SHA-pinned for consistency with the other third-party actions
-      # in this file. Same risk model — even though this job is
-      # `contents: read` only, a hijacked `@stable` tag could still
-      # inject backdoored Rust into the release tarball.
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ matrix.target }}-cargo-
-
-      - name: Build release binary
-        # `--locked` enforces that the lockfile committed at the tag
-        # exactly matches Cargo.toml — so a release tag can't silently
-        # pick up a new transitive dep version. This works because
-        # the "Propose release PR" step rewrites `Cargo.lock`
-        # alongside the `Cargo.toml` version bump in the release PR.
-        # If a future release PR ever lands without a matching
-        # `Cargo.lock` bump, this step fails loudly rather than
-        # producing a release built against a drifted lockfile.
-        env:
-          TARGET: ${{ matrix.target }}
-        # `--features icechunk`: ship Icechunk Zarr support in release binaries
-        # (object_store S3 backend, ~+8 MB, no AWS SDK — #339). Reuses the
-        # object_store/rustls stack already in the base build, so it adds no new
-        # cross-compilation deps. Remove once the icechunk [patch] forks are
-        # dropped if a leaner default is preferred (#340).
-        run: cargo build --release --locked --target "${TARGET}" -p server --features icechunk
-
-      - name: Package tarball
-        # All inputs flow through `env:` so the shell never sees an
-        # untrusted GitHub expression. `tag` comes from
-        # `workflow_dispatch` input on the manual-backfill path, which
-        # a write-access collaborator could otherwise abuse to run
-        # arbitrary commands on the runner.
-        env:
-          VERSION: ${{ needs.resolve-target.outputs.tag }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          base="meteocore-${VERSION}-${TARGET}"
-          mkdir -p "dist/${base}"
-          # Match the Docker image's binary name so the tarball and the
-          # container ship the same `dataserver` symbol.
-          cp "target/${TARGET}/release/server" "dist/${base}/dataserver"
-          cp LICENSE* README.md "dist/${base}/" 2>/dev/null || true
-          tar -czf "dist/${base}.tar.gz" -C dist "${base}"
-          (cd dist && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256")
-          rm -rf "dist/${base}"
-          ls -la dist/
-
-      # Upload v7 + download v8 (in the `upload` job below) is the
-      # intended pairing: both use the post-v4 artifact API; v8 is the
-      # Node 24 successor of v7's download counterpart with no data-format
-      # change. Same combination is in use upstream (fmidev/kubetin's
-      # release.yml) and is the per-action floor in our CLAUDE.md.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
-        with:
-          name: meteocore-${{ matrix.target }}
-          path: dist/*
-          retention-days: 7
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      tag: ${{ needs.resolve-target.outputs.tag }}
 
   build-container:
     name: container image
@@ -532,26 +451,43 @@ jobs:
     needs: [resolve-target, build-binary]
     # See build-binary above — `always()` defeats transitive skip
     # propagation from the dispatch-path-skipped `release` job.
-    if: always() && needs.resolve-target.result == 'success' && needs.build-binary.result == 'success'
+    #
+    # Also runs when some platforms failed: the ones that built still ship,
+    # and the failed leg keeps the run red. A Windows-only break should not
+    # withhold the Linux binaries.
+    if: >-
+      always() && needs.resolve-target.result == 'success' &&
+      (needs.build-binary.result == 'success' || needs.build-binary.result == 'failure')
     permissions:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      # `pattern` keeps any other artifact of this run out of dist/.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           path: dist
+          pattern: meteocore-*
           merge-multiple: true
 
+      # One checksum file for every archive, written here on Linux so the
+      # format does not depend on each runner's sha256 tool.
       - name: Aggregate checksums
         run: |
+          shopt -s nullglob
           cd dist
-          cat *.sha256 > SHA256SUMS
-          rm -f *.sha256
+          archives=(*.tar.gz *.zip)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "::error::No binary archives were built."
+            exit 1
+          fi
+          sha256sum -- "${archives[@]}" > SHA256SUMS
           ls -la
+          cat SHA256SUMS
 
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
         with:
           tag_name: ${{ needs.resolve-target.outputs.tag }}
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS

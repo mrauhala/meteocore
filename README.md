@@ -70,6 +70,32 @@ cargo build --release -p server
 
 The release binary is self-contained — deploy it alongside `config.toml` and your data files.
 
+### Release binaries
+
+Each GitHub release carries the server, named `dataserver`, for:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64, arm64 | `meteocore-<tag>-x86_64-unknown-linux-gnu.tar.gz`, `…-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon, Intel (macOS 11 or later) | `…-aarch64-apple-darwin.tar.gz`, `…-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `…-x86_64-pc-windows-msvc.zip` |
+
+`SHA256SUMS` lists every archive's checksum. The Docker image remains the
+production deployment.
+
+- **macOS:** the binaries are not notarized. A copy downloaded with a browser
+  is quarantined and Gatekeeper refuses to start it; clear that with
+  `xattr -d com.apple.quarantine dataserver`. `curl` and `gh release download`
+  downloads are not quarantined. macOS allows only 256 open files per shell
+  by default; raise it with `ulimit -n 10240` before serving many collections.
+- **Windows:** needs the Microsoft Visual C++ 2015–2022 Redistributable (x64),
+  which most machines already have. Only Ctrl+C shuts the server down
+  gracefully, flushing engine state; closing the console window stops it
+  without the final `state_dir` save.
+- **Memory:** jemalloc, and with it the `jemalloc_*` metrics, is in every
+  build but the Windows one. `process_resident_memory_bytes` and
+  `process_swap_memory_bytes` are read from `/proc` and stay 0 off Linux.
+
 ### Command-Line Options
 
 ```
