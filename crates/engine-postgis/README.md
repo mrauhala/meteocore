@@ -9,7 +9,8 @@ TimescaleDB) through OGC API - EDR and OGC API - Features.
 
 - `Engine` trait — `get_locations`, `query_position`, `query_location`, `query_area`.
 - `FeatureEngine` trait — each station is one Feature; properties come from the
-  mapped `property_cols`.
+  mapped `property_cols`, and each one not named like an API control such as `limit` or `f` is a
+  property filter (`?territory=FI`) from startup, even before any station row has loaded.
 - Three observation-table shapes:
   - `long` — EAV (`param_col` + `value_col`)
   - `wide` — column-per-parameter
