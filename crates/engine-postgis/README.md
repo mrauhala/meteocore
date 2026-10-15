@@ -179,6 +179,9 @@ dsn_env = "NEXUS_DSN"
 # Optional; defaults to max(4, min(cpu_count * 2, 16)), hard-capped at 32.
 # pool_size = 8
 # metadata_refresh_secs = 300
+# Most stations the location list holds; 1..=1000000, default 200000.
+# A list cut at it degrades /health — see "Station-list cap" below.
+# max_locations = 200000
 
 [collections.postgis.stations]
 table         = "public.stations"
@@ -463,7 +466,9 @@ locations_window = "PT24H"           # optional; default 24h. "all" = full histo
 **How it performs.** The observation-derived location list is built with one
 `SELECT DISTINCT ON (station_fk)` **per observation table** (deduped by id in
 Rust — NOT a single `UNION`, which would run as one statement and blow a
-read-only role's `statement_timeout`), each capped at `MAX_LOCATIONS` (50 001).
+read-only role's `statement_timeout`), each fetching `max_locations + 1` rows
+and the merged list stopping at `max_locations` (see
+[Station-list cap](#station-list-cap-max_locations)).
 It runs only in the **background metadata refresh** (`metadata_refresh_secs`),
 never on a request; the per-request observation fetch (`WHERE station_fk = $1`)
 is identical in every mode, so request latency is unchanged.
@@ -481,10 +486,98 @@ took >5 s). So the derivation is **time-windowed by default**:
   from the role, not the engine), or a pre-materialized distinct-`(id, geom)`
   table wired as the `stations` block.
 
-In modes A/B, `position` (nearest, by haversine) and `area` are answered
-**in-memory** from the cached location set — an `area` polygon returns its
-**bounding-box superset**, not exact `ST_Within` (documented v1 simplification);
-stations-only mode keeps the live `ST_DWithin`/`ST_Within` SQL path.
+In modes A/B, `position` (nearest, by haversine) and `area` (exact
+point-in-polygon, #671) are answered **in-memory** from the cached location
+set; stations-only mode keeps the live `ST_DWithin`/`ST_Within` SQL path.
+
+## Station-list cap (`max_locations`)
+
+Every station shape caches its location list (#110), and `[postgis]
+max_locations` bounds it (#1061): default **200 000**, at most **1 000 000**,
+checked at config load (0, a larger value, or the key on the `events` shape is
+a load error).
+
+- **Detection.** Every location query fetches `max_locations + 1` rows: the
+  stations table read (`ORDER BY id`) and each per-table observations query.
+  A row past the cap means the list does not fit: the first `max_locations`
+  stations are kept in query order and the snapshot is flagged truncated.
+  Exactly `max_locations` stations is a complete list. In mode B either read
+  can be cut. A cut reporter list misses stations, as above. A cut registry
+  matters only when a reporter finds no registry row, since that row may be
+  past the cap: such reporters are served without their label and
+  properties, and the list is flagged as a cut registry. When every reporter
+  found its row, nothing served is missing and nothing is flagged.
+- **Visibility.** A truncated list degrades the collection in `/health`
+  (`"station list truncated at max_locations = N: …"`, or `"station registry
+  truncated at max_locations = N: …"` for a cut mode-B registry) while the
+  database answers; an unreachable database is reported first. The verdict
+  is live: the reload response and the load snapshot keep the collection
+  `ready`, since it still serves. The gauge
+  `postgis_locations_truncated{collection}` is 1, the Grafana overview shows
+  it under PostGIS, and a WARN is logged when a refresh first cuts the list
+  (INFO when it fits again). Stations past the cap are missing from
+  `/locations`, EDR `items` and Features `/items`; in modes A/B also from
+  position and area queries, which run on the cached list. In stations-only
+  mode position and area run in SQL and still find them.
+- **What fixes it.** Raise `max_locations`, or narrow the list:
+  `stations.where`, a view, or a shorter `observations.locations_window`.
+
+**Sizing (measured).** The `metadata::tests::footprint` test counts the heap
+of the cached snapshot for stations with a WIGOS-style id, a 19-character
+name and three properties (text, float, integer). Per station, in requested
+bytes before the allocator's size-class rounding:
+
+| What | Bytes per station | At 200 000 | At 1 000 000 |
+|---|---|---|---|
+| decoded rows (`FeatureStation` + properties) | 446 | 89 MB | 446 MB |
+| whole snapshot (rows + `Location` list + id index) | 613 | 123 MB | 613 MB |
+| copy `get_locations` hands each `/locations` request | 98 | 20 MB | 98 MB |
+
+A refresh holds the old snapshot until the new one is swapped in, plus the
+query's rows (tokio-postgres buffers the result: about 300–350 B a row for
+this layout, estimated from the row structure). The peak is therefore about
+0.3 GB at 200 000 stations and about 1.5 GB at the ceiling. Memory follows
+the stations actually loaded, not the cap: the cap bounds what a
+misconfigured or unexpectedly large source can cost. The default covers
+national and continental networks (tens of thousands of stations, closed ones
+included) with headroom; the ceiling stops a typo from removing the bound.
+
+**Costs that grow with the list** (checked for #1061):
+
+- **Refresh** (every `metadata_refresh_secs`, on the background poll runtime,
+  never a request worker): `CollectionMeta::build` measured 0.8 µs a station
+  in a debug build, under 0.2 s at 200 000; the query and row decoding come on
+  top. The new snapshot replaces the old through `ArcSwap`; readers never
+  wait, and a request still holding the old one keeps it alive until it
+  finishes.
+- **EDR `/locations`** has a byte budget of its own: the GeoJSON is about
+  610 B a location with six parameters (each feature lists the collection's
+  `parameter-name`s), so the default `MC_EDR_LOCATIONS_MAX_BYTES` of 16 MiB
+  holds about 27 000 locations. A larger unpaged list is a 503 `ResponseLimit`
+  ("page it with `limit`"), as it already was at the old 50 001 cap; pages of
+  up to 10 000 (about 6 MB) fit. Each request, paged or not, copies the whole
+  `Location` list first (the row above), inside the EDR executor's admission
+  bound.
+- **Other EDR paths copy the same list**, since `EdrEngine::get_locations`
+  returns an owned `Vec`: every EDR `items` page and single item
+  (`EdrMembers::new`, to label the page's few station members), every
+  `f=GeoJSON` query (`station_names`), and, once per request, a location-list
+  query with an id the collection lacks or more ids than its `limit`
+  (`require_known_location`, which also builds a set of every id). That is
+  about 20 MB a request at 200 000 stations and about 98 MB at the ceiling,
+  four to twenty times the cost at the old cap. Serving the snapshot by `Arc`
+  would remove the copies for all of them; it changes the trait for every
+  engine and is left as a follow-up.
+- **Features `/items`** pages with `limit` ≤ 1000 and `offset`; each page
+  filters the whole cached list in memory, an O(n) scan plus a pointer per
+  match (1.6 MB of pointers when all 200 000 match). Vector tiles do the same
+  per tile, then cache the tile.
+- **Modes A/B in-memory queries:** position scans the list for the nearest
+  station (O(n) haversine per request). Area polygons are bounded at
+  20 million `stations × polygon vertices` edge tests
+  (`ds_core::feature::check_mask_budget`), so at 200 000 stations a polygon
+  may have at most 100 vertices, and 20 at the ceiling, before the 400 that
+  names the numbers; rectangles are exempt.
 
 ## Startup behavior: error vs. warning
 
@@ -501,6 +594,7 @@ suspicious but workable (WARN — the collection still loads).
 - Any schema, table, or column identifier fails the regex
   `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
 - `pool_size > 32`.
+- `max_locations` of 0 or above 1 000 000, or set on the `events` shape.
 - Two collections share a pool tuple `(host, port, db, user, sslmode)` but
   specify different passwords.
 - `stations.geom_col` is not `geometry(Point, 4326)` (SRID or geometry type
@@ -531,13 +625,18 @@ suspicious but workable (WARN — the collection still loads).
 - **Health:** `/health` reports per-collection `ready | degraded | failed`.
   A 30 s background `SELECT 1` ping (2 s deadline) flips a loaded collection
   between `ready` and `degraded` on DB reachability — live, not boot-time-only.
-  `failed` means the collection never finished loading (config/privilege). A
-  metadata-refresh failure does NOT degrade health (the ping is the authority;
-  the failure shows up in metrics + logs).
+  A station list cut at `max_locations` is `degraded` too, with the cap in the
+  message (see [Station-list cap](#station-list-cap-max_locations)).
+  `failed` means the collection never finished loading (config/privilege).
+  The ping and the last successful refresh's cut are the authority: a
+  metadata-refresh failure does NOT degrade health; it keeps the previous
+  snapshot and shows in metrics + logs.
 - **Metrics:** Prometheus series under the `postgis_*` prefix, scraped live —
   gauges `postgis_up{collection}` (1/0), `postgis_pool_{size,max_size,available,waiting}{pool_key}`
   (`size` = open connections, `max_size` = capacity, `available` = acquirable now),
-  `postgis_metadata_refresh_seconds{collection}` (last refresh duration); and
+  `postgis_metadata_refresh_seconds{collection}` (last refresh duration),
+  `postgis_locations_truncated{collection}` (1 = station list, or a mode-B
+  station registry, cut at `max_locations`); and
   counters `postgis_{metadata_refreshes,metadata_refresh_failures,pings,ping_failures}_total{collection}`
   (process-global, delta-tracked so `rate()` works across reloads). Labels are
   bounded (collection / pool_key are config-time).
@@ -547,10 +646,12 @@ suspicious but workable (WARN — the collection still loads).
 - **Reload:** `POST /admin/collections/reload` re-reads the config and swaps
   engines atomically via `ArcSwap`. Shared pools carry over by identity across
   reloads; dropped URLs' pools close naturally.
-- **Row cap:** every emitted SELECT carries `LIMIT 10001` (per-query,
-  non-configurable). Location/station listings use `LIMIT 1001`. Hitting the
-  ceiling returns HTTP 413 with a message asking the caller to narrow `bbox`
-  or `datetime` — it is a protection invariant, not a policy knob.
+- **Row caps:** every emitted SELECT carries a `LIMIT`. Observation queries
+  are bounded by the response budget (500 000 values a request), the area
+  prefilter by 10 001 stations; past either, the request is an HTTP 400 that
+  names the numbers and what to narrow. Location lists fetch
+  `max_locations + 1` rows (see
+  [Station-list cap](#station-list-cap-max_locations)).
 
 ## References
 

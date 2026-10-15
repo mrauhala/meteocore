@@ -8,7 +8,9 @@
 //! the internal form the engine operates on.
 
 use chrono::Duration;
-use ds_core::config::PostgisConfig;
+use ds_core::config::{
+    PostgisConfig, POSTGIS_DEFAULT_MAX_LOCATIONS, POSTGIS_MAX_LOCATIONS_CEILING,
+};
 use ds_core::datetime::parse_iso8601_duration;
 use thiserror::Error;
 
@@ -57,6 +59,8 @@ pub enum PostgisConfigError {
     InvalidLocationsWindow(String),
     #[error("invalid observations.default_datetime: {0}")]
     InvalidDefaultDatetime(String),
+    #[error("max_locations {0} is outside 1..={POSTGIS_MAX_LOCATIONS_CEILING}")]
+    InvalidMaxLocations(usize),
     #[error("parameter '{name}' (source_key '{key}') is not mapped in observations.{where_}")]
     ParameterNotMapped {
         name: String,
@@ -80,6 +84,10 @@ pub struct PostgisEngineConfig {
     pub pool_size: u32,
     pub pool_label: Option<String>,
     pub metadata_refresh_secs: u64,
+    /// Most stations the cached location list holds (`[postgis]
+    /// max_locations`, #1061). Location queries fetch one row more, so a list
+    /// that does not fit is detected, cut to this many and reported.
+    pub max_locations: usize,
     pub location_source: LocationSource,
     pub observations: ObservationSchema,
     pub parameters: Vec<ValidatedParameter>,
@@ -201,6 +209,11 @@ impl PostgisEngineConfig {
         }
 
         let pool_size = cfg.pool_size.unwrap_or_else(default_pool_size).min(32);
+        // Defense in depth: `validate_postgis` already bounds it at load.
+        let max_locations = cfg.max_locations.unwrap_or(POSTGIS_DEFAULT_MAX_LOCATIONS);
+        if max_locations == 0 || max_locations > POSTGIS_MAX_LOCATIONS_CEILING {
+            return Err(PostgisConfigError::InvalidMaxLocations(max_locations));
+        }
 
         Ok(Self {
             dsn,
@@ -210,6 +223,7 @@ impl PostgisEngineConfig {
             metadata_refresh_secs: cfg
                 .metadata_refresh_secs
                 .unwrap_or(DEFAULT_METADATA_REFRESH_SECS),
+            max_locations,
             location_source,
             observations,
             parameters,
@@ -321,6 +335,7 @@ mod tests {
             pool_size: None,
             pool_label: None,
             metadata_refresh_secs: None,
+            max_locations: None,
             stations: Some(PostgisStationsConfig {
                 table: "weather.stations".into(),
                 id_col: "wigos_id".into(),
@@ -587,6 +602,31 @@ mod tests {
         assert_eq!(resolved.parameters.len(), 2);
     }
 
+    /// #1061: absent ⇒ the default; a configured value is kept; outside
+    /// 1..=ceiling is an error even if config validation was bypassed.
+    #[test]
+    fn resolve_max_locations_default_and_bounds() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+
+        let resolved = PostgisEngineConfig::resolve(&nexus_config()).unwrap();
+        assert_eq!(resolved.max_locations, POSTGIS_DEFAULT_MAX_LOCATIONS);
+
+        let mut cfg = nexus_config();
+        cfg.max_locations = Some(75_000);
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert_eq!(resolved.max_locations, 75_000);
+
+        for bad in [0, POSTGIS_MAX_LOCATIONS_CEILING + 1] {
+            cfg.max_locations = Some(bad);
+            let err = PostgisEngineConfig::resolve(&cfg).unwrap_err();
+            assert!(
+                matches!(err, PostgisConfigError::InvalidMaxLocations(n) if n == bad),
+                "got: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn resolve_caps_pool_size_at_32() {
         let g = env_guard();
@@ -606,6 +646,7 @@ mod tests {
             pool_size: None,
             pool_label: None,
             metadata_refresh_secs: None,
+            max_locations: None,
             stations: None,
             observations: PostgisObservationsConfig {
                 shape: "events".into(),

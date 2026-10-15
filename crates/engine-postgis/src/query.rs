@@ -2,8 +2,8 @@
 //!
 //! Every emitted SELECT ends with a hard row cap (a caller-supplied
 //! `LIMIT $N` bind for observations — see [`MAX_RESPONSE_VALUES`] for the
-//! budget model — `LIMIT 50001` for locations, `LIMIT 10001` for the
-//! stations-in-polygon prefilter, `LIMIT 1` for the nearest-station
+//! budget model — `[postgis] max_locations + 1` for locations, `LIMIT 10001`
+//! for the stations-in-polygon prefilter, `LIMIT 1` for the nearest-station
 //! position query). Every identifier goes through [`quote_ident`]; every
 //! value is bound as `$1..$n`. The builders never interpolate request
 //! data into SQL — only config-derived identifiers from the validated
@@ -25,13 +25,6 @@ use crate::schema::{
     EventsShape, LongShape, ObservationSchema, PerParameterShape, QualifiedTable, WideShape,
 };
 use crate::security::{quote_ident, QuoteError};
-
-/// Maximum rows returned by a locations list query. 50_001 covers the
-/// real-world deployment range (FMI ~10k stations, MET Office ~5k, NOAA
-/// COOP ~30k). Operators with larger networks should narrow via
-/// `stations.where`. The 50_001th row signals the cap is breached so the
-/// engine can warn — see #110 metadata refresh status.
-pub const MAX_LOCATIONS: usize = 50_001;
 
 /// Per-query row cap for one station×parameter query inside an **area**
 /// fan-out. Area queries run concurrently, so each in-flight query needs
@@ -232,9 +225,28 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
             sql.push_str(&format!(" WHERE {w}"));
         }
     }
-    sql.push_str(&format!(" ORDER BY {id} LIMIT {MAX_LOCATIONS}"));
+    sql.push_str(&format!(
+        " ORDER BY {id} LIMIT {}",
+        location_fetch_rows(cfg)
+    ));
 
     Ok(BuiltQuery::new(sql, vec![]))
+}
+
+/// Rows a location query fetches: `max_locations + 1`, so a list that does
+/// not fit returns one row past the cap and the caller can tell "exactly the
+/// cap" from "cut at the cap" (#1061).
+///
+/// Inlined as an integer literal, not a `$N` bind: it is a validated `usize`
+/// from config (at most `POSTGIS_MAX_LOCATIONS_CEILING`), so it cannot carry
+/// SQL, and Postgres plans a bound LIMIT in a generic plan as 10 % of the
+/// rows. These prepared statements run every refresh, so after five custom
+/// plans that estimate would make the generic plan look ten times cheaper,
+/// and the windowed `DISTINCT ON` scan could switch to a plan chosen for a
+/// tenth of its rows: the kind of plan change that blows a read-only role's
+/// `statement_timeout` (#435, #438).
+pub fn location_fetch_rows(cfg: &PostgisEngineConfig) -> usize {
+    cfg.max_locations.saturating_add(1)
 }
 
 /// Derive the location list from the observations table(s)' own geometry —
@@ -257,12 +269,13 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
 /// `since` is `Some`, an `AND <time_col> >= <since>` filter restricts each scan
 /// to recent hypertable chunks (the default — keeps `DISTINCT ON` cheap on huge
 /// tables and advertises only currently-reporting stations); `None` scans full
-/// history (`observations.locations_window = "all"`). Each query is capped at
-/// [`MAX_LOCATIONS`].
+/// history (`observations.locations_window = "all"`). Each query fetches
+/// [`location_fetch_rows`] rows at most.
 pub fn build_locations_from_observations(
     cfg: &PostgisEngineConfig,
     since: Option<DateTime<Utc>>,
 ) -> Result<Vec<BuiltQuery>, BuildError> {
+    let fetch_rows = location_fetch_rows(cfg);
     match &cfg.observations {
         ObservationSchema::Long(l) => Ok(vec![obs_locations_query(
             &l.table,
@@ -271,6 +284,7 @@ pub fn build_locations_from_observations(
             &l.time_col,
             l.time_col_tz.as_deref(),
             since,
+            fetch_rows,
         )?]),
         ObservationSchema::Wide(w) => Ok(vec![obs_locations_query(
             &w.table,
@@ -279,6 +293,7 @@ pub fn build_locations_from_observations(
             &w.time_col,
             w.time_col_tz.as_deref(),
             since,
+            fetch_rows,
         )?]),
         ObservationSchema::PerParameter(pp) => {
             let mut queries = Vec::with_capacity(pp.tables.len());
@@ -291,6 +306,7 @@ pub fn build_locations_from_observations(
                     &t.time_col,
                     t.time_col_tz.as_deref(),
                     since,
+                    fetch_rows,
                 )?);
             }
             Ok(queries)
@@ -301,7 +317,8 @@ pub fn build_locations_from_observations(
 }
 
 /// One standalone observations-derived `(id, lat, lon)` query for a single table,
-/// with an optional recent-window time filter, capped at [`MAX_LOCATIONS`].
+/// with an optional recent-window time filter, fetching at most `fetch_rows`
+/// rows ([`location_fetch_rows`]).
 fn obs_locations_query(
     table: &QualifiedTable,
     station_fk_col: &str,
@@ -309,6 +326,7 @@ fn obs_locations_query(
     time_col: &str,
     time_col_tz: Option<&str>,
     since: Option<DateTime<Utc>>,
+    fetch_rows: usize,
 ) -> Result<BuiltQuery, BuildError> {
     let table_fq = fq_table(table)?;
     let fk = quote_ident(station_fk_col)?;
@@ -334,7 +352,7 @@ fn obs_locations_query(
         sql.push_str(&format!(" AND {time} >= {rhs}"));
         params.push(SqlParam::Timestamp(ts));
     }
-    sql.push_str(&format!(" ORDER BY {fk} LIMIT {MAX_LOCATIONS}"));
+    sql.push_str(&format!(" ORDER BY {fk} LIMIT {fetch_rows}"));
     Ok(BuiltQuery::new(sql, params))
 }
 
@@ -884,6 +902,7 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: LocationSource::Stations(stations),
             observations,
             parameters,
@@ -901,6 +920,7 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: LocationSource::Observations,
             observations,
             parameters: vec![param("t2m", "t", "°C", "t2m", "t2m")],
@@ -1021,8 +1041,35 @@ mod tests {
         assert!(q.sql.contains("\"territory\""));
         assert!(q.sql.contains("ST_Y(\"the_geom\")"));
         assert!(q.sql.contains("FROM \"public\".\"stations\""));
-        assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
+        assert!(q.sql.contains(&format!("LIMIT {}", cfg.max_locations + 1)));
         assert!(!q.sql.contains(" WHERE ")); // no where_clause in this cfg
+    }
+
+    /// #1061: every location query fetches `max_locations + 1` rows, so the
+    /// row past the cap tells "exactly the cap" from "cut at the cap".
+    #[test]
+    fn location_queries_fetch_one_row_past_max_locations() {
+        let mut cfg = nexus_per_parameter_cfg();
+        cfg.max_locations = 3;
+        assert_eq!(location_fetch_rows(&cfg), 4);
+
+        let q = build_locations(&cfg).unwrap();
+        assert!(
+            q.sql.ends_with("ORDER BY \"wigos_id\" LIMIT 4"),
+            "{}",
+            q.sql
+        );
+        assert!(q.params.is_empty());
+
+        let qs = build_locations_from_observations(&cfg, Some(t(2026, 6, 15, 0))).unwrap();
+        assert_eq!(qs.len(), 2);
+        for q in &qs {
+            assert!(
+                q.sql.ends_with("ORDER BY \"wigos_id\" LIMIT 4"),
+                "{}",
+                q.sql
+            );
+        }
     }
 
     #[test]
@@ -1045,7 +1092,7 @@ mod tests {
             assert!(q.sql.contains("ST_Y(\"the_geom\")"));
             assert!(q.sql.contains("ST_X(\"the_geom\")"));
             assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
-            assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
+            assert!(q.sql.contains(&format!("LIMIT {}", cfg.max_locations + 1)));
             assert!(!q.sql.contains("UNION")); // no cross-table union in SQL
                                                // Orphans carry no station metadata columns.
             assert!(!q.sql.contains("\"territory\""));
@@ -1064,9 +1111,10 @@ mod tests {
             // Recent-window filter present; the bind (not the column) is wrapped
             // for the naive-UTC column so the index/chunk-pruning stays usable.
             assert!(q.sql.contains("AND \"time\" >= ($1 AT TIME ZONE 'UTC')"));
-            assert!(q
-                .sql
-                .contains(&format!("ORDER BY \"wigos_id\" LIMIT {MAX_LOCATIONS}")));
+            assert!(q.sql.contains(&format!(
+                "ORDER BY \"wigos_id\" LIMIT {}",
+                cfg.max_locations + 1
+            )));
             assert_eq!(q.params, vec![SqlParam::Timestamp(since)]);
         }
         // None ⇒ no time filter, no bind (full-history path).
@@ -1205,9 +1253,10 @@ mod tests {
         assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
         assert!(q.sql.contains("\"wigos_id\"::text AS id"));
         assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
-        assert!(q
-            .sql
-            .contains(&format!("ORDER BY \"wigos_id\" LIMIT {MAX_LOCATIONS}")));
+        assert!(q.sql.contains(&format!(
+            "ORDER BY \"wigos_id\" LIMIT {}",
+            cfg.max_locations + 1
+        )));
         assert!(!q.sql.contains(" UNION "));
     }
 
