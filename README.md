@@ -414,6 +414,11 @@ Maps Part 1 core, spatial subsetting, scaling, date-time and CRS parameters
 - **Headers**: every map carries `Content-Crs`, `Content-Bbox` (the rendered
   corners, in the CRS's axis order) and, on a collection with a temporal
   extent, `Content-Datetime` (the instant rendered).
+- **Anything else** is a 400 naming the accepted parameters: `bbox`,
+  `bbox-crs`, `subset`, `subset-crs`, `center`, `center-crs`, `width`,
+  `height`, `scale-denominator`, `crs`, `datetime`, `transparent`, `f`,
+  `quality`, `elevation`, `parameter-name` (#954). Names are case-sensitive,
+  and a cache-buster such as `_` is rejected too.
 
 ### Map tile requests (OGC API - Tiles, Maps Map Tilesets)
 
@@ -1859,10 +1864,13 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 | `scale-denominator` | no | — | A positive number on the standard 0.28 mm pixel: one pixel spans scale × 0.28 mm on the ground at the map centre. With `bbox` or a spatial `subset` it derives the size, and is a 400 with `width` or `height`; otherwise it sets the extent around `center`, or the extent's centre. |
 | `crs` | no | the collection's `storageCrs`, else CRS84 | Output CRS: CRS84, EPSG:4326, EPSG:3857, EPSG:3067 or EPSG:3035, in the forms `bbox-crs` takes. The storage CRS is the default when it is one of these. |
 | `datetime` | no | latest | An RFC 3339 instant, snapped to an available time step, or an interval (`a/b`, `../b`, `a/..`), rendering the latest time step inside it; an interval holding none is a 404. Not with `subset=time(…)` (400). |
+| `elevation` | no | the engine's default level | One vertical level as a number: a radar elevation angle in degrees, or a pressure or model level. Each engine sets its default and how a level is matched. On a collection with no vertical dimension, or not a finite number: 400. |
 | `f` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp` |
 | `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData), or an RGB composite of a satellite collection, which renders with the `default` style only (another style is 404). The valid names are the keys of the collection's `parameter_names`. Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
 | `transparent` | no | — | Accepted but currently a no-op |
 | `quality` | no | see description | MeteoCore extension: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range: 400. |
+
+Any other query parameter, a misspelling such as `heigth` included, is a 400 naming these, on the per-API routes and at the shared root alike.
 
 `width × height`, given or derived, is additionally capped at `MAX_MAP_PIXELS = 64,000,000` (= 8000²), so a request at the per-dimension cap never trips the pixel cap with a confusing second error. A derived size over a cap is a 400 naming what set it. See also [Map requests](#map-requests-ogc-api---maps).
 
@@ -1886,6 +1894,7 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 - `bbox` follows `bbox-crs` (CRS84, lon/lat, by default), not the output `crs`; a CRS's own axis order applies, so EPSG:4326 is latitude first in both
 - Multi-parameter selection uses `?parameter-name=`, not `LAYERS=collection/param`
 - Errors are JSON, not `ServiceExceptionReport` XML
+- An unknown query parameter is a 400 naming the accepted ones, where WMS ignores it: upper-case names such as `BBOX`, WMS names such as `styles` or `layers`, and cache-busters such as `_` included
 
 ### Conformance Classes
 
