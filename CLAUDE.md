@@ -498,6 +498,7 @@ one never implies the other.
 | `engine_geotiff::decode_budget::BUDGET` | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
 | engine-zarr `read_budget::BUDGET` | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
 | `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
+| `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
 
 - At the default `MC_RENDER_MEMORY_MB` the API caps' full 64 M px is
@@ -511,7 +512,9 @@ one never implies the other.
   `MAX_AREA_DIM` coarsening): `query_bbox` checks `MAX_AREA_VALUES` over
   `timesteps × ny × nx` before allocating the result or reading a file, so
   an over-budget area is the 400. Only a file that cannot be read becomes a
-  logged timestep of nulls; client errors fail the query (#858).
+  logged timestep of nulls; client errors fail the query (#858). Its
+  polygon mask has the shared `check_mask_budget` (#889). Both run before
+  any data read; on a STAC source, after the window's metadata loads.
 - A new source cap must name the pixel space it counts and fail with
   `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
   `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine

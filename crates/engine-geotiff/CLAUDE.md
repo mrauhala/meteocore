@@ -53,7 +53,7 @@ apply here.
   header again. A timeout is not a non-COG, and a full download from the
   same stalled storage only stalls longer.
 
-## STAC metadata loading (#90)
+## STAC metadata loading (#90, #889)
 
 - Startup reads only the collection extent. Each `poll_cycle` adds items
   newer than the newest entry as stubs (the first poll: the last hour), then
@@ -62,13 +62,35 @@ apply here.
   `STAC_PRELOAD_CONCURRENCY` in flight, async reqwest end to end. Never loop
   the sync `load_stac_entry_metadata` there: that is N sequential blocking
   round trips (root Critical Rule 9).
-- The lazy request path (`ensure_metadata` / `ensure_entries_loaded`) stays
-  the fallback for older items (on-demand `fetch_stac_range`), items past the
-  cap and failed preloads. Both paths share `fetch_stac_entry_metadata` and
-  the `loading_in_flight` single-flight set: the preload `try_claim`s without
-  parking and skips an item a request is loading; a request for an item being
-  preloaded waits for it. Install through `install_stac_metadata`, whose
-  `rcu` keeps concurrent loaders from dropping each other's update.
+- The request path is the fallback for older items (on-demand
+  `fetch_stac_range`), items past the cap and failed preloads. A render
+  loads its one item (`ensure_metadata`). An EDR query loads every stub in
+  its window through `load_cold_stac_entries` (#889); a query without
+  `datetime`, every stub in the catalog. More than
+  `STAC_REQUEST_MAX_COLD_ITEMS` (400; a closed one-day window of
+  five-minute frames is 289 items) is a 400 `QueryTooLarge` naming both
+  counts and telling the client to narrow, or add, a datetime window.
+  `ensure_entries_loaded` counts an on-demand STAC response before it
+  installs it, so a refused query leaves no stubs behind to count against
+  later queries. The stubs a query without `datetime` can still meet are a
+  poll backlog past the preload cap and items whose load failed; a windowed
+  query loads those in its window.
+- The cold items load `STAC_PRELOAD_CONCURRENCY` at a time under one
+  `block_on` of the STAC bridge, and none starts once the request's
+  `ds_core::deadline` has passed. Never loop `ensure_metadata` over a
+  window's cold items: that is N sequential round trips on the request
+  worker. Its one loop is the wait afterwards for the items another loader
+  held, bounded by that loader's claims.
+- Every loader shares `fetch_stac_entry_metadata` and the
+  `loading_in_flight` single-flight set. The preload and a query's
+  concurrent loads claim through `claim_and_load_stac_entry`, which
+  `try_claim`s without parking: a future parked on the condvar would stall
+  every other load of its `block_on`. The preload skips an item someone else
+  is loading. A query waits for such items (`ensure_metadata`) only after its
+  own loads finish, holding no claim, so two loaders never wait on each
+  other; it loads an item itself only when that loader gave it up. Install
+  through `install_stac_metadata`, whose `rcu` keeps concurrent loaders from
+  dropping each other's update.
 
 ## Decode admission
 
@@ -181,9 +203,17 @@ GRIB: no `MAX_AREA_DIM` coarsening, which would need overview selection and a
 strided polygon mask. `query_bbox` checks the shared
 `ds_core::feature::check_area_budget` over `timesteps × ny × nx` before it
 allocates the result or reads a file, so an over-budget area is a 400 naming
-the limit (#858). Per timestep, only a file that cannot be read (`Engine`,
-`Storage`, `Io`: `is_unreadable_file`) becomes logged nulls; any other read
-error fails the query — client errors stay 400, admission/deadline 503/504.
+the limit (#858). The polygon mask tests each cell of the window against
+every ring vertex, so `query_area` first checks the shared
+`ds_core::feature::check_mask_budget`, before `query_bbox` reads a file
+(#889): over 20 M edge tests is a 400, as on GRIB and QueryData. A rectangle
+is exempt; a radius query's 65-vertex circle trips it past about 307 k
+cells. Per timestep, only a file that cannot be read (`Engine`, `Storage`,
+`Io`: `is_unreadable_file`) becomes logged nulls; any other read error fails
+the query — client errors stay 400, admission/deadline 503/504. On a STAC
+source a query first loads the metadata of the cold items in its window,
+bounded and concurrent (see STAC metadata loading above); the area and mask
+budgets need the window's grid, so they run after those loads.
 
 Encoded remote tile ranges are validated before fetching: each is capped at
 64 MiB and included in decode admission alongside raw and boxed output buffers.
