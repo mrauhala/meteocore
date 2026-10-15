@@ -19,7 +19,7 @@ use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
 use ds_render::{CacheKey, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
 
 use crate::error::MapsError;
-use crate::params::{LegendFormat, LegendQueryParams, MapQueryParams, MapRequest, MapTime};
+use crate::params::{self, LegendFormat, LegendQueryParams, MapQueryParams, MapRequest, MapTime};
 
 /// Shared state for the OGC API Maps service.
 #[derive(Clone)]
@@ -453,29 +453,20 @@ fn format_parameter() -> serde_json::Value {
 }
 
 /// The query parameters of both map routes, in the order Swagger UI lists
-/// them.
+/// them: [`params::MAP_PARAMETERS`], the list the handlers accept, so the
+/// documented and the accepted set are one.
 fn map_parameters() -> Vec<serde_json::Value> {
-    [
-        "bbox",
-        "bbox-crs",
-        "subset",
-        "subset-crs",
-        "center",
-        "center-crs",
-        "width",
-        "height",
-        "scale-denominator",
-        "crs",
-        MAP_DATETIME,
-        "transparent",
-        "f",
-        "quality",
-        "elevation",
-        "parameter-name",
-    ]
-    .into_iter()
-    .map(|name| json!({"$ref": format!("#/components/parameters/{name}")}))
-    .collect()
+    params::MAP_PARAMETERS
+        .iter()
+        .map(|&name| {
+            if name == "datetime" {
+                MAP_DATETIME
+            } else {
+                name
+            }
+        })
+        .map(|name| json!({"$ref": format!("#/components/parameters/{name}")}))
+        .collect()
 }
 
 /// Maps' `datetime` component. It differs from Tiles' instant-only
@@ -1296,6 +1287,8 @@ pub async fn get_map(
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, MapsError> {
+    // A parameter the route does not take is a 400, never dropped (#954).
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_PARAMETERS)?;
     let subsets = subset::query_values(query.as_deref(), "subset");
     render_map(&id, "default", params, &subsets, headers, state).await
 }
@@ -1308,6 +1301,7 @@ pub async fn get_styled_map(
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, MapsError> {
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_PARAMETERS)?;
     let subsets = subset::query_values(query.as_deref(), "subset");
     render_map(&id, &style_id, params, &subsets, headers, state).await
 }
