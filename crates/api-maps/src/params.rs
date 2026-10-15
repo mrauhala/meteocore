@@ -111,6 +111,43 @@ pub struct MapQueryParams {
     pub quality: Option<String>,
 }
 
+/// Every query parameter the map routes accept: the [`MapQueryParams`]
+/// fields plus the repeatable `subset`, in the order the OpenAPI operations
+/// list them. Anything else is a 400 naming these, never silently dropped
+/// (root CLAUDE.md, #605, #954). That includes cache-busters such as `_`.
+pub const MAP_PARAMETERS: &[&str] = &[
+    "bbox",
+    "bbox-crs",
+    "subset",
+    "subset-crs",
+    "center",
+    "center-crs",
+    "width",
+    "height",
+    "scale-denominator",
+    "crs",
+    "datetime",
+    "transparent",
+    "f",
+    "quality",
+    "elevation",
+    "parameter-name",
+];
+
+/// A 400 naming the accepted parameters when `raw_query` holds another one.
+pub fn reject_unknown_parameters(
+    raw_query: Option<&str>,
+    accepted: &[&str],
+) -> Result<(), MapsError> {
+    match subset::unknown_parameter(raw_query, accepted) {
+        Some(name) => Err(bad(format!(
+            "Unknown query parameter '{name}'. Supported: {}",
+            accepted.join(", ")
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Query parameters for the style legend endpoint.
 #[derive(Debug, Deserialize)]
 pub struct LegendQueryParams {
@@ -803,6 +840,101 @@ mod tests {
 
     fn crs84(bbox: &str) -> Result<[f64; 4], MapsError> {
         parse_bbox(bbox, MapCrs::Crs84)
+    }
+
+    /// `MAP_PARAMETERS` is exactly the `MapQueryParams` fields plus
+    /// `subset`: every listed name but `subset` fills a field, and the
+    /// exhaustive destructuring stops a new field compiling until it is
+    /// checked here, so the list cannot drift from what the handler reads.
+    #[test]
+    fn map_parameters_are_the_query_fields_and_subset() {
+        let query: Vec<String> = MAP_PARAMETERS
+            .iter()
+            .filter(|name| **name != "subset")
+            .map(|name| format!("{name}=x"))
+            .collect();
+        let uri: axum::http::Uri = format!("/map?{}", query.join("&")).parse().unwrap();
+        let axum::extract::Query(params) =
+            axum::extract::Query::<MapQueryParams>::try_from_uri(&uri).unwrap();
+        let MapQueryParams {
+            bbox,
+            width,
+            height,
+            crs,
+            datetime,
+            transparent,
+            format,
+            bbox_crs,
+            center,
+            center_crs,
+            subset_crs,
+            scale_denominator,
+            parameter_name,
+            elevation,
+            quality,
+        } = params;
+        let fields = [
+            bbox,
+            width,
+            height,
+            crs,
+            datetime,
+            transparent,
+            format,
+            bbox_crs,
+            center,
+            center_crs,
+            subset_crs,
+            scale_denominator,
+            parameter_name,
+            elevation,
+            quality,
+        ];
+        assert!(
+            fields.iter().all(|f| f.as_deref() == Some("x")),
+            "{fields:?}"
+        );
+        assert_eq!(fields.len(), MAP_PARAMETERS.len() - 1);
+        assert!(MAP_PARAMETERS.contains(&"subset"));
+    }
+
+    #[test]
+    fn unknown_parameters_are_named_with_the_accepted_ones() {
+        let accepted = MAP_PARAMETERS.join(", ");
+        for (query, name) in [
+            ("parameter_name=t", "parameter_name"),
+            ("width=8&heigth=512", "heigth"),
+            ("_=1700000000", "_"),
+            ("BBOX=10,55,30,70", "BBOX"),
+            ("reference_time=2024-01-01T00:00:00Z", "reference_time"),
+        ] {
+            let Err(MapsError::BadRequest(message)) =
+                reject_unknown_parameters(Some(query), MAP_PARAMETERS)
+            else {
+                panic!("{query} was accepted");
+            };
+            assert_eq!(
+                message,
+                format!("Unknown query parameter '{name}'. Supported: {accepted}"),
+                "{query}"
+            );
+        }
+        let every = MAP_PARAMETERS
+            .iter()
+            .map(|name| format!("{name}=x"))
+            .collect::<Vec<_>>()
+            .join("&");
+        for query in [
+            None,
+            Some(""),
+            Some("subset=Lat(60:65)&subset=time(*)"),
+            Some(every.as_str()),
+        ] {
+            assert!(
+                reject_unknown_parameters(query, MAP_PARAMETERS).is_ok(),
+                "{query:?}"
+            );
+        }
     }
 
     #[test]

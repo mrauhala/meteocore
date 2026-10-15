@@ -88,6 +88,17 @@ Derivation rules (hard-won from production timeouts):
   background runtime (spawned at boot AND on reload; `shutdown()` on
   reload). A failed refresh WARNs and keeps the previous snapshot — never
   empties the cache, and does NOT flip health.
+- **Features `filterables` = the configured `stations.property_cols` ∪ the
+  names the cached rows carry** (#1024). `MetadataCache::new(cfg)` seeds them
+  at construction, so an empty stations table or a failed first refresh
+  (database unreachable at boot) still accepts `territory=FI`: 200 with zero
+  features, never a 400 that lasts until the first row loads. Every stations
+  row carries every property column, so the union adds nothing once data is
+  in. The observations-only mode and the events shape have no stations table
+  and seed nothing; in mode B the orphans carry no properties, so a filter
+  matches registered stations only. Snapshot assembly is
+  `CollectionMeta::build`, pure and unit-tested without a database; keep new
+  per-refresh derivations there, not in `refresh`.
 - **Live ping:** `poll_loop` runs `SELECT 1` every 30 s (2 s deadline) on a
   **dedicated** connection (not the shared pool — a busy pool must not
   masquerade as DB-unreachable), flipping the collection ready⇄degraded.

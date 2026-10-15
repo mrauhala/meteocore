@@ -6407,11 +6407,49 @@ pub async fn correlation_id_middleware(
     response
 }
 
+/// Longest `User-Agent` / `Referer` value the request log keeps, in bytes,
+/// cut back to a char boundary. Both are client-controlled, so the bound
+/// keeps one client from inflating every log line it causes.
+const MAX_LOGGED_HEADER_LEN: usize = 256;
+
+/// `s` cut to at most `max` bytes, never inside a multi-byte character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// A `Referer` without its query string and fragment: both can carry
+/// session tokens or other secrets of the referring page.
+fn strip_referer_query(referer: &str) -> &str {
+    referer
+        .find(['?', '#'])
+        .map_or(referer, |cut| &referer[..cut])
+}
+
+/// The value of request header `name` as the request log records it:
+/// decoded lossily (a byte that is not UTF-8 becomes U+FFFD), passed
+/// through `clean`, then truncated to [`MAX_LOGGED_HEADER_LEN`] bytes. An
+/// absent header is an empty string, like the line's other optional strings.
+fn logged_header(headers: &HeaderMap, name: header::HeaderName, clean: fn(&str) -> &str) -> String {
+    headers.get(name).map_or_else(String::new, |value| {
+        let decoded = String::from_utf8_lossy(value.as_bytes());
+        truncate_on_char_boundary(clean(&decoded), MAX_LOGGED_HEADER_LEN).to_string()
+    })
+}
+
 /// Middleware that emits one structured INFO log line per HTTP request.
 ///
 /// Fields: request_id, method, path, route (template), api, collection,
-/// query_type, query (raw query string), status, duration_ms, result_size
-/// (bytes from Content-Length header if present).
+/// query_type, query (raw query string), user_agent, referer (without its
+/// query string and fragment), status, duration_ms, result_size (bytes from
+/// Content-Length header if present). `user_agent` and `referer` are cut to
+/// [`MAX_LOGGED_HEADER_LEN`] bytes and are empty when the header is absent.
 pub async fn request_logging_middleware(
     matched_path: Option<MatchedPath>,
     req: axum::extract::Request,
@@ -6421,6 +6459,8 @@ pub async fn request_logging_middleware(
     let method = req.method().to_string();
     let uri_path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
+    let user_agent = logged_header(req.headers(), header::USER_AGENT, |ua| ua);
+    let referer = logged_header(req.headers(), header::REFERER, strip_referer_query);
     let matched = matched_path.as_ref().map(|p| p.as_str().to_string());
     let request_id = req
         .extensions()
@@ -6459,7 +6499,7 @@ pub async fn request_logging_middleware(
     let query_str = query.as_deref().unwrap_or("");
 
     // Local macro keeps the field list in one place: future fields like
-    // `user_agent` or `cache_hit` get added once and apply to both arms.
+    // `cache_hit` get added once and apply to both arms.
     // tracing's macro requires the field list at the call site, so we splice
     // an optional `error = …,` token tree depending on whether a reason was
     // attached.
@@ -6474,6 +6514,8 @@ pub async fn request_logging_middleware(
                 collection = collection_str,
                 query_type = query_type,
                 query = query_str,
+                user_agent = user_agent.as_str(),
+                referer = referer.as_str(),
                 status = status,
                 duration_ms = duration_str,
                 result_size = result_size,
@@ -7869,6 +7911,143 @@ mod tests {
     fn rejects_oversized_ids() {
         let huge = "a".repeat(256);
         assert!(!is_safe_request_id(&huge));
+    }
+
+    // --- request log: user_agent / referer (#995) ---
+
+    /// An in-memory log sink for a JSON `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// The `request` log line `request_logging_middleware` writes for
+    /// `headers`, as the JSON object production's `LOG_FORMAT=json` emits.
+    /// The subscriber is the thread's default, and the current-thread test
+    /// runtime keeps the whole request on this thread.
+    async fn request_log_line(headers: &[(&str, &[u8])]) -> serde_json::Value {
+        use tower::ServiceExt;
+        let logs = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let app = axum::Router::new()
+            .route(
+                "/edr/collections/{id}/position",
+                axum::routing::get(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn(super::request_logging_middleware));
+        let mut request = axum::http::Request::builder().uri("/edr/collections/obs/position");
+        for (name, value) in headers {
+            request = request.header(*name, axum::http::HeaderValue::from_bytes(value).unwrap());
+        }
+        let request = request.body(axum::body::Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = logs.0.lock().unwrap().clone();
+        let lines: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|line: &serde_json::Value| line["message"] == "request")
+            .collect();
+        assert_eq!(lines.len(), 1, "one request line: {lines:?}");
+        lines.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_log_records_user_agent_and_referer() {
+        let line = request_log_line(&[
+            ("user-agent", b"Mozilla/5.0 (X11; Linux x86_64) test/1.0"),
+            ("referer", b"https://example.org/preview/map"),
+        ])
+        .await;
+        assert_eq!(
+            line["user_agent"],
+            "Mozilla/5.0 (X11; Linux x86_64) test/1.0"
+        );
+        assert_eq!(line["referer"], "https://example.org/preview/map");
+        assert_eq!(line["collection"], "obs");
+    }
+
+    /// The query string and fragment of the referring page can carry
+    /// tokens: the log keeps the referer up to the first `?` or `#`.
+    #[tokio::test]
+    async fn request_log_strips_the_referer_query_and_fragment() {
+        let line = request_log_line(&[(
+            "referer",
+            b"https://example.org/view?access_token=s3cret&x=1#state=abc",
+        )])
+        .await;
+        assert_eq!(line["referer"], "https://example.org/view");
+        let line = request_log_line(&[("referer", b"https://example.org/view#token=abc?x")]).await;
+        assert_eq!(line["referer"], "https://example.org/view");
+    }
+
+    #[tokio::test]
+    async fn request_log_truncates_long_header_values() {
+        let long_ua = "a".repeat(1000);
+        let long_referer = format!("https://example.org/{}?token=s3cret", "p".repeat(1000));
+        let line = request_log_line(&[
+            ("user-agent", long_ua.as_bytes()),
+            ("referer", long_referer.as_bytes()),
+        ])
+        .await;
+        assert_eq!(line["user_agent"], "a".repeat(super::MAX_LOGGED_HEADER_LEN));
+        let referer = line["referer"].as_str().unwrap();
+        assert_eq!(referer.len(), super::MAX_LOGGED_HEADER_LEN);
+        assert!(referer.starts_with("https://example.org/ppp"), "{referer}");
+
+        // A two-byte character straddling the limit is dropped whole, and
+        // a byte that is not UTF-8 is logged as U+FFFD, not dropped.
+        let mut ua = "a".repeat(super::MAX_LOGGED_HEADER_LEN - 1).into_bytes();
+        ua.extend_from_slice("äbc".as_bytes());
+        let line = request_log_line(&[("user-agent", &ua), ("referer", b"https://x/\xe4")]).await;
+        assert_eq!(
+            line["user_agent"],
+            "a".repeat(super::MAX_LOGGED_HEADER_LEN - 1)
+        );
+        assert_eq!(line["referer"], "https://x/\u{FFFD}");
+    }
+
+    /// Absent headers log as empty strings, like `query` and `collection`
+    /// when a request has none.
+    #[tokio::test]
+    async fn request_log_records_absent_headers_as_empty() {
+        let line = request_log_line(&[]).await;
+        assert_eq!(line["user_agent"], "");
+        assert_eq!(line["referer"], "");
+        assert_eq!(line["query"], "");
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        use super::truncate_on_char_boundary as cut;
+        assert_eq!(cut("abc", 3), "abc");
+        assert_eq!(cut("abcd", 3), "abc");
+        // "€" is three bytes: a cut at byte 2 or 3 drops it whole.
+        assert_eq!(cut("a€b", 2), "a");
+        assert_eq!(cut("a€b", 3), "a");
+        assert_eq!(cut("a€b", 4), "a€");
+        assert_eq!(cut("", 0), "");
     }
 
     #[test]
