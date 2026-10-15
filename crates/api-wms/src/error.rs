@@ -250,10 +250,26 @@ mod tests {
             ),
         ] {
             let xml = String::from_utf8(err.to_xml()).expect("valid utf-8");
-            assert!(
-                xml.contains(&format!("<ServiceException code=\"{code}\">")),
-                "expected code {code}, got {xml}"
-            );
+            assert_eq!(service_exception_code(&xml).as_deref(), Some(code), "{xml}");
+        }
+    }
+
+    /// The `code` attribute of the report's `<ServiceException>`, read with
+    /// quick-xml rather than matched as text (check_geo_safety.sh).
+    fn service_exception_code(xml: &str) -> Option<String> {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(xml);
+        loop {
+            match reader.read_event().ok()? {
+                Event::Start(e) | Event::Empty(e)
+                    if e.local_name().as_ref() == "ServiceException" =>
+                {
+                    let attr = e.try_get_attribute("code").ok()??;
+                    return Some(attr.value.into_owned());
+                }
+                Event::Eof => return None,
+                _ => {}
+            }
         }
     }
 
