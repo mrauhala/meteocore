@@ -477,6 +477,8 @@ pub fn background_tile(
 
 /// Weight function: count the byte size of each cached rendered image
 /// (bytes + 18-byte quoted 16-hex-char ETag string + 64-byte overhead).
+/// The length is the whole allocation only because the encoders return
+/// exact-length buffers (#1052): `Bytes::from(vec)` keeps spare capacity.
 fn weigh_rendered(_key: &CacheKey, val: &CachedRendered) -> u64 {
     val.bytes().len() as u64 + val.etag().len() as u64 + 64
 }
@@ -2150,6 +2152,48 @@ mod tests {
         assert_eq!(&lossless[12..16], b"VP8L");
         assert_ne!(&lossy[12..16], b"VP8L");
         assert_ne!(lossless, lossy);
+    }
+
+    #[test]
+    fn rendered_cache_weight_covers_the_encoded_allocation() {
+        // #1052: the handlers cache `Bytes::from(render_tile(..))`, which keeps
+        // the whole Vec allocation, and `weigh_rendered` counts the length. A
+        // sparse tile encodes to a small fraction of the encoders' worst-case
+        // reservations, so only an exact-length buffer keeps the weight honest.
+        let tile = RasterTile {
+            width: 256,
+            height: 256,
+            values: (0..256 * 256)
+                .map(|i| (i % 256 < 16 && i / 256 < 16).then_some(0.5))
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.0);
+        for format in [ImageFormat::Png, ImageFormat::JPEG, ImageFormat::WEBP] {
+            let encoded = render_tile(&tile, &cmap, format).unwrap();
+            let allocation = encoded.capacity() as u64;
+            let key = CacheKey {
+                layer: "radar".into(),
+                style: "default".into(),
+                format,
+                crs: "EPSG:3857".into(),
+                bbox: [0, 0, 1, 1],
+                width: 256,
+                height: 256,
+                time: None,
+                parameter: None,
+                z: None,
+                reference_time: None,
+                content_version: 0,
+                background: None,
+            };
+            let cached = CachedRendered::new(Bytes::from(encoded));
+            let weight = weigh_rendered(&key, &cached);
+            assert!(
+                weight >= allocation,
+                "{format:?}: weight {weight} B under-counts a {allocation} B allocation"
+            );
+        }
     }
 
     #[test]
