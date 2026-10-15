@@ -1,0 +1,253 @@
+# OGC WMS 1.3.0 executable test suite (ets-wms13) against a server built
+# from this commit (#1065).
+#
+# The job builds the server, starts it on fixtures committed to the
+# repository (ci/wms-ets/config.toml), runs OGC's ets-wms13 under TEAM
+# Engine from the suite's published image, and turns the result into the
+# job summary. The full report is the `wms-ets-report` artifact.
+#
+# Test failures do NOT fail the job, for now. MeteoCore's WMS has
+# deliberate limits a strict run meets: LayerLimit 1 (one layer per
+# GetMap) and no GetFeatureInfo (every layer is queryable="0"). The basic
+# class's dataset-specific tests also need OGC's "Blue Lake" test dataset
+# (the cite:* layers), which these fixtures do not carry.
+# crates/api-wms/README.md lists the expected failures. The job fails only
+# when the suite could not run at all: the server or TEAM Engine did not
+# come up, the server died during the run, the run returned no report, or
+# no conformance class ran (the suite could not read the capabilities
+# document).
+#
+# Not a required check: a path-filtered workflow that does not run would
+# leave its required check pending forever.
+
+name: WMS ETS
+
+on:
+  schedule:
+    - cron: '41 4 * * 3'
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/wms-ets.yml
+      - ci/wms-ets/**
+      - crates/api-wms/**
+      # The fixtures ci/wms-ets/config.toml serves.
+      - testdata/radar/**
+      - testdata/radar-tm35fin/**
+      - testdata/grib-local/**
+      - testdata/grib-arpege-wind/**
+
+# A pull request cancels its own superseded runs; scheduled and manual runs
+# each get a group of their own.
+concurrency:
+  group: wms-ets-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # ets-wms13 1.34 on TEAM Engine 6.0.0-RC2, the suite's latest release.
+  # The digest pins the image behind the tag.
+  ETS_IMAGE: ogccite/ets-wms13:1.34-teamengine-6.0.0-RC2@sha256:0ac80eb3ff9cf50eaf825a7135cbc5d99f3e4936fdf0a5a347618df2da7ad1ad
+  # TEAM Engine's REST API wants an account; the image ships this test
+  # account. It is public, not a secret.
+  TE_AUTH: ogctest:ogctest
+  TE_URL: http://127.0.0.1:8080/teamengine
+  # The image's TE_BASE (`-DTE_BASE` in the suite's Dockerfile). A REST run
+  # writes its session, every test's log.xml and the EARL report, to
+  # TE_BASE/users/<account>/rest/<session id>, not to java.io.tmpdir.
+  TE_BASE: /root/te_base
+  # The fixture server (ci/wms-ets/config.toml pins the port). Its
+  # capabilities advertise http://127.0.0.1:8000/wms, which the suite's
+  # container reaches unchanged through the host network.
+  CAPABILITIES_URL: http://127.0.0.1:8000/wms?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0
+
+jobs:
+  ets:
+    name: ets-wms13 (basic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The summarizer's own tests: seconds, before anything is pulled or
+      # built. A wrong verdict there would pass or fail every run silently.
+      - name: Test the summarizer
+        run: python3 -m unittest discover -s ci/wms-ets -v
+
+      # Started first so Tomcat boots while the server compiles. Host
+      # networking: TEAM Engine listens on the runner's port 8080 and reaches
+      # the server at 127.0.0.1:8000.
+      - name: Start TEAM Engine with ets-wms13
+        run: docker run -d --name ets-wms13 --network host "$ETS_IMAGE"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      # Restore-only reuse of the `check` job's cargo cache in ci.yml:
+      # `shared-key: check` yields the key that job saves. The check job
+      # saves the entry on main, where every branch can restore it, and
+      # restores keep it from being evicted, so it is the cache that
+      # reliably exists. This job never saves one, as the repository's
+      # cache budget is already full.
+      # The key also hashes the rustc version and every CARGO*, CC*, CFLAGS*,
+      # CXX*, CMAKE* and RUST* variable: this workflow sets none beyond
+      # CARGO_TERM_COLOR, which ci.yml sets too. After a Cargo.lock change
+      # it restores the newest entry for the same toolchain; with no entry
+      # at all the build below runs cold, slower but the same.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: check
+          save-if: false
+
+      # A dev build, the profile that cache holds dependencies for. The
+      # workspace crates compile, plus the few dependencies whose features
+      # the cached `cargo test` widened, such as tokio's test-util and the
+      # crates built on tokio. A cached release build would need a cache
+      # entry of its own, which the full budget keeps evicting.
+      - name: Build the server
+        run: cargo build --locked -p server
+
+      # A debug build renders several times slower than release. The render
+      # deadline goes from 3 s to 30 s so that build speed cannot turn into
+      # 503s; the suite tests the protocol, not the deadline. The memory
+      # budget stays at its default. The pid file lets a later step check
+      # that the server outlived the run.
+      - name: Start the server on the fixture config
+        env:
+          MC_RENDER_TIMEOUT_MS: 30000
+        run: |
+          mkdir -p ets-report
+          target/debug/server --config ci/wms-ets/config.toml > ets-report/server.log 2>&1 &
+          server_pid=$!
+          echo "$server_pid" > ets-report/server.pid
+          # Ready once GetCapabilities names a layer of every fixture
+          # collection, the document the suite reads first.
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "::error::The server exited before it was ready."
+              cat ets-report/server.log
+              exit 1
+            fi
+            if curl -fsS --max-time 5 -o ets-report/capabilities.xml "$CAPABILITIES_URL" 2>/dev/null \
+              && grep -qF '<Name>ets-geotiff</Name>' ets-report/capabilities.xml \
+              && grep -qF '<Name>ets-radar</Name>' ets-report/capabilities.xml \
+              && grep -qF '<Name>ets-grib-pressure</Name>' ets-report/capabilities.xml \
+              && grep -qF '<Name>ets-arpege/' ets-report/capabilities.xml; then
+              echo "Server ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The server did not serve every fixture layer within 120 s."
+          cat ets-report/server.log
+          exit 1
+
+      - name: Wait for TEAM Engine
+        run: |
+          code=000
+          for _ in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -u "$TE_AUTH" \
+              -H 'Accept: application/xml' "$TE_URL/rest/suites/wms13/" || true)
+            if [ "$code" = 200 ]; then
+              echo "TEAM Engine lists ets-wms13."
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' ets-wms13 2>/dev/null)" != true ]; then
+              echo "::error::The TEAM Engine container is not running."
+              docker logs ets-wms13 2>&1 | tail -100
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::TEAM Engine did not list ets-wms13 within 180 s (last HTTP status $code)."
+          docker logs ets-wms13 2>&1 | tail -100
+          exit 1
+
+      # One synchronous run: TEAM Engine answers once every test has
+      # finished, with its CTL log (report_logs.xml). `basic=basic` requests
+      # the basic conformance class; the data-independent tests always run.
+      # queryable waits for GetFeatureInfo (#1064); the time, elevation and
+      # recommendation classes stay off.
+      - name: Run ets-wms13
+        id: run
+        run: |
+          code=$(curl -sS -o ets-report/report_logs.xml -w '%{http_code}' --max-time 3000 \
+            -u "$TE_AUTH" -H 'Accept: application/xml' -G \
+            --data-urlencode "capabilities-url=$CAPABILITIES_URL" \
+            --data-urlencode 'basic=basic' \
+            "$TE_URL/rest/suites/wms13/run" || true)
+          echo "TEAM Engine answered HTTP $code."
+          if [ "$code" != 200 ]; then
+            echo "::error::The ets-wms13 run did not complete (HTTP $code)."
+            head -c 4000 ets-report/report_logs.xml 2>/dev/null || true
+            exit 1
+          fi
+
+      # A server that died during the run means the suite could not run,
+      # which is the one thing this job fails on. Checked also when the run
+      # step failed, which a dead server can cause.
+      - name: Check the server outlived the run
+        if: always() && steps.run.outcome != 'skipped'
+        run: |
+          pid=$(cat ets-report/server.pid)
+          if ! kill -0 "$pid" 2>/dev/null \
+            || ! curl -fsS --max-time 30 -o /dev/null "$CAPABILITIES_URL"; then
+            echo "::error::The server died during the run."
+            tail -n 200 ets-report/server.log
+            exit 1
+          fi
+          echo "The server is still up and serving GetCapabilities."
+
+      # A REST run's session lives under TE_BASE/users/<account>/rest: one
+      # directory per session with every test's log.xml, report_logs.xml and
+      # the EARL report (earl-results.rdf). This run is the only session.
+      - name: Collect the TEAM Engine session and logs
+        if: always()
+        run: |
+          mkdir -p ets-report
+          docker logs ets-wms13 > ets-report/teamengine.log 2>&1 || true
+          sessions="$TE_BASE/users/${TE_AUTH%%:*}/rest"
+          if ! docker cp "ets-wms13:$sessions" ets-report/teamengine-session; then
+            echo "::warning::No TEAM Engine session directory at $sessions."
+            # Where the EARL reports went instead, should an image move them.
+            docker exec ets-wms13 find / -xdev -name earl-results.rdf 2>/dev/null || true
+          fi
+
+      # Exits non-zero only when the report shows the suite did not run.
+      - name: Summarize
+        if: always() && steps.run.outcome != 'skipped'
+        run: |
+          rc=0
+          python3 ci/wms-ets/summarize.py ets-report/report_logs.xml \
+            --logs-dir ets-report/teamengine-session \
+            --markdown ets-report/summary.md \
+            --json ets-report/summary.json || rc=$?
+          if [ -f ets-report/summary.md ]; then
+            cat ets-report/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
+
+      # One archive instead of a file per test call, and no file name that
+      # the artifact upload could refuse.
+      - name: Pack the TEAM Engine session
+        if: always()
+        run: |
+          if [ -d ets-report/teamengine-session ]; then
+            tar -C ets-report -czf ets-report/teamengine-session.tar.gz teamengine-session
+            rm -rf ets-report/teamengine-session
+          fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wms-ets-report
+          path: ets-report/
+          if-no-files-found: warn
+          retention-days: 30

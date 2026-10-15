@@ -310,3 +310,58 @@ cached images remain available. GeoTIFF remote reads use the same deadline.
 GRIB metadata is shared through cached descriptors for capabilities and map
 requests. Bounds come from a header probe of each level collection's latest-run
 representative grid; unknown geometry is omitted rather than marked global.
+
+## OGC test suite
+
+The `WMS ETS` workflow (`.github/workflows/wms-ets.yml`, #1065) runs OGC's
+WMS 1.3.0 executable test suite, [ets-wms13](https://github.com/opengeospatial/ets-wms13),
+under TEAM Engine from the suite's published container, pinned by digest. It
+runs weekly, on demand, and on pull requests that change this crate, the
+workflow, its config in `ci/wms-ets/` or the fixtures that config serves. It
+builds the server, a debug build with the render deadline raised to 30 s, and
+starts it on `ci/wms-ets/config.toml`, whose collections use only fixtures
+committed to the repository:
+
+| Layer | Covers |
+|-------|--------|
+| `ets-geotiff` | A plain raster: one GeoTIFF on a projected grid (EPSG:3067) |
+| `ets-radar` | A time axis: five radar frames |
+| `ets-grib-pressure` | An elevation axis (GRIB pressure levels) and a model-run axis (`reference_time`), one value each |
+| `ets-arpege/<param>` | A multi-parameter forecast: a parent layer with one child layer per parameter, a model-run axis of one run, and an `<Attribution>` |
+
+No committed fixture holds several model runs or several pressure levels, so
+those axes are tested with a single value.
+
+The run requests the basic conformance class; the data-independent tests
+always run. The job summary lists the passed, failed and skipped tests, with
+each failure's message and request. Failures in the classes that need OGC's
+test dataset, below, are collapsed to one line each, except
+`basic:gif-or-png` and `basic:options-requirements`, which test MeteoCore's
+own capabilities and are listed in full. The `wms-ets-report` artifact holds
+the full report: TEAM Engine's CTL log, the session directory with every
+test's log and the EARL report (`teamengine-session.tar.gz`), the server log
+and the capabilities document as the server served it at startup.
+
+Test failures do not fail the job. The job fails only when the suite could
+not run: the server or TEAM Engine did not start, the server died during the
+run, the run returned no report, or no conformance class ran. The run meets
+these deliberate limits:
+
+- One layer per GetMap (`LayerLimit` 1, #1014): the suite's GetMap requests
+  with two or three layers, including its multi-layer `STYLES` tests, get an
+  exception and fail.
+- No GetFeatureInfo: GetCapabilities does not advertise the operation and
+  every layer is `queryable="0"`, so the data-independent GetFeatureInfo
+  tests have nothing to request. The queryable class stays off until
+  GetFeatureInfo exists (#1064).
+- The basic class's dataset tests and the separate data-preconditions class
+  need OGC's "Blue Lake" test dataset (the `cite:*` layers), which MeteoCore
+  does not serve. They fail.
+- GetMap accepts only `VERSION=1.3.0`. This costs nothing here: the suite
+  sends 1.3.0, and GetCapabilities answers any `VERSION` with the 1.3.0
+  document, as version negotiation requires.
+
+The server is a debug build, with overflow checks and debug assertions on, so
+reproduce a 500 or a dropped connection on a release build before filing it.
+
+Results are recorded here after the first run.
