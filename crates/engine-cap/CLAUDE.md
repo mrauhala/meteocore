@@ -341,6 +341,15 @@ memory. Things that differ from the pull sources:
 - Single layer per collection, parameter `"severity"`, value = CAP severity
   code (Unknown=0, Minor=1, Moderate=2, Severe=3, Extreme=4). Overlaps use
   `Combine::Max` — highest severity wins, order-independent.
+- **Per-render cap (#805).** One render draws at most `MAX_RENDER_RECORDS`
+  (50 000) areas active at the render instant. Over it, `select_for_render`
+  keeps the most severe: a stable sort by descending `severity_code`, so
+  equal severities keep record order, then truncation, with a WARN naming
+  how many areas were left undrawn. Inactive areas are filtered out first
+  and never take a slot. The sort runs only over the cap, so the normal
+  path costs nothing extra; `Combine::Max` keeps the pixels independent of
+  drawing order either way. Never cut the candidates in storage order:
+  that leaves out an arbitrary set, possibly a valid Extreme warning.
 - Style: the `cap_severity` builtin colormap (grey→green→yellow→orange→red
   with alpha; codes sit exactly on the 0–4 stops — no inter-code blending).
   Set `[wms] colormap = "cap_severity"`.

@@ -943,6 +943,28 @@ impl MapEngine for CapEngine {
         _z: Option<f64>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
+        Ok(self.render(bbox, width, height, time, output_crs, MAX_RENDER_RECORDS))
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        // Cheap clone of the prebuilt snapshot — no recomputation (#211); the
+        // cost is O(times), bounded by the 256-entry TIME cap.
+        (*self.snapshot().info).clone()
+    }
+}
+
+impl CapEngine {
+    /// [`MapEngine::get_raster_tile`] with the per-render area cap as a
+    /// parameter, so a test can exceed it with a handful of alerts.
+    fn render(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        max_records: usize,
+    ) -> RasterTile {
         let cat = self.snapshot();
         // None ⇒ "now" (the snapshot's as_of); an explicit TIME selects that instant.
         let t = time.unwrap_or(cat.as_of);
@@ -958,13 +980,21 @@ impl MapEngine for CapEngine {
         let candidates: Vec<usize> = match Bbox::new(query_west, bbox[1], query_east, bbox[3]) {
             Ok(b) => cat.query_bbox(&b),
             Err(_) => {
-                return Ok(RasterTile {
+                return RasterTile {
                     width,
                     height,
                     values: values.into(),
-                })
+                }
             }
         };
+        let (selected, undrawn) = select_for_render(&cat.records, candidates, t, max_records);
+        if undrawn > 0 {
+            tracing::warn!(
+                "[{}] cap: render capped at {max_records} areas: {undrawn} less severe active \
+                 area(s) left undrawn",
+                self.collection_id
+            );
+        }
 
         // A viewport reaching past ±180° (a Maps bbox crossing the
         // antimeridian arrives unwrapped, #828) shows an area at −175° at
@@ -977,12 +1007,8 @@ impl MapEngine for CapEngine {
             _ => &[0.0, 360.0, -360.0],
         };
 
-        let mut rendered = 0usize;
-        for &i in &candidates {
+        for &i in &selected {
             let rec = &cat.records[i];
-            if !rec.window.active_at(t) {
-                continue;
-            }
             for &k in shifts {
                 let in_view = |[w, _, e, _]: [f64; 4]| w + k <= bbox[2] && e + k >= bbox[0];
                 if k != 0.0 && !rec.bbox.is_some_and(in_view) {
@@ -1008,28 +1034,41 @@ impl MapEngine for CapEngine {
                     );
                 }
             }
-            rendered += 1;
-            if rendered >= MAX_RENDER_RECORDS {
-                tracing::warn!(
-                    "[{}] cap: render capped at {MAX_RENDER_RECORDS} areas",
-                    self.collection_id
-                );
-                break;
-            }
         }
 
-        Ok(RasterTile {
+        RasterTile {
             width,
             height,
             values: values.into(),
-        })
+        }
     }
+}
 
-    fn raster_info(&self) -> RasterInfo {
-        // Cheap clone of the prebuilt snapshot — no recomputation (#211); the
-        // cost is O(times), bounded by the 256-entry TIME cap.
-        (*self.snapshot().info).clone()
+/// The `candidates` active at `t` that one render draws: all of them up to
+/// `max`, else the `max` most severe (#805). Fills combine with
+/// [`Combine::Max`], so the drawing order never changes the output; what the
+/// cap decides is which areas are left out, and that must be the least
+/// severe, never a valid Severe or Extreme warning that happens to sit late
+/// in storage order. The sort is stable (equal severities keep record order)
+/// and runs only over the cap, so the normal path never pays for it.
+/// Returns the selection and how many active areas it leaves out.
+fn select_for_render(
+    records: &[crate::catalog::AreaRecord],
+    mut candidates: Vec<usize>,
+    t: DateTime<Utc>,
+    max: usize,
+) -> (Vec<usize>, usize) {
+    candidates.retain(|&i| records[i].window.active_at(t));
+    let undrawn = candidates.len().saturating_sub(max);
+    if undrawn > 0 {
+        candidates.sort_by(|&a, &b| {
+            records[b]
+                .severity_code
+                .total_cmp(&records[a].severity_code)
+        });
+        candidates.truncate(max);
     }
+    (candidates, undrawn)
 }
 
 /// The CRS84 `[west, east]` the catalog is queried with for a request
@@ -1463,5 +1502,151 @@ mod tests {
             1,
             "Features keeps the retained warning history"
         );
+    }
+
+    /// A `severity` alert over the 0.5° square east of `lon` at 60–61°N,
+    /// from 2020-01-01 until `expires`. Records sort by feature id, so the
+    /// identifier sets an area's place in storage order.
+    fn area_alert(identifier: &str, severity: &str, lon: f64, expires: &str) -> String {
+        let (w, e) = (lon, lon + 0.5);
+        include_str!("../tests/fixtures/helsinki-flood.xml")
+            .replace("urn:test:helsinki-flood-1", identifier)
+            .replace(
+                "<severity>Severe</severity>",
+                &format!("<severity>{severity}</severity><expires>{expires}</expires>"),
+            )
+            .replace(
+                "60.10,24.90 60.10,25.10 60.30,25.10 60.30,24.90 60.10,24.90",
+                &format!("60.0,{w} 60.0,{e} 61.0,{e} 61.0,{w} 60.0,{w}"),
+            )
+    }
+
+    const VALID: &str = "2099-01-01T00:00:00+00:00";
+    const ENDED: &str = "2020-01-02T00:00:00+00:00";
+
+    fn render_time() -> DateTime<Utc> {
+        "2020-06-01T00:00:00Z".parse().unwrap()
+    }
+
+    /// A network-free WIS2 engine holding `alerts` (identifier, severity,
+    /// west longitude, expires).
+    fn area_engine(alerts: &[(&str, &str, f64, &str)]) -> CapEngine {
+        let engine = CapEngine::new(&wis2_config(None), "cap-render").unwrap();
+        let alerts = alerts
+            .iter()
+            .flat_map(|&(id, severity, lon, expires)| {
+                crate::parser::parse_document(&area_alert(id, severity, lon, expires)).unwrap()
+            })
+            .collect();
+        engine
+            .publish_load(
+                Ok(SourceLoad {
+                    alerts,
+                    failed_documents: 0,
+                }),
+                render_time(),
+            )
+            .unwrap();
+        engine
+    }
+
+    /// The severity code drawn at the centre of each area of
+    /// [`render_cap_leaves_out_the_least_severe_active_areas`], west to east.
+    fn drawn(tile: &RasterTile) -> Vec<Option<f64>> {
+        // 0.1° pixels over 20…25.5°E × 59.5…61.5°N; row 10 is 60.4–60.5°N.
+        [20.5, 21.5, 22.5, 23.5, 24.5]
+            .iter()
+            .map(|lon| {
+                let col = ((lon + 0.25 - 20.0) / 0.1) as usize;
+                tile.values.value_at(10 * 55 + col)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_cap_leaves_out_the_least_severe_active_areas() {
+        // Storage order puts the least severe first and an ended Extreme
+        // warning ahead of all of them: drawing in record order up to the
+        // cap left out the Severe and Extreme areas.
+        let engine = area_engine(&[
+            ("urn:test:0-ended-extreme", "Extreme", 24.5, ENDED),
+            ("urn:test:a-minor", "Minor", 20.5, VALID),
+            ("urn:test:b-moderate", "Moderate", 21.5, VALID),
+            ("urn:test:c-severe", "Severe", 22.5, VALID),
+            ("urn:test:d-extreme", "Extreme", 23.5, VALID),
+        ]);
+        let bbox = [20.0, 59.5, 25.5, 61.5];
+        let render = |cap| engine.render(bbox, 55, 20, Some(render_time()), &OutputCrs::Wgs84, cap);
+
+        // Over the cap: the two most severe ACTIVE areas, never the ended one.
+        assert_eq!(
+            drawn(&render(2)),
+            [None, None, Some(3.0), Some(4.0), None],
+            "minor, moderate, severe, extreme, ended extreme"
+        );
+        assert_eq!(
+            drawn(&render(3)),
+            [None, Some(2.0), Some(3.0), Some(4.0), None]
+        );
+        // At the cap and under it every active area is drawn.
+        let all = [Some(1.0), Some(2.0), Some(3.0), Some(4.0), None];
+        assert_eq!(drawn(&render(4)), all);
+        let tile = engine
+            .get_raster_tile(
+                bbox,
+                55,
+                20,
+                Some(render_time()),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(drawn(&tile), all);
+    }
+
+    #[test]
+    fn render_selection_is_stable_and_sorts_only_over_the_cap() {
+        let engine = area_engine(&[
+            ("urn:test:a-minor", "Minor", 20.5, VALID),
+            ("urn:test:b-severe", "Severe", 21.5, VALID),
+            ("urn:test:c-ended", "Extreme", 22.5, ENDED),
+            ("urn:test:d-severe", "Severe", 23.5, VALID),
+        ]);
+        let cat = engine.snapshot();
+        let ids = |selected: &[usize]| -> Vec<String> {
+            selected
+                .iter()
+                .map(|&i| cat.records[i].id.rsplit(':').next().unwrap().to_string())
+                .collect()
+        };
+        let select = |max| {
+            let (selected, undrawn) = select_for_render(
+                &cat.records,
+                (0..cat.records.len()).collect(),
+                render_time(),
+                max,
+            );
+            (ids(&selected), undrawn)
+        };
+        // Within the cap: the active areas in record order, unsorted.
+        assert_eq!(
+            select(3),
+            (
+                vec![
+                    "a-minor.0.0".into(),
+                    "b-severe.0.0".into(),
+                    "d-severe.0.0".into()
+                ],
+                0
+            )
+        );
+        // Over it: most severe first, equal severities in record order.
+        assert_eq!(
+            select(2),
+            (vec!["b-severe.0.0".into(), "d-severe.0.0".into()], 1)
+        );
+        assert_eq!(select(1), (vec!["b-severe.0.0".into()], 2));
     }
 }
