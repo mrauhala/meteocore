@@ -44,6 +44,13 @@ exclude = ["fuzz"]
 # bump in the release-PR step. Only crates/server's version is released;
 # the other members stay wherever they are.
 
+# The licence is the one field every first-party member inherits, with
+# `license.workspace = true` (#1081). crates/ds-bufr declares its own: it is
+# derived from tinybufr and keeps that crate's licence and notices. fuzz/ is
+# outside the workspace and repeats the value.
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
 # Dev/test build-speed tuning. The dominant cost of `cargo test` here is not
 # test execution (every binary finishes in <0.5s) but linking — writing and
 # relocating full DWARF debug info across ~440 dependency crates and 17

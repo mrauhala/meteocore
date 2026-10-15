@@ -193,6 +193,28 @@ cargo audit                          # exactly what CI enforces
   crates and for GitHub Actions; purely transitive crates are refreshed by
   `cargo update`, prompted by the scheduled audit run.
 
+### Licences (#1081)
+
+MeteoCore is `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`). Every
+member inherits `[workspace.package] license` with `license.workspace = true`;
+a new crate without it fails CI. `crates/ds-bufr` keeps its own tinybufr
+declaration and licence files.
+
+- `deny.toml` is the dependency licence allow-list. The `licenses` CI job runs
+  `cargo deny --locked check licenses` and gates the Docker publish like
+  `audit`; advisories stay with `cargo audit`.
+- `THIRD-PARTY-NOTICES.txt` is generated, never committed:
+  `scripts/third_party_notices.sh` (cargo-about 0.9.2, `about.toml`,
+  `third-party/notices.hbs`) runs in the Dockerfile's `notices` stage and in
+  `build-binaries.yml`. A licence added to `deny.toml` usually belongs in
+  `about.toml`'s `accepted` too.
+- The script fails the build when a crate that compiles C/C++ with `cc` or
+  `cmake` is not classified in its `bundled_licences`, or a listed licence
+  file has moved. Add the bundled library's own licence file there; the
+  crate's declared licence covers only its Rust code. blosc-src ships no
+  licence files, so `third-party/c-blosc.txt` holds C-Blosc's, copied from
+  the release blosc-src bundles; the script fails when that release changes.
+
 ### CodeQL scanning
 
 `.github/workflows/codeql.yml` scans Rust, Actions, JavaScript/TypeScript, and
@@ -297,7 +319,8 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 
 ### Adding a new engine
 
-1. Create `crates/engine-<name>/` with a `Cargo.toml` depending on `ds-core`.
+1. Create `crates/engine-<name>/` with a `Cargo.toml` depending on `ds-core`,
+   with `license.workspace = true` in its `[package]`.
 2. Implement `EdrEngine`, `FeatureEngine`, `MapEngine`, and/or `VolumeEngine`.
 3. Add the crate to workspace members in root `Cargo.toml`.
 4. Add it as a dependency of `crates/server/Cargo.toml`.

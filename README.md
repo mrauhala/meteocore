@@ -80,8 +80,9 @@ Each GitHub release carries the server, named `dataserver`, for:
 | macOS Apple Silicon, Intel (macOS 11 or later) | `…-aarch64-apple-darwin.tar.gz`, `…-x86_64-apple-darwin.tar.gz` |
 | Windows x86_64 | `…-x86_64-pc-windows-msvc.zip` |
 
-`SHA256SUMS` lists every archive's checksum. The Docker image remains the
-production deployment.
+`SHA256SUMS` lists every archive's checksum. Each archive also holds
+`README.md`, the licence files and `THIRD-PARTY-NOTICES.txt` (see
+[License](#license)). The Docker image remains the production deployment.
 
 - **macOS:** the binaries are not notarized. A copy downloaded with a browser
   is quarantined and Gatekeeper refuses to start it; clear that with
@@ -2284,4 +2285,53 @@ baseline before adding CodeQL to required merge checks. The existing RustSec
 - **libaec-sys** for GRIB CCSDS/AEC decompression
 - **memmap2** for memory-mapped QueryData file access
 - **zarrs** for Zarr V2/V3 array reading and codecs (with optional **icechunk** for versioned repositories)
-- **CesiumJS** (vendored, bundled via `include_str!`) for the 3D Tiles viewer SPA
+- **CesiumJS** for the 3D Tiles viewer SPA, whose page (bundled via `include_str!`) loads it from cesium.com
+
+## License
+
+MeteoCore is licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option (SPDX `MIT OR Apache-2.0`).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in MeteoCore by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+### Third-party software
+
+The server is built from third-party software under its own licences. Every
+release archive and the Docker image (in `/usr/share/doc/meteocore/`) carry
+`THIRD-PARTY-NOTICES.txt`. It is generated at build time from `Cargo.lock` by
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) (`about.toml`,
+`scripts/third_party_notices.sh`), never committed, and lists:
+
+1. every Rust crate compiled into the server, with its licence text;
+2. the C libraries crates compile from bundled sources: AWS-LC, C-Blosc,
+   jemalloc, libaec, libwebp, LZ4, Snappy, zlib and Zstandard;
+3. the crates' `NOTICE` files;
+4. the components vendored in this repository:
+
+| Component | Location | Licence |
+|---|---|---|
+| ds-bufr, a BUFR decoder derived from [tinybufr](https://github.com/ciscorn/tinybufr) 0.1.3 | `crates/ds-bufr` | MIT OR Apache-2.0 (`LICENSE-MIT.txt`, `LICENSE-APACHE.txt`) |
+| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.33.0, the API documentation pages | `crates/core/assets/swagger-ui-5.33.0` | Apache-2.0, with its `NOTICE`; code bundled into it is listed in `swagger-ui-bundle.js.LICENSE.txt` |
+| [MapLibre GL JS](https://github.com/maplibre/maplibre-gl-js) 5.24.0, the `/preview` maps | `crates/server/preview/vendor` | BSD-3-Clause (`LICENSE-maplibre-gl.txt`) |
+| [Natural Earth](https://www.naturalearthdata.com/) 1:110m country outlines | `crates/server/preview/vendor/workbench-land.json` | Public domain (`LICENSE-workbench-land.txt`) |
+| [ColorBrewer](https://colorbrewer2.org/) RdBu colour scheme, the built-in `diverging` palette | `crates/render/src/palette.rs` | Apache-2.0 (`third-party/colorbrewer.txt`) |
+
+To generate the notices locally, install cargo-about 0.9.2
+(`cargo install --locked cargo-about --version 0.9.2 --features cli`) and run
+`scripts/third_party_notices.sh THIRD-PARTY-NOTICES.txt`.
+
+This software is based in part on the work of the Independent JPEG Group. JPEG
+map output uses the `jpeg-encoder` crate, whose IJG licence asks for that
+acknowledgement.
+
+CI enforces the dependency licence policy: `cargo deny check licenses` fails
+when a dependency's licence is not on the permissive allow-list in
+`deny.toml`.
+
+The schema files under `schemas/` are test fixtures and are not compiled into
+the server. The licences of the datasets a deployment serves are separate:
+each collection declares its own in `[collections.license]`.

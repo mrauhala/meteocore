@@ -2,6 +2,7 @@
 name = "engine-satellite"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Geostationary satellite imagery engine (GOES-R ABI NetCDF-4 -> WMS/Maps/Tiles)"
 
 [dependencies]

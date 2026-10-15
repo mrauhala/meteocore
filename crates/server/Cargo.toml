@@ -2,6 +2,7 @@
 name = "server"
 version = "0.11.0"
 edition = "2021"
+license.workspace = true
 
 [features]
 # Read Icechunk repositories in the Zarr engine (#335). Off by default (heavy

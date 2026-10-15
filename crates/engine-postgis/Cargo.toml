@@ -2,6 +2,7 @@
 name = "engine-postgis"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 # Uses `slice::as_chunks` (stable 1.88), a clippy-preferred idiom it lints
 # for. Declared so an older toolchain fails clearly.
 rust-version = "1.88"

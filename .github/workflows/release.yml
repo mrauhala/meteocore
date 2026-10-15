@@ -52,7 +52,10 @@
 # (re-)build artifacts for an existing tag — useful when the release
 # went through but build jobs were skipped due to a workflow bug. The
 # resolve-target job picks the tag from the dispatch input or from
-# the release job's output as appropriate.
+# the release job's output as appropriate. The jobs come from the
+# dispatching ref, the sources from the tag: for a tag cut before #1081,
+# build-binaries.yml leaves the licence files and notices out of the
+# archives, while the image still gets the licence label set below.
 #
 # Security:
 #   - No workflow-level `permissions:` — each job grants itself the
@@ -403,6 +406,11 @@ jobs:
             type=semver,pattern={{version}},value=${{ needs.resolve-target.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve-target.outputs.tag }}
             type=raw,value=latest
+          # The action fills this label from GitHub's licence detection,
+          # which cannot express the dual licence, and its labels override
+          # the Dockerfile's LABEL (#1081).
+          labels: |
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
 
       # Gate BEFORE the multi-arch publish: build the native-arch image
       # into the local daemon and boot it (scripts/docker_boot_smoke.sh).

@@ -2,6 +2,7 @@
 name = "ds-wis2"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "WMO WIS2 client: Global Broker subscription, notification parsing, deduplication and payload retrieval"
 
 [dependencies]
