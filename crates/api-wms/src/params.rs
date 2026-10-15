@@ -90,51 +90,74 @@ pub fn parse_legend_format(format: Option<&str>) -> Result<LegendFormat, WmsErro
     parse_image_format(format).map(LegendFormat::Image)
 }
 
-/// Raw WMS query parameters (case-insensitive keys handled by axum).
-#[derive(Debug, Deserialize)]
+/// Largest legend image `GetLegendGraphic` draws, per side: a larger
+/// `WIDTH`/`HEIGHT` is clamped to it.
+const MAX_LEGEND_WIDTH: u32 = 512;
+const MAX_LEGEND_HEIGHT: u32 = 1024;
+
+/// The size of the legend image `GetLegendGraphic` returns for its `WIDTH`
+/// and `HEIGHT` values: [`ds_render::LEGEND_DEFAULT_WIDTH`] ×
+/// [`ds_render::LEGEND_DEFAULT_HEIGHT`], large enough for the value-tick
+/// labels and the title (#371), for an absent or unparseable side, and every
+/// side clamped to 1..=512 × 1..=1024. A client can still ask for a small
+/// thumbnail, where the renderer degrades to a bare swatch.
+pub fn legend_size(width: Option<&str>, height: Option<&str>) -> (u32, u32) {
+    let side = |raw: Option<&str>, default: u32, max: u32| {
+        raw.and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(default)
+            .clamp(1, max)
+    };
+    (
+        side(width, ds_render::LEGEND_DEFAULT_WIDTH, MAX_LEGEND_WIDTH),
+        side(height, ds_render::LEGEND_DEFAULT_HEIGHT, MAX_LEGEND_HEIGHT),
+    )
+}
+
+/// WMS request parameters.
+///
+/// WMS 1.3.0 §6.8.1 makes parameter names case-insensitive: `REQUEST`,
+/// `request` and `ReQuEsT` are one parameter. serde field names and aliases
+/// match case-sensitively, so the query string is read as its decoded
+/// `(name, value)` pairs and keyed here by [`WmsQuery::from_pairs`]; never
+/// add serde aliases for a spelling. Values are kept exactly as sent, since
+/// layer and style names are case-sensitive. A name the server does not use
+/// is ignored, as WMS requires, and a parameter given more than once, in any
+/// mix of cases, takes its first value.
+#[derive(Debug, Default)]
 pub struct WmsQuery {
-    #[serde(alias = "SERVICE", alias = "Service")]
     pub service: Option<String>,
-    #[serde(alias = "REQUEST", alias = "Request")]
     pub request: Option<String>,
-    #[serde(alias = "VERSION", alias = "Version")]
     pub version: Option<String>,
-    #[serde(alias = "LAYERS", alias = "Layers")]
     pub layers: Option<String>,
-    #[serde(alias = "LAYER", alias = "Layer")]
     pub layer: Option<String>,
-    #[serde(alias = "STYLES", alias = "Styles")]
     pub styles: Option<String>,
-    #[serde(alias = "STYLE", alias = "Style")]
     pub style: Option<String>,
-    #[serde(alias = "CRS", alias = "Crs")]
     pub crs: Option<String>,
-    #[serde(alias = "BBOX", alias = "Bbox")]
     pub bbox: Option<String>,
-    #[serde(alias = "WIDTH", alias = "Width")]
     pub width: Option<String>,
-    #[serde(alias = "HEIGHT", alias = "Height")]
     pub height: Option<String>,
-    #[serde(alias = "FORMAT", alias = "Format")]
     pub format: Option<String>,
-    #[serde(alias = "TRANSPARENT", alias = "Transparent")]
     pub transparent: Option<String>,
-    #[serde(alias = "BGCOLOR", alias = "Bgcolor")]
     pub bgcolor: Option<String>,
-    #[serde(alias = "TIME", alias = "Time")]
     pub time: Option<String>,
-    #[serde(alias = "ELEVATION", alias = "Elevation")]
     pub elevation: Option<String>,
     /// Forecast model run selector — the custom `reference_time` dimension
     /// (de-facto ncWMS/THREDDS convention). Per WMS, a dimension `foo` is
-    /// requested via `DIM_FOO`; serde matches the lowercase field name itself,
-    /// these aliases add the upper/title-case variants real clients send.
-    #[serde(alias = "DIM_REFERENCE_TIME", alias = "Dim_Reference_Time")]
+    /// requested via `DIM_FOO`.
     pub dim_reference_time: Option<String>,
     /// Encoder quality vendor parameter (GetMap only): 1–100 for
     /// `image/webp` (100 = lossless) and `image/jpeg`; rejected for PNG.
-    #[serde(alias = "QUALITY", alias = "Quality")]
     pub quality: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for WmsQuery {
+    /// Reads the query string as its `(name, value)` pairs in request order,
+    /// both already percent-decoded, so names can be matched in any case and
+    /// "first value wins" is well defined.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let pairs = Vec::<(String, String)>::deserialize(deserializer)?;
+        Ok(Self::from_pairs(pairs))
+    }
 }
 
 /// Validated GetMap parameters.
@@ -169,6 +192,52 @@ pub struct GetMapParams {
 }
 
 impl WmsQuery {
+    /// Key a request's decoded `(name, value)` pairs, in request order.
+    ///
+    /// Names match whatever their case; values are kept as sent. A name no
+    /// field reads is skipped, and a repeated parameter keeps its first value:
+    /// `LAYERS=a&layers=b` names layer `a`.
+    pub fn from_pairs<N, V>(pairs: impl IntoIterator<Item = (N, V)>) -> Self
+    where
+        N: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut query = Self::default();
+        for (name, value) in pairs {
+            if let Some(slot) = query.slot(name.as_ref()) {
+                slot.get_or_insert_with(|| value.into());
+            }
+        }
+        query
+    }
+
+    /// The field parameter `name` fills, matched case-insensitively, or
+    /// `None` for a name the server does not use.
+    fn slot(&mut self, name: &str) -> Option<&mut Option<String>> {
+        let slot = match name.to_ascii_lowercase().as_str() {
+            "service" => &mut self.service,
+            "request" => &mut self.request,
+            "version" => &mut self.version,
+            "layers" => &mut self.layers,
+            "layer" => &mut self.layer,
+            "styles" => &mut self.styles,
+            "style" => &mut self.style,
+            "crs" => &mut self.crs,
+            "bbox" => &mut self.bbox,
+            "width" => &mut self.width,
+            "height" => &mut self.height,
+            "format" => &mut self.format,
+            "transparent" => &mut self.transparent,
+            "bgcolor" => &mut self.bgcolor,
+            "time" => &mut self.time,
+            "elevation" => &mut self.elevation,
+            "dim_reference_time" => &mut self.dim_reference_time,
+            "quality" => &mut self.quality,
+            _ => return None,
+        };
+        Some(slot)
+    }
+
     /// Extract and validate the REQUEST type.
     pub fn request_type(&self) -> Result<WmsRequestType, WmsError> {
         let request = self
@@ -804,6 +873,183 @@ mod tests {
         }
         // Without QUALITY, PNG is unaffected.
         assert!(get_map_query("image/png", None).validate_get_map().is_ok());
+    }
+
+    /// Every parameter name `WmsQuery` reads, lower-case, in the order
+    /// [`fields`] lists the fields.
+    const NAMES: [&str; 18] = [
+        "service",
+        "request",
+        "version",
+        "layers",
+        "layer",
+        "styles",
+        "style",
+        "crs",
+        "bbox",
+        "width",
+        "height",
+        "format",
+        "transparent",
+        "bgcolor",
+        "time",
+        "elevation",
+        "dim_reference_time",
+        "quality",
+    ];
+
+    /// The fields of `q`, in [`NAMES`] order, written out so the test pins
+    /// each name to its own field rather than reusing `WmsQuery::slot`.
+    /// The destructuring names every field and has no `..`: a new
+    /// `WmsQuery` field fails to compile here until it joins `NAMES`, and
+    /// then the case test fails until `slot` reads it, so no parameter can
+    /// be silently never read.
+    fn fields(q: &WmsQuery) -> [Option<&str>; 18] {
+        let WmsQuery {
+            service,
+            request,
+            version,
+            layers,
+            layer,
+            styles,
+            style,
+            crs,
+            bbox,
+            width,
+            height,
+            format,
+            transparent,
+            bgcolor,
+            time,
+            elevation,
+            dim_reference_time,
+            quality,
+        } = q;
+        [
+            service,
+            request,
+            version,
+            layers,
+            layer,
+            styles,
+            style,
+            crs,
+            bbox,
+            width,
+            height,
+            format,
+            transparent,
+            bgcolor,
+            time,
+            elevation,
+            dim_reference_time,
+            quality,
+        ]
+        .map(Option::as_deref)
+    }
+
+    /// `name` with its letters alternately upper and lower case, the way
+    /// the OGC test suite spells them: `ReQuEsT`, or `rEqUeSt`.
+    fn alternating_case(name: &str, upper_first: bool) -> String {
+        name.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if (i % 2 == 0) == upper_first {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    }
+
+    /// WMS 1.3.0 §6.8.1: parameter names are case-insensitive. Every name
+    /// fills its field whatever its case, not only the lower, upper and
+    /// capitalised spellings the serde aliases used to list.
+    #[test]
+    fn every_parameter_name_matches_in_any_case() {
+        let spellings: [fn(&str) -> String; 4] = [
+            str::to_ascii_lowercase,
+            str::to_ascii_uppercase,
+            |name| alternating_case(name, true),
+            |name| alternating_case(name, false),
+        ];
+        for spell in spellings {
+            let query = WmsQuery::from_pairs(NAMES.map(|name| (spell(name), name)));
+            assert_eq!(
+                fields(&query),
+                NAMES.map(Some),
+                "spelled like {:?}",
+                spell("request")
+            );
+        }
+    }
+
+    /// Values are kept as sent (layer and style names are case-sensitive),
+    /// and a name the server does not use is ignored, as WMS requires.
+    #[test]
+    fn values_keep_their_case_and_unknown_names_are_ignored() {
+        let query = WmsQuery::from_pairs([
+            ("BoGuS", "ignored"),
+            ("LaYeRs", "Radar-FI/DBZH"),
+            ("sTyLeS", "Radar_FMI"),
+            ("EXCEPTIONS", "XML"),
+        ]);
+        assert_eq!(query.layers.as_deref(), Some("Radar-FI/DBZH"));
+        assert_eq!(query.styles.as_deref(), Some("Radar_FMI"));
+        let set = fields(&query).iter().filter(|f| f.is_some()).count();
+        assert_eq!(set, 2, "only LAYERS and STYLES are read: {query:?}");
+    }
+
+    /// A parameter given more than once, in one case or several, takes its
+    /// first value, an empty one included.
+    #[test]
+    fn a_repeated_parameter_keeps_its_first_value() {
+        let query = WmsQuery::from_pairs([
+            ("LAYERS", "first"),
+            ("layers", "second"),
+            ("LaYeRs", "third"),
+            ("styles", ""),
+            ("STYLES", "named"),
+        ]);
+        assert_eq!(query.layers.as_deref(), Some("first"));
+        assert_eq!(query.styles.as_deref(), Some(""));
+    }
+
+    /// The query string the handler's `Query<WmsQuery>` extractor parses:
+    /// names in any case, names and values percent-decoded, `+` a space, a
+    /// repeated name answered with its first value instead of the
+    /// "duplicate field" rejection serde's derive gave, and unknown names
+    /// skipped.
+    #[test]
+    fn query_string_is_decoded_then_keyed_case_insensitively() {
+        let uri: axum::http::Uri = "/?ReQuEsT=%47%65%74%4D%61%70&%4C%61%59%65%52%73=radar%2FDBZH\
+             &cRs=CRS%3A84&StYlEs=a+b&BoGuS=ignored&layers=other"
+            .parse()
+            .unwrap();
+        let axum::extract::Query(query) =
+            axum::extract::Query::<WmsQuery>::try_from_uri(&uri).expect("query parses");
+        assert_eq!(query.request.as_deref(), Some("GetMap"));
+        assert_eq!(query.layers.as_deref(), Some("radar/DBZH"));
+        assert_eq!(query.crs.as_deref(), Some("CRS:84"));
+        assert_eq!(query.styles.as_deref(), Some("a b"));
+        assert!(matches!(query.request_type(), Ok(WmsRequestType::GetMap)));
+    }
+
+    /// An absent or unparseable side takes the default size and every side
+    /// is clamped, as GetLegendGraphic sized legends before the size moved
+    /// here for capabilities to share.
+    #[test]
+    fn legend_size_defaults_and_clamps_each_side() {
+        let default = (
+            ds_render::LEGEND_DEFAULT_WIDTH,
+            ds_render::LEGEND_DEFAULT_HEIGHT,
+        );
+        assert_eq!(legend_size(None, None), default);
+        assert_eq!(legend_size(Some("wide"), Some("")), default);
+        assert_eq!(legend_size(Some("20"), Some("120")), (20, 120));
+        assert_eq!(legend_size(Some("0"), Some("0")), (1, 1));
+        assert_eq!(legend_size(Some("9999"), Some("9999")), (512, 1024));
     }
 
     /// Adding an entry to `SUPPORTED_FORMATS` without extending the match in

@@ -169,7 +169,8 @@ fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str 
     }
 }
 
-/// Main WMS handler — dispatches on REQUEST parameter.
+/// Main WMS handler — dispatches on REQUEST parameter. `WmsQuery` keys the
+/// query string case-insensitively for every request type.
 pub async fn wms_handler(
     headers: HeaderMap,
     Query(query): Query<WmsQuery>,
@@ -1025,21 +1026,11 @@ pub async fn wms_handler(
     }
 }
 
-/// The legend image size a GetLegendGraphic asks for. The default fits the
-/// value-tick labels + title (#371); a client can still request a smaller
-/// thumbnail, where the renderer degrades to a bare swatch.
+/// The legend image size a GetLegendGraphic asks for: the one function
+/// capabilities also reads for its LegendURL size, so the advertised size is
+/// the size served.
 fn legend_size(query: &WmsQuery) -> (u32, u32) {
-    let width: u32 = query
-        .width
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(ds_render::LEGEND_DEFAULT_WIDTH);
-    let height: u32 = query
-        .height
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(ds_render::LEGEND_DEFAULT_HEIGHT);
-    (width.clamp(1, 512), height.clamp(1, 1024))
+    crate::params::legend_size(query.width.as_deref(), query.height.as_deref())
 }
 
 /// GetLegendGraphic for an RGB composite layer (#819): the channel list,

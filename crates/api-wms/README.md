@@ -80,18 +80,40 @@ new ol.layer.Tile({
 
 | Operation | Description |
 |-----------|-------------|
-| `GetCapabilities` | Returns XML document listing available layers, CRS, extents, time dimension, and styles; `<Service>` advertises the GetMap limits (`LayerLimit`, `MaxWidth`, `MaxHeight`) |
+| `GetCapabilities` | Returns XML document listing available layers, CRS, extents, time dimension, and styles with their legends; `<Service>` advertises the GetMap limits (`LayerLimit`, `MaxWidth`, `MaxHeight`) |
 | `GetMap` | Returns a rendered map image (PNG or JPEG) |
 | `GetLegendGraphic` | Returns a legend image showing the colormap scale |
 
 GetFeatureInfo is not supported.
+
+The capabilities document names its schemas and validates against them: the
+root's `xsi:schemaLocation` points at the WMS 1.3.0 `capabilities_1_3_0.xsd`
+and at the SLD 1.1.0 `sld_capabilities.xsd`. `<Request>` lists
+`GetCapabilities`, `GetMap` and `sld:GetLegendGraphic`: GetLegendGraphic is
+an SLD operation, which the WMS schema admits only as an extended operation
+in SLD's namespace. `<Capability>` lists `<Request>`, then `<Exception>`,
+which offers `XML` only (see [Error Responses](#error-responses)), then the
+layers. Each style's `<LegendURL>` names the legend's `<Format>`,
+`image/png`, and carries its `width` and `height`: the size its link
+returns, GetLegendGraphic's default of 180 × 300 pixels.
+
+## Parameter Names
+
+Parameter names are case-insensitive in every request, as WMS 1.3.0 §6.8.1
+requires: `REQUEST`, `request` and `ReQuEsT` are one parameter. Values are
+kept as sent and matched exactly, so layer and style names are
+case-sensitive; `TRANSPARENT` and the JSON legend `FORMAT` are the
+exceptions, matched case-insensitively. Names and values are percent-decoded
+first, so `ReQuEsT=%47%65%74%4D%61%70` is a GetMap. A parameter the server
+does not read is ignored, and a parameter given more than once, in any mix
+of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 
 ## GetMap Parameters
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `SERVICE` | yes | Must be `WMS` |
-| `VERSION` | yes | Must be `1.3.0` |
+| `VERSION` | no | Must be `1.3.0`, the default when omitted. Deliberate: ets-wms13's `getmap:no-version` expects an exception |
 | `REQUEST` | yes | `GetMap` |
 | `LAYERS` | yes | Layer name (= collection ID). Only one layer per request. |
 | `CRS` | yes | Coordinate reference system (see below) |
@@ -249,7 +271,9 @@ All GetMap responses include an `ETag` header derived from the request parameter
 
 ## Error Responses
 
-WMS errors are returned as XML `ServiceExceptionReport` documents per the WMS 1.3.0 spec:
+WMS errors are returned as XML `ServiceExceptionReport` documents per the
+WMS 1.3.0 spec, with `Content-Type: text/xml`, WMS 1.3.0's MIME type for
+them:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -261,6 +285,15 @@ WMS errors are returned as XML `ServiceExceptionReport` documents per the WMS 1.
 ```
 
 Error codes: `LayerNotDefined`, `StyleNotDefined`, `CRSNotDefined`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`.
+
+GetCapabilities advertises this one exception format,
+`<Exception><Format>XML</Format></Exception>`, right after `<Request>`. The
+`EXCEPTIONS` parameter is ignored: a request error is always this XML
+document, and so is the 503 of an overloaded or timed-out render. A GetMap
+whose render fails in the engine is not a request error: it returns a red
+error image with HTTP 200. Whether to honour `EXCEPTIONS=INIMAGE` and
+`BLANK` is still open (#1027). Until #1065 the exception documents were
+served as WMS 1.1.1's `application/vnd.ogc.se_xml`.
 
 ## Architecture
 
@@ -369,12 +402,16 @@ passed, 96 failed (72 directly, 24 through a failed subtest). By cause:
 
 | Failures | Cause | Status |
 |---:|---|---|
-| 62 | Mixed-case parameter names (`ReQuEsT`, `WiDtH`): WMS 1.3.0 §6.8.1 makes parameter names case-insensitive, and `WmsQuery` accepted only lower, upper and capitalised spellings | fixing (#1065) |
-| 7 | `LegendURL` has no `<Format>` child, so the suite cannot compare the legend's MIME type | fixing (#1065) |
-| 1 | The capabilities root has no `xsi:schemaLocation` | fixing (#1065) |
-| 1 | No `<Exception>` element in `<Capability>` | fixing (#1027) |
+| 62 | Mixed-case parameter names (`ReQuEsT`, `WiDtH`): WMS 1.3.0 §6.8.1 makes parameter names case-insensitive, and `WmsQuery` accepted only lower, upper and capitalised spellings | fixed: names are matched case-insensitively for every request |
+| 7 | `LegendURL` has no `<Format>` child, so the suite cannot compare the legend's MIME type | fixed: `<Format>image/png</Format>` plus the legend's width and height |
+| 1 | The capabilities root has no `xsi:schemaLocation` | fixed: WMS 1.3.0 and SLD 1.1.0 schema locations; `GetLegendGraphic` is written as `sld:GetLegendGraphic` so the document validates |
+| 1 | No `<Exception>` element in `<Capability>` | fixed: `XML` only; honouring `EXCEPTIONS=INIMAGE/BLANK` stays open on #1027 |
 | 1 | `getmap:no-version`: GetMap without `VERSION` renders instead of raising an exception | deliberate: a missing `VERSION` defaults to 1.3.0, so clients that leave it out keep working |
 | 1 + class | `data-preconditions` and most of `basic` need OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
 
 The mixed-case failures stop most GetMap tests at the first request, so the
 next run after that fix shows what lies behind them.
+
+The same fix also made request errors `text/xml`, the WMS 1.3.0 exception
+MIME type; `application/vnd.ogc.se_xml` is WMS 1.1.1's, and
+`getmap:exceptions-default` / `getmap:exceptions-xml` rejected it.

@@ -9,6 +9,25 @@ WMS 1.3.0 HTTP layer. Read the root `CLAUDE.md` first — Critical Rules 3
 escaping. Never build XML with `format!()` or string concatenation — XML
 injection risk.**
 
+## Parameter names (#1065)
+
+- WMS 1.3.0 §6.8.1: names are case-insensitive. `WmsQuery` deserializes the
+  query string as its percent-decoded `(name, value)` pairs and
+  `WmsQuery::from_pairs` keys them by lower-cased name (`slot`), for every
+  request type. A new parameter is a field plus a lower-case `slot` arm
+  (and an entry in the params tests' `NAMES`/`fields`, whose exhaustive
+  destructuring will not compile without it), never a serde alias: an
+  alias matches only the spellings it lists, and the OGC test suite's
+  `ReQuEsT`, `WiDtH` stopped 62 of its tests at their first request.
+- Values are kept as sent and matched exactly, so layer and style names
+  are case-sensitive. `TRANSPARENT` and the JSON legend `FORMAT` are the
+  documented exceptions, matched case-insensitively.
+- An unknown name is ignored. A repeated parameter, in any mix of cases,
+  takes its first value; serde's derive used to reject a repeat with a
+  plain-text 400 that was no ServiceException.
+- GetMap without `VERSION` assumes 1.3.0. Deliberate, kept although
+  ets-wms13's `getmap:no-version` expects an exception.
+
 ## BBOX axis order (critical gotcha)
 
 WMS 1.3.0 BBOX axis order depends on the CRS:
@@ -190,6 +209,28 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   `<LayerLimit>` = `params::LAYER_LIMIT` (1: GetMap renders one layer),
   `<MaxWidth>`/`<MaxHeight>` = `params::MAX_MAP_DIMENSION`. Change a limit
   there and capabilities follows; never hard-code the numbers in the XML.
+- The root declares `xmlns:xsi`, `xmlns:sld` and an `xsi:schemaLocation`
+  (`SCHEMA_LOCATION`) pairing the WMS namespace with WMS 1.3.0's
+  `capabilities_1_3_0.xsd` and the SLD namespace with SLD 1.1.0's
+  `sld_capabilities.xsd`. The document must validate against them: the
+  OGC test suite's `validate-using-schemaLocation` does exactly that.
+- `<Request>` is `GetCapabilities`, `GetMap`, then `sld:GetLegendGraphic`.
+  The WMS schema allows only `GetFeatureInfo` and `_ExtendedOperation`s
+  after GetMap; SLD 1.1.0 declares GetLegendGraphic as one, in its own
+  namespace (GeoServer and MapServer write it the same way). A
+  `<GetLegendGraphic>` in the WMS namespace is invalid. A new operation
+  that is not WMS's own needs its namespace and schema pair too.
+- `<Capability>` is `Request`, `Exception`, then the root `Layer`, the
+  schema's sequence. `<Exception>` lists `EXCEPTION_FORMATS`, `XML` only:
+  every request error is a ServiceExceptionReport, served as `text/xml`
+  (WMS 1.3.0's MIME type for it; the 1.1.1 `application/vnd.ogc.se_xml`
+  fails the suite), and `EXCEPTIONS` is ignored. Honouring
+  `INIMAGE`/`BLANK` is open (#1027); add a format there only together with
+  the code that serves it.
+- `<LegendURL width height>` holds `<Format>` then `<OnlineResource>`. Its
+  size is `params::legend_size(None, None)`, the function GetLegendGraphic
+  sizes a legend with, so the advertised size is the size the link returns;
+  never hard-code it.
 - Collection `keywords` → `<KeywordList>` (after `<Abstract>`, WMS 1.3.0
   schema order); license → `<Attribution>` (after `<Dimension>` elements).
 - ODIM per-site layers: `<Title>` is prefixed with the site place name via

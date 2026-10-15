@@ -132,10 +132,13 @@ impl IntoResponse for WmsError {
         let reason =
             ds_core::error::ErrorReason(format!("{}: {}", self.error_code(), self.message()));
         let xml = self.to_xml();
+        // WMS 1.3.0's MIME type for the `XML` exception format. WMS 1.1.1's
+        // `application/vnd.ogc.se_xml` is not a 1.3.0 type: the OGC test
+        // suite fails it (#1065).
         let mut response = (
             status,
             [
-                (header::CONTENT_TYPE, "application/vnd.ogc.se_xml"),
+                (header::CONTENT_TYPE, "text/xml"),
                 (
                     header::HeaderName::from_static("x-content-type-options"),
                     "nosniff",

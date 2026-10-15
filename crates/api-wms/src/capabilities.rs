@@ -10,6 +10,29 @@ use quick_xml::Writer;
 use crate::params;
 use ds_render::{CompositeSpec, StyleInfo};
 
+/// The SLD namespace, which `GetLegendGraphic` belongs to: the WMS 1.3.0
+/// schema's `<Request>` holds GetCapabilities, GetMap and GetFeatureInfo,
+/// then only extended operations, and SLD 1.1.0 declares
+/// `sld:GetLegendGraphic` as one.
+const SLD_NAMESPACE: &str = "http://www.opengis.net/sld";
+
+/// Each namespace the document uses with the schema that defines it, as the
+/// root's `xsi:schemaLocation` pairs them, so a validator can find both:
+/// WMS 1.3.0's capabilities schema, and SLD 1.1.0's, which declares
+/// `sld:GetLegendGraphic`. Without the second pair the document is invalid.
+const SCHEMA_LOCATION: &str = "http://www.opengis.net/wms \
+     http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd \
+     http://www.opengis.net/sld \
+     http://schemas.opengis.net/sld/1.1.0/sld_capabilities.xsd";
+
+/// Every format a request error comes in, for the `<Exception>` element:
+/// `XML`, the ServiceExceptionReport. The `EXCEPTIONS` parameter is not
+/// honoured, so `INIMAGE` and `BLANK` are not offered (#1027).
+const EXCEPTION_FORMATS: &[&str] = &["XML"];
+
+/// The image format every LegendURL links to and names in its `<Format>`.
+const LEGEND_URL_FORMAT: &str = "image/png";
+
 /// Generate WMS 1.3.0 GetCapabilities XML.
 ///
 /// Uses quick-xml Writer to ensure all text content is properly escaped.
@@ -30,14 +53,19 @@ pub fn get_capabilities_xml(
     root.push_attribute(("version", "1.3.0"));
     root.push_attribute(("xmlns", "http://www.opengis.net/wms"));
     root.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
+    root.push_attribute(("xmlns:sld", SLD_NAMESPACE));
+    root.push_attribute(("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance"));
+    root.push_attribute(("xsi:schemaLocation", SCHEMA_LOCATION));
     let _ = writer.write_event(Event::Start(root));
 
     // Service section
     write_service(&mut writer, base_url);
 
-    // Capability section
+    // Capability section: Request, then Exception, then the layers, in the
+    // order of the schema's `Capability` sequence.
     let _ = writer.write_event(Event::Start(BytesStart::new("Capability")));
     write_request(&mut writer, base_url);
+    write_exception(&mut writer);
 
     // Root Layer (container for all layers)
     let _ = writer.write_event(Event::Start(BytesStart::new("Layer")));
@@ -126,8 +154,10 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 
     // GetMap and GetLegendGraphic accept the same image formats — iterate
     // SUPPORTED_FORMATS so the advertised list can't drift from what the
-    // handlers actually serve.
-    for op in ["GetMap", "GetLegendGraphic"] {
+    // handlers actually serve. GetLegendGraphic is SLD's operation, written
+    // `sld:GetLegendGraphic` (see `SLD_NAMESPACE`); its children stay WMS
+    // elements, of the WMS schema's `OperationType`.
+    for op in ["GetMap", "sld:GetLegendGraphic"] {
         let _ = writer.write_event(Event::Start(BytesStart::new(op)));
         for format in params::SUPPORTED_FORMATS {
             write_format(writer, format);
@@ -137,6 +167,16 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     }
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Request")));
+}
+
+/// Write `<Exception>`: the formats request errors come in, which the WMS
+/// 1.3.0 schema requires right after `<Request>`.
+fn write_exception(writer: &mut Writer<Vec<u8>>) {
+    let _ = writer.write_event(Event::Start(BytesStart::new("Exception")));
+    for format in EXCEPTION_FORMATS {
+        write_format(writer, format);
+    }
+    let _ = writer.write_event(Event::End(BytesEnd::new("Exception")));
 }
 
 fn write_format(writer: &mut Writer<Vec<u8>>, format: &str) {
@@ -516,9 +556,19 @@ fn write_style(
     // layer advertises; using the bare collection id would hand back the
     // collection default's legend for a parameter layer rendered with its own
     // palette.
-    let _ = writer.write_event(Event::Start(BytesStart::new("LegendURL")));
+    //
+    // The schema's LegendURL is a `<Format>` then the `<OnlineResource>`,
+    // with `width` and `height` attributes for the image size. The link names
+    // no WIDTH or HEIGHT, so it returns the size `params::legend_size` gives
+    // for none: the same function GetLegendGraphic reads.
+    let (width, height) = params::legend_size(None, None);
+    let mut legend = BytesStart::new("LegendURL");
+    legend.push_attribute(("width", width.to_string().as_str()));
+    legend.push_attribute(("height", height.to_string().as_str()));
+    let _ = writer.write_event(Event::Start(legend));
+    write_format(writer, LEGEND_URL_FORMAT);
     let legend_url = format!(
-        "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={name}&FORMAT=image/png"
+        "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={name}&FORMAT={LEGEND_URL_FORMAT}"
     );
     let mut or = BytesStart::new("OnlineResource");
     or.push_attribute(("xlink:type", "simple"));
