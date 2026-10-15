@@ -38,8 +38,9 @@ Derivation rules (hard-won from production timeouts):
 - Orphan/derived locations use `SELECT DISTINCT ON (station_fk)`; for
   `per_parameter`, **one query per table, NOT a single `UNION`** — a UNION
   of N multi-second scans runs as one statement and blows a read-only
-  role's `statement_timeout` (#435). Deduped by id in Rust; each capped at
-  `MAX_LOCATIONS`.
+  role's `statement_timeout` (#435). Deduped by id in Rust
+  (`DerivedLocations`); each query fetches `max_locations + 1` rows and the
+  merged list stops at `max_locations` (below).
 - The derivation is **time-windowed by default**
   (`observations.locations_window`, ISO 8601 duration, default 24 h;
   `"all"` = full history) — restricts the scan to recent hypertable chunks
@@ -80,6 +81,45 @@ Derivation rules (hard-won from production timeouts):
   each load so rebuilt collections on the same DSN join them — DSN sharing
   is a standing invariant, not load-time-only.
 
+## Station-list cap (`[postgis] max_locations`, #1061)
+
+- One cap for every station shape: default
+  `ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS` (200 000), validated at
+  load to `1..=POSTGIS_MAX_LOCATIONS_CEILING` (1 000 000); rejected on the
+  events shape. Never a silent cut: every location query fetches
+  `max_locations + 1` rows (`query::location_fetch_rows`), and one past the cap
+  keeps the first `max_locations` in query order and sets
+  `CollectionMeta::locations_cut` (`LocationSet::of_station_rows` for the
+  stations table, `DerivedLocations::merge_table` for each per-table
+  observation query). Exactly `max_locations` is complete. Mode B
+  (`orphan_fallback`): a cut reporter list is `LocationsCut::Stations`; a cut
+  registry is `LocationsCut::Registry` only when some reporter found no
+  registry row, else nothing served is missing and nothing is flagged.
+  `fetch_*_rows` call those helpers and the tests call the same ones: keep
+  the cap logic in them, not inline in the async fetch.
+- The `LIMIT` is an integer literal from the validated `usize`, NOT a `$N`
+  bind: Postgres plans a bound LIMIT in a generic plan as 10 % of the rows,
+  and after five executions of these per-refresh prepared statements that
+  could switch the `DISTINCT ON` scan to a plan chosen for a tenth of its
+  rows — the statement-timeout failure class of #435/#438. Keep it a literal.
+- Truncation is visible: `PostgisEngine::live_health()` folds it into
+  `LiveHealth::LocationsTruncated` (degraded, `LocationsCut::reason` names
+  the cap and which read; an unreachable DB wins), the
+  `postgis_locations_truncated{collection}` gauge, a Grafana stat, and a
+  WARN on the refresh that first cuts the list. Every `/health` string comes
+  from `LiveHealth::degraded_reason`.
+- A cut list is still served, so it is **live-only**: the load/reload
+  snapshot keeps it `ready` (`admin::postgis_load_status`, degraded only for
+  an unreachable DB) and `effective_health` overlays the cut. Recording it in
+  the snapshot made a later outage show the cut instead (an `Unreachable`
+  verdict keeps a recorded error) and would fail reload's zero-`ready` guard
+  when every collection is cut.
+- Sizing is measured, not guessed: `metadata::tests::footprint` counts the
+  snapshot's heap (≈ 613 B a station with three properties; the README has
+  the table and the /locations, Features, refresh and mask-budget costs). If
+  a new snapshot field grows per station, rerun it with `--nocapture` and
+  update the README numbers; the test fails past 1 KiB a station.
+
 ## Metadata cache & health (#110, #441, #445)
 
 - `ArcSwap<CollectionMeta>` holds stations, parameter descriptors, temporal
@@ -102,12 +142,13 @@ Derivation rules (hard-won from production timeouts):
 - **Live ping:** `poll_loop` runs `SELECT 1` every 30 s (2 s deadline) on a
   **dedicated** connection (not the shared pool — a busy pool must not
   masquerade as DB-unreachable), flipping the collection ready⇄degraded.
-  The ping is the `/health` authority: the handler overrides the boot
-  snapshot with `engine.health_status()` for postgis collections, while a
-  `failed` collection (couldn't construct) has no engine and keeps its boot
+  `engine.live_health()` is the `/health` authority: the ping's verdict plus
+  a truncated station list (above); the handler overrides the boot snapshot
+  with it for postgis collections (`admin::apply_postgis_live_health`), while
+  a `failed` collection (couldn't construct) has no engine and keeps its boot
   status.
-- Metrics: `postgis_up{collection}`, `postgis_pool_*{pool_key}` gauges,
-  `postgis_metadata_refresh_seconds`, and
+- Metrics: `postgis_up{collection}`, `postgis_locations_truncated{collection}`,
+  `postgis_pool_*{pool_key}` gauges, `postgis_metadata_refresh_seconds`, and
   `postgis_{metadata_refreshes,metadata_refresh_failures,pings,
   ping_failures}_total` counters (process-global with
   rebaseline-on-reset delta tracking, since engines reset on reload — keeps
@@ -127,8 +168,8 @@ Derivation rules (hard-won from production timeouts):
 - Supporting caps: stations-in-polygon prefilter ceiling `LIMIT 10_001`
   (bounds the prefilter buffer, not the real gate); `MAX_AREA_QUERIES`
   20k SQL queries per area request (stations × params for `per_parameter`
-  — the parameter list multiplies DB work); locations `LIMIT 50_001`;
-  nearest-station `LIMIT 1`.
+  — the parameter list multiplies DB work); locations
+  `LIMIT max_locations + 1` (above); nearest-station `LIMIT 1`.
 - Observation `LIMIT` is a **bind** (`LIMIT $N`, `SqlParam::Int`,
   `BuiltQuery::{row_limit,set_row_limit}`), not a literal: single-station
   paths (position/location) rewrite it to the remaining budget per query

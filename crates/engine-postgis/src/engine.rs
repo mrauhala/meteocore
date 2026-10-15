@@ -26,8 +26,8 @@ use ds_poll::Shutdown;
 use tokio_postgres::Row;
 
 use crate::config::PostgisEngineConfig;
-use crate::health::{Health, HealthSnapshot, HealthStatus};
-use crate::metadata::{CollectionMeta, MetadataCache};
+use crate::health::{Health, HealthSnapshot, HealthStatus, LiveHealth};
+use crate::metadata::{CollectionMeta, LocationsCut, MetadataCache};
 use crate::query::{
     build_events_area, build_events_window, build_location, build_position,
     build_stations_in_polygon, params_as_refs, BuiltQuery, WindowAttrs, DEFAULT_POSITION_RADIUS_M,
@@ -116,11 +116,28 @@ impl PostgisEngine {
         &self.cache
     }
 
-    /// Authoritative live `/health` status — `None` until the first ping has
-    /// run (so the caller keeps the boot snapshot rather than the optimistic
-    /// seed), then `Some(Ready/Degraded)`.
-    pub fn live_health(&self) -> Option<HealthStatus> {
-        self.health.live_status()
+    /// Authoritative live `/health` verdict: the `SELECT 1` ping's status
+    /// with the metadata snapshot's cut on top (#1061). `None` until the
+    /// first ping has run and while nothing is cut (so the caller keeps the
+    /// boot snapshot rather than the optimistic seed). O(1): two atomic loads
+    /// and one `ArcSwap` load.
+    pub fn live_health(&self) -> Option<LiveHealth> {
+        LiveHealth::from_parts(
+            self.health.live_status(),
+            self.locations_cut(),
+            self.config.max_locations,
+        )
+    }
+
+    /// Which read `max_locations` cut in the cached snapshot, if any (#1061).
+    pub fn locations_cut(&self) -> Option<LocationsCut> {
+        self.cache.load().locations_cut
+    }
+
+    /// Whether `max_locations` cut the cached snapshot (#1061): the
+    /// `postgis_locations_truncated` gauge.
+    pub fn locations_truncated(&self) -> bool {
+        self.locations_cut().is_some()
     }
 
     /// Health + metrics-counter snapshot for the `/metrics` scrape.
@@ -138,6 +155,7 @@ impl PostgisEngine {
     /// `/metrics` (a failure does NOT flip `/health` — the ping owns that).
     pub async fn refresh_metadata(&self) -> Result<(), DataServerError> {
         let start = Instant::now();
+        let was_cut = self.locations_cut();
         let result = self
             .cache
             .refresh(&self.config, &self.pool)
@@ -158,6 +176,24 @@ impl PostgisEngine {
                 )
             });
         self.health.record_refresh(result.is_ok(), start.elapsed());
+        let now_cut = self.locations_cut();
+        if result.is_ok() && now_cut != was_cut {
+            // Log the transitions only: `/health` and the gauge carry the
+            // state while it lasts.
+            match now_cut {
+                Some(cut) => tracing::warn!(
+                    collection = %self.collection_id,
+                    max_locations = self.config.max_locations,
+                    "postgis: {} (collection degraded)",
+                    cut.reason(self.config.max_locations)
+                ),
+                None => tracing::info!(
+                    collection = %self.collection_id,
+                    max_locations = self.config.max_locations,
+                    "postgis: station list fits max_locations again"
+                ),
+            }
+        }
         result
     }
 
@@ -1535,6 +1571,7 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::Stations(dummy_stations()),
             observations: dummy_long_obs(),
             parameters: vec![
@@ -1589,6 +1626,7 @@ mod tests {
             pool_size: 2,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::None,
             observations: ObservationSchema::Events(EventsShape {
                 coverage_bbox: None,
@@ -1636,6 +1674,7 @@ mod tests {
             pool_size: 2,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::Stations(dummy_stations()),
             observations: dummy_long_obs(),
             parameters: vec![ValidatedParameter {
@@ -1682,6 +1721,7 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::None,
             observations: ObservationSchema::Events(EventsShape {
                 coverage_bbox: None,
@@ -1776,6 +1816,7 @@ mod tests {
             temporal_extent: None,
             spatial_extent: None,
             wms_times: std::sync::Arc::new(Vec::new()),
+            locations_cut: None,
             version: 1,
         }
     }
@@ -1905,6 +1946,7 @@ mod tests {
             pool_size: 2,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::Stations(
                 crate::schema::StationsMapping {
                     property_cols: property_cols.iter().map(|c| (*c).to_string()).collect(),
@@ -1966,10 +2008,166 @@ mod tests {
     #[test]
     fn configured_property_filter_is_valid_on_an_empty_stations_table() {
         let engine = engine_with(stations_engine_config(&["territory"]));
-        let refreshed = CollectionMeta::build(engine.config(), Vec::new(), None, 1);
+        let refreshed = CollectionMeta::build(
+            engine.config(),
+            crate::metadata::LocationSet::default(),
+            None,
+            1,
+        );
         engine.cache().store(refreshed);
         assert_eq!(engine.cache().load().version, 1);
         assert_territory_filter_matches_nothing(&engine);
+    }
+
+    // ---- #1061: a station list cut at max_locations ------------------------
+
+    fn station(id: &str) -> crate::metadata::FeatureStation {
+        crate::metadata::FeatureStation {
+            id: id.into(),
+            label: format!("Station {id}"),
+            lat: 60.0,
+            lon: 25.0,
+            properties: Arc::new(HashMap::from([(
+                "territory".to_string(),
+                ds_core::feature::PropertyValue::String("FI".into()),
+            )])),
+        }
+    }
+
+    fn served_ids(engine: &PostgisEngine) -> Vec<String> {
+        use ds_core::feature::FeatureQuery;
+        use ds_core::feature_engine::FeatureEngine;
+        let edr: Vec<String> = engine
+            .get_locations()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        let features: Vec<String> = engine
+            .get_features(&FeatureQuery::default())
+            .unwrap()
+            .features
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(edr, features, "/locations and Features serve one list");
+        assert_eq!(engine.feature_count(), edr.len());
+        edr
+    }
+
+    /// Stations-only mode: `build_locations` fetches `max_locations + 1`
+    /// rows, and `fetch_station_rows` caps them with `of_station_rows`; a
+    /// fourth row with a cap of three keeps the first three in query order,
+    /// flags the list and degrades `/health`, before the first ping and with
+    /// the database reachable.
+    #[test]
+    fn stations_only_list_past_the_cap_is_truncated_and_degraded() {
+        let mut cfg = stations_engine_config(&["territory"]);
+        cfg.max_locations = 3;
+        let engine = engine_with(cfg);
+        assert!(matches!(
+            engine.config().location_source,
+            crate::schema::LocationSource::Stations(_)
+        ));
+
+        let rows = ["a", "b", "c", "d"].map(station).to_vec();
+        let set = crate::metadata::LocationSet::of_station_rows(engine.config(), rows);
+        engine
+            .cache()
+            .store(CollectionMeta::build(engine.config(), set, None, 1));
+
+        assert!(engine.locations_truncated());
+        assert_eq!(engine.locations_cut(), Some(LocationsCut::Stations));
+        assert_eq!(served_ids(&engine), ["a", "b", "c"]);
+        let cut = LiveHealth::LocationsTruncated {
+            max_locations: 3,
+            cut: LocationsCut::Stations,
+        };
+        assert_eq!(engine.live_health(), Some(cut));
+        engine.health.record_ping(true);
+        assert_eq!(engine.live_health(), Some(cut));
+        // An unreachable database is the more urgent reason.
+        engine.health.record_ping(false);
+        assert_eq!(engine.live_health(), Some(LiveHealth::Unreachable));
+    }
+
+    /// Stations-only mode at and under the cap: no flag, and `/health`
+    /// follows the ping alone.
+    #[test]
+    fn stations_only_list_within_the_cap_is_complete() {
+        let mut cfg = stations_engine_config(&["territory"]);
+        cfg.max_locations = 3;
+        let engine = engine_with(cfg);
+        for rows in [vec!["a", "b"], vec!["a", "b", "c"]] {
+            let rows: Vec<_> = rows.into_iter().map(station).collect();
+            let n = rows.len();
+            let set = crate::metadata::LocationSet::of_station_rows(engine.config(), rows);
+            engine
+                .cache()
+                .store(CollectionMeta::build(engine.config(), set, None, 1));
+            assert!(!engine.locations_truncated());
+            assert_eq!(served_ids(&engine).len(), n);
+            assert_eq!(
+                engine.live_health(),
+                None,
+                "boot snapshot until the first ping"
+            );
+        }
+        engine.health.record_ping(true);
+        assert_eq!(engine.live_health(), Some(LiveHealth::Ready));
+    }
+
+    /// The observations-only mode (A), merged by the `merge_table` that
+    /// `fetch_observation_rows` runs per table: two per-table result sets,
+    /// ids deduplicated across them (first geometry wins), four distinct
+    /// reporters against a cap of three. The first three are kept in query
+    /// order and the in-memory position query no longer finds the fourth.
+    #[test]
+    fn observations_only_list_past_the_cap_is_truncated_and_degraded() {
+        let mut cfg = stations_engine_config(&[]);
+        cfg.location_source = crate::schema::LocationSource::Observations;
+        cfg.max_locations = 3;
+        let engine = engine_with(cfg);
+
+        let tables = [
+            vec![("a", 24.0, 60.0), ("b", 25.0, 61.0)],
+            vec![("a", 0.0, 0.0), ("c", 26.0, 62.0), ("d", 27.0, 63.0)],
+        ];
+        let mut merged = crate::metadata::DerivedLocations::new(engine.config().max_locations);
+        let mut stopped = false;
+        for rows in &tables {
+            let more = merged
+                .merge_table(rows, |r| Ok(r.0.to_string()), |r| Ok((r.2, r.1)))
+                .unwrap();
+            if !more {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "reading stops at the first station past the cap");
+        let set = merged.finish();
+        engine
+            .cache()
+            .store(CollectionMeta::build(engine.config(), set, None, 1));
+
+        assert!(engine.locations_truncated());
+        assert_eq!(served_ids(&engine), ["a", "b", "c"]);
+        // "a" keeps its first table's geometry.
+        assert_eq!(engine.get_locations().unwrap()[0].longitude, 24.0);
+        let meta = engine.load_meta();
+        assert_eq!(
+            nearest_in_memory(&meta, 26.0, 62.0, 1_000.0).as_deref(),
+            Some("c")
+        );
+        assert_eq!(nearest_in_memory(&meta, 27.0, 63.0, 1_000.0), None);
+        engine.health.record_ping(true);
+        assert_eq!(
+            engine.live_health(),
+            Some(LiveHealth::LocationsTruncated {
+                max_locations: 3,
+                cut: LocationsCut::Stations,
+            })
+        );
     }
 
     #[test]

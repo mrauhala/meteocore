@@ -2515,6 +2515,14 @@ pub struct PostgisConfig {
     pub pool_label: Option<String>,
     /// Metadata cache refresh cadence. Default 300 s.
     pub metadata_refresh_secs: Option<u64>,
+    /// Most stations the cached location list holds (#1061). The stations
+    /// table read and the observations-derived set both stop there; a list
+    /// cut at it degrades the collection in `/health` and sets
+    /// `postgis_locations_truncated`. Default
+    /// [`POSTGIS_DEFAULT_MAX_LOCATIONS`], at most
+    /// [`POSTGIS_MAX_LOCATIONS_CEILING`]. Not valid for the `events` shape,
+    /// which has no location list.
+    pub max_locations: Option<usize>,
     /// Optional stations table. When absent (mode A), or present but with a
     /// resolvable `observations.geom_col` (mode B, orphan fallback), location
     /// coordinates are derived from the observations table's own geometry —
@@ -2688,6 +2696,21 @@ pub fn validate_qualified_table(name: &str) -> Result<(&str, &str), String> {
     Ok((schema, table))
 }
 
+/// Default `[postgis] max_locations` (#1061): the most stations a postgis
+/// collection caches. Sized by memory: a cached station with a name and three
+/// properties measures ≈ 613 B across the metadata snapshot (engine-postgis
+/// `metadata::tests::footprint`), so 200 000 stations is ≈ 120 MB resident
+/// and ≈ 0.3 GB while a refresh holds the old snapshot and the query's rows.
+/// That covers national and continental networks, closed stations included,
+/// with headroom; memory follows the stations actually loaded, not the cap.
+pub const POSTGIS_DEFAULT_MAX_LOCATIONS: usize = 200_000;
+
+/// Hard ceiling on `[postgis] max_locations` (#1061), checked at config load:
+/// ≈ 0.6 GB resident and ≈ 1.5 GB at a refresh by the same measure. It keeps
+/// a typo from removing the bound; the engine-postgis README lists what else
+/// grows with the list.
+pub const POSTGIS_MAX_LOCATIONS_CEILING: usize = 1_000_000;
+
 fn looks_like_db_url(s: &str) -> bool {
     s.starts_with("postgres://") || s.starts_with("postgresql://")
 }
@@ -2733,6 +2756,25 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
         if n > 32 {
             return Err(Config(format!(
                 "Collection '{id}': [postgis].pool_size {n} exceeds hard cap 32"
+            )));
+        }
+    }
+
+    // -- max_locations (#1061) --------------------------------------------
+    if let Some(n) = cfg.max_locations {
+        if cfg.observations.shape == "events" {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].max_locations is not valid for observations.shape 'events' (it has no location list)"
+            )));
+        }
+        if n == 0 {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].max_locations must be > 0"
+            )));
+        }
+        if n > POSTGIS_MAX_LOCATIONS_CEILING {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].max_locations {n} exceeds the hard ceiling {POSTGIS_MAX_LOCATIONS_CEILING}"
             )));
         }
     }
@@ -6220,6 +6262,69 @@ observed_property = "wind_speed"
         assert_eq!(pg.observations.shape, "per_parameter");
         assert_eq!(pg.observations.tables.len(), 2);
         assert_eq!(pg.parameters.len(), 2);
+        // Absent ⇒ the engine applies POSTGIS_DEFAULT_MAX_LOCATIONS.
+        assert_eq!(pg.max_locations, None);
+    }
+
+    /// #1061: `max_locations` is read from `[postgis]` and bounded at load:
+    /// 1 ..= the hard ceiling.
+    #[test]
+    fn postgis_max_locations_validated_at_load() {
+        let with = |value: &str| {
+            nexus_postgis_toml().replace(
+                "dsn_env = \"NEXUS_DSN\"",
+                &format!("dsn_env = \"NEXUS_DSN\"\nmax_locations = {value}"),
+            )
+        };
+        let load = |toml: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(tmp.path(), "config.toml", toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+
+        for ok in [
+            1,
+            POSTGIS_DEFAULT_MAX_LOCATIONS,
+            POSTGIS_MAX_LOCATIONS_CEILING,
+        ] {
+            let config = load(&with(&ok.to_string())).unwrap();
+            let pg = config.collections[0].postgis.as_ref().unwrap();
+            assert_eq!(pg.max_locations, Some(ok));
+        }
+
+        let err = load(&with("0")).unwrap_err().to_string();
+        assert!(err.contains("max_locations must be > 0"), "got: {err}");
+
+        let over = (POSTGIS_MAX_LOCATIONS_CEILING + 1).to_string();
+        let err = load(&with(&over)).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "max_locations {over} exceeds the hard ceiling {POSTGIS_MAX_LOCATIONS_CEILING}"
+            )),
+            "got: {err}"
+        );
+
+        // A negative count is not a usize: rejected by the parser.
+        assert!(load(&with("-5")).is_err());
+    }
+
+    /// #1061: the events shape has no location list, so the knob would do
+    /// nothing there — rejected rather than silently ignored.
+    #[test]
+    fn postgis_events_rejects_max_locations() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "dsn_env = \"NEXUS_DSN\"",
+            "dsn_env = \"NEXUS_DSN\"\nmax_locations = 1000",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("max_locations is not valid for observations.shape 'events'"),
+            "got: {err}"
+        );
     }
 
     fn lightning_events_toml() -> &'static str {

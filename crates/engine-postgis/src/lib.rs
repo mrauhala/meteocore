@@ -10,8 +10,9 @@ pub mod schema;
 pub mod security;
 
 pub use engine::PostgisEngine;
-pub use health::{Health, HealthSnapshot, HealthStatus};
+pub use health::{Health, HealthSnapshot, HealthStatus, LiveHealth};
 pub use maps::strike_window_cache_metrics;
+pub use metadata::LocationsCut;
 
 pub use config::{PostgisConfigError, PostgisEngineConfig, ValidatedParameter};
 pub use schema::{

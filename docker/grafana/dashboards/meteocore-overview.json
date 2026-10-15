@@ -2055,6 +2055,57 @@
       ]
     },
     {
+      "type": "stat",
+      "title": "Truncated station lists",
+      "description": "Collections whose cached station list was cut at [postgis] max_locations (#1061): stations past the cap are missing from /locations, Features and, in the observations-derived modes, from position and area queries. In mode B a cut station registry counts too: reporters whose registry row was past the cap are served without their label and properties. /health shows them degraded with the reason. Should be 0. Raise max_locations (memory sizing in the engine-postgis README) or narrow the station set.",
+      "id": 79,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 124
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(postgis_locations_truncated) or vector(0)",
+          "refId": "A",
+          "legendFormat": "truncated"
+        }
+      ]
+    },
+    {
       "type": "timeseries",
       "title": "Connection pool",
       "description": "Open connections vs capacity, acquirable-now, and waiters. Sustained waiting > 0 = pool too small or slow queries.",

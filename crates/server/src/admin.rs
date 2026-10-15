@@ -580,6 +580,14 @@ static POSTGIS_UP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
 });
+static POSTGIS_LOCATIONS_TRUNCATED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_locations_truncated",
+        "1 if [postgis] max_locations cut the PostGIS collection's cached station list, or in \
+         mode B the station registry it is enriched from (/health degraded), else 0",
+        &["collection"],
+    )
+});
 static POSTGIS_POOL_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     pg_int_gauge(
         "postgis_pool_size",
@@ -3532,13 +3540,7 @@ pub fn load_collections(
                         // ping owns liveness. `None` (no ping completed yet)
                         // keeps the optimistic seed — the engine was accepted
                         // by a previous load.
-                        let (status, err) = match engine.live_health() {
-                            Some(engine_postgis::HealthStatus::Degraded) => (
-                                CollectionStatus::Degraded,
-                                Some("database unreachable (live health)".to_string()),
-                            ),
-                            _ => (CollectionStatus::Ready, None),
-                        };
+                        let (status, err) = postgis_load_status(engine.live_health());
                         (engine, status, err)
                     }
                     None => {
@@ -3628,7 +3630,10 @@ pub fn load_collections(
                                     engine.get_locations().map(|l| l.len()).unwrap_or(0),
                                     engine.get_parameters().len()
                                 );
-                                (CollectionStatus::Ready, None)
+                                // No ping has run yet: the only live verdict
+                                // here is a cut station list, which stays out
+                                // of the load snapshot (`postgis_load_status`).
+                                postgis_load_status(engine.live_health())
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -5284,34 +5289,25 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
 
     // Reflect LIVE postgis health (the 30s SELECT 1 ping) over the boot snapshot,
     // so a DB that went down after startup flips to `degraded` and one that
-    // recovered flips back (#110). A `Failed` collection has no engine (couldn't
-    // construct), so it's absent from the live map and keeps its boot status.
-    // `live_health()` is `None` until the first ping completes — so a
-    // boot-degraded collection keeps that boot status instead of the optimistic
-    // `ready` seed during the load→first-ping window.
+    // recovered flips back (#110), and a station list cut at `max_locations`
+    // degrades a reachable collection (#1061). A `Failed` collection has no
+    // engine (couldn't construct), so it's absent from the live map and keeps
+    // its boot status. `live_health()` is `None` until the first ping completes
+    // (unless the list is cut) — so a boot-degraded collection keeps that boot
+    // status instead of the optimistic `ready` seed during the load→first-ping
+    // window.
     {
         let engines = state
             .postgis_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let live: HashMap<&str, engine_postgis::HealthStatus> = engines
+        let live: HashMap<&str, engine_postgis::LiveHealth> = engines
             .iter()
             .filter_map(|e| Some((e.collection_id(), e.live_health()?)))
             .collect();
         for h in health.iter_mut().filter(|h| h.engine_type == "postgis") {
             if let Some(&s) = live.get(h.id.as_str()) {
-                match s {
-                    engine_postgis::HealthStatus::Ready => {
-                        h.status = CollectionStatus::Ready;
-                        h.error = None;
-                    }
-                    engine_postgis::HealthStatus::Degraded => {
-                        h.status = CollectionStatus::Degraded;
-                        h.error.get_or_insert_with(|| {
-                            "database unreachable (health ping failed)".into()
-                        });
-                    }
-                }
+                apply_postgis_live_health(h, s);
             }
         }
     }
@@ -5387,6 +5383,47 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
     }
 
     health
+}
+
+/// A postgis collection's entry in the load/reload snapshot: degraded only
+/// for an unreachable database. A station list cut at `max_locations`
+/// (#1061) is still served, so it stays `Ready` here and `effective_health`
+/// reports it live: kept out of the snapshot, it cannot mask a later
+/// database outage (an `Unreachable` verdict keeps a recorded error), and a
+/// reload of cut collections still passes the zero-`Ready` guard.
+fn postgis_load_status(
+    live: Option<engine_postgis::LiveHealth>,
+) -> (CollectionStatus, Option<String>) {
+    match live {
+        Some(live @ engine_postgis::LiveHealth::Unreachable) => {
+            (CollectionStatus::Degraded, live.degraded_reason())
+        }
+        _ => (CollectionStatus::Ready, None),
+    }
+}
+
+/// One postgis collection's live verdict over its boot/reload entry. An
+/// unreachable database keeps a boot error already recorded (the boot
+/// refresh's failure says more); a station list cut at `max_locations`
+/// (#1061) names the cap, replacing any boot error, since the refresh that
+/// cut it succeeded.
+fn apply_postgis_live_health(h: &mut CollectionHealth, live: engine_postgis::LiveHealth) {
+    match live {
+        engine_postgis::LiveHealth::Ready => {
+            h.status = CollectionStatus::Ready;
+            h.error = None;
+        }
+        engine_postgis::LiveHealth::Unreachable => {
+            h.status = CollectionStatus::Degraded;
+            if h.error.is_none() {
+                h.error = live.degraded_reason();
+            }
+        }
+        engine_postgis::LiveHealth::LocationsTruncated { .. } => {
+            h.status = CollectionStatus::Degraded;
+            h.error = live.degraded_reason();
+        }
+    }
 }
 
 /// Set the `collections_*` gauges from [`effective_health`] — the same live
@@ -5970,8 +6007,16 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             .postgis_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        // Rebuilt every scrape so a collection removed on reload leaves no
+        // stale `1` behind. The gather below runs after the counter-state
+        // lock is released, so a scrape that overlaps another's reset can
+        // briefly miss the series, like the satellite gauges.
+        POSTGIS_LOCATIONS_TRUNCATED.reset();
         for engine in engines.iter() {
             let cid = engine.collection_id();
+            POSTGIS_LOCATIONS_TRUNCATED
+                .with_label_values(&[cid])
+                .set(i64::from(engine.locations_truncated()));
             let snap = engine.health_snapshot();
             // Only emit postgis_up once the first ping has run — before that the
             // status is the optimistic seed, and emitting `1` would disagree with
@@ -8966,6 +9011,96 @@ colormap = "no_such_map"
             let warning = super::state_dir_reload_warning(live, wanted).unwrap();
             assert!(warning.contains("restart to apply"), "{warning}");
         }
+    }
+
+    /// #1061: a postgis station list cut at `max_locations` stays `Ready` in
+    /// the load snapshot and is degraded live, in `/health`, with the cap
+    /// named. Since every `effective_health` call starts from that snapshot,
+    /// a database outage afterwards reports itself instead of the cut, and
+    /// recovery returns to the cut's reason. An unreachable database keeps a
+    /// recorded boot error; `Ready` clears it.
+    #[test]
+    fn postgis_live_health_degrades_a_truncated_station_list() {
+        use super::{
+            apply_postgis_live_health, postgis_load_status, CollectionHealth, CollectionStatus,
+        };
+        use engine_postgis::{LiveHealth, LocationsCut};
+        let entry = |(status, error): (CollectionStatus, Option<String>)| CollectionHealth {
+            id: "obs".into(),
+            engine_type: "postgis".into(),
+            status,
+            error,
+        };
+        let live = |snapshot: &CollectionHealth, verdict| {
+            let mut h = snapshot.clone();
+            apply_postgis_live_health(&mut h, verdict);
+            (h.status, h.error)
+        };
+        let unreachable = (
+            CollectionStatus::Degraded,
+            Some("database unreachable (health ping failed)".to_string()),
+        );
+
+        for cut in [LocationsCut::Stations, LocationsCut::Registry] {
+            let verdict = LiveHealth::LocationsTruncated {
+                max_locations: 200_000,
+                cut,
+            };
+            let reason = cut.reason(200_000);
+            assert!(reason.contains("max_locations = 200000"), "{reason}");
+            // Load and reload: still served, so `Ready` in the snapshot.
+            let snapshot = entry(postgis_load_status(Some(verdict)));
+            assert_eq!(snapshot.status, CollectionStatus::Ready);
+            assert_eq!(snapshot.error, None);
+            assert_eq!(
+                live(&snapshot, verdict),
+                (CollectionStatus::Degraded, Some(reason.clone()))
+            );
+            // The database goes down: the outage is the reason shown.
+            assert_eq!(live(&snapshot, LiveHealth::Unreachable), unreachable);
+            // It comes back with the list still cut.
+            assert_eq!(
+                live(&snapshot, verdict),
+                (CollectionStatus::Degraded, Some(reason.clone()))
+            );
+            // A boot refresh error is replaced: the refresh that cut the
+            // list succeeded later.
+            let failed_boot = entry((
+                CollectionStatus::Degraded,
+                Some("metadata refresh failed".to_string()),
+            ));
+            assert_eq!(
+                live(&failed_boot, verdict),
+                (CollectionStatus::Degraded, Some(reason))
+            );
+        }
+
+        assert_eq!(
+            postgis_load_status(Some(LiveHealth::Unreachable)),
+            unreachable
+        );
+        for verdict in [None, Some(LiveHealth::Ready)] {
+            assert_eq!(
+                postgis_load_status(verdict),
+                (CollectionStatus::Ready, None)
+            );
+        }
+
+        let failed_boot = entry((
+            CollectionStatus::Degraded,
+            Some("metadata refresh failed".to_string()),
+        ));
+        assert_eq!(
+            live(&failed_boot, LiveHealth::Unreachable),
+            (
+                CollectionStatus::Degraded,
+                Some("metadata refresh failed".to_string())
+            )
+        );
+        assert_eq!(
+            live(&failed_boot, LiveHealth::Ready),
+            (CollectionStatus::Ready, None)
+        );
     }
 
     /// #990 harness: one file-fed CAP collection (live `Ready` once its
