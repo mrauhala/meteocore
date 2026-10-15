@@ -179,11 +179,12 @@ pub trait EdrEngine: Send + Sync {
     }
 
     /// Whether this engine's results are time series at its named locations
-    /// (stations): every `locations`, `position` and `radius` result is a
-    /// `PointSeries`, or a collection of them, with no `z`, at the
+    /// (stations): every `locations`, `position`, `radius` and `area` result
+    /// is a `PointSeries`, or a collection of them, with no `z`, at the
     /// coordinates of a location [`Self::get_locations`] lists. The EDR layer
-    /// then also encodes those queries as EDR GeoJSON, one feature per
-    /// location (#929). **O(1)**: it is read per metadata request.
+    /// then also encodes the point queries as EDR GeoJSON, one feature per
+    /// location (#929), and those and `area` as CSV, one row per location,
+    /// time and parameter (#1066). **O(1)**: it is read per metadata request.
     ///
     /// Default `false`: gridded and polar results are coverages, not
     /// features, and keep CoverageJSON only.

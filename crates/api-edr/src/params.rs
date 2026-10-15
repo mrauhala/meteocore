@@ -267,10 +267,18 @@ pub enum EdrFormat {
     GeoJson,
     /// A rendered PNG plot (vertical profile or time series).
     Png,
+    /// CSV, one row per location, time and parameter, for station series
+    /// (#1066, `crate::csv`).
+    Csv,
     /// An HTML page of the response (EDR `/req/html/definition`, #971):
     /// offered by every data query, after its data formats.
     Html,
 }
+
+/// The media type CSV is advertised as (#1066): RFC 4180's `text/csv`
+/// with its `header` parameter, since the first row names the columns.
+/// The response's `Content-Type` adds `charset=utf-8` (`crate::csv`).
+pub const CSV_MEDIA_TYPE: &str = "text/csv;header=present";
 
 impl EdrFormat {
     /// The `f` token, as advertised in `output_formats`.
@@ -279,6 +287,7 @@ impl EdrFormat {
             EdrFormat::CoverageJson => "CoverageJSON",
             EdrFormat::GeoJson => "GeoJSON",
             EdrFormat::Png => "PNG",
+            EdrFormat::Csv => "CSV",
             EdrFormat::Html => "HTML",
         }
     }
@@ -289,12 +298,14 @@ impl EdrFormat {
             EdrFormat::CoverageJson => COVERAGE_JSON_MEDIA_TYPE,
             EdrFormat::GeoJson => "application/geo+json",
             EdrFormat::Png => "image/png",
+            EdrFormat::Csv => CSV_MEDIA_TYPE,
             EdrFormat::Html => "text/html",
         }
     }
 
-    /// The format a media type names (lowercase), if any. `application/json`
-    /// names none: both JSON formats are JSON, so it leaves the default.
+    /// The format a media type names (lowercase, without parameters), if
+    /// any. `application/json` names none: both JSON formats are JSON, so
+    /// it leaves the default.
     fn from_media_type(media: &str) -> Option<EdrFormat> {
         match media {
             COVERAGE_JSON_MEDIA_TYPE | LEGACY_COVERAGE_JSON_MEDIA_TYPE => {
@@ -302,6 +313,7 @@ impl EdrFormat {
             }
             "application/geo+json" => Some(EdrFormat::GeoJson),
             "image/png" => Some(EdrFormat::Png),
+            "text/csv" => Some(EdrFormat::Csv),
             "text/html" => Some(EdrFormat::Html),
             _ => None,
         }
@@ -309,11 +321,15 @@ impl EdrFormat {
 }
 
 /// Parse the `f` query parameter. Absent/blank → CoverageJSON.
-/// `coveragejson`, `geojson`, `png` and `html` are accepted case-insensitively, and
-/// so are their media types (#510): `application/vnd.cov+json` (what the
-/// responses carry, EDR 1.2, #920), `application/prs.coverage+json` (EDR
-/// 1.1's type, still accepted; the response is the same CoverageJSON under
-/// the 1.2 type), `application/geo+json`, `image/png` and `text/html`. A `+` sent
+/// `coveragejson`, `geojson`, `png`, `csv` and `html` are accepted
+/// case-insensitively, and so are their media types (#510):
+/// `application/vnd.cov+json` (what the responses carry, EDR 1.2, #920),
+/// `application/prs.coverage+json` (EDR 1.1's type, still accepted; the
+/// response is the same CoverageJSON under the 1.2 type),
+/// `application/geo+json`, `image/png`, `text/csv` (#1066; also with its
+/// parameters, `;header=present` or `;charset=utf-8`, any other `header` or
+/// `charset` being a 400 and other parameters ignored) and `text/html`.
+/// The other media types take no parameters. A `+` sent
 /// unencoded arrives as a space, so a space inside a media type reads as
 /// `+`. Anything else is a 400. Whether the query offers the format is the
 /// caller's check ([`query_formats`]).
@@ -327,13 +343,49 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
         Some("coveragejson") => Ok(EdrFormat::CoverageJson),
         Some("geojson") => Ok(EdrFormat::GeoJson),
         Some("png") => Ok(EdrFormat::Png),
+        Some("csv") => Ok(EdrFormat::Csv),
         Some("html") => Ok(EdrFormat::Html),
-        Some(media) => EdrFormat::from_media_type(media).ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "Unsupported output format '{media}' — expected 'CoverageJSON', 'GeoJSON', 'PNG' or 'HTML'"
-            ))
-        }),
+        // `text/csv` with its RFC 4180 parameters (`;header=present`); a
+        // space around them arrived as a `+`. Every other media type is
+        // matched whole, parameters included, so it has none.
+        Some(media) => match media.split_once(';') {
+            Some((essence, parameters)) if essence.trim_end_matches('+') == "text/csv" => {
+                check_csv_parameters(parameters)?;
+                Ok(EdrFormat::Csv)
+            }
+            _ => EdrFormat::from_media_type(media).ok_or_else(|| {
+                DataServerError::InvalidParameter(format!(
+                    "Unsupported output format '{media}' — expected 'CoverageJSON', 'GeoJSON', \
+                     'PNG', 'CSV' or 'HTML'"
+                ))
+            }),
+        },
     }
+}
+
+/// The parameters of an `f=text/csv;…` (lowercase, `;`-separated): every
+/// CSV response has its header row and is UTF-8, so `header` other than
+/// `present` and `charset` other than `utf-8` are a 400 naming what is
+/// served. Other parameters are ignored.
+fn check_csv_parameters(parameters: &str) -> Result<(), DataServerError> {
+    for parameter in parameters.split(';') {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        let (name, value) = (name.trim_matches('+'), value.trim_matches('+'));
+        let served = match name {
+            "header" => "present",
+            "charset" => "utf-8",
+            _ => continue,
+        };
+        if value.trim_matches('"') != served {
+            return Err(DataServerError::InvalidParameter(format!(
+                "Unsupported output format 'text/csv' with {name}={value}: CSV is served as \
+                 text/csv;header=present in UTF-8"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The output formats a data query offers, default first, in the order they
@@ -342,26 +394,30 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
 /// is offered for the point-shaped queries (`locations`, `position`,
 /// `radius`) of an engine that serves station series
 /// (`EdrEngine::serves_station_series`); gridded results, `area` and `cube`
-/// keep CoverageJSON only (#929). PNG plots a single series or profile, so area and
-/// radius results are not offered as PNG. A trajectory is never GeoJSON; it
-/// is a PNG heatmap only as a radar cross-section
-/// (`EdrEngine::trajectory_shape`), an along-path trajectory (#926) being
-/// CoverageJSON otherwise. Every query also offers HTML (#971), last, so an
-/// `Accept` naming it beside a data format at the same q keeps the data.
+/// keep CoverageJSON only (#929). CSV (#1066) is offered for the same
+/// station queries and for their `area`, whose result is the same station
+/// series; a gridded collection has no CSV. PNG plots a single series or
+/// profile, so area and radius results are not offered as PNG. A trajectory
+/// is never GeoJSON or CSV; it is a PNG heatmap only as a radar
+/// cross-section (`EdrEngine::trajectory_shape`), an along-path trajectory
+/// (#926) being CoverageJSON otherwise. Every query also offers HTML (#971),
+/// last, so an `Accept` naming it beside a data format at the same q keeps
+/// the data.
 pub fn query_formats(
     query_type: &str,
     station_series: bool,
     trajectory: TrajectoryShape,
 ) -> &'static [EdrFormat] {
-    use EdrFormat::{CoverageJson, GeoJson, Html, Png};
+    use EdrFormat::{CoverageJson, Csv, GeoJson, Html, Png};
     match (query_type, station_series) {
-        ("locations" | "position", true) => &[CoverageJson, GeoJson, Png, Html],
+        ("locations" | "position", true) => &[CoverageJson, GeoJson, Png, Csv, Html],
         ("locations" | "position", false) => &[CoverageJson, Png, Html],
         ("trajectory", _) => match trajectory {
             TrajectoryShape::CrossSection => &[CoverageJson, Png, Html],
             TrajectoryShape::AlongPath => &[CoverageJson, Html],
         },
-        ("radius", true) => &[CoverageJson, GeoJson, Html],
+        ("radius", true) => &[CoverageJson, GeoJson, Csv, Html],
+        ("area", true) => &[CoverageJson, Csv, Html],
         _ => &[CoverageJson, Html],
     }
 }
@@ -1484,21 +1540,25 @@ mod tests {
 
     #[test]
     fn geojson_is_offered_for_point_queries_of_station_series_only() {
-        use EdrFormat::{CoverageJson, GeoJson, Html, Png};
+        use EdrFormat::{CoverageJson, Csv, GeoJson, Html, Png};
         let along = TrajectoryShape::AlongPath;
         assert_eq!(
             query_formats("position", true, along),
-            [CoverageJson, GeoJson, Png, Html]
+            [CoverageJson, GeoJson, Png, Csv, Html]
         );
         assert_eq!(
             query_formats("locations", true, along),
-            [CoverageJson, GeoJson, Png, Html]
+            [CoverageJson, GeoJson, Png, Csv, Html]
         );
         assert_eq!(
             query_formats("radius", true, along),
-            [CoverageJson, GeoJson, Html]
+            [CoverageJson, GeoJson, Csv, Html]
         );
-        assert_eq!(query_formats("area", true, along), [CoverageJson, Html]);
+        // CSV (#1066) also on a station collection's area: the same series.
+        assert_eq!(
+            query_formats("area", true, along),
+            [CoverageJson, Csv, Html]
+        );
         assert_eq!(query_formats("cube", true, along), [CoverageJson, Html]);
         for qt in ["locations", "position"] {
             assert_eq!(
@@ -1560,6 +1620,82 @@ mod tests {
         for f in ["foo", "CoverageJSON", "PNG"] {
             assert!(list(Some(f), None).is_err(), "{f}");
         }
+    }
+
+    /// CSV (#1066): `f=csv` or `text/csv` (with the parameters it is served
+    /// with; other parameters ignored), and an `Accept` naming it, after
+    /// CoverageJSON and before HTML; never on a gridded collection.
+    #[test]
+    fn csv_is_negotiated_on_station_series_only() {
+        use EdrFormat::{CoverageJson, Csv, Html};
+        for f in [
+            "csv",
+            "CSV",
+            "text/csv",
+            "Text/CSV",
+            "text/csv;header=present",
+            // `; header=present` with its space sent unencoded.
+            "text/csv;+header=present",
+            "text/csv ;header=present",
+            "text/csv; charset=utf-8",
+            "text/csv;charset=\"UTF-8\";header=present",
+            "text/csv;foo=bar",
+        ] {
+            assert_eq!(parse_edr_format(Some(f)).unwrap(), Csv, "{f}");
+        }
+        assert_eq!(Csv.name(), "CSV");
+        assert_eq!(Csv.media_type(), "text/csv;header=present");
+        assert!(parse_edr_format(Some("text/tab-separated-values")).is_err());
+        // A header row and UTF-8 are what every CSV response has.
+        for f in ["text/csv;header=absent", "text/csv; charset=iso-8859-1"] {
+            let err = parse_edr_format(Some(f)).unwrap_err().to_string();
+            assert!(
+                err.contains("text/csv;header=present in UTF-8"),
+                "{f}: {err}"
+            );
+        }
+        // Only text/csv takes parameters: every other media type is matched
+        // whole, as before CSV.
+        for f in [
+            "application/geo+json;charset=utf-8",
+            "image/png;x=y",
+            "application/vnd.cov+json;foo",
+            "text/html;charset=utf-8",
+        ] {
+            assert!(parse_edr_format(Some(f)).is_err(), "{f}");
+        }
+
+        let along = TrajectoryShape::AlongPath;
+        let offered = query_formats("position", true, along);
+        let pick = |accept: &str| {
+            negotiate_edr_format(None, Some(accept), offered, "q")
+                .unwrap()
+                .format
+        };
+        assert_eq!(pick("text/csv"), Csv);
+        assert_eq!(pick("text/csv;header=present"), Csv);
+        // Ties keep CoverageJSON first and HTML last.
+        assert_eq!(pick("text/csv, application/vnd.cov+json"), CoverageJson);
+        assert_eq!(pick("text/html, text/csv"), Csv);
+        assert_eq!(pick("text/csv;q=0.5, text/html"), Html);
+
+        for qt in [
+            "locations",
+            "position",
+            "area",
+            "radius",
+            "cube",
+            "trajectory",
+        ] {
+            let err = negotiate_edr_format(Some("CSV"), None, query_formats(qt, false, along), "q")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("CSV output is not available"), "{qt}: {err}");
+        }
+        for shape in [TrajectoryShape::AlongPath, TrajectoryShape::CrossSection] {
+            assert!(!query_formats("trajectory", true, shape).contains(&Csv));
+        }
+        assert!(!query_formats("cube", true, along).contains(&Csv));
     }
 
     /// A trajectory's formats follow its shape (#926), never GeoJSON: a
