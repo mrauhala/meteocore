@@ -162,6 +162,19 @@ impl MapEngine for Mock {
         }
     }
 
+    /// `10u` and `10v` render together from a third run (#1026).
+    fn resolve_parameters_reference_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        if parameters.contains(&"10u") && parameters.contains(&"10v") {
+            return Some(hour(2));
+        }
+        self.resolve_parameter_reference_time(parameters.first().copied(), time, reference_time)
+    }
+
     fn content_version(&self) -> u64 {
         42
     }
@@ -367,6 +380,36 @@ fn a_speed_tile_combines_the_component_tiles_of_one_request() {
     // Other parameters pass straight through.
     tile(&wind, "2t").unwrap();
     assert_eq!(*mock.tiles.lock().unwrap(), [call("2t")]);
+    mock.tiles.lock().unwrap().clear();
+    // Unpinned, both components render from the run they share, the one
+    // the cache key names, never each from its own (#1026).
+    let unpinned = |parameter| {
+        wind.get_raster_tile(
+            [0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            Some(hour(1)),
+            &OutputCrs::WebMercator,
+            Some(parameter),
+            Some(850.0),
+            None,
+        )
+    };
+    unpinned("10si").unwrap();
+    let shared = |p: &str| (p.to_string(), Some(hour(1)), Some(850.0), Some(hour(2)));
+    assert_eq!(
+        wind.resolve_parameter_reference_time(Some("10si"), Some(hour(1)), None),
+        Some(hour(2))
+    );
+    assert_eq!(
+        std::mem::take(&mut *mock.tiles.lock().unwrap()),
+        [shared("10u"), shared("10v")]
+    );
+    unpinned("2t").unwrap();
+    assert_eq!(
+        *mock.tiles.lock().unwrap(),
+        [("2t".to_string(), Some(hour(1)), Some(850.0), None)]
+    );
 }
 
 #[test]
@@ -511,14 +554,28 @@ fn every_other_method_delegates() {
         Some(hour(7))
     );
     assert_eq!(wind.resolve_reference_time(None, None), Some(hour(0)));
-    // A derived speed renders from its u component's run (#1005).
+    // A derived speed renders from the run its u and v render together
+    // from, not u's alone (#1005, #1026).
     assert_eq!(
         wind.resolve_parameter_reference_time(Some("10si"), None, None),
+        Some(hour(2))
+    );
+    assert_eq!(
+        wind.resolve_parameter_reference_time(Some("10u"), None, None),
         Some(hour(1))
     );
     assert_eq!(
         wind.resolve_parameter_reference_time(Some("2t"), None, None),
         Some(hour(0))
+    );
+    // Several parameters: the derived ones' components in their place.
+    assert_eq!(
+        wind.resolve_parameters_reference_time(&["2t", "10si"], None, None),
+        Some(hour(2))
+    );
+    assert_eq!(
+        wind.resolve_parameters_reference_time(&["10u", "2t"], None, None),
+        Some(hour(1))
     );
     assert_eq!(
         wind.resolve_parameter_reference_time(None, None, None),

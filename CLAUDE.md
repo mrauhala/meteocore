@@ -365,7 +365,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    that time renders from an older run, #1005), override
    `resolve_parameter_reference_time` with that selection too: the API
    layers resolve the run with it, then pass that run to
-   `resolve_parameter_time` and the render.
+   `resolve_parameter_time` and the render. Likewise
+   `resolve_parameters_reference_time`, the run several parameters render
+   together from (`DerivedWind`'s u and v; GRIB, #1026).
    **If the engine's content for a fixed `(time, reference_time)` can be
    revised in place** (a push-fed alert set: a warning published later is
    active at instants already rendered), it MUST override
@@ -659,7 +661,8 @@ one never implies the other.
   (no cyclic palette). It derives **after sampling** — two component reads
   with identical bbox/size/time/z/run, combined per value, never a derived
   field interpolated — and resolves time/run/content as the components do
-  (`resolve_parameters_time` over u and v, intersected axes; #507/#521).
+  (`resolve_parameters_time` and `resolve_parameters_reference_time` over
+  u and v, intersected axes; #507/#521/#1026).
   Per collection `derive_wind = false` opts out. Engines report facts
   (`WindSource`); they never compute derived fields themselves.
 

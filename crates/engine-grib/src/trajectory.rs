@@ -30,10 +30,12 @@ impl GribEngine {
         let catalog = self.catalog();
         // An M path's samples snap to the run's nearest step, so its run
         // only has to cover the path's first time, as a map `TIME` does; a
-        // 2-D or Z path selects by `datetime`, like position.
+        // 2-D or Z path selects by `datetime`, like position. Both prefer
+        // the runs that have every named parameter (#1026).
+        let names = named(parameters);
         let run = match path.time_window() {
-            Some((first, _)) => covering_run(&catalog, reference_time, Some(first))?,
-            None => resolve_run(&catalog, reference_time, datetime)?,
+            Some((first, _)) => covering_run(&catalog, reference_time, Some(first), &names)?,
+            None => resolve_run(&catalog, reference_time, datetime, &names)?,
         };
         let keys = catalog
             .parameter_keys(&run.reference_time)
