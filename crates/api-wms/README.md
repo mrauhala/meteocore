@@ -364,4 +364,17 @@ these deliberate limits:
 The server is a debug build, with overflow checks and debug assertions on, so
 reproduce a 500 or a dropped connection on a release build before filing it.
 
-Results are recorded here after the first run.
+**First run, 2026-10-15** (ets-wms13 1.34, TEAM Engine 6.0.0-RC2): 139 tests, 43
+passed, 96 failed (72 directly, 24 through a failed subtest). By cause:
+
+| Failures | Cause | Status |
+|---:|---|---|
+| 62 | Mixed-case parameter names (`ReQuEsT`, `WiDtH`): WMS 1.3.0 §6.8.1 makes parameter names case-insensitive, and `WmsQuery` accepted only lower, upper and capitalised spellings | fixing (#1065) |
+| 7 | `LegendURL` has no `<Format>` child, so the suite cannot compare the legend's MIME type | fixing (#1065) |
+| 1 | The capabilities root has no `xsi:schemaLocation` | fixing (#1065) |
+| 1 | No `<Exception>` element in `<Capability>` | fixing (#1027) |
+| 1 | `getmap:no-version`: GetMap without `VERSION` renders instead of raising an exception | deliberate: a missing `VERSION` defaults to 1.3.0, so clients that leave it out keep working |
+| 1 + class | `data-preconditions` and most of `basic` need OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
+
+The mixed-case failures stop most GetMap tests at the first request, so the
+next run after that fix shows what lies behind them.
