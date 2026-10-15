@@ -49,6 +49,15 @@ ignore = [
     # Tracked in #594.
     "RUSTSEC-2026-0253",
 
+    # RUSTSEC-2024-0449 — `unsafe-libyaml` is unmaintained (no vulnerability).
+    # Reached only through `icechunk` -> `serde_yaml_ng` 0.10, behind
+    # engine-zarr's `icechunk` feature. Icechunk uses it to read and write a
+    # repository's `config.yaml`. We only open operator-configured
+    # repositories read-only, so the YAML parsed is that config file from a
+    # store the operator chose. No icechunk release avoids it yet: 2.3.0, the
+    # latest, still depends on serde_yaml_ng 0.10. Tracked in #594.
+    "RUSTSEC-2024-0449",
+
     # rumqttc 0.25.1 (the WIS2 MQTT client behind `ds-wis2`) pins
     # `rustls-webpki 0.102.8` and the unmaintained `rustls-pemfile 2.2.0`
     # through its `use-rustls` feature. Neither is reachable from our TLS
