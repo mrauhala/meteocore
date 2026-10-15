@@ -1,0 +1,57 @@
+# cargo-deny configuration: the dependency licence policy (#1081).
+#
+# CI runs `cargo deny check licenses` from the repo root, so this file IS the
+# gate: a local run gives the same verdict. Only the `licenses` check is used.
+# Security advisories belong to the RustSec job and `.cargo/audit.toml`, and
+# `cargo deny check advisories` is deliberately not run.
+#
+# MeteoCore is `MIT OR Apache-2.0`. Every dependency must be usable under
+# permissive terms so the server, the release archives and the Docker image
+# can be redistributed under that licence. A dependency whose licence
+# expression cannot be satisfied from the list below, such as a copyleft-only
+# or an unlicensed crate, fails the check.
+#
+# The third-party notices that ship with the binaries are generated from the
+# same dependency graph by cargo-about (about.toml). A licence added here
+# usually needs adding to `accepted` there too.
+
+[graph]
+# Every feature, so the `icechunk` build that ships in the release archives
+# and the Docker image is checked too.
+all-features = true
+
+[licenses]
+# Licences that may satisfy a dependency's licence expression. An `OR`
+# expression passes when any one of its licences is listed, so `r-efi`'s
+# `MIT OR Apache-2.0 OR LGPL-2.1-or-later` passes on MIT.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # Public-domain dedication: `notify`, the collections_dir watcher.
+    "CC0-1.0",
+    # The Mozilla CA root list as data: `webpki-roots`, `webpki-root-certs`.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+# Licences accepted for one crate only, because they carry a condition the
+# project has to act on.
+exceptions = [
+    # The IJG licence asks binary distributions to state in their
+    # documentation that the software is based in part on the work of the
+    # Independent JPEG Group. README.md (License) and the generated
+    # third-party notices carry that statement.
+    { crate = "jpeg-encoder", allow = ["IJG"] },
+]
+
+[licenses.private]
+# Workspace crates are checked like any other: each one inherits
+# `license.workspace = true`, and a member that loses it fails here.
+ignore = false

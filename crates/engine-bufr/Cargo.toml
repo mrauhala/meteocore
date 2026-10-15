@@ -2,6 +2,7 @@
 name = "engine-bufr"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "WMO BUFR surface-observation engine (SYNOP/SHIP station reports → EDR + Features)"
 
 [dependencies]

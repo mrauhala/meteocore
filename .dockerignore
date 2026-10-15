@@ -21,3 +21,7 @@ fuzz/
 # from a developer's tree. Excluding it keeps `cargo chef prepare`'s
 # output deterministic regardless of whether the dev ran chef locally.
 recipe.json
+
+# Generated inside the image by the `notices` stage (#1081); a stray local
+# copy must not reach the build context.
+THIRD-PARTY-NOTICES.txt

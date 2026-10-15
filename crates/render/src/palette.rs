@@ -597,7 +597,9 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
     },
     // Signed fields — wind components, vertical velocity, vorticity (#763).
     // Normalized, so it spans any style range; a range symmetric about zero
-    // puts zero on the white midpoint. ColorBrewer RdBu, blue end low.
+    // puts zero on the white midpoint. ColorBrewer RdBu, blue end low; its
+    // licence notice ships in the third-party notices
+    // (third-party/colorbrewer.txt).
     BuiltinDef {
         name: "diverging",
         title: "Diverging (blue–white–red)",
