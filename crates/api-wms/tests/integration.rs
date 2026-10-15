@@ -1862,10 +1862,16 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
 /// each element's name and its text, or for `<OnlineResource>` its
 /// `xlink:href`.
 fn service_children(xml: &str) -> Vec<(String, String)> {
+    element_children(xml, "Service")
+}
+
+/// The children of the first `<parent>` element in document order: each
+/// element's name and its text, or for an empty element its `xlink:href`.
+fn element_children(xml: &str, parent: &str) -> Vec<(String, String)> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(xml);
-    // Depth below `<Service>`: `Some(0)` = directly inside it.
+    // Depth below `<parent>`: `Some(0)` = directly inside it.
     let mut depth: Option<usize> = None;
     let mut children: Vec<(String, String)> = Vec::new();
     loop {
@@ -1873,7 +1879,7 @@ fn service_children(xml: &str) -> Vec<(String, String)> {
             Event::Start(e) => {
                 let name = e.name().as_ref().to_owned();
                 match depth {
-                    None if name == "Service" => depth = Some(0),
+                    None if name == parent => depth = Some(0),
                     None => {}
                     Some(d) => {
                         if d == 0 {
@@ -4754,6 +4760,35 @@ mod composites {
             composite.contains("REQUEST=GetLegendGraphic&amp;LAYER=sat/rgb&amp;STYLE=default"),
             "{composite}"
         );
+
+        // Its LegendURL names the format and size of the channel-list
+        // legend its link returns, as a palette style's does (#1065).
+        let url = legend_urls(&caps)
+            .into_iter()
+            .find(|url| {
+                url.children
+                    .iter()
+                    .any(|(_, href)| href.contains("LAYER=sat/rgb&"))
+            })
+            .unwrap_or_else(|| panic!("no LegendURL for sat/rgb: {caps}"));
+        let names: Vec<&str> = url.children.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Format", "OnlineResource"], "{composite}");
+        assert_eq!(url.children[0].1, "image/png");
+        assert_eq!(
+            (url.width, url.height),
+            (
+                ds_render::LEGEND_DEFAULT_WIDTH,
+                ds_render::LEGEND_DEFAULT_HEIGHT
+            )
+        );
+        let href = &url.children[1].1;
+        let query = href
+            .strip_prefix("/wms?")
+            .unwrap_or_else(|| panic!("{href}"));
+        let legend = fetch(&app, &format!("/?{query}")).await;
+        assert_eq!(legend.status, StatusCode::OK, "{href}: {}", legend.text());
+        assert_eq!(legend.content_type, "image/png", "{href}");
+        assert_eq!(png_dims(&legend.body), (url.width, url.height), "{href}");
     }
 
     /// A GetMap is `render_composite_tiles` over the band tiles at the
@@ -5421,4 +5456,375 @@ async fn getmap_resolves_a_run_inside_an_advertised_range() {
         assert!(xml.contains("InvalidDimensionValue"), "{run}: {xml}");
     }
     assert_eq!(calls.lock().unwrap().len(), 1, "no invalid run rendered");
+}
+
+// ---------------------------------------------------------------------------
+// OGC WMS 1.3.0 test suite findings (#1065)
+// ---------------------------------------------------------------------------
+
+/// One response, read whole.
+struct Fetched {
+    status: StatusCode,
+    content_type: String,
+    x_cache: String,
+    body: Vec<u8>,
+}
+
+impl Fetched {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// One request for `uri`, path and query, through `app`.
+async fn fetch(app: &axum::Router, uri: &str) -> Fetched {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    let (status, content_type, x_cache) =
+        (resp.status(), header("content-type"), header("x-cache"));
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    Fetched {
+        status,
+        content_type,
+        x_cache,
+        body,
+    }
+}
+
+/// The capabilities document `app` serves.
+async fn capabilities(app: &axum::Router) -> String {
+    let reply = fetch(app, "/?SERVICE=WMS&REQUEST=GetCapabilities").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    reply.text()
+}
+
+/// GetCapabilities as the suite spells it: every name in mixed case, the
+/// `REQUEST` value percent-encoded, and a parameter no server knows. WMS
+/// 1.3.0 §6.8.1 makes names case-insensitive and lets a server ignore an
+/// unknown parameter, so both are ordinary GetCapabilities requests.
+#[tokio::test]
+async fn getcapabilities_reads_parameter_names_in_any_case() {
+    let app = build_populated_router();
+    for uri in [
+        "/?SeRvIcE=WMS&ReQuEsT=GetCapabilities&VeRsIoN=1.3.0&BoGuS=ignored",
+        "/?sErViCe=WMS&rEqUeSt=%47%65%74%43%61%70%61%62%69%6C%69%74%69%65%73",
+    ] {
+        let reply = fetch(&app, uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.text());
+        assert_eq!(reply.content_type, "text/xml", "{uri}");
+        assert!(reply.text().contains("<WMS_Capabilities"), "{uri}");
+    }
+}
+
+/// GetMap as the suite spells it names the same request as the canonical
+/// spelling: the second is a rendered-cache hit on identical bytes. Every
+/// parameter that shapes the image is in the cache key — `TRANSPARENT` and
+/// `BGCOLOR` the background, `WIDTH` and `HEIGHT` the size — so a name read
+/// in one spelling and missed in the other would miss the cache. Values are
+/// percent-encoded as the suite sends them, and the unknown `BoGuS` is
+/// ignored.
+#[tokio::test]
+async fn getmap_reads_parameter_names_in_any_case() {
+    let app = build_populated_router();
+    let suite = fetch(
+        &app,
+        "/?SeRvIcE=WMS&VeRsIoN=1.3.0&ReQuEsT=%47%65%74%4D%61%70&LaYeRs=radar&StYlEs=\
+         &CrS=CRS%3A84&BbOx=10,55,30,70&WiDtH=64&HeIgHt=48&FoRmAt=image%2Fpng\
+         &TrAnSpArEnT=FALSE&BgCoLoR=0x336699&TiMe=2024-01-01T00:00:00Z&BoGuS=ignored",
+    )
+    .await;
+    assert_eq!(suite.status, StatusCode::OK, "{}", suite.text());
+    assert_eq!(suite.content_type, "image/png");
+    assert_eq!(suite.x_cache, "MISS");
+    assert_eq!(png_dims(&suite.body), (64, 48));
+
+    let canonical = fetch(
+        &app,
+        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=radar&STYLES=\
+         &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=48&FORMAT=image/png\
+         &TRANSPARENT=FALSE&BGCOLOR=0x336699&TIME=2024-01-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(canonical.status, StatusCode::OK);
+    assert_eq!(
+        canonical.x_cache, "HIT",
+        "the canonical spelling must name the same request"
+    );
+    assert_eq!(canonical.body, suite.body);
+}
+
+/// GetLegendGraphic reads its names in any case too: the mixed-case
+/// request draws the named style at the requested size, byte for byte the
+/// canonical one, and not the default style's legend.
+#[tokio::test]
+async fn getlegendgraphic_reads_parameter_names_in_any_case() {
+    let app = build_empty_router();
+    let suite = fetch(
+        &app,
+        "/?SeRvIcE=WMS&ReQuEsT=GetLegendGraphic&LaYeR=empty&StYlE=radar_fmi\
+         &FoRmAt=image%2Fpng&WiDtH=20&HeIgHt=120",
+    )
+    .await;
+    assert_eq!(suite.status, StatusCode::OK, "{}", suite.text());
+    assert_eq!(png_dims(&suite.body), (20, 120));
+
+    let legend = |style: &str| {
+        format!(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER=empty&STYLE={style}\
+             &FORMAT=image/png&WIDTH=20&HEIGHT=120"
+        )
+    };
+    let canonical = fetch(&app, &legend("radar_fmi")).await;
+    assert_eq!(canonical.status, StatusCode::OK);
+    assert_eq!(canonical.body, suite.body);
+    let default = fetch(&app, &legend("default")).await;
+    assert_ne!(default.body, suite.body, "StYlE must select the style");
+}
+
+/// A parameter given twice, in two cases, takes its first value. Before,
+/// serde's derive rejected any repeat with a plain-text 400 that was no
+/// ServiceException.
+#[tokio::test]
+async fn a_parameter_repeated_in_another_case_takes_its_first_value() {
+    let app = build_populated_router();
+    let get_map = "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&STYLES=&CRS=CRS:84\
+                   &BBOX=10,55,30,70&WIDTH=64&HEIGHT=64&FORMAT=image/png";
+
+    let known_first = fetch(&app, &format!("{get_map}&LAYERS=radar&layers=missing")).await;
+    assert_eq!(known_first.status, StatusCode::OK, "{}", known_first.text());
+    assert_eq!(known_first.content_type, "image/png");
+
+    let unknown_first = fetch(&app, &format!("{get_map}&layers=missing&LAYERS=radar")).await;
+    assert_eq!(unknown_first.status, StatusCode::BAD_REQUEST);
+    let xml = unknown_first.text();
+    assert!(
+        xml.contains("code=\"LayerNotDefined\"") && xml.contains("missing"),
+        "{xml}"
+    );
+}
+
+/// The root names the XML Schema instance and SLD namespaces and points
+/// `xsi:schemaLocation` at the WMS 1.3.0 capabilities schema and at SLD
+/// 1.1.0's, which declares `sld:GetLegendGraphic`, so a validator can find
+/// both.
+#[tokio::test]
+async fn capabilities_root_points_at_its_schemas() {
+    use quick_xml::events::Event;
+
+    let xml = capabilities(&build_populated_router()).await;
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let root = loop {
+        match reader.read_event().expect("capabilities XML parses") {
+            Event::Start(e) => break e,
+            Event::Eof => panic!("no root element: {xml}"),
+            _ => {}
+        }
+    };
+    assert_eq!(root.name().as_ref(), "WMS_Capabilities");
+    let attribute = |name: &str| {
+        root.try_get_attribute(name)
+            .expect("attributes parse")
+            .unwrap_or_else(|| panic!("root has no {name}: {xml}"))
+            .value
+            .into_owned()
+    };
+    assert_eq!(
+        attribute("xmlns:xsi"),
+        "http://www.w3.org/2001/XMLSchema-instance"
+    );
+    assert_eq!(attribute("xmlns:sld"), "http://www.opengis.net/sld");
+    assert_eq!(
+        attribute("xsi:schemaLocation"),
+        "http://www.opengis.net/wms \
+         http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd \
+         http://www.opengis.net/sld \
+         http://schemas.opengis.net/sld/1.1.0/sld_capabilities.xsd"
+    );
+}
+
+/// `<Capability>` is `Request`, `Exception`, then the root `Layer`, the
+/// order of the schema's sequence (#1027), and `<Exception>` offers only
+/// `XML`: the format a request error is answered in, whatever `EXCEPTIONS`
+/// asks for. `<Request>` holds the operations in the schema's order, with
+/// GetLegendGraphic as SLD's extended operation: a `<GetLegendGraphic>` in
+/// the WMS namespace is not in the schema and fails validation.
+#[tokio::test]
+async fn capabilities_advertise_xml_exceptions_right_after_request() {
+    let app = build_populated_router();
+    let xml = capabilities(&app).await;
+    let names = |parent: &str| -> Vec<String> {
+        element_children(&xml, parent)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    assert_eq!(
+        names("Capability"),
+        ["Request", "Exception", "Layer"],
+        "{xml}"
+    );
+    assert_eq!(
+        names("Request"),
+        ["GetCapabilities", "GetMap", "sld:GetLegendGraphic"],
+        "{xml}"
+    );
+    assert_eq!(
+        element_children(&xml, "Exception"),
+        [("Format".to_string(), "XML".to_string())],
+        "{xml}"
+    );
+}
+
+/// What capabilities advertises is what a request error is: a
+/// ServiceExceptionReport in `text/xml`, WMS 1.3.0's MIME type for `XML`,
+/// whatever `EXCEPTIONS` says. The requests are the OGC test suite's
+/// `getmap:exceptions-default` and `getmap:exceptions-xml`, which failed on
+/// WMS 1.1.1's `application/vnd.ogc.se_xml`, plus an `INIMAGE` that is not
+/// honoured (#1027).
+#[tokio::test]
+async fn request_errors_are_text_xml_service_exception_reports() {
+    let app = build_populated_router();
+    let get_map = "/?BbOx=0,0,1,1&VeRsIoN=1.3.0&WiDtH=100&StYlEs=&FoRmAt=image%2Fpng\
+                   &HeIgHt=100&LaYeRs=NonExistant&ReQuEsT=GetMap&CrS=CRS:84";
+    for uri in [
+        get_map.to_string(),
+        format!("{get_map}&ExCePtIoNs=XML"),
+        format!("{get_map}&EXCEPTIONS=INIMAGE"),
+    ] {
+        let error = fetch(&app, &uri).await;
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(error.content_type, "text/xml", "{uri}");
+        let xml = error.text();
+        assert!(
+            xml.contains("<ServiceExceptionReport") && xml.contains("code=\"LayerNotDefined\""),
+            "{uri}: {xml}"
+        );
+    }
+}
+
+/// One `<LegendURL>`: its `width` and `height` attributes, and its children
+/// in document order, each element's name with its text or, for the empty
+/// `<OnlineResource>`, its unescaped `xlink:href`.
+struct LegendUrl {
+    width: u32,
+    height: u32,
+    children: Vec<(String, String)>,
+}
+
+/// Every `<LegendURL>` of a capabilities document.
+fn legend_urls(xml: &str) -> Vec<LegendUrl> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut urls: Vec<LegendUrl> = Vec::new();
+    // Inside a `<LegendURL>`, and inside one of its child elements.
+    let (mut in_legend, mut in_child) = (false, false);
+    loop {
+        match reader.read_event().expect("capabilities XML parses") {
+            Event::Start(e) if e.name().as_ref() == "LegendURL" => {
+                let size = |name: &str| -> u32 {
+                    let value = e
+                        .try_get_attribute(name)
+                        .expect("attributes parse")
+                        .unwrap_or_else(|| panic!("<LegendURL> has no {name}: {xml}"))
+                        .value
+                        .into_owned();
+                    value
+                        .parse()
+                        .unwrap_or_else(|_| panic!("<LegendURL> {name} {value:?}"))
+                };
+                urls.push(LegendUrl {
+                    width: size("width"),
+                    height: size("height"),
+                    children: Vec::new(),
+                });
+                in_legend = true;
+            }
+            Event::Start(e) if in_legend => {
+                let name = e.name().as_ref().to_owned();
+                urls.last_mut()
+                    .unwrap()
+                    .children
+                    .push((name, String::new()));
+                in_child = true;
+            }
+            Event::Empty(e) if in_legend => {
+                let name = e.name().as_ref().to_owned();
+                let href = e
+                    .try_get_attribute("xlink:href")
+                    .expect("attributes parse")
+                    .map(|a| {
+                        a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .expect("href unescapes")
+                            .into_owned()
+                    })
+                    .unwrap_or_default();
+                urls.last_mut().unwrap().children.push((name, href));
+            }
+            Event::Text(t) if in_child => {
+                let child = urls.last_mut().unwrap().children.last_mut().unwrap();
+                child.1.push_str(&t);
+            }
+            Event::End(e) if e.name().as_ref() == "LegendURL" => in_legend = false,
+            Event::End(_) if in_legend => in_child = false,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    urls
+}
+
+/// Each LegendURL follows the schema, a `<Format>` then its
+/// `<OnlineResource>`, and its `width`, `height` and format are those of
+/// the image the link returns: following it serves a PNG of exactly the
+/// advertised size.
+#[tokio::test]
+async fn legend_urls_name_the_format_and_size_their_link_returns() {
+    let app = build_empty_router();
+    let xml = capabilities(&app).await;
+    let urls = legend_urls(&xml);
+    // One per style of the `empty` layer: `default` and `radar_fmi`.
+    assert_eq!(urls.len(), 2, "{xml}");
+    for url in urls {
+        let names: Vec<&str> = url.children.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Format", "OnlineResource"], "{xml}");
+        let format = &url.children[0].1;
+        assert_eq!(format, "image/png");
+        assert_eq!(
+            (url.width, url.height),
+            (
+                ds_render::LEGEND_DEFAULT_WIDTH,
+                ds_render::LEGEND_DEFAULT_HEIGHT
+            )
+        );
+
+        // The router serves at `/` what the server mounts at `/wms`.
+        let href = &url.children[1].1;
+        let query = href
+            .strip_prefix("/wms?")
+            .unwrap_or_else(|| panic!("{href}"));
+        let legend = fetch(&app, &format!("/?{query}")).await;
+        assert_eq!(legend.status, StatusCode::OK, "{href}: {}", legend.text());
+        assert_eq!(&legend.content_type, format, "{href}");
+        assert_eq!(
+            png_dims(&legend.body),
+            (url.width, url.height),
+            "{href} must return the advertised size"
+        );
+    }
 }
