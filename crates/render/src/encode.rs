@@ -26,6 +26,21 @@ fn palette_slot(key: u32) -> usize {
     (key.wrapping_mul(0x9E37_79B9) >> (u32::BITS - PALETTE_TABLE_SLOTS.trailing_zeros())) as usize
 }
 
+/// `buf` with its capacity cut to its length: the PNG and JPEG encoders
+/// return through this, so an encoded image owns exactly its bytes (#1052).
+///
+/// They reserve their output for a worst case (half the raw RGBA,
+/// `w × h / 2`, `w × h × 3`) or grow it by doubling, so the encoded image
+/// sits in a larger allocation: a sparse 256×256 radar tile of about 1 KB
+/// held a 32 KB PNG8 reservation. Callers cache the result as
+/// `Bytes::from(vec)`, which keeps the whole allocation when
+/// `len != capacity`, while the rendered-cache weigher counts the length.
+/// Going through `Box<[u8]>` makes the capacity equal the length by
+/// construction, for one shrinking realloc of the encoded bytes.
+fn exact_len(buf: Vec<u8>) -> Vec<u8> {
+    buf.into_boxed_slice().into_vec()
+}
+
 /// Encode an RGBA buffer to PNG bytes.
 ///
 /// Auto-selects the encoding based on the buffer's colour count:
@@ -73,7 +88,8 @@ pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataS
 /// Internal helper for the >256-colour fallback path of [`encode_png`].
 /// `rgba` length is assumed pre-validated by the caller.
 fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
-    let mut buf = Vec::with_capacity(rgba.len() / 2); // rough estimate
+    // Rough estimate to limit regrowth; `exact_len` trims it on return.
+    let mut buf = Vec::with_capacity(rgba.len() / 2);
     {
         let mut encoder = png::Encoder::new(&mut buf, width, height);
         encoder.set_color(png::ColorType::Rgba);
@@ -94,7 +110,7 @@ fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
             .map_err(|e| DataServerError::Render(format!("PNG write error: {e}")))?;
     }
 
-    Ok(buf)
+    Ok(exact_len(buf))
 }
 
 /// Try to encode an RGBA buffer as an 8-bit indexed-palette PNG.
@@ -204,7 +220,7 @@ fn encode_png_indexed(
             .map_err(|e| DataServerError::Render(format!("PNG8 write error: {e}")))?;
     }
 
-    Ok(Some(buf))
+    Ok(Some(exact_len(buf)))
 }
 
 /// Straight-alpha "over" of one RGBA pixel onto an opaque background colour.
@@ -285,7 +301,7 @@ pub fn encode_jpeg(
             jpeg_encoder::ColorType::Rgb,
         )
         .map_err(|e| DataServerError::Render(format!("JPEG encode error: {e}")))?;
-    Ok(buf)
+    Ok(exact_len(buf))
 }
 
 /// libwebp effort (`method`, 0–6) of a lossy WebP encode: 0, the fastest.
@@ -383,6 +399,8 @@ pub fn encode_webp(
     let memory = encoder
         .encode_advanced(&config)
         .map_err(|e| DataServerError::Render(format!("WebP encode error: {e:?}")))?;
+    // libwebp owns the encoded buffer; `to_vec` copies it into an allocation
+    // of exactly its length, so no `exact_len` is needed here.
     Ok(memory.to_vec())
 }
 
@@ -945,5 +963,58 @@ mod tests {
             png_has_trns(&bytes),
             "palette with any non-opaque entry must emit tRNS"
         );
+    }
+
+    // --- Exact-length output (#1052) ---------------------------------------
+
+    /// A 256×256 tile, transparent but for a 16×16 block of one colour: a
+    /// sparse radar tile, which encodes to a small fraction of any
+    /// worst-case reservation.
+    fn sparse_tile() -> Vec<u8> {
+        rgba_from(256, 256, |x, y| {
+            if x < 16 && y < 16 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 0, 0]
+            }
+        })
+    }
+
+    #[test]
+    fn png8_owns_no_spare_capacity() {
+        // Reserved at `w × h / 2` = 32 KB; the tile encodes to about 1 KB.
+        // `Bytes::from` would keep the rest alive, unweighed.
+        let bytes = encode_png(&sparse_tile(), 256, 256).unwrap();
+        assert_eq!(decode_png_to_rgba(&bytes).2, png::ColorType::Indexed);
+        assert_eq!(bytes.capacity(), bytes.len(), "PNG8 spare capacity");
+    }
+
+    #[test]
+    fn rgba_png_owns_no_spare_capacity() {
+        // 65 536 colours take the RGBA path, reserved at half the raw buffer
+        // (128 KB); the gradient compresses to well under that.
+        let rgba = rgba_from(256, 256, |x, y| [x as u8, y as u8, 128, 255]);
+        let bytes = encode_png(&rgba, 256, 256).unwrap();
+        assert_eq!(decode_png_to_rgba(&bytes).2, png::ColorType::Rgba);
+        assert_eq!(bytes.capacity(), bytes.len(), "RGBA PNG spare capacity");
+    }
+
+    #[test]
+    fn jpeg_owns_no_spare_capacity() {
+        // Reserved at `w × h × 3` = 192 KB.
+        let bytes = encode_jpeg(&sparse_tile(), 256, 256, crate::DEFAULT_JPEG_QUALITY).unwrap();
+        assert_eq!(bytes.capacity(), bytes.len(), "JPEG spare capacity");
+    }
+
+    #[test]
+    fn webp_owns_no_spare_capacity() {
+        for quality in [crate::MAX_QUALITY, 80] {
+            let bytes = encode_webp(&sparse_tile(), 256, 256, quality).unwrap();
+            assert_eq!(
+                bytes.capacity(),
+                bytes.len(),
+                "WebP spare capacity at quality {quality}"
+            );
+        }
     }
 }

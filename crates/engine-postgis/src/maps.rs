@@ -118,7 +118,7 @@ pub(crate) fn build_wms_times(
 /// sharing the process AND invalidates naturally when a reload repoints a
 /// collection id at a different table or database — the collection id alone
 /// would keep serving the old table's cached windows until eviction.
-/// Weight = key + one `Strike` per row.
+/// Weight: see [`strike_window_weight`].
 type WindowKey = (String, DateTime<Utc>, DateTime<Utc>);
 
 /// The cache-key source component: collection id + qualified table + pool
@@ -133,12 +133,23 @@ fn window_key_source(engine: &PostgisEngine, shape: &EventsShape) -> String {
     )
 }
 
+/// Cache weight of one strike window: the key, the `Arc` header, and one
+/// `Strike` per slot the `Vec` **allocated** (#1052). The window reserves
+/// one slot per returned row and skips rows with an empty geometry, so the
+/// length can fall short of what the entry holds.
+fn strike_window_weight(k: &WindowKey, v: &Arc<Vec<Strike>>) -> u64 {
+    (k.0.len() + 32 + v.capacity() * std::mem::size_of::<Strike>()) as u64
+}
+
 pub fn strike_window_cache() -> &'static ByteBoundedCache<WindowKey, Arc<Vec<Strike>>> {
     static CACHE: OnceLock<ByteBoundedCache<WindowKey, Arc<Vec<Strike>>>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        ByteBoundedCache::from_env("MC_LIGHTNING_STRIKE_CACHE_MB", 32, 64 * 1024, |k, v| {
-            (k.0.len() + 32 + v.len() * std::mem::size_of::<Strike>()) as u64
-        })
+        ByteBoundedCache::from_env(
+            "MC_LIGHTNING_STRIKE_CACHE_MB",
+            32,
+            64 * 1024,
+            strike_window_weight,
+        )
     })
 }
 
@@ -391,6 +402,33 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    /// #1052: the weight counts the slots the window reserved, not only
+    /// the strikes left after empty-geometry rows were skipped.
+    #[test]
+    fn strike_window_weight_counts_reserved_slots() {
+        let key: WindowKey = (
+            "lightning|public.strikes|pool".into(),
+            ts("2026-07-11T20:00:00Z"),
+            ts("2026-07-11T20:20:00Z"),
+        );
+        // Reserved for 100 rows; 40 had an empty geometry and were skipped.
+        let mut strikes = Vec::with_capacity(100);
+        for _ in 0..60 {
+            strikes.push(Strike {
+                time: ts("2026-07-11T20:10:00Z"),
+                lon: 25.0,
+                lat: 60.0,
+            });
+        }
+        let window = Arc::new(strikes);
+        let allocated = (window.capacity() * std::mem::size_of::<Strike>()) as u64;
+        let weight = strike_window_weight(&key, &window);
+        assert!(
+            weight >= allocated,
+            "weight {weight} B under-counts a {allocated} B allocation"
+        );
     }
 
     #[test]
