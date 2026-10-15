@@ -299,6 +299,7 @@ Client
 - No GetFeatureInfo (use EDR position query instead)
 - Source sampling depends on the engine (including bilinear for GRIB/QueryData/Zarr); meta-tile assembly uses nearest-neighbor to preserve discrete palettes
 - Collections must implement `MapEngine` and enable `wms`; GeoTIFF, GRIB, ODIM, QueryData, Zarr, nowcast, CAP and PostGIS events are supported
+- CAP limits that can leave a warning off the map, the same in WMS, Maps and Tiles: a WIS2-fed collection holds at most `max_alerts` (default 10 000) alerts, and past it drops still-valid ones from the map and `/items`, not-yet-active and lowest severity first, reporting `degraded` in `/health`; one render draws at most 50 000 active alert areas, and past that leaves out the least severe (#805)
 - JPEG output composites transparency onto white background (no alpha channel)
 
 Uncached GetMap requests have a configurable 3 s queue/render deadline
