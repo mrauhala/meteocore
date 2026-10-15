@@ -86,11 +86,14 @@ impl PostgisEngine {
                 .map(|(_, key, _)| key.to_string())
                 .unwrap_or_else(|_| "unknown".to_string())
         });
+        // Seeded with the configured station property columns, so a
+        // property filter is valid before the first refresh lands (#1024).
+        let cache = Arc::new(MetadataCache::new(&config));
         Self {
             collection_id,
             config,
             pool,
-            cache: Arc::new(MetadataCache::new_empty()),
+            cache,
             health: Health::new(),
             pool_key_label,
             shutdown: Shutdown::new(),
@@ -1892,6 +1895,81 @@ mod tests {
         assert_eq!(page.number_matched, 2);
         assert_eq!(page.features[0].id, "c");
         assert_eq!(page.next_offset, None);
+    }
+
+    /// A stations-only engine whose stations table maps `property_cols`.
+    fn stations_engine_config(property_cols: &[&str]) -> PostgisEngineConfig {
+        PostgisEngineConfig {
+            dsn: "postgres://user:pw@127.0.0.1:1/db".into(),
+            dsn_was_literal: false,
+            pool_size: 2,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            location_source: crate::schema::LocationSource::Stations(
+                crate::schema::StationsMapping {
+                    property_cols: property_cols.iter().map(|c| (*c).to_string()).collect(),
+                    ..dummy_stations()
+                },
+            ),
+            observations: dummy_long_obs(),
+            parameters: vec![],
+            locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
+        }
+    }
+
+    /// What the Features API needs for `?territory=FI` to answer 200 with
+    /// zero features: the name is filterable and the engine pages an empty
+    /// match set without error.
+    fn assert_territory_filter_matches_nothing(engine: &PostgisEngine) {
+        use ds_core::feature::FeatureQuery;
+        use ds_core::feature_engine::FeatureEngine;
+        assert!(
+            engine.filterables().contains("territory"),
+            "filterables: {:?}",
+            engine.filterables()
+        );
+        let query = FeatureQuery {
+            property_filters: vec![("territory".into(), "FI".into())],
+            ..Default::default()
+        };
+        let page = engine.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 0);
+        assert_eq!(page.number_returned, 0);
+        assert!(page.features.is_empty());
+    }
+
+    /// #1024: a configured station property is a valid filter before the
+    /// first metadata refresh and after one that failed because the database
+    /// was unreachable at boot, not a 400 until the first row arrives.
+    #[tokio::test]
+    async fn configured_property_filter_survives_a_failed_first_refresh() {
+        let engine = engine_with(stations_engine_config(&["territory"]));
+        assert_territory_filter_matches_nothing(&engine);
+
+        // Nothing listens on port 1: the refresh fails and the seeded
+        // snapshot stays in place.
+        let refreshed =
+            tokio::time::timeout(Duration::from_secs(30), engine.refresh_metadata()).await;
+        assert!(
+            matches!(refreshed, Ok(Err(_))),
+            "a refresh against port 1 must fail, not succeed or hang"
+        );
+        assert_eq!(engine.health_snapshot().refresh_failures, 1);
+        assert_eq!(engine.cache().load().version, 0);
+        assert_territory_filter_matches_nothing(&engine);
+    }
+
+    /// #1024: a refresh that reads an empty stations table keeps the
+    /// configured property columns filterable.
+    #[test]
+    fn configured_property_filter_is_valid_on_an_empty_stations_table() {
+        let engine = engine_with(stations_engine_config(&["territory"]));
+        let refreshed = CollectionMeta::build(engine.config(), Vec::new(), None, 1);
+        engine.cache().store(refreshed);
+        assert_eq!(engine.cache().load().version, 1);
+        assert_territory_filter_matches_nothing(&engine);
     }
 
     #[test]
