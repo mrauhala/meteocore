@@ -18,18 +18,19 @@ use futures::stream::BoxStream;
 use crate::catalog::{self, Catalog, FileEntry};
 use crate::reader::{DataSource, TiffMetadata};
 
-const FIXTURE: &str = concat!(
+pub(crate) const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/radar/radar_20260324T2315Z.tif"
 );
 const KEY: &str = "d/radar_20260324T2315Z.tif";
 
 /// An in-memory store whose next `fail_ranges` range reads fail the way a
-/// stalled S3 body does, counting range reads and whole-object GETs.
+/// stalled S3 body does, counting range reads and whole-object GETs. Also
+/// the failing store of `tile_fetch_failure_tests` (#1051).
 #[derive(Debug, Default)]
-struct FlakyStore {
+pub(crate) struct FlakyStore {
     inner: InMemory,
-    fail_ranges: AtomicUsize,
+    pub(crate) fail_ranges: AtomicUsize,
     /// Answer every range read the way object_store does when an HTTP
     /// origin ignores `Range`.
     ignore_ranges: std::sync::atomic::AtomicBool,
@@ -38,7 +39,7 @@ struct FlakyStore {
 }
 
 impl FlakyStore {
-    fn with_object(bytes: Vec<u8>) -> Arc<Self> {
+    pub(crate) fn with_object(bytes: Vec<u8>) -> Arc<Self> {
         let store = Self::default();
         futures::executor::block_on(
             store
@@ -50,7 +51,7 @@ impl FlakyStore {
     }
 
     /// `(range reads, whole-object GETs)` so far.
-    fn counts(&self) -> (usize, usize) {
+    pub(crate) fn counts(&self) -> (usize, usize) {
         (
             self.range_reads.load(Ordering::SeqCst),
             self.full_gets.load(Ordering::SeqCst),
@@ -83,7 +84,8 @@ impl ObjectStore for FlakyStore {
                     });
                 }
                 // Tests drive one read at a time, so load-then-decrement is
-                // race-free here.
+                // race-free here; a count far above the reads a test makes
+                // fails every read, concurrent ones too.
                 let fail = self.fail_ranges.load(Ordering::SeqCst) > 0;
                 if fail {
                     self.fail_ranges.fetch_sub(1, Ordering::SeqCst);
