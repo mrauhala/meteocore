@@ -28,7 +28,7 @@ impl GribEngine {
             ));
         }
         let catalog = self.catalog();
-        let run = resolve_run(&catalog, reference_time, datetime)?;
+        let run = resolve_run(&catalog, reference_time, datetime, &named(parameters))?;
         let levels = self.selected_levels(&catalog, run.reference_time, z)?;
         let keys = catalog
             .parameter_keys(&run.reference_time)

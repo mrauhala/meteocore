@@ -11,6 +11,8 @@ mod metadata;
 mod parameter_times_tests;
 mod position;
 pub mod reader;
+#[cfg(test)]
+mod retained_runs_tests;
 mod runtime;
 #[cfg(test)]
 mod scan_tests;
@@ -794,8 +796,8 @@ impl GribEngine {
         );
         self.publish_catalog(new_catalog);
 
-        // Probe one message per distinct short name in the newest run to
-        // populate the parameter metadata cache. Without this, the EDR
+        // Probe one message per advertised parameter, in the newest run that
+        // has it, to populate the parameter metadata cache. Without this, the EDR
         // /collections endpoint returns empty labels/units until the first
         // actual query is served.
         self.probe_new_parameters();
@@ -803,9 +805,9 @@ impl GribEngine {
         Ok(())
     }
 
-    /// For each distinct short name in the newest forecast run that has not
-    /// yet been seen, read the message headers via byte-range so the
-    /// WMO triple populates the parameter metadata cache.
+    /// For each advertised parameter whose key (that of the newest run that
+    /// has it) has not yet been seen, read the message headers via
+    /// byte-range so the WMO triple populates the parameter metadata cache.
     ///
     /// Any failures are logged and swallowed — the probe is best-effort and
     /// the metadata cache will eventually fill in as real queries land on
@@ -826,21 +828,29 @@ impl GribEngine {
             let cache = self.source.param_meta.read().unwrap();
             let mut todo = BTreeMap::new();
             for catalog in catalogs {
-                let Some(run) = catalog.latest_run() else {
-                    continue;
-                };
-                let Some(keys) = catalog.parameter_keys(&run.reference_time) else {
-                    continue;
-                };
-                for key in keys
-                    .values()
-                    .filter(|key| !cache.by_level.contains_key(*key))
+                // Each advertised parameter at the key of the newest run
+                // that has it: one only an older run still has needs its
+                // label and unit too (#1026).
+                for (name, key) in catalog
+                    .advertised_keys()
+                    .iter()
+                    .filter(|(_, key)| !cache.by_level.contains_key(*key))
                 {
-                    if let Some((sf, m)) = run
-                        .steps
+                    let found = catalog
+                        .runs
                         .values()
-                        .find_map(|sf| sf.messages.iter().find(|m| key.matches(m)).map(|m| (sf, m)))
-                    {
+                        .rev()
+                        .filter(|run| {
+                            catalog
+                                .parameter_keys(&run.reference_time)
+                                .and_then(|keys| keys.get(name))
+                                == Some(key)
+                        })
+                        .flat_map(|run| run.steps.values())
+                        .find_map(|sf| {
+                            sf.messages.iter().find(|m| key.matches(m)).map(|m| (sf, m))
+                        });
+                    if let Some((sf, m)) = found {
                         todo.insert(
                             format!("{}:{}:{:?}", key.param, key.levtype, key.level),
                             (sf, m),
@@ -1159,15 +1169,12 @@ impl GribEngine {
         true
     }
 
-    /// Look up cached parameter metadata. Returns a placeholder (identity
+    /// Look up cached parameter metadata at the canonical key of the newest
+    /// run that has the parameter (#1026). Returns a placeholder (identity
     /// conversion, empty unit string) if the short name has not yet been
     /// populated — typically because its headers have not been read yet.
     fn param_metadata(&self, catalog: &Catalog, short_name: &str) -> ParamMetadata {
-        catalog
-            .latest_run()
-            .and_then(|run| catalog.parameter_keys(&run.reference_time))
-            .map(|keys| self.param_metadata_for(keys, short_name))
-            .unwrap_or_else(|| ParamMetadata::placeholder(short_name))
+        self.param_metadata_for(catalog.advertised_keys(), short_name)
     }
 
     fn param_metadata_for(&self, keys: &ParameterKeys, short_name: &str) -> ParamMetadata {
@@ -1314,7 +1321,7 @@ fn select_default_run_step(
     reference_time: Option<DateTime<Utc>>,
     time: Option<DateTime<Utc>>,
 ) -> Result<(&ForecastRun, u32, &StepFile), DataServerError> {
-    let run = covering_run(catalog, reference_time, time)?;
+    let run = covering_run(catalog, reference_time, time, &[])?;
     let (step, sf) = match time {
         Some(time) => run.find_step_for_time(time).ok_or_else(|| {
             DataServerError::InvalidParameter(format!("No forecast step for time {time}"))
@@ -1338,9 +1345,7 @@ fn pinned_run(
     reference_time: Option<DateTime<Utc>>,
 ) -> Result<Option<&ForecastRun>, DataServerError> {
     if catalog.runs.is_empty() {
-        return Err(DataServerError::Engine(
-            "No forecast data available".to_string(),
-        ));
+        return Err(no_forecast_data());
     }
     reference_time
         .map(|rt| {
@@ -1355,30 +1360,34 @@ fn pinned_run(
         .transpose()
 }
 
-/// The run a map render at `time`, or an M trajectory starting at `time`,
-/// reads: the pinned run, else the newest run whose published valid-time
-/// extent covers `time` (both snap to its nearest step), else the latest
-/// run for `None`. An incomplete newer run does not hide a covering older
-/// one.
-fn covering_run(
-    catalog: &Catalog,
+/// The run a map render of the default layer at `time`, or an M trajectory
+/// starting at `time`, reads: the pinned run, else the newest run whose
+/// published valid-time extent covers `time` (both snap to its nearest
+/// step), else the latest run for `None`. An incomplete newer run does not
+/// hide a covering older one. A trajectory naming `parameters` prefers the
+/// runs that have them all ([`preferring_runs_with`], #1026).
+fn covering_run<'a>(
+    catalog: &'a Catalog,
     reference_time: Option<DateTime<Utc>>,
     time: Option<DateTime<Utc>>,
-) -> Result<&ForecastRun, DataServerError> {
+    parameters: &[&str],
+) -> Result<&'a ForecastRun, DataServerError> {
     if let Some(run) = pinned_run(catalog, reference_time)? {
         return Ok(run);
     }
-    match time {
-        Some(time) => catalog
-            .runs
-            .values()
-            .rev()
-            .find(|r| r.find_step_for_time(time).is_some())
-            .ok_or_else(|| {
-                DataServerError::InvalidParameter(format!("No forecast run covers time {time}"))
-            }),
-        None => Ok(catalog.latest_run().expect("runs is non-empty")),
-    }
+    preferring_runs_with(catalog, parameters, |eligible| {
+        let mut newest_first = catalog.runs.values().rev().filter(|run| eligible(run));
+        match time {
+            Some(time) => newest_first.find(|r| r.find_step_for_time(time).is_some()),
+            None => newest_first.next(),
+        }
+    })
+    .ok_or_else(|| match time {
+        Some(time) => {
+            DataServerError::InvalidParameter(format!("No forecast run covers time {time}"))
+        }
+        None => no_forecast_data(),
+    })
 }
 
 /// Select the forecast run an EDR query serves (position, area, radius,
@@ -1391,39 +1400,95 @@ fn covering_run(
 /// is how an open start (`../end`) or a window starting before a run finds
 /// one. An instant `(t, t)` needs a step valid at exactly `t`, never the
 /// nearest. No run with a step inside ⇒ [`no_step_within`] (404). No
-/// datetime: the latest run.
-fn resolve_run(
-    catalog: &Catalog,
+/// datetime: the latest run. Either way among the runs that have every
+/// named parameter first ([`preferring_runs_with`], #1026): a new run with
+/// only its analysis does not answer for its missing windows.
+fn resolve_run<'a>(
+    catalog: &'a Catalog,
     reference_time: Option<DateTime<Utc>>,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<&ForecastRun, DataServerError> {
+    parameters: &[&str],
+) -> Result<&'a ForecastRun, DataServerError> {
     if let Some(run) = pinned_run(catalog, reference_time)? {
         return Ok(run);
     }
-    let Some((start, end)) = datetime else {
-        return Ok(catalog.latest_run().expect("runs is non-empty"));
-    };
-    let intersects = |run: &&ForecastRun| run.steps_within(start, end).next().is_some();
-    let newest_first = || catalog.runs.values().rev().filter(intersects);
-    newest_first()
-        .find(|run| run.find_step_for_time(start).is_some())
-        .or_else(|| newest_first().next())
-        .ok_or_else(|| no_step_within(start, end))
+    preferring_runs_with(catalog, parameters, |eligible| {
+        let newest_first = || catalog.runs.values().rev().filter(|run| eligible(run));
+        let Some((start, end)) = datetime else {
+            return newest_first().next();
+        };
+        let intersects = |run: &&ForecastRun| run.steps_within(start, end).next().is_some();
+        newest_first()
+            .filter(intersects)
+            .find(|run| run.find_step_for_time(start).is_some())
+            .or_else(|| newest_first().find(intersects))
+    })
+    .ok_or_else(|| match datetime {
+        Some((start, end)) => no_step_within(start, end),
+        None => no_forecast_data(),
+    })
+}
+
+/// `select` over the runs that have every one of `parameters`, newest
+/// first (#1026); when it finds none there, over every run, as without
+/// parameters. A parameter only older runs still have (dropped from the
+/// newest, or one its analysis lacks) is then read from a run that has it,
+/// while a request no such run can answer keeps its answer from before.
+fn preferring_runs_with<'a>(
+    catalog: &'a Catalog,
+    parameters: &[&str],
+    select: impl Fn(&dyn Fn(&ForecastRun) -> bool) -> Option<&'a ForecastRun>,
+) -> Option<&'a ForecastRun> {
+    if !parameters.is_empty() {
+        if let Some(run) = select(&|run| catalog.run_has(run, parameters)) {
+            return Some(run);
+        }
+    }
+    select(&|_| true)
+}
+
+/// The catalog has no run: [`pinned_run`] answers this before any selection.
+fn no_forecast_data() -> DataServerError {
+    DataServerError::Engine("No forecast data available".to_string())
+}
+
+/// The names a query's `parameter-name` lists: the runs having them are
+/// preferred ([`preferring_runs_with`]).
+fn named(parameters: Option<&[String]>) -> Vec<&str> {
+    parameters
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect()
 }
 
 /// The steps an area, radius or cube query reads from `run`: every step
 /// valid inside the `datetime` window (an instant: the step at exactly that
-/// time, never the nearest), else the run's last step. None inside ⇒
-/// [`no_step_within`] (404).
-fn grid_steps(
-    run: &ForecastRun,
+/// time, never the nearest). None inside ⇒ [`no_step_within`] (404). No
+/// datetime: the last step carrying every named parameter, as a map
+/// without `TIME` renders (#1026): a window only some steps carry, such as
+/// `TCDC_avg_3h`, is not the 400 of a field the run's last step lacks.
+/// Without parameters, or when no step carries them all, the run's last
+/// step.
+fn grid_steps<'a>(
+    catalog: &'a Catalog,
+    run: &'a ForecastRun,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<Vec<(DateTime<Utc>, &StepFile)>, DataServerError> {
+    parameters: &[&str],
+) -> Result<Vec<(DateTime<Utc>, &'a StepFile)>, DataServerError> {
     let Some((start, end)) = datetime else {
-        let (&step, file) = run
-            .steps
-            .iter()
-            .next_back()
+        let carried = if parameters.is_empty() {
+            None
+        } else {
+            catalog.carried_steps(run, parameters).last()
+        };
+        let (step, file) = carried
+            .or_else(|| {
+                run.steps
+                    .iter()
+                    .next_back()
+                    .map(|(&step, file)| (step, file))
+            })
             .ok_or_else(|| DataServerError::Engine("forecast run has no steps".to_string()))?;
         let time = run.reference_time + chrono::Duration::hours(i64::from(step));
         return Ok(vec![(time, file)]);
@@ -1755,8 +1820,22 @@ impl MapEngine for GribEngine {
         time: Option<DateTime<Utc>>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
+        self.resolve_parameters_reference_time(parameter.as_slice(), time, reference_time)
+    }
+
+    /// The run `get_raster_tiles` renders `parameters` from, through the
+    /// SAME `select_run_step`: the newest whose steps carry them all at
+    /// that time, so a wind component only an older run still has renders
+    /// with its partner from that run (#1026). A failed selection echoes
+    /// the request, as above.
+    fn resolve_parameters_reference_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
         let catalog = self.catalog();
-        select_run_step(&catalog, parameter.as_slice(), reference_time, time)
+        select_run_step(&catalog, parameters, reference_time, time)
             .map(|(run, _, _)| Some(run.reference_time))
             .unwrap_or(reference_time)
     }
@@ -2481,7 +2560,7 @@ mod tests {
         let t = |s: &str| Some(s.parse::<DateTime<Utc>>().unwrap());
         // 09Z predates the newest run's reference → fall back to run A
         // (the past-frame-after-new-run-lands case).
-        let run = covering_run(&catalog, None, t("2026-06-07T09:00:00Z")).unwrap();
+        let run = covering_run(&catalog, None, t("2026-06-07T09:00:00Z"), &[]).unwrap();
         assert_eq!(run.reference_time, run_a, "past valid time must fall back");
         // 15Z is beyond the newest run's published extent; the older run
         // actually has this forecast step and must serve it.
@@ -2495,10 +2574,10 @@ mod tests {
         assert!(select_run_step(&catalog, &[], Some(run_b), t("2026-06-07T15:00:00Z")).is_err());
         assert!(select_run_step(&catalog, &[], None, t("2026-06-07T19:00:00Z")).is_err());
         // Explicit pin stays exact even when another run also covers.
-        let run = covering_run(&catalog, Some(run_a), t("2026-06-07T15:00:00Z")).unwrap();
+        let run = covering_run(&catalog, Some(run_a), t("2026-06-07T15:00:00Z"), &[]).unwrap();
         assert_eq!(run.reference_time, run_a);
         // No time: latest run wins.
-        let run = covering_run(&catalog, None, None).unwrap();
+        let run = covering_run(&catalog, None, None, &[]).unwrap();
         assert_eq!(run.reference_time, run_b);
     }
 
@@ -2512,8 +2591,8 @@ mod tests {
         let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
         let (min, max) = (DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC);
         let select = |reference_time, window: (DateTime<Utc>, DateTime<Utc>)| {
-            resolve_run(&catalog, reference_time, Some(window)).and_then(|run| {
-                let steps = grid_steps(run, Some(window))?;
+            resolve_run(&catalog, reference_time, Some(window), &[]).and_then(|run| {
+                let steps = grid_steps(&catalog, run, Some(window), &[])?;
                 Ok((
                     run.reference_time,
                     steps.into_iter().map(|(time, _)| time).collect::<Vec<_>>(),
@@ -2579,10 +2658,13 @@ mod tests {
             Err(DataServerError::ReferenceTimeNotFound(_))
         ));
         // No datetime: the latest run, and an area its last step.
-        let run = resolve_run(&catalog, None, None).unwrap();
+        let run = resolve_run(&catalog, None, None, &[]).unwrap();
         assert_eq!(run.reference_time, run_b);
-        let run = resolve_run(&catalog, Some(run_a), None).unwrap();
-        assert_eq!(grid_steps(run, None).unwrap()[0].0, steps(&[18])[0]);
+        let run = resolve_run(&catalog, Some(run_a), None, &[]).unwrap();
+        assert_eq!(
+            grid_steps(&catalog, run, None, &[]).unwrap()[0].0,
+            steps(&[18])[0]
+        );
     }
 
     #[test]

@@ -153,6 +153,14 @@ impl DerivedWind {
         z: Option<f64>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
+        // Both components render from one run: the one the cache key names
+        // (`resolve_parameter_reference_time`). Unpinned, an engine whose
+        // run depends on the parameter would otherwise pick one for each,
+        // and pair a new run's u with an older run's v (#1026).
+        let reference_time = reference_time.or_else(|| {
+            self.map
+                .resolve_parameters_reference_time(&[&d.u, &d.v], time, None)
+        });
         // Components on time axes of their own render from one timestep
         // they share: the one the cache key names (`resolve_parameter_time`).
         let time = if self.map.parameter_times(&d.u).is_some()
@@ -245,6 +253,24 @@ impl DerivedWind {
             Some(selection) => selection.finish(query(selection.inner.as_deref())?),
         }
     }
+}
+
+/// `parameters` with each derived one replaced by its u and v components,
+/// each name once, in order: what the wrapped engine renders.
+fn components<'a>(plan: &'a WindPlan, parameters: &[&'a str]) -> Vec<&'a str> {
+    let mut expanded: Vec<&str> = Vec::with_capacity(parameters.len() + 2);
+    for &p in parameters {
+        let names = match plan.get(p) {
+            Some(d) => vec![d.u.as_str(), d.v.as_str()],
+            None => vec![p],
+        };
+        for name in names {
+            if !expanded.contains(&name) {
+                expanded.push(name);
+            }
+        }
+    }
+    expanded
 }
 
 /// Ascending timesteps present in both ascending axes.
@@ -553,10 +579,11 @@ impl MapEngine for DerivedWind {
         self.map.resolve_reference_time(time, reference_time)
     }
 
-    /// A derived parameter renders from its u component's run: u and v are
-    /// written together at every step of the sources wrapped. Were they
-    /// not, `resolve_parameter_time` still picks the step both have within
-    /// that run, so the cache key keeps naming what is rendered.
+    /// A derived parameter renders from the run its u and v components are
+    /// rendered together from (`resolve_parameters_reference_time`): a
+    /// component only an older run still has pairs from that run (#1026).
+    /// `resolve_parameter_time` then picks the step both have within that
+    /// run, so the cache key keeps naming what is rendered.
     fn resolve_parameter_reference_time(
         &self,
         parameter: Option<&str>,
@@ -564,12 +591,29 @@ impl MapEngine for DerivedWind {
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
         let plan = self.plan();
-        let parameter = match parameter.and_then(|p| plan.get(p)) {
-            Some(d) => Some(d.u.as_str()),
-            None => parameter,
-        };
-        self.map
-            .resolve_parameter_reference_time(parameter, time, reference_time)
+        match parameter.and_then(|p| plan.get(p)) {
+            Some(d) => {
+                self.map
+                    .resolve_parameters_reference_time(&[&d.u, &d.v], time, reference_time)
+            }
+            None => self
+                .map
+                .resolve_parameter_reference_time(parameter, time, reference_time),
+        }
+    }
+
+    fn resolve_parameters_reference_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let plan = self.plan();
+        self.map.resolve_parameters_reference_time(
+            &components(&plan, parameters),
+            time,
+            reference_time,
+        )
     }
 
     fn content_version(&self) -> u64 {
@@ -621,20 +665,8 @@ impl MapEngine for DerivedWind {
                 .map
                 .resolve_parameters_time(parameters, time, reference_time);
         }
-        let mut expanded: Vec<&str> = Vec::with_capacity(parameters.len() + 2);
-        for p in parameters {
-            let names = match plan.get(p) {
-                Some(d) => vec![d.u.as_str(), d.v.as_str()],
-                None => vec![*p],
-            };
-            for name in names {
-                if !expanded.contains(&name) {
-                    expanded.push(name);
-                }
-            }
-        }
         self.map
-            .resolve_parameters_time(&expanded, time, reference_time)
+            .resolve_parameters_time(&components(&plan, parameters), time, reference_time)
     }
 
     fn composites(&self) -> Arc<[CompositeDef]> {

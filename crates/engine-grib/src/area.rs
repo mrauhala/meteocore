@@ -26,11 +26,13 @@ impl GribEngine {
             polygon.bbox.north,
         ];
         let catalog = self.catalog();
-        let run = resolve_run(&catalog, reference_time, datetime)?;
+        let names = named(parameters);
+        let run = resolve_run(&catalog, reference_time, datetime, &names)?;
         // An interval reads every step valid inside it, reported on a `t`
         // axis; an instant (only the step valid at it) or no datetime (the
-        // run's last step) is the one step of a t-less Grid.
-        let steps = grid_steps(run, datetime)?;
+        // run's last step carrying the named parameters) is the one step of
+        // a t-less Grid.
+        let steps = grid_steps(&catalog, run, datetime, &names)?;
         let time_axis = datetime.is_some_and(|(start, end)| start < end);
         let keys = catalog
             .parameter_keys(&run.reference_time)

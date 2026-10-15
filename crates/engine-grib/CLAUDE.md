@@ -47,7 +47,8 @@ unlike GeoTIFF's one band per collection.
   eight concurrent reads over 120 indexes with 150 ms simulated GET latency.
   Run with `--ignored --nocapture`; timings are measurements, not CI gates.
 - Parameter metadata populates lazily: `scan_once` probes ≤32 messages per
-  scan, at most eight concurrently, across the newest run's step files.
+  scan, at most eight concurrently, each advertised parameter in the step
+  files of the newest run that has it (#1026).
   Read headers with 4 KiB read-ahead, skip local-use/unsupported grid bodies, and cap each
   fetched metadata section at 64 KiB. Use the GRIB indicator's length for tail
   probes without HEAD. Never unpack values or fill the grid cache for discovery.
@@ -134,10 +135,14 @@ Two selections, never mixed (#967):
   nearest; a window every step inside it, open ends (`MIN_UTC`/`MAX_UTC`)
   included. The run: the newest covering the window's start with a step
   inside, else the newest with any step inside (`../end`). None inside is
-  `LocationNotFound` (404), which a datetime list skips.
+  `LocationNotFound` (404), which a datetime list skips. A request naming
+  parameters chooses among the runs that have them all first (#1026, below).
 
 An incomplete newest run does not hide a covering older run; explicit run
-pins do not fall back. No requested datetime still selects the latest run.
+pins do not fall back. No requested datetime selects the latest run, among
+those with every named parameter first (#1026); an area, radius or cube
+then reads its last step carrying them all (`grid_steps`), else its last
+step.
 
 Each run also has canonical `(parameter, level type, level)` selectors,
 rebuilt with `Catalog::refresh_metadata` before publication. Metadata
@@ -177,8 +182,8 @@ on the request path. Single-level and legacy views require exact metadata.
   by window length. Precipitation kg/m² displays as mm; already-averaged flux
   W/m² stays W/m², and energy in J/m² stays energy. ECMWF JSON sidecars retain
   their existing naming/semantics; this change does not infer missing windows.
-- Parameter discovery and bounded metadata probes include every step in the
-  newest run: the analysis step commonly has no aggregates. An aggregate
+- Parameter discovery and bounded metadata probes include every step of
+  every retained run: the analysis step commonly has no aggregates. An aggregate
   absent from a time step is a null in a position series, never a zero.
   A wgrib2 index with mixed window-end times is rejected rather than assigning
   all its records the first record's time.
@@ -254,9 +259,7 @@ ones only in the legacy layout.
   read that snapshot (an `Arc` clone). The API layers then give the WMS
   child layer its own `time` dimension and default, and Maps/Tiles/EDR
   `parameter_names` its own `extent.temporal`. `RasterInfo.times` stays the
-  union. The advertised parameters are still the newest run's: while it
-  has only its analysis, its windows are no layer and a request naming one
-  is a 400, although older runs could serve it.
+  union. The advertised parameters are every retained run's (#1026, below).
 - Map selection of a parameter (`select_run_step`, `CarriedSteps`), over
   the pinned run, else the runs newest first:
   1. the first whose carrying steps span the time, at the nearest of them;
@@ -286,6 +289,44 @@ ones only in the legacy layout.
   keys, Maps, EDR metadata, through `DerivedWind`; with two runs, the run
   WMS, Maps and Tiles render and key where the newest lacks the window).
 
+## Parameters over retained runs (#1026)
+
+- A new run's analysis, typically one scan cycle on its own, lacks every
+  window and maximum, and a run may drop a parameter altogether.
+  `Catalog::refresh_metadata` therefore advertises the union over every
+  retained run, newest run first (its index order, then each older run's
+  other names), so the order holds once the new run has them all.
+  `refresh_families` calls it for each level view: the views union alike.
+  WMS layers, Maps/Tiles and EDR `parameter_names` all read that list.
+- `Catalog::advertised_keys`: each name's canonical key in the newest run
+  that has it. Labels and units (`param_metadata`), the metadata probes and
+  the wind facts read it, so an older run's parameter is never a bare name
+  with an empty unit. `has_parameter` reads it too (O(log n)).
+- Maps need no other change: `select_run_step` already walks every run, so a
+  parameter the newest run lacks renders, and keys (#507/#521), an older
+  run's step, `None` that run's last carrying step. Several parameters'
+  run is `resolve_parameters_reference_time`, the same selection.
+- EDR (`resolve_run`) and an M trajectory (`covering_run`) take the runs
+  that have every named parameter first (`preferring_runs_with`), then,
+  when none of those qualifies, every run as before. Without
+  `parameter-name`, or naming only what the newest run has, nothing
+  changes; an explicit run pin never falls back. Without a datetime, an
+  area, radius or cube reads the last step of that run carrying every
+  named parameter (`grid_steps`, as a map without `TIME` renders), so
+  `TCDC_avg_3h` is not the 400 of a last step that lacks it.
+- `DerivedWind::speed_tile` resolves an unpinned render's run over u and v
+  (`resolve_parameters_reference_time`) before reading either component:
+  `get_raster_tile` with `None` per component would pick each one's own
+  run, the new run's u with the old run's v, unlike the keyed render.
+- A parameter dropped from the newer runs stays advertised until
+  `max_runs` (or the `time_window`) evicts the last run that has it.
+- Tests: `retained_runs_tests.rs` (a complete 00Z run next to a 06Z run
+  with only its analysis: advertisement and order, labels and units, map
+  selection and the cache-key sweep, EDR position and area, an area of a
+  window the last step lacks, an M trajectory, eviction, a pressure view's
+  position and cube, and a v component only the older run has, with the
+  derived speed's direct-versus-keyed sweep).
+
 ## Position queries
 
 - `query_positions` samples every requested coordinate from each field once,
@@ -308,7 +349,8 @@ ones only in the legacy layout.
 ## Trajectory queries (#926)
 
 - `trajectory.rs` selects the run (an M path's samples snap to the nearest
-  step, so its run is `covering_run` of its first time, as a map's is),
+  step, so its run is `covering_run` of its first time, as a map's is,
+  among the runs with the named parameters first, #1026),
   steps, levels and parameters with the position
   query's helpers (`resolve_run`, `position_parameters`, `selected_levels`)
   and leaves the path, time/level rules and layout to
@@ -401,8 +443,12 @@ ones only in the legacy layout.
   `RasterInfo` (`refresh_discovery`), so `wind_facts()` is an `Arc` clone.
   Single-level views give each parameter its canonical level identity
   (`hag:10`, `sfc`) and label; pressure/model views none (a request's `z`
-  reads both components at that level). The latest run's canonical level is
-  the pairing basis.
+  reads both components at that level). The canonical level of the newest
+  run that has the parameter (`Catalog::advertised_keys`) is the pairing
+  basis, so a component only an older run still has pairs (#1026). A
+  derived speed's run is `resolve_parameters_reference_time` over u and v,
+  through `select_run_step`: the run whose steps carry both, never the new
+  run's u with the old run's v.
 - The grid is reported `GridAxes::NorthAligned` because only Template 3.0
   decodes. A rotated or projected template must report its own axes there,
   or grid-relative components would silently pass as earth-relative.

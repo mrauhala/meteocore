@@ -370,11 +370,15 @@ pub struct Catalog {
     /// Fingerprint for rendered caches, computed on publication from the
     /// ordered message identities (including origins, offsets and levels).
     pub content_version: u64,
-    /// Latest-run parameter union, rebuilt on the poll path before publication.
+    /// Parameter union over every retained run, newest run first (#1026),
+    /// rebuilt on the poll path before publication.
     parameters: Vec<(String, String, Option<u32>)>,
     /// Canonical levels per run, selected once on publication. A missing
     /// canonical level in a step is missing data, not a switch to upper air.
     parameter_keys: BTreeMap<DateTime<Utc>, ParameterKeys>,
+    /// Each advertised parameter's canonical key in the newest run that has
+    /// it (#1026): what its label, unit and wind facts describe.
+    advertised_keys: ParameterKeys,
     /// Built once on the scan path. Child catalogs contain no further children.
     pub families: BTreeMap<GribLevelType, Arc<Catalog>>,
     /// Per-run level union, also precomputed for vertical query selection.
@@ -430,7 +434,8 @@ impl Catalog {
             .zip(self.valid_times.last().copied())
     }
 
-    /// Parameters are unioned across the run: f000 commonly lacks aggregates.
+    /// Parameters are unioned across the steps of every retained run: f000
+    /// commonly lacks aggregates.
     pub fn surface_params(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         self.all_params_with_levels()
@@ -445,13 +450,29 @@ impl Catalog {
         self.param_names.clone()
     }
 
-    /// All unique parameters with level info from every step in the latest run.
+    /// All unique parameters with level info from every step of every
+    /// retained run, the newest run's first (#1026).
     pub fn all_params_with_levels(&self) -> Vec<(String, String, Option<u32>)> {
         self.parameters.clone()
     }
 
     pub fn parameter_keys(&self, reference_time: &DateTime<Utc>) -> Option<&ParameterKeys> {
         self.parameter_keys.get(reference_time)
+    }
+
+    /// Each advertised parameter's canonical key in the newest run that has
+    /// it: a parameter only an older run still has is described by that
+    /// run's key (#1026).
+    pub fn advertised_keys(&self) -> &ParameterKeys {
+        &self.advertised_keys
+    }
+
+    /// Whether `run` has every one of `parameters` (at some step).
+    pub fn run_has(&self, run: &ForecastRun, parameters: &[&str]) -> bool {
+        let keys = self.parameter_keys.get(&run.reference_time);
+        parameters
+            .iter()
+            .all(|name| keys.is_some_and(|keys| keys.contains_key(*name)))
     }
 
     /// `parameter`'s valid times over every retained run, when they are not
@@ -463,9 +484,7 @@ impl Catalog {
 
     /// Whether any retained run has `parameter`.
     pub fn has_parameter(&self, parameter: &str) -> bool {
-        self.parameter_keys
-            .values()
-            .any(|keys| keys.contains_key(parameter))
+        self.advertised_keys.contains_key(parameter)
     }
 
     /// The steps of `run` that carry every one of `parameters`; with none,
@@ -603,14 +622,28 @@ impl Catalog {
             })
             .collect();
         self.partial_steps = self.build_partial_steps();
-        self.parameter_times.clear();
-        let Some(run) = self.runs.values().next_back() else {
-            return;
-        };
-        let mut seen = HashMap::new();
-        for m in run.steps.values().flat_map(|sf| &sf.messages) {
-            let key = (&m.param, &m.levtype, m.level);
-            if seen.insert(key, ()).is_none() {
+        // Every retained run's parameters, newest first (#1026): while a new
+        // run has only its analysis, its windows and maxima, and anything
+        // else only older runs still have, stay advertised, and in the same
+        // order once the new run has them.
+        let mut advertised = ParameterKeys::new();
+        for keys in self.parameter_keys.values().rev() {
+            for (name, key) in keys {
+                advertised
+                    .entry(name.clone())
+                    .or_insert_with(|| key.clone());
+            }
+        }
+        self.advertised_keys = advertised;
+        let mut seen = HashSet::new();
+        for m in self
+            .runs
+            .values()
+            .rev()
+            .flat_map(|run| run.steps.values())
+            .flat_map(|sf| &sf.messages)
+        {
+            if seen.insert((&m.param, &m.levtype, m.level)) {
                 self.parameters
                     .push((m.param.clone(), m.levtype.clone(), m.level));
             }

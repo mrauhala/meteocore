@@ -243,7 +243,9 @@ Only this list changed order. The engines still answer their runs ascending
 (`EdrEngine::get_instances` and `instance_reference_times`, built with
 `ds_core::instances::build_instances`), and the handler sorts them
 descending for the list alone. Run selection (`None` ⇒ the latest run, for
-every query without an instance) picks by reference time and has no order;
+every query without an instance; on GRIB the latest run that has every
+named parameter first, see the GRIB section, #1026) picks by reference
+time and has no order;
 the WMS `reference_time` dimension and its Annex C ranges
 (`RasterInfo.reference_times`) stay ascending.
 
@@ -599,7 +601,7 @@ transforms retain serial retrieval.
 |---|---|---|---|---|---|---|---|---|---|
 | CSV | ✓, `datetime` by observation rows | – | ✓ | ✓ | – | – | n/a | ✓ stations | stations whose point is inside the polygon (≤ 500) and that have a row in the `datetime` window; a station without one is left out, as on BUFR (`/req/edr/REQ_rc-within-response` A, #968), and no station with data → 404 |
 | GeoTIFF | – | ✓ | ✓ | ✓ | – | – | n/a | – | Grid over the polygon's bbox at native resolution, no 256-cell coarsening (≤ 1M values across timesteps → 400, checked before any read, #858), pixels outside the polygon masked; `t` axis when several steps; a file that cannot be read is a timestep of nulls, any other error fails the query |
-| GRIB | – | ✓ | ✓ | ✓ | ✓ pressure/model views | ✓ | ✓ | – | Grid of the native nodes enclosing the polygon's bbox (≤ 1M values across steps/levels/parameters); nodes outside the polygon are null: for a rectangle, those whose cell, half a spacing either side, misses it, and a rectangle no cell meets is a 404 (#966), for any other polygon those centred outside it; antimeridian-crossing bboxes rejected (#667). `datetime` matches steps exactly on every query (#967): an instant is the step valid at it, never the nearest; an interval, open ends included, every step inside it, on a `t` axis for area and radius even when one step is inside; no step → 404. Without `datetime` an area is the latest run's last step |
+| GRIB | – | ✓ | ✓ | ✓ | ✓ pressure/model views | ✓ | ✓ | – | Grid of the native nodes enclosing the polygon's bbox (≤ 1M values across steps/levels/parameters); nodes outside the polygon are null: for a rectangle, those whose cell, half a spacing either side, misses it, and a rectangle no cell meets is a 404 (#966), for any other polygon those centred outside it; antimeridian-crossing bboxes rejected (#667). `datetime` matches steps exactly on every query (#967): an instant is the step valid at it, never the nearest; an interval, open ends included, every step inside it, on a `t` axis for area and radius even when one step is inside; no step → 404. Without `datetime` an area is one step: of the latest run that has every named parameter, else the latest run (#1026), its last step carrying them all, else its last step |
 | QueryData | – | ✓ | ✓ | ✓ | – | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps; no step in the `datetime` window → 404, on position and trajectory too. Lat/lon, rotated, stereographic and LCC grids (including the tangent-cone MEPS grid, on the sphere its file declares); a projected grid's extent is its projected rectangle's edges, not its corners' lon/lat box |
 | Zarr | – | ✓ | ✓ | ✓ | – | ✓ | ✓ | – | Grid over bbox at native resolution, ≤ 256 cells/axis, one subset retrieval per variable for the whole time span (each may read multiple chunks) (two across the antimeridian; cells within half a native cell of ±180° are not interpolated across the seam, #667), at most 8 variables per request, cells outside the polygon masked (vertex fallback for sub-cell shapes); polygon outside the extent → 404; `t` axis when several steps; no step in the `datetime` window → 404, on position and trajectory too. Forecast stores (reference + lead axes) expose every run as an instance; `None` ⇒ latest |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | – | n/a | – | Grid over bbox, ≤ 256 cells/axis, masked to the polygon; `t` axis when several steps |
@@ -658,7 +660,8 @@ its display unit conversion).
   range is a 400 (EDR 1.2 abstract test `/conf/trajectory/
   coords-param-invalid-time`). On GRIB the run is the newest whose
   time range covers the path's first time, as for a map `TIME`, since the
-  samples snap; a pinned instance never falls back. `datetime` (a list too)
+  samples snap, among the runs that have every named parameter first
+  (#1026); a pinned instance never falls back. `datetime` (a list too)
   together with M/ZM → 400.
 - **Z (level).** In the collection's vertical coordinate (`extent.vertical`,
   hPa or model level on GRIB level views), interpolated along the segment
@@ -668,8 +671,10 @@ its display unit conversion).
   ignores Z (`/req/edr/z-response` A) — QueryData and Zarr today. `z`
   together with Z/ZM → 400, also where the collection would ignore `z`.
 - **2-D and Z paths** use the `datetime` selection of a position query (all
-  steps of the latest run when omitted; a `datetime` list queries each
-  instant and lists the answers): one `Trajectory` coverage per timestep.
+  steps of the latest run when omitted, on GRIB of the latest run that has
+  every named parameter, else the latest run, #1026; a `datetime` list
+  queries each instant and lists the answers): one `Trajectory` coverage
+  per timestep.
   On QueryData and Zarr no step in the window is a 404 (the plan's no-data
   answer), so a list skips that instant (#968). **2-D and M paths** on a collection with a vertical extent are
   sampled on the `z` levels (all levels when omitted, `/req/edr/z-response`
@@ -763,7 +768,11 @@ or a `TMAX`/`TMIN` the analysis lacks, carries its own `extent.temporal` in
 `parameter_names`: the valid times of the steps that have it, over the
 retained runs (#1005). The collection's temporal extent stays the union of all
 steps; queries still match `datetime` exactly, so an instant a key lacks is
-null for it.
+null for it. `parameter_names` lists every retained run's parameters, the
+newest run's first, each labelled from the newest run that has it (#1026):
+while a new run has only its analysis, its windows and maxima stay listed,
+and a parameter the newer runs dropped stays listed until the last run that
+has it is evicted (`max_runs`, `time_window`).
 
 GRIB sources can opt into `level_types = ["single", "pressure", "model"]`.
 The server publishes only present/enabled families as `{id}-single`,
@@ -853,8 +862,17 @@ instant needs a step valid at exactly that time. An incomplete newer run does
 not hide a covering older run. Position, area, radius, cube and 2-D or Z
 trajectories then take every step of that run inside the window. No step
 inside is a 404, which a datetime list skips. Explicit instance pins never
-fall back to another run. Maps, Tiles and WMS keep snapping `TIME` to the
-nearest step of the newest run covering it.
+fall back to another run. With `parameter-name`, the runs that have every
+named parameter are tried first, then every run (#1026): without a
+`datetime`, `parameter-name=TCDC_avg_6h` reads the newest run that has the
+6 h average, not a newer run that has only its analysis; a request without
+`parameter-name`, or naming only what the newest run has, is unchanged.
+Without a `datetime`, area, radius and cube read the last step of that run
+carrying every named parameter, so `parameter-name=TCDC_avg_3h` is the
+step with the 3 h average, not the 400 of a last step without it. Maps,
+Tiles and WMS snap `TIME` to the nearest step carrying the parameter, in
+the newest run whose carrying steps span it (#1005), as described in
+`crates/engine-grib/CLAUDE.md`.
 
 If a wgrib2 index repeats the same parameter/level/window at different offsets,
 the scan emits one summary warning after parameter/family filtering, with

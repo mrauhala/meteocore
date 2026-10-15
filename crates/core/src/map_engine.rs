@@ -746,6 +746,24 @@ pub trait MapEngine: Send + Sync {
         self.resolve_reference_time(time, reference_time)
     }
 
+    /// [`Self::resolve_parameter_reference_time`] for parameters rendered
+    /// together from one run, such as the u and v components a derived
+    /// wind speed combines: the run that has them all, which
+    /// [`Self::resolve_parameters_time`] then selects their one timestep in.
+    ///
+    /// An engine whose run selection depends on the parameter MUST override
+    /// this with the selection its render uses. GRIB does (#1026): a
+    /// component only an older run still has renders, with its partner,
+    /// from that run. Default: the first parameter's run.
+    fn resolve_parameters_reference_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        self.resolve_parameter_reference_time(parameters.first().copied(), time, reference_time)
+    }
+
     /// [`Self::resolve_parameter_time`] for parameters rendered together,
     /// such as an RGB composite's bands: the one timestep
     /// [`Self::get_raster_tiles`] renders them all from. The API layer must
@@ -923,6 +941,10 @@ mod tests {
         );
         assert_eq!(
             plain.resolve_parameter_reference_time(Some("late"), Some(at(2)), Some(at(1))),
+            Some(at(1))
+        );
+        assert_eq!(
+            plain.resolve_parameters_reference_time(&["late", "other"], Some(at(2)), Some(at(1))),
             Some(at(1))
         );
     }

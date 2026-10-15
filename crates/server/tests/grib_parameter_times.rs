@@ -441,3 +441,90 @@ async fn the_run_rendered_is_the_parameters_on_every_map_api() {
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.datetime, "2026-05-11T06:00:00Z");
 }
+
+/// A new run with only its analysis next to the complete 00Z run (#1026):
+/// the windows the analysis lacks stay WMS layers, Maps parameters and EDR
+/// parameter names, and render and query from the 00Z run, where they used
+/// to drop out of every list until the new run's f003.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_analysis_only_run_keeps_the_windows_on_every_api() {
+    let dir = tempfile::tempdir().unwrap();
+    write_steps(dir.path());
+    write_run(dir.path(), "2026051106", &[(0, "anl", None)]);
+    let engine = engine(dir.path());
+    assert_eq!(engine.raster_info_shared().reference_times, [at(0), at(6)]);
+
+    let app = wms(engine.clone(), dir.path());
+    let caps = get(&app, "/?SERVICE=WMS&REQUEST=GetCapabilities").await;
+    let caps = String::from_utf8(caps.body.to_vec()).unwrap();
+    for name in ["UGRD", "VGRD", "WIND_avg_3h", "WIND_avg_6h"] {
+        assert!(
+            caps.contains(&format!("<Name>{ID}/{name}</Name>")),
+            "{name}"
+        );
+    }
+    let map = |time: Option<i64>| {
+        let time = time.map_or(String::new(), |h| {
+            format!("&TIME={}", at(h).format("%Y-%m-%dT%H:%M:%SZ"))
+        });
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={ID}/WIND_avg_6h&STYLES=\
+             &FORMAT=image/png&CRS=CRS:84&BBOX={BBOX}&WIDTH=64&HEIGHT=64{time}"
+        )
+    };
+    // TIME omitted: the 00Z run's f006, never the error tile; the same
+    // step requested by its time, or the analysis without a window, hits.
+    let first = get(&app, &map(None)).await;
+    assert_eq!(
+        (first.status, first.x_cache.as_str()),
+        (StatusCode::OK, "MISS")
+    );
+    for hours in [6, 0] {
+        let reply = get(&app, &map(Some(hours))).await;
+        assert_eq!(reply.x_cache, "HIT", "TIME = +{hours} h");
+        assert_eq!(reply.body, first.body);
+    }
+
+    let app = maps(engine.clone(), dir.path());
+    let collection = json(&get(&app, &format!("/collections/{ID}")).await);
+    assert_eq!(
+        collection["parameter_names"]["WIND_avg_3h"]["extent"]["temporal"]["interval"],
+        serde_json::json!([[rfc3339(3), rfc3339(9)]])
+    );
+    let reply = get(
+        &app,
+        &format!("/collections/{ID}/map?bbox={BBOX}&width=64&height=64&parameter-name=WIND_avg_6h"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.starts_with(b"\x89PNG"));
+
+    let app = edr(engine, dir.path());
+    let collection = json(&get(&app, &format!("/collections/{ID}")).await);
+    assert!(
+        collection["parameter_names"]["WIND_avg_6h"].is_object(),
+        "{}",
+        collection["parameter_names"]
+    );
+    // No datetime: the run that has the window, not the new analysis.
+    let reply = get(
+        &app,
+        &format!("/collections/{ID}/position?coords=POINT(10%2050)&parameter-name=WIND_avg_6h"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let coverage = json(&reply);
+    assert_eq!(
+        coverage["domain"]["axes"]["t"]["values"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4,
+        "{coverage}"
+    );
+    let values = coverage["ranges"]["WIND_avg_6h"]["values"]
+        .as_array()
+        .unwrap();
+    assert!(values[2].is_number(), "{values:?}");
+    assert!(values[0].is_null() && values[1].is_null() && values[3].is_null());
+}

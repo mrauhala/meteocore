@@ -40,10 +40,12 @@ impl GribEngine {
             )));
         }
         let catalog = self.catalog();
-        // No datetime is the run's last step, as an area query answers; an
-        // instant the step valid at it, an interval every step inside it.
-        let run = resolve_run(&catalog, reference_time, datetime)?;
-        let steps = grid_steps(run, datetime)?;
+        // No datetime is the run's last step carrying the named parameters,
+        // as an area query answers; an instant the step valid at it, an
+        // interval every step inside it.
+        let names = named(parameters);
+        let run = resolve_run(&catalog, reference_time, datetime, &names)?;
+        let steps = grid_steps(&catalog, run, datetime, &names)?;
         let keys = catalog
             .parameter_keys(&run.reference_time)
             .cloned()

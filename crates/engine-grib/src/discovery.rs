@@ -150,14 +150,13 @@ impl GribEngine {
             .insert((url.to_owned(), entry.offset), geometry);
         true
     }
-    /// What each parameter's latest-run metadata states for wind
-    /// derivation (#897): its WMO triple and GRIB2 component flag, read by
-    /// the header probe or a decode (`Unknown` until then), and the
-    /// canonical level it is served at.
+    /// What each parameter's metadata states for wind derivation (#897):
+    /// its WMO triple and GRIB2 component flag, read by the header probe or
+    /// a decode (`Unknown` until then), and the canonical level it is served
+    /// at. All of it from the newest run that has the parameter (#1026), so
+    /// a component only an older run still has pairs at its own level.
     fn build_wind_facts(&self, catalog: &Catalog) -> WindFacts {
-        let keys = catalog
-            .latest_run()
-            .and_then(|run| catalog.parameter_keys(&run.reference_time));
+        let keys = catalog.advertised_keys();
         // A pressure or model-level view's parameters span its vertical
         // axis; a request reads every component at the same level.
         let single_level = self.vertical_kind().is_none();
@@ -167,7 +166,7 @@ impl GribEngine {
             .map(|name| {
                 let meta = self.param_metadata(catalog, &name);
                 let level = keys
-                    .and_then(|keys| keys.get(&name))
+                    .get(&name)
                     .filter(|_| single_level)
                     .map(|key| match key.level {
                         Some(level) => format!("{}:{level}", key.levtype),
