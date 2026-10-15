@@ -113,7 +113,7 @@ with WMS):
   `instance_reference_times` too, from its run map's keys; the default clones
   every run's valid times.
 
-## Output formats and GeoJSON (#929)
+## Output formats, GeoJSON (#929) and CSV (#1066)
 
 - `params::query_formats(query_type, engine.serves_station_series())` is
   the one list of formats a data query offers: the handler negotiates over
@@ -131,6 +131,19 @@ with WMS):
   of every coverage (`GeoJsonRequest::location_ids`).
 - GeoJSON rendering reads `get_locations()`, so it runs inside the query
   executor with the query, never on an HTTP worker.
+- CSV (#1066, `src/csv.rs`) is offered where GeoJSON is and on a station
+  collection's `area`: one long-form row per location, time and parameter,
+  named through the same `StationNames` and `geojson::station_series_axes`,
+  so it also renders on the executor. Numbers go through
+  `serde_json::Number` (the JSON's own text); text cells keep RFC 4180
+  quoting and the OWASP formula guard (a `'` before `= + - @`, tab, CR or
+  `'` at a cell's start, and before those or `"` right after a `;`, so it
+  undoes exactly). A row is 10 to 20 times a CoverageJSON value's bytes,
+  so the body has its own cap, `csv::MAX_BYTES` (64 MiB, a 400 over it):
+  one writer runs twice, into a counting sink that stops at the cap, then
+  into a buffer of exactly the counted size. Keep both passes on the same
+  code, and never reserve per series.
+  Never offer it for a gridded result without a decided layout.
 
 ## Radius queries (#513)
 

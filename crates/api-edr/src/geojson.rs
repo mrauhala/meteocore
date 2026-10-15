@@ -34,6 +34,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
+use chrono::{DateTime, Utc};
 use ds_core::model::{CoverageResponse, DomainDescription, Location, QueryResult};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
@@ -169,6 +170,30 @@ pub struct FeatureSummary {
     pub datetime: String,
 }
 
+/// Coverage `q` as a station series: the point and time axis of a time
+/// series at one point without `z`, or the kind of coverage it is instead
+/// (the engine broke its `serves_station_series` promise). The one check
+/// the GeoJSON and the CSV (#1066) encodings of a station result share.
+pub(crate) fn station_series_axes(
+    q: &QueryResult,
+) -> Result<(f64, f64, &[DateTime<Utc>]), &'static str> {
+    match &q.domain {
+        DomainDescription::PointSeries { x, y, t, z: None } => Ok((*x, *y, t)),
+        DomainDescription::PointSeries { .. } => Err("PointSeries with z"),
+        DomainDescription::Point { .. } => Err("Point"),
+        DomainDescription::Grid { .. } => Err("Grid"),
+        DomainDescription::VerticalProfile { .. } => Err("VerticalProfile"),
+        DomainDescription::Section { .. } => Err("Section"),
+        DomainDescription::Trajectory { .. } => Err("Trajectory"),
+    }
+}
+
+/// The label of a station series no single location names: its point as
+/// WKT. GeoJSON, its HTML page and CSV (#1066) label it alike.
+pub(crate) fn unnamed_label(x: f64, y: f64) -> String {
+    format!("POINT({x} {y})")
+}
+
 impl<'a> Series<'a> {
     /// Coverage `i` as a station series: a time series at one point without
     /// `z`, named by `identify`.
@@ -177,23 +202,7 @@ impl<'a> Series<'a> {
         q: &'a QueryResult,
         identify: &impl Fn(usize, &QueryResult) -> Option<FeatureIdentity<'a>>,
     ) -> Result<Self, GeoJsonError> {
-        let (x, y, t) = match &q.domain {
-            DomainDescription::PointSeries { x, y, t, z: None } => (*x, *y, t),
-            DomainDescription::PointSeries { .. } => {
-                return Err(GeoJsonError::NotStationSeries("PointSeries with z"))
-            }
-            DomainDescription::Point { .. } => return Err(GeoJsonError::NotStationSeries("Point")),
-            DomainDescription::Grid { .. } => return Err(GeoJsonError::NotStationSeries("Grid")),
-            DomainDescription::VerticalProfile { .. } => {
-                return Err(GeoJsonError::NotStationSeries("VerticalProfile"))
-            }
-            DomainDescription::Section { .. } => {
-                return Err(GeoJsonError::NotStationSeries("Section"))
-            }
-            DomainDescription::Trajectory { .. } => {
-                return Err(GeoJsonError::NotStationSeries("Trajectory"))
-            }
-        };
+        let (x, y, t) = station_series_axes(q).map_err(GeoJsonError::NotStationSeries)?;
         Ok(Series {
             x,
             y,
@@ -223,7 +232,7 @@ impl<'a> Series<'a> {
             },
             None => FeatureSummary {
                 id: None,
-                label: format!("POINT({} {})", self.x, self.y),
+                label: unnamed_label(self.x, self.y),
                 edrqueryendpoint: format!("{collection_url}/locations"),
                 datetime,
             },

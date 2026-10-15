@@ -234,7 +234,7 @@ impl GeoJsonRequest {
             index: LocationIndex::new(
                 self.engine
                     .get_locations()
-                    .map_err(|e| map_query_error(&e, "GeoJSON locations"))?,
+                    .map_err(|e| map_query_error(&e, "EDR station locations"))?,
             ),
             location_ids: &self.location_ids,
         })
@@ -332,13 +332,46 @@ fn render_station_geojson(
         .into_response())
 }
 
+/// Encode a station-series result as CSV (#1066), each coverage's rows named
+/// by [`StationNames`] as the GeoJSON features are.
+fn render_station_csv(
+    result: &CoverageResponse,
+    req: &GeoJsonRequest,
+) -> Result<Response, HandlerError> {
+    let names = req.station_names()?;
+    let body = crate::csv::write_station_series(
+        result,
+        |i, q| names.identify(i, q),
+        crate::csv::MAX_BYTES,
+    )
+    .map_err(|e| match e {
+        crate::csv::CsvError::TooLarge => bad_request(&DataServerError::QueryTooLarge(format!(
+            "The CSV response would exceed {} bytes ({} MiB): narrow datetime, the area or \
+             the list of locations, name fewer parameters with parameter-name, set limit, \
+             or use f=CoverageJSON",
+            crate::csv::MAX_BYTES,
+            crate::csv::MAX_BYTES >> 20
+        ))),
+        crate::csv::CsvError::NotStationSeries(kind) => {
+            tracing::error!(
+                collection = %req.collection_id,
+                "EDR CSV: a station-series engine answered a {kind} coverage"
+            );
+            server_error()
+        }
+    })?;
+    Ok(([(header::CONTENT_TYPE, crate::csv::CONTENT_TYPE)], body).into_response())
+}
+
 /// Serialise an EDR coverage response in the requested output format.
 ///
 /// `CoverageJSON` is the default; `GeoJSON` encodes station series (only
 /// offered where the engine serves them), with `number_matched` (the
 /// top-level coverages before `limit`, `None` when uncounted) as its
 /// `numberMatched`; `PNG` renders a vertical-profile or time-series plot
-/// (one stacked panel per parameter); `HTML` is a page of the CoverageJSON
+/// (one stacked panel per parameter); `CSV` encodes station series as one
+/// row per location, time and parameter (#1066, offered where GeoJSON is,
+/// and on a station collection's area); `HTML` is a page of the CoverageJSON
 /// (#971), plus the GeoJSON's location identity where GeoJSON is offered.
 /// A response that can't be plotted (a gridded/area result) maps
 /// to 400.
@@ -353,6 +386,7 @@ fn render_coverage_response(
     match format {
         EdrFormat::CoverageJson => coverage_json_response(&result, "EDR"),
         EdrFormat::GeoJson => render_station_geojson(&result, number_matched, geojson),
+        EdrFormat::Csv => render_station_csv(&result, geojson),
         EdrFormat::Png => {
             let panels = coverage_response_to_panels(&result).map_err(|e| bad_request(&e))?;
             let (w, h) = plot_dimensions(width, height);
@@ -416,15 +450,16 @@ pub(crate) fn bad_request(e: &DataServerError) -> HandlerError {
 }
 
 /// The request's EDR 1.2 `limit` for a response in `format` (`None` = no
-/// limit), or its 400. Only CoverageJSON and GeoJSON count top-level objects
-/// a client can page through; a PNG plot is one image and an HTML page shows
-/// the whole result, so there `limit` is validated and then ignored
-/// (`/req/edr/rc-core-query-parameters` L). Both stay bounded by the
-/// query's value caps.
+/// limit), or its 400. CoverageJSON and GeoJSON count top-level objects a
+/// client can page through, and CSV (#1066) holds the rows of the same
+/// coverages, so it keeps what CoverageJSON keeps; a PNG plot is one image
+/// and an HTML page shows the whole result, so there `limit` is validated
+/// and then ignored (`/req/edr/rc-core-query-parameters` L). Both stay
+/// bounded by the query's value caps.
 fn request_limit(raw: Option<&str>, format: EdrFormat) -> Result<Option<usize>, HandlerError> {
     let limit = parse_limit(raw).map_err(|e| bad_request(&e))?;
     Ok(match format {
-        EdrFormat::CoverageJson | EdrFormat::GeoJson => limit,
+        EdrFormat::CoverageJson | EdrFormat::GeoJson | EdrFormat::Csv => limit,
         EdrFormat::Png | EdrFormat::Html => None,
     })
 }
@@ -967,6 +1002,14 @@ fn data_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
                  `time` and per-parameter property arrays)"
             }
             EdrFormat::Png => "PNG (a vertical-profile / time-series plot)",
+            EdrFormat::Csv => {
+                "CSV (text/csv;header=present, one row per location, time and parameter: \
+                 location_id,label,longitude,latitude,datetime,parameter,value,unit; RFC 4180 \
+                 quoting, RFC 3339 UTC datetimes, an empty value where there is none; against \
+                 spreadsheet formulas a text cell gets a single quote before =, +, -, @, tab, CR \
+                 or ' at its start, and before those or \" right after a ; in it, the quotes a \
+                 client drops to read the data; a body over 64 MiB is a 400)"
+            }
             EdrFormat::Html => "HTML (a page of the response)",
         })
         .collect();
@@ -991,7 +1034,7 @@ fn locations_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
     if let Some(description) = param["description"].as_str() {
         param["description"] = json!(format!(
             "{description} PNG plots one location: for a list of locations it is a 400, \
-             and every other format, GeoJSON included, answers the whole list."
+             and every other format, GeoJSON and CSV included, answers the whole list."
         ));
     }
     param
@@ -1007,7 +1050,7 @@ fn data_response_content(formats: &[EdrFormat]) -> serde_json::Value {
                 json!({"$ref": "#/components/schemas/edrFeatureCollectionGeoJSON"})
             }
             EdrFormat::Png => json!({"type": "string", "format": "binary"}),
-            EdrFormat::Html => json!({"type": "string"}),
+            EdrFormat::Csv | EdrFormat::Html => json!({"type": "string"}),
         };
         content.insert(format.media_type().into(), json!({ "schema": schema }));
     }
@@ -2578,7 +2621,7 @@ pub async fn location_query(
     if list && parse_edr_format(params.f.as_deref()).is_ok_and(|f| f == EdrFormat::Png) {
         return Err(bad_request_msg(
             "PNG output plots one location: request a single location id, or CoverageJSON \
-             (GeoJSON on a station collection) for a list",
+             (GeoJSON or CSV on a station collection) for a list",
         ));
     }
     let offered: Vec<EdrFormat> = engine_query_formats(engine.as_ref(), "locations")
@@ -3110,7 +3153,7 @@ async fn run_area_query(
     // (e.g. `…/instances/x/area?f=png` → 400 "PNG not available", not a 404 on
     // the instance). An area result is gridded / multi-coverage, not a plot,
     // and area is not a point query, so no GeoJSON either (#929): CoverageJSON
-    // or its HTML page (#971).
+    // or its HTML page (#971), and CSV on a station collection (#1066).
     let format = data_query_format(
         engine,
         "area",
@@ -3135,6 +3178,8 @@ async fn run_area_query(
 
     let page = request.geojson(&state, engine, config, "area");
     let engine = engine.clone();
+    // Rendering stays on the query executor: CSV reads the engine's location
+    // inventory to name the stations.
     let response = execute_query(false, move |budget| {
         let result = crate::datetime_list::run(
             datetime.as_ref(),
@@ -3217,7 +3262,8 @@ async fn run_radius_query(
     // consistent with `data_queries` and the OpenAPI gating.
     require_query_type(engine, &id, "radius", "radius")?;
 
-    // Never PNG (a multi-coverage result); GeoJSON for station series (#929).
+    // Never PNG (a multi-coverage result); GeoJSON (#929) and CSV (#1066)
+    // for station series.
     let format = data_query_format(
         engine,
         "radius",
@@ -3542,9 +3588,12 @@ pub async fn trajectory_query(
         EdrFormat::CoverageJson => {
             with_data_cache_control(coverage_json_response(&result, "Trajectory")?, window)
         }
-        // `query_formats` never offers GeoJSON for a trajectory.
-        EdrFormat::GeoJson => {
-            tracing::error!("EDR trajectory: GeoJSON negotiated for a trajectory");
+        // `query_formats` never offers GeoJSON or CSV for a trajectory.
+        EdrFormat::GeoJson | EdrFormat::Csv => {
+            tracing::error!(
+                "EDR trajectory: {} negotiated for a trajectory",
+                format.name()
+            );
             return Err(server_error());
         }
         EdrFormat::Png => {
@@ -3625,8 +3674,9 @@ fn temporal_extent_json(
 /// `EdrEngine::serves_station_series`; `trajectory`:
 /// `EdrEngine::trajectory_shape`): area and radius results are gridded or
 /// multi-coverage, so they have no PNG plot, the point queries of a station
-/// collection add GeoJSON (#929), and only a radar cross-section trajectory
-/// renders as a PNG — an along-path one (#926) is CoverageJSON only.
+/// collection add GeoJSON (#929), those and its area add CSV (#1066), and
+/// only a radar cross-section trajectory renders as a PNG — an along-path
+/// one (#926) is CoverageJSON only.
 fn data_query_variables(
     query_type: &str,
     station_series: bool,
@@ -3982,11 +4032,16 @@ impl<'a> CollectionMetadata<'a> {
             "data_queries": data_queries,
             "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
             "parameter_names": parameter_names,
-            "output_formats": if self.station_series {
-                json!(["CoverageJSON", "GeoJSON", "PNG", "HTML"])
-            } else {
-                json!(["CoverageJSON", "PNG", "HTML"])
-            }
+            // Every format a data query of the collection may offer: the
+            // point queries' list (#929, #1066), from `query_formats`.
+            "output_formats": query_formats(
+                "position",
+                self.station_series,
+                TrajectoryShape::AlongPath,
+            )
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>()
         });
         if radius {
             fields["within_units"] = json!(WITHIN_UNITS);
