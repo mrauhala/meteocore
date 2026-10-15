@@ -23,8 +23,9 @@ Each merged range has these limits:
 - The existing absolute deadline follows all Rayon work, reads and retries.
   Rejected or short batches fall back to individual reads. Admission/deadline
   failures propagate; they never become transparent gaps. Invalid metadata is
-  rejected before any tile I/O. Ordinary tile failures keep the existing retry
-  and nodata policy.
+  rejected before any tile I/O. A tile whose individual fetch still fails after
+  its retries fails the request with 503; only bytes that arrived but do not
+  decode become a nodata gap (#1051).
 
 ## Current OPERA comparison — 2026-09-16 UTC
 
