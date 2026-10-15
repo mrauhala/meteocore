@@ -1654,7 +1654,7 @@ An RGB composite layer has no colour bar: its legend (`STYLE=default`, the only 
 
 ### Errors
 
-Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: `LayerNotDefined`, `StyleNotDefined`, `CRSNotDefined`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`. HTTP status is 400 for client errors, 503 when the render semaphore is saturated (`Server busy, try again later`), and 500 for internal errors (the message is redacted in the response body; the original detail is captured via `tracing::warn!` for operators).
+Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: `LayerNotDefined`, `StyleNotDefined`, `InvalidCRS`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`. A `LAYERS` list naming an undefined layer or style answers `LayerNotDefined` / `StyleNotDefined` before the one-layer limit refuses the list. HTTP status is 400 for client errors, 503 when the render semaphore is saturated (`Server busy, try again later`), and 500 for internal errors (the message is redacted in the response body; the original detail is captured via `tracing::warn!` for operators).
 
 ### Rendering Pipeline
 

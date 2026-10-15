@@ -169,6 +169,122 @@ fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str 
     }
 }
 
+/// What a GetMap `(LAYERS, STYLES)` pair names: the engine, how its
+/// pixels are painted, and the metadata snapshot validation reads.
+struct MapLayer {
+    collection_id: String,
+    /// The `/param` segment of a `collection/param` layer name.
+    layer_parameter: Option<String>,
+    engine: Arc<dyn MapEngine>,
+    paint: Paint,
+    /// The resolved style's name: `STYLES=` and `STYLES=default` resolve to
+    /// the same one.
+    style_name: String,
+    /// The parameter the style is configured for, if any.
+    style_parameter: Option<String>,
+    info: Arc<ds_core::map_engine::RasterInfo>,
+}
+
+/// Resolve one GetMap layer and its style: `LayerNotDefined` for a layer
+/// this server does not serve (an unknown collection, or an unknown
+/// parameter of `collection/param`), `StyleNotDefined` for a style the
+/// layer does not offer (WMS 1.3.0 Table E.1).
+fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLayer, WmsError> {
+    // Parse layer name: "collection-id" or "collection-id/parameter"
+    let (collection_id, layer_parameter) = match layer.split_once('/') {
+        Some((cid, param)) => (cid.to_string(), Some(param.to_string())),
+        None => (layer.to_string(), None),
+    };
+
+    // Look up engine by collection ID
+    let engine = state
+        .engines
+        .get(&collection_id)
+        .ok_or_else(|| WmsError::layer_not_found(layer))?
+        .clone();
+
+    // An RGB composite layer (#819) has no style map: its colours
+    // come from its channels, and its one style is `default`.
+    let composite = composite_layer(engine.as_ref(), layer);
+
+    // Look up style: try full layer name first (e.g., "ecmwf-kenya/2t" for
+    // per-parameter defaults), then fall back to collection ID
+    let (paint, style_name, style_parameter) = match &composite {
+        Some(spec) => {
+            if style != ds_render::COMPOSITE_STYLE {
+                return Err(WmsError::StyleNotDefined(format!(
+                    "Style '{style}' not defined for layer '{layer}'. Available: {}",
+                    ds_render::COMPOSITE_STYLE
+                )));
+            }
+            (
+                Paint::Composite(spec.clone()),
+                ds_render::COMPOSITE_STYLE.to_string(),
+                None,
+            )
+        }
+        None => {
+            let layer_styles = state
+                .styles
+                .get(layer)
+                .or_else(|| state.styles.get(&collection_id))
+                .ok_or_else(|| WmsError::layer_not_found(layer))?;
+
+            let style_info = layer_styles.get(style).ok_or_else(|| {
+                WmsError::StyleNotDefined(format!(
+                    "Style '{style}' not defined for layer '{layer}'. Available: {}",
+                    layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
+                ))
+            })?;
+            (
+                Paint::Colormap(style_info.colormap.clone()),
+                style_info.name.clone(),
+                style_info.parameter.clone(),
+            )
+        }
+    };
+
+    // Share one metadata snapshot across parameter, ELEVATION and
+    // reference_time validation.
+    let info = engine.raster_info_shared();
+
+    // Validate `LAYERS=collection/parameter` against the engine's
+    // advertised list (mirroring Maps + Tiles). Without this, an
+    // unknown parameter would silently render whatever the engine
+    // defaults to and cache that result under the invalid name —
+    // ServiceException is the correct OGC response here.
+    if let Some(pname) = layer_parameter.as_deref() {
+        if composite.is_none()
+            && !info.parameters.is_empty()
+            && !info.parameters.iter().any(|p| p.name == pname)
+        {
+            let composites = engine.composites();
+            let mut supported: Vec<&str> = info
+                .parameters
+                .iter()
+                .map(|p| p.name.as_str())
+                .chain(composites.iter().map(|c| c.name.as_str()))
+                .collect();
+            supported.sort_unstable();
+            return Err(WmsError::LayerNotDefined(format!(
+                "Parameter '{pname}' is not available for layer \
+                 '{collection_id}'. Available: {}",
+                supported.join(", ")
+            )));
+        }
+    }
+
+    Ok(MapLayer {
+        collection_id,
+        layer_parameter,
+        engine,
+        paint,
+        style_name,
+        style_parameter,
+        info,
+    })
+}
+
 /// Main WMS handler — dispatches on REQUEST parameter. `WmsQuery` keys the
 /// query string case-insensitively for every request type.
 pub async fn wms_handler(
@@ -201,98 +317,35 @@ pub async fn wms_handler(
         WmsRequestType::GetMap => {
             let params = query.validate_get_map()?;
 
-            // Parse layer name: "collection-id" or "collection-id/parameter"
-            let (collection_id, layer_parameter) =
-                if let Some((cid, param)) = params.layer.split_once('/') {
-                    (cid.to_string(), Some(param.to_string()))
-                } else {
-                    (params.layer.clone(), None)
-                };
+            let MapLayer {
+                collection_id,
+                layer_parameter,
+                engine,
+                paint,
+                style_name,
+                style_parameter,
+                info,
+            } = resolve_map_layer(&state, &params.layer, &params.style)?;
 
-            // Look up engine by collection ID
-            let engine = state
-                .engines
-                .get(&collection_id)
-                .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
-
-            // An RGB composite layer (#819) has no style map: its colours
-            // come from its channels, and its one style is `default`.
-            let composite = composite_layer(engine.as_ref(), &params.layer);
-
-            // Look up style: try full layer name first (e.g., "ecmwf-kenya/2t" for
-            // per-parameter defaults), then fall back to collection ID
-            let (paint, style_name, style_parameter) = match &composite {
-                Some(spec) => {
-                    if params.style != ds_render::COMPOSITE_STYLE {
-                        return Err(WmsError::StyleNotDefined(format!(
-                            "Style '{}' not defined for layer '{}'. Available: {}",
-                            params.style,
-                            params.layer,
-                            ds_render::COMPOSITE_STYLE
-                        )));
-                    }
-                    (
-                        Paint::Composite(spec.clone()),
-                        ds_render::COMPOSITE_STYLE.to_string(),
-                        None,
-                    )
-                }
-                None => {
-                    let layer_styles = state
-                        .styles
-                        .get(&params.layer)
-                        .or_else(|| state.styles.get(&collection_id))
-                        .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
-
-                    let style_info = layer_styles.get(&params.style).ok_or_else(|| {
-                        WmsError::StyleNotDefined(format!(
-                            "Style '{}' not defined for layer '{}'. Available: {}",
-                            params.style,
-                            params.layer,
-                            layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-                        ))
-                    })?;
-                    (
-                        Paint::Colormap(style_info.colormap.clone()),
-                        style_info.name.clone(),
-                        style_info.parameter.clone(),
-                    )
-                }
-            };
-
-            // Share one metadata snapshot across parameter, ELEVATION and
-            // reference_time validation below.
-            let info = engine.raster_info_shared();
-
-            // Validate `LAYERS=collection/parameter` against the engine's
-            // advertised list (mirroring Maps + Tiles). Without this, an
-            // unknown parameter would silently render whatever the engine
-            // defaults to and cache that result under the invalid name —
-            // ServiceException is the correct OGC response here.
-            if let Some(pname) = layer_parameter.as_deref() {
-                if composite.is_none()
-                    && !info.parameters.is_empty()
-                    && !info.parameters.iter().any(|p| p.name == pname)
-                {
-                    let composites = engine.composites();
-                    let mut supported: Vec<&str> = info
-                        .parameters
-                        .iter()
-                        .map(|p| p.name.as_str())
-                        .chain(composites.iter().map(|c| c.name.as_str()))
-                        .collect();
-                    supported.sort_unstable();
-                    return Err(WmsError::LayerNotDefined(format!(
-                        "Parameter '{pname}' is not available for layer \
-                         '{collection_id}'. Available: {}",
-                        supported.join(", ")
-                    )));
-                }
+            // GetMap renders one layer (`LayerLimit`), but a request naming
+            // a layer or style this server does not serve gets that error
+            // first: WMS 1.3.0 Table E.1's `LayerNotDefined` /
+            // `StyleNotDefined`, whichever layer of the list it is (#1065).
+            for (layer, style) in &params.other_layers {
+                resolve_map_layer(&state, layer, style)?;
+            }
+            if 1 + params.other_layers.len() > crate::params::LAYER_LIMIT {
+                return Err(WmsError::invalid_parameter(
+                    "Exactly one LAYERS value is supported",
+                ));
             }
 
-            // Reject an `ELEVATION` against a layer with no vertical axis.
+            // Reject an `ELEVATION` against a layer with no vertical axis:
+            // a sample dimension value the layer cannot take, Table E.1's
+            // `InvalidDimensionValue`, as a `DIM_REFERENCE_TIME` on a
+            // layer without runs is below (#1065).
             if params.elevation.is_some() && info.vertical.is_none() {
-                return Err(WmsError::invalid_parameter(&format!(
+                return Err(WmsError::InvalidDimensionValue(format!(
                     "Layer '{collection_id}' has no ELEVATION dimension"
                 )));
             }
@@ -562,22 +615,31 @@ pub async fn wms_handler(
 
                         // Direct single-shot render: one get_raster_tile →
                         // colorize → encode, or a composite's bands → compose →
-                        // encode.
+                        // encode. The engine is asked only for the rows
+                        // inside the CRS: rows past a pole of a geographic
+                        // view stay empty, and a view wholly past one is the
+                        // empty image without an engine read (WMS 1.3.0
+                        // §7.3.3.6, #1065).
                         let direct = || {
                             let mut phases = RenderPhases::default();
                             let engine_start = std::time::Instant::now();
                             let bytes = match &paint {
                                 Paint::Colormap(colormap) => {
-                                    let tile = engine.get_raster_tile(
-                                        bbox,
-                                        width,
-                                        height,
-                                        time,
-                                        &output_crs,
-                                        style_parameter.as_deref(),
-                                        elevation,
-                                        reference_time,
-                                    )?;
+                                    let Some(tile) =
+                                        ds_core::map_engine::get_raster_tile_in_domain(
+                                            engine.as_ref(),
+                                            bbox,
+                                            width,
+                                            height,
+                                            time,
+                                            &output_crs,
+                                            style_parameter.as_deref(),
+                                            elevation,
+                                            reference_time,
+                                        )?
+                                    else {
+                                        return Ok((None, phases));
+                                    };
                                     phases.add(RenderPhase::Engine, engine_start.elapsed());
                                     // If every pixel is nodata, skip colorization + encoding entirely.
                                     if tile.is_empty() {
@@ -596,16 +658,21 @@ pub async fn wms_handler(
                                 Paint::Composite(spec) => {
                                     // Every band from the one timestep the
                                     // cache key names (#507).
-                                    let tiles = engine.get_raster_tiles(
-                                        bbox,
-                                        width,
-                                        height,
-                                        time,
-                                        &output_crs,
-                                        &bands,
-                                        elevation,
-                                        reference_time,
-                                    )?;
+                                    let Some(tiles) =
+                                        ds_core::map_engine::get_raster_tiles_in_domain(
+                                            engine.as_ref(),
+                                            bbox,
+                                            width,
+                                            height,
+                                            time,
+                                            &output_crs,
+                                            &bands,
+                                            elevation,
+                                            reference_time,
+                                        )?
+                                    else {
+                                        return Ok((None, phases));
+                                    };
                                     phases.add(RenderPhase::Engine, engine_start.elapsed());
                                     let encode_start = std::time::Instant::now();
                                     let Some(bytes) = ds_render::render_composite_tiles(

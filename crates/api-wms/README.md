@@ -115,7 +115,7 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | `SERVICE` | yes | Must be `WMS` |
 | `VERSION` | no | Must be `1.3.0`, the default when omitted. Deliberate: ets-wms13's `getmap:no-version` expects an exception |
 | `REQUEST` | yes | `GetMap` |
-| `LAYERS` | yes | Layer name (= collection ID). Only one layer per request. |
+| `LAYERS` | yes | Layer name (= collection ID). Only one layer per request (`LayerLimit` 1): a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, a list of served layers `InvalidParameterValue` |
 | `CRS` | yes | Coordinate reference system (see below) |
 | `BBOX` | yes | Bounding box (axis order depends on CRS) |
 | `WIDTH` | yes | Output image width in pixels (1–8000) |
@@ -125,7 +125,7 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output (default `0xFFFFFF`) |
 | `QUALITY` | no | Vendor parameter: encoder quality 1–100 for `image/webp` (1–99 lossy, 100 lossless; default the collection's `[wms] webp_quality`, else lossless) and `image/jpeg` (default 85). With `image/png` or out of range: `InvalidParameterValue` |
 | `TIME` | no | ISO 8601 timestamp. Defaults to latest available. |
-| `STYLES` | no | Ignored (only default style is supported) |
+| `STYLES` | no | The layer's style; empty for its default. A `LAYERS` list, which `LayerLimit` 1 refuses, is first checked pair by pair: one `STYLES` value per layer (`STYLES=a,,b`), or empty for every default |
 
 ## Supported CRS
 
@@ -138,6 +138,12 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | `EPSG:3035` | minx, miny, maxx, maxy | ETRS89-LAEA (Europe) |
 
 **Important:** WMS 1.3.0 changed BBOX axis order to match the CRS definition. EPSG:4326 uses latitude/longitude order, not longitude/latitude. CRS:84 uses the more intuitive longitude/latitude order. When in doubt, use CRS:84.
+
+Any other CRS answers `InvalidCRS`. A CRS:84 or EPSG:4326 BBOX may reach
+past a pole: the rows whose centres lie beyond ±90° have no content
+(transparent, or `BGCOLOR` with `TRANSPARENT=FALSE`), as WMS 1.3.0 §7.3.3.6
+asks, and a BBOX wholly past a pole is the empty image. No engine is asked
+for those rows (#1065).
 
 ## WMS Configuration
 
@@ -284,7 +290,18 @@ them:
 </ServiceExceptionReport>
 ```
 
-Error codes: `LayerNotDefined`, `StyleNotDefined`, `CRSNotDefined`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`.
+Error codes: `LayerNotDefined`, `StyleNotDefined`, `InvalidCRS`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`.
+
+The codes WMS 1.3.0 Table E.1 defines are used where it says: an unknown
+layer or `collection/parameter` is `LayerNotDefined` and a style the layer
+does not offer `StyleNotDefined`, for every layer of a `LAYERS` list before
+the list's length is refused; a CRS other than the five above is
+`InvalidCRS`; an unsupported `FORMAT` is `InvalidFormat`; a malformed `TIME`
+or `ELEVATION`, an `ELEVATION` for a layer without one, or a
+`DIM_REFERENCE_TIME` that is no run of the layer, is `InvalidDimensionValue`;
+an unknown `REQUEST` is `OperationNotSupported`. Until #1065 an unsupported
+CRS was `CRSNotDefined`, and a malformed `ELEVATION` or one for a layer
+without one `InvalidParameterValue`.
 
 GetCapabilities advertises this one exception format,
 `<Exception><Format>XML</Format></Exception>`, right after `<Request>`. The
@@ -351,9 +368,10 @@ WMS 1.3.0 executable test suite, [ets-wms13](https://github.com/opengeospatial/e
 under TEAM Engine from the suite's published container, pinned by digest. It
 runs weekly, on demand, and on pull requests that change this crate, the
 workflow, its config in `ci/wms-ets/` or the fixtures that config serves. It
-builds the server, a debug build with the render deadline raised to 30 s, and
-starts it on `ci/wms-ets/config.toml`, whose collections use only fixtures
-committed to the repository:
+builds the server, a debug build with the render deadline raised to 60 s and
+the render memory budget to 2560 MiB, which admits the advertised 8000 × 8000
+maximum, and starts it on `ci/wms-ets/config.toml`, whose collections use
+only fixtures committed to the repository:
 
 | Layer | Covers |
 |-------|--------|
@@ -382,7 +400,14 @@ these deliberate limits:
 
 - One layer per GetMap (`LayerLimit` 1, #1014): the suite's GetMap requests
   with two or three layers, including its multi-layer `STYLES` tests, get an
-  exception and fail.
+  exception and fail. Its lists naming an undefined layer or style pass: the
+  names are checked before the length.
+- `TRANSPARENT` defaults to `TRUE` (#163), where WMS 1.3.0 says `FALSE`:
+  content outside the data is transparent, a pixel of RGBA 0,0,0,0.
+  `getmap:bbox-outside-crs` asks for a box wholly north of 90°N without
+  `TRANSPARENT`, reads only its pixels' red, green and blue, and wants every
+  pixel white, the spec default's background. The server returns the empty
+  image, transparent, and the test fails.
 - No GetFeatureInfo: GetCapabilities does not advertise the operation and
   every layer is `queryable="0"`, so the data-independent GetFeatureInfo
   tests have nothing to request. The queryable class stays off until
@@ -415,3 +440,21 @@ next run after that fix shows what lies behind them.
 The same fix also made request errors `text/xml`, the WMS 1.3.0 exception
 MIME type; `application/vnd.ogc.se_xml` is WMS 1.1.1's, and
 `getmap:exceptions-default` / `getmap:exceptions-xml` rejected it.
+
+**Second run, 2026-10-15** (ets-wms13 1.34, TEAM Engine 6.0.0-RC2, after the
+first run's fixes): 146 tests, 115 passed, 31 failed (20 directly, 11 through
+a failed subtest), and the data-preconditions class. By cause:
+
+| Failures | Tests | Cause | Status |
+|---:|---|---|---|
+| 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | GetMap renders one layer (`LayerLimit` 1, #1014) | expected: deliberate |
+| 4 | `getmap:first-layer-invalid`, `second-layer-invalid`, `first-style-invalid`, `second-style-invalid` | A `LAYERS` list was refused for its length, `InvalidParameterValue`, before its names were checked | fixed: every named layer and style is checked first, so an undefined one is `LayerNotDefined` / `StyleNotDefined`; a list of served layers is still refused |
+| 1 | `getmap:invalid-crs` | An unsupported CRS answered `CRSNotDefined`, not Table E.1's `InvalidCRS` | fixed: `InvalidCRS`. A malformed `ELEVATION`, or one for a layer without one, is now `InvalidDimensionValue`, as a malformed `TIME` was |
+| 1 | `getmap:large-size` | The advertised maximum, 8000 × 8000, is 64 M pixels; the default render memory budget admits 33.5 M, so it was a 503 | fixed in the job: `MC_RENDER_MEMORY_MB=2560`, the render deadline 60 s. Production sizes its own budget |
+| 1 | `getmap:bbox-outside-crs` | The box is wholly north of 90°N. The server returned the empty image, transparent since `TRANSPARENT` defaults to `TRUE`, and the suite wants every pixel's RGB white | expected while `TRANSPARENT` defaults to `TRUE` (#163). The test exposed a real fault next to it: a box reaching past a pole had the engine draw there, a global GRIB grid the rows of its edge cell south of 90°S. Fixed: WMS and Maps ask the engine only for the rows inside ±90° |
+| 1 | `getmap:no-version` | GetMap without `VERSION` renders | expected: deliberate |
+| 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
+| 11 | `getmap:getmap`, `bbox`, `crs`, `layers`, `styles`, `width-and-height`, `version`; `basic:getmap`, `bbox`, `bgcolor`, `transparent` | fail through a subtest above | follow their subtests |
+
+With these fixes the next run should pass the six fixed tests, and
+`getmap:crs` and `getmap:width-and-height` through them.

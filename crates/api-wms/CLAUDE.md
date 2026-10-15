@@ -28,6 +28,22 @@ injection risk.**
 - GetMap without `VERSION` assumes 1.3.0. Deliberate, kept although
   ets-wms13's `getmap:no-version` expects an exception.
 
+## Exception codes (#1065)
+
+- Use WMS 1.3.0 Table E.1's code wherever it names one, spelled as it
+  spells it (`WmsError::error_code`): `InvalidCRS` (never `CRSNotDefined`),
+  `LayerNotDefined`, `StyleNotDefined`, `InvalidFormat`,
+  `InvalidDimensionValue` (malformed `TIME`/`ELEVATION`, unknown
+  `DIM_REFERENCE_TIME`, and either of the last two on a layer without
+  that axis), `OperationNotSupported`. `MissingParameterValue` /
+  `InvalidParameterValue` are for what the table does not cover.
+- A `LAYERS` list is checked name by name before `LAYER_LIMIT` (1,
+  deliberate) refuses it: `resolve_map_layer` runs on every
+  `(layer, style)` pair (`GetMapParams::other_layers`), so an undefined one
+  is `LayerNotDefined` / `StyleNotDefined`. Several layers pair with
+  `STYLES` values one to one (§7.3.3.4), an empty `STYLES` meaning every
+  default; a single layer takes the whole `STYLES` value, as it always has.
+
 ## BBOX axis order (critical gotcha)
 
 WMS 1.3.0 BBOX axis order depends on the CRS:
@@ -62,6 +78,12 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   discrete radar palette and killed PNG8 (~9× bigger output, #451).
 - Meta-tiling is engine-agnostic and WMS-only; keep it enabled (it is the pan
   substrate — 86% marginal tile hit rate in production).
+- The direct path calls `ds_core::map_engine::get_raster_tile_in_domain` /
+  `get_raster_tiles_in_domain`, never the engine's own methods: a CRS:84 /
+  EPSG:4326 BBOX may reach past a pole, and those rows must stay empty
+  (§7.3.3.6, #1065). The helpers ask the engine only for the rows whose
+  centres lie inside ±90°, and nothing for a BBOX wholly past a pole (the
+  empty image). Engines need no guard of their own; Maps does the same.
 
 ## Rendered-image cache (#1010)
 
@@ -111,7 +133,8 @@ error images never are. Measured on a day of a live deployment's GetMaps
   #1005) and snaps with `resolve_parameter_time`, so the caches key the
   parameter's own run and timestep.
 - **ELEVATION** — advertised when the collection has a vertical extent
-  (`RasterInfo.vertical`); rejected with 400 otherwise.
+  (`RasterInfo.vertical`); rejected with 400 `InvalidDimensionValue`
+  otherwise.
 - **`reference_time` (forecast model run, #337/#345):** forecast layers
   (non-empty `RasterInfo.reference_times`) advertise a custom
   `<Dimension name="reference_time">` alongside `time`, defaulting to the
@@ -187,6 +210,9 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   tile is flattened too.
 - GetCapabilities advertises nothing for these; the layer `opaque` attribute
   is unrelated and unchanged.
+- ets-wms13's `getmap:bbox-outside-crs` fails on the `TRUE` default: it
+  sends no `TRANSPARENT`, reads only the pixels' RGB and wants white, and a
+  transparent pixel is RGBA 0,0,0,0. With `TRANSPARENT=FALSE` it passes.
 
 ## QUALITY / `[wms] webp_quality`
 
