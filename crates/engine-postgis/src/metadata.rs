@@ -18,9 +18,9 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
-use ds_core::feature::PropertyValue;
+use ds_core::feature::{FilterableProperties, PropertyValue};
 use ds_core::model::{Location, ParameterDescription};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 use tokio_postgres::types::Type;
 use tokio_postgres::Row;
@@ -70,7 +70,10 @@ pub struct CollectionMeta {
     /// from this list and kept in the same order, so `station_idx`
     /// is a valid index into both.
     pub feature_stations: Arc<Vec<FeatureStation>>,
-    pub filterables: ds_core::feature::FilterableProperties,
+    /// Features property-filter names: the configured
+    /// `stations.property_cols` plus the names the cached rows carry
+    /// (`station_filterables`, #1024).
+    pub filterables: FilterableProperties,
     pub locations: Arc<Vec<Location>>,
     /// `id → index into feature_stations/locations` lookup built once
     /// per refresh. Constant-time station resolution for
@@ -90,10 +93,12 @@ pub struct CollectionMeta {
 }
 
 impl CollectionMeta {
-    fn empty() -> Self {
+    /// The snapshot before the first successful refresh: no stations yet,
+    /// but the configured property columns are already filterable (#1024).
+    fn empty(cfg: &PostgisEngineConfig) -> Self {
         Self {
             feature_stations: Arc::new(Vec::new()),
-            filterables: Default::default(),
+            filterables: station_filterables(cfg, &[]),
             locations: Arc::new(Vec::new()),
             station_idx: Arc::new(HashMap::new()),
             parameters: Arc::new(HashMap::new()),
@@ -103,6 +108,79 @@ impl CollectionMeta {
             version: 0,
         }
     }
+
+    /// Assemble a refreshed snapshot from what [`MetadataCache::refresh`]
+    /// fetched. Pure, so the row-to-snapshot rules are testable without a
+    /// database.
+    pub(crate) fn build(
+        cfg: &PostgisEngineConfig,
+        feature_stations: Vec<FeatureStation>,
+        temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        version: u64,
+    ) -> Self {
+        let locations: Vec<Location> = feature_stations
+            .iter()
+            .map(FeatureStation::to_location)
+            .collect();
+        let station_idx = build_station_idx(&feature_stations);
+        let parameters = build_parameter_descriptions(&cfg.parameters);
+        // Events shape: the location list is empty, so the spatial extent
+        // comes from config (`extent_bbox`) — never from an `ST_Extent`
+        // full scan over the event table.
+        let spatial_extent = match cfg.events_extent_bbox {
+            Some(bbox) => Some(bbox),
+            None => spatial_extent_from(&locations),
+        };
+        // Events shape (#504): the advertised WMS/Maps/Tiles TIME steps,
+        // quantized and bounded, rebuilt per refresh so raster_info() is a
+        // snapshot clone.
+        let wms_times = if matches!(cfg.observations, ObservationSchema::Events(_)) {
+            crate::maps::build_wms_times(temporal_extent)
+        } else {
+            Vec::new()
+        };
+        Self {
+            filterables: station_filterables(cfg, &feature_stations),
+            feature_stations: Arc::new(feature_stations),
+            locations: Arc::new(locations),
+            station_idx: Arc::new(station_idx),
+            parameters: Arc::new(parameters),
+            temporal_extent,
+            spatial_extent,
+            wms_times: Arc::new(wms_times),
+            version,
+        }
+    }
+}
+
+/// The Features property-filter names of a station collection (#1024): the
+/// configured `stations.property_cols`, then any further names the cached
+/// rows carry. The configured columns are known before any row is read, so an
+/// empty stations table, or a first refresh that failed because the database
+/// was unreachable, still accepts a filter on one of them: 200 with zero
+/// features, not a 400 that lasts until a row arrives. Every stations row
+/// carries every property column (`fetch_station_rows`), so the union adds
+/// nothing once data is loaded. The observations-only mode has no stations
+/// table and the events shape no stations at all; both configure none.
+fn station_filterables(
+    cfg: &PostgisEngineConfig,
+    stations: &[FeatureStation],
+) -> FilterableProperties {
+    let configured = cfg
+        .location_source
+        .stations()
+        .map(|s| s.property_cols.as_slice())
+        .unwrap_or_default();
+    let names: BTreeSet<&str> = configured
+        .iter()
+        .map(String::as_str)
+        .chain(
+            stations
+                .iter()
+                .flat_map(|s| s.properties.keys().map(String::as_str)),
+        )
+        .collect();
+    Arc::new(names.into_iter().map(String::from).collect())
 }
 
 fn build_station_idx(stations: &[FeatureStation]) -> HashMap<String, usize> {
@@ -124,9 +202,11 @@ pub struct MetadataCache {
 }
 
 impl MetadataCache {
-    pub fn new_empty() -> Self {
+    /// An empty cache for `cfg`, its filterables already seeded from the
+    /// configured `stations.property_cols` (#1024).
+    pub fn new(cfg: &PostgisEngineConfig) -> Self {
         Self {
-            inner: ArcSwap::from_pointee(CollectionMeta::empty()),
+            inner: ArcSwap::from_pointee(CollectionMeta::empty(cfg)),
         }
     }
 
@@ -147,45 +227,14 @@ impl MetadataCache {
         pool: &Pool,
     ) -> Result<(), MetadataError> {
         let feature_stations = fetch_locations(cfg, pool).await?;
-        let locations: Vec<Location> = feature_stations
-            .iter()
-            .map(FeatureStation::to_location)
-            .collect();
-        let station_idx = build_station_idx(&feature_stations);
-        let parameters = build_parameter_descriptions(&cfg.parameters);
-        // Events shape: the location list is empty, so the spatial extent
-        // comes from config (`extent_bbox`) — never from an `ST_Extent`
-        // full scan over the event table.
-        let spatial = match cfg.events_extent_bbox {
-            Some(bbox) => Some(bbox),
-            None => spatial_extent_from(&locations),
-        };
         let temporal = fetch_temporal_extent(cfg, pool).await?;
-        // Events shape (#504): the advertised WMS/Maps/Tiles TIME steps,
-        // quantized and bounded, rebuilt per refresh so raster_info() is a
-        // snapshot clone.
-        let wms_times = if matches!(cfg.observations, ObservationSchema::Events(_)) {
-            crate::maps::build_wms_times(temporal)
-        } else {
-            Vec::new()
-        };
-
-        let previous = self.inner.load();
-        let filterables = ds_core::feature::property_names(
-            feature_stations.iter().map(|s| s.properties.as_ref()),
-        );
-        let next = CollectionMeta {
-            filterables,
-            feature_stations: Arc::new(feature_stations),
-            locations: Arc::new(locations),
-            station_idx: Arc::new(station_idx),
-            parameters: Arc::new(parameters),
-            temporal_extent: temporal,
-            spatial_extent: spatial,
-            wms_times: Arc::new(wms_times),
-            version: previous.version.wrapping_add(1),
-        };
-        self.inner.store(Arc::new(next));
+        let version = self.inner.load().version.wrapping_add(1);
+        self.store(CollectionMeta::build(
+            cfg,
+            feature_stations,
+            temporal,
+            version,
+        ));
         Ok(())
     }
 }
@@ -569,6 +618,7 @@ async fn fetch_temporal_extent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{LongShape, QualifiedTable, StationsMapping};
 
     fn mk_loc(id: &str, lon: f64, lat: f64) -> Location {
         Location {
@@ -600,9 +650,113 @@ mod tests {
         assert_eq!(spatial_extent_from(&locs), Some([10.0, 35.0, 30.0, 45.0]));
     }
 
+    fn stations_mapping(property_cols: &[&str]) -> StationsMapping {
+        StationsMapping {
+            table: QualifiedTable {
+                schema: "public".into(),
+                table: "stations".into(),
+            },
+            id_col: "id".into(),
+            label_col: "name".into(),
+            geom_col: "geom".into(),
+            property_cols: property_cols.iter().map(|c| (*c).to_string()).collect(),
+            where_clause: None,
+        }
+    }
+
+    fn cfg_with(location_source: LocationSource) -> PostgisEngineConfig {
+        PostgisEngineConfig {
+            dsn: "postgres://user:pw@127.0.0.1:1/db".into(),
+            dsn_was_literal: false,
+            pool_size: 2,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            location_source,
+            observations: ObservationSchema::Long(LongShape {
+                table: QualifiedTable {
+                    schema: "public".into(),
+                    table: "obs".into(),
+                },
+                station_fk_col: "station_id".into(),
+                time_col: "time".into(),
+                time_col_tz: None,
+                param_col: "param".into(),
+                value_col: "value".into(),
+                geom_col: None,
+            }),
+            parameters: vec![],
+            locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
+        }
+    }
+
+    fn names(f: &FilterableProperties) -> Vec<&str> {
+        f.iter().map(String::as_str).collect()
+    }
+
+    /// #1024: the configured property columns are filterable before any row
+    /// is read, both in a fresh cache (the database was unreachable at boot)
+    /// and after a refresh that found an empty stations table.
+    #[test]
+    fn configured_property_cols_are_filterable_without_rows() {
+        let mapping = stations_mapping(&["territory", "elevation"]);
+        for source in [
+            LocationSource::Stations(mapping.clone()),
+            LocationSource::StationsWithOrphans(mapping),
+        ] {
+            let cfg = cfg_with(source);
+            let fresh = MetadataCache::new(&cfg).load();
+            assert_eq!(names(&fresh.filterables), ["elevation", "territory"]);
+            assert!(fresh.feature_stations.is_empty());
+            assert_eq!(fresh.version, 0);
+
+            let empty_table = CollectionMeta::build(&cfg, Vec::new(), None, 1);
+            assert_eq!(names(&empty_table.filterables), ["elevation", "territory"]);
+            assert!(empty_table.feature_stations.is_empty());
+        }
+    }
+
+    /// No stations table ⇒ nothing configured to seed: the observations-only
+    /// mode and the events shape keep an empty catalog.
+    #[test]
+    fn no_stations_table_seeds_no_filterables() {
+        for source in [LocationSource::Observations, LocationSource::None] {
+            let cfg = cfg_with(source);
+            assert!(MetadataCache::new(&cfg).load().filterables.is_empty());
+            let bare = mk_fs("0-246-0-101004", 24.9, 60.2, "0-246-0-101004", &[]);
+            let meta = CollectionMeta::build(&cfg, vec![bare], None, 1);
+            assert!(meta.filterables.is_empty());
+        }
+    }
+
+    /// A refresh keeps the configured names and adds whatever the rows carry;
+    /// a name no row holds stays filterable.
+    #[test]
+    fn refreshed_filterables_union_configured_and_row_names() {
+        let cfg = cfg_with(LocationSource::StationsWithOrphans(stations_mapping(&[
+            "territory",
+            "elevation",
+        ])));
+        let rows = vec![
+            mk_fs("reg", 25.0, 60.3, "Helsinki", &[("territory", "FI")]),
+            mk_fs("other", 18.0, 59.3, "Stockholm", &[("network", "synop")]),
+            mk_fs("orphan", 18.9, 12.1, "orphan", &[]),
+        ];
+        let meta = CollectionMeta::build(&cfg, rows, None, 7);
+        assert_eq!(
+            names(&meta.filterables),
+            ["elevation", "network", "territory"]
+        );
+        assert_eq!(meta.version, 7);
+        assert_eq!(meta.locations.len(), 3);
+        assert_eq!(meta.station_idx.get("other"), Some(&1));
+        assert_eq!(meta.spatial_extent, Some([18.0, 12.1, 25.0, 60.3]));
+    }
+
     #[test]
     fn cache_starts_empty_and_store_replaces() {
-        let cache = MetadataCache::new_empty();
+        let cache = MetadataCache::new(&cfg_with(LocationSource::Observations));
         let m0 = cache.load();
         assert_eq!(m0.version, 0);
         assert!(m0.locations.is_empty());

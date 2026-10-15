@@ -12,6 +12,8 @@ mod reader;
 mod remote_header_tests;
 #[cfg(test)]
 mod stac_preload_tests;
+#[cfg(test)]
+mod tile_fetch_failure_tests;
 
 /// Snapshot of the process-global decoded-chunk cache (#463) for `/metrics`:
 /// `(hits, misses, bytes, capacity_bytes)`.
@@ -1718,10 +1720,14 @@ impl GeoTiffEngine {
 }
 
 /// Whether an EDR area read error means the file itself could not be read
-/// (fetch, decode or I/O failure), which the query answers as a timestep of
-/// nulls. Every other error belongs to the request and fails it (#858):
-/// admission and deadline (503/504), and client errors such as
-/// `QueryTooLarge` / `InvalidParameter` (400) — never nulls with HTTP 200.
+/// (a local open, decode or I/O failure, an invalid remote tile layout),
+/// which the query answers as a timestep of nulls. Every other error belongs
+/// to the request and fails it (#858): admission and deadline (503/504),
+/// and client errors such as `QueryTooLarge` / `InvalidParameter` (400) —
+/// never nulls with HTTP 200. A remote tile fetch that still fails after its
+/// retries arrives here as `ResourceExhausted`, so it is a 503 as on the map
+/// path, not nulls; remote bytes that do not decode are already nulls in the
+/// grid (#1051).
 fn is_unreadable_file(e: &DataServerError) -> bool {
     matches!(
         e,

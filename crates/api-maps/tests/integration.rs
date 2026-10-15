@@ -126,6 +126,15 @@ fn build_router_with_engine_and_wms(
     engine: Arc<dyn MapEngine>,
     wms: Option<ds_core::config::WmsConfig>,
 ) -> axum::Router {
+    api_maps::router(build_state_with_engine_and_wms(engine, wms))
+}
+
+/// The state behind [`build_router_with_engine_and_wms`], for mounting the
+/// same collection on another surface (the shared root's Maps block).
+fn build_state_with_engine_and_wms(
+    engine: Arc<dyn MapEngine>,
+    wms: Option<ds_core::config::WmsConfig>,
+) -> api_maps::AppState {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -175,7 +184,7 @@ fn build_router_with_engine_and_wms(
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
-    let state = Arc::new(ArcSwap::from_pointee(MapsState {
+    Arc::new(ArcSwap::from_pointee(MapsState {
         engines,
         collections,
         styles: styles_map,
@@ -184,8 +193,7 @@ fn build_router_with_engine_and_wms(
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
-    }));
-    api_maps::router(state)
+    }))
 }
 
 /// `apis` is the collection config; the Tiles service registers the
@@ -4570,6 +4578,128 @@ mod part1 {
             for name in ["Content-Bbox", "Content-Crs", "Content-Datetime"] {
                 assert!(headers[name].is_object(), "{path}: {name}");
             }
+        }
+    }
+
+    /// The map routes on every surface that serves them: the per-API
+    /// service and the shared OGC API root (#789), composed by
+    /// `api_common::shared::router` as the server composes it, whose Maps
+    /// block reuses the same handlers; each with the collection and a
+    /// styled map.
+    fn map_surfaces(engine: Arc<Recorder>) -> Vec<(axum::Router, &'static str)> {
+        let state = build_state_with_engine_and_wms(engine, None);
+        let per_api = api_maps::router(state.clone());
+        let shared = api_common::shared::router(api_common::shared::SharedApi::new(
+            "",
+            vec![Arc::new(api_maps::MapsBlock::new(state))],
+            vec![],
+        ));
+        let mut surfaces = Vec::new();
+        for app in [per_api, shared] {
+            for path in [
+                "/collections/radar/map",
+                "/collections/radar/styles/default/map",
+            ] {
+                surfaces.push((app.clone(), path));
+            }
+        }
+        surfaces
+    }
+
+    /// A query parameter the map routes do not take is a 400 naming the
+    /// ones they do, never silently ignored: a misspelt `parameter_name` or
+    /// `heigth` used to render the default map (root CLAUDE.md, #605,
+    /// #954). Cache-busters such as `_` are not tolerated either.
+    #[tokio::test]
+    async fn unknown_parameters_are_400_naming_the_accepted_ones() {
+        let engine = radar();
+        let supported = api_maps::params::MAP_PARAMETERS.join(", ");
+        for (query, name) in [
+            ("parameter_name=t", "parameter_name"),
+            ("width=8&heigth=512", "heigth"),
+            ("_=1700000000000", "_"),
+            ("BBOX=10,55,30,70", "BBOX"),
+            ("reference_time=2024-01-01T00:00:00Z", "reference_time"),
+            ("styles=default&width=8", "styles"),
+        ] {
+            for (app, path) in map_surfaces(engine.clone()) {
+                let uri = format!("{path}?{query}");
+                let (status, json) = get_on(app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                assert_eq!(
+                    json["description"],
+                    format!("Unknown query parameter '{name}'. Supported: {supported}"),
+                    "{uri}"
+                );
+            }
+        }
+        assert!(engine.renders().is_empty());
+    }
+
+    /// Every accepted parameter still renders, the workbench's map request
+    /// among them, and `elevation` reaches its own validation rather than
+    /// the unknown-parameter 400.
+    #[tokio::test]
+    async fn known_parameters_still_render() {
+        let engine = radar();
+        for query in [
+            // The workbench's Maps request (api-common workbench/map.js).
+            "bbox=10,55,30,70&bbox-crs=CRS:84&crs=EPSG:3857&width=64&height=48\
+             &f=image/png&transparent=true&datetime=2024-01-01T00:00:00Z",
+            "subset=Lat(60:65)&subset=time(*)&subset-crs=CRS:84&width=8",
+            "center=20,60&center-crs=CRS:84&width=8&height=8&scale-denominator=1000000",
+            "f=image/webp&quality=80&parameter-name=reflectivity&width=8",
+            "",
+        ] {
+            for (app, path) in map_surfaces(engine.clone()) {
+                let uri = format!("{path}?{query}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+        for (app, path) in map_surfaces(engine.clone()) {
+            let uri = format!("{path}?elevation=0.5");
+            let (status, json) = get_on(app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains("no vertical dimension"),
+                "{description}"
+            );
+        }
+    }
+
+    /// The parameters each map operation documents are exactly the ones
+    /// the routes accept.
+    #[tokio::test]
+    async fn openapi_documents_exactly_the_accepted_parameters() {
+        let (status, doc) = get("/api").await;
+        assert_eq!(status, StatusCode::OK);
+        for path in [
+            "/maps/collections/radar/map",
+            "/maps/collections/radar/styles/{styleId}/map",
+        ] {
+            let query: Vec<&str> = doc["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|parameter| match parameter["$ref"].as_str() {
+                    Some(r) => {
+                        let id = r.trim_start_matches("#/components/parameters/");
+                        &doc["components"]["parameters"][id]
+                    }
+                    None => parameter,
+                })
+                .filter(|parameter| parameter["in"] == "query")
+                .map(|parameter| parameter["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(query, api_maps::params::MAP_PARAMETERS, "{path}");
         }
     }
 }

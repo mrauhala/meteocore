@@ -175,6 +175,36 @@ budget and its client-visible failure.
   the client's retry fetches the rest
   (`a_deadline_cut_read_keeps_fetched_tiles_for_the_retry`).
 
+## Remote tile read failures (#1051)
+
+`reader::read_remote_chunk_with_retry` is the one policy for every remote
+tile read: map renders (WMS, Maps, Tiles), EDR area and radius
+(`read_bbox`) and EDR position (`read_pixel`). `read_encoded_chunk` gives a
+failure a class, `TileReadError`, and the class decides, never the message:
+
+- **`Fetch`**: a storage or transport error, or a short body. Retried twice
+  (50 ms, then 100 ms, within the request deadline). Still failing, the read
+  fails with `ResourceExhausted` and the detail is logged: HTTP 503 with
+  `Retry-After` in WMS/Maps/Tiles, 503 in EDR. Never an `Ok` tile with
+  nodata in its place: the rendered and meta-tile caches keep every `Ok`
+  tile with no TTL, and an explicit-time response is browser-cached for a
+  day, so a gap from a short storage outage outlived it. An object deleted
+  after the scan fails the same way until the catalog drops it.
+- **`Decode`**: the bytes arrived but do not decode. A logged nodata gap at
+  once, not retried: the compressed cache already holds the same bytes.
+- **`Fatal`**: decode admission, the deadline and an invalid tile layout
+  fail the read at once and are never retried. Admission and the deadline
+  fail the request in every API; an invalid layout fails a map render, but
+  on EDR it is the #858 unreadable-file null (see EDR below). A fetch
+  closure passes the storage bridge's `DeadlineExceeded` through unchanged
+  (`range_read_error`), so a deadline is never retried or reported as a
+  failed store.
+- An empty tile (`byte_count == 0`) is no failure: nodata, without I/O.
+
+The poll-time pre-warm (`prewarm.rs`, `reader::fetch_encoded_range`) is not
+a read under this policy: it caches only bytes that arrived and logs a WARN
+for reads that failed, so it can neither fail a request nor insert a gap.
+
 ## Rendering gotchas (hard-won)
 
 - **Overview selection:** pick overviews with bounded upscale
@@ -203,15 +233,21 @@ GRIB: no `MAX_AREA_DIM` coarsening, which would need overview selection and a
 strided polygon mask. `query_bbox` checks the shared
 `ds_core::feature::check_area_budget` over `timesteps × ny × nx` before it
 allocates the result or reads a file, so an over-budget area is a 400 naming
-the limit (#858). The polygon mask tests each cell of the window against
-every ring vertex, so `query_area` first checks the shared
+the limit (#858). The polygon mask tests each cell of the window against every
+ring vertex, so `query_area` first checks the shared
 `ds_core::feature::check_mask_budget`, before `query_bbox` reads a file
 (#889): over 20 M edge tests is a 400, as on GRIB and QueryData. A rectangle
-is exempt; a radius query's 65-vertex circle trips it past about 307 k
-cells. Per timestep, only a file that cannot be read (`Engine`, `Storage`,
-`Io`: `is_unreadable_file`) becomes logged nulls; any other read error fails
-the query — client errors stay 400, admission/deadline 503/504. On a STAC
-source a query first loads the metadata of the cold items in its window,
+is exempt; a radius query's 65-vertex circle trips it past about 307 k cells.
+Per timestep, only a file that cannot be read (`Engine`, `Storage`, `Io`:
+`is_unreadable_file`), such as a local file that fails to open or decode or a
+remote file with an invalid tile layout, becomes logged nulls; any other read
+error fails the query — client errors stay 400, admission/deadline 503/504. A
+remote tile fetch is no unreadable file: one that still fails after its
+retries is `ResourceExhausted`, so the whole area query is a 503 and never a
+timestep of nulls with HTTP 200 (#1051). Remote bytes that do not decode are
+nulls in that tile's cells. Position follows the same policy: a failed remote
+fetch is a 503, an undecodable tile or an invalid tile layout a null. On a
+STAC source a query first loads the metadata of the cold items in its window,
 bounded and concurrent (see STAC metadata loading above); the area and mask
 budgets need the window's grid, so they run after those loads.
 
@@ -219,8 +255,9 @@ Encoded remote tile ranges are validated before fetching: each is capped at
 64 MiB and included in decode admission alongside raw and boxed output buffers.
 Direct HTTP range bodies are also streamed with the requested length as a cap,
 including when the origin omits Content-Length or ignores Range. Invalid tile
-index arithmetic fails the request; ordinary fetch/decode errors may still
-produce nodata gaps.
+index arithmetic fails the read before any I/O, which on EDR is the
+unreadable-file null above; fetch and decode failures follow "Remote tile
+read failures" above.
 
 Interactive render deadlines propagate through Rayon tile fetching to both
 object-store and direct HTTP range/body reads. All retries share one absolute

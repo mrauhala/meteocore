@@ -307,6 +307,16 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 6. Wire it into the appropriate registries per the collection's `apis`.
 7. Obey the Performance & Concurrency rules — especially: spawn the poll loop
    on the background runtime, and never project per output pixel.
+   **A `MapEngine` returns `Err` for a deadline or a failed read** —
+   `DeadlineExceeded`, or `ResourceExhausted` (503) for a storage failure
+   that outlived its retries, with the detail logged — never an `Ok` tile
+   with nodata in its place: the rendered and meta-tile caches keep every
+   `Ok` tile with no TTL, so a gap from a short outage would outlive it
+   (#993, #1051). Only a tile or field the source itself declares empty
+   (a COG tile with `byte_count == 0`) or bytes that do not decode are
+   nodata. A missing object is engine-specific: engine-odim draws a typed
+   `NotFound` as nodata (#993/#996), GeoTIFF answers 503 until the next scan
+   drops the entry.
    **If the engine snaps a requested time to an available timestep**
    (latest-not-after, nearest, …) instead of exact-matching, it MUST
    override `MapEngine::resolve_time` with the SAME selection logic

@@ -129,6 +129,12 @@ does ([#794](https://github.com/mrauhala/meteocore/issues/794)).
 The contract suite checks each declaration against the links and OpenAPI
 parameters it requires. No Common classes change.
 
+Map route parameters (2026-10-15, [#954](https://github.com/mrauhala/meteocore/issues/954)):
+Maps `…/map` and `…/styles/{styleId}/map`, per-API and at the shared root,
+reject a query parameter outside the list their OpenAPI operations document
+with a 400 naming that list, as map tiles already did. No Common classes
+change.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a
