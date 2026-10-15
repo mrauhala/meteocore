@@ -4703,3 +4703,81 @@ mod part1 {
         }
     }
 }
+
+/// The box and height of each `get_raster_tile` call.
+type RasterRequests = Arc<std::sync::Mutex<Vec<([f64; 4], u32)>>>;
+
+/// Records the box and height of every `get_raster_tile` call, and draws
+/// on every pixel it is asked for, as [`MockMapEngine`] does.
+struct RecordingMapEngine(RasterRequests);
+
+impl MapEngine for RecordingMapEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.0.lock().unwrap().push((bbox, height));
+        MockMapEngine.get_raster_tile(
+            bbox,
+            width,
+            height,
+            time,
+            output_crs,
+            parameter,
+            z,
+            reference_time,
+        )
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        MockMapEngine::make_info()
+    }
+}
+
+/// A CRS84 map reaching past a pole asks the engine only for the rows
+/// whose centres lie inside the CRS, so no engine draws past a pole, and a
+/// map wholly past one is the empty image without an engine read (#1065).
+#[tokio::test]
+async fn map_past_a_pole_asks_the_engine_only_for_rows_inside_the_crs() {
+    let asked = RasterRequests::default();
+    let app = build_router_with_engine(Arc::new(RecordingMapEngine(asked.clone())));
+    let map = |bbox: &str| {
+        let app = app.clone();
+        let uri = format!("/collections/radar/map?bbox={bbox}&width=100&height=100");
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let x_cache = resp
+                .headers()
+                .get("x-cache")
+                .map(|v| v.to_str().unwrap().to_string());
+            (resp.status(), x_cache)
+        }
+    };
+
+    let (status, x_cache) = map("-10,90,10,110").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(x_cache.as_deref(), Some("EMPTY"));
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "engine asked past the pole"
+    );
+
+    // Rows centred at 99.9°N … 80.1°N: only the southern half is asked for.
+    let (status, x_cache) = map("-10,80,10,100").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(x_cache.as_deref(), Some("MISS"));
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        [([-10.0, 80.0, 10.0, 90.0], 50)]
+    );
+}

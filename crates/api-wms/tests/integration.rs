@@ -511,16 +511,15 @@ const GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=rada
                           &FORMAT=image/png";
 
 /// `ELEVATION` against a layer with no vertical dimension
-/// (`raster_info().vertical` is `None`) is a 400 ServiceException.
+/// (`raster_info().vertical` is `None`) is a 400 ServiceException with
+/// Table E.1's `InvalidDimensionValue`, as `DIM_REFERENCE_TIME` on a
+/// layer without runs is (#1065).
 #[tokio::test]
 async fn elevation_against_non_vertical_layer_returns_400() {
     let app = build_populated_router();
-    let req = Request::builder()
-        .uri(format!("{GETMAP_URI}&ELEVATION=0.5"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let reply = fetch(&app, &format!("{GETMAP_URI}&ELEVATION=0.5")).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(exception_code(&reply.text()), "InvalidDimensionValue");
 }
 
 /// Regression for #145: the WMS GetMap ETag must be FNV-1a over the
@@ -5827,4 +5826,172 @@ async fn legend_urls_name_the_format_and_size_their_link_returns() {
             "{href} must return the advertised size"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The OGC test suite's second run (#1065)
+// ---------------------------------------------------------------------------
+
+/// The `code` of a ServiceExceptionReport's one ServiceException.
+fn exception_code(xml: &str) -> &str {
+    let code = xml
+        .split_once("<ServiceException code=\"")
+        .unwrap_or_else(|| panic!("no ServiceException: {xml}"))
+        .1;
+    &code[..code.find('"').unwrap()]
+}
+
+/// ets-wms13's `getmap:invalid-crs`: a CRS the server does not offer is
+/// WMS 1.3.0 Table E.1's `InvalidCRS`, not the `CRSNotDefined` it was.
+#[tokio::test]
+async fn getmap_with_an_unoffered_crs_is_invalid_crs() {
+    let app = build_populated_router();
+    for crs in ["UndefinedCRS", "EPSG:32635"] {
+        let uri = format!(
+            "/?StYlEs=&ReQuEsT=GetMap&HeIgHt=200&FoRmAt=image%2Fpng&BbOx=-1,-1,1,1\
+             &CrS={crs}&WiDtH=200&LaYeRs=radar&VeRsIoN=1.3.0"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(reply.content_type, "text/xml", "{uri}");
+        assert_eq!(exception_code(&reply.text()), "InvalidCRS", "{uri}");
+    }
+}
+
+/// GetMap renders one layer (`LayerLimit` 1), but a list naming a layer or
+/// style the server does not serve is answered with that error, as
+/// ets-wms13's `getmap:first-layer-invalid`, `second-layer-invalid`,
+/// `first-style-invalid` and `second-style-invalid` expect. A list of
+/// served layers is still refused, and STYLES must pair with LAYERS.
+#[tokio::test]
+async fn layer_lists_report_undefined_layers_and_styles_before_the_layer_limit() {
+    let app = build_populated_router();
+    for (layers, styles, code) in [
+        ("NonExistant,radar", "", "LayerNotDefined"),
+        ("radar,NonExistant", "", "LayerNotDefined"),
+        ("radar,radar", "UndefinedStyle,default", "StyleNotDefined"),
+        ("radar,radar", "default,UndefinedStyle", "StyleNotDefined"),
+        ("radar,radar", "", "InvalidParameterValue"),
+        ("radar,radar", ",", "InvalidParameterValue"),
+        ("radar,radar", "default,default", "InvalidParameterValue"),
+        ("radar,radar", "default", "InvalidParameterValue"),
+        ("radar,NonExistant", "a,b,c", "InvalidParameterValue"),
+    ] {
+        let uri = format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={layers}&STYLES={styles}\
+             &CRS=CRS:84&BBOX=-0.0025,-0.0025,0.0025,0.0025&WIDTH=100&HEIGHT=100\
+             &FORMAT=image/png"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(exception_code(&reply.text()), code, "{uri}");
+    }
+    // One layer keeps taking the whole STYLES value as its style.
+    let reply = fetch(
+        &app,
+        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=radar&STYLES=default,\
+         &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64&FORMAT=image/png",
+    )
+    .await;
+    assert_eq!(exception_code(&reply.text()), "StyleNotDefined");
+}
+
+/// A malformed ELEVATION is an invalid sample dimension value, like a
+/// malformed TIME: `InvalidDimensionValue` (Table E.1).
+#[tokio::test]
+async fn malformed_elevation_is_invalid_dimension_value() {
+    let app = build_populated_router();
+    for elevation in ["high", "1,2", "NaN"] {
+        let reply = fetch(&app, &format!("{GETMAP_URI}&STYLES=&ELEVATION={elevation}")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{elevation}");
+        assert_eq!(
+            exception_code(&reply.text()),
+            "InvalidDimensionValue",
+            "{elevation}"
+        );
+    }
+}
+
+/// Which rows of a decoded RGBA image have any visible pixel.
+fn visible_rows(pixels: &[[u8; 4]], width: usize) -> Vec<bool> {
+    pixels
+        .chunks(width)
+        .map(|row| row.iter().any(|p| p[3] != 0))
+        .collect()
+}
+
+/// WMS 1.3.0 §7.3.3.6: a geographic BBOX reaching past a pole has no
+/// content there. The engine here draws on every pixel it is asked for, as
+/// a grid's edge cell or a projected source's forward can past a pole (a
+/// global GRIB grid drew a row south of 90°S): only the rows inside the CRS
+/// may reach it. ets-wms13's `getmap:bbox-outside-crs` box, wholly past the
+/// north pole, is the empty image without an engine read.
+#[tokio::test]
+async fn geographic_getmap_past_a_pole_is_empty_there() {
+    use std::sync::atomic::Ordering;
+    let (app, _, calls) = build_counting_router(16);
+    let get_map = |crs: &str, bbox: &str| {
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=data&STYLES=\
+             &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=100&HEIGHT=100"
+        )
+    };
+
+    let reply = fetch(&app, &get_map("CRS:84", "-10,90,10,110")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.x_cache, "EMPTY");
+    assert!(png_pixels(&reply.body).iter().all(|p| p[3] == 0));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "engine asked past the pole"
+    );
+
+    let north_half: Vec<bool> = [[false; 50], [true; 50]].concat();
+    let south_half: Vec<bool> = [[true; 50], [false; 50]].concat();
+    for (crs, bbox, rows) in [
+        // Rows centred at 99.9°N … 80.1°N: the southern half is inside.
+        ("CRS:84", "-10,80,10,100", &north_half),
+        // The same box in EPSG:4326's latitude, longitude order.
+        ("EPSG:4326", "80,-10,100,10", &north_half),
+        ("CRS:84", "-10,-100,10,-80", &south_half),
+    ] {
+        let reply = fetch(&app, &get_map(crs, bbox)).await;
+        assert_eq!(reply.status, StatusCode::OK, "{crs} {bbox}");
+        assert_eq!(
+            &visible_rows(&png_pixels(&reply.body), 100),
+            rows,
+            "{crs} {bbox}"
+        );
+    }
+
+    // Opaque output paints the empty content in BGCOLOR: the whole image
+    // when the box is wholly past the pole, and only the cut rows of one
+    // reaching past it, the others drawn.
+    let background = [0x33, 0x66, 0x99, 0xff];
+    let opaque = |bbox: &str| {
+        format!(
+            "{}&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+            get_map("CRS:84", bbox)
+        )
+    };
+    let reply = fetch(&app, &opaque("-10,90,10,110")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.x_cache, "EMPTY");
+    assert!(png_pixels(&reply.body).iter().all(|p| *p == background));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        3,
+        "engine asked past the pole"
+    );
+
+    let reply = fetch(&app, &opaque("-10,80,10,100")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let pixels = png_pixels(&reply.body);
+    let (cut, inside) = pixels.split_at(50 * 100);
+    assert!(cut.iter().all(|p| *p == background), "rows past the pole");
+    assert!(
+        inside.iter().all(|p| p[3] == 0xff && *p != background),
+        "rows inside the CRS"
+    );
 }

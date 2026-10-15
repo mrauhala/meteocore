@@ -1611,7 +1611,8 @@ async fn render_map(
                     // (#507), in the plane order the spec reads.
                     let bands: Vec<&str> = spec.parameters.iter().map(String::as_str).collect();
                     let engine_start = std::time::Instant::now();
-                    let tiles = engine.get_raster_tiles(
+                    let Some(tiles) = ds_core::map_engine::get_raster_tiles_in_domain(
+                        engine.as_ref(),
                         bbox,
                         width,
                         height,
@@ -1620,7 +1621,10 @@ async fn render_map(
                         &bands,
                         render_z,
                         reference_time,
-                    )?;
+                    )?
+                    else {
+                        return Ok((None, phases));
+                    };
                     phases.add(RenderPhase::Engine, engine_start.elapsed());
                     let encode_start = std::time::Instant::now();
                     let bytes = ds_render::render_composite_tiles(&tiles, spec, format, None)?;
@@ -1631,8 +1635,12 @@ async fn render_map(
                 }
             };
 
+            // Only the rows inside the CRS: a geographic view reaching past a
+            // pole leaves those rows empty, and one wholly past it renders
+            // nothing (#1065).
             let engine_start = std::time::Instant::now();
-            let tile = engine.get_raster_tile(
+            let Some(tile) = ds_core::map_engine::get_raster_tile_in_domain(
+                engine.as_ref(),
                 bbox,
                 width,
                 height,
@@ -1644,7 +1652,10 @@ async fn render_map(
                 // same pixels as `None` by the engine contract, but survives a
                 // run swap mid-render without mixing runs in one response.
                 reference_time,
-            )?;
+            )?
+            else {
+                return Ok((None, phases));
+            };
             phases.add(RenderPhase::Engine, engine_start.elapsed());
             // If every pixel is nodata, skip colorization + encoding entirely.
             if tile.is_empty() {

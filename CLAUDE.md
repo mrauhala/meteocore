@@ -88,6 +88,11 @@ Violating these has caused production incidents. Never break them.
      requests legitimately reach past ±85°, and the client maps the returned
      image over the full requested extent.
    - Clamp to `LAT_LIMIT_DEG` only when selecting tile-grid indices.
+   - Geographic (`OutputCrs::Wgs84`) direct renders of a client-chosen bbox go
+     through `ds_core::map_engine::get_raster_tile_in_domain` /
+     `get_raster_tiles_in_domain`, which cut the output rows centred past ±90°
+     (nodata there) and never clamp. An engine asked for those rows samples its
+     edge cells instead (#1065).
 5. **Never project per output pixel in a render path.** The CRS forward
    transform dominates render cost; per-pixel projection was a ~10×
    regression (#203). Evaluate the projection on a coarse `ProjectionGrid`

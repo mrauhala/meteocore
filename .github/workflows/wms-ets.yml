@@ -114,13 +114,24 @@ jobs:
         run: cargo build --locked -p server
 
       # A debug build renders several times slower than release. The render
-      # deadline goes from 3 s to 30 s so that build speed cannot turn into
-      # 503s; the suite tests the protocol, not the deadline. The memory
-      # budget stays at its default. The pid file lets a later step check
-      # that the server outlived the run.
+      # deadline goes from 3 s to 60 s so that build speed cannot turn into
+      # 503s; the suite tests the protocol, not the deadline. Its largest
+      # map, getmap:large-size, is the advertised MaxWidth x MaxHeight,
+      # 8000 x 8000, which takes about 9 s in a local debug build.
+      #
+      # The render memory budget admits that map. Admission charges 32 B
+      # per output pixel against MC_RENDER_MEMORY_MB, whose 1024 MiB default
+      # admits 33 554 432 pixels and answers 64 M with a 503: the "Pixel
+      # budgets" table in the root CLAUDE.md. 64 000 000 x 32 B is
+      # 1953 MiB, so 2560 MiB leaves headroom. Production sizes its own
+      # budget.
+      #
+      # The pid file lets a later step check that the server outlived the
+      # run.
       - name: Start the server on the fixture config
         env:
-          MC_RENDER_TIMEOUT_MS: 30000
+          MC_RENDER_TIMEOUT_MS: 60000
+          MC_RENDER_MEMORY_MB: 2560
         run: |
           mkdir -p ets-report
           target/debug/server --config ci/wms-ets/config.toml > ets-report/server.log 2>&1 &

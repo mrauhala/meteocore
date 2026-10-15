@@ -29,6 +29,8 @@ pub const MAX_MAP_DIMENSION: u32 = 8000;
 /// Most layers one GetMap may name in `LAYERS`, advertised as the
 /// `<Service>`'s `<LayerLimit>`. GetMap renders exactly one layer — it reads
 /// only the first name — so raise this only together with layer composition.
+/// The handler refuses more only after checking every named layer and
+/// style, so an undefined one is `LayerNotDefined` / `StyleNotDefined`.
 pub const LAYER_LIMIT: usize = 1;
 
 /// Supported CRS identifiers.
@@ -162,8 +164,16 @@ impl<'de> Deserialize<'de> for WmsQuery {
 
 /// Validated GetMap parameters.
 pub struct GetMapParams {
+    /// The first `LAYERS` name: the layer GetMap renders.
     pub layer: String,
+    /// Its style, `default` for an empty `STYLES` value.
     pub style: String,
+    /// The further `(layer, style)` pairs of a request naming several layers,
+    /// in `LAYERS` order. GetMap renders one layer ([`LAYER_LIMIT`]): the
+    /// handler checks each pair names a layer and style it serves, so an
+    /// undefined one gets its WMS 1.3.0 Table E.1 code, then refuses the
+    /// request.
+    pub other_layers: Vec<(String, String)>,
     pub crs: String,
     /// Bbox in WGS84 [west, south, east, north], normalized from CRS axis order.
     pub bbox: [f64; 4],
@@ -263,19 +273,42 @@ impl WmsQuery {
             )));
         }
 
-        // LAYERS — exactly one layer (`LAYER_LIMIT`; `split` yields at
-        // least one name, so only too many can fail here).
+        // LAYERS and STYLES. `split` yields at least one name. More layers
+        // than `LAYER_LIMIT` are refused by the handler, once it has checked
+        // that each names a layer and style it serves.
         let layers_str = self
             .layers
             .as_deref()
             .ok_or(WmsError::missing_parameter("LAYERS"))?;
         let layers: Vec<&str> = layers_str.split(',').collect();
-        if layers.len() > LAYER_LIMIT {
-            return Err(WmsError::invalid_parameter(
-                "Exactly one LAYERS value is supported",
-            ));
+        let styles_str = self
+            .styles
+            .as_deref()
+            .or(self.style.as_deref())
+            .unwrap_or("");
+        // One layer takes the whole STYLES value as its style, as it always
+        // has. Several pair with STYLES' values one to one (WMS 1.3.0
+        // §7.3.3.4); an empty STYLES gives each its default.
+        let styles: Vec<&str> = if layers.len() == 1 || styles_str.is_empty() {
+            vec![styles_str; layers.len()]
+        } else {
+            styles_str.split(',').collect()
+        };
+        if styles.len() != layers.len() {
+            return Err(WmsError::invalid_parameter(&format!(
+                "STYLES has {} values for {} LAYERS: give one per layer, or leave STYLES \
+                 empty for every layer's default",
+                styles.len(),
+                layers.len()
+            )));
         }
-        let layer = layers[0].to_string();
+        // An empty style is the layer's default.
+        let mut pairs = layers.iter().zip(&styles).map(|(&layer, &style)| {
+            let style = if style.is_empty() { "default" } else { style };
+            (layer.to_string(), style.to_string())
+        });
+        let (layer, style) = pairs.next().expect("split yields at least one layer");
+        let other_layers: Vec<(String, String)> = pairs.collect();
 
         // CRS
         let crs = self
@@ -351,7 +384,9 @@ impl WmsQuery {
 
         // ELEVATION — a single vertical level. WMS 1.3.0 permits a
         // comma-separated list, but this server renders one layer per
-        // request, so a list is rejected with an explicit message.
+        // request, so a list is rejected with an explicit message. Like a
+        // malformed TIME, a value that is no single level is an invalid
+        // sample dimension value: `InvalidDimensionValue` (Table E.1).
         let elevation = match self
             .elevation
             .as_deref()
@@ -359,8 +394,9 @@ impl WmsQuery {
             .filter(|s| !s.is_empty())
         {
             Some(raw) if raw.contains(',') => {
-                return Err(WmsError::invalid_parameter(
-                    "ELEVATION must be a single value; comma-separated lists are not supported",
+                return Err(WmsError::InvalidDimensionValue(
+                    "ELEVATION must be a single value; comma-separated lists are not supported"
+                        .to_string(),
                 ));
             }
             Some(raw) => Some(
@@ -368,7 +404,7 @@ impl WmsQuery {
                     .ok()
                     .filter(|v| v.is_finite())
                     .ok_or_else(|| {
-                        WmsError::invalid_parameter(&format!(
+                        WmsError::InvalidDimensionValue(format!(
                             "ELEVATION '{raw}' is not a finite number"
                         ))
                     })?,
@@ -387,21 +423,10 @@ impl WmsQuery {
             .map(parse_reference_time)
             .transpose()?;
 
-        // STYLES — empty string or missing = "default"
-        let style = self
-            .styles
-            .as_deref()
-            .or(self.style.as_deref())
-            .unwrap_or("");
-        let style = if style.is_empty() {
-            "default".to_string()
-        } else {
-            style.to_string()
-        };
-
         Ok(GetMapParams {
             layer,
             style,
+            other_layers,
             crs,
             bbox,
             width,
