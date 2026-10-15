@@ -74,15 +74,22 @@ const DEFAULT_CELL_SET_CACHE_MB: u64 = 64;
 type CellSetKey = (Arc<str>, Arc<str>, [usize; 3], (u64, u64, u64));
 
 /// Approximate resident bytes of a cached [`CellSet`]: the struct itself,
-/// per-cell fixed fields, and each footprint ring's vertices — the term that
+/// the cell array, and each footprint ring's vertices — the term that
 /// actually varies (everything else is a few hundred bytes).
+///
+/// Both `Vec`s are weighed by **capacity**, not length (#1052): the cell
+/// array grows by `push`, and `ds_core::cells::footprint_ring` closes each
+/// exact-size ring with one more `push`, which roughly doubles its
+/// allocation. Counting the length would leave that slack outside the
+/// cache budget.
 fn cell_set_weight_bytes(key: &CellSetKey, set: &Arc<CellSet>) -> u64 {
-    let cells: u64 = set
+    let footprints: usize = set
         .cells
         .iter()
-        .map(|c| (std::mem::size_of_val(c) + c.footprint.len() * 16) as u64)
+        .map(|c| c.footprint.capacity() * std::mem::size_of::<[f64; 2]>())
         .sum();
-    cells + (std::mem::size_of::<CellSet>() + key.0.len() + key.1.len() + 64) as u64
+    let cells = set.cells.capacity() * std::mem::size_of::<ds_core::cells::StormCell>();
+    (cells + footprints + std::mem::size_of::<CellSet>() + key.0.len() + key.1.len() + 64) as u64
 }
 
 /// Process-global memo of per-volume segmentations, shared across every PVOL
@@ -505,5 +512,83 @@ mod tests {
             0,
             "a one-point track has no trajectory to draw"
         );
+    }
+
+    /// Heap bytes a cached [`CellSet`] actually holds: the cell array and
+    /// every footprint ring, at their allocated capacity.
+    fn cell_set_allocation(set: &CellSet) -> usize {
+        set.cells.capacity() * std::mem::size_of::<StormCell>()
+            + set
+                .cells
+                .iter()
+                .map(|c| c.footprint.capacity() * std::mem::size_of::<[f64; 2]>())
+                .sum::<usize>()
+    }
+
+    /// #1052: the cell-set cache weight must cover the allocation an entry
+    /// holds, not just its length. Real segmentation output grows its cell
+    /// array by `push` and closes each footprint ring with a `push` onto an
+    /// exact-size `Vec`, so both carry slack.
+    #[test]
+    fn cell_set_weight_covers_its_allocation() {
+        let key: CellSetKey = (
+            Arc::from("src|vol.h5"),
+            Arc::from("DBZH"),
+            [20, 36, 10],
+            (0, 0, 0),
+        );
+
+        // Real segmentation output: one 45 dBZ blob.
+        let (n_r, n_a, n_h) = (20, 36, 10);
+        let mut values = vec![f32::NAN; n_r * n_a * n_h];
+        for i_r in 4..8 {
+            for i_a in 9..12 {
+                for i_h in 2..6 {
+                    values[(i_r * n_a + i_a) * n_h + i_h] = 45.0;
+                }
+            }
+        }
+        let grid = ds_core::volume::VoxelGrid {
+            origin_lon: 24.5,
+            origin_lat: 60.5,
+            origin_height: 100.0,
+            dims: [n_r, n_a, n_h],
+            radius_range: [0.0, 100_000.0],
+            angle_range: [0.0, std::f64::consts::TAU],
+            height_range: [0.0, 10_000.0],
+            values,
+            quantity: "DBZH".into(),
+            unit: "dBZ".into(),
+        };
+        let opts = ds_core::cells::CellExtractionOptions {
+            threshold: 35.0,
+            min_volume_km3: 0.0,
+            max_cells: 256,
+        };
+        let extracted = Arc::new(extract_cells(&grid, t(0), &opts));
+        assert_eq!(extracted.cells.len(), 1, "the blob segments as one cell");
+
+        // Spare capacity made explicit, so the footprint term is pinned on
+        // its own whatever `ds_core::cells` happens to reserve.
+        let mut spare = cell(1, 25.0, 60.0);
+        spare.footprint.reserve_exact(64);
+        let mut cells = Vec::with_capacity(8);
+        cells.push(spare);
+        let spare = Arc::new(CellSet {
+            time: t(0),
+            quantity: "DBZH".into(),
+            threshold: 35.0,
+            origin: [25.0, 60.0, 100.0],
+            cells,
+        });
+
+        for set in [&extracted, &spare] {
+            let weight = cell_set_weight_bytes(&key, set);
+            let allocated = cell_set_allocation(set) as u64;
+            assert!(
+                weight >= allocated,
+                "weight {weight} B under-counts a {allocated} B allocation"
+            );
+        }
     }
 }
