@@ -162,6 +162,18 @@ these headers, the proxy strips `Forwarded`/`X-Forwarded-*` on untrusted
 client requests, and clients cannot reach the backend directly — otherwise a
 client could spoof the emitted self-links (open-redirect risk downstream).
 
+## Request log (`request_logging_middleware`)
+
+One INFO `request` line per HTTP request (`admin::request_logging_middleware`;
+fields listed in its doc comment and the README's Structured Logging section).
+`user_agent` and `referer` (#995) are client-controlled: each is decoded
+lossily, cut to `MAX_LOGGED_HEADER_LEN` (256) bytes on a char boundary, and
+logged as `""` when absent, like `query`. The referer drops everything from
+the first `?` or `#`, since the query and fragment can carry tokens. Both stay
+log-body fields: `docker/alloy/config.alloy` must never promote them to Loki
+labels (unbounded cardinality). The client IP is deliberately not logged
+pending a privacy decision (#995).
+
 ## Render admission and deadlines
 
 `ds-executor` owns process-wide render slots and the waiting queue, preserved

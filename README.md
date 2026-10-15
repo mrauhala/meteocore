@@ -2153,7 +2153,9 @@ Replace `tile_` with `rendered_` or `grid_` for the other two caches. Drop the o
 
 ### Structured Logging
 
-The server emits one structured log line per HTTP request with the fields needed to diagnose slow queries and correlate them with client-side errors: `request_id`, `method`, `path`, `route`, `api`, `collection`, `query_type`, `query`, `status`, `duration_ms`, `result_size`.
+The server emits one structured log line per HTTP request with the fields needed to diagnose slow queries and correlate them with client-side errors: `request_id`, `method`, `path`, `route`, `api`, `collection`, `query_type`, `query`, `user_agent`, `referer`, `status`, `duration_ms`, `result_size`.
+
+`user_agent` and `referer` identify where traffic comes from. Both are client-controlled, so each is cut to 256 bytes on a character boundary, and the referer is logged without its query string and fragment, which can carry tokens of the referring page. A request without the header logs an empty string, as `query` does. The client IP is not logged.
 
 Two log formats are supported, selected via the `LOG_FORMAT` environment variable:
 
@@ -2204,7 +2206,7 @@ API operations read-only. Only run this stack with trusted local users.
 
 Tear down including volumes: `docker compose down -v`.
 
-Alloy promotes a bounded set of labels to Loki: `level`, `api`, `query_type`, `status_class` (`2xx` / `4xx` / `5xx`). High-cardinality fields like `collection`, `path`, `request_id`, and the raw query string stay in the log body and are queryable via `| json` in LogQL — this keeps Loki's index bounded as the number of collections grows.
+Alloy promotes a bounded set of labels to Loki: `level`, `api`, `query_type`, `status_class` (`2xx` / `4xx` / `5xx`). High-cardinality fields like `collection`, `path`, `request_id`, the raw query string, `user_agent` and `referer` stay in the log body and are queryable via `| json` in LogQL — this keeps Loki's index bounded as the number of collections grows.
 
 The bundled Grafana dashboard at `docker/grafana/dashboards/meteocore-overview.json` has a **Logs** row with four Loki-backed panels: request rate by `(api, query_type)`, error rate by `status_class`, live request stream, and a dedicated 4xx/5xx stream. All panels work with the Prometheus and Loki datasources that are auto-provisioned from `docker/grafana/provisioning/`.
 
