@@ -1,0 +1,103 @@
+# Fixture server for the OGC WMS 1.3.0 executable test suite (ets-wms13),
+# started by .github/workflows/wms-ets.yml (#1065). Run from the repository
+# root:
+#
+#   cargo run -p server -- --config ci/wms-ets/config.toml
+#
+# Every data_path is a fixture committed to the repository: CI checks out
+# nothing else, and most testdata/ directories are untracked. Check with
+# `git ls-files testdata/<dir>` before pointing a collection at a new one.
+#
+# The collections cover the WMS layer shapes the suite should see:
+#
+# - ets-geotiff:        a plain raster, one GeoTIFF on a projected
+#                       (EPSG:3067) grid; its time axis has one value.
+# - ets-radar:          a time axis, five 5-minute radar frames.
+# - ets-grib-pressure:  an elevation axis (GRIB pressure levels) and a
+#                       model-run axis (`reference_time`). The committed
+#                       fixture holds one level (150 hPa) of one run, so
+#                       both axes have a single value.
+# - ets-arpege:         a multi-parameter GRIB forecast: a parent layer
+#                       with one child layer per parameter, a model-run axis
+#                       of one run, and an <Attribution>.
+#
+# No committed fixture has several model runs or several pressure levels.
+
+[server]
+# The suite's container shares the runner's network (`--network host`), so
+# the capabilities' OnlineResource, http://127.0.0.1:8000/wms, is reachable
+# from it unchanged.
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "ets-geotiff"
+title = "Plain raster (GeoTIFF, EPSG:3067)"
+description = "One radar reflectivity GeoTIFF on the ETRS-TM35FIN grid"
+data_path = "testdata/radar-tm35fin"
+engine_type = "geotiff"
+apis = ["wms"]
+
+[collections.geotiff]
+filename_template = "radar_tm35_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 3600
+
+[collections.wms]
+colormap = "radar_dbz"
+
+[[collections]]
+id = "ets-radar"
+title = "Time axis (radar series)"
+description = "Five radar reflectivity frames five minutes apart"
+data_path = "testdata/radar"
+engine_type = "geotiff"
+apis = ["wms"]
+keywords = ["radar", "reflectivity"]
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 3600
+
+[collections.wms]
+colormap = "radar_dbz"
+
+[[collections]]
+# Registered as `ets-grib-pressure`: level_types expands the source into
+# one collection per level family present.
+id = "ets-grib"
+title = "Elevation axis (GRIB pressure levels)"
+description = "Specific humidity at 150 hPa from one forecast run"
+engine_type = "grib"
+apis = ["wms"]
+
+[collections.grib]
+data_path = "testdata/grib-local"
+level_types = ["pressure"]
+poll_interval_secs = 3600
+
+[collections.wms]
+colormap = "viridis"
+
+[[collections]]
+id = "ets-arpege"
+title = "Multi-parameter forecast (GRIB)"
+description = "ARPEGE 10 m wind components, speed and direction from one run"
+engine_type = "grib"
+apis = ["wms"]
+
+[collections.license]
+title = "Licence Ouverte / Open Licence Etalab 2.0"
+url = "https://www.etalab.gouv.fr/licence-ouverte-open-licence/"
+
+[collections.grib]
+data_path = "testdata/grib-arpege-wind"
+poll_interval_secs = 3600
+
+# Each parameter layer takes its built-in default style (wind speed,
+# direction, components); this is the collection-level fallback.
+[collections.wms]
+colormap = "wind_speed"
