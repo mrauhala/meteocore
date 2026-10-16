@@ -220,15 +220,23 @@ impl OutputCrs {
     /// centres lie inside this output CRS's domain, with the WGS84 box those
     /// rows span; `None` when no row does.
     ///
-    /// Only geographic output can be asked for positions outside its CRS:
-    /// CRS:84 and EPSG:4326 define latitude on [-90°, 90°], and a request box
-    /// may reach past a pole. WMS 1.3.0 §7.3.3.6 wants empty content there,
-    /// but an engine sampling such a row can draw: a grid's edge cell extends
-    /// past a pole, and a projected source's forward maps latitude 95° to 85°
-    /// on the far meridian (#1065). Latitude falls row by row, so the rows
-    /// inside form one run. Every other variant answers all rows: Web Mercator
-    /// latitudes stay inside (−90°, 90°), and a projected output's
-    /// out-of-domain pixels are already non-finite in [`Self::project_node`].
+    /// Geographic output is cut row by row: CRS:84 and EPSG:4326 define
+    /// latitude on [-90°, 90°], and a request box may reach past a pole.
+    /// WMS 1.3.0 §7.3.3.6 wants empty content there, but an engine sampling
+    /// such a row can draw: a grid's edge cell extends past a pole, and a
+    /// projected source's forward maps latitude 95° to 85° on the far
+    /// meridian (#1065). Latitude falls row by row, so the rows inside form
+    /// one run.
+    ///
+    /// Web Mercator answers all rows: its latitudes stay inside (−90°, 90°).
+    /// So does a projected output, except when its box lies wholly outside
+    /// the projection's valid area
+    /// ([`crate::geo::outside_projection_domain`]): then no pixel maps to the
+    /// Earth, and the answer is `None` (#1089). That test reads the projected
+    /// box only, so `wgs84_bbox` may be anything for such a box, which has no
+    /// meaningful WGS84 envelope. In a box partly outside, the pixels past
+    /// the LAEA disk are non-finite in [`Self::project_node`] and stay empty;
+    /// those past TM's strip are not, since its inverse is finite there.
     ///
     /// The box is the request box cut at the outer edges of the first and
     /// last row, so a render of it at `rows.len()` rows samples the full
@@ -239,6 +247,11 @@ impl OutputCrs {
     pub fn domain_rows(&self, wgs84_bbox: [f64; 4], height: u32) -> Option<DomainRows> {
         if height == 0 {
             return None;
+        }
+        if let OutputCrs::Projected { crs, bbox } = self {
+            if crate::geo::outside_projection_domain(crs, *bbox) {
+                return None;
+            }
         }
         let [west, south, east, north] = wgs84_bbox;
         let geographic = (-90.0..=90.0).contains(&south) && (-90.0..=90.0).contains(&north);
@@ -1011,7 +1024,8 @@ pub fn default_request_time(
 /// the others stay nodata, the empty content WMS 1.3.0 §7.3.3.6 wants
 /// outside a CRS's range. `Ok(None)` when no row is inside: there is nothing
 /// to draw, and the engine is not called. The API layers' direct renders go
-/// through this, so no engine is asked for a latitude past a pole (#1065).
+/// through this, so no engine is asked for a latitude past a pole (#1065)
+/// or for a projected box wholly outside its projection (#1089).
 #[allow(clippy::too_many_arguments)] // mirrors get_raster_tile
 pub fn get_raster_tile_in_domain(
     engine: &dyn MapEngine,
@@ -1657,6 +1671,54 @@ mod tests {
         }
     }
 
+    /// A projected box wholly outside its projection's valid area has no row
+    /// inside (#1089): an EPSG:3035 box past the LAEA disk, an EPSG:3067 one
+    /// past the strip TM maps the Earth into, north or south, or so far east
+    /// that the TM inverse has no finite result. A box reaching into the
+    /// area, or enclosing it, keeps every row.
+    #[test]
+    fn domain_rows_of_a_projected_box_outside_its_projection_are_none() {
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        // The WGS84 box does not enter the test; such a box has none.
+        let wgs84 = [0.0; 4];
+        let projected = |crs: &Crs, bbox| OutputCrs::Projected {
+            crs: crs.clone(),
+            bbox,
+        };
+        for (crs, bbox) in [
+            (&laea, [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
+            (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
+            (&tm, [1.0e20, 6.5e6, 2.0e20, 7.0e6]),
+        ] {
+            assert_eq!(
+                projected(crs, bbox).domain_rows(wgs84, 64),
+                None,
+                "{bbox:?}"
+            );
+        }
+        for (crs, bbox) in [
+            (&laea, [4.0e6, 3.0e6, 4.5e6, 3.5e6]),
+            // Across the disk's rim.
+            (&laea, [1.6e7, 2.2e6, 1.8e7, 4.2e6]),
+            // Wider than the disk.
+            (&laea, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]),
+            (&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6]),
+            // Across the TM strip's edge.
+            (&tm, [0.0, 1.9e7, 1.0e6, 2.1e7]),
+        ] {
+            assert_eq!(
+                projected(crs, bbox).domain_rows(wgs84, 64),
+                Some(DomainRows {
+                    rows: 0..64,
+                    bbox: wgs84
+                }),
+                "{bbox:?}"
+            );
+        }
+    }
+
     /// Placing a tile's rows in a taller tile keeps every pixel's value and
     /// makes the added rows nodata, for every `RasterValues` variant.
     #[test]
@@ -1763,6 +1825,21 @@ mod tests {
 
         assert!(render([-10.0, 90.0, 10.0, 110.0]).is_none());
         assert!(engine.0.lock().unwrap().is_empty(), "engine called");
+        // Nor for a projected box wholly outside its projection (#1089): past
+        // the LAEA disk, or past TM's strip, where the inverse still gives
+        // TM a finite read window.
+        for (code, bbox) in [
+            ("EPSG:3035", [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            ("EPSG:3067", [0.0, 2.1e7, 1.0e6, 2.2e7]),
+        ] {
+            let crs = projected_output_crs(code).unwrap();
+            let read = crate::geo::wgs84_envelope(&crs, bbox).unwrap_or([0.0; 4]);
+            let outside = OutputCrs::Projected { crs, bbox };
+            let tile =
+                get_raster_tile_in_domain(&engine, read, 4, 10, None, &outside, None, None, None);
+            assert!(tile.unwrap().is_none(), "{code}");
+            assert!(engine.0.lock().unwrap().is_empty(), "{code}: engine called");
+        }
 
         let tile = render([-10.0, 80.0, 10.0, 100.0]).unwrap();
         assert_eq!((tile.width, tile.height), (4, 10));

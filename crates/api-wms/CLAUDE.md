@@ -84,6 +84,24 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   (§7.3.3.6, #1065). The helpers ask the engine only for the rows whose
   centres lie inside ±90°, and nothing for a BBOX wholly past a pole (the
   empty image). Engines need no guard of their own; Maps does the same.
+- A view with no row inside its CRS is the empty image before either path
+  runs: `OutputCrs::domain_rows` is `None` (#1089). Besides a geographic
+  BBOX wholly past a pole, that is an EPSG:3067/3035 BBOX wholly outside
+  the projection's valid area (`ds_core::geo::outside_projection_domain`).
+  The check must precede meta-tiling, whose tiles reach past the view and
+  call the engine directly: a box just past the LAEA disk has covering
+  tiles that cross it.
+- `params::parse_bbox` asks `outside_projection_domain` before
+  `wgs84_envelope`, which samples only the box's edges. Wholly outside is
+  the empty image, with read window `NO_READ_WINDOW` (NaN, never read). An
+  envelope of `None` for any other box means the edges miss a valid area
+  inside it: an EPSG:3035 box wider than the disk, or a tall one crossing
+  it between samples. That stays `InvalidParameterValue`: there is no read
+  window, and a global one would read whole datasets. Malformed boxes are
+  rejected before either. An envelope of `Some` does not mean inside:
+  TM's inverse is finite past its strip, |N| > 19 995 930 m for
+  EPSG:3067. So `outside_projection_domain` tests that strip itself, and in
+  a box partly past it those pixels still reach the engine.
 
 ## Rendered-image cache (#1010)
 

@@ -92,7 +92,9 @@ Violating these has caused production incidents. Never break them.
      through `ds_core::map_engine::get_raster_tile_in_domain` /
      `get_raster_tiles_in_domain`, which cut the output rows centred past ±90°
      (nodata there) and never clamp. An engine asked for those rows samples its
-     edge cells instead (#1065).
+     edge cells instead (#1065). For a projected box wholly outside its
+     projection (`ds_core::geo::outside_projection_domain`) they return
+     `None` without calling the engine (#1089).
 5. **Never project per output pixel in a render path.** The CRS forward
    transform dominates render cost; per-pixel projection was a ~10×
    regression (#203). Evaluate the projection on a coarse `ProjectionGrid`

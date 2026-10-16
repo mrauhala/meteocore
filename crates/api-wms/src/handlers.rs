@@ -668,6 +668,15 @@ pub async fn wms_handler(
                         if matches!(paint, Paint::Composite(_)) && time.is_none() {
                             return Ok((None, RenderPath::Direct(RenderPhases::default())));
                         }
+                        // A view wholly outside its CRS, past a pole or a
+                        // projected box outside the projection, is the empty
+                        // image without an engine read (WMS 1.3.0 §7.3.3.6).
+                        // Checked before either path: the meta-tile path asks
+                        // the engine per tile, not through the domain helpers,
+                        // and its tiles reach past the view (#1089).
+                        if output_crs.domain_rows(bbox, height).is_none() {
+                            return Ok((None, RenderPath::Direct(RenderPhases::default())));
+                        }
 
                         // Direct single-shot render: one get_raster_tile →
                         // colorize → encode, or a composite's bands → compose →
