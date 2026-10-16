@@ -10,10 +10,10 @@ Raster admission reserves memory before CPU, sharing one absolute deadline.
 RGB composite's bands) 16 B per output pixel per plane past the first
 (`budget::raster_bytes`); `acquire_raster` is its one-plane case.
 No CPU slot is held while waiting for memory. CPU permits belong to workers,
-never HTTP futures awaiting a running worker. The handler and worker each hold
-an `Arc<RenderPermit>`: the worker's clone survives HTTP cancellation, while
-the handler's clone covers any empty/error image encoding after the worker
-returns. A timeout cannot release a running worker's permit. Abort handles may
+never HTTP futures awaiting a running worker. The raster handlers move the
+`Arc<RenderPermit>` into the job, so it survives HTTP cancellation; the job
+also encodes the empty and error images (#1093), so nothing is encoded after
+the worker returns. A timeout cannot release a running worker's permit. Abort handles may
 cancel pending blocking jobs but cannot preempt running CPU work. Keep tests for overload, canceled
 waiters, deadline expiry, and worker permit ownership.
 

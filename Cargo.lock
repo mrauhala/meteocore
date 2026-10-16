@@ -1303,7 +1303,6 @@ dependencies = [
  "ds-core",
  "jpeg-encoder",
  "png",
- "quick_cache 0.6.24",
  "serde_json",
  "toml",
  "webp",

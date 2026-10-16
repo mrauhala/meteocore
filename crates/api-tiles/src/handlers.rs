@@ -14,6 +14,7 @@ use api_common::subset::{self, RequestedTime, TimeSelection};
 use api_common::workbench::Surface;
 use api_common::{rel, Mount};
 use ds_core::config::CollectionConfig;
+use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, RasterInfo};
@@ -22,7 +23,7 @@ use ds_mvt::{
     encode_tile, properties_hash, CachedTile, PropertyAllowlist, TileEncodeOptions, TmsKind,
     VectorTileCache, VectorTileKey,
 };
-use ds_render::{CacheKey, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
+use ds_render::{CacheKey, CachedRendered, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
 
 use crate::error::TilesError;
 use crate::params::{self, LegendFormat, LegendQueryParams, TileQueryParams};
@@ -2291,6 +2292,42 @@ pub async fn get_styled_tile(
     .await
 }
 
+/// A map tile render's outcome: the encoded image, `None` for an all-nodata
+/// tile, and the phases it ran.
+type Rendered = Result<(Option<Vec<u8>>, RenderPhases), DataServerError>;
+
+/// What a map tile render job hands back: the image to serve, already
+/// encoded on the render worker that held the CPU slot (#1093), never on the
+/// async request worker after it.
+enum Finished {
+    /// A populated tile, served `MISS` and inserted in the rendered cache.
+    Image(CachedRendered),
+    /// An all-nodata tile, served `EMPTY`: its memoized empty image, or the
+    /// encoder's error.
+    Empty(Result<CachedRendered, DataServerError>),
+}
+
+/// The work a map tile's `RenderJob` runs: `render`, then the image it
+/// serves, on the same blocking worker, which holds the output-memory
+/// reservation `memory` until both are done. An all-nodata tile takes
+/// `empty`'s image, so a memo miss encodes it there too, like every
+/// populated tile (#1093).
+fn render_job(
+    memory: Arc<ds_executor::budget::RenderPermit>,
+    empty: impl FnOnce() -> Result<CachedRendered, DataServerError> + Send + 'static,
+    render: impl FnOnce() -> Rendered + Send + 'static,
+) -> impl FnOnce() -> Result<(Finished, RenderPhases), DataServerError> + Send + 'static {
+    move || {
+        let _memory = memory;
+        let (bytes, phases) = render()?;
+        let finished = match bytes {
+            Some(bytes) => Finished::Image(CachedRendered::new(bytes::Bytes::from(bytes))),
+            None => Finished::Empty(empty()),
+        };
+        Ok((finished, phases))
+    }
+}
+
 /// Shared tile rendering logic. `subsets` are the `subset` values in request
 /// order.
 #[allow(clippy::too_many_arguments)]
@@ -2601,7 +2638,6 @@ async fn render_tile(
     )
     .await
     .map_err(TilesError::from)?;
-    let worker_memory = memory_permit.clone();
     // Where the render's time goes (#147): admission here, the engine read
     // and encode in the worker.
     let mut phases = RenderPhases::default();
@@ -2616,9 +2652,24 @@ async fn render_tile(
     let render_parameter = effective_parameter;
     let render_z = validated.z;
 
+    // An all-nodata tile's image, in the requested format at its quality
+    // like a populated tile (#1091). A default-size PNG reuses the global
+    // `EMPTY_TILE_CACHED`, so its FNV-1a hash is computed once per process
+    // instead of per request; another format, or a tile the Scaling
+    // parameters sized, gets an empty image of its own format and size from
+    // the same shared memo. The job finishes it too (#1093), so the request
+    // worker only reads the result.
+    let empty = move || {
+        if format == ds_render::ImageFormat::Png
+            && (width, height) == (params::TILE_SIZE, params::TILE_SIZE)
+        {
+            Ok(EMPTY_TILE_CACHED.clone())
+        } else {
+            ds_render::empty_tile(width, height, format)
+        }
+    };
     let render_result = job
-        .run(move || {
-            let _memory_permit = worker_memory;
+        .run(render_job(memory_permit, empty, move || {
             let mut phases = phases;
 
             let colormap = match &paint {
@@ -2677,12 +2728,12 @@ async fn render_tile(
             let encode_start = std::time::Instant::now();
             let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
             phases.add(RenderPhase::Encode, encode_start.elapsed());
-            Ok::<_, ds_core::error::DataServerError>((Some(bytes), phases))
-        })
+            Ok((Some(bytes), phases))
+        }))
         .await
         .map_err(TilesError::from)?;
 
-    let (maybe_bytes, phases) = render_result.map_err(|e| {
+    let (finished, phases) = render_result.map_err(|e| {
         use ds_core::error::DataServerError as DSE;
         // A client mistake (multi-parameter collection rendered without a
         // parameter, bad bbox/datetime) is a 400 with the engine's message,
@@ -2723,33 +2774,23 @@ async fn render_tile(
     })?;
 
     // Empty tiles return a memoized empty image in the requested format
-    // without caching; populated tiles get cached. Wrap both in
-    // `CachedRendered` so the response ETag is FNV-1a over the actual
+    // without caching; populated tiles get cached. Both are a
+    // `CachedRendered`, so the response ETag is FNV-1a over the actual
     // bytes — different pixels produce different ETags (#145). The empty
     // image is encoded in the requested format at its quality like a
     // populated tile (#1091), so the Content-Type is the requested one on
-    // every exit and never lies about the payload (#162). A default-size
-    // PNG reuses the global `EMPTY_TILE_CACHED`, so its FNV-1a hash is
-    // computed once per process instead of per request.
-    // Each arm produces a `CachedRendered` ready to serve. Only the
-    // populated `Some(_)` path inserts into the rendered cache; the
-    // EMPTY fast-path intentionally doesn't (the shared empty-tile cache
-    // already serves the deterministic empty response).
-    let (cached, x_cache) = match maybe_bytes {
-        None if format == ds_render::ImageFormat::Png
-            && (width, height) == (params::TILE_SIZE, params::TILE_SIZE) =>
-        {
-            (EMPTY_TILE_CACHED.clone(), "EMPTY")
-        }
-        // Another format, or a tile the Scaling parameters sized, gets an
-        // empty image of its own format and size from the same shared memo.
-        None => {
-            let empty = ds_render::empty_tile(width, height, format)
+    // every exit and never lies about the payload (#162). The job finished
+    // both (`render_job`, #1093); this only labels them. Only the populated
+    // tile inserts into the rendered cache; the EMPTY fast-path
+    // intentionally doesn't (the shared empty-tile cache already serves the
+    // deterministic empty response).
+    let (cached, x_cache) = match finished {
+        Finished::Empty(tile) => {
+            let empty = tile
                 .map_err(|e| TilesError::Internal(format!("Failed to encode empty tile: {e}")))?;
             (empty, "EMPTY")
         }
-        Some(bytes) => {
-            let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+        Finished::Image(cached) => {
             rendered_cache.insert(cache_key, cached.clone());
             (cached, "MISS")
         }
