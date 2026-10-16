@@ -21,13 +21,13 @@ use ds_core::model::*;
 struct MockEngine;
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "helsinki".to_string(),
             label: "Helsinki".to_string(),
             latitude: 60.1699,
             longitude: 24.9384,
-        }])
+        }])))
     }
 
     fn query_location(
@@ -622,7 +622,7 @@ struct FailingEngine;
 const INTERNAL_DETAIL: &str = "connection refused at 10.0.0.5:5432";
 
 impl EdrEngine for FailingEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         Err(DataServerError::Engine(INTERNAL_DETAIL.into()))
     }
 

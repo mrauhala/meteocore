@@ -18,6 +18,9 @@ pub struct CsvEngine {
     /// Immutable station inventory in first-observation order. Observation
     /// history must not be scanned or turned into Features on each page request.
     stations: Vec<Feature>,
+    /// The EDR location inventory in first-observation order, built once:
+    /// `get_locations` hands every request this `Arc` (#1083).
+    locations: Arc<LocationSnapshot>,
     /// First and last observation time, computed once: the Features
     /// temporal extent is read per request (Critical Rule 10).
     time_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -41,9 +44,11 @@ impl CsvEngine {
             .map(|row| row.time)
             .min()
             .zip(store.rows.iter().map(|row| row.time).max());
+        let locations = Arc::new(LocationSnapshot::new(inventory(&store)));
         Self {
             store,
             stations,
+            locations,
             time_extent,
         }
     }
@@ -202,24 +207,8 @@ impl CsvEngine {
 }
 
 impl EdrEngine for CsvEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        let mut locations = Vec::new();
-        let mut seen = HashMap::new();
-
-        for row in &self.store.rows {
-            if seen.contains_key(&row.location) {
-                continue;
-            }
-            seen.insert(&row.location, true);
-            locations.push(Location {
-                id: row.location.clone(),
-                label: row.location.clone(),
-                latitude: row.latitude,
-                longitude: row.longitude,
-            });
-        }
-
-        Ok(locations)
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::clone(&self.locations))
     }
 
     /// `/locations?datetime=` (#932): stations with an observation row in
@@ -481,6 +470,28 @@ impl FeatureEngine for CsvEngine {
     }
 }
 
+/// One location per station, at its first row's coordinates, in
+/// first-observation order.
+fn inventory(store: &CsvDataStore) -> Vec<Location> {
+    let mut locations = Vec::new();
+    let mut seen = HashMap::new();
+
+    for row in &store.rows {
+        if seen.contains_key(&row.location) {
+            continue;
+        }
+        seen.insert(&row.location, true);
+        locations.push(Location {
+            id: row.location.clone(),
+            label: row.location.clone(),
+            latitude: row.latitude,
+            longitude: row.longitude,
+        });
+    }
+
+    locations
+}
+
 fn station_feature(row: &crate::loader::CsvRow) -> Feature {
     Feature {
         id: row.location.clone(),
@@ -650,6 +661,28 @@ mod tests {
         for f in &all.features {
             assert!(matches!(*f.geometry, Geometry::Point { .. }));
             assert!(f.properties.contains_key("name"));
+        }
+    }
+
+    /// The location inventory is built once (#1083): every call shares one
+    /// snapshot, in the order `/items` lists the stations.
+    #[test]
+    fn locations_are_one_shared_snapshot_in_station_order() {
+        let engine = CsvEngine::new(test_store());
+        let locations = engine.get_locations().unwrap();
+        assert!(Arc::ptr_eq(&locations, &engine.get_locations().unwrap()));
+        let features = engine
+            .get_features(&FeatureQuery {
+                limit: 10000,
+                ..Default::default()
+            })
+            .unwrap();
+        let location_ids: Vec<&str> = locations.iter().map(|l| l.id.as_str()).collect();
+        let feature_ids: Vec<&str> = features.features.iter().map(|f| f.id.as_str()).collect();
+        assert!(location_ids.len() > 1);
+        assert_eq!(location_ids, feature_ids);
+        for location in locations.iter() {
+            assert_eq!(locations.by_id(&location.id).unwrap().id, location.id);
         }
     }
 

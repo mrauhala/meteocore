@@ -514,6 +514,43 @@ pub struct LocationsPage<'a> {
     pub links: &'a [(String, &'static str, &'static str)],
 }
 
+/// The locations a `/locations` response lists, borrowed from the engine's
+/// [`LocationSnapshot`](ds_core::model::LocationSnapshot) (#1083): a run of
+/// the inventory (all of it, or a page), or the locations a `bbox` or
+/// `datetime` filter kept (all of them, or a page). Never a copy.
+#[derive(Clone, Copy)]
+pub(crate) enum LocationRows<'a> {
+    /// Consecutive locations of the inventory, in its order.
+    Run(&'a [Location]),
+    /// The locations a filter kept, in inventory order.
+    Kept(&'a [&'a Location]),
+}
+
+impl<'a> LocationRows<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Run(run) => run.len(),
+            Self::Kept(kept) => kept.len(),
+        }
+    }
+
+    /// The rows in `range`: one page.
+    pub(crate) fn page(self, range: std::ops::Range<usize>) -> Self {
+        match self {
+            Self::Run(run) => Self::Run(&run[range]),
+            Self::Kept(kept) => Self::Kept(&kept[range]),
+        }
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = &'a Location> {
+        let (run, kept): (&[Location], &[&Location]) = match self {
+            Self::Run(run) => (run, &[]),
+            Self::Kept(kept) => (&[], kept),
+        };
+        run.iter().chain(kept.iter().copied())
+    }
+}
+
 /// Serialize the complete EDR location inventory directly into response
 /// bytes. Only one feature's links are allocated at a time; parameter and
 /// temporal metadata are borrowed instead of cloned into a full JSON tree.
@@ -522,7 +559,7 @@ pub fn locations_to_json(
     ctx: &LocationsContext,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = Vec::new();
-    locations_to_writer(locations, ctx, None, &mut bytes)?;
+    locations_to_writer(LocationRows::Run(locations), ctx, None, &mut bytes)?;
     Ok(bytes)
 }
 
@@ -532,7 +569,7 @@ pub fn locations_to_json(
 /// pre-paging one (no counts, one `self` link); otherwise its links replace
 /// that `self` link, and a page adds `numberMatched` and `numberReturned`.
 pub(crate) fn locations_to_writer(
-    locations: &[Location],
+    locations: LocationRows<'_>,
     ctx: &LocationsContext,
     page: Option<&LocationsPage>,
     writer: impl std::io::Write,
@@ -593,7 +630,7 @@ struct LocationCollection<'a> {
 }
 
 struct LocationFeatures<'a> {
-    locations: &'a [Location],
+    locations: LocationRows<'a>,
     ctx: &'a LocationsContext<'a>,
     datetime: &'a str,
 }
@@ -640,7 +677,7 @@ impl serde::Serialize for LocationFeatures<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.locations.len()))?;
-        for loc in self.locations {
+        for loc in self.locations.iter() {
             // Ids are free text (CSV station names with spaces and
             // non-ASCII letters): encoded, the link is a valid RFC 3986 URI.
             let endpoint = format!(
@@ -726,12 +763,12 @@ mod location_tests {
             links: &links,
         };
         locations_to_writer(
-            &[Location {
+            LocationRows::Run(&[Location {
                 id: "station-1".into(),
                 label: "x".into(),
                 latitude: 60.0,
                 longitude: 24.0,
-            }],
+            }]),
             &ctx,
             Some(&page),
             &mut bytes,
@@ -751,7 +788,7 @@ mod location_tests {
             links: &links,
         };
         let mut bytes = Vec::new();
-        locations_to_writer(&[], &ctx, Some(&filtered), &mut bytes).unwrap();
+        locations_to_writer(LocationRows::Kept(&[]), &ctx, Some(&filtered), &mut bytes).unwrap();
         let filtered: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(filtered.get("numberMatched").is_none());
         assert!(filtered.get("numberReturned").is_none());

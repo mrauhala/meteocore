@@ -108,13 +108,13 @@ impl Recorder {
 }
 
 impl EdrEngine for Recorder {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "site".into(),
             label: "Site".into(),
             latitude: 60.0,
             longitude: 24.0,
-        }])
+        }])))
     }
 
     fn get_instances(&self) -> Vec<RunInfo> {

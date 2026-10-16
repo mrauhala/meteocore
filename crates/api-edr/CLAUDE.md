@@ -131,6 +131,14 @@ with WMS):
   of every coverage (`GeoJsonRequest::location_ids`).
 - GeoJSON rendering reads `get_locations()`, so it runs inside the query
   executor with the query, never on an HTTP worker.
+- `get_locations()` is the engine's shared `Arc<LocationSnapshot>` (#1083).
+  Every path borrows from it: `/locations` pages are slices
+  (`response::LocationRows`), and `items`, GeoJSON and CSV naming and the
+  unknown-id check of a location list look ids up with
+  `LocationSnapshot::by_id`; GeoJSON and CSV name a coverage by its point
+  through `LocationSnapshot::at`, an index built once per snapshot. Never
+  copy the list, or build a set or index of it, per request: at 200 000
+  stations a copy is about 20 MB.
 - CSV (#1066, `src/csv.rs`) is offered where GeoJSON is and on a station
   collection's `area`: one long-form row per location, time and parameter,
   named through the same `StationNames` and `geojson::station_series_axes`,
@@ -383,7 +391,7 @@ arithmetic, under the same `location_budget` writer.
 
 `params::parse_locations_query` is the one `/locations` parser (#932).
 `bbox` (`parse_cube_bbox`, heights dropped), then `datetime`, filter the
-`get_locations()` result in place before paging, so `numberMatched` and the
+`get_locations()` snapshot before paging, so `numberMatched` and the
 links count the filtered list; an unpaged filtered list gets a `self` link
 carrying its query. `datetime` is the engine's answer:
 `EdrEngine::location_time_filter` takes `DatetimeSelector::intervals()` (open

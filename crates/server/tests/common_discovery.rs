@@ -16,7 +16,7 @@ use ds_core::{
     feature::{Feature, FeaturePage, FeatureQuery},
     feature_engine::FeatureEngine,
     map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile},
-    model::{CoverageResponse, Location},
+    model::{CoverageResponse, LocationSnapshot},
     vertical::{VerticalDimension, VerticalKind},
 };
 use http_body_util::BodyExt;
@@ -43,7 +43,7 @@ struct Fixture {
 }
 
 impl EdrEngine for Fixture {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         panic!("metadata must not query data")
     }
     fn query_location(

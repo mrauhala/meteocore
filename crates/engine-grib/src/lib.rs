@@ -1523,9 +1523,9 @@ fn no_step_within(start: DateTime<Utc>, end: DateTime<Utc>) -> DataServerError {
 // ---------------------------------------------------------------------------
 
 impl EdrEngine for GribEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         // Gridded data has no discrete locations
-        Ok(Vec::new())
+        Ok(LocationSnapshot::empty())
     }
 
     /// Each forecast run is an EDR instance (latest last). Valid times are

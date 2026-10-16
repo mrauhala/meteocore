@@ -10,7 +10,8 @@ use crate::edr_engine::{select_parameters, EdrEngine, TrajectoryShape};
 use crate::error::DataServerError;
 use crate::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
 use crate::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use crate::wind::*;
 
@@ -205,8 +206,8 @@ impl MapEngine for Mock {
 }
 
 impl EdrEngine for Mock {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn location_time_filter<'a>(

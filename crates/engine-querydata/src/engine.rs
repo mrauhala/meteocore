@@ -13,7 +13,8 @@ use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, 
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_core::temp_files;
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
@@ -215,8 +216,8 @@ impl QueryDataEngine {
 }
 
 impl EdrEngine for QueryDataEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     /// Each retained `.sqd` file is a model run / EDR instance (latest last),

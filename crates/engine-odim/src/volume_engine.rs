@@ -65,8 +65,8 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::geo::geodetic_to_ecef;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
-    VerticalCoord,
+    CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult, VerticalCoord,
 };
 use ds_core::resample::ProjectionGrid;
 use ds_core::temp_files;
@@ -1096,6 +1096,10 @@ pub(crate) struct SiteMeta {
     /// is an O(1) `Arc` clone on the request path (no per-call `Vec` clone),
     /// per the `RasterInfo` rule (#211). Rebuilt on each catalog swap.
     volume_info: Arc<VolumeInfo>,
+    /// The site's one EDR location (id = NOD, label = PLC or the NOD, the
+    /// antenna point), pre-built so `EdrEngine::get_locations` is an `Arc`
+    /// clone (#1083). Rebuilt on each catalog swap.
+    location: Arc<LocationSnapshot>,
 }
 
 /// The engine's catalog: per-site time-sorted volume lists, plus the
@@ -1893,7 +1897,7 @@ fn derive_catalog(
     // own radar without re-deriving from sweeps per request.
     let by_site_meta: HashMap<String, SiteMeta> = by_site
         .iter()
-        .filter_map(|(nod, list)| Some((nod.clone(), derive_site_meta(list)?)))
+        .filter_map(|(nod, list)| Some((nod.clone(), derive_site_meta(nod, list)?)))
         .collect();
 
     // Precompute the network-inventory FeatureEngine's per-request answers once
@@ -1917,7 +1921,7 @@ fn derive_catalog(
 /// Returns `None` for a site whose most-recent volume has no sweeps or no
 /// moment datasets (an entirely malformed file) — such a site is dropped
 /// from `by_site_meta` and is never registered as a collection.
-fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
+fn derive_site_meta(nod: &str, list: &[VolumeEntry]) -> Option<SiteMeta> {
     let latest = list.last()?;
     let site = &latest.volume.site;
 
@@ -2082,6 +2086,12 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         });
     }
 
+    let location = Arc::new(LocationSnapshot::new(vec![Location {
+        id: nod.to_owned(),
+        label: site.plc.clone().unwrap_or_else(|| nod.to_owned()),
+        latitude: site.lat,
+        longitude: site.lon,
+    }]));
     Some(SiteMeta {
         lon: site.lon,
         lat: site.lat,
@@ -2096,6 +2106,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         lowest_sweep_range_m,
         vertical,
         volume_info,
+        location,
     })
 }
 
@@ -4984,18 +4995,13 @@ impl EdrEngine for PolarVolumeSiteView {
     /// and the point geometry is the antenna position. A 404 (not an empty
     /// list) when the site has dropped from `by_site_meta`, so the locations
     /// list and `query_location` agree on the same data condition.
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         let catalog = self.catalog.load();
         let m = catalog
             .by_site_meta
             .get(&self.nod)
             .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?;
-        Ok(vec![Location {
-            id: self.nod.clone(),
-            label: m.plc.clone().unwrap_or_else(|| self.nod.clone()),
-            latitude: m.lat,
-            longitude: m.lon,
-        }])
+        Ok(Arc::clone(&m.location))
     }
 
     /// `/locations?datetime=` (#932): the site when one of its volumes falls
@@ -8151,6 +8157,15 @@ mod tests {
         assert_eq!(locs.len(), 1, "a per-site collection has one location");
         assert_eq!(locs[0].id, "fivih");
         assert_eq!(locs[0].label, "Test Site");
+        // Pre-built with the catalog: requests share it (#1083).
+        assert!(Arc::ptr_eq(
+            &locs,
+            &EdrEngine::get_locations(&view).expect("locations")
+        ));
+        assert_eq!(
+            locs.by_id("fivih").map(|l| l.label.as_str()),
+            Some("Test Site")
+        );
     }
 
     /// `/locations?datetime=` on a per-site view (#932): the site is listed
@@ -8174,7 +8189,7 @@ mod tests {
             EdrEngine::get_temporal_extent(&view),
             Some((t("2026-07-05T00:00:00Z"), t("2026-07-05T06:00:00Z")))
         );
-        let site = EdrEngine::get_locations(&view).unwrap().remove(0);
+        let site = EdrEngine::get_locations(&view).unwrap()[0].clone();
         let other = Location {
             id: "fianj".into(),
             ..site.clone()
@@ -8400,7 +8415,7 @@ mod tests {
         momentless.sweeps[0].moments.clear();
         let list = vec![entry(momentless, "m")];
         assert!(
-            derive_site_meta(&list).is_none(),
+            derive_site_meta("fivih", &list).is_none(),
             "a site whose sweeps carry no moments must yield no SiteMeta"
         );
     }
@@ -9050,6 +9065,7 @@ mod tests {
                 lowest_sweep_range_m: None,
                 vertical: None,
                 volume_info: Arc::default(),
+                location: Arc::default(),
             }
         }
         let nods = vec!["fivih".to_string()];
