@@ -34,7 +34,8 @@ use ds_core::map_engine::{
     select_common_time, CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile,
 };
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
@@ -970,8 +971,8 @@ impl<'a> PixelReader<'a> {
 /// on async request workers; a scan the cache evicted is fetched through
 /// `Source::fetch`, which is safe there.
 impl EdrEngine for SatelliteEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(

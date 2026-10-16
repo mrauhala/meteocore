@@ -20,7 +20,8 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::geo::great_circle_distance_m;
 use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_core::state::{
     collection_key, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
@@ -748,8 +749,8 @@ fn round_stored(v: f32) -> f64 {
 // ---------------------------------------------------------------------------
 
 impl ds_core::edr_engine::EdrEngine for BufrEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(self.snapshot.load().locations.as_ref().clone())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::clone(&self.snapshot.load().locations))
     }
 
     /// `/locations?datetime=` (#932): stations with a report inside one of
@@ -1280,8 +1281,8 @@ mod tests {
         let ids: Vec<String> = b
             .get_locations()
             .unwrap()
-            .into_iter()
-            .map(|l| l.id)
+            .iter()
+            .map(|l| l.id.clone())
             .collect();
         assert_eq!(ids, vec!["A", "B"]);
         assert_eq!(

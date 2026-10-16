@@ -170,7 +170,7 @@ fn main() {
     let antenna = view
         .get_locations()
         .ok()
-        .and_then(|locs| locs.into_iter().next());
+        .and_then(|locs| locs.first().cloned());
     let site_label = antenna
         .as_ref()
         .map(|l| l.label.clone())

@@ -126,8 +126,8 @@ struct StationEngine {
 }
 
 impl EdrEngine for StationEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(stations())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(stations())))
     }
 
     fn query_location(
@@ -213,8 +213,8 @@ impl EdrEngine for StationEngine {
 struct GriddedEngine;
 
 impl EdrEngine for GriddedEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(

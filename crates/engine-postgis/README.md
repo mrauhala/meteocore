@@ -531,8 +531,8 @@ bytes before the allocator's size-class rounding:
 | What | Bytes per station | At 200 000 | At 1 000 000 |
 |---|---|---|---|
 | decoded rows (`FeatureStation` + properties) | 446 | 89 MB | 446 MB |
-| whole snapshot (rows + `Location` list + id index) | 613 | 123 MB | 613 MB |
-| copy `get_locations` hands each `/locations` request | 98 | 20 MB | 98 MB |
+| whole snapshot (rows + `Location` snapshot + id indexes) | 621 | 124 MB | 621 MB |
+| what an EDR request copies of it (`get_locations` shares the `Location` snapshot) | 0 | 0 | 0 |
 
 A refresh holds the old snapshot until the new one is swapped in, plus the
 query's rows (tokio-postgres buffers the result: about 300–350 B a row for
@@ -546,7 +546,7 @@ included) with headroom; the ceiling stops a typo from removing the bound.
 **Costs that grow with the list** (checked for #1061):
 
 - **Refresh** (every `metadata_refresh_secs`, on the background poll runtime,
-  never a request worker): `CollectionMeta::build` measured 0.8 µs a station
+  never a request worker): `CollectionMeta::build` measured 0.9 µs a station
   in a debug build, under 0.2 s at 200 000; the query and row decoding come on
   top. The new snapshot replaces the old through `ArcSwap`; readers never
   wait, and a request still holding the old one keeps it alive until it
@@ -556,19 +556,22 @@ included) with headroom; the ceiling stops a typo from removing the bound.
   `parameter-name`s), so the default `MC_EDR_LOCATIONS_MAX_BYTES` of 16 MiB
   holds about 27 000 locations. A larger unpaged list is a 503 `ResponseLimit`
   ("page it with `limit`"), as it already was at the old 50 001 cap; pages of
-  up to 10 000 (about 6 MB) fit. Each request, paged or not, copies the whole
-  `Location` list first (the row above), inside the EDR executor's admission
-  bound.
-- **Other EDR paths copy the same list**, since `EdrEngine::get_locations`
-  returns an owned `Vec`: every EDR `items` page and single item
-  (`EdrMembers::new`, to label the page's few station members), every
-  `f=GeoJSON` query (`station_names`), and, once per request, a location-list
-  query with an id the collection lacks or more ids than its `limit`
-  (`require_known_location`, which also builds a set of every id). That is
-  about 20 MB a request at 200 000 stations and about 98 MB at the ceiling,
-  four to twenty times the cost at the old cap. Serving the snapshot by `Arc`
-  would remove the copies for all of them; it changes the trait for every
-  engine and is left as a follow-up.
+  up to 10 000 (about 6 MB) fit. A page is a slice of the cached `Location`
+  snapshot, which `get_locations` shares by `Arc` (#1083); a `bbox` or
+  `datetime` filter collects a pointer per kept location (1.6 MB when all
+  200 000 match).
+- **Other EDR paths look stations up by id** in the same shared snapshot
+  (`LocationSnapshot::by_id`, a bisection over an index of 8 B a station):
+  EDR `items` pages and single items, `f=GeoJSON` and CSV queries, and the
+  unknown-id check of a location list. On 200 000 synthetic stations in a
+  release build (`cargo run --release -p ds-core --example
+  location_snapshot_bench`) a lookup takes about 0.2 µs and allocates
+  nothing; the copy of the list each of these requests made before took
+  about 10–25 ms and 20–28 MB. A GeoJSON or CSV position, area or radius
+  query names its coverages through an index of the list's points
+  (`LocationSnapshot::at`), built by the first such query after each refresh
+  and kept with the snapshot until the next one; a result named by its
+  location ids never builds it.
 - **Features `/items`** pages with `limit` ≤ 1000 and `offset`; each page
   filters the whole cached list in memory, an O(n) scan plus a pointer per
   match (1.6 MB of pointers when all 200 000 match). Vector tiles do the same

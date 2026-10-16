@@ -20,7 +20,8 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{check_mask_budget, parse_area_coords, QueryPolygon};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_poll::Shutdown;
 use tokio_postgres::Row;
@@ -439,8 +440,8 @@ impl ds_core::events::EventSource for PostgisEngine {
 // ─── Engine trait ────────────────────────────────────────────────────────────
 
 impl EdrEngine for PostgisEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok((*self.load_meta().locations).clone())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::clone(&self.load_meta().locations))
     }
 
     fn get_parameters(&self) -> Vec<String> {
@@ -2000,7 +2001,7 @@ mod tests {
                     .map(|s: &crate::metadata::FeatureStation| s.properties.as_ref()),
             ),
             feature_stations: std::sync::Arc::new(stations),
-            locations: std::sync::Arc::new(locations),
+            locations: std::sync::Arc::new(LocationSnapshot::new(locations)),
             station_idx: std::sync::Arc::new(station_idx),
             parameters: std::sync::Arc::new(HashMap::new()),
             temporal_extent: None,
@@ -2297,8 +2298,8 @@ mod tests {
         let edr: Vec<String> = engine
             .get_locations()
             .unwrap()
-            .into_iter()
-            .map(|l| l.id)
+            .iter()
+            .map(|l| l.id.clone())
             .collect();
         let features: Vec<String> = engine
             .get_features(&FeatureQuery::default())
@@ -2410,8 +2411,12 @@ mod tests {
         assert!(engine.locations_truncated());
         assert_eq!(served_ids(&engine), ["a", "b", "c"]);
         // "a" keeps its first table's geometry.
-        assert_eq!(engine.get_locations().unwrap()[0].longitude, 24.0);
+        let locations = engine.get_locations().unwrap();
+        assert_eq!(locations[0].longitude, 24.0);
+        assert_eq!(locations.by_id("c").unwrap().latitude, 62.0);
         let meta = engine.load_meta();
+        // Requests share the refresh's snapshot, never a copy (#1083).
+        assert!(Arc::ptr_eq(&locations, &meta.locations));
         assert_eq!(
             nearest_in_memory(&meta, 26.0, 62.0, 1_000.0).as_deref(),
             Some("c")

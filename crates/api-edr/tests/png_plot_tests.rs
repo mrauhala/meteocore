@@ -97,8 +97,8 @@ fn series_result() -> QueryResult {
 macro_rules! impl_common {
     ($t:ty, $result:expr) => {
         impl EdrEngine for $t {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(vec![])
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -302,8 +302,8 @@ struct SectionEngine {
 }
 
 impl EdrEngine for SectionEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
     fn query_location(
         &self,

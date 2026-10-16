@@ -89,15 +89,17 @@ impl LimitMock {
 }
 
 impl EdrEngine for LimitMock {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok((0..LOCATIONS)
-            .map(|i| Location {
-                id: format!("s{i}"),
-                label: format!("Station {i}"),
-                latitude: 60.0 + i as f64,
-                longitude: 24.0,
-            })
-            .collect())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(
+            (0..LOCATIONS)
+                .map(|i| Location {
+                    id: format!("s{i}"),
+                    label: format!("Station {i}"),
+                    latitude: 60.0 + i as f64,
+                    longitude: 24.0,
+                })
+                .collect(),
+        )))
     }
 
     fn get_instances(&self) -> Vec<RunInfo> {

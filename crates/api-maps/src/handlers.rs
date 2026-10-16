@@ -14,9 +14,10 @@ use serde_json::json;
 use api_common::workbench::Surface;
 use api_common::{mounts, rel, Mount};
 use ds_core::config::CollectionConfig;
+use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, RasterInfo};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
-use ds_render::{CacheKey, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
+use ds_render::{CacheKey, CachedRendered, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
 
 use crate::error::MapsError;
 use crate::params::{self, LegendFormat, LegendQueryParams, MapQueryParams, MapRequest, MapTime};
@@ -1319,6 +1320,41 @@ fn requested_time(
         .map_err(|none| MapsError::NotFound(none.0))
 }
 
+/// A map render's outcome: the encoded image, `None` for an all-nodata view,
+/// and the phases it ran.
+type Rendered = Result<(Option<Vec<u8>>, RenderPhases), DataServerError>;
+
+/// What a map render job hands back: the image to serve, already encoded on
+/// the render worker that held the CPU slot (#1093), never on the async
+/// request worker after it.
+enum Finished {
+    /// A populated image, served `MISS` and inserted in the rendered cache.
+    Image(CachedRendered),
+    /// An all-nodata view, served `EMPTY`: its memoized empty image, or the
+    /// encoder's error.
+    Empty(Result<CachedRendered, DataServerError>),
+}
+
+/// The work a map's `RenderJob` runs: `render`, then the image it serves, on
+/// the same blocking worker, which holds the output-memory reservation
+/// `memory` until both are done. An all-nodata view takes `empty`'s image,
+/// so a memo miss encodes it there too, like every populated image (#1093).
+fn render_job(
+    memory: Arc<ds_executor::budget::RenderPermit>,
+    empty: impl FnOnce() -> Result<CachedRendered, DataServerError> + Send + 'static,
+    render: impl FnOnce() -> Rendered + Send + 'static,
+) -> impl FnOnce() -> Result<(Finished, RenderPhases), DataServerError> + Send + 'static {
+    move || {
+        let _memory = memory;
+        let (bytes, phases) = render()?;
+        let finished = match bytes {
+            Some(bytes) => Finished::Image(CachedRendered::new(bytes::Bytes::from(bytes))),
+            None => Finished::Empty(empty()),
+        };
+        Ok((finished, phases))
+    }
+}
+
 /// Shared rendering logic for get_map and get_styled_map.
 async fn render_map(
     collection_id: &str,
@@ -1577,7 +1613,6 @@ async fn render_map(
     )
     .await
     .map_err(MapsError::from)?;
-    let worker_memory = memory_permit.clone();
     // Where the render's time goes (#147): admission here, the engine read
     // and encode in the worker.
     let mut phases = RenderPhases::default();
@@ -1594,9 +1629,13 @@ async fn render_map(
     let render_parameter = effective_parameter;
     let render_z = validated.z;
 
+    // An all-nodata view's image: transparent (white in JPEG, which has no
+    // alpha), encoded once per (w, h, format) and shared across
+    // WMS/Maps/Tiles (#171). The job finishes it too (#1093), so the request
+    // worker only reads the result.
+    let empty = move || ds_render::empty_tile(width, height, format);
     let render_result = job
-        .run(move || {
-            let _memory_permit = worker_memory;
+        .run(render_job(memory_permit, empty, move || {
             let mut phases = phases;
 
             let colormap = match &paint {
@@ -1664,8 +1703,8 @@ async fn render_map(
             let encode_start = std::time::Instant::now();
             let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
             phases.add(RenderPhase::Encode, encode_start.elapsed());
-            Ok::<_, ds_core::error::DataServerError>((Some(bytes), phases))
-        })
+            Ok((Some(bytes), phases))
+        }))
         .await
         .map_err(MapsError::from)?;
     let phases = render_result
@@ -1675,26 +1714,22 @@ async fn render_map(
     // The EMPTY fast path skips colorization but encodes in the requested
     // format at its quality like a populated render (#1091), so the
     // Content-Type is the requested one on every exit and never lies about
-    // the payload (#162). Wrap every branch in `CachedRendered` so the
-    // response ETag is FNV-1a over the actual bytes — different pixels,
-    // different ETag — regardless of which exit we take (#145).
-    // Each arm produces a `CachedRendered` ready to serve. Only the
-    // populated `Ok(Some(_))` path inserts into the rendered cache; the
-    // EMPTY fast-path intentionally doesn't (its bytes are deterministic
-    // for fixed dimensions and format). Engine errors are mapped to their
-    // HTTP status in the `Err` arm.
+    // the payload (#162). Every arm is a `CachedRendered`, so the response
+    // ETag is FNV-1a over the actual bytes — different pixels, different
+    // ETag — regardless of which exit we take (#145). The job finished
+    // them (`render_job`, #1093); this only labels them. Only the populated
+    // image inserts into the rendered cache; the EMPTY fast-path
+    // intentionally doesn't (its bytes are deterministic for fixed
+    // dimensions and format, and come from their own memo). Engine errors
+    // are mapped to their HTTP status in the `Err` arm.
     let (cached, x_cache) = match render_result {
-        Ok((Some(bytes), _)) => {
-            let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+        Ok((Finished::Image(cached), _)) => {
             rendered_cache.insert(cache_key, cached.clone());
             (cached, "MISS")
         }
-        Ok((None, _)) => {
-            // Empty image: transparent (white in JPEG, which has no alpha),
-            // encoded once per (w, h, format) and shared across
-            // WMS/Maps/Tiles (#171). Not inserted into the rendered cache.
-            let cached = ds_render::empty_tile(width, height, format)
-                .map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
+        Ok((Finished::Empty(tile), _)) => {
+            let cached =
+                tile.map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
             (cached, "EMPTY")
         }
         Err(e) => {

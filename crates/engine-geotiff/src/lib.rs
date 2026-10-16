@@ -2150,8 +2150,8 @@ fn resample_nearest<T: Copy>(
 }
 
 impl EdrEngine for GeoTiffEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(

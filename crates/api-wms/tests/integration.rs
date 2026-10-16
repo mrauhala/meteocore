@@ -226,7 +226,7 @@ async fn empty_image_is_encoded_in_the_requested_format() {
 }
 
 /// Mock engine whose `get_raster_tile` always fails. Drives the WMS
-/// `Err(e)` branch that emits the red `render_error_tile`, in the
+/// `Err(e)` branch that serves the red `ds_render::error_tile`, in the
 /// requested format, with `X-Cache: ERROR`. WMS is the only handler
 /// that does this — Maps and Tiles propagate engine errors as JSON 500.
 struct FailingMockMapEngine;
@@ -6020,4 +6020,113 @@ async fn geographic_getmap_past_a_pole_is_empty_there() {
         inside.iter().all(|p| p[3] == 0xff && *p != background),
         "rows inside the CRS"
     );
+}
+
+/// WMS 1.3.0 §7.3.3.6: a projected BBOX wholly outside its projection's
+/// valid area is the empty image, encoded in the requested FORMAT, without
+/// an engine read (#1089). EPSG:3035's boxes lie past the LAEA disk, where
+/// they were a 400. EPSG:3067's lie past the strip TM maps the Earth into,
+/// north and south, where the engine was asked to read the meaningless
+/// latitudes TM's inverse gives there, or at eastings so far out that the
+/// inverse has no finite result, a 400 before. The engine draws on every
+/// pixel it is asked for, so a read would show. On both render paths a box
+/// reaching into the area still renders, and a malformed box, or one whose
+/// edges miss the area inside it, is still a 400.
+#[tokio::test]
+async fn projected_getmap_wholly_outside_its_projection_is_empty() {
+    use ds_render::{encode_jpeg, encode_png, encode_webp};
+    use std::sync::atomic::Ordering;
+    let get_map = |crs: &str, bbox: &str, extra: &str| {
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=data&STYLES=\
+             &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64{extra}"
+        )
+    };
+    let outside = [
+        ("EPSG:3035", "20000000,20000000,21000000,21000000"),
+        // 32 km past the disk's rim: the meta-tile covering it crosses the
+        // rim, so only a check before meta-tiling keeps the engine out.
+        ("EPSG:3035", "17100000,3000000,17200000,3100000"),
+        // Past TM's strip, which reaches 19 995 930 m from the equator.
+        ("EPSG:3067", "0,21000000,1000000,22000000"),
+        ("EPSG:3067", "0,-22000000,1000000,-21000000"),
+        ("EPSG:3067", "1e20,6500000,2e20,7000000"),
+    ];
+    let transparent = solid(64, 64, [0, 0, 0, 0]);
+    let white = solid(64, 64, [255, 255, 255, 255]);
+    let bg = solid(64, 64, BG);
+    let cases = [
+        ("&FORMAT=image/png", encode_png(&transparent, 64, 64)),
+        (
+            "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+            encode_png(&bg, 64, 64),
+        ),
+        ("&FORMAT=image/jpeg", encode_jpeg(&white, 64, 64, 85)),
+        ("&FORMAT=image/webp", encode_webp(&transparent, 64, 64, 100)),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+            encode_webp(&bg, 64, 64, 100),
+        ),
+    ];
+
+    // Meta-tiled, then direct with meta-tiling off.
+    for metatile_mb in [64, 0] {
+        let (app, _, calls) = build_counting_router(metatile_mb);
+        for (crs, bbox) in outside {
+            for (extra, expected) in &cases {
+                let reply = fetch(&app, &get_map(crs, bbox, extra)).await;
+                let context = format!("{metatile_mb} MB {crs} {extra}");
+                assert_eq!(reply.status, StatusCode::OK, "{context}: {}", reply.text());
+                assert_eq!(reply.x_cache, "EMPTY", "{context}");
+                let requested = extra[8..].split('&').next().unwrap();
+                assert_eq!(reply.content_type, requested, "{context}");
+                assert_magic(requested, &reply.body, &context);
+                assert_eq!(&reply.body, expected.as_ref().unwrap(), "{context}");
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "{metatile_mb} MB: engine asked outside the projection"
+        );
+
+        // Across the LAEA disk's rim, and inside it: drawn.
+        for bbox in [
+            "16000000,2200000,18000000,4200000",
+            "4000000,3000000,4512000,3512000",
+        ] {
+            let reply = fetch(&app, &get_map("EPSG:3035", bbox, "&FORMAT=image/png")).await;
+            assert_eq!(reply.status, StatusCode::OK, "{metatile_mb} MB {bbox}");
+            assert_eq!(reply.x_cache, "MISS", "{metatile_mb} MB {bbox}");
+            assert!(
+                png_pixels(&reply.body).iter().any(|p| p[3] != 0),
+                "{metatile_mb} MB {bbox}: nothing drawn"
+            );
+        }
+        assert!(calls.load(Ordering::Relaxed) > 0, "{metatile_mb} MB");
+
+        for (crs, bbox) in [
+            // min ≥ max, outside or not.
+            ("EPSG:3035", "21000000,20000000,20000000,21000000"),
+            ("EPSG:3035", "20000000,20000000,20000000,21000000"),
+            ("EPSG:3067", "2e20,6500000,1e20,7000000"),
+            // Not finite numbers.
+            ("EPSG:3035", "NaN,20000000,21000000,21000000"),
+            ("EPSG:3067", "inf,6500000,2e20,7000000"),
+            ("EPSG:3035", "20000000,20000000,21000000"),
+            // Wider than the LAEA disk: its edges miss the valid area the
+            // box encloses, and give no read window. So do a tall box's,
+            // which cross the disk only between their samples.
+            ("EPSG:3035", "-30000000,-30000000,30000000,30000000"),
+            ("EPSG:3035", "17000000,-50000000,18000000,50000000"),
+        ] {
+            let reply = fetch(&app, &get_map(crs, bbox, "&FORMAT=image/png")).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{crs} {bbox}");
+            assert_eq!(
+                exception_code(&reply.text()),
+                "InvalidParameterValue",
+                "{crs} {bbox}"
+            );
+        }
+    }
 }

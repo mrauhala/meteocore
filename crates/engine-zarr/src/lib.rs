@@ -49,7 +49,8 @@ use ds_core::instances::{self, RunInfo};
 const MAX_AREA_VARIABLES: usize = 8;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_core::resample::ProjectionGrid;
 
@@ -256,8 +257,8 @@ impl EdrEngine for ZarrEngine {
         })
     }
 
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(

@@ -386,9 +386,10 @@ complete inventory over the per-response cap is a `ResponseLimit` whose
 description suggests paging it with `limit`, a list filtered by `bbox` or
 `datetime` without `limit` one that names it a filtered list and suggests
 the same (#961), and a page over it one that suggests a smaller `limit`. Cancellation/deadlines stop serialization.
-Engine-owned inventory snapshots and the `get_locations()` result are
-separate from this encoded-buffer budget and are the whole inventory for a
-page too; retrieval remains under the bounded query executor.
+The engine's inventory snapshot, which `get_locations()` shares with every
+request without copying it, is separate from this encoded-buffer budget; a
+page borrows its locations from it, and retrieval remains under the bounded
+query executor.
 
 Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304 (#499).
 

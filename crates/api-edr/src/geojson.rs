@@ -31,11 +31,14 @@
 //! identical queries are byte-identical and the content-derived ETag
 //! revalidates (#499).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use ds_core::model::{CoverageResponse, DomainDescription, Location, QueryResult};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, Location, LocationSnapshot, QueryResult,
+};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -84,44 +87,27 @@ pub struct GeoJsonLink {
 /// coordinates: a station engine's coverage sits at its location's
 /// coordinates (the `serves_station_series` contract). Coordinates two
 /// locations share name neither.
+///
+/// It borrows the engine's snapshot (#1083), whose point index
+/// ([`LocationSnapshot::at`]) is built once per snapshot on first use, not
+/// per request.
 pub struct LocationIndex {
-    locations: Vec<Location>,
-    by_point: HashMap<(u64, u64), Option<usize>>,
-}
-
-/// Hash key of a coordinate pair; `-0.0` and `0.0` are one point.
-fn point_key(x: f64, y: f64) -> (u64, u64) {
-    ((x + 0.0).to_bits(), (y + 0.0).to_bits())
+    locations: Arc<LocationSnapshot>,
 }
 
 impl LocationIndex {
-    pub fn new(locations: Vec<Location>) -> Self {
-        let mut by_point: HashMap<(u64, u64), Option<usize>> =
-            HashMap::with_capacity(locations.len());
-        for (i, loc) in locations.iter().enumerate() {
-            if !(loc.longitude.is_finite() && loc.latitude.is_finite()) {
-                continue;
-            }
-            by_point
-                .entry(point_key(loc.longitude, loc.latitude))
-                .and_modify(|slot| *slot = None)
-                .or_insert(Some(i));
-        }
-        LocationIndex {
-            locations,
-            by_point,
-        }
+    pub fn new(locations: Arc<LocationSnapshot>) -> Self {
+        LocationIndex { locations }
     }
 
     /// The one location at exactly `(x, y)`.
     pub fn at(&self, x: f64, y: f64) -> Option<&Location> {
-        let i = (*self.by_point.get(&point_key(x, y))?)?;
-        self.locations.get(i)
+        self.locations.at(x, y)
     }
 
-    /// The location with this id.
+    /// The location with this id, the first when ids repeat.
     pub fn by_id(&self, id: &str) -> Option<&Location> {
-        self.locations.iter().find(|l| l.id == id)
+        self.locations.by_id(id)
     }
 }
 
@@ -430,6 +416,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use ds_core::model::{NdArray, ParameterDescription};
+    use std::collections::HashMap;
 
     fn series(x: f64, y: f64, hours: &[u32], values: &[(&str, Vec<Option<f64>>)]) -> QueryResult {
         let t: Vec<DateTime<Utc>> = hours
@@ -503,7 +490,12 @@ mod tests {
 
     #[test]
     fn one_feature_per_station_with_aligned_arrays() {
-        let index = LocationIndex::new(vec![loc("Alajärvi Möksy", "Möksy", 24.26, 63.09)]);
+        let index = LocationIndex::new(Arc::new(LocationSnapshot::new(vec![loc(
+            "Alajärvi Möksy",
+            "Möksy",
+            24.26,
+            63.09,
+        )])));
         let result = CoverageResponse::Single(series(
             24.26,
             63.09,
@@ -556,7 +548,10 @@ mod tests {
     #[test]
     fn an_unnamed_coverage_is_labelled_by_its_point() {
         // Two locations share the point: neither names the coverage.
-        let index = LocationIndex::new(vec![loc("a", "A", 10.0, 60.0), loc("b", "B", 10.0, 60.0)]);
+        let index = LocationIndex::new(Arc::new(LocationSnapshot::new(vec![
+            loc("a", "A", 10.0, 60.0),
+            loc("b", "B", 10.0, 60.0),
+        ])));
         let result =
             CoverageResponse::Collection(vec![series(10.0, 60.0, &[5], &[("t", vec![Some(1.0)])])]);
         let json = encode(&result, &index).unwrap();
@@ -570,9 +565,22 @@ mod tests {
         );
     }
 
+    /// A result is named through the engine's snapshot, by id or by point
+    /// (#1083).
+    #[test]
+    fn names_by_id_and_by_point_through_the_snapshot() {
+        let index = LocationIndex::new(Arc::new(LocationSnapshot::new(vec![
+            loc("a", "A", 10.0, 60.0),
+            loc("b", "B", 11.0, 60.0),
+        ])));
+        assert_eq!(index.by_id("b").map(|l| l.label.as_str()), Some("B"));
+        assert!(index.by_id("c").is_none());
+        assert_eq!(index.at(10.0, 60.0).map(|l| l.id.as_str()), Some("a"));
+    }
+
     #[test]
     fn empty_collection_is_an_empty_feature_collection() {
-        let index = LocationIndex::new(Vec::new());
+        let index = LocationIndex::new(LocationSnapshot::empty());
         let json = encode(&CoverageResponse::Collection(Vec::new()), &index).unwrap();
         assert_eq!(json["features"], serde_json::json!([]));
         assert_eq!(json["numberMatched"], 0);
@@ -581,7 +589,7 @@ mod tests {
 
     #[test]
     fn non_series_and_reserved_names_are_rejected() {
-        let index = LocationIndex::new(Vec::new());
+        let index = LocationIndex::new(LocationSnapshot::empty());
         let grid = CoverageResponse::Single(QueryResult {
             domain: DomainDescription::Grid {
                 x: vec![1.0],

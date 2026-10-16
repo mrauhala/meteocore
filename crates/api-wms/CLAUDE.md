@@ -84,6 +84,24 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   (§7.3.3.6, #1065). The helpers ask the engine only for the rows whose
   centres lie inside ±90°, and nothing for a BBOX wholly past a pole (the
   empty image). Engines need no guard of their own; Maps does the same.
+- A view with no row inside its CRS is the empty image before either path
+  runs: `OutputCrs::domain_rows` is `None` (#1089). Besides a geographic
+  BBOX wholly past a pole, that is an EPSG:3067/3035 BBOX wholly outside
+  the projection's valid area (`ds_core::geo::outside_projection_domain`).
+  The check must precede meta-tiling, whose tiles reach past the view and
+  call the engine directly: a box just past the LAEA disk has covering
+  tiles that cross it.
+- `params::parse_bbox` asks `outside_projection_domain` before
+  `wgs84_envelope`, which samples only the box's edges. Wholly outside is
+  the empty image, with read window `NO_READ_WINDOW` (NaN, never read). An
+  envelope of `None` for any other box means the edges miss a valid area
+  inside it: an EPSG:3035 box wider than the disk, or a tall one crossing
+  it between samples. That stays `InvalidParameterValue`: there is no read
+  window, and a global one would read whole datasets. Malformed boxes are
+  rejected before either. An envelope of `Some` does not mean inside:
+  TM's inverse is finite past its strip, |N| > 19 995 930 m for
+  EPSG:3067. So `outside_projection_domain` tests that strip itself, and in
+  a box partly past it those pixels still reach the engine.
 
 ## Rendered-image cache (#1010)
 
@@ -206,8 +224,9 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - Caching: the background is part of the rendered-image `CacheKey` (the
   encoded bytes differ) but NOT of the meta-tile key — cached tiles stay
   RGBA, so opaque and transparent views share them. The all-nodata path uses
-  `ds_render::background_tile` (memoized per size + background + format with
-  its quality); the error tile is flattened too.
+  `ds_render::background_tile` and a failed render `ds_render::error_tile`,
+  both memoized per size + background + format with its quality; the error
+  tile is flattened too.
 - GetCapabilities advertises nothing for these; the layer `opaque` attribute
   is unrelated and unchanged.
 - ets-wms13's `getmap:bbox-outside-crs` fails on the `TRUE` default: it
@@ -226,10 +245,23 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - JPEG has no alpha: the empty image is solid `BGCOLOR` (default white) and
   the semi-transparent error tile is flattened onto it. WebP keeps alpha like
   PNG unless `TRANSPARENT=FALSE`.
-- Neither is inserted into the rendered cache; the empty image comes from
-  `ds_render::background_tile`'s item-bounded memo, keyed on
-  `(width, height, background, format)` so a PNG and a JPEG of one size never
-  share an entry. The ERROR `Cache-Control` stays short.
+- Neither is inserted into the rendered cache. Both come from one
+  process-wide memo in ds-render (`ds_render::background_tile`,
+  `ds_render::error_tile`, #1093), keyed on the image and
+  `(width, height, background, format)` so a PNG and a JPEG of one size, or
+  the empty image and the error tile, never share an entry. The memo is
+  bounded by bytes (32 MiB, one shard), not entries: a solid JPEG grows with
+  the pixel count, to about 1 MB at 8000 × 8000. It has no `/metrics`
+  family. A miss is single-flight, so an outage's concurrent failures of one
+  size share one encode. The ERROR `Cache-Control` stays short.
+- Both are encoded inside the render job, never on the async request worker
+  (#1093): `finish_render` turns the render's outcome into the image to
+  serve on the blocking worker that holds the CPU slot and the memory
+  reservation, under the render deadline, and the handler only labels the
+  result. Keep it there; `background_tile` and `error_tile` encode on a miss
+  and block a caller waiting for another's encode. A `ResourceExhausted` or
+  `DeadlineExceeded` render stays the 503 and encodes nothing. Maps and Tiles
+  finish their empty image in the job the same way (`render_job`).
 
 ## QUALITY / `[wms] webp_quality`
 

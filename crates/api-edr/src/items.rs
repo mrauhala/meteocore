@@ -19,7 +19,7 @@
 //! to the engine's own. They are added here, never in the Features API's
 //! `/items`, whose features are not EDR features.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, RawQuery, State};
@@ -37,7 +37,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, DatetimeInterval, Feature, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
-use ds_core::model::Location;
+use ds_core::model::LocationSnapshot;
 
 use crate::geojson::encode_path_segment;
 use crate::handlers::{
@@ -240,8 +240,10 @@ struct EdrMembers<'a> {
     /// `start/end` of the collection's temporal extent, empty without one.
     datetime: String,
     parameter_names: Vec<String>,
-    /// The page's items that are locations, by id.
-    locations: HashMap<String, Location>,
+    /// The engine's location snapshot, when it serves locations: an item
+    /// is a location when its id is found here (#1083: looked up, never
+    /// copied).
+    locations: Option<Arc<LocationSnapshot>>,
     /// `{edr root}/collections/{id}`.
     collection_url: String,
     serves_position: bool,
@@ -249,25 +251,14 @@ struct EdrMembers<'a> {
 }
 
 impl<'a> EdrMembers<'a> {
-    /// The members for the items `ids` of collection `id`, under `root`.
-    fn new(
-        engine: &'a dyn EdrEngine,
-        root: &str,
-        id: &str,
-        ids: &[&str],
-    ) -> Result<Self, DataServerError> {
+    /// The members for the items of collection `id`, under `root`.
+    fn new(engine: &'a dyn EdrEngine, root: &str, id: &str) -> Result<Self, DataServerError> {
         let query_types = engine.supported_query_types();
         let serves = |query_type: &str| query_types.iter().any(|q| q == query_type);
         let locations = if serves("locations") {
-            let wanted: HashSet<&str> = ids.iter().copied().collect();
-            engine
-                .get_locations()?
-                .into_iter()
-                .filter(|l| wanted.contains(l.id.as_str()))
-                .map(|l| (l.id.clone(), l))
-                .collect()
+            Some(engine.get_locations()?)
         } else {
-            HashMap::new()
+            None
         };
         Ok(Self {
             engine,
@@ -286,7 +277,11 @@ impl<'a> EdrMembers<'a> {
     /// Add the members to `json`, the GeoJSON of `feature`. They replace an
     /// engine property of the same name: their meaning is EDR's.
     fn apply(&self, feature: &Feature, json: &mut Value) {
-        let (label, endpoint, datetime) = match self.locations.get(&feature.id) {
+        let location = self
+            .locations
+            .as_deref()
+            .and_then(|locations| locations.by_id(&feature.id));
+        let (label, endpoint, datetime) = match location {
             Some(location) => (
                 location.label.clone(),
                 format!(
@@ -432,9 +427,8 @@ pub async fn items(
             &root,
             &ResponseCrs::default(),
         );
-        let ids: Vec<&str> = page.features.iter().map(|f| f.id.as_str()).collect();
-        let members = EdrMembers::new(edr.as_ref(), &root, &id, &ids)
-            .map_err(|e| map_query_error(&e, "Items"))?;
+        let members =
+            EdrMembers::new(edr.as_ref(), &root, &id).map_err(|e| map_query_error(&e, "Items"))?;
         if let Some(json) = doc["features"].as_array_mut() {
             for (feature, json) in page.features.iter().zip(json) {
                 members.apply(feature, json);
@@ -495,7 +489,7 @@ pub async fn item(
             .get_feature(&item_id)
             .map_err(|e| map_query_error(&e, "Item"))?;
         let mut doc = feature_to_geojson(&feature, &id, &root, &ResponseCrs::default());
-        EdrMembers::new(edr.as_ref(), &root, &id, &[feature.id.as_str()])
+        EdrMembers::new(edr.as_ref(), &root, &id)
             .map_err(|e| map_query_error(&e, "Item"))?
             .apply(&feature, &mut doc);
         if format.format == EdrFormat::Html {

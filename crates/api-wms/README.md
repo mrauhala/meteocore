@@ -145,6 +145,27 @@ past a pole: the rows whose centres lie beyond ±90° have no content
 asks, and a BBOX wholly past a pole is the empty image. No engine is asked
 for those rows (#1065).
 
+An EPSG:3067 or EPSG:3035 BBOX wholly outside its projection's valid area,
+where no point maps to the Earth, is the empty image too, in the requested
+`FORMAT`, and no engine is asked (#1089):
+
+- EPSG:3035: a box past the LAEA disk, of radius about 12 742 km around
+  (4 321 000, 3 210 000).
+- EPSG:3067: a box past the strip Transverse Mercator maps the Earth into,
+  northings more than 19 995 930 m from the equator, at any easting. So is
+  a box at eastings so far out (10²⁰ m) that the TM inverse has no finite
+  result.
+
+A box partly outside renders what lies inside. In EPSG:3035 its pixels past
+the disk are empty. In EPSG:3067 the pixels past the strip are not
+guaranteed empty: TM's inverse gives them meaningless coordinates, so an
+engine may draw there. Two boxes stay `InvalidParameterValue`:
+
+- a malformed one: min ≥ max, or a value that is no finite number;
+- one whose edge samples all miss the valid area inside it. That is an
+  EPSG:3035 box wider than the disk, or a very tall one whose edges cross
+  the disk only between samples. Its edges give no area to read.
+
 ## WMS Configuration
 
 The `[collections.wms]` section configures how raster data is rendered as map images.

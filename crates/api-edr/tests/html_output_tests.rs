@@ -102,8 +102,8 @@ fn grid() -> CoverageResponse {
 struct Every;
 
 impl EdrEngine for Every {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![
             Location {
                 id: "here".into(),
                 label: "<b>Here</b>".into(),
@@ -116,7 +116,7 @@ impl EdrEngine for Every {
                 latitude: 61.0,
                 longitude: 26.0,
             },
-        ])
+        ])))
     }
 
     fn get_instances(&self) -> Vec<RunInfo> {
@@ -255,8 +255,8 @@ fn station(i: usize) -> Feature {
 struct Section;
 
 impl EdrEngine for Section {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(
@@ -350,7 +350,7 @@ impl Stations {
 }
 
 impl EdrEngine for Stations {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         if self.inventory_down {
             return Err(DataServerError::Engine("inventory unavailable".into()));
         }

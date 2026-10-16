@@ -77,13 +77,13 @@ impl MockEngine {
 }
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "helsinki".into(),
             label: "Helsinki".into(),
             latitude: 60.1699,
             longitude: 24.9384,
-        }])
+        }])))
     }
 
     fn query_location(

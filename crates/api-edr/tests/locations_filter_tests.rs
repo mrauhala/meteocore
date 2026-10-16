@@ -68,17 +68,19 @@ struct Stations {
 }
 
 impl EdrEngine for Stations {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         self.inventory_reads.fetch_add(1, Ordering::Relaxed);
-        Ok(STATIONS
-            .iter()
-            .map(|&(id, longitude, latitude, _)| Location {
-                id: id.into(),
-                label: id.to_uppercase(),
-                latitude,
-                longitude,
-            })
-            .collect())
+        Ok(Arc::new(LocationSnapshot::new(
+            STATIONS
+                .iter()
+                .map(|&(id, longitude, latitude, _)| Location {
+                    id: id.into(),
+                    label: id.to_uppercase(),
+                    latitude,
+                    longitude,
+                })
+                .collect(),
+        )))
     }
 
     fn location_time_filter<'a>(

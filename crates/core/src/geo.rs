@@ -450,14 +450,86 @@ fn edge_envelope(bbox: [f64; 4], map: impl Fn(f64, f64) -> Option<(f64, f64)>) -
 /// corners. Used to derive the WGS84 read window for a projected-output render
 /// (the engine still reads source pixels by lon/lat).
 ///
-/// Returns `None` when **every** sampled point fails to inverse-project — i.e.
-/// the projected bbox lies entirely outside the projection's valid domain. The
-/// caller must surface that as a client error (HTTP 400), *not* fall back to a
-/// global extent: a global read window on a planet-scale GRIB/COG source would
-/// decode the whole dataset for one bogus request (a DoS vector). Unreachable
-/// for any valid EPSG:3067/3035 bbox.
+/// Returns `None` when **every** sampled point fails to inverse-project. Ask
+/// [`outside_projection_domain`] first: for a bbox it keeps, `None` means
+/// the edge samples miss a valid area that reaches into the bbox. That is an
+/// EPSG:3035 box wider than the LAEA disk, or a tall one whose edges cross
+/// the disk only between samples. The edges then give no read window, and
+/// the caller must not fall back to a global extent: a global read window on
+/// a planet-scale GRIB/COG source would decode the whole dataset for one
+/// request.
+///
+/// `Some` does not put the bbox inside the valid area: Transverse Mercator's
+/// inverse is finite past the strip the Earth fills, at latitudes past 180°.
 pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> Option<[f64; 4]> {
     edge_envelope(bbox, |x, y| crs.inverse(x, y))
+}
+
+/// Whether the projected bbox `[min_e, min_n, max_e, max_n]` lies wholly
+/// outside `crs`'s valid area, where no point maps to the Earth. A map of it
+/// is empty content (WMS 1.3.0 §7.3.3.6), with nothing to read.
+///
+/// For the projected output CRSs ([`projected_output_crs`]) that area is
+/// convex and symmetric about the axes through a centre:
+/// - LAEA: the ellipse `ρ ≤ 2·Rq` around the false origin. Past it the
+///   inverse is NaN.
+/// - Transverse Mercator: the strip `|N − N_eq| ≤ k₀ · 2 · M(90°)` about the
+///   equator's northing `N_eq`, at any easting, centred on
+///   `(false_e, N_eq)`. Inside it, past a pole, the inverse gives latitudes
+///   of 90° to 180°; past it, finite but meaningless ones, so the strip is
+///   tested on its own. Eastings so far out that the inverse has no finite
+///   result (10²⁰ m, next to TM's singular points on the equator) are left
+///   out too: a render draws nothing there either.
+///
+/// So the bbox meets the area exactly when its point nearest the centre
+/// does, the centre clamped into the bbox: one test. Unlike the edge samples
+/// of [`wgs84_envelope`], it also sees an area the bbox encloses. `false`
+/// for every other variant, none of which is an output CRS.
+pub fn outside_projection_domain(crs: &Crs, bbox: [f64; 4]) -> bool {
+    let (centre_e, centre_n) = match *crs {
+        Crs::LambertAzimuthalEqualArea {
+            false_e, false_n, ..
+        } => (false_e, false_n),
+        Crs::TransverseMercator {
+            lat0,
+            k0,
+            false_e,
+            false_n,
+            ..
+        } => (false_e, tm_strip(lat0, k0, false_n).0),
+        _ => return false,
+    };
+    let [min_e, min_n, max_e, max_n] = bbox;
+    // `max` then `min`, not `clamp`, which panics on an inverted range.
+    let e = centre_e.max(min_e).min(max_e);
+    let n = centre_n.max(min_n).min(max_n);
+    !maps_to_earth(crs, e, n)
+}
+
+/// Whether the projected point `(e, n)` lies in `crs`'s valid area: it
+/// inverse-projects and, for Transverse Mercator, lies in [`tm_strip`].
+fn maps_to_earth(crs: &Crs, e: f64, n: f64) -> bool {
+    if let Crs::TransverseMercator {
+        lat0, k0, false_n, ..
+    } = *crs
+    {
+        let (equator, half_width) = tm_strip(lat0, k0, false_n);
+        if (n - equator).abs() > half_width {
+            return false;
+        }
+    }
+    crs.inverse(e, n).is_some()
+}
+
+/// The strip a Transverse Mercator projection maps the Earth into: the
+/// equator's northing, and the half-width that the meridian from the
+/// equator over a pole to the equator on the far side covers, two quarter
+/// meridians at scale `k0`.
+fn tm_strip(lat0: f64, k0: f64, false_n: f64) -> (f64, f64) {
+    (
+        false_n - k0 * meridian_arc(lat0),
+        k0 * 2.0 * meridian_arc(PI / 2.0),
+    )
 }
 
 /// Projected envelope `[min_e, min_n, max_e, max_n]` (in `crs`'s metres) of a
@@ -2168,11 +2240,11 @@ mod tests {
     #[test]
     fn edge_envelope_is_none_when_every_sample_fails() {
         // Backs the wgs84_envelope DoS guard (#267 review): if no sampled point
-        // transforms, the envelope is None so the caller returns HTTP 400 —
-        // never a fabricated or global-extent box that would trigger a
-        // whole-dataset read. (The projection inverses are Newton-based and
-        // return finite values almost everywhere, so this contract is exercised
-        // at the edge-sampling level rather than via a specific CRS.)
+        // transforms, the envelope is None — never a fabricated or
+        // global-extent box that would trigger a whole-dataset read. The
+        // caller tells a box wholly outside the projection (the empty map)
+        // from one enclosing what its edges miss (a 400) with
+        // `outside_projection_domain`; see its test for real CRSs.
         assert_eq!(edge_envelope([0.0, 0.0, 1.0, 1.0], |_, _| None), None);
         // And Some, with correct min/max, when points do transform.
         assert_eq!(
@@ -2186,6 +2258,80 @@ mod tests {
         let crs = projected_output_crs("EPSG:3035").unwrap();
         let proj = projected_envelope(&crs, [5.0, 48.0, 15.0, 55.0]);
         assert!(wgs84_envelope(&crs, proj).is_some());
+    }
+
+    /// `outside_projection_domain` says whether any point of a box maps to
+    /// the Earth, checked here against a 41 × 41 grid of points. It also sees
+    /// a valid area the box encloses, where the edge samples of
+    /// `wgs84_envelope` find nothing, and TM's strip, past which the inverse
+    /// is finite but meaningless (#1089).
+    #[test]
+    fn outside_projection_domain_matches_the_inverse() {
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let meets = |crs: &Crs, [x0, y0, x1, y1]: [f64; 4]| {
+            let at = |lo: f64, hi: f64, k: u32| lo + (hi - lo) * f64::from(k) / 40.0;
+            (0..=40).any(|i| (0..=40).any(|j| maps_to_earth(crs, at(x0, x1, i), at(y0, y1, j))))
+        };
+        // (crs, box, wholly outside, has an envelope). The LAEA disk is
+        // centred at (4 321 000, 3 210 000), its radius about 12 742 km.
+        for (crs, bbox, outside, envelope) in [
+            // Europe.
+            (&laea, [4.0e6, 3.0e6, 4.5e6, 3.5e6], false, true),
+            // Across the rim, east of the centre.
+            (&laea, [1.6e7, 2.2e6, 1.8e7, 4.2e6], false, true),
+            // Past the rim: east, west, north, south.
+            (&laea, [1.8e7, 2.2e6, 1.9e7, 4.2e6], true, false),
+            (&laea, [1.71e7, 3.0e6, 1.72e7, 3.1e6], true, false),
+            (&laea, [-1.5e7, 2.2e6, -1.0e7, 4.2e6], true, false),
+            (&laea, [3.0e6, 1.7e7, 5.0e6, 1.8e7], true, false),
+            (&laea, [3.0e6, -1.2e7, 5.0e6, -1.0e7], true, false),
+            // Past it diagonally, though each axis range overlaps the disk's.
+            (&laea, [1.4e7, 1.2e7, 1.5e7, 1.3e7], true, false),
+            // Wider than the disk: the edges miss it, the box encloses it.
+            (&laea, [-3.0e7, -3.0e7, 3.0e7, 3.0e7], false, false),
+            // Tall: its west edge crosses the disk only for northings of
+            // about 1.9e6 to 4.5e6, between the edge samples at 0 and 5e6.
+            (&laea, [1.7e7, -5.0e7, 1.8e7, 5.0e7], false, false),
+            // Finland.
+            (&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6], false, true),
+            // Inside the TM strip past the North Pole, at latitudes of 90° to
+            // 180° on the far meridian, and across the strip's edge.
+            (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7], false, true),
+            (&tm, [0.0, 1.9e7, 1.0e6, 2.1e7], false, true),
+            // Past the strip, north and south: the inverse is finite there,
+            // the envelope too, but nothing maps to the Earth.
+            (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7], true, true),
+            (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7], true, true),
+            // Past it, its eastings reaching far to both sides.
+            (&tm, [-5.0e7, 2.1e7, 5.0e7, 2.2e7], true, true),
+            // Eastings so far out that the TM inverse has no finite result,
+            // each side.
+            (&tm, [1.0e20, 6.5e6, 2.0e20, 7.0e6], true, false),
+            (&tm, [-2.0e20, 6.5e6, -1.0e20, 7.0e6], true, false),
+        ] {
+            assert_eq!(outside_projection_domain(crs, bbox), outside, "{bbox:?}");
+            assert_eq!(meets(crs, bbox), !outside, "{bbox:?}");
+            assert_eq!(wgs84_envelope(crs, bbox).is_some(), envelope, "{bbox:?}");
+        }
+        // The strip's edge, against the WGS84 quarter meridian of
+        // 10 001 965.729 m: EPSG:3067's strip reaches
+        // 0.9996 · 2 · 10 001 965.729 = 19 995 929.885 m from the equator.
+        let (equator, half_width) = tm_strip(0.0, 0.9996, 0.0);
+        assert_eq!(equator, 0.0);
+        assert!((half_width - 19_995_929.885).abs() < 0.01, "{half_width}");
+        for (north, outside) in [(19_995_000.0, false), (19_997_000.0, true)] {
+            for bbox in [[0.0, north, 1.0e6, 2.1e7], [0.0, -2.1e7, 1.0e6, -north]] {
+                assert_eq!(outside_projection_domain(&tm, bbox), outside, "{bbox:?}");
+            }
+        }
+        // No other variant is an output CRS: never known to be outside.
+        assert!(!outside_projection_domain(
+            &Crs::Wgs84,
+            [1.0e300, 1.0e300, 1.5e300, 1.5e300]
+        ));
+        // An inverted box does not panic.
+        outside_projection_domain(&laea, [1.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]

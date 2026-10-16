@@ -14,7 +14,7 @@ use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 
 use ds_core::error::DataServerError;
 use ds_core::feature::MAX_AREA_VALUES;
-use ds_core::model::CoverageResponse;
+use ds_core::model::{CoverageResponse, Location, LocationSnapshot};
 use ds_core::trajectory::{TrajectoryPath, MAX_TRAJECTORY_NODES, MAX_TRAJECTORY_SAMPLES};
 use ds_render::{render_chart, render_heatmap};
 
@@ -33,8 +33,8 @@ use crate::params::{
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
-    collection_parameter_json, coverage_response_to_json, locations_to_writer, LocationsContext,
-    LocationsPage, COVERAGE_JSON_MEDIA_TYPE,
+    collection_parameter_json, coverage_response_to_json, locations_to_writer, LocationRows,
+    LocationsContext, LocationsPage, COVERAGE_JSON_MEDIA_TYPE,
 };
 
 /// Converting through [`JsonError`] is what attaches the `ErrorReason` the
@@ -228,7 +228,8 @@ impl StationNames<'_> {
 }
 
 impl GeoJsonRequest {
-    /// The names of this query's stations, from the engine's inventory.
+    /// The names of this query's stations, from the engine's inventory
+    /// snapshot, borrowed (#1083).
     fn station_names(&self) -> Result<StationNames<'_>, HandlerError> {
         Ok(StationNames {
             index: LocationIndex::new(
@@ -2409,31 +2410,50 @@ pub async fn locations(
                 Json(json!({ "code": "ServerError", "description": "Internal server error" })),
             )
         };
-        let mut locs = query_engine.get_locations().map_err(|_| server_error())?;
+        // The engine's shared snapshot: pages and filters borrow from it,
+        // nothing copies the list (#1083).
+        let inventory = query_engine.get_locations().map_err(|_| server_error())?;
         // Filter first, then page: `numberMatched` and the links count the
         // locations left. `contains` handles `west > east`; the box goes
         // first, so the time filter probes only the locations inside it.
-        if let Some(bbox) = &request.bbox {
-            locs.retain(|loc| bbox.contains(loc.longitude, loc.latitude));
-        }
-        if let Some(datetime) = &request.datetime {
-            let intervals = datetime.intervals();
-            // Built after `get_locations`, never around it: the filter may
-            // hold a read guard on the engine's index.
-            let Some(has_data) = query_engine.location_time_filter(&intervals) else {
-                return Err(JsonError(
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "code": "BadRequest",
-                        "description": format!(
-                            "Collection '{id}' cannot filter its locations by datetime: \
-                             they carry no per-location time. Leave datetime out to list them all"
-                        )
-                    })),
-                ));
-            };
-            locs.retain(|loc| has_data(loc));
-        }
+        let in_box = |loc: &Location| {
+            request
+                .bbox
+                .as_ref()
+                .is_none_or(|bbox| bbox.contains(loc.longitude, loc.latitude))
+        };
+        let kept: Option<Vec<&Location>> = match &request.datetime {
+            None if request.bbox.is_none() => None,
+            None => Some(inventory.iter().filter(|loc| in_box(loc)).collect()),
+            Some(datetime) => {
+                let intervals = datetime.intervals();
+                // Built after `get_locations`, never around it: the filter
+                // may hold a read guard on the engine's index, released at
+                // the end of this block, before serialization.
+                let Some(has_data) = query_engine.location_time_filter(&intervals) else {
+                    return Err(JsonError(
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "code": "BadRequest",
+                            "description": format!(
+                                "Collection '{id}' cannot filter its locations by datetime: \
+                                 they carry no per-location time. Leave datetime out to list them all"
+                            )
+                        })),
+                    ));
+                };
+                Some(
+                    inventory
+                        .iter()
+                        .filter(|loc| in_box(loc) && has_data(loc))
+                        .collect(),
+                )
+            }
+        };
+        let locs = match &kept {
+            Some(kept) => LocationRows::Kept(kept),
+            None => LocationRows::Run(&inventory),
+        };
         let params = query_engine.get_parameters();
         let temporal = query_engine
             .get_temporal_extent()
@@ -2453,7 +2473,7 @@ pub async fn locations(
                 if request.is_filtered() {
                     links.push((request.href(&href, 0), "self", "Locations"));
                 }
-                (&locs[..], None)
+                (locs, None)
             }
             // One page: the /collections paging arithmetic over the list.
             Some(paging) => {
@@ -2473,7 +2493,7 @@ pub async fn locations(
                         "Previous page",
                     ));
                 }
-                (&locs[window.range()], Some(locs.len()))
+                (locs.page(window.range()), Some(locs.len()))
             }
         };
         // What a `ResponseLimit` names: a page, a filtered list or the
@@ -2837,17 +2857,18 @@ fn query_location_list(
 }
 
 /// The 404 for a listed location id the collection does not have. `known`
-/// caches the inventory's ids across one list. An engine whose inventory is
-/// itself not found (a radar site that dropped out) knows no ids.
+/// holds the inventory snapshot across one list, read once and looked up by
+/// id (#1083). An engine whose inventory is itself not found (a radar site
+/// that dropped out) knows no ids.
 fn require_known_location(
     engine: &dyn EdrEngine,
-    known: &mut Option<std::collections::HashSet<String>>,
+    known: &mut Option<Arc<LocationSnapshot>>,
     id: &str,
 ) -> Result<(), HandlerError> {
     if known.is_none() {
         *known = Some(match engine.get_locations() {
-            Ok(locations) => locations.into_iter().map(|l| l.id).collect(),
-            Err(DataServerError::LocationNotFound(_)) => Default::default(),
+            Ok(locations) => locations,
+            Err(DataServerError::LocationNotFound(_)) => LocationSnapshot::empty(),
             Err(e) => return Err(map_query_error(&e, "Location")),
         });
     }

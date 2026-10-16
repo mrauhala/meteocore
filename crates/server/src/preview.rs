@@ -880,7 +880,7 @@ mod tests {
     use ds_core::feature::{Feature, FeaturePage, FeatureQuery};
     use ds_core::feature_engine::FeatureEngine;
     use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
-    use ds_core::model::{CoverageResponse, Location};
+    use ds_core::model::{CoverageResponse, LocationSnapshot};
 
     use crate::admin::ServerState;
 
@@ -892,8 +892,8 @@ mod tests {
     }
 
     impl EdrEngine for EdrMock {
-        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-            Ok(Vec::new())
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+            Ok(LocationSnapshot::empty())
         }
         fn query_location(
             &self,
@@ -1452,8 +1452,8 @@ mod tests {
             interval: (DateTime<Utc>, DateTime<Utc>),
         }
         impl EdrEngine for IntervalOnlyMock {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(Vec::new())
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -1574,8 +1574,8 @@ mod tests {
             interval: (DateTime<Utc>, DateTime<Utc>),
         }
         impl EdrEngine for IntervalOnlyEdr {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(Vec::new())
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -1904,8 +1904,8 @@ mod tests {
         // tile descriptor so the dropdown surfaces in the SPA.
         struct MultiParamEdr;
         impl EdrEngine for MultiParamEdr {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(Vec::new())
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -2254,8 +2254,8 @@ mod tests {
 
         struct MultiParamEdrShim;
         impl EdrEngine for MultiParamEdrShim {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(Vec::new())
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -2353,8 +2353,8 @@ mod tests {
 
         struct WideEdr;
         impl EdrEngine for WideEdr {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(Vec::new())
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,

@@ -21,7 +21,7 @@ use ds_core::error::DataServerError;
 use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::instances::RunInfo;
-use ds_core::model::{CoverageResponse, Location};
+use ds_core::model::{CoverageResponse, Location, LocationSnapshot};
 
 #[path = "support/edr_schema.rs"]
 mod edr_schema;
@@ -104,15 +104,17 @@ impl FeatureEngine for Stations {
 
 impl EdrEngine for Stations {
     /// Every station is a location, labelled unlike its `name` property.
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok((0..COUNT)
-            .map(|i| Location {
-                id: format!("s{i}"),
-                label: format!("Station {i}"),
-                latitude: 60.0,
-                longitude: 20.0 + 0.5 * i as f64,
-            })
-            .collect())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(
+            (0..COUNT)
+                .map(|i| Location {
+                    id: format!("s{i}"),
+                    label: format!("Station {i}"),
+                    latitude: 60.0,
+                    longitude: 20.0 + 0.5 * i as f64,
+                })
+                .collect(),
+        )))
     }
 
     fn query_location(

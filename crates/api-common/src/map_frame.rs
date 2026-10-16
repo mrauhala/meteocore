@@ -266,7 +266,12 @@ pub struct Frame {
 /// Why a box has no frame in the requested CRS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
-    /// The box lies entirely outside a projection's valid area.
+    /// The box's edge samples all miss a projection's valid area
+    /// (`geo::wgs84_envelope` is `None`): the box lies wholly outside it, or
+    /// the area lies inside the box, as in an EPSG:3035 box wider than the
+    /// LAEA disk. Not every box wholly outside gets here: past Transverse
+    /// Mercator's strip the inverse is finite, and such a frame renders
+    /// empty through `get_raster_tile_in_domain` (#1089).
     OutsideDomain,
 }
 
@@ -365,8 +370,8 @@ impl Frame {
 
     /// The `get_raster_tile` viewport and output CRS: for a projected CRS the
     /// longitude/latitude envelope the engine reads, with the metres frame
-    /// carried in [`OutputCrs::Projected`]. `None` when the projected frame is
-    /// entirely outside its CRS's valid area.
+    /// carried in [`OutputCrs::Projected`]. `None` when the frame's edge
+    /// samples all miss its CRS's valid area, as for [`FrameError::OutsideDomain`].
     pub fn render_target(&self) -> Option<([f64; 4], OutputCrs)> {
         match self.crs {
             MapCrs::Crs84 | MapCrs::Epsg4326 => Some((self.rect, OutputCrs::Wgs84)),
