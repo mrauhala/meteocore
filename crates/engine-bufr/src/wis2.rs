@@ -601,15 +601,24 @@ mod tests {
         let ids: Vec<String> = e
             .get_locations()
             .unwrap()
-            .into_iter()
-            .map(|l| l.id)
+            .iter()
+            .map(|l| l.id.clone())
             .collect();
         assert_eq!(ids, vec!["0-20000-0-68155"]);
         // Unknown / repeated deletion is a no-op.
+        let before = e.get_locations().unwrap();
         src.apply(&e, resolved("se-smhi/a", None));
         src.apply(&e, resolved("never-seen", None));
         e.snapshot_if_dirty();
-        assert_eq!(e.get_locations().unwrap().len(), 1);
+        let after = e.get_locations().unwrap();
+        assert_eq!(after.len(), 1);
+        // Nothing changed, nothing was rebuilt: every request shares the one
+        // snapshot (#1083).
+        assert!(std::sync::Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            after.by_id("0-20000-0-68155").unwrap().id,
+            "0-20000-0-68155"
+        );
     }
 
     #[test]

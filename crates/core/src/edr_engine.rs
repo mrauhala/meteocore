@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -6,7 +7,7 @@ use crate::cube::CubeResolution;
 use crate::error::DataServerError;
 use crate::feature::{Bbox, DatetimeInterval, Feature};
 use crate::instances::RunInfo;
-use crate::model::{CoverageResponse, Location, ParameterDescription};
+use crate::model::{CoverageResponse, Location, LocationSnapshot, ParameterDescription};
 use crate::vertical::VerticalDimension;
 
 /// A predicate over [`EdrEngine::get_locations`] entries: `true` keeps the
@@ -15,7 +16,19 @@ use crate::vertical::VerticalDimension;
 pub type LocationFilter<'a> = Box<dyn Fn(&Location) -> bool + 'a>;
 
 pub trait EdrEngine: Send + Sync {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
+    /// The locations this engine serves, in its inventory order: the
+    /// `/locations` list, and the ids [`Self::query_location`] answers.
+    ///
+    /// **O(1)** (Critical Rule 10, #1083): return a clone of the `Arc` the
+    /// engine built when it loaded or last refreshed its data, never a list
+    /// built per call. The API reads it on every `/locations` and `items`
+    /// request, every station GeoJSON or CSV query, and an unknown id of a
+    /// location list, and borrows from it: pages are slices, ids are looked
+    /// up with [`LocationSnapshot::by_id`]. An engine whose locations change
+    /// at runtime builds a new snapshot when they change and swaps it in; a
+    /// request holding the old one keeps it alive until it finishes. An
+    /// engine without locations returns [`LocationSnapshot::empty`].
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError>;
 
     /// The `datetime` filter of the `/locations` list (#932): a predicate
     /// that is `true` for a location with at least one observation inside

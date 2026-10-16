@@ -31,8 +31,8 @@ use ds_core::model::*;
 struct MockEngine;
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![
             Location {
                 id: "station1".to_string(),
                 label: "Helsinki".to_string(),
@@ -45,7 +45,7 @@ impl EdrEngine for MockEngine {
                 latitude: 61.4978,
                 longitude: 23.7610,
             },
-        ])
+        ])))
     }
 
     fn query_location(
@@ -654,8 +654,8 @@ async fn finding_16_data_queries_link_structure() {
 async fn data_queries_default_output_format_set_for_all_query_types() {
     struct AllQueriesEngine;
     impl EdrEngine for AllQueriesEngine {
-        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-            Ok(vec![])
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+            Ok(LocationSnapshot::empty())
         }
         fn query_location(
             &self,
@@ -722,8 +722,8 @@ struct QueryTypesEngine {
 }
 
 impl EdrEngine for QueryTypesEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
     fn query_location(
         &self,

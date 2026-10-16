@@ -91,16 +91,16 @@ impl Stub {
 }
 
 impl EdrEngine for Stub {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         if self.answer == Answer::Broken {
             return Err(DataServerError::Engine("boom".into()));
         }
-        Ok(vec![Location {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "a".into(),
             label: "A".into(),
             latitude: 1.0,
             longitude: 1.0,
-        }])
+        }])))
     }
     fn get_instances(&self) -> Vec<RunInfo> {
         vec![RunInfo {

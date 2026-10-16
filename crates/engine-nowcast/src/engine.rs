@@ -44,7 +44,8 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::instances::{build_instances, format_instance_id, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_core::resample::ProjectionGrid;
 use ds_core::significance::WeightedScorer;
@@ -2290,8 +2291,8 @@ impl NowcastEngine {
 }
 
 impl EdrEngine for NowcastEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     /// Every retained generation is an instance, exactly as WMS advertises

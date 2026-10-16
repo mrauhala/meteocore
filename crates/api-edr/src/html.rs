@@ -27,11 +27,13 @@ use api_common::workbench::{self as ui, Page, Surface};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use ds_core::html::escape;
-use ds_core::model::{CoverageResponse, Location};
+use ds_core::model::CoverageResponse;
 use serde_json::Value;
 
 use crate::geojson::{encode_path_segment, FeatureSummary};
-use crate::response::{coverage_response_to_json, LocationsContext, COVERAGE_JSON_MEDIA_TYPE};
+use crate::response::{
+    coverage_response_to_json, LocationRows, LocationsContext, COVERAGE_JSON_MEDIA_TYPE,
+};
 
 /// The `Content-Type` of every HTML data page.
 pub(crate) const CONTENT_TYPE: &str = "text/html; charset=utf-8";
@@ -920,7 +922,7 @@ fn self_href(feature: &Value) -> Option<&str> {
 /// so they are listed once above the table; each row carries the
 /// location's id, label, point and data links.
 pub(crate) fn write_locations(
-    locations: &[Location],
+    locations: LocationRows<'_>,
     ctx: &LocationsContext,
     page: &DataPage,
     counts: Option<(usize, usize)>,
@@ -966,7 +968,7 @@ pub(crate) fn write_locations(
     );
     body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Locations</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">label</th><th scope=\"col\">geometry</th><th scope=\"col\">Longitude</th><th scope=\"col\">Latitude</th><th scope=\"col\">edrqueryendpoint</th><th scope=\"col\">links</th><th scope=\"col\">View</th></tr></thead><tbody>");
     w.write_all(body.as_bytes())?;
-    for loc in locations {
+    for loc in locations.iter() {
         let endpoint = format!(
             "{}/edr/collections/{}/locations/{}",
             ctx.base_url,

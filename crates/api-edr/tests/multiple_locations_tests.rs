@@ -100,17 +100,19 @@ struct Stations {
 }
 
 impl EdrEngine for Stations {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         *self.inventory_reads.lock().unwrap() += 1;
-        Ok(["s0", "s1", "s2", "s3", "big0", "big1", COMMA_ID]
-            .iter()
-            .map(|id| Location {
-                id: id.to_string(),
-                label: id.to_string(),
-                latitude: 60.0,
-                longitude: 24.0,
-            })
-            .collect())
+        Ok(Arc::new(LocationSnapshot::new(
+            ["s0", "s1", "s2", "s3", "big0", "big1", COMMA_ID]
+                .iter()
+                .map(|id| Location {
+                    id: id.to_string(),
+                    label: id.to_string(),
+                    latitude: 60.0,
+                    longitude: 24.0,
+                })
+                .collect(),
+        )))
     }
 
     fn query_location(

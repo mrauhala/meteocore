@@ -19,7 +19,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::feature::{FilterableProperties, PropertyValue};
-use ds_core::model::{Location, ParameterDescription};
+use ds_core::model::{Location, LocationSnapshot, ParameterDescription};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 use tokio_postgres::types::Type;
@@ -139,7 +139,8 @@ pub struct CollectionMeta {
     /// `stations.property_cols` plus the names the cached rows carry
     /// (`station_filterables`, #1024).
     pub filterables: FilterableProperties,
-    pub locations: Arc<Vec<Location>>,
+    /// What `get_locations` hands every request, shared (#1083).
+    pub locations: Arc<LocationSnapshot>,
     /// `id → index into feature_stations/locations` lookup built once
     /// per refresh. Constant-time station resolution for
     /// `query_location`, `query_area` (per-station), and
@@ -170,7 +171,7 @@ impl CollectionMeta {
         Self {
             feature_stations: Arc::new(Vec::new()),
             filterables: station_filterables(cfg, &[]),
-            locations: Arc::new(Vec::new()),
+            locations: LocationSnapshot::empty(),
             station_idx: Arc::new(HashMap::new()),
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
@@ -218,7 +219,7 @@ impl CollectionMeta {
         Self {
             filterables: station_filterables(cfg, &feature_stations),
             feature_stations: Arc::new(feature_stations),
-            locations: Arc::new(locations),
+            locations: Arc::new(LocationSnapshot::new(locations)),
             station_idx: Arc::new(station_idx),
             parameters: Arc::new(parameters),
             temporal_extent,
@@ -922,7 +923,7 @@ mod tests {
         let next = CollectionMeta {
             feature_stations: Arc::new(vec![]),
             filterables: Default::default(),
-            locations: Arc::new(vec![mk_loc("s", 1.0, 2.0)]),
+            locations: Arc::new(LocationSnapshot::new(vec![mk_loc("s", 1.0, 2.0)])),
             station_idx: Arc::new(HashMap::from([("s".to_string(), 0)])),
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
@@ -1284,13 +1285,16 @@ mod tests {
             out
         }
 
-        /// Bytes per station of the decoded rows, of the snapshot built from
-        /// them (the rows plus the `Location` list and the id index) and of the
-        /// `Vec<Location>` copy `get_locations` hands each `/locations` request.
-        /// Run with `--nocapture` to print them. The bound keeps the documented
-        /// sizing honest: under 1 KiB a station, 200 000 stations stay under
-        /// 200 MiB resident and a refresh, which holds the old snapshot while it
-        /// builds the next, under 400 MiB.
+        /// Bytes per station of the decoded rows and of the snapshot built
+        /// from them (the rows plus the `Location` snapshot and the id
+        /// indexes). Run with `--nocapture` to print them. The bound keeps
+        /// the documented sizing honest: under 1 KiB a station, 200 000
+        /// stations stay under 200 MiB resident and a refresh, which holds
+        /// the old snapshot while it builds the next, under 400 MiB.
+        ///
+        /// What a request costs is pinned too (#1083): the `Location` list
+        /// `get_locations` hands it, a lookup by id and a page of it allocate
+        /// nothing.
         #[test]
         fn per_station_bytes_of_the_cached_snapshot() {
             const N: usize = 20_000;
@@ -1309,21 +1313,27 @@ mod tests {
             let build_time = started.elapsed();
             let snapshot_bytes = live() - before;
 
-            let before_copy = live();
-            let copy = (*meta.locations).clone();
-            let copy_bytes = live() - before_copy;
+            let before_request = live();
+            let shared = Arc::clone(&meta.locations);
+            let found = shared.by_id("0-20000-0-12345").map(|l| l.label.len());
+            let page = shared[N - 100..].len();
+            let request_bytes = live() - before_request;
 
             let per = |bytes: isize| bytes as f64 / N as f64;
             eprintln!(
-                "per station: decoded rows {:.0} B, snapshot {:.0} B, /locations copy {:.0} B; \
+                "per station: decoded rows {:.0} B, snapshot {:.0} B; per request {request_bytes} B; \
                  build {:.2} µs/station (debug build)",
                 per(rows_bytes),
                 per(snapshot_bytes),
-                per(copy_bytes),
                 build_time.as_secs_f64() * 1e6 / N as f64,
             );
             assert_eq!(meta.feature_stations.len(), N);
-            assert_eq!(copy.len(), N);
+            assert_eq!(found, Some("Station name 012345".len()));
+            assert_eq!(page, 100);
+            assert_eq!(
+                request_bytes, 0,
+                "a request must borrow the list, never copy it"
+            );
             assert!(per(rows_bytes) > 100.0, "the counter must see the rows");
             assert!(
                 per(snapshot_bytes) < 1024.0,
@@ -1331,7 +1341,7 @@ mod tests {
                  POSTGIS_DEFAULT_MAX_LOCATIONS and the engine-postgis README sizing",
                 per(snapshot_bytes)
             );
-            drop(copy);
+            drop(shared);
             drop(meta);
         }
     }

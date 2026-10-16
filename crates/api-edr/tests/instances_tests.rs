@@ -40,8 +40,8 @@ impl ForecastMock {
 }
 
 impl EdrEngine for ForecastMock {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn get_instances(&self) -> Vec<RunInfo> {
@@ -139,13 +139,13 @@ impl EdrEngine for ForecastMock {
 struct StationForecastMock;
 
 impl EdrEngine for StationForecastMock {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "station".to_string(),
             label: "Station".to_string(),
             latitude: 60.0,
             longitude: 25.0,
-        }])
+        }])))
     }
     fn serves_station_series(&self) -> bool {
         true
@@ -193,8 +193,8 @@ impl EdrEngine for StationForecastMock {
 struct NonForecastMock;
 
 impl EdrEngine for NonForecastMock {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
     fn query_location(
         &self,
@@ -321,8 +321,8 @@ impl ArchiveMock {
 }
 
 impl EdrEngine for ArchiveMock {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
     fn get_instances(&self) -> Vec<RunInfo> {
         panic!("a request enumerated every run of a long run axis with its valid times");

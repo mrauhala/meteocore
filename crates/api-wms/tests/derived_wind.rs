@@ -20,7 +20,7 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{
     MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile, RasterValues,
 };
-use ds_core::model::{CoverageResponse, Location};
+use ds_core::model::{CoverageResponse, LocationSnapshot};
 use ds_core::wind::{
     DerivedWind, GridAxes, OutcomeLog, ParameterFacts, VectorFrame, WindFacts, WindSource,
 };
@@ -93,8 +93,8 @@ impl MapEngine for Components {
 }
 
 impl EdrEngine for Components {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(

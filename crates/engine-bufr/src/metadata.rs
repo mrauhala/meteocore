@@ -7,14 +7,15 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::feature::{Feature, Geometry, PropertyValue};
-use ds_core::model::Location;
+use ds_core::model::{Location, LocationSnapshot};
 
 use crate::store::{ObsStore, StationInfo};
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub stations: Arc<Vec<StationInfo>>,
-    pub locations: Arc<Vec<Location>>,
+    /// What `get_locations` hands every request (#1083).
+    pub locations: Arc<LocationSnapshot>,
     pub features: Arc<Vec<Feature>>,
     /// station id → index into `stations` / `locations` / `features`.
     pub index: Arc<HashMap<String, usize>>,
@@ -29,7 +30,7 @@ impl Snapshot {
     pub fn empty() -> Self {
         Snapshot {
             stations: Arc::new(Vec::new()),
-            locations: Arc::new(Vec::new()),
+            locations: LocationSnapshot::empty(),
             features: Arc::new(Vec::new()),
             index: Arc::new(HashMap::new()),
             spatial_extent: None,
@@ -105,7 +106,7 @@ impl Snapshot {
         }
         Snapshot {
             stations: Arc::new(stations),
-            locations: Arc::new(locations),
+            locations: Arc::new(LocationSnapshot::new(locations)),
             features: Arc::new(features),
             index: Arc::new(index),
             spatial_extent: spatial,

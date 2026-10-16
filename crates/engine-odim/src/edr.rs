@@ -25,13 +25,15 @@
 //! runtime handle for remote reads instead.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{parse_area_coords, QueryPolygon};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 
 use crate::catalog::CatalogEntry;
@@ -400,9 +402,9 @@ impl OdimEngine {
 }
 
 impl EdrEngine for OdimEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         // ODIM composites are gridded fields, not station networks.
-        Ok(vec![])
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(

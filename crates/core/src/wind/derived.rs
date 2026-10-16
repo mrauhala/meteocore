@@ -15,7 +15,9 @@ use crate::instances::RunInfo;
 use crate::map_engine::{
     CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile, RasterValues,
 };
-use crate::model::{CoverageResponse, Location, NdArray, ParameterDescription, QueryResult};
+use crate::model::{
+    CoverageResponse, LocationSnapshot, NdArray, ParameterDescription, QueryResult,
+};
 use crate::vertical::VerticalDimension;
 
 /// Reports one pair's outcome: `(collection id, outcome)`. Called for every
@@ -675,7 +677,7 @@ impl MapEngine for DerivedWind {
 }
 
 impl EdrEngine for DerivedWind {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         self.edr.get_locations()
     }
 

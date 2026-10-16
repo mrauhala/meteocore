@@ -71,13 +71,13 @@ fn point_series() -> CoverageResponse {
 }
 
 impl EdrEngine for EveryQueryEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "here".to_string(),
             label: "Here".to_string(),
             latitude: 60.0,
             longitude: 25.0,
-        }])
+        }])))
     }
 
     fn get_instances(&self) -> Vec<RunInfo> {

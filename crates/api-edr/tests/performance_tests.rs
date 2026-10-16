@@ -62,7 +62,7 @@ struct ScalableEngine {
 }
 
 impl EdrEngine for ScalableEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         let locations = (0..self.location_count)
             .map(|i| Location {
                 id: format!("loc_{i}"),
@@ -71,7 +71,7 @@ impl EdrEngine for ScalableEngine {
                 longitude: 24.0 + (i as f64 * 0.01),
             })
             .collect();
-        Ok(locations)
+        Ok(Arc::new(LocationSnapshot::new(locations)))
     }
 
     fn query_location(
@@ -202,13 +202,13 @@ struct WorkerMetadataEngine {
 }
 
 impl EdrEngine for WorkerMetadataEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "one".into(),
             label: "Station one".into(),
             latitude: 60.0,
             longitude: 24.0,
-        }])
+        }])))
     }
 
     fn query_location(

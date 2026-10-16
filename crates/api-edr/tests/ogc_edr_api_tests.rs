@@ -87,8 +87,8 @@ impl MockEngine {
 }
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Self::sample_locations())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(Self::sample_locations())))
     }
 
     fn query_location(
@@ -564,7 +564,7 @@ mod collections {
         // (locations, parameters, etc.) is exercised identically.
         struct VerticalMockEngine(MockEngine);
         impl EdrEngine for VerticalMockEngine {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
                 self.0.get_locations()
             }
             fn query_location(
@@ -619,7 +619,7 @@ mod collections {
     async fn per_parameter_temporal_extent_validates() {
         struct OwnTimesEngine(MockEngine);
         impl EdrEngine for OwnTimesEngine {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
                 self.0.get_locations()
             }
             fn query_location(
@@ -700,7 +700,7 @@ mod collections {
     async fn parameter_names_follow_metocean_profile() {
         struct DescribedEngine(MockEngine);
         impl EdrEngine for DescribedEngine {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
                 self.0.get_locations()
             }
             fn query_location(
@@ -1782,8 +1782,8 @@ mod unimplemented_queries {
 
         struct TrajectoryMock;
         impl EdrEngine for TrajectoryMock {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(vec![])
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -1937,8 +1937,8 @@ mod unimplemented_queries {
             VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0, 500.0])
         }
         impl EdrEngine for AlongPathMock {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(vec![])
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -2300,7 +2300,7 @@ mod request_budget {
         values_per_point: usize,
     }
     impl EdrEngine for CountingEngine {
-        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
             MockEngine.get_locations()
         }
         fn get_parameters(&self) -> Vec<String> {
@@ -2350,7 +2350,7 @@ mod request_budget {
     }
 
     impl EdrEngine for BatchEngine {
-        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
             MockEngine.get_locations()
         }
         fn get_parameters(&self) -> Vec<String> {
