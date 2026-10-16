@@ -1663,7 +1663,7 @@ Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: 
 3. Build a cache key from quantized bbox, layer, style, format, CRS, width, height, time, and parameter.
 4. Check the rendered-image cache (shared LRU). On hit: compare the cached entry's content-derived ETag against `If-None-Match` — match → `304` with `X-Cache: HIT`, otherwise return the cached bytes with `X-Cache: HIT`.
 5. On miss: acquire a render semaphore permit (timed out → 503). Run `MapEngine::get_raster_tile()` on a blocking thread — the engine projects the bbox into the source CRS, picks the best overview, reads source tiles, and resamples (nearest-neighbor).
-6. Empty (all-nodata) tile: encode a transparent PNG with `Content-Type: image/png`. Error: render the red error tile (WMS only). Neither is inserted into the cache.
+6. Empty (all-nodata) tile: serve the empty image in the requested format and quality: transparent, or the background colour for `TRANSPARENT=FALSE` and JPEG. It is encoded once per size, background and format. Error: render the red error tile (WMS only) in the requested format too, flattened onto the background for JPEG. Neither is inserted into the cache.
 7. Populated tile: colorize (LUT for discrete data, linear gradient for continuous), encode to PNG/JPEG/WebP, wrap in `CachedRendered` (which derives the ETag via FNV-1a over the bytes), and insert into the cache.
 8. Compare the freshly-computed ETag against `If-None-Match` — match → `304` carrying the same `X-Cache` label the 200 would have (`MISS`, `EMPTY`, or `ERROR`), otherwise return the body with `X-Cache: MISS | EMPTY | ERROR`. Revalidations stay categorised the same as initial fetches on dashboards.
 
@@ -1885,7 +1885,7 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 - `Content-Datetime:` the instant rendered, on a collection with a temporal extent
 - `ETag:` FNV-1a hash of the encoded response body — changes whenever the rendered pixels change, regardless of whether the cache key changed. This is what makes a server-side fix (e.g. colormap correction) invalidate stale browser caches instead of letting them serve infinite `304`s.
 - `Cache-Control: public, max-age=86400, immutable` when a time instant is requested; `public, max-age=60, must-revalidate` otherwise, intervals and `*` included
-- `X-Cache: HIT | MISS | EMPTY | ERROR` for observability. Set on every 200 and 304 response: `HIT` for cache-hit revalidations, `MISS` for post-render revalidations, `EMPTY` for transparent-tile fast-paths, `ERROR` for the WMS error-tile fallback. The 304 carries the same label the 200 would, so revalidations stay in their original dashboard category. Operators can grep by value rather than reasoning about header absence.
+- `X-Cache: HIT | MISS | EMPTY | ERROR` for observability. Set on every 200 and 304 response: `HIT` for cache-hit revalidations, `MISS` for post-render revalidations, `EMPTY` for empty-image fast-paths, `ERROR` for the WMS error-tile fallback. The 304 carries the same label the 200 would, so revalidations stay in their original dashboard category. Operators can grep by value rather than reasoning about header absence.
 
 `If-None-Match` is evaluated against the content-derived ETag from the cache hit or the freshly-rendered bytes — not before the cache lookup. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
 
@@ -1949,7 +1949,7 @@ Raster requests resolve a style (the `default` style for the unstyled route, or 
 1. TMS → bbox conversion (Mercator math for `WebMercatorQuad`, linear lon/lat for `WorldCRS84Quad`).
 2. ETag check / rendered-cache check.
 3. On miss: acquire render permit (timed out → 503), call `MapEngine::get_raster_tile()` with the TMS-derived `output_crs`, colorize, encode.
-4. Empty (all-nodata) tiles return a pre-generated transparent PNG of the tile's size with `X-Cache: EMPTY` and `Content-Type: image/png` regardless of the requested format — no cache insert. Clients that strictly need JPEG/WebP output should check `X-Cache: EMPTY` and refetch only if needed; the alternative would be re-encoding a known-uniform buffer on every empty tile.
+4. Empty (all-nodata) tiles return a memoized empty image of the tile's size in the requested format and quality, with `X-Cache: EMPTY` and that `Content-Type`: transparent in PNG and WebP, white in JPEG, which has no alpha. No cache insert.
 
 Successful responses include `Content-Type`, `Content-Crs` (OGC URI for the TMS's CRS), `ETag`, `Cache-Control` (`max-age=86400, immutable` when a time instant is requested, `max-age=60, must-revalidate` otherwise), `OGCAPI-datetime` (the instant rendered, on a collection with a temporal extent) and `X-Cache: HIT|MISS|EMPTY`. The rendered cache keys on the time step rendered, so every selection resolving to one step shares its tile.
 
