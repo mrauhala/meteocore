@@ -10,7 +10,7 @@ use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
-use ds_render::{CacheKey, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
+use ds_render::{CacheKey, ColorMap, CompositeSpec, ImageFormat, RenderedCache, StyleInfo};
 
 use crate::error::WmsError;
 use crate::params::{WmsQuery, WmsRequestType};
@@ -130,22 +130,19 @@ fn request_base_url(state: &WmsState, headers: &HeaderMap) -> String {
     })
 }
 
-/// Render a semi-transparent red error tile to make failed areas visible,
-/// composited over `background` when the request asked for opaque output.
+/// Render a semi-transparent red error tile to make failed areas visible, in
+/// the requested `format` at its quality (#1091), composited over
+/// `background` when the request asked for opaque output (always for JPEG,
+/// which has no alpha). Encoded by `ds_render::encode_rgba`, the entry point
+/// a populated render takes, so PNG and WebP keep the alpha a JPEG cannot.
 fn render_error_tile(
     width: u32,
     height: u32,
+    format: ImageFormat,
     background: Option<[u8; 3]>,
 ) -> Result<Vec<u8>, WmsError> {
-    let pixel_count = (width * height) as usize;
-    let mut rgba = Vec::with_capacity(pixel_count * 4);
-    for _ in 0..pixel_count {
-        rgba.extend_from_slice(&[255, 0, 0, 100]);
-    }
-    if let Some(bg) = background {
-        ds_render::flatten_onto(&mut rgba, bg);
-    }
-    ds_render::encode_png(&rgba, width, height)
+    let mut rgba = [255u8, 0, 0, 100].repeat(width as usize * height as usize);
+    ds_render::encode_rgba(&mut rgba, width, height, format, background)
         .map_err(|e| WmsError::Internal(format!("Failed to encode error tile: {e}")))
 }
 
@@ -858,35 +855,38 @@ pub async fn wms_handler(
                 }
             }
 
-            // The EMPTY and ERROR fast paths skip the format-aware encoder and
-            // emit PNG bytes directly. Track the *actual* Content-Type per
-            // branch so the header never lies about the payload (#162). Wrap
-            // every branch in `CachedRendered` so the response ETag is
-            // FNV-1a over the actual bytes — different pixels, different
-            // ETag — regardless of which exit we take (#145).
-            // Each arm produces a `CachedRendered` ready to serve. Only the
-            // populated `Ok(Some(_))` path inserts into the rendered cache;
-            // the EMPTY and ERROR fast-paths intentionally don't (their
-            // bytes are deterministic for fixed dimensions and the
-            // engine error case shouldn't poison the cache).
-            let (cached, x_cache, response_content_type) = match render_result {
+            // Every arm is encoded in the requested FORMAT at its quality,
+            // the EMPTY and ERROR fast paths included (WMS 1.3.0 answers
+            // the format asked for, #1091), so the Content-Type is the
+            // requested one on every exit and never lies about the payload
+            // (#162). Wrap every branch in `CachedRendered` so the response
+            // ETag is FNV-1a over the actual bytes — different pixels,
+            // different ETag — regardless of which exit we take (#145).
+            // Only the populated `Ok(Some(_))` path inserts into the
+            // rendered cache; the EMPTY and ERROR fast-paths intentionally
+            // don't (their bytes are deterministic for fixed dimensions and
+            // format, and the engine error case shouldn't poison the cache).
+            let (cached, x_cache) = match render_result {
                 Ok(Some(bytes)) => {
                     let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
                     rendered_cache.insert(cache_key, cached.clone());
-                    (cached, "MISS", content_type)
+                    (cached, "MISS")
                 }
                 Ok(None) => {
-                    // Empty tile: a transparent PNG — or, for opaque output, a
-                    // solid background one — encoded once per (w,h,background)
-                    // and shared across WMS/Maps/Tiles (#171). Not inserted into
-                    // the rendered cache — the shared empty-tile cache already
-                    // serves the deterministic empty response.
-                    let cached =
-                        ds_render::background_tile(params.width, params.height, params.background)
-                            .map_err(|e| {
-                                WmsError::Internal(format!("Failed to encode empty tile: {e}"))
-                            })?;
-                    (cached, "EMPTY", "image/png")
+                    // Empty image: transparent — or, for opaque output and
+                    // JPEG, solid background — encoded once per
+                    // (w, h, background, format) and shared across
+                    // WMS/Maps/Tiles (#171). Not inserted into the rendered
+                    // cache — the shared empty-tile cache already serves the
+                    // deterministic empty response.
+                    let cached = ds_render::background_tile(
+                        params.width,
+                        params.height,
+                        params.background,
+                        format,
+                    )
+                    .map_err(|e| WmsError::Internal(format!("Failed to encode empty tile: {e}")))?;
+                    (cached, "EMPTY")
                 }
                 Err(
                     e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
@@ -895,9 +895,10 @@ pub async fn wms_handler(
                 }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
-                    let png = render_error_tile(params.width, params.height, params.background)?;
-                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
-                    (cached, "ERROR", "image/png")
+                    let bytes =
+                        render_error_tile(params.width, params.height, format, params.background)?;
+                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+                    (cached, "ERROR")
                 }
             };
             // A failed render is transient: never pin its error tile for a
@@ -920,7 +921,7 @@ pub async fn wms_handler(
                 // `x_cache` label the 200 response would carry — `"MISS"`,
                 // `"EMPTY"`, or `"ERROR"` — so revalidations look the
                 // same on dashboards as initial fetches. A client
-                // revalidating a cached transparent-tile response sees
+                // revalidating a cached empty-image response sees
                 // `304 x-cache: EMPTY`, not a misleading `MISS`.
                 axum::response::Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
@@ -932,7 +933,7 @@ pub async fn wms_handler(
                     .into_response()
             } else {
                 axum::response::Response::builder()
-                    .header(header::CONTENT_TYPE, response_content_type)
+                    .header(header::CONTENT_TYPE, content_type)
                     .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
                     .header(

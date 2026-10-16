@@ -1404,51 +1404,53 @@ mod get_map {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// Regression for #162: when the engine produces an all-nodata tile,
-    /// the fast path emits PNG bytes without going through the
-    /// format-aware encoder. Before this fix the response carried the
-    /// *requested* Content-Type (e.g. image/jpeg) over PNG bytes,
-    /// breaking decoders that trust the header. Both header and body
-    /// must agree.
+    /// #1091 (and #162 before it): an all-nodata map is encoded in the
+    /// requested `f` at its `quality`, with that Content-Type — never a PNG
+    /// under a JPEG or WebP request. Maps has no background option, so
+    /// JPEG, which has no alpha, is white and WebP stays transparent.
     #[tokio::test]
-    async fn empty_tile_forces_png_content_type_even_when_jpeg_requested() {
+    async fn empty_map_is_encoded_in_the_requested_format() {
+        use ds_render::{encode_jpeg, encode_png, encode_webp};
         let app = build_empty_router();
-        let req = Request::builder()
-            .uri("/collections/empty/map?bbox=10,55,30,70&f=image/jpeg")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let headers = resp.headers().clone();
-        assert_eq!(
-            headers.get("content-type").unwrap(),
-            "image/png",
-            "empty-tile response must self-declare PNG, not the requested image/jpeg"
-        );
-        assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(
-            body.starts_with(&[0x89, b'P', b'N', b'G']),
-            "body must be a real PNG, got first bytes {:?}",
-            &body[..4.min(body.len())]
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_tile_forces_png_content_type_even_when_webp_requested() {
-        // Same regression as above, second format for symmetry — WebP
-        // takes a different `ImageFormat::Webp` branch in the cache
-        // key, so this exercises a distinct code path.
-        let app = build_empty_router();
-        let req = Request::builder()
-            .uri("/collections/empty/map?bbox=10,55,30,70&f=image/webp")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let headers = resp.headers().clone();
-        assert_eq!(headers.get("content-type").unwrap(), "image/png");
-        assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
+        let transparent = [0u8, 0, 0, 0].repeat(64 * 48);
+        for (format, quality, expected) in [
+            ("image/jpeg", "", encode_jpeg(&transparent, 64, 48, 85)),
+            (
+                "image/jpeg",
+                "&quality=40",
+                encode_jpeg(&transparent, 64, 48, 40),
+            ),
+            ("image/webp", "", encode_webp(&transparent, 64, 48, 100)),
+            (
+                "image/webp",
+                "&quality=60",
+                encode_webp(&transparent, 64, 48, 60),
+            ),
+            ("image/png", "", encode_png(&transparent, 64, 48)),
+        ] {
+            let uri = format!(
+                "/collections/empty/map?bbox=10,55,30,70&width=64&height=48&f={format}{quality}"
+            );
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let headers = resp.headers().clone();
+            assert_eq!(headers.get("content-type").unwrap(), format, "{uri}");
+            assert_eq!(headers.get("x-cache").unwrap(), "EMPTY", "{uri}");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            match format {
+                "image/jpeg" => assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "{uri}"),
+                "image/webp" => {
+                    assert_eq!(&body[..4], b"RIFF", "{uri}");
+                    assert_eq!(&body[8..12], b"WEBP", "{uri}");
+                }
+                _ => assert!(body.starts_with(&[0x89, b'P', b'N', b'G']), "{uri}"),
+            }
+            assert_eq!(body, expected.unwrap(), "{uri}");
+        }
     }
 
     /// Revalidating a cached empty-tile response must round-trip the
@@ -1498,9 +1500,8 @@ mod get_map {
 }
 
 /// Mock engine that returns an all-`None` (all-nodata) `RasterTile`.
-/// Used to exercise the empty-tile fast path that bypasses the
-/// format-aware encoder. The regression test for #162 lives in
-/// `mod get_map` above.
+/// Used to exercise the empty-image fast path that skips colorization.
+/// The regression test for #162 / #1091 lives in `mod get_map` above.
 struct EmptyMockMapEngine;
 
 impl MapEngine for EmptyMockMapEngine {

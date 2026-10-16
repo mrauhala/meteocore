@@ -4,7 +4,8 @@
 //! `src/params.rs`. This file covers behaviours that only emerge once
 //! the router, mock engine, and full state are wired together — the
 //! seed test is the regression for #162 (empty-tile Content-Type
-//! mismatch when a non-PNG format is requested).
+//! mismatch when a non-PNG format is requested), now #1091 (the empty
+//! image is encoded in the requested format).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,9 +23,8 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 
 /// Mock engine that returns an all-`None` (all-nodata) `RasterTile`.
-/// Drives the empty-tile fast path that bypasses the format-aware
-/// encoder and emits PNG bytes directly — the code path that #162
-/// fixed.
+/// Drives the empty-image fast path that skips colorization and serves
+/// the memoized empty image — the code path #162 and #1091 fixed.
 struct EmptyMockMapEngine;
 
 impl MapEngine for EmptyMockMapEngine {
@@ -153,65 +153,82 @@ fn build_empty_router() -> axum::Router {
     api_wms::router(state)
 }
 
-/// Regression for #162: when the engine produces an all-nodata tile,
-/// the WMS GetMap handler short-circuits to a freshly-encoded
-/// transparent PNG without going through the format-aware encoder.
-/// Before the fix the response carried the *requested* Content-Type
-/// (e.g. `image/jpeg`) over PNG bytes, breaking decoders that trust
-/// the header. Both header and body must agree.
-#[tokio::test]
-async fn empty_tile_forces_png_content_type_even_when_jpeg_requested() {
-    let app = build_empty_router();
-    let req = Request::builder()
-        .uri(
-            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=empty\
-             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
-             &FORMAT=image/jpeg",
-        )
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let headers = resp.headers().clone();
-    assert_eq!(
-        headers.get("content-type").unwrap(),
-        "image/png",
-        "empty-tile response must self-declare PNG, not the requested image/jpeg"
-    );
-    assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    assert!(
-        body.starts_with(&[0x89, b'P', b'N', b'G']),
-        "body must be a real PNG, got first bytes {:?}",
-        &body[..4.min(body.len())]
-    );
+/// A `width`×`height` image of one RGBA pixel value.
+fn solid(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
+    pixel.repeat((width * height) as usize)
 }
 
+/// The body starts with `content_type`'s magic bytes.
+fn assert_magic(content_type: &str, body: &[u8], context: &str) {
+    match content_type {
+        "image/png" => assert!(body.starts_with(&[0x89, b'P', b'N', b'G']), "{context}"),
+        "image/jpeg" => assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "{context}"),
+        "image/webp" => assert!(
+            body.len() > 12 && &body[..4] == b"RIFF" && &body[8..12] == b"WEBP",
+            "{context}"
+        ),
+        other => panic!("unexpected content type {other}"),
+    }
+}
+
+/// #1091 (and #162 before it): an all-nodata view is encoded in the
+/// requested FORMAT at its QUALITY, with that Content-Type — on the direct
+/// and the meta-tiled empty path. JPEG has no alpha, so it is the
+/// background (BGCOLOR, default white); WebP keeps the alpha like PNG.
 #[tokio::test]
-async fn empty_tile_forces_png_content_type_even_when_webp_requested() {
-    // Second format for symmetry — WebP takes a distinct `ImageFormat`
-    // branch through the cache key, so this exercises a different code
-    // path than the JPEG case above.
+async fn empty_image_is_encoded_in_the_requested_format() {
+    use ds_render::{encode_jpeg, encode_png, encode_webp};
     let app = build_empty_router();
-    let req = Request::builder()
-        .uri(
-            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=empty\
-             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
-             &FORMAT=image/webp",
-        )
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let headers = resp.headers().clone();
-    assert_eq!(headers.get("content-type").unwrap(), "image/png");
-    assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
+    let transparent = solid(64, 64, [0, 0, 0, 0]);
+    let white = solid(64, 64, [255, 255, 255, 255]);
+    let bg = solid(64, 64, BG);
+    let cases = [
+        ("&FORMAT=image/jpeg", encode_jpeg(&white, 64, 64, 85)),
+        (
+            "&FORMAT=image/jpeg&QUALITY=40",
+            encode_jpeg(&white, 64, 64, 40),
+        ),
+        (
+            "&FORMAT=image/jpeg&BGCOLOR=0x336699",
+            encode_jpeg(&bg, 64, 64, 85),
+        ),
+        ("&FORMAT=image/webp", encode_webp(&transparent, 64, 64, 100)),
+        (
+            "&FORMAT=image/webp&QUALITY=60",
+            encode_webp(&transparent, 64, 64, 60),
+        ),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+            encode_webp(&bg, 64, 64, 100),
+        ),
+        ("&FORMAT=image/png", encode_png(&transparent, 64, 64)),
+    ];
+    for (crs, bbox) in HALF_VIEWS {
+        for (extra, expected) in &cases {
+            let uri = format!(
+                "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=empty&STYLES=\
+                 &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64{extra}"
+            );
+            let reply = fetch(&app, &uri).await;
+            let context = format!("{crs} {extra}");
+            assert_eq!(reply.status, StatusCode::OK, "{context}");
+            assert_eq!(reply.x_cache, "EMPTY", "{context}");
+            let requested = extra[8..].split('&').next().unwrap();
+            assert_eq!(reply.content_type, requested, "{context}");
+            assert_magic(requested, &reply.body, &context);
+            assert_eq!(
+                &reply.body,
+                expected.as_ref().unwrap(),
+                "{context}: the shared encoder's image at the requested quality"
+            );
+        }
+    }
 }
 
 /// Mock engine whose `get_raster_tile` always fails. Drives the WMS
-/// `Err(e)` branch that emits the red `render_error_tile` PNG with
-/// `X-Cache: ERROR`. WMS is the only handler that does this — Maps
-/// and Tiles propagate engine errors as JSON 500.
+/// `Err(e)` branch that emits the red `render_error_tile`, in the
+/// requested format, with `X-Cache: ERROR`. WMS is the only handler
+/// that does this — Maps and Tiles propagate engine errors as JSON 500.
 struct FailingMockMapEngine;
 
 impl MapEngine for FailingMockMapEngine {
@@ -315,41 +332,50 @@ fn build_failing_router() -> axum::Router {
     api_wms::router(state)
 }
 
-/// Regression for #162 (WMS error-tile branch): when the engine
-/// returns `Err`, the handler swallows it and serves a red
-/// `render_error_tile` PNG with `X-Cache: ERROR`. The PR also fixed
-/// this branch to emit `Content-Type: image/png` instead of the
-/// requested-but-misleading `image/jpeg`/`image/webp`.
+/// The red error tile follows FORMAT too (#1091): encoded at the request's
+/// QUALITY with the requested Content-Type. JPEG flattens it onto BGCOLOR
+/// (default white); PNG and WebP keep its alpha unless TRANSPARENT=FALSE.
 #[tokio::test]
-async fn error_tile_forces_png_content_type_even_when_jpeg_requested() {
+async fn error_tile_is_encoded_in_the_requested_format() {
+    use ds_render::{encode_jpeg, encode_png, encode_webp};
     let app = build_failing_router();
-    let req = Request::builder()
-        .uri(
-            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken\
-             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
-             &FORMAT=image/jpeg",
-        )
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "WMS swallows engine errors into a 200 + error-tile"
-    );
-    let headers = resp.headers().clone();
-    assert_eq!(
-        headers.get("content-type").unwrap(),
-        "image/png",
-        "error-tile response must self-declare PNG, not the requested image/jpeg"
-    );
-    assert_eq!(headers.get("x-cache").unwrap(), "ERROR");
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    assert!(
-        body.starts_with(&[0x89, b'P', b'N', b'G']),
-        "body must be a real PNG, got first bytes {:?}",
-        &body[..4.min(body.len())]
-    );
+    let red = solid(64, 64, [255, 0, 0, 100]);
+    // [255, 0, 0, 100] over white and over black.
+    let on_white = solid(64, 64, [255, 155, 155, 255]);
+    let on_black = solid(64, 64, [100, 0, 0, 255]);
+    for (extra, expected) in [
+        ("&FORMAT=image/jpeg", encode_jpeg(&on_white, 64, 64, 85)),
+        (
+            "&FORMAT=image/jpeg&QUALITY=30&BGCOLOR=0x000000",
+            encode_jpeg(&on_black, 64, 64, 30),
+        ),
+        ("&FORMAT=image/webp", encode_webp(&red, 64, 64, 100)),
+        (
+            "&FORMAT=image/webp&QUALITY=70",
+            encode_webp(&red, 64, 64, 70),
+        ),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=FALSE",
+            encode_webp(&on_white, 64, 64, 100),
+        ),
+        ("&FORMAT=image/png", encode_png(&red, 64, 64)),
+    ] {
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken&STYLES=\
+             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64{extra}"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "WMS swallows engine errors into a 200 + error-tile"
+        );
+        assert_eq!(reply.x_cache, "ERROR", "{extra}");
+        let requested = extra[8..].split('&').next().unwrap();
+        assert_eq!(reply.content_type, requested, "{extra}");
+        assert_magic(requested, &reply.body, extra);
+        assert_eq!(reply.body, expected.unwrap(), "{extra}");
+    }
 }
 
 /// A failed render is transient: its error tile under an explicit TIME must

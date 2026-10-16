@@ -1672,29 +1672,30 @@ async fn render_map(
         .as_ref()
         .map_or(RenderPhases::default(), |&(_, phases)| phases);
 
-    // The EMPTY fast path skips the format-aware encoder and emits PNG
-    // bytes directly. Track the actual Content-Type per branch so the
-    // header never lies about the payload (#162). Wrap every branch in
-    // `CachedRendered` so the response ETag is FNV-1a over the actual
-    // bytes — different pixels, different ETag — regardless of which
-    // exit we take (#145).
+    // The EMPTY fast path skips colorization but encodes in the requested
+    // format at its quality like a populated render (#1091), so the
+    // Content-Type is the requested one on every exit and never lies about
+    // the payload (#162). Wrap every branch in `CachedRendered` so the
+    // response ETag is FNV-1a over the actual bytes — different pixels,
+    // different ETag — regardless of which exit we take (#145).
     // Each arm produces a `CachedRendered` ready to serve. Only the
     // populated `Ok(Some(_))` path inserts into the rendered cache; the
     // EMPTY fast-path intentionally doesn't (its bytes are deterministic
-    // for fixed dimensions). Engine errors bail with 500 before this
-    // match.
-    let (cached, x_cache, response_content_type) = match render_result {
+    // for fixed dimensions and format). Engine errors are mapped to their
+    // HTTP status in the `Err` arm.
+    let (cached, x_cache) = match render_result {
         Ok((Some(bytes), _)) => {
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
             rendered_cache.insert(cache_key, cached.clone());
-            (cached, "MISS", content_type)
+            (cached, "MISS")
         }
         Ok((None, _)) => {
-            // Empty tile: a transparent PNG, encoded once per (w,h) and shared
-            // across WMS/Maps/Tiles (#171). Not inserted into the rendered cache.
-            let cached = ds_render::empty_tile(width, height)
+            // Empty image: transparent (white in JPEG, which has no alpha),
+            // encoded once per (w, h, format) and shared across
+            // WMS/Maps/Tiles (#171). Not inserted into the rendered cache.
+            let cached = ds_render::empty_tile(width, height, format)
                 .map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
-            (cached, "EMPTY", "image/png")
+            (cached, "EMPTY")
         }
         Err(e) => {
             use ds_core::error::DataServerError as DSE;
@@ -1745,7 +1746,7 @@ async fn render_map(
     // in api-tiles. Forward the same `x_cache` label the 200 response
     // would carry (`"MISS"` or `"EMPTY"`) so revalidations look the
     // same on dashboards as initial fetches — a client revalidating a
-    // cached transparent-tile response sees `304 x-cache: EMPTY`, not
+    // cached empty-image response sees `304 x-cache: EMPTY`, not
     // a misleading `MISS`.
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
@@ -1770,7 +1771,7 @@ async fn render_map(
         &content_bbox,
         content_datetime.as_deref(),
     )
-    .header(header::CONTENT_TYPE, response_content_type)
+    .header(header::CONTENT_TYPE, content_type)
     .header(header::ETAG, cached.etag())
     .header(header::CACHE_CONTROL, cache_control)
     .header(

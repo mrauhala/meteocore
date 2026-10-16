@@ -28,18 +28,24 @@ use crate::error::TilesError;
 use crate::params::{self, LegendFormat, LegendQueryParams, TileQueryParams};
 use crate::tilematrixset::{self, SUPPORTED_TILE_MATRIX_SETS};
 
-/// Pre-generated 256×256 fully transparent `CachedRendered` for empty
+/// Pre-generated 256×256 fully transparent PNG `CachedRendered` for empty
 /// (all-nodata) tiles — the bytes and their FNV-1a ETag are computed once per
 /// process instead of on every empty-tile response, and the colorization +
 /// encoding pipeline is skipped when a tile has no data.
 ///
 /// Sourced from the shared [`ds_render::empty_tile`] cache, which WMS and Maps
-/// now use too (#171) — so all three raster APIs share one mechanism rather than
-/// each rolling their own. Tiles is always 256×256, so a process-once `LazyLock`
-/// keeps cloning per request essentially free (`Bytes` is `Arc`-backed).
+/// use too (#171) — so all three raster APIs share one mechanism rather than
+/// each rolling their own. A default-size PNG tile is by far the common empty
+/// response, so a process-once `LazyLock` keeps cloning it per request
+/// essentially free (`Bytes` is `Arc`-backed). Any other size or format is
+/// read from the shared cache, which keys on both (#1091).
 static EMPTY_TILE_CACHED: LazyLock<ds_render::CachedRendered> = LazyLock::new(|| {
-    ds_render::empty_tile(params::TILE_SIZE, params::TILE_SIZE)
-        .expect("encoding empty tile PNG must not fail")
+    ds_render::empty_tile(
+        params::TILE_SIZE,
+        params::TILE_SIZE,
+        ds_render::ImageFormat::Png,
+    )
+    .expect("encoding empty tile PNG must not fail")
 });
 
 /// Shared state for the OGC API Tiles service.
@@ -2716,33 +2722,36 @@ async fn render_tile(
         }
     })?;
 
-    // Empty tiles return the pre-generated transparent PNG without caching;
-    // populated tiles get cached. Wrap both in `CachedRendered` so the
-    // response ETag is FNV-1a over the actual bytes — different pixels
-    // produce different ETags (#145). Track the actual Content-Type per
-    // branch so the header never lies about the payload (#162). Empty
-    // tiles reuse the global `EMPTY_TILE_CACHED` so the FNV-1a hash is
+    // Empty tiles return a memoized empty image in the requested format
+    // without caching; populated tiles get cached. Wrap both in
+    // `CachedRendered` so the response ETag is FNV-1a over the actual
+    // bytes — different pixels produce different ETags (#145). The empty
+    // image is encoded in the requested format at its quality like a
+    // populated tile (#1091), so the Content-Type is the requested one on
+    // every exit and never lies about the payload (#162). A default-size
+    // PNG reuses the global `EMPTY_TILE_CACHED`, so its FNV-1a hash is
     // computed once per process instead of per request.
     // Each arm produces a `CachedRendered` ready to serve. Only the
     // populated `Some(_)` path inserts into the rendered cache; the
-    // EMPTY fast-path intentionally doesn't (the global
-    // `EMPTY_TILE_CACHED` already serves as the deterministic empty
-    // response).
-    let (cached, x_cache, response_content_type) = match maybe_bytes {
-        // A tile the Scaling parameters sized gets an empty image of its
-        // own size, from the same shared memo.
-        None if (width, height) == (params::TILE_SIZE, params::TILE_SIZE) => {
-            (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png")
+    // EMPTY fast-path intentionally doesn't (the shared empty-tile cache
+    // already serves the deterministic empty response).
+    let (cached, x_cache) = match maybe_bytes {
+        None if format == ds_render::ImageFormat::Png
+            && (width, height) == (params::TILE_SIZE, params::TILE_SIZE) =>
+        {
+            (EMPTY_TILE_CACHED.clone(), "EMPTY")
         }
+        // Another format, or a tile the Scaling parameters sized, gets an
+        // empty image of its own format and size from the same shared memo.
         None => {
-            let empty = ds_render::empty_tile(width, height)
+            let empty = ds_render::empty_tile(width, height, format)
                 .map_err(|e| TilesError::Internal(format!("Failed to encode empty tile: {e}")))?;
-            (empty, "EMPTY", "image/png")
+            (empty, "EMPTY")
         }
         Some(bytes) => {
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
             rendered_cache.insert(cache_key, cached.clone());
-            (cached, "MISS", content_type)
+            (cached, "MISS")
         }
     };
 
@@ -2751,7 +2760,7 @@ async fn render_tile(
     // encode. Forward the same `x_cache` label the 200 response would
     // carry (`"MISS"` or `"EMPTY"`) so revalidations look the same
     // on dashboards as initial fetches — a client revalidating a
-    // cached transparent-tile response sees `304 x-cache: EMPTY`,
+    // cached empty-image response sees `304 x-cache: EMPTY`,
     // not a misleading `MISS`. This matters for any tile viewer
     // panning over out-of-coverage areas.
     if let Some(ref inm) = if_none_match {
@@ -2772,7 +2781,7 @@ async fn render_tile(
     }
 
     Ok(with_datetime(axum::response::Response::builder())
-        .header(header::CONTENT_TYPE, response_content_type)
+        .header(header::CONTENT_TYPE, content_type)
         .header(header::ETAG, cached.etag())
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::HeaderName::from_static("content-crs"), content_crs)

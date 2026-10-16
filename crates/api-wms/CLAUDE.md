@@ -206,13 +206,30 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - Caching: the background is part of the rendered-image `CacheKey` (the
   encoded bytes differ) but NOT of the meta-tile key — cached tiles stay
   RGBA, so opaque and transparent views share them. The all-nodata path uses
-  `ds_render::background_tile` (memoized per size + background); the error
-  tile is flattened too.
+  `ds_render::background_tile` (memoized per size + background + format with
+  its quality); the error tile is flattened too.
 - GetCapabilities advertises nothing for these; the layer `opaque` attribute
   is unrelated and unchanged.
 - ets-wms13's `getmap:bbox-outside-crs` fails on the `TRUE` default: it
   sends no `TRANSPARENT`, reads only the pixels' RGB and wants white, and a
   transparent pixel is RGBA 0,0,0,0. With `TRANSPARENT=FALSE` it passes.
+
+## EMPTY and ERROR images follow FORMAT (#1091)
+
+- WMS 1.3.0 answers GetMap in the requested `FORMAT`, so the all-nodata
+  image (`x-cache: EMPTY`) and the red error tile (`x-cache: ERROR`) are
+  encoded in it at the effective `QUALITY`, with that `Content-Type`, like a
+  populated render. Both go through `ds_render::encode_rgba`, the encoder
+  entry point every render takes; never hand-roll a second encoding for
+  them. ets-wms13's `getmap:each-format` checks this whenever the layer it
+  picks has no data at its test bbox.
+- JPEG has no alpha: the empty image is solid `BGCOLOR` (default white) and
+  the semi-transparent error tile is flattened onto it. WebP keeps alpha like
+  PNG unless `TRANSPARENT=FALSE`.
+- Neither is inserted into the rendered cache; the empty image comes from
+  `ds_render::background_tile`'s item-bounded memo, keyed on
+  `(width, height, background, format)` so a PNG and a JPEG of one size never
+  share an entry. The ERROR `Cache-Control` stays short.
 
 ## QUALITY / `[wms] webp_quality`
 
