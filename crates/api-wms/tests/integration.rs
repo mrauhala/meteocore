@@ -144,6 +144,7 @@ fn build_empty_router() -> axum::Router {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -323,6 +324,7 @@ fn build_failing_router() -> axum::Router {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -524,6 +526,7 @@ fn build_populated_state_with_wms(
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -917,6 +920,7 @@ fn build_counting_router_versioned(
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: tile_cache.clone(),
@@ -1188,6 +1192,7 @@ fn build_snapping_router_with(
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache,
@@ -1669,7 +1674,13 @@ fn capabilities_bbox_stays_in_the_crs84_domain() {
         engines.insert("grid".to_string(), Arc::new(ExtentMockMapEngine(extent)));
         let collections = HashMap::from([("grid".to_string(), site_collection_config("grid"))]);
         let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-        let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+        let xml = api_wms::capabilities::get_capabilities_xml(
+            &engines,
+            &collections,
+            &styles,
+            &HashMap::new(),
+            "",
+        );
         String::from_utf8(xml).expect("capabilities XML is UTF-8")
     };
 
@@ -1729,7 +1740,13 @@ fn child_layer_titles_are_site_prefixed_for_flat_clients() {
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     // Requestable child <Name> is unchanged (id/quantity).
@@ -1771,7 +1788,13 @@ fn capabilities_emit_keywords_and_attribution() {
     collections.insert("radar-fivih".to_string(), config);
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     assert!(
@@ -1854,7 +1877,13 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     assert!(
@@ -1982,6 +2011,7 @@ fn capabilities_service_advertises_getmap_limits_in_schema_order() {
         &engines,
         &collections,
         &styles,
+        &HashMap::new(),
         "https://wms.example",
     );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
@@ -2223,6 +2253,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -2278,7 +2309,13 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     // Both dimensions present: the valid-time axis and the run axis.
@@ -2344,7 +2381,13 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
     assert!(
         !xml.contains("reference_time"),
@@ -2693,6 +2736,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache,
@@ -2880,6 +2924,7 @@ fn build_advancing_router() -> AdvancingFixture {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -3394,6 +3439,7 @@ fn build_param_layer_router() -> axum::Router {
         engines,
         collections,
         styles: param_layer_styles(),
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -3509,6 +3555,7 @@ fn param_layer_capabilities_xml() -> String {
         &engines,
         &collections,
         &param_layer_styles(),
+        &HashMap::new(),
         "",
     );
     String::from_utf8(xml).expect("capabilities XML is UTF-8")
@@ -3934,6 +3981,7 @@ mod per_parameter_times {
                 "sat".to_string(),
                 HashMap::from([("default".to_string(), style)]),
             )]),
+            point_engines: HashMap::new(),
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             rendered_cache: Arc::new(RenderedCache::new(16)),
             tile_cache: Arc::new(ds_render::TilePixelCache::new(64)),
@@ -4694,6 +4742,7 @@ mod composites {
                     ("viridis".to_string(), viridis),
                 ]),
             )]),
+            point_engines: HashMap::new(),
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             rendered_cache: Arc::new(RenderedCache::new(16)),
             tile_cache: tile_cache.clone(),
@@ -5416,7 +5465,13 @@ fn archive_capabilities() -> String {
         },
     );
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     String::from_utf8(xml).expect("capabilities XML is UTF-8")
 }
 
@@ -5685,9 +5740,10 @@ async fn capabilities_root_points_at_its_schemas() {
 /// `<Capability>` is `Request`, `Exception`, then the root `Layer`, the
 /// order of the schema's sequence (#1027), and `<Exception>` offers only
 /// `XML`: the format a request error is answered in, whatever `EXCEPTIONS`
-/// asks for. `<Request>` holds the operations in the schema's order, with
-/// GetLegendGraphic as SLD's extended operation: a `<GetLegendGraphic>` in
-/// the WMS namespace is not in the schema and fails validation.
+/// asks for. `<Request>` holds the operations in the schema's order,
+/// GetFeatureInfo right after GetMap (#1064), with GetLegendGraphic as SLD's
+/// extended operation: a `<GetLegendGraphic>` in the WMS namespace is not in
+/// the schema and fails validation.
 #[tokio::test]
 async fn capabilities_advertise_xml_exceptions_right_after_request() {
     let app = build_populated_router();
@@ -5705,7 +5761,12 @@ async fn capabilities_advertise_xml_exceptions_right_after_request() {
     );
     assert_eq!(
         names("Request"),
-        ["GetCapabilities", "GetMap", "sld:GetLegendGraphic"],
+        [
+            "GetCapabilities",
+            "GetMap",
+            "GetFeatureInfo",
+            "sld:GetLegendGraphic"
+        ],
         "{xml}"
     );
     assert_eq!(

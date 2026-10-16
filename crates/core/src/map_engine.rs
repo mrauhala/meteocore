@@ -73,12 +73,36 @@ impl OutputCrs {
                 )
             }
             OutputCrs::Projected { crs, bbox } => {
-                let [min_e, min_n, max_e, max_n] = bbox;
-                let e = min_e + fx * (max_e - min_e);
-                let n = max_n - fy * (max_n - min_n);
+                let (e, n) = projected_point(bbox, fx, fy);
                 crs.inverse(e, n).unwrap_or((f64::NAN, f64::NAN))
             }
         }
+    }
+
+    /// The WGS84 `(lon, lat)` of the output position `(fx, fy)`, mapped as
+    /// [`Self::project_node`] maps it, when that point lies on the Earth;
+    /// `None` when it does not. For a single point, such as the pixel
+    /// centre a WMS GetFeatureInfo reads (#1064), never per output pixel.
+    ///
+    /// Off the Earth are a geographic point past a pole, and a projected
+    /// point outside its projection's valid area
+    /// ([`crate::geo::outside_projection_domain`], #1089). The point is
+    /// tested on its own before the inverse: past the LAEA disk the inverse
+    /// is non-finite, but past the strip Transverse Mercator maps the Earth
+    /// into it is finite and meaningless. Inside that strip, past a pole,
+    /// TM's inverse gives a latitude past 90°, which is off the Earth too.
+    /// Every point of a projected box wholly outside its projection is
+    /// outside. The `Projected` variant ignores `wgs84_bbox`, as
+    /// `project_node` does, so a box with no WGS84 envelope may pass NaN.
+    pub fn position_on_earth(&self, wgs84_bbox: [f64; 4], fx: f64, fy: f64) -> Option<(f64, f64)> {
+        if let OutputCrs::Projected { crs, bbox } = self {
+            let (e, n) = projected_point(bbox, fx, fy);
+            if crate::geo::outside_projection_domain(crs, [e, n, e, n]) {
+                return None;
+            }
+        }
+        let (lon, lat) = self.project_node(wgs84_bbox, fx, fy);
+        (lon.is_finite() && lat.is_finite() && (-90.0..=90.0).contains(&lat)).then_some((lon, lat))
     }
 
     /// Inverse of [`Self::project_node`]: map a WGS84 `(lon, lat)` to the
@@ -279,6 +303,14 @@ impl OutputCrs {
             bbox: [west, edge(end), east, edge(top)],
         })
     }
+}
+
+/// The projected metres `(e, n)` of the output position `(fx, fy)` in the
+/// request rectangle `bbox` `[min_e, min_n, max_e, max_n]`: a projected
+/// output lays its pixels out linearly in its metres.
+fn projected_point(bbox: &[f64; 4], fx: f64, fy: f64) -> (f64, f64) {
+    let [min_e, min_n, max_e, max_n] = *bbox;
+    (min_e + fx * (max_e - min_e), max_n - fy * (max_n - min_n))
 }
 
 /// The first of `0..height` for which `pred` holds, `height` when none
@@ -969,6 +1001,54 @@ pub trait MapEngine: Send + Sync {
             std::sync::LazyLock::new(|| Arc::from([]));
         NONE.clone()
     }
+
+    /// Whether the layer of `parameter`, one of [`RasterInfo::parameters`],
+    /// shows that parameter's own values: the values a position query of
+    /// the same collection answers at a point. `false` for an overlay drawn
+    /// from other data, such as a radar site's storm-cell outlines, which
+    /// no point query answers.
+    ///
+    /// WMS GetFeatureInfo reads a layer's value with the collection's EDR
+    /// position query (#1064), so it answers only for such layers: an
+    /// overlay layer is `queryable="0"` and answers `LayerNotQueryable`.
+    /// Default `true`. **O(1)**, no I/O: GetCapabilities reads it for every
+    /// layer (Critical Rule 10).
+    fn layer_shows_values(&self, parameter: &str) -> bool {
+        let _ = parameter;
+        true
+    }
+
+    /// The vertical level [`Self::get_raster_tile`] draws `parameter` at
+    /// when it is passed `z` (WMS `ELEVATION`, `None` when omitted), at the
+    /// `time` and `reference_time` the render is passed, those
+    /// [`Self::resolve_parameter_time`] and
+    /// [`Self::resolve_parameter_reference_time`] resolved. One of
+    /// [`RasterInfo::vertical`]'s levels; `None` for a layer without one.
+    ///
+    /// WMS GetFeatureInfo passes this level to the collection's position
+    /// query and reports it (#1064), so the value it answers is one the map
+    /// shows. An engine whose render draws another level than `z`, or than
+    /// the first advertised level when `z` is `None`, MUST override this
+    /// with the selection `get_raster_tile` uses, through a shared helper so
+    /// the two cannot drift. GRIB draws the selected run's own first level;
+    /// a radar volume draws the sweep nearest `z`, or the lowest, among
+    /// those carrying the quantity. Default: `z`, else the first advertised
+    /// level. From a snapshot, no I/O.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        let _ = (parameter, time, reference_time);
+        z.or_else(|| {
+            self.raster_info_shared()
+                .vertical
+                .as_ref()
+                .and_then(|vertical| vertical.levels.first().copied())
+        })
+    }
 }
 
 /// The timestep a multi-parameter render uses, chosen among the times
@@ -1376,6 +1456,54 @@ mod tests {
         assert!(Plain.composites().is_empty());
         assert!(Arc::ptr_eq(&Plain.composites(), &Plain.composites()));
     }
+
+    /// By default a map draws the requested level, else the first
+    /// advertised one; a collection without levels has none.
+    #[test]
+    fn default_resolve_elevation_is_z_else_the_first_level() {
+        struct Levels(Option<Vec<f64>>);
+        impl MapEngine for Levels {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unreachable!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                RasterInfo {
+                    native_crs: "CRS:84".into(),
+                    spatial_extent: None,
+                    times: Vec::new(),
+                    parameter: "t".into(),
+                    unit: "K".into(),
+                    parameters: Vec::new(),
+                    vertical: self.0.clone().map(|levels| {
+                        VerticalDimension::new(crate::vertical::VerticalKind::Pressure, levels)
+                    }),
+                    grid_size: None,
+                    layer_subtitle: None,
+                    reference_times: Vec::new(),
+                }
+            }
+        }
+        let pressure = Levels(Some(vec![850.0, 500.0]));
+        assert_eq!(
+            pressure.resolve_elevation(None, None, None, None),
+            Some(850.0)
+        );
+        assert_eq!(
+            pressure.resolve_elevation(Some("t"), Some(500.0), None, None),
+            Some(500.0)
+        );
+        assert_eq!(Levels(None).resolve_elevation(None, None, None, None), None);
+    }
     use crate::geo::projected_output_crs;
 
     const FINLAND_WGS84: [f64; 4] = [19.0, 59.0, 32.0, 70.0]; // [w, s, e, n]
@@ -1717,6 +1845,88 @@ mod tests {
                 "{bbox:?}"
             );
         }
+    }
+
+    /// A point's position is `project_node`'s when the point lies on the
+    /// Earth, and `None` past a pole of a geographic box, past the LAEA
+    /// disk, and past the strip Transverse Mercator maps the Earth into or,
+    /// inside it, past a pole (#1064, #1089). A projected output reads its
+    /// own metres, so a NaN WGS84 box does not matter.
+    #[test]
+    fn position_on_earth_is_none_off_the_earth() {
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let projected = |crs: &Crs, bbox| OutputCrs::Projected {
+            crs: crs.clone(),
+            bbox,
+        };
+        let nan = [f64::NAN; 4];
+
+        // On the Earth: exactly `project_node`.
+        for (out, wgs84) in [
+            (OutputCrs::Wgs84, FINLAND_WGS84),
+            (OutputCrs::WebMercator, FINLAND_WGS84),
+            (projected(&tm, [4.905e5, 6.64e6, 5.105e5, 6.66e6]), nan),
+            (projected(&laea, [4.0e6, 3.0e6, 4.5e6, 3.5e6]), nan),
+        ] {
+            for (fx, fy) in [(0.5, 0.5), (0.0, 1.0), (0.25, 0.75)] {
+                let node = out.project_node(wgs84, fx, fy);
+                assert_eq!(out.position_on_earth(wgs84, fx, fy), Some(node), "{out:?}");
+            }
+        }
+
+        // Past a pole of a geographic box: row 0 of 80–100°N.
+        assert_eq!(
+            OutputCrs::Wgs84.position_on_earth([-10.0, 80.0, 10.0, 100.0], 0.5, 0.05),
+            None
+        );
+        // Every point of a box wholly outside its projection: past the LAEA
+        // disk, past the TM strip north and south.
+        for (crs, bbox) in [
+            (&laea, [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
+            (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
+        ] {
+            let out = projected(crs, bbox);
+            for (fx, fy) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)] {
+                assert_eq!(out.position_on_earth(nan, fx, fy), None, "{bbox:?}");
+            }
+        }
+        // A TM box from 85°N across the pole to past the strip: the top
+        // point is past the strip, where the inverse is finite but no
+        // place; the middle is inside the strip past the pole; the bottom
+        // is on the Earth.
+        let across = projected(&tm, [0.0, 9.0e6, 1.0e6, 2.1e7]);
+        let (lon, lat) = across.project_node(nan, 0.5, 0.0);
+        assert!(
+            lon.is_finite() && lat.is_finite(),
+            "TM's inverse past the strip: {lon}, {lat}"
+        );
+        assert_eq!(across.position_on_earth(nan, 0.5, 0.0), None);
+        assert_eq!(across.position_on_earth(nan, 0.5, 0.5), None);
+        let (_, lat) = across.position_on_earth(nan, 0.5, 1.0).unwrap();
+        assert!((80.0..90.0).contains(&lat), "{lat}");
+
+        // Far east of the central meridian, past the strip, the inverse
+        // can land inside ±90°: a place on the Earth the point does not
+        // name. Only the point's own test keeps such a point off the Earth.
+        // The top two rows of this 20 × 4 grid lie past the strip.
+        let far_east = projected(&tm, [1.5e7, 1.9e7, 2.5e7, 2.1e7]);
+        let mut inverse_on_earth = 0;
+        for j in 0..2 {
+            for i in 0..20 {
+                let (fx, fy) = ((f64::from(i) + 0.5) / 20.0, (f64::from(j) + 0.5) / 4.0);
+                let (lon, lat) = far_east.project_node(nan, fx, fy);
+                if lon.is_finite() && (-90.0..=90.0).contains(&lat) {
+                    inverse_on_earth += 1;
+                }
+                assert_eq!(far_east.position_on_earth(nan, fx, fy), None, "({i}, {j})");
+            }
+        }
+        assert!(
+            inverse_on_earth > 0,
+            "no point past the strip inverse-projects inside ±90°: the point test goes untested"
+        );
     }
 
     /// Placing a tile's rows in a taller tile keeps every pixel's value and

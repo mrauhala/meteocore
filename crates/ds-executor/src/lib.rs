@@ -332,32 +332,87 @@ impl RenderJob {
         Ok(Self { permit, deadline })
     }
 
+    /// Run `work` on a blocking-pool thread of the calling runtime, as a
+    /// render's `get_raster_tile` runs.
     pub async fn run<T: Send + 'static>(
         self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, ExecutionError> {
         let deadline = self.deadline;
-        let task = tokio::task::spawn_blocking(move || {
-            let _permit = self.permit;
+        let task = tokio::task::spawn_blocking(self.worker(work));
+        join(task, deadline).await
+    }
+
+    /// Run a synchronous engine query, such as the EDR position query WMS
+    /// GetFeatureInfo reads (#1064), with the slot and deadline of
+    /// [`Self::run`], as a task on [`QUERY_RUNTIME`], never on the runtime
+    /// that serves the request. `block_in_place` is valid there, and an
+    /// engine that takes `Handle::current()`, as GRIB's field jobs and the
+    /// `DataStore` bridge do, spawns onto the query runtime (root CLAUDE.md
+    /// Critical Rule 7). api-edr runs its queries on a runtime of its own
+    /// the same way.
+    pub async fn run_query<T: Send + 'static>(
+        self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, ExecutionError> {
+        let deadline = self.deadline;
+        let worker = self.worker(work);
+        let task = QUERY_RUNTIME.spawn(async move { worker() });
+        join(task, deadline).await
+    }
+
+    /// `work` as a worker: it owns the slot until it returns, runs under the
+    /// absolute deadline, and never starts once that has passed.
+    fn worker<T>(
+        self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl FnOnce() -> Result<T, ExecutionError> + Send + 'static {
+        let Self { permit, deadline } = self;
+        move || {
+            let _permit = permit;
             let _scope = ds_core::deadline::enter(Some(deadline));
             if Instant::now() >= deadline {
                 return Err(ExecutionError::Timeout);
             }
             Ok(work())
-        });
-        // abort only cancels tasks that have not started. Running work owns its
-        // permit until completion, even after HTTP timeout or disconnection.
-        let _abort = AbortOnDrop(task.abort_handle());
-        let result = tokio::time::timeout_at(deadline.into(), task)
-            .await
-            .map_err(|_| timeout_error(&TIMED_OUT_RENDER))??;
-        // Count at the request boundary, exactly once. Counting inside the
-        // worker would race the outer timeout and could count one expiry twice.
-        if matches!(&result, Err(ExecutionError::Timeout)) || Instant::now() >= deadline {
-            return Err(timeout_error(&TIMED_OUT_RENDER));
         }
-        result
     }
+}
+
+/// The runtime [`RenderJob::run_query`] runs engine queries on, sized like
+/// api-edr's query runtime: two to eight workers. The render slots bound how
+/// many queries it holds. A query waiting here for a worker still counts
+/// against its deadline, and is aborted when that expires first.
+static QUERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+        .clamp(2, 8);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .thread_name("render-query")
+        .enable_all()
+        .build()
+        .expect("render query runtime")
+});
+
+/// Await a worker `task` until `deadline`.
+async fn join<T>(
+    task: tokio::task::JoinHandle<Result<T, ExecutionError>>,
+    deadline: Instant,
+) -> Result<T, ExecutionError> {
+    // abort only cancels tasks that have not started. Running work owns its
+    // permit until completion, even after HTTP timeout or disconnection.
+    let _abort = AbortOnDrop(task.abort_handle());
+    let result = tokio::time::timeout_at(deadline.into(), task)
+        .await
+        .map_err(|_| timeout_error(&TIMED_OUT_RENDER))??;
+    // Count at the request boundary, exactly once. Counting inside the
+    // worker would race the outer timeout and could count one expiry twice.
+    if matches!(&result, Err(ExecutionError::Timeout)) || Instant::now() >= deadline {
+        return Err(timeout_error(&TIMED_OUT_RENDER));
+    }
+    result
 }
 
 /// Count one deadline expiry against its stage's counter.
@@ -736,6 +791,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(memory.available(), memory.capacity());
+    }
+
+    /// A query runs on the query runtime, never on the caller's. On a
+    /// current-thread caller, `block_in_place` would panic, and a task the
+    /// work spawns on `Handle::current()`, as GRIB's field jobs do, would
+    /// land on the caller (#1064).
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_query_runs_engine_work_on_the_query_runtime() {
+        let job = RenderJob::acquire_on(
+            Arc::new(Semaphore::new(1)),
+            Arc::new(Semaphore::new(0)),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let thread_name = || std::thread::current().name().map(str::to_owned);
+        let (ran_on, spawned_on, deadline) = job
+            .run_query(move || {
+                let handle = tokio::runtime::Handle::current();
+                let spawned_on = tokio::task::block_in_place(|| {
+                    handle.block_on(
+                        handle.spawn(async move { tokio::task::block_in_place(thread_name) }),
+                    )
+                })
+                .unwrap();
+                (thread_name(), spawned_on, ds_core::deadline::current())
+            })
+            .await
+            .unwrap();
+        assert_eq!(ran_on.as_deref(), Some("render-query"));
+        assert_eq!(spawned_on.as_deref(), Some("render-query"));
+        assert!(deadline.is_some(), "the work runs under the deadline");
+
+        let expired = RenderJob::acquire_on(
+            Arc::new(Semaphore::new(1)),
+            Arc::new(Semaphore::new(0)),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            expired
+                .run_query(|| panic!("expired work must not start"))
+                .await,
+            Err(ExecutionError::Timeout)
+        ));
     }
 
     #[tokio::test]

@@ -674,6 +674,31 @@ impl MapEngine for DerivedWind {
     fn composites(&self) -> Arc<[CompositeDef]> {
         self.map.composites()
     }
+
+    /// A derived speed shows its own values, which the wrapped position
+    /// query derives too; every other layer is the wrapped engine's.
+    fn layer_shows_values(&self, parameter: &str) -> bool {
+        self.plan().get(parameter).is_some() || self.map.layer_shows_values(parameter)
+    }
+
+    /// A derived parameter is drawn from its u and v components at the `z`
+    /// it is passed, so it is drawn at the level the wrapped engine draws u
+    /// at; every other layer is the wrapped engine's.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        let plan = self.plan();
+        let parameter = match parameter.and_then(|p| plan.get(p)) {
+            Some(d) => Some(d.u.as_str()),
+            None => parameter,
+        };
+        self.map
+            .resolve_elevation(parameter, z, time, reference_time)
+    }
 }
 
 impl EdrEngine for DerivedWind {

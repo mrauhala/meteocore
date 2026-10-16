@@ -48,12 +48,17 @@ TEXT_LIMIT = 400
 # which MeteoCore does not serve. Their failures are expected, so they are
 # listed collapsed, one line each, after the classes that judge MeteoCore's
 # own layers (main:data-independent).
-DATASET_CLASSES = ("main:data-preconditions", "basic:basic")
+DATASET_CLASSES = ("main:data-preconditions", "basic:basic", "queryable:queryable")
 # The tests of a DATASET_CLASSES class that read MeteoCore's own capabilities
 # document, not the Blue Lake layers: whether GetMap offers image/gif or
-# image/png, and the options-requirements test that calls it. Their failures
-# are listed in full, like the data-independent ones.
-OWN_TESTS = ("basic:gif-or-png", "basic:options-requirements")
+# image/png, the options-requirements test that calls it, and whether
+# GetFeatureInfo is advertised. Their failures are listed in full, like the
+# data-independent ones.
+OWN_TESTS = (
+    "basic:gif-or-png",
+    "basic:options-requirements",
+    "queryable:getfeatureinfo-supported",
+)
 # Failures listed in full, with request and response; the rest get one line.
 MAX_EXPANDED = 100
 # GitHub drops a step summary over 1 MiB, leaving only an annotation.
@@ -275,11 +280,12 @@ def markdown(class_logs, scored, outside, title, expand=MAX_EXPANDED):
         "",
         "Test failures do not fail this job. The OGC test suite section of "
         "`crates/api-wms/README.md` lists the failures expected from MeteoCore's "
-        "deliberate limits. `data-preconditions` and `basic` test OGC's Blue Lake "
-        "dataset, which MeteoCore does not serve: their failures are expected and "
-        "listed collapsed, except `basic:gif-or-png` and `basic:options-requirements`, "
-        "which read MeteoCore's own capabilities and are listed in full. The full "
-        "report is the run's `wms-ets-report` artifact.",
+        "deliberate limits. `data-preconditions`, `basic` and `queryable` test OGC's "
+        "Blue Lake dataset, which MeteoCore does not serve: their failures are "
+        "expected and listed collapsed, except `basic:gif-or-png`, "
+        "`basic:options-requirements` and `queryable:getfeatureinfo-supported`, which "
+        "read MeteoCore's own capabilities and are listed in full. The full report is "
+        "the run's `wms-ets-report` artifact.",
         "",
         "| Conformance class | Verdict | " + " | ".join(c.capitalize() for c in columns) + " |",
         "|---|---|" + "---:|" * len(columns),

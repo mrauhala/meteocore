@@ -92,6 +92,53 @@ pub fn parse_legend_format(format: Option<&str>) -> Result<LegendFormat, WmsErro
     parse_image_format(format).map(LegendFormat::Image)
 }
 
+/// The formats GetFeatureInfo answers in, its `INFO_FORMAT` values, in the
+/// order GetCapabilities lists them.
+///
+/// Single source of truth: capabilities iterates this slice, and
+/// [`InfoFormat::parse`] mirrors it.
+pub const INFO_FORMATS: &[&str] = &["text/plain", "application/json", "text/html"];
+
+/// A GetFeatureInfo response format (`INFO_FORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoFormat {
+    /// `text/plain`: one `name: value` line per field.
+    Text,
+    /// `application/json`: a GeoJSON FeatureCollection, one Point feature
+    /// per queried layer at the sampled position.
+    Json,
+    /// `text/html`: one table per queried layer.
+    Html,
+}
+
+impl InfoFormat {
+    /// Parse `INFO_FORMAT`. MIME types are case-insensitive, so it is
+    /// matched in any case. Omitted or empty is `text/plain`, as GeoServer
+    /// and MapServer answer; WMS 1.3.0 makes the parameter mandatory, and
+    /// a client that leaves it out still gets a value. Anything else is
+    /// `InvalidFormat` (WMS 1.3.0 Table E.1).
+    pub fn parse(raw: Option<&str>) -> Result<Self, WmsError> {
+        let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(InfoFormat::Text);
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "text/plain" => Ok(InfoFormat::Text),
+            "application/json" => Ok(InfoFormat::Json),
+            "text/html" => Ok(InfoFormat::Html),
+            _ => Err(WmsError::invalid_info_format(raw)),
+        }
+    }
+
+    /// The response's `Content-Type`.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            InfoFormat::Text => "text/plain; charset=utf-8",
+            InfoFormat::Json => "application/json",
+            InfoFormat::Html => "text/html; charset=utf-8",
+        }
+    }
+}
+
 /// Largest legend image `GetLegendGraphic` draws, per side: a larger
 /// `WIDTH`/`HEIGHT` is clamped to it.
 const MAX_LEGEND_WIDTH: u32 = 512;
@@ -150,6 +197,16 @@ pub struct WmsQuery {
     /// Encoder quality vendor parameter (GetMap only): 1–100 for
     /// `image/webp` (100 = lossless) and `image/jpeg`; rejected for PNG.
     pub quality: Option<String>,
+    /// GetFeatureInfo: the `LAYERS` layers to read a value from.
+    pub query_layers: Option<String>,
+    /// GetFeatureInfo: the column of the queried pixel, 0 at the left.
+    pub i: Option<String>,
+    /// GetFeatureInfo: the row of the queried pixel, 0 at the top.
+    pub j: Option<String>,
+    /// GetFeatureInfo: the response's MIME type, one of [`INFO_FORMATS`].
+    pub info_format: Option<String>,
+    /// GetFeatureInfo: the most features to report per layer.
+    pub feature_count: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for WmsQuery {
@@ -205,6 +262,25 @@ pub struct GetMapParams {
     pub reference_time: Option<DateTime<Utc>>,
 }
 
+/// Validated GetFeatureInfo parameters (WMS 1.3.0 §7.4.3).
+pub struct GetFeatureInfoParams {
+    /// The map the client shows: the GetMap parameters, validated by
+    /// [`WmsQuery::validate_get_map`] so the two requests cannot read them
+    /// differently.
+    pub map: GetMapParams,
+    /// The `QUERY_LAYERS` names, in request order, each once. The handler
+    /// checks each is one of the map's `LAYERS`.
+    pub query_layers: Vec<String>,
+    /// The queried pixel's column, `0..map.width`.
+    pub i: u32,
+    /// The queried pixel's row, `0..map.height`, 0 at the top.
+    pub j: u32,
+    pub info_format: InfoFormat,
+    /// `FEATURE_COUNT`, 1 when omitted. Every queried layer has one value
+    /// at a point, so any count reports it.
+    pub feature_count: u32,
+}
+
 impl WmsQuery {
     /// Key a request's decoded `(name, value)` pairs, in request order.
     ///
@@ -247,6 +323,11 @@ impl WmsQuery {
             "elevation" => &mut self.elevation,
             "dim_reference_time" => &mut self.dim_reference_time,
             "quality" => &mut self.quality,
+            "query_layers" => &mut self.query_layers,
+            "i" => &mut self.i,
+            "j" => &mut self.j,
+            "info_format" => &mut self.info_format,
+            "feature_count" => &mut self.feature_count,
             _ => return None,
         };
         Some(slot)
@@ -263,6 +344,7 @@ impl WmsQuery {
             "GetCapabilities" => Ok(WmsRequestType::GetCapabilities),
             "GetMap" => Ok(WmsRequestType::GetMap),
             "GetLegendGraphic" => Ok(WmsRequestType::GetLegendGraphic),
+            "GetFeatureInfo" => Ok(WmsRequestType::GetFeatureInfo),
             other => Err(WmsError::operation_not_supported(other)),
         }
     }
@@ -444,12 +526,85 @@ impl WmsQuery {
             reference_time,
         })
     }
+
+    /// Validate and extract GetFeatureInfo parameters (WMS 1.3.0 §7.4.3).
+    ///
+    /// The map part is [`Self::validate_get_map`]'s, with its exceptions.
+    /// Then: `QUERY_LAYERS` is mandatory; `INFO_FORMAT` is one of
+    /// [`INFO_FORMATS`], else `InvalidFormat`; `I` and `J` are mandatory,
+    /// and one that is no pixel of the `WIDTH` × `HEIGHT` map, a negative or
+    /// non-integer value included, is `InvalidPoint`; `FEATURE_COUNT`, when
+    /// given, is a positive integer.
+    pub fn validate_get_feature_info(&self) -> Result<GetFeatureInfoParams, WmsError> {
+        let map = self.validate_get_map()?;
+
+        let mut query_layers: Vec<String> = Vec::new();
+        for name in self
+            .query_layers
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !query_layers.iter().any(|q| q == name) {
+                query_layers.push(name.to_string());
+            }
+        }
+        if query_layers.is_empty() {
+            return Err(WmsError::missing_parameter("QUERY_LAYERS"));
+        }
+
+        let info_format = InfoFormat::parse(self.info_format.as_deref())?;
+
+        let pixel = |name: &str, raw: Option<&str>, size: u32| -> Result<u32, WmsError> {
+            let raw = raw
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| WmsError::missing_parameter(name))?;
+            raw.parse::<u32>()
+                .ok()
+                .filter(|&v| v < size)
+                .ok_or_else(|| {
+                    WmsError::InvalidPoint(format!(
+                        "{name} '{raw}' is no pixel of the map: use an integer from 0 to {}",
+                        size - 1
+                    ))
+                })
+        };
+        let i = pixel("I", self.i.as_deref(), map.width)?;
+        let j = pixel("J", self.j.as_deref(), map.height)?;
+
+        let feature_count = match self
+            .feature_count
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => 1,
+            Some(raw) => raw.parse::<u32>().ok().filter(|&n| n > 0).ok_or_else(|| {
+                WmsError::invalid_parameter(&format!(
+                    "FEATURE_COUNT '{raw}' must be a positive integer"
+                ))
+            })?,
+        };
+
+        Ok(GetFeatureInfoParams {
+            map,
+            query_layers,
+            i,
+            j,
+            info_format,
+            feature_count,
+        })
+    }
 }
 
 pub enum WmsRequestType {
     GetCapabilities,
     GetMap,
     GetLegendGraphic,
+    GetFeatureInfo,
 }
 
 /// Parse a BBOX string and resolve the output CRS, handling WMS 1.3.0 axis
@@ -890,6 +1045,11 @@ mod tests {
             elevation: None,
             dim_reference_time: None,
             quality: quality.map(str::to_string),
+            query_layers: None,
+            i: None,
+            j: None,
+            info_format: None,
+            feature_count: None,
         }
     }
 
@@ -948,9 +1108,125 @@ mod tests {
         assert!(get_map_query("image/png", None).validate_get_map().is_ok());
     }
 
+    /// A GetFeatureInfo on a 64 × 32 CRS:84 map, with `pairs` added or, as
+    /// a repeated name keeps its first value, overriding.
+    fn get_feature_info(pairs: &[(&str, &str)]) -> Result<GetFeatureInfoParams, WmsError> {
+        let base = [
+            ("REQUEST", "GetFeatureInfo"),
+            ("LAYERS", "radar"),
+            ("CRS", "CRS:84"),
+            ("BBOX", "10,55,30,70"),
+            ("WIDTH", "64"),
+            ("HEIGHT", "32"),
+            ("QUERY_LAYERS", "radar"),
+            ("I", "63"),
+            ("J", "31"),
+        ];
+        WmsQuery::from_pairs(pairs.iter().chain(&base).copied()).validate_get_feature_info()
+    }
+
+    #[test]
+    fn get_feature_info_reads_the_map_part_and_its_own_parameters() {
+        let p = get_feature_info(&[("QUERY_LAYERS", "radar, radar")]).unwrap();
+        assert_eq!(p.map.layer, "radar");
+        assert_eq!((p.map.width, p.map.height), (64, 32));
+        assert_eq!(p.query_layers, ["radar"], "named once");
+        assert_eq!((p.i, p.j), (63, 31));
+        assert_eq!(p.info_format, InfoFormat::Text, "INFO_FORMAT omitted");
+        assert_eq!(p.feature_count, 1);
+        let p = get_feature_info(&[("INFO_FORMAT", "Application/JSON"), ("FEATURE_COUNT", "5")])
+            .unwrap();
+        assert_eq!(
+            p.info_format,
+            InfoFormat::Json,
+            "MIME types match in any case"
+        );
+        assert_eq!(p.feature_count, 5);
+        // The map part's exceptions are GetMap's.
+        assert!(matches!(
+            get_feature_info(&[("CRS", "EPSG:9999")]),
+            Err(WmsError::InvalidCrs(_))
+        ));
+    }
+
+    /// WMS 1.3.0 Table E.1: an `I` or `J` that is no pixel of the map is
+    /// `InvalidPoint`, whatever makes it so.
+    #[test]
+    fn get_feature_info_point_outside_the_map_is_invalid_point() {
+        for (name, value) in [
+            ("I", "64"),
+            ("J", "32"),
+            ("I", "-1"),
+            ("J", "1.5"),
+            ("I", "left"),
+        ] {
+            match get_feature_info(&[(name, value)]) {
+                Err(WmsError::InvalidPoint(msg)) => assert!(msg.contains(value), "{msg}"),
+                Err(other) => panic!("{name}={value}: expected InvalidPoint, got {other:?}"),
+                Ok(_) => panic!("{name}={value}: expected InvalidPoint"),
+            }
+        }
+        for name in ["I", "J", "QUERY_LAYERS"] {
+            let query = WmsQuery::from_pairs(
+                [
+                    ("REQUEST", "GetFeatureInfo"),
+                    ("LAYERS", "radar"),
+                    ("CRS", "CRS:84"),
+                    ("BBOX", "10,55,30,70"),
+                    ("WIDTH", "64"),
+                    ("HEIGHT", "32"),
+                    ("QUERY_LAYERS", "radar"),
+                    ("I", "1"),
+                    ("J", "1"),
+                ]
+                .into_iter()
+                .filter(|(n, _)| *n != name),
+            );
+            assert!(
+                matches!(
+                    query.validate_get_feature_info(),
+                    Err(WmsError::MissingParameterValue(_))
+                ),
+                "{name} omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn get_feature_info_rejects_other_formats_and_feature_counts() {
+        for format in ["text/xml", "application/vnd.ogc.gml", "image/png"] {
+            assert!(
+                matches!(
+                    get_feature_info(&[("INFO_FORMAT", format)]),
+                    Err(WmsError::InvalidFormat(_))
+                ),
+                "{format}"
+            );
+        }
+        for count in ["0", "-1", "many"] {
+            assert!(
+                matches!(
+                    get_feature_info(&[("FEATURE_COUNT", count)]),
+                    Err(WmsError::InvalidParameterValue(_))
+                ),
+                "{count}"
+            );
+        }
+    }
+
+    /// Capabilities lists `INFO_FORMATS`: each must parse, and to the
+    /// format whose Content-Type names it.
+    #[test]
+    fn info_formats_all_parse_to_their_own_content_type() {
+        for format in INFO_FORMATS {
+            let parsed = InfoFormat::parse(Some(format)).unwrap();
+            assert!(parsed.content_type().starts_with(format), "{format}");
+        }
+    }
+
     /// Every parameter name `WmsQuery` reads, lower-case, in the order
     /// [`fields`] lists the fields.
-    const NAMES: [&str; 18] = [
+    const NAMES: [&str; 23] = [
         "service",
         "request",
         "version",
@@ -969,6 +1245,11 @@ mod tests {
         "elevation",
         "dim_reference_time",
         "quality",
+        "query_layers",
+        "i",
+        "j",
+        "info_format",
+        "feature_count",
     ];
 
     /// The fields of `q`, in [`NAMES`] order, written out so the test pins
@@ -977,7 +1258,7 @@ mod tests {
     /// `WmsQuery` field fails to compile here until it joins `NAMES`, and
     /// then the case test fails until `slot` reads it, so no parameter can
     /// be silently never read.
-    fn fields(q: &WmsQuery) -> [Option<&str>; 18] {
+    fn fields(q: &WmsQuery) -> [Option<&str>; 23] {
         let WmsQuery {
             service,
             request,
@@ -997,6 +1278,11 @@ mod tests {
             elevation,
             dim_reference_time,
             quality,
+            query_layers,
+            i,
+            j,
+            info_format,
+            feature_count,
         } = q;
         [
             service,
@@ -1017,6 +1303,11 @@ mod tests {
             elevation,
             dim_reference_time,
             quality,
+            query_layers,
+            i,
+            j,
+            info_format,
+            feature_count,
         ]
         .map(Option::as_deref)
     }

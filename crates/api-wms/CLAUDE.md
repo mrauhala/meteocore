@@ -20,8 +20,9 @@ injection risk.**
   alias matches only the spellings it lists, and the OGC test suite's
   `ReQuEsT`, `WiDtH` stopped 62 of its tests at their first request.
 - Values are kept as sent and matched exactly, so layer and style names
-  are case-sensitive. `TRANSPARENT` and the JSON legend `FORMAT` are the
-  documented exceptions, matched case-insensitively.
+  are case-sensitive. `TRANSPARENT`, the JSON legend `FORMAT` and
+  GetFeatureInfo's `INFO_FORMAT` (a MIME type) are the documented
+  exceptions, matched case-insensitively.
 - An unknown name is ignored. A repeated parameter, in any mix of cases,
   takes its first value; serde's derive used to reject a repeat with a
   plain-text 400 that was no ServiceException.
@@ -35,7 +36,8 @@ injection risk.**
   `LayerNotDefined`, `StyleNotDefined`, `InvalidFormat`,
   `InvalidDimensionValue` (malformed `TIME`/`ELEVATION`, unknown
   `DIM_REFERENCE_TIME`, and either of the last two on a layer without
-  that axis), `OperationNotSupported`. `MissingParameterValue` /
+  that axis), `OperationNotSupported`, and for GetFeatureInfo
+  `LayerNotQueryable` and `InvalidPoint`. `MissingParameterValue` /
   `InvalidParameterValue` are for what the table does not cover.
 - A `LAYERS` list is checked name by name before `LAYER_LIMIT` (1,
   deliberate) refuses it: `resolve_map_layer` runs on every
@@ -289,7 +291,8 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   `capabilities_1_3_0.xsd` and the SLD namespace with SLD 1.1.0's
   `sld_capabilities.xsd`. The document must validate against them: the
   OGC test suite's `validate-using-schemaLocation` does exactly that.
-- `<Request>` is `GetCapabilities`, `GetMap`, then `sld:GetLegendGraphic`.
+- `<Request>` is `GetCapabilities`, `GetMap`, `GetFeatureInfo` (its
+  `<Format>`s are `params::INFO_FORMATS`), then `sld:GetLegendGraphic`.
   The WMS schema allows only `GetFeatureInfo` and `_ExtendedOperation`s
   after GetMap; SLD 1.1.0 declares GetLegendGraphic as one, in its own
   namespace (GeoServer and MapServer write it the same way). A
@@ -310,6 +313,88 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   schema order); license → `<Attribution>` (after `<Dimension>` elements).
 - ODIM per-site layers: `<Title>` is prefixed with the site place name via
   `RasterInfo.layer_subtitle` so flat clients can tell per-site layers apart.
+
+## GetFeatureInfo (#1064)
+
+`feature_info.rs`. The value is the collection's EDR position query at the
+centre of pixel `(I, J)`, never a 1×1 `get_raster_tile` or a meta-tile
+pixel: the same engine call answers EDR `position`, so the two report the
+same value (the source value, sampled as the engine's position query does:
+bilinear for GRIB, QueryData and Zarr, while a projected GetMap resamples
+meta-tiles by nearest neighbour).
+
+- **Engines.** `WmsState::point_engines` holds the `EdrEngine` of every WMS
+  collection whose engine answers position queries
+  (`feature_info::answers_position`, `supported_query_types` containing
+  `position`). The server registers it whatever the collection's `apis`
+  list (`admin::register_point_engine`, the `wind_wrapped` EDR side for
+  GRIB/QueryData/Zarr, so a derived wind speed is queryable); `edr` in
+  `apis` only decides whether EDR routes are published. The capability is
+  read once per load, never per request: `supported_query_types` builds a
+  `Vec`.
+- **Queryable.** `layer_is_queryable`: the collection has a point engine and
+  the layer shows its parameter's own values
+  (`MapEngine::layer_shows_values`, O(1)). RGB composites, overlays (ODIM
+  `CELLS`) and collections without a position query (CAP, PostGIS events,
+  nowcast) are `queryable="0"` and answer `LayerNotQueryable`.
+  GetCapabilities and the handler use the same function, so the attribute
+  and the answer cannot disagree. Never decide it with a probe query.
+- **Map part.** `validate_get_feature_info` runs `validate_get_map`, and the
+  handler resolves it through `handlers::resolve_map`, GetMap's own layer,
+  style, dimension, time, run and content-version resolution. Never resolve
+  a GetFeatureInfo dimension a second way: the value must belong to the
+  frame GetMap draws and keys its caches on. `QUERY_LAYERS` must be layers
+  of `LAYERS` (`LayerNotDefined`, Table E.1's "a layer not shown on the
+  map"); with `LAYER_LIMIT` 1 that is the map's one layer.
+- **Point.** `OutputCrs::position_on_earth` at `((I+0.5)/WIDTH,
+  (J+0.5)/HEIGHT)`: `project_node`, the mapping every engine renders with
+  (EPSG:4326's BBOX is already lon/lat by then), for a point on the Earth,
+  then `ds_core::geo::wrap_lon`. Never re-derive the CRS math. A projected
+  map's point comes from the metres `OutputCrs::Projected` carries, never
+  from `GetMapParams.bbox`, which is NaN for a BBOX wholly outside the
+  projection. A centre off the Earth has no value and no engine call: the
+  JSON `geometry` and `value` are null. That is every pixel of a map whose
+  `domain_rows` is `None` (GetMap's empty image without a read, #1089), a
+  centre past a pole, and a projected centre outside the projection's
+  valid area, which `position_on_earth` tests with
+  `outside_projection_domain` before the inverse: past TM's strip the
+  inverse is finite but names no place, inside it past a pole it gives a
+  latitude past 90°. `I`/`J` outside the image, negative or non-integer is
+  `InvalidPoint`.
+- **Dimensions.** The resolved time as `datetime` `(t, t)`, the resolved run
+  as `reference_time`, and as `z` the level GetMap draws:
+  `MapEngine::resolve_elevation(parameter, ELEVATION, time, run)`, from the
+  parameter, time and run GetMap passes `get_raster_tile`. Never pass
+  `ELEVATION` or `vertical.levels[0]` as such: GRIB draws the run's own
+  first level, and an ODIM volume the nearest sweep carrying the quantity,
+  where the position query matches `z` to one sweep exactly. The response
+  reports the time, the run and the level when the layer has them.
+- **Execution.** `RenderJob::acquire` (the render slots, queue and deadline
+  GetMap uses, no memory reservation: one point) and `job.run_query`, a task
+  on ds-executor's dedicated query runtime, as api-edr runs its queries.
+  Never `job.run`: on a `spawn_blocking` worker of the serving runtime,
+  GRIB's field jobs and the `DataStore` bridge take `Handle::current()` and
+  put their blocking work back on request workers (root Critical Rule 7).
+  `crates/server/tests/wms_get_feature_info.rs` serves its GRIB requests on
+  a current-thread runtime, where that panics.
+  `LocationNotFound` / `FeatureNotFound` / `ReferenceTimeNotFound` /
+  `CollectionNotFound` is an empty answer (value null): no data there, or no
+  longer any after a run eviction or a reload. `ResourceExhausted` /
+  `DeadlineExceeded` 503; an engine `InvalidParameter` (and the other
+  client-error variants) a generic `InvalidParameterValue`; anything else
+  `Internal`, its detail only in the log (Critical Rule 11).
+- **Formats.** `params::INFO_FORMATS` is the one list capabilities
+  advertises and `InfoFormat::parse` accepts; an omitted `INFO_FORMAT` is
+  `text/plain`. JSON is a GeoJSON FeatureCollection, one Point feature per
+  queried layer, through `axum::Json` (serde, no new dependency). HTML is
+  written with quick-xml like every other markup here, which escapes every
+  label and value (`check_geo_safety.sh` rejects hand-built markup in this
+  crate).
+- **Caching.** `cache_control_value`, as GetMap: `immutable` only for an
+  explicit `TIME` that resolved, with `content_version` 0, and only for a
+  value. A null answer always revalidates: GeoTIFF and GRIB answer a failed
+  read with a null sample, and GetMap never pins a failed render either. No
+  server-side cache: one point read is cheaper than a cache entry.
 
 GetMap cache misses use `ds-executor::RenderJob`: a bounded shared queue and
 one absolute deadline across admission/render/encoding. The worker retains

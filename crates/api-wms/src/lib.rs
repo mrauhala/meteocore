@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod error;
+pub mod feature_info;
 pub mod handlers;
 pub mod params;
 

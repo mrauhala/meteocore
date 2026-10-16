@@ -132,6 +132,7 @@ fn build_wms_router() -> axum::Router {
         engines,
         collections,
         styles,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -332,6 +333,7 @@ mod load_shedding {
             engines,
             collections,
             styles,
+            point_engines: HashMap::new(),
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(0)), // 0 permits!
             rendered_cache: Arc::new(RenderedCache::new(16)),
             tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),

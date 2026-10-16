@@ -23,6 +23,12 @@ pub enum WmsError {
     InvalidParameterValue(String),
     /// Operation not supported.
     OperationNotSupported(String),
+    /// A GetFeatureInfo `QUERY_LAYERS` layer is not queryable: WMS 1.3.0
+    /// Table E.1's `LayerNotQueryable`.
+    LayerNotQueryable(String),
+    /// A GetFeatureInfo `I` or `J` that is no pixel of the map: Table E.1's
+    /// `InvalidPoint`.
+    InvalidPoint(String),
     /// Internal server error.
     Internal(String),
     /// Server too busy (render semaphore exhausted).
@@ -49,6 +55,15 @@ impl WmsError {
         ))
     }
 
+    /// An `INFO_FORMAT` GetFeatureInfo does not answer in: `InvalidFormat`,
+    /// naming the formats it does.
+    pub fn invalid_info_format(format: &str) -> Self {
+        WmsError::InvalidFormat(format!(
+            "INFO_FORMAT '{format}' is not supported. Use {}.",
+            crate::params::INFO_FORMATS.join(", ")
+        ))
+    }
+
     pub fn layer_not_found(layer: &str) -> Self {
         WmsError::LayerNotDefined(format!("Layer '{layer}' does not exist"))
     }
@@ -67,6 +82,8 @@ impl WmsError {
             WmsError::InvalidFormat(_) => "InvalidFormat",
             WmsError::InvalidParameterValue(_) => "InvalidParameterValue",
             WmsError::OperationNotSupported(_) => "OperationNotSupported",
+            WmsError::LayerNotQueryable(_) => "LayerNotQueryable",
+            WmsError::InvalidPoint(_) => "InvalidPoint",
             WmsError::Internal(_) => "Internal",
             WmsError::ServiceUnavailable(_) => "Internal",
         }
@@ -90,7 +107,9 @@ impl WmsError {
             | WmsError::MissingParameterValue(m)
             | WmsError::InvalidFormat(m)
             | WmsError::InvalidParameterValue(m)
-            | WmsError::OperationNotSupported(m) => m,
+            | WmsError::OperationNotSupported(m)
+            | WmsError::LayerNotQueryable(m)
+            | WmsError::InvalidPoint(m) => m,
             WmsError::Internal(_) => "Internal server error",
             WmsError::ServiceUnavailable(_) => "Server busy, try again later",
         }
@@ -245,9 +264,12 @@ mod tests {
                 "InvalidDimensionValue",
             ),
             (
-                WmsError::operation_not_supported("GetFeatureInfo"),
+                WmsError::operation_not_supported("DescribeLayer"),
                 "OperationNotSupported",
             ),
+            (WmsError::LayerNotQueryable("x".into()), "LayerNotQueryable"),
+            (WmsError::InvalidPoint("x".into()), "InvalidPoint"),
+            (WmsError::invalid_info_format("text/xml"), "InvalidFormat"),
         ] {
             let xml = String::from_utf8(err.to_xml()).expect("valid utf-8");
             assert_eq!(service_exception_code(&xml).as_deref(), Some(code), "{xml}");

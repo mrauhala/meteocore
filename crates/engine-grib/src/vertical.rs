@@ -711,4 +711,101 @@ mod tests {
             .level_collections()
             .is_empty());
     }
+
+    /// The newest run lacks the first level the runs together advertise.
+    /// Without `z`, a map draws the run's own first level, and
+    /// `resolve_elevation` names that level, so WMS GetFeatureInfo asks the
+    /// position query for a level the run has and reads the drawn value
+    /// (#1064). The advertised first level would be a 400.
+    #[test]
+    fn resolve_elevation_is_the_selected_runs_own_first_level() {
+        let source = TestSource::new();
+        let tmp = |kelvin: f32, hpa: u32| message(0, kelvin, [0; 4], 100, hpa * 100);
+        source.write_run(
+            "old",
+            "2026040500",
+            &[
+                ("TMP", "850 mb", "anl", tmp(270.0, 850)),
+                ("TMP", "500 mb", "anl", tmp(250.0, 500)),
+            ],
+        );
+        source.write_run(
+            "new",
+            "2026040506",
+            &[("TMP", "500 mb", "anl", tmp(240.0, 500))],
+        );
+        let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+        let views = engine.level_collections();
+        let [pressure] = views.as_slice() else {
+            panic!()
+        };
+        let levels = pressure
+            .raster_info_shared()
+            .vertical
+            .clone()
+            .unwrap()
+            .levels;
+        assert_eq!(levels, [850.0, 500.0]);
+
+        let old: DateTime<Utc> = "2026-04-05T00:00:00Z".parse().unwrap();
+        let new = old + chrono::Duration::hours(6);
+        let run = pressure.resolve_parameter_reference_time(Some("TMP"), None, None);
+        let time = pressure.resolve_parameter_time(Some("TMP"), None, run);
+        assert_eq!((time, run), (Some(new), Some(new)));
+        let drawn = pressure
+            .get_raster_tile(
+                [0.0, 0.0, 1.0, 1.0],
+                1,
+                1,
+                time,
+                &OutputCrs::Wgs84,
+                Some("TMP"),
+                None,
+                run,
+            )
+            .unwrap()
+            .values
+            .value_at(0)
+            .unwrap();
+        // 240 K at 500 hPa; map tiles store f32 (#475).
+        assert_eq!(drawn as f32, -33.15);
+        let level = pressure.resolve_elevation(Some("TMP"), None, time, run);
+        assert_eq!(level, Some(500.0));
+
+        let tmp = ["TMP".to_string()];
+        let position = |z: f64| {
+            pressure.query_position(
+                "POINT(0.5 0.5)",
+                time.map(|t| (t, t)),
+                Some(&tmp),
+                Some(std::slice::from_ref(&z)),
+                run,
+            )
+        };
+        let Ok(CoverageResponse::Single(series)) = position(500.0) else {
+            panic!("expected one series")
+        };
+        let value = series.ranges["TMP"].values[0].unwrap();
+        assert_eq!(value as f32, drawn as f32);
+        assert!(matches!(
+            position(levels[0]),
+            Err(DataServerError::InvalidParameter(_))
+        ));
+
+        // The older run has both and draws its own first; a level the run
+        // has stays itself, and one it lacks is echoed, failing the render
+        // and the query alike.
+        assert_eq!(
+            pressure.resolve_elevation(Some("TMP"), None, Some(old), Some(old)),
+            Some(850.0)
+        );
+        assert_eq!(
+            pressure.resolve_elevation(Some("TMP"), Some(500.0), Some(old), Some(old)),
+            Some(500.0)
+        );
+        assert_eq!(
+            pressure.resolve_elevation(Some("TMP"), Some(850.0), time, run),
+            Some(850.0)
+        );
+    }
 }

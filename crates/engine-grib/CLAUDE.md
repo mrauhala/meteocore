@@ -97,6 +97,11 @@ unlike GeoTIFF's one band per collection.
   Missing parameter/level pairs are null in EDR and errors in Maps. Pressure/
   model labels omit a fixed-level qualifier. The shared vertical descriptor
   feeds both EDR and Maps; single-level fields retain their label qualifiers.
+- A map draws the requested level, else the selected run's own first level
+  (`map_level`), which need not be the first of the advertised union.
+  `render_field` and `MapEngine::resolve_elevation` share `map_level` and
+  `select_run_step`, so WMS GetFeatureInfo asks the position query for the
+  level the map shows (#1064).
 - New families register through the server's background registration/recovery
   loop using the accepted config. Config reserves all enabled derived IDs.
 

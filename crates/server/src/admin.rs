@@ -1893,6 +1893,11 @@ pub fn load_collections(
         HashMap::new();
     let mut feature_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut map_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
+    // The EDR engines answering WMS GetFeatureInfo (#1064), for every WMS
+    // collection whose engine answers position queries, whether or not it
+    // lists `edr`.
+    let mut wms_point_engines: HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>> =
+        HashMap::new();
     let mut map_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut map_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
     let mut maps_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
@@ -2232,6 +2237,11 @@ pub fn load_collections(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
                     map_collections.insert(collection.id.clone(), collection.clone());
 
                     map_styles.extend(collection_layer_styles(
@@ -2389,6 +2399,11 @@ pub fn load_collections(
 
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(collection.id.clone(), map_engine.clone());
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        edr_engine.clone(),
+                    );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2554,6 +2569,11 @@ pub fn load_collections(
 
                     if collection.apis.contains(&"wms".to_string()) {
                         map_engines.insert(collection.id.clone(), map_engine.clone());
+                        register_point_engine(
+                            &mut wms_point_engines,
+                            &collection.id,
+                            edr_engine.clone(),
+                        );
                         map_collections.insert(collection.id.clone(), collection.clone());
                         map_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2696,6 +2716,11 @@ pub fn load_collections(
 
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(collection.id.clone(), map_engine.clone());
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        edr_engine.clone(),
+                    );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2823,6 +2848,11 @@ pub fn load_collections(
                     map_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
@@ -2953,6 +2983,11 @@ pub fn load_collections(
                     map_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
@@ -3166,6 +3201,11 @@ pub fn load_collections(
                         map_engines.insert(
                             site_id.clone(),
                             view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        register_point_engine(
+                            &mut wms_point_engines,
+                            &site_id,
+                            view.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                         );
                         map_collections.insert(site_id.clone(), site_cfg.clone());
                         map_styles.extend(collection_layer_styles(
@@ -3688,6 +3728,11 @@ pub fn load_collections(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -3958,6 +4003,11 @@ pub fn load_collections(
                 collection.id.clone(),
                 engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
             );
+            register_point_engine(
+                &mut wms_point_engines,
+                &collection.id,
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
             map_collections.insert(collection.id.clone(), collection.clone());
             map_styles.extend(collection_layer_styles(
                 style_ctx,
@@ -4117,6 +4167,7 @@ pub fn load_collections(
         },
         wms_state: WmsState {
             engines: map_engines,
+            point_engines: wms_point_engines,
             collections: map_collections,
             styles: map_styles,
             render_semaphore: render_semaphore.clone(),
@@ -4175,6 +4226,21 @@ pub fn load_collections(
         nowcast_dependency_updates,
         engines_by_id,
         wind_by_id,
+    }
+}
+
+/// Register a WMS collection's EDR engine for GetFeatureInfo (#1064) when it
+/// answers position queries (`api_wms::feature_info::answers_position`),
+/// whether or not the collection lists `edr`: the WMS reads a layer's value
+/// with it, and listing `edr` only decides whether EDR routes are published.
+/// The capability is read here, once per load, never per request.
+fn register_point_engine(
+    point_engines: &mut HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>>,
+    id: &str,
+    engine: Arc<dyn ds_core::edr_engine::EdrEngine>,
+) {
+    if api_wms::feature_info::answers_position(engine.as_ref()) {
+        point_engines.insert(id.to_string(), engine);
     }
 }
 
@@ -6859,6 +6925,88 @@ mod tests {
             .contains(&"WindSpeedMS".to_string()));
         assert!(!off.wms_state.styles.contains_key("kenya/WindSpeedMS"));
         assert!(off.wind_by_id.is_empty());
+    }
+
+    /// WMS GetFeatureInfo (#1064): a WMS collection whose engine answers
+    /// position queries registers its EDR side for the WMS whether or not it
+    /// lists `edr`, which only decides the EDR routes. A GRIB collection
+    /// registers its derived-wind wrapper, so a derived speed is queryable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wms_collections_register_their_position_engine_without_edr() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let geotiff = serde_json::json!({
+            "filename_template": "radar_%Y%m%dT%H%MZ.tif",
+            "parameter": "reflectivity", "unit": "dBZ",
+        });
+        let collections: Vec<CollectionConfig> = [
+            serde_json::json!({
+                "id": "radar", "title": "Radar", "description": "GeoTIFF",
+                "engine_type": "geotiff", "apis": ["wms"],
+                "data_path": "../../testdata/radar", "geotiff": geotiff,
+            }),
+            serde_json::json!({
+                "id": "arpege-uv", "title": "ARPEGE", "description": "u/v",
+                "engine_type": "grib", "apis": ["wms"],
+                "grib": {"data_path": "../../testdata/grib-arpege-wind", "parameters": ["10u", "10v"]},
+            }),
+            serde_json::json!({
+                "id": "radar-edr", "title": "Radar", "description": "EDR only",
+                "engine_type": "geotiff", "apis": ["edr"],
+                "data_path": "../../testdata/radar", "geotiff": geotiff,
+            }),
+        ]
+        .into_iter()
+        .map(|c| serde_json::from_value(c).unwrap())
+        .collect();
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &collections,
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let ids = |keys: Vec<&String>| {
+            let mut ids: Vec<String> = keys.into_iter().cloned().collect();
+            ids.sort();
+            ids
+        };
+        let point = &result.wms_state.point_engines;
+        assert_eq!(ids(point.keys().collect()), ["arpege-uv", "radar"]);
+        assert_eq!(
+            ids(result.edr_state.engines.keys().collect()),
+            ["radar-edr"]
+        );
+        assert!(point["arpege-uv"]
+            .get_parameters()
+            .contains(&"10si".to_string()));
+
+        // Through the WMS: the derived speed's value at a point.
+        let app = api_wms::router(Arc::new(arc_swap::ArcSwap::from_pointee(result.wms_state)));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo\
+                         &LAYERS=arpege-uv/10si&QUERY_LAYERS=arpege-uv/10si&STYLES=\
+                         &CRS=CRS:84&BBOX=10,46,12,48&WIDTH=2&HEIGHT=2&I=0&J=0\
+                         &INFO_FORMAT=application/json",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let properties = &body["features"][0]["properties"];
+        assert_eq!(properties["parameter"], "10si", "{body}");
+        assert!(properties["value"].is_number(), "{body}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
