@@ -7,10 +7,13 @@
 # job summary. The full report is the `wms-ets-report` artifact.
 #
 # Test failures do NOT fail the job, for now. MeteoCore's WMS has
-# deliberate limits a strict run meets: LayerLimit 1 (one layer per
-# GetMap) and no GetFeatureInfo (every layer is queryable="0"). The basic
-# class's dataset-specific tests also need OGC's "Blue Lake" test dataset
-# (the cite:* layers), which these fixtures do not carry.
+# deliberate limits a strict run meets, such as LayerLimit 1 (one layer per
+# GetMap). The basic class's dataset-specific tests also need OGC's "Blue
+# Lake" test dataset (the cite:* layers), which these fixtures do not
+# carry. Every fixture layer is advertised queryable (GetFeatureInfo,
+# #1064): each engine answers EDR position queries, though the collections
+# list only `wms`. The queryable class has no recorded run yet: whether its
+# tests also need Blue Lake is for its first run here to show.
 # crates/api-wms/README.md lists the expected failures. The job fails only
 # when the suite could not run at all: the server or TEAM Engine did not
 # come up, the server died during the run, the run returned no report, or
@@ -67,7 +70,7 @@ env:
 
 jobs:
   ets:
-    name: ets-wms13 (basic)
+    name: ets-wms13 (basic, queryable)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
@@ -181,10 +184,12 @@ jobs:
           exit 1
 
       # One synchronous run: TEAM Engine answers once every test has
-      # finished, with its CTL log (report_logs.xml). `basic=basic` requests
-      # the basic conformance class; the data-independent tests always run.
-      # queryable waits for GetFeatureInfo (#1064); the time, elevation and
-      # recommendation classes stay off.
+      # finished, with its CTL log (report_logs.xml). `basic=basic` and
+      # `queryable=queryable` request the basic and queryable conformance
+      # classes, the second for GetFeatureInfo (#1064). The `queryable`
+      # name follows `basic`'s pattern; the first run confirms the suite
+      # took it, by listing the class. The data-independent tests always
+      # run. The time, elevation and recommendation classes stay off.
       - name: Run ets-wms13
         id: run
         run: |
@@ -192,6 +197,7 @@ jobs:
             -u "$TE_AUTH" -H 'Accept: application/xml' -G \
             --data-urlencode "capabilities-url=$CAPABILITIES_URL" \
             --data-urlencode 'basic=basic' \
+            --data-urlencode 'queryable=queryable' \
             "$TE_URL/rest/suites/wms13/run" || true)
           echo "TEAM Engine answered HTTP $code."
           if [ "$code" != 200 ]; then

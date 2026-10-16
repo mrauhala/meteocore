@@ -6,7 +6,9 @@ use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
+use chrono::{DateTime, Utc};
 use ds_core::config::CollectionConfig;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
@@ -15,7 +17,7 @@ use ds_render::{
 };
 
 use crate::error::WmsError;
-use crate::params::{WmsQuery, WmsRequestType};
+use crate::params::{GetMapParams, WmsQuery, WmsRequestType};
 
 /// Log a phase breakdown for any GetMap render at or above this wall-clock time,
 /// so production tells us where a slow render's time actually goes (queue wait
@@ -76,7 +78,7 @@ impl RenderPath {
 }
 
 /// How a GetMap turns engine output into pixels.
-enum Paint {
+pub(crate) enum Paint {
     /// One parameter through its style's colormap.
     Colormap(Arc<dyn ColorMap>),
     /// An RGB composite layer (#819): its bands from `get_raster_tiles`,
@@ -108,6 +110,12 @@ fn composite_layer(engine: &dyn MapEngine, layer: &str) -> Option<Arc<CompositeS
 #[derive(Clone)]
 pub struct WmsState {
     pub engines: HashMap<String, Arc<dyn MapEngine>>,
+    /// The EDR engine of each WMS collection whose engine answers position
+    /// queries ([`crate::feature_info::answers_position`]), keyed like
+    /// `engines`: GetFeatureInfo reads a layer's value with it (#1064).
+    /// Registered whether or not the collection lists `edr`, which only
+    /// decides whether EDR routes are published.
+    pub point_engines: HashMap<String, Arc<dyn EdrEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
     /// Map of layer → style name → StyleInfo. Every layer has at least "default".
     pub styles: HashMap<String, HashMap<String, StyleInfo>>,
@@ -212,7 +220,7 @@ fn render_job(
 ///   cache (60 s) and revalidate, so a browser/CDN that holds a pre-revision
 ///   tile for the same URL asks again (the ETag is content-derived, so an
 ///   unchanged tile is a cheap 304). The red error tile is always short too.
-fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
+pub(crate) fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
     if pinned_time && content_version == 0 {
         "public, max-age=86400, immutable"
     } else {
@@ -336,6 +344,165 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
     })
 }
 
+/// The map a GetMap draws, or a GetFeatureInfo queries: its layer and style,
+/// and the parameter, timestep, model run and content version GetMap renders
+/// and keys its caches on. GetFeatureInfo resolves its map part through
+/// [`resolve_map`] too, so the value it reports belongs to the frame the
+/// client shows (#1064).
+pub(crate) struct ResolvedMap {
+    pub collection_id: String,
+    pub engine: Arc<dyn MapEngine>,
+    pub paint: Paint,
+    /// The resolved style's name.
+    pub style_name: String,
+    pub info: Arc<ds_core::map_engine::RasterInfo>,
+    /// The parameter drawn: the `/param` of `LAYERS=collection/param`, else
+    /// the style's; for a composite, the composite's name.
+    pub parameter: Option<String>,
+    /// The timestep drawn: `TIME`, or the layer's default, snapped by the
+    /// engine (#507). `None` when the engine has nothing to draw.
+    pub time: Option<DateTime<Utc>>,
+    /// The model run drawn (#521); `None` for an engine without runs.
+    pub reference_time: Option<DateTime<Utc>>,
+    /// [`MapEngine::content_version`], read right after the time resolved.
+    pub content_version: u64,
+}
+
+/// Resolve a GetMap's (or a GetFeatureInfo's map part's) layers, styles and
+/// dimensions: every WMS exception the map part can raise, then the
+/// parameter, timestep and model run the engine draws.
+pub(crate) fn resolve_map(
+    state: &WmsState,
+    params: &GetMapParams,
+) -> Result<ResolvedMap, WmsError> {
+    let MapLayer {
+        collection_id,
+        layer_parameter,
+        engine,
+        paint,
+        style_name,
+        style_parameter,
+        info,
+    } = resolve_map_layer(state, &params.layer, &params.style)?;
+
+    // GetMap renders one layer (`LayerLimit`), but a request naming
+    // a layer or style this server does not serve gets that error
+    // first: WMS 1.3.0 Table E.1's `LayerNotDefined` /
+    // `StyleNotDefined`, whichever layer of the list it is (#1065).
+    for (layer, style) in &params.other_layers {
+        resolve_map_layer(state, layer, style)?;
+    }
+    if 1 + params.other_layers.len() > crate::params::LAYER_LIMIT {
+        return Err(WmsError::invalid_parameter(
+            "Exactly one LAYERS value is supported",
+        ));
+    }
+
+    // Reject an `ELEVATION` against a layer with no vertical axis:
+    // a sample dimension value the layer cannot take, Table E.1's
+    // `InvalidDimensionValue`, as a `DIM_REFERENCE_TIME` on a
+    // layer without runs is below (#1065).
+    if params.elevation.is_some() && info.vertical.is_none() {
+        return Err(WmsError::InvalidDimensionValue(format!(
+            "Layer '{collection_id}' has no ELEVATION dimension"
+        )));
+    }
+
+    // Validate `DIM_REFERENCE_TIME` against the layer's advertised model
+    // runs. The engine requires an exact run match (`select_run` →
+    // `ReferenceTimeNotFound`, which the GetMap render path would turn
+    // into a red 200 tile); surfacing `InvalidDimensionValue` here is the
+    // correct WMS response — mirroring the parameter/ELEVATION checks.
+    if let Some(rt) = params.reference_time {
+        if info.reference_times.is_empty() {
+            return Err(WmsError::InvalidDimensionValue(format!(
+                "Layer '{collection_id}' has no reference_time dimension"
+            )));
+        }
+        // Ascending by the `RasterInfo` contract; an archive keeps
+        // thousands of runs (#1006).
+        if info.reference_times.binary_search(&rt).is_err() {
+            return Err(WmsError::InvalidDimensionValue(format!(
+                "reference_time '{}' is not an available model run for layer \
+                 '{collection_id}'",
+                rt.to_rfc3339()
+            )));
+        }
+    }
+
+    // WMS picks the parameter via `LAYERS=collection/param` (parsed
+    // into layer_parameter) and then `style_info.parameter`. Settle it
+    // first: a parameter can have its own time axis, and so can a
+    // composite, whose name the engine resolves like a parameter's.
+    let parameter = layer_parameter.or(style_parameter);
+
+    // Engine-owned default first (CAP: active now), then the
+    // parameter's (else the collection's) latest time. Resolve before
+    // keying so an omitted TIME tracks catalog updates.
+    let time = params.time.or_else(|| {
+        ds_core::map_engine::default_request_time(engine.as_ref(), &info, parameter.as_deref())
+    });
+
+    // Normalise an explicit pin of the *current* latest run to `None`
+    // BEFORE resolution, so it gets the same fallback-tolerant run
+    // selection as an omitted dimension: the common client flow
+    // echoes the GetCapabilities `default=` (the latest run) on
+    // every request — including animation frames OLDER than that
+    // run's reference time, which an exact pin would refuse (GRIB's
+    // cross-run fallback applies only to `None`). A pin of an
+    // *older* run stays explicit/exact — that is user intent.
+    let requested_run = params
+        .reference_time
+        .filter(|&rt| info.reference_times.last().copied() != Some(rt));
+
+    // #521: resolve the run axis to the CONCRETE run the engine will
+    // render — the run-axis mirror of what #508 does for TIME below.
+    // The no-TTL caches keyed on `None` ("latest at render time")
+    // would freeze whichever run was latest at first render: when a
+    // newer run re-covers the same valid times with different pixels
+    // (every few hours for NWP, every ~5 min for a nowcast
+    // generation), the stale entries would keep serving forever.
+    // Asking the ENGINE (rather than picking
+    // `reference_times.last()` here) preserves engine-specific
+    // selection such as GRIB's cross-run fallback — a valid time the
+    // newest run doesn't cover resolves to (and keys) the older run
+    // actually rendered. Engines without runs keep the identity
+    // default (`None` stays `None`). The run is the parameter's:
+    // GRIB renders an aggregate the newest run lacks at that time
+    // from an older run that has it (#1005).
+    let reference_time =
+        engine.resolve_parameter_reference_time(parameter.as_deref(), time, requested_run);
+
+    // #507: snap that instant to the exact timestep the engine will
+    // actually render, BEFORE any cache key is built. Engines that
+    // select latest-not-after (geotiff) would otherwise render T−1
+    // pixels for a not-yet-ingested TIME=T and cache them under T's
+    // key — permanently poisoning frame T for the covered tiles once
+    // T's file lands (the partial one-step-behind animation regions
+    // seen under storm load). Resolving here also pins one timestep
+    // for the whole request, so a catalog swap mid-render can no
+    // longer mix timesteps within a single response. Exact-match
+    // engines keep the identity default; a parameter with its own
+    // time axis snaps on that axis.
+    let time = engine.resolve_parameter_time(parameter.as_deref(), time, reference_time);
+    // Content revised in place under the same instant (a push-fed
+    // alert set) must not hit a stale entry: the engine's content
+    // version is part of every rendered/meta-tile key.
+    let content_version = engine.content_version();
+
+    Ok(ResolvedMap {
+        collection_id,
+        engine,
+        paint,
+        style_name,
+        info,
+        parameter,
+        time,
+        reference_time,
+        content_version,
+    })
+}
+
 /// Main WMS handler — dispatches on REQUEST parameter. `WmsQuery` keys the
 /// query string case-insensitively for every request type.
 pub async fn wms_handler(
@@ -351,6 +518,7 @@ pub async fn wms_handler(
                 &state.engines,
                 &state.collections,
                 &state.styles,
+                &state.point_engines,
                 &request_base_url(&state, &headers),
             );
             Ok((
@@ -368,60 +536,17 @@ pub async fn wms_handler(
         WmsRequestType::GetMap => {
             let params = query.validate_get_map()?;
 
-            let MapLayer {
+            let ResolvedMap {
                 collection_id,
-                layer_parameter,
                 engine,
                 paint,
                 style_name,
-                style_parameter,
-                info,
-            } = resolve_map_layer(&state, &params.layer, &params.style)?;
-
-            // GetMap renders one layer (`LayerLimit`), but a request naming
-            // a layer or style this server does not serve gets that error
-            // first: WMS 1.3.0 Table E.1's `LayerNotDefined` /
-            // `StyleNotDefined`, whichever layer of the list it is (#1065).
-            for (layer, style) in &params.other_layers {
-                resolve_map_layer(&state, layer, style)?;
-            }
-            if 1 + params.other_layers.len() > crate::params::LAYER_LIMIT {
-                return Err(WmsError::invalid_parameter(
-                    "Exactly one LAYERS value is supported",
-                ));
-            }
-
-            // Reject an `ELEVATION` against a layer with no vertical axis:
-            // a sample dimension value the layer cannot take, Table E.1's
-            // `InvalidDimensionValue`, as a `DIM_REFERENCE_TIME` on a
-            // layer without runs is below (#1065).
-            if params.elevation.is_some() && info.vertical.is_none() {
-                return Err(WmsError::InvalidDimensionValue(format!(
-                    "Layer '{collection_id}' has no ELEVATION dimension"
-                )));
-            }
-
-            // Validate `DIM_REFERENCE_TIME` against the layer's advertised model
-            // runs. The engine requires an exact run match (`select_run` →
-            // `ReferenceTimeNotFound`, which the GetMap render path would turn
-            // into a red 200 tile); surfacing `InvalidDimensionValue` here is the
-            // correct WMS response — mirroring the parameter/ELEVATION checks.
-            if let Some(rt) = params.reference_time {
-                if info.reference_times.is_empty() {
-                    return Err(WmsError::InvalidDimensionValue(format!(
-                        "Layer '{collection_id}' has no reference_time dimension"
-                    )));
-                }
-                // Ascending by the `RasterInfo` contract; an archive keeps
-                // thousands of runs (#1006).
-                if info.reference_times.binary_search(&rt).is_err() {
-                    return Err(WmsError::InvalidDimensionValue(format!(
-                        "reference_time '{}' is not an available model run for layer \
-                         '{collection_id}'",
-                        rt.to_rfc3339()
-                    )));
-                }
-            }
+                info: _,
+                parameter,
+                time,
+                reference_time,
+                content_version,
+            } = resolve_map(&state, &params)?;
 
             // The format as encoded: an explicit QUALITY, else for WebP the
             // collection's `[wms] webp_quality`, else the format default
@@ -437,70 +562,6 @@ pub async fn wms_handler(
             );
             let content_type = format.content_type();
             let has_explicit_time = params.time.is_some();
-
-            // WMS picks the parameter via `LAYERS=collection/param` (parsed
-            // into layer_parameter) and then `style_info.parameter`. Settle it
-            // first: a parameter can have its own time axis, and so can a
-            // composite, whose name the engine resolves like a parameter's.
-            let parameter = layer_parameter.clone().or(style_parameter);
-
-            // Engine-owned default first (CAP: active now), then the
-            // parameter's (else the collection's) latest time. Resolve before
-            // keying so an omitted TIME tracks catalog updates.
-            let time = params.time.or_else(|| {
-                ds_core::map_engine::default_request_time(
-                    engine.as_ref(),
-                    &info,
-                    parameter.as_deref(),
-                )
-            });
-
-            // Normalise an explicit pin of the *current* latest run to `None`
-            // BEFORE resolution, so it gets the same fallback-tolerant run
-            // selection as an omitted dimension: the common client flow
-            // echoes the GetCapabilities `default=` (the latest run) on
-            // every request — including animation frames OLDER than that
-            // run's reference time, which an exact pin would refuse (GRIB's
-            // cross-run fallback applies only to `None`). A pin of an
-            // *older* run stays explicit/exact — that is user intent.
-            let requested_run = params
-                .reference_time
-                .filter(|&rt| info.reference_times.last().copied() != Some(rt));
-
-            // #521: resolve the run axis to the CONCRETE run the engine will
-            // render — the run-axis mirror of what #508 does for TIME below.
-            // The no-TTL caches keyed on `None` ("latest at render time")
-            // would freeze whichever run was latest at first render: when a
-            // newer run re-covers the same valid times with different pixels
-            // (every few hours for NWP, every ~5 min for a nowcast
-            // generation), the stale entries would keep serving forever.
-            // Asking the ENGINE (rather than picking
-            // `reference_times.last()` here) preserves engine-specific
-            // selection such as GRIB's cross-run fallback — a valid time the
-            // newest run doesn't cover resolves to (and keys) the older run
-            // actually rendered. Engines without runs keep the identity
-            // default (`None` stays `None`). The run is the parameter's:
-            // GRIB renders an aggregate the newest run lacks at that time
-            // from an older run that has it (#1005).
-            let reference_time =
-                engine.resolve_parameter_reference_time(parameter.as_deref(), time, requested_run);
-
-            // #507: snap that instant to the exact timestep the engine will
-            // actually render, BEFORE any cache key is built. Engines that
-            // select latest-not-after (geotiff) would otherwise render T−1
-            // pixels for a not-yet-ingested TIME=T and cache them under T's
-            // key — permanently poisoning frame T for the covered tiles once
-            // T's file lands (the partial one-step-behind animation regions
-            // seen under storm load). Resolving here also pins one timestep
-            // for the whole request, so a catalog swap mid-render can no
-            // longer mix timesteps within a single response. Exact-match
-            // engines keep the identity default; a parameter with its own
-            // time axis snaps on that axis.
-            let time = engine.resolve_parameter_time(parameter.as_deref(), time, reference_time);
-            // Content revised in place under the same instant (a push-fed
-            // alert set) must not hit a stale entry: the engine's content
-            // version is part of every rendered/meta-tile key.
-            let content_version = engine.content_version();
 
             // Build cache key
             let cache_key = CacheKey {
@@ -1005,6 +1066,9 @@ pub async fn wms_handler(
                 );
             }
             Ok(response)
+        }
+        WmsRequestType::GetFeatureInfo => {
+            crate::feature_info::get_feature_info(&state, &query).await
         }
         WmsRequestType::GetLegendGraphic => {
             let layer_name = query

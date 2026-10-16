@@ -1013,6 +1013,23 @@ impl GribEngine {
         self.fetch_grid_by_entry(step_file.message_url(entry), entry)
     }
 
+    /// The level a map field of `run` is drawn at: the requested `z`, which
+    /// the run must have, else the run's own first level; `None` on a view
+    /// without a vertical axis. `render_field` and `resolve_elevation`
+    /// share it, so WMS GetFeatureInfo queries the level GetMap draws
+    /// (#1064).
+    fn map_level(
+        &self,
+        catalog: &Catalog,
+        run: DateTime<Utc>,
+        z: Option<f64>,
+    ) -> Result<Option<f64>, DataServerError> {
+        let requested = z.map(|v| [v]);
+        let levels =
+            self.selected_levels(catalog, run, requested.as_ref().map(|a| a.as_slice()))?;
+        Ok(levels[0])
+    }
+
     /// One map field of `run`'s `step_file`: `parameter` (else the step's
     /// default product) at the requested or the run's first level,
     /// resampled onto the request in display units.
@@ -1028,13 +1045,8 @@ impl GribEngine {
             .parameter_keys(&run.reference_time)
             .cloned()
             .unwrap_or_default();
-        let requested = field.z.map(|v| [v]);
-        let levels = self.selected_levels(
-            catalog,
-            run.reference_time,
-            requested.as_ref().map(|a| a.as_slice()),
-        )?;
-        let keys = Self::keys_at_level(&keys, levels[0]);
+        let level = self.map_level(catalog, run.reference_time, field.z)?;
+        let keys = Self::keys_at_level(&keys, level);
 
         // Determine parameter to render
         let param_name = parameter.unwrap_or_else(|| {
@@ -1855,6 +1867,24 @@ impl MapEngine for GribEngine {
             .map(|(run, step, _)| run.reference_time + chrono::Duration::hours(i64::from(step)))
             .ok()
             .or(time)
+    }
+
+    /// The level `get_raster_tile` draws, through the SAME `select_run_step`
+    /// and `map_level`: without `z`, the selected run's own first level,
+    /// which need not be the first of the levels every run together
+    /// advertise. A failed selection echoes `z`: the render, and the
+    /// position query GetFeatureInfo runs at it, fail the same way.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        let catalog = self.catalog();
+        select_run_step(&catalog, parameter.as_slice(), reference_time, time)
+            .and_then(|(run, _, _)| self.map_level(&catalog, run.reference_time, z))
+            .unwrap_or(z)
     }
 
     /// The valid times of the steps carrying `parameter` (#1005), over

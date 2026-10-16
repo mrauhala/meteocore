@@ -43,7 +43,7 @@ baselines, with implementation gaps and evidence for standards experimentation.
 | `api-features` | [OGC API - Features 1.0](https://docs.ogc.org/is/17-069r4/17-069r4.html) | core, oas30, geojson |
 | `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, spatial-subsetting, scaling, datetime, crs, png, jpeg |
 | `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | ogcapi-tiles-1: core, tileset, tilesets-list, geodata-tilesets, datetime, png, jpeg, mvt; tms 2.0: tilematrixset, json-tilematrixset; at the shared root also ogcapi-maps-1: tilesets |
-| `api-wms` | [OGC WMS 1.3.0](https://portal.ogc.org/files/?artifact_id=14416) | GetCapabilities, GetMap, GetLegendGraphic |
+| `api-wms` | [OGC WMS 1.3.0](https://portal.ogc.org/files/?artifact_id=14416) | GetCapabilities, GetMap, GetFeatureInfo, GetLegendGraphic |
 | `api-3dtiles` | [OGC 3D Tiles 1.1](https://docs.ogc.org/cs/22-025r4/22-025r4.html) | point clouds (`.pnts`), glTF mesh content (`.glb` — isosurface + echo-top), cylindrical voxels (`.glb`, `EXT_primitive_voxels` draft); bundled CesiumJS viewer SPA |
 
 ### Binary
@@ -364,6 +364,7 @@ the shared root serves all three):
 
 /wms/?SERVICE=WMS&REQUEST=GetCapabilities      WMS 1.3.0 GetCapabilities (XML)
 /wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG/JPEG/WebP)
+/wms/?SERVICE=WMS&REQUEST=GetFeatureInfo&...   WMS 1.3.0 GetFeatureInfo (text, GeoJSON, HTML)
 /wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic (PNG/JPEG/WebP)
 
 /3dtiles/                                      3D Tiles landing page
@@ -1590,6 +1591,7 @@ A single `/wms/` endpoint dispatches on the `REQUEST` query parameter:
 
 - **GetCapabilities** — XML capabilities listing layers, CRS, extents, time dimension, and styles. Its `<Service>` advertises the GetMap limits as `<LayerLimit>1</LayerLimit>`, `<MaxWidth>8000</MaxWidth>` and `<MaxHeight>8000</MaxHeight>`, so a client can size its requests.
 - **GetMap** — render a map image as PNG, JPEG, or WebP
+- **GetFeatureInfo** — a layer's value at a pixel of the map, as `text/plain`, `application/json` (GeoJSON) or `text/html`: the collection's EDR position query at the pixel's centre, at the time, run and level GetMap draws. A layer is `queryable="1"` when its engine answers position queries, whether or not the collection lists `edr`; RGB composites, the ODIM `CELLS` overlay, CAP, PostGIS events and nowcast layers are not queryable. See [GetFeatureInfo](crates/api-wms/README.md#getfeatureinfo)
 - **GetLegendGraphic** — render a colormap legend strip
 
 WMS, OGC API - Maps, and OGC API - Tiles share the same `MapEngine`, render semaphore, rendered-image cache, and colormaps. Only the HTTP layer is WMS-specific.
@@ -1836,6 +1838,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | Supported CRS | `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, `EPSG:3035` |
 | Supported `FORMAT` (GetMap) | `image/png`, `image/jpeg`, `image/webp` |
 | Supported `FORMAT` (GetLegendGraphic) | `image/png`, `image/jpeg`, `image/webp` |
+| Supported `INFO_FORMAT` (GetFeatureInfo) | `text/plain` (default), `application/json`, `text/html` |
 
 ## OGC API - Maps
 
@@ -2005,6 +2008,7 @@ A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the T
 |----------|---------------|------|
 | Request with explicit timestamp | `public, max-age=86400, immutable` | Yes |
 | Request without timestamp (latest) | `public, max-age=60, must-revalidate` | Yes |
+| GetFeatureInfo | As a map request: `immutable` only with an explicit timestamp on content the engine never revises, and only for a value; a null answer revalidates | No |
 | GetLegendGraphic | `public, max-age=86400, immutable` | No |
 | Metadata endpoints | No cache headers | No |
 
@@ -2261,7 +2265,7 @@ baseline before adding CodeQL to required merge checks. The existing RustSec
 - GeoJSON engine implements `FeatureEngine` only (not EDR or WMS)
 - GeoTIFF engine implements `EdrEngine` + `MapEngine` only (not Features)
 - GeoTIFF: one band per collection; strip-based TIFFs not supported
-- WMS: one `LAYERS` value per request; no external SLD/SE styling or GetFeatureInfo. Local SLD ColorMap palette import is supported.
+- WMS: one `LAYERS` value per request; no external SLD/SE styling. Local SLD ColorMap palette import is supported. GetFeatureInfo answers only layers whose engine answers EDR position queries.
 - Raster sampling is engine-specific: GRIB, QueryData and Zarr use bilinear sampling; GeoTIFF and nowcast use nearest-neighbor. WMS meta-tile assembly uses nearest-neighbor to preserve discrete palettes; there is no request-level resampling selector.
 - STAC metadata discovery retries transport failures and server errors up to three times with backoff; it does not use conditional HTTP caching (ETag/Last-Modified).
 - Tiles: WebMercatorQuad and WorldCRS84Quad only; fixed 256x256 raster tiles; MVT is supported via `?f=mvt` for `FeatureEngine`-backed collections

@@ -643,9 +643,10 @@ struct Pixels<'a> {
     /// `Some(handle)` when the caller runs inside `spawn_blocking`
     /// (`get_raster_tile` / `query_trajectory`) — the fetch then uses
     /// `handle.block_on` because `block_in_place` panics on a `spawn_blocking`
-    /// pool thread. `None` on a dedicated EDR runtime worker (position / area /
-    /// locations), where the fetch must use `block_in_place` via the plain
-    /// `DataStore::get`. Irrelevant for a `Local` source.
+    /// pool thread. `None` on a dedicated query runtime worker (EDR position /
+    /// area / locations, and WMS GetFeatureInfo's position query through
+    /// `RenderJob::run_query`), where the fetch must use `block_in_place` via
+    /// the plain `DataStore::get`. Irrelevant for a `Local` source.
     handle: Option<&'a tokio::runtime::Handle>,
     /// Complete requested quantity for a 3D render, retained across LRU eviction.
     moments: Option<&'a MomentPixels>,
@@ -2570,6 +2571,31 @@ fn nearest_sweep_index(volume: &PolarVolume, target: f64) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// The sweep a map of `quantity` draws for `z`: among the sweeps that
+/// carry the moment, the one nearest `z`, else the lowest. `None` when no
+/// sweep carries it. A blind lowest or nearest pick would 400 on a quantity
+/// only higher sweeps carry (split-cut scan strategies), though it is
+/// advertised: the parameter list unions across sweeps. `sweeps` is sorted
+/// ascending by elangle (M1), so the first candidate is the lowest.
+///
+/// Shared by [`polar_sample`] and the site view's
+/// `MapEngine::resolve_elevation`, so WMS GetFeatureInfo asks the position
+/// query for the sweep GetMap draws (#1064).
+fn drawn_sweep<'v>(volume: &'v PolarVolume, quantity: &str, z: Option<f64>) -> Option<&'v Sweep> {
+    let mut candidates = volume
+        .sweeps
+        .iter()
+        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity));
+    match z {
+        Some(target) => candidates.min_by(|a, b| {
+            (a.elangle - target)
+                .abs()
+                .total_cmp(&(b.elangle - target).abs())
+        }),
+        None => candidates.next(),
+    }
+}
+
 /// Resample one polar moment of a sweep into a Cartesian output grid.
 ///
 /// `bbox` is `[west, south, east, north]` in WGS84 degrees. Each output pixel's
@@ -2598,8 +2624,9 @@ fn nearest_sweep_index(volume: &PolarVolume, target: f64) -> Option<usize> {
 /// elevation sweep this M2 interim, the near-horizon geometry keeps the
 /// slant-vs-ground discrepancy small.
 ///
-/// `z` selects the elevation sweep: `Some(angle)` renders the sweep
-/// nearest that angle, `None` renders the lowest sweep.
+/// `z` selects the elevation sweep through [`drawn_sweep`]: `Some(angle)`
+/// renders the sweep nearest that angle, `None` the lowest, among the
+/// sweeps carrying `quantity`.
 #[allow(clippy::too_many_arguments)]
 fn polar_sample(
     volume: &PolarVolume,
@@ -2613,33 +2640,12 @@ fn polar_sample(
     z: Option<f64>,
     resampling: ResamplingMethod,
 ) -> Result<RasterTile, DataServerError> {
-    // Pick the sweep that actually carries `quantity`: nearest to `z` (or
-    // the lowest when `z` is absent) *among the sweeps that contain the
-    // moment*. A blind lowest/nearest pick would 400 on a quantity that is
-    // only present on higher sweeps (split-cut scan strategies), even
-    // though it is advertised (the parameter list unions across sweeps).
-    // `sweeps` is sorted ascending by elangle (M1), so the first matching
-    // candidate is the lowest sweep that has the quantity.
-    let mut candidates = volume
-        .sweeps
-        .iter()
-        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity))
-        .peekable();
-    if candidates.peek().is_none() {
-        return Err(DataServerError::InvalidParameter(format!(
+    let sweep = drawn_sweep(volume, quantity, z).ok_or_else(|| {
+        DataServerError::InvalidParameter(format!(
             "quantity `{quantity}` is not present in any sweep of PVOL site `{}`",
             volume.site.nod.as_deref().unwrap_or("?")
-        )));
-    }
-    let sweep = match z {
-        Some(target) => candidates.min_by(|a, b| {
-            (a.elangle - target)
-                .abs()
-                .total_cmp(&(b.elangle - target).abs())
-        }),
-        None => candidates.next(),
-    }
-    .expect("non-empty candidate set checked above");
+        ))
+    })?;
 
     let moment = sweep
         .moments
@@ -4420,6 +4426,49 @@ impl MapEngine for PolarVolumeSiteView {
             .and_then(|volumes| select_volume_entry(volumes, time))
             .map(|e| e.volume.time)
             .or(time)
+    }
+
+    /// The CELLS overlay (#367) draws tracked storm cells, not a moment: no
+    /// position query answers it, so WMS GetFeatureInfo does not (#1064).
+    fn layer_shows_values(&self, parameter: &str) -> bool {
+        parameter != crate::cells::CELLS_PARAMETER
+    }
+
+    /// The sweep angle `get_raster_tile` draws, through the SAME
+    /// `select_volume_entry` and `drawn_sweep`, rounded as the advertised
+    /// angles are: the sweep nearest `z`, else the lowest, among those that
+    /// carry the quantity. WMS GetFeatureInfo asks the position query for
+    /// it (#1064). The position query matches `z` to a sweep exactly and
+    /// reads only that one: on a split-cut scan whose lowest sweep lacks
+    /// the quantity, the advertised first angle has no value where the map
+    /// shows one, and an `ELEVATION` between sweeps would be a 400. CELLS
+    /// ignores `z`; a site without volumes echoes it.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        if parameter == Some(crate::cells::CELLS_PARAMETER) {
+            return z;
+        }
+        let catalog = self.catalog.load();
+        let quantity = parameter.or_else(|| {
+            catalog
+                .by_site_meta
+                .get(&self.nod)
+                .map(|m| m.volume_info.default_quantity.as_str())
+        });
+        quantity
+            .zip(catalog.by_site.get(&self.nod))
+            .and_then(|(quantity, volumes)| {
+                let entry = select_volume_entry(volumes, time)?;
+                drawn_sweep(&entry.volume, quantity, z)
+            })
+            .map(|sweep| round_elevation(sweep.elangle))
+            .filter(|angle| angle.is_finite())
+            .or(z)
     }
 }
 
@@ -8151,6 +8200,16 @@ mod tests {
             vec!["DBZH".to_string()],
             "EDR parameter list is the bare quantity"
         );
+        // Every map layer the position query answers shows its values; the
+        // CELLS overlay, which it does not, is no WMS GetFeatureInfo layer
+        // (#1064).
+        for name in names {
+            assert_eq!(
+                MapEngine::layer_shows_values(&view, name),
+                EdrEngine::get_parameters(&view).iter().any(|p| p == name),
+                "{name}"
+            );
+        }
 
         // Exactly one EDR location — this radar.
         let locs = EdrEngine::get_locations(&view).expect("locations");
@@ -8569,6 +8628,57 @@ mod tests {
         )
         .expect("a higher-sweep-only quantity must render, not 400");
         assert_eq!(tile.values.len(), 16 * 4);
+    }
+
+    /// `resolve_elevation` names the sweep `get_raster_tile` draws, so WMS
+    /// GetFeatureInfo asks the position query for the sweep the map shows
+    /// (#1064). A quantity only the 1.5° sweep carries is drawn from it
+    /// without `ELEVATION`, and for an `ELEVATION` nearer 0.5°. At the
+    /// advertised first angle, 0.5°, the position query has no VRADH.
+    #[test]
+    fn site_view_resolve_elevation_is_the_sweep_get_map_draws() {
+        let mut vol = synthetic_volume(25.0, 60.0);
+        let mut sweep1 = vol.sweeps[0].clone();
+        sweep1.elangle = 1.5;
+        sweep1.moments[0].quantity = "VRADH".to_string();
+        vol.sweeps.push(sweep1);
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "resolve-elevation")]);
+        let view = site_view_for(by_site, "fivih");
+        let levels = MapEngine::raster_info(&view).vertical.unwrap().levels;
+        assert_eq!(levels, [0.5, 1.5]);
+
+        let time = MapEngine::resolve_time(&view, None, None);
+        let resolve = |parameter, z| MapEngine::resolve_elevation(&view, parameter, z, time, None);
+        assert_eq!(resolve(Some("VRADH"), None), Some(1.5));
+        assert_eq!(resolve(Some("VRADH"), Some(0.5)), Some(1.5));
+        assert_eq!(resolve(Some("DBZH"), None), Some(0.5));
+        // Between the sweeps: the nearest one, as GetMap draws it.
+        assert_eq!(resolve(Some("DBZH"), Some(1.2)), Some(0.5));
+        // The default quantity, DBZH.
+        assert_eq!(resolve(None, None), Some(0.5));
+        // CELLS ignores `z`.
+        assert_eq!(
+            resolve(Some(crate::cells::CELLS_PARAMETER), Some(1.2)),
+            Some(1.2)
+        );
+
+        let vradh = ["VRADH".to_string()];
+        let position = |z: f64| {
+            EdrEngine::query_position(
+                &view,
+                "POINT(25.0 60.1)",
+                None,
+                Some(&vradh),
+                Some(std::slice::from_ref(&z)),
+                None,
+            )
+        };
+        assert!(position(1.5).is_ok());
+        assert!(matches!(
+            position(levels[0]),
+            Err(DataServerError::LocationNotFound(_))
+        ));
     }
 
     /// `resolve_quantities` unions moments across **all** selected volumes,

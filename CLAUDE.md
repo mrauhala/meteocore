@@ -94,7 +94,9 @@ Violating these has caused production incidents. Never break them.
      (nodata there) and never clamp. An engine asked for those rows samples its
      edge cells instead (#1065). For a projected box wholly outside its
      projection (`ds_core::geo::outside_projection_domain`) they return
-     `None` without calling the engine (#1089).
+     `None` without calling the engine (#1089). A single point, such as a
+     WMS GetFeatureInfo pixel centre, goes through
+     `OutputCrs::position_on_earth`, which tests the point itself (#1064).
 5. **Never project per output pixel in a render path.** The CRS forward
    transform dominates render cost; per-pixel projection was a ~10×
    regression (#203). Evaluate the projection on a coarse `ProjectionGrid`
@@ -108,6 +110,9 @@ Violating these has caused production incidents. Never break them.
    (`block_in_place(|| handle.block_on(..))`). Keep its runtime context
    explicit:
    - Call it from the background poll runtime (or another dedicated runtime).
+     A request's engine *query* runs as a task on a dedicated query
+     runtime: api-edr's executor, and `ds_executor::RenderJob::run_query`
+     for WMS GetFeatureInfo (#1064).
    - Never from a request-handler task — it parks a request worker.
    - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
      `get_range_on`). Do not rely on an ambient runtime handle.
@@ -406,6 +411,18 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    meta-tile caches key on it, and explicit-`TIME` responses then carry a
    short, revalidating `Cache-Control` instead of `immutable`.
    Immutable-timestep engines keep the default `0`.
+   **If the engine's map layers have levels** (`RasterInfo.vertical`) and
+   it draws another level than the requested `z`, or than the first
+   advertised level without one, it MUST override
+   `MapEngine::resolve_elevation` with the SAME selection
+   `get_raster_tile` uses (GRIB: the run's own first level; ODIM PVOL: the
+   nearest sweep carrying the quantity). WMS GetFeatureInfo passes that
+   level to the position query as `z` (#1064).
+   **If a map layer is an overlay** whose values the engine's EDR position
+   query does not answer (ODIM `CELLS`), override
+   `MapEngine::layer_shows_values` (O(1)) to return `false` for it.
+   Otherwise WMS advertises it `queryable="1"` and answers with nodata or
+   a 400 (#1064).
    **If a `FeatureEngine`'s features carry time**, apply
    `FeatureQuery::datetime` as OGC `datetime`: keep the features whose
    temporal geometry intersects the interval (an instant is `start == end`,

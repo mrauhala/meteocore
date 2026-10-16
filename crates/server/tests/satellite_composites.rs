@@ -151,6 +151,7 @@ fn wms(engine: Arc<SatelliteEngine>, dir: &Path) -> axum::Router {
         engines: HashMap::from([(ID.to_string(), engine as Arc<dyn MapEngine>)]),
         collections: HashMap::from([(ID.to_string(), collection(dir, &["wms"]))]),
         styles: styles(),
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(64)),

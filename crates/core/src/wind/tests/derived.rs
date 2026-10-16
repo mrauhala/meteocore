@@ -203,6 +203,20 @@ impl MapEngine for Mock {
             None => self.resolve_time(time, reference_time),
         }
     }
+
+    /// Without `z`, `10u` is drawn at 925 hPa and the rest at 1000 hPa.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        _time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        z.or(match parameter {
+            Some("10u") => Some(925.0),
+            _ => Some(1000.0),
+        })
+    }
 }
 
 impl EdrEngine for Mock {
@@ -411,6 +425,19 @@ fn a_speed_tile_combines_the_component_tiles_of_one_request() {
         *mock.tiles.lock().unwrap(),
         [("2t".to_string(), Some(hour(1)), Some(850.0), None)]
     );
+}
+
+/// A derived speed is drawn from its components at the level the wrapped
+/// engine draws u at, the level WMS GetFeatureInfo then queries (#1064).
+/// Other parameters are the wrapped engine's.
+#[test]
+fn a_derived_speed_is_drawn_at_its_u_components_level() {
+    let mock = Mock::new(VectorFrame::Earth);
+    let (wind, _) = wrap(&mock);
+    let level = |parameter, z| wind.resolve_elevation(Some(parameter), z, None, None);
+    assert_eq!(level("10si", None), Some(925.0));
+    assert_eq!(level("10si", Some(850.0)), Some(850.0));
+    assert_eq!(level("2t", None), Some(1000.0));
 }
 
 #[test]

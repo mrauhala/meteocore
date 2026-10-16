@@ -216,6 +216,7 @@ fn router() -> axum::Router {
             ("ref".to_string(), collection("ref")),
         ]),
         styles,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),

@@ -17,6 +17,18 @@ the worker returns. A timeout cannot release a running worker's permit. Abort ha
 cancel pending blocking jobs but cannot preempt running CPU work. Keep tests for overload, canceled
 waiters, deadline expiry, and worker permit ownership.
 
+Two ways to run admitted work, sharing one worker wrapper and one join:
+`RenderJob::run`, a `spawn_blocking` thread of the caller's runtime, for a
+render; and `RenderJob::run_query`, a task on the process-wide
+`QUERY_RUNTIME` (multi-thread, 2–8 workers like api-edr's, threads named
+`render-query`), for a synchronous engine *query* such as WMS
+GetFeatureInfo's EDR position call (#1064). An engine query may take
+`Handle::current()` and spawn: GRIB's field jobs, the `DataStore` bridge.
+From `run`, that handle is the serving runtime, so the blocking work lands
+on request workers (root CLAUDE.md Critical Rule 7). From `run_query` it is
+the query runtime, where `block_in_place` is valid. The slot, the deadline
+and the abort-before-start semantics are the same for both.
+
 Slot count: `render_concurrency()`, fixed by its first read — the server's
 `[server] render_concurrency` via `set_render_concurrency` at boot, else
 `default_render_concurrency()` (2× CPUs, min 8). Nothing may read the slots,

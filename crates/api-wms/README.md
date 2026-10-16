@@ -82,16 +82,15 @@ new ol.layer.Tile({
 |-----------|-------------|
 | `GetCapabilities` | Returns XML document listing available layers, CRS, extents, time dimension, and styles with their legends; `<Service>` advertises the GetMap limits (`LayerLimit`, `MaxWidth`, `MaxHeight`) |
 | `GetMap` | Returns a rendered map image (PNG or JPEG) |
+| `GetFeatureInfo` | Returns a layer's value at a pixel of the map, as plain text, GeoJSON or HTML ([GetFeatureInfo](#getfeatureinfo)) |
 | `GetLegendGraphic` | Returns a legend image showing the colormap scale |
-
-GetFeatureInfo is not supported.
 
 The capabilities document names its schemas and validates against them: the
 root's `xsi:schemaLocation` points at the WMS 1.3.0 `capabilities_1_3_0.xsd`
 and at the SLD 1.1.0 `sld_capabilities.xsd`. `<Request>` lists
-`GetCapabilities`, `GetMap` and `sld:GetLegendGraphic`: GetLegendGraphic is
-an SLD operation, which the WMS schema admits only as an extended operation
-in SLD's namespace. `<Capability>` lists `<Request>`, then `<Exception>`,
+`GetCapabilities`, `GetMap`, `GetFeatureInfo` and `sld:GetLegendGraphic`:
+GetLegendGraphic is an SLD operation, which the WMS schema admits only as an
+extended operation in SLD's namespace. `<Capability>` lists `<Request>`, then `<Exception>`,
 which offers `XML` only (see [Error Responses](#error-responses)), then the
 layers. Each style's `<LegendURL>` names the legend's `<Format>`,
 `image/png`, and carries its `width` and `height`: the size its link
@@ -102,8 +101,8 @@ returns, GetLegendGraphic's default of 180 × 300 pixels.
 Parameter names are case-insensitive in every request, as WMS 1.3.0 §6.8.1
 requires: `REQUEST`, `request` and `ReQuEsT` are one parameter. Values are
 kept as sent and matched exactly, so layer and style names are
-case-sensitive; `TRANSPARENT` and the JSON legend `FORMAT` are the
-exceptions, matched case-insensitively. Names and values are percent-decoded
+case-sensitive; `TRANSPARENT`, the JSON legend `FORMAT` and GetFeatureInfo's
+`INFO_FORMAT` are the exceptions, matched case-insensitively. Names and values are percent-decoded
 first, so `ReQuEsT=%47%65%74%4D%61%70` is a GetMap. A parameter the server
 does not read is ignored, and a parameter given more than once, in any mix
 of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
@@ -165,6 +164,111 @@ engine may draw there. Two boxes stay `InvalidParameterValue`:
 - one whose edge samples all miss the valid area inside it. That is an
   EPSG:3035 box wider than the disk, or a very tall one whose edges cross
   the disk only between samples. Its edges give no area to read.
+
+## GetFeatureInfo
+
+GetFeatureInfo returns the value of a layer at a pixel of the map a client
+shows, for QGIS's identify tool, a click in OpenLayers or Leaflet, or any
+WMS client:
+
+```
+http://localhost:8000/wms/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS=radar&QUERY_LAYERS=radar&STYLES=&CRS=CRS:84&BBOX=19,59,32,71&WIDTH=256&HEIGHT=256&I=128&J=100&INFO_FORMAT=application/json
+```
+
+The value is the collection's EDR position query at the centre of pixel
+(`I`, `J`): GetFeatureInfo and `/edr/collections/{id}/position` at that
+point, time, model run and level answer the same value. It is the source
+value, sampled the way the engine's position query samples it (bilinear
+between grid nodes for GRIB, QueryData and Zarr), not the colour of the
+pixel: an EPSG:3857/3067/3035 GetMap is assembled from meta-tiles by nearest
+neighbour, so next to a class edge the pixel can show a neighbour's colour.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| GetMap's | yes | The parameters that define the map: `LAYERS`, `STYLES`, `CRS`, `BBOX`, `WIDTH`, `HEIGHT`, `TIME`, `ELEVATION`, `DIM_REFERENCE_TIME`. Every GetMap parameter sent, `FORMAT`, `TRANSPARENT`, `BGCOLOR` and `QUALITY` included, is validated as GetMap validates it, with GetMap's exceptions: an unsupported `FORMAT` is `InvalidFormat` here too. The image parameters do not change the value |
+| `QUERY_LAYERS` | yes | The layers of `LAYERS` to read. A layer the server does not serve, or one `LAYERS` does not name, is `LayerNotDefined`; one that is not queryable `LayerNotQueryable` |
+| `I` | yes | The pixel's column, 0 to `WIDTH` − 1. Anything else, a negative or non-integer value included, is `InvalidPoint` |
+| `J` | yes | The pixel's row, 0 (top) to `HEIGHT` − 1; otherwise `InvalidPoint` |
+| `INFO_FORMAT` | no | `text/plain` (the default when omitted), `application/json` or `text/html`, in any case. Anything else is `InvalidFormat` |
+| `FEATURE_COUNT` | no | A positive integer, default 1. A layer has one value at a point, so any count returns it |
+
+The pixel's centre goes through the same CRS handling as GetMap's pixels:
+EPSG:4326's `BBOX` is lat/lon, CRS:84's lon/lat, and EPSG:3857, 3067 and
+3035 are inverse-projected. `TIME` and `DIM_REFERENCE_TIME` resolve exactly
+as GetMap resolves them, so the value belongs to the frame the client
+shows: an omitted `TIME` is the layer's default, and a `TIME` between
+timesteps is the timestep GetMap draws for it (a GeoTIFF's latest frame not
+after it). The level is likewise the one GetMap draws, as the engine
+selects it, with or without `ELEVATION`. That is not always `ELEVATION`
+itself or the first advertised level:
+
+- GRIB: without `ELEVATION`, the model run's own first level, which can
+  differ from the first of the levels all retained runs advertise
+  together.
+- ODIM radar volumes: the sweep nearest `ELEVATION`, or the lowest sweep,
+  among the sweeps that carry the quantity. On a split-cut scan a velocity
+  moment can be missing from the lowest sweep, and an `ELEVATION` between
+  two sweeps draws the nearer one.
+
+The answer reports the resolved time, and the model run and level when the
+layer has them.
+
+`application/json` is a GeoJSON FeatureCollection, one Point feature per
+queried layer at the sampled position:
+
+```json
+{
+  "type": "FeatureCollection",
+  "features": [{
+    "type": "Feature",
+    "geometry": {"type": "Point", "coordinates": [11.0765, 67.8999]},
+    "properties": {
+      "layer": "radar",
+      "parameter": "reflectivity",
+      "value": 40.5,
+      "unit": "dBZ",
+      "time": "2026-03-24T23:35:00Z"
+    }
+  }]
+}
+```
+
+`reference_time` and `elevation` join the properties when the layer has
+them. `text/plain` lists the same fields one `name: value` line each, after
+`layer:`; `text/html` is a table per layer, with every label and value
+escaped.
+
+A point without data is an answer, not an exception: the JSON `value` is
+`null` and the text formats say `nodata`. That covers a nodata pixel and a
+point outside the collection's data, beyond a radar's range for example. A
+pixel whose centre is not on the Earth has no position either: its JSON
+`geometry` is `null` too, and no engine is asked. That is a centre:
+
+- past a pole of a CRS:84 or EPSG:4326 `BBOX`;
+- anywhere in an EPSG:3067 or EPSG:3035 `BBOX` wholly outside its
+  projection's valid area, the `BBOX` GetMap answers with the empty image;
+- outside that area in a `BBOX` partly outside it: past the LAEA disk, or
+  past the strip Transverse Mercator maps the Earth into, where its inverse
+  still gives coordinates, but meaningless ones. An EPSG:3067 centre
+  inside the strip but past a pole is not on the Earth either.
+
+**Queryable layers.** A layer is `queryable="1"` in GetCapabilities exactly
+when its collection's engine answers EDR position queries for the layer's
+parameter, whether or not the collection lists `edr` in its `apis`; without
+it no EDR route is published, and the WMS still reads values through the
+engine. These layers stay `queryable="0"` and answer `LayerNotQueryable`:
+
+- RGB composite layers (`coll/<composite>`): a value per band, which no
+  position query answers.
+- The ODIM per-site `CELLS` overlay: storm-cell outlines, not a moment.
+- CAP alert layers, PostGIS events-shape (lightning) layers and nowcast
+  layers: their engines answer no position query.
+
+GetFeatureInfo runs on the same render slots, queue and deadline as GetMap
+(`MC_RENDER_TIMEOUT_MS`): an overloaded or timed-out request is HTTP 503 with
+`Retry-After: 1`. Like an EDR query, the engine call runs on a dedicated
+query runtime, never on the threads that serve requests. An engine failure
+is a generic exception, its detail only in the server log.
 
 ## WMS Configuration
 
@@ -279,6 +383,7 @@ WMS responses include headers for client and CDN caching:
 |----------|---------------|
 | GetMap with `TIME=` | `public, max-age=86400, immutable` (24h) |
 | GetMap without `TIME` | `public, max-age=60, must-revalidate` (1min) |
+| GetFeatureInfo | As GetMap: `immutable` only with `TIME=` on content the engine never revises in place, and only for a value: a null answer always revalidates |
 | GetLegendGraphic | `public, max-age=86400, immutable` (24h) |
 
 All GetMap responses include an `ETag` header derived from the request parameters.
@@ -311,7 +416,7 @@ them:
 </ServiceExceptionReport>
 ```
 
-Error codes: `LayerNotDefined`, `StyleNotDefined`, `InvalidCRS`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`.
+Error codes: `LayerNotDefined`, `StyleNotDefined`, `InvalidCRS`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`, and for GetFeatureInfo `LayerNotQueryable` and `InvalidPoint`.
 
 The codes WMS 1.3.0 Table E.1 defines are used where it says: an unknown
 layer or `collection/parameter` is `LayerNotDefined` and a style the layer
@@ -320,7 +425,11 @@ the list's length is refused; a CRS other than the five above is
 `InvalidCRS`; an unsupported `FORMAT` is `InvalidFormat`; a malformed `TIME`
 or `ELEVATION`, an `ELEVATION` for a layer without one, or a
 `DIM_REFERENCE_TIME` that is no run of the layer, is `InvalidDimensionValue`;
-an unknown `REQUEST` is `OperationNotSupported`. Until #1065 an unsupported
+an unknown `REQUEST` is `OperationNotSupported`. GetFeatureInfo adds
+`LayerNotQueryable` for a layer that is not queryable, `InvalidPoint` for an
+`I` or `J` outside the image, `InvalidFormat` for an unsupported
+`INFO_FORMAT`, and `LayerNotDefined` for a `QUERY_LAYERS` layer that
+`LAYERS` does not name. Until #1065 an unsupported
 CRS was `CRSNotDefined`, and a malformed `ELEVATION` or one for a layer
 without one `InvalidParameterValue`.
 
@@ -367,7 +476,7 @@ Client
 
 - Single layer per request (no multi-layer composition)
 - No external SLD/SE style documents; local SLD ColorMap palette import is supported
-- No GetFeatureInfo (use EDR position query instead)
+- GetFeatureInfo answers one value per layer, from the collection's position query; composites, overlays and collections without a position query are not queryable ([GetFeatureInfo](#getfeatureinfo))
 - Source sampling depends on the engine (including bilinear for GRIB/QueryData/Zarr); meta-tile assembly uses nearest-neighbor to preserve discrete palettes
 - Collections must implement `MapEngine` and enable `wms`; GeoTIFF, GRIB, ODIM, QueryData, Zarr, nowcast, CAP and PostGIS events are supported
 - CAP limits that can leave a warning off the map, the same in WMS, Maps and Tiles: a WIS2-fed collection holds at most `max_alerts` (default 10 000) alerts, and past it drops still-valid ones from the map and `/items`, not-yet-active and lowest severity first, reporting `degraded` in `/health`; one render draws at most 50 000 active alert areas, and past that leaves out the least severe (#805)
@@ -404,8 +513,11 @@ only fixtures committed to the repository:
 No committed fixture holds several model runs or several pressure levels, so
 those axes are tested with a single value.
 
-The run requests the basic conformance class; the data-independent tests
-always run. The job summary lists the passed, failed and skipped tests, with
+The run requests the basic conformance class and, since GetFeatureInfo
+(#1064), the queryable class; the data-independent tests always run. Every
+fixture layer is advertised `queryable="1"`: each engine answers EDR
+position queries, though no fixture collection lists `edr`. The job summary
+lists the passed, failed and skipped tests, with
 each failure's message and request. Failures in the classes that need OGC's
 test dataset, below, are collapsed to one line each, except
 `basic:gif-or-png` and `basic:options-requirements`, which test MeteoCore's
@@ -429,10 +541,10 @@ these deliberate limits:
   `TRANSPARENT`, reads only its pixels' red, green and blue, and wants every
   pixel white, the spec default's background. The server returns the empty
   image, transparent, and the test fails.
-- No GetFeatureInfo: GetCapabilities does not advertise the operation and
-  every layer is `queryable="0"`, so the data-independent GetFeatureInfo
-  tests have nothing to request. The queryable class stays off until
-  GetFeatureInfo exists (#1064).
+- The queryable class has no recorded run yet. Which of its tests read
+  MeteoCore's own layers, and which need the Blue Lake dataset below, is for
+  its first CI run to show. Until then `ci/wms-ets/summarize.py` lists its
+  failures in full, as MeteoCore's own.
 - The basic class's dataset tests and the separate data-preconditions class
   need OGC's "Blue Lake" test dataset (the `cite:*` layers), which MeteoCore
   does not serve. They fail.

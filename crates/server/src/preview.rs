@@ -1026,6 +1026,7 @@ mod tests {
             engines: HashMap::new(),
             collections: HashMap::new(),
             styles: HashMap::new(),
+            point_engines: HashMap::new(),
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             tile_cache: Arc::new(ds_render::TilePixelCache::new(1)),

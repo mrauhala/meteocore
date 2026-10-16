@@ -67,6 +67,13 @@ around `ds-storage` calls (Critical Rules 6–7).
   measurement), or the 3D Tiles products (those sample nearest, then
   `ds-3dtiles` applies its own 3-D `smooth_grid` blur; the point cloud is
   raw).
+- **The sweep a map draws is `drawn_sweep`**: among the sweeps carrying the
+  quantity, the one nearest `z`, else the lowest. `polar_sample` and the
+  site view's `MapEngine::resolve_elevation` share it, so WMS GetFeatureInfo
+  asks the position query for that sweep's rounded angle and reads the
+  sweep the map shows (#1064). The position query matches `z` to one sweep
+  exactly (`resolve_levels`), so the advertised first angle would read
+  nothing on a split-cut scan whose lowest sweep lacks the quantity.
 - **Pixel pre-warm** (`[odim] prewarm_sweeps`, default `1`; #461/#472).
   Pixel arrays are read lazily per moment (#289), so a moment's first render
   does a cold whole-`.h5` read **while holding a render-semaphore permit** —
@@ -264,6 +271,10 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   `[[wms.parameters]] name = "CELLS"`. `time` selects the scan (TIME
   animation works); `z` is ignored. 3D Tiles `representation=cells` +
   Features output are follow-ups of #367.
+- Not queryable: `MapEngine::layer_shows_values` is `false` for `CELLS`, so
+  WMS GetFeatureInfo, which reads values with the site's EDR position
+  query, marks the layer `queryable="0"` and answers `LayerNotQueryable`
+  (#1064). Every moment layer is queryable.
 
 ## File discovery
 

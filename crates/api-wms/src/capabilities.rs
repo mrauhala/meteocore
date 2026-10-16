@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ds_core::config::{CollectionConfig, LicenseConfig};
+use ds_core::edr_engine::EdrEngine;
 use ds_core::map_engine::{default_request_time, MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
+use crate::feature_info::layer_is_queryable;
 use crate::params;
 use ds_render::{CompositeSpec, StyleInfo};
 
@@ -35,12 +37,17 @@ const LEGEND_URL_FORMAT: &str = "image/png";
 
 /// Generate WMS 1.3.0 GetCapabilities XML.
 ///
+/// `point_engines` are the collections whose engine answers position
+/// queries ([`crate::handlers::WmsState::point_engines`]): their layers that
+/// show a parameter's own values are `queryable="1"` (#1064).
+///
 /// Uses quick-xml Writer to ensure all text content is properly escaped.
 /// Never builds XML via format!() or string concatenation (XML injection risk).
 pub fn get_capabilities_xml(
     engines: &HashMap<String, Arc<dyn MapEngine>>,
     collections: &HashMap<String, CollectionConfig>,
     styles: &HashMap<String, HashMap<String, StyleInfo>>,
+    point_engines: &HashMap<String, Arc<dyn EdrEngine>>,
     base_url: &str,
 ) -> Vec<u8> {
     let mut writer = Writer::new(Vec::new());
@@ -92,11 +99,18 @@ pub fn get_capabilities_xml(
                     config,
                     &info,
                     styles,
+                    point_engines,
                     base_url,
                     engine.as_ref(),
                 );
             } else {
-                // Single-parameter engine: one requestable layer
+                // Single-parameter engine: one requestable layer, drawing
+                // its one parameter.
+                let parameter = info
+                    .parameters
+                    .first()
+                    .map(|p| p.name.as_str())
+                    .or(Some(info.parameter.as_str()).filter(|p| !p.is_empty()));
                 write_layer(
                     &mut writer,
                     id,
@@ -107,6 +121,7 @@ pub fn get_capabilities_xml(
                     None,
                     engine.default_time(),
                     None,
+                    layer_is_queryable(point_engines, id, engine.as_ref(), parameter),
                 );
             }
         }
@@ -154,12 +169,18 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 
     // GetMap and GetLegendGraphic accept the same image formats — iterate
     // SUPPORTED_FORMATS so the advertised list can't drift from what the
-    // handlers actually serve. GetLegendGraphic is SLD's operation, written
-    // `sld:GetLegendGraphic` (see `SLD_NAMESPACE`); its children stay WMS
-    // elements, of the WMS schema's `OperationType`.
-    for op in ["GetMap", "sld:GetLegendGraphic"] {
+    // handlers actually serve. GetFeatureInfo answers in INFO_FORMATS, and
+    // the schema's sequence puts it right after GetMap. GetLegendGraphic is
+    // SLD's operation, written `sld:GetLegendGraphic` (see `SLD_NAMESPACE`)
+    // after them; its children stay WMS elements, of the WMS schema's
+    // `OperationType`.
+    for (op, formats) in [
+        ("GetMap", params::SUPPORTED_FORMATS),
+        ("GetFeatureInfo", params::INFO_FORMATS),
+        ("sld:GetLegendGraphic", params::SUPPORTED_FORMATS),
+    ] {
         let _ = writer.write_event(Event::Start(BytesStart::new(op)));
-        for format in params::SUPPORTED_FORMATS {
+        for format in formats {
             write_format(writer, format);
         }
         write_dcp_type(writer, base_url);
@@ -207,12 +228,14 @@ fn write_dcp_type(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 /// registers one. Reusing the collection map for every child advertised
 /// parameter-scoped styles on layers that would reject them at GetMap time
 /// (and hid the ones that layer really has).
+#[allow(clippy::too_many_arguments)]
 fn write_parent_layer(
     writer: &mut Writer<Vec<u8>>,
     id: &str,
     config: &CollectionConfig,
     info: &RasterInfo,
     styles: &HashMap<String, HashMap<String, StyleInfo>>,
+    point_engines: &HashMap<String, Arc<dyn EdrEngine>>,
     base_url: &str,
     engine: &dyn MapEngine,
 ) {
@@ -266,6 +289,7 @@ fn write_parent_layer(
             own_times
                 .as_ref()
                 .map(|(times, default)| (&times[..], *default)),
+            layer_is_queryable(point_engines, id, engine, Some(short_name)),
         );
     }
 
@@ -299,7 +323,8 @@ fn write_parent_layer(
 
 /// Write an RGB composite's child layer: its name and title, an abstract
 /// naming what each channel reads, its own `time` dimension and its one
-/// style, `default`, with a LegendURL to the channel-list legend.
+/// style, `default`, with a LegendURL to the channel-list legend. Never
+/// queryable: no position query answers a composite (#1064).
 fn write_composite_layer(
     writer: &mut Writer<Vec<u8>>,
     layer_name: &str,
@@ -346,7 +371,8 @@ type OwnTimes<'a> = (&'a [DateTime<Utc>], Option<DateTime<Utc>>);
 /// If `param_title` is Some, this is a child of a multi-param parent and we
 /// skip inherited metadata (CRS, bbox, time) since the parent already has it —
 /// except a `time` dimension of the child's own, `own_times` (its values and
-/// default), which replaces the inherited one.
+/// default), which replaces the inherited one. `queryable`: GetFeatureInfo
+/// answers for the layer ([`layer_is_queryable`]).
 #[allow(clippy::too_many_arguments)]
 fn write_layer(
     writer: &mut Writer<Vec<u8>>,
@@ -358,9 +384,10 @@ fn write_layer(
     param_title: Option<&str>,
     default_time: Option<DateTime<Utc>>,
     own_times: Option<OwnTimes<'_>>,
+    queryable: bool,
 ) {
     let mut layer = BytesStart::new("Layer");
-    layer.push_attribute(("queryable", "0"));
+    layer.push_attribute(("queryable", if queryable { "1" } else { "0" }));
     layer.push_attribute(("opaque", "1"));
     let _ = writer.write_event(Event::Start(layer));
 
