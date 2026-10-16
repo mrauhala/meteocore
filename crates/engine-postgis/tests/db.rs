@@ -772,8 +772,8 @@ async fn timing_set_based_and_fan_out_on_a_hypertable() {
         engine
             .get_locations()
             .unwrap()
-            .into_iter()
-            .map(|l| l.id)
+            .iter()
+            .map(|l| l.id.clone())
             .collect(),
     );
     let statements = build_area_set(&cfg, &ids, Some(week), &["t2m"], MAX_RESPONSE_VALUES + 1)

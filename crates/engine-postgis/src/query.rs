@@ -70,7 +70,7 @@ pub const MAX_STATIONS_IN_POLYGON: usize = 200_000 + 1;
 /// window (#1062), so the value budget decides.
 pub const MAX_AREA_QUERIES: usize = 20_000;
 
-/// Provisional (#1062): an area query whose `datetime` window spans at most
+/// Measured (#1062): an area query whose `datetime` window spans at most
 /// this runs **set-based** — one statement per observation table for every
 /// station in the polygon — instead of the per-station fan-out. That covers
 /// an instant (`start == end`) and every instant of a `datetime` list, which
@@ -79,10 +79,14 @@ pub const MAX_AREA_QUERIES: usize = 20_000;
 /// decides between them is how many steps each station's series holds: few
 /// steps favour one statement, long series favour the fan-out's parallel
 /// `(station, time)` index scans. The engine does not know a collection's
-/// cadence, so the window length stands in for the step count (one hour is
-/// seven 10-minute steps). The database tests print both paths' timings by
-/// stations × steps on a TimescaleDB hypertable to tune it.
-pub const SET_BASED_MAX_WINDOW: TimeDelta = TimeDelta::hours(1);
+/// cadence, so the window length stands in for the step count. On a
+/// TimescaleDB hypertable with 10-minute steps, the database tests'
+/// timing table measured set-based faster at every size: 18–25× at one
+/// instant and 1.75× at 73 steps, 12 h, for 400 to 5 000 stations, on a
+/// database next to the server. 12 h is the longest window measured, so
+/// past it the fan-out keeps the long series it may still win. Re-run that
+/// table before raising it.
+pub const SET_BASED_MAX_WINDOW: TimeDelta = TimeDelta::hours(12);
 
 /// Output name of the station id column set-based statements lead with.
 /// Rows are decoded by position, so the name only has to differ from the

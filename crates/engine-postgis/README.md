@@ -663,8 +663,9 @@ suspicious but workable (WARN — the collection still loads).
   the same order (two edge cases aside: only the fan-out stops at 10 000
   rows a station, and only set-based drops rows whose `citext`-like
   station key spells the id differently):
-  - **set-based**, for a `datetime` window of at most one hour (an instant,
-    or each instant of a `datetime` list): one statement per observation
+  - **set-based**, for a `datetime` window of at most 12 hours (an
+    instant, each instant of a `datetime` list, or up to 72 ten-minute
+    steps): one statement per observation
     table (`long` and `wide` one, `per_parameter` one per parameter) for
     every station at once, `station_fk = ANY($1)`, rows streamed in
     station and time order and charged against the budget as they arrive.
@@ -684,10 +685,13 @@ suspicious but workable (WARN — the collection still loads).
   of stations: run set-based, its 400 is cheap only when the database
   stops reading at the statement's `LIMIT`, and without the index it can
   read every row in the window and hit the timeout, a 500 instead of the
-  400. The one-hour threshold is provisional; the database tests print
-  both paths' timings on a TimescaleDB hypertable to tune it, each path's
-  time to that 400 for a week over 20 000 stations, and the set-based
-  statement's query plan.
+  400. The 12-hour threshold comes from the database tests, which print
+  both paths' timings on a TimescaleDB hypertable, each path's time to
+  that 400 for a week over 20 000 stations, and the set-based statement's
+  query plan. In CI set-based was faster at every size measured: 18–25×
+  at one instant and 1.75× at 12 hours of 10-minute steps, for 400 to
+  20 000 stations; the week's 400 took 0.9 s set-based and 2.1 s fanned
+  out, its plan an incremental sort that stops at the `LIMIT`.
 
 ## References
 

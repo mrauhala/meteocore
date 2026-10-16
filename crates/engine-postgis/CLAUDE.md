@@ -180,13 +180,15 @@ Derivation rules (hard-won from production timeouts):
 - **Two area paths (#1062), one result** but for the two edge cases
   below. `query_area` picks with
   `area_path`: **set-based** for a `datetime` window of at most
-  `SET_BASED_MAX_WINDOW` (provisional 1 h: an instant, each instant of a
-  `datetime` list, which the API queries one by one) and for a longer
+  `SET_BASED_MAX_WINDOW` (12 h, the longest window the timing table
+  measured; set-based won at every size there; an instant and each instant
+  of a `datetime` list, which the API queries one by one, are within it) and for a longer
   window the fan-out could not run (over `MAX_AREA_QUERIES`, so the value
   budget decides); the **fan-out** otherwise and without `datetime`. The
   threshold is a window, not stations × steps: both paths pay per station,
   so what decides is the steps per station, and the engine does not know a
-  collection's cadence. Tune it from the timing table `tests/db.rs` prints.
+  collection's cadence. Re-run the timing table `tests/db.rs` prints
+  before raising it.
   - **Risk of the long-window routing:** a long window over more stations
     than the fan-out may take used to be the statement-count 400 before
     any SQL ran. Set-based, it is one `ORDER BY <fk>, <time> LIMIT
