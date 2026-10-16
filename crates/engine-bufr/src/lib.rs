@@ -19,5 +19,5 @@ pub mod store;
 mod wis2;
 
 pub use decode::{Decoder, ObsReport};
-pub use engine::{BufrEngine, IngestOutcome, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON};
+pub use engine::{BufrEngine, IngestOutcome, MAX_RESPONSE_VALUES};
 pub use params::ParameterTable;

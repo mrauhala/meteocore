@@ -2,9 +2,9 @@
 //!
 //! Every emitted SELECT ends with a hard row cap (a caller-supplied
 //! `LIMIT $N` bind for observations — see [`MAX_RESPONSE_VALUES`] for the
-//! budget model — `[postgis] max_locations + 1` for locations, `LIMIT 10001`
-//! for the stations-in-polygon prefilter, `LIMIT 1` for the nearest-station
-//! position query). Every identifier goes through [`quote_ident`]; every
+//! budget model — `[postgis] max_locations + 1` for locations,
+//! [`MAX_STATIONS_IN_POLYGON`] for the stations-in-polygon prefilter,
+//! `LIMIT 1` for the nearest-station position query). Every identifier goes through [`quote_ident`]; every
 //! value is bound as `$1..$n`. The builders never interpolate request
 //! data into SQL — only config-derived identifiers from the validated
 //! [`PostgisEngineConfig`] are inlined, and those have already passed the
@@ -17,7 +17,9 @@
 //! `per_parameter` shape, where a single EDR location query fans out into
 //! one DB query per requested parameter).
 
-use chrono::{DateTime, Utc};
+use std::sync::Arc;
+
+use chrono::{DateTime, TimeDelta, Utc};
 use thiserror::Error;
 
 use crate::config::PostgisEngineConfig;
@@ -44,19 +46,52 @@ pub const MAX_OBSERVATION_ROWS: usize = 10001;
 /// CoverageJSON. Breach ⇒ `QueryTooLarge` ⇒ HTTP 400.
 pub const MAX_RESPONSE_VALUES: usize = 500_000;
 
-/// Sanity ceiling on stations matched by an area polygon (the prefilter
-/// fetches one extra row to detect the breach). NOT the real gate — the
-/// response budget and the query-count bound are — this only bounds the
-/// prefilter buffer and the per-request station Vec. Live `fmi-obs`
-/// advertises ~8.3k stations, so a whole-extent polygon fits.
-pub const MAX_STATIONS_IN_POLYGON: usize = 10_001;
+/// Memory guard on the stations an area polygon matches: a ceiling of
+/// 200 000, one past it here because the prefilter fetches one extra row to
+/// detect the breach. NOT the gate on a request's size —
+/// [`MAX_RESPONSE_VALUES`] is (#1062) — but the value budget does not bound
+/// per-station memory, since one value a station still makes a coverage a
+/// station. Before any row, a request holds about 300 bytes a station: the
+/// prefilter's `Location` and, on the set-based path, the id list, its
+/// index and a series slot. That is ≈ 60 MB at this ceiling. The response
+/// then holds a coverage for each station with data, of the order of a
+/// kilobyte each before serialisation, so a request at the ceiling is a
+/// few hundred MB. Well above any station network (national networks hold
+/// thousands, global SYNOP about 20 000); the same figure as the default
+/// `[postgis] max_locations`.
+pub const MAX_STATIONS_IN_POLYGON: usize = 200_000 + 1;
 
-/// Ceiling on SQL queries one area request may fan out (stations ×
+/// Ceiling on SQL queries one area **fan-out** may run (stations ×
 /// requested parameters for the `per_parameter` shape; stations × 1 for
-/// `long`/`wide`). Bounds total DB work independently of row counts —
-/// 8k stations × 1 parameter is fine, 8k × 6 parameters is not; narrow
-/// `parameter-name` instead.
+/// `long`/`wide`). Bounds the fan-out's round trips independently of row
+/// counts. It applies to the fan-out path only: the set-based path runs one
+/// statement per observation table whatever the station count, and an area
+/// query the fan-out could not take runs set-based when it has a `datetime`
+/// window (#1062), so the value budget decides.
 pub const MAX_AREA_QUERIES: usize = 20_000;
+
+/// Measured (#1062): an area query whose `datetime` window spans at most
+/// this runs **set-based** — one statement per observation table for every
+/// station in the polygon — instead of the per-station fan-out. That covers
+/// an instant (`start == end`) and every instant of a `datetime` list, which
+/// the API layer queries one at a time. Both paths pay per station (an index
+/// probe in the set-based statement, a round trip in the fan-out), so what
+/// decides between them is how many steps each station's series holds: few
+/// steps favour one statement, long series favour the fan-out's parallel
+/// `(station, time)` index scans. The engine does not know a collection's
+/// cadence, so the window length stands in for the step count. On a
+/// TimescaleDB hypertable with 10-minute steps, the database tests'
+/// timing table measured set-based faster at every size: 18–25× at one
+/// instant and 1.75× at 73 steps, 12 h, for 400 to 5 000 stations, on a
+/// database next to the server. 12 h is the longest window measured, so
+/// past it the fan-out keeps the long series it may still win. Re-run that
+/// table before raising it.
+pub const SET_BASED_MAX_WINDOW: TimeDelta = TimeDelta::hours(12);
+
+/// Output name of the station id column set-based statements lead with.
+/// Rows are decoded by position, so the name only has to differ from the
+/// statement's other output names.
+const STATION_ALIAS: &str = "mc_station";
 
 /// Default search radius for nearest-station position queries (25 km).
 pub const DEFAULT_POSITION_RADIUS_M: f64 = 25_000.0;
@@ -88,6 +123,9 @@ pub enum SqlParam {
     Int(i64),
     Timestamp(DateTime<Utc>),
     TextArray(Vec<String>),
+    /// A text array shared between statements: the set-based area path binds
+    /// one station id list to every per-table statement (#1062).
+    SharedTextArray(Arc<Vec<String>>),
 }
 
 impl SqlParam {
@@ -101,6 +139,7 @@ impl SqlParam {
             SqlParam::Int(i) => i,
             SqlParam::Timestamp(t) => t,
             SqlParam::TextArray(v) => v,
+            SqlParam::SharedTextArray(v) => &**v,
         }
     }
 }
@@ -416,10 +455,12 @@ pub fn build_position(
 
 // ─── locations inside polygon (area prefilter) ─────────────────────────────
 
-/// Prefilter stations by bbox + exact `ST_Within`. Returned stations
-/// become the fan-out set for `build_location` — the caller iterates and
-/// runs one observation query per station so the per-query `LIMIT 10001`
-/// cap protects each station independently.
+/// Prefilter stations by bbox + exact `ST_Within` (stations-only mode).
+/// Returned stations become the area query's station set: the set-based
+/// path binds their ids to one statement per observation table
+/// ([`build_area_set`]); the fan-out runs one [`build_location`] per station.
+/// Fetches at most [`MAX_STATIONS_IN_POLYGON`] rows, one past the memory
+/// guard, so the caller can tell a breach.
 pub fn build_stations_in_polygon(
     cfg: &PostgisEngineConfig,
     polygon_wkt: &str,
@@ -468,6 +509,59 @@ pub fn build_stations_in_polygon(
 
 // ─── observation queries (shape-aware) ─────────────────────────────────────
 
+/// Which stations one observation statement reads. The single-station and
+/// fan-out paths read one (`<fk> = $1`); the set-based area path reads a set
+/// (`<fk> = ANY($1)`, #1062), so its rows lead with the station id
+/// ([`STATION_ALIAS`]) and come back ordered by station, then time. Apart
+/// from that leading column, both select the same columns in the same order,
+/// so one row decoder serves every path.
+#[derive(Debug, Clone, Copy)]
+enum StationSelect<'a> {
+    One(&'a str),
+    Set(&'a Arc<Vec<String>>),
+}
+
+impl StationSelect<'_> {
+    /// The `$1` bind: the station id, or the shared id list.
+    fn bind(self) -> SqlParam {
+        match self {
+            StationSelect::One(id) => SqlParam::Text(id.to_string()),
+            StationSelect::Set(ids) => SqlParam::SharedTextArray(Arc::clone(ids)),
+        }
+    }
+
+    /// The leading output column: the station id on a set-based statement,
+    /// nothing on a single-station one. `fk` is already quoted.
+    fn lead_column(self, fk: &str) -> String {
+        match self {
+            StationSelect::One(_) => String::new(),
+            StationSelect::Set(_) => format!("{fk}::text AS {STATION_ALIAS}, "),
+        }
+    }
+
+    /// The station predicate on `$1`. `fk` is already quoted.
+    fn predicate(self, fk: &str) -> String {
+        match self {
+            StationSelect::One(_) => format!("{fk} = $1"),
+            StationSelect::Set(_) => format!("{fk} = ANY($1)"),
+        }
+    }
+
+    /// The `ORDER BY` list. Quoted `fk` and `time` columns.
+    fn order_by(self, fk: &str, time: &str) -> String {
+        match self {
+            StationSelect::One(_) => time.to_string(),
+            StationSelect::Set(_) => format!("{fk}, {time}"),
+        }
+    }
+}
+
+/// Column index of a row's first observation column (its time): set-based
+/// rows lead with the station id (#1062), single-station rows do not.
+pub(crate) fn first_observation_column(set_based: bool) -> usize {
+    usize::from(set_based)
+}
+
 /// Build observation queries for a single station.
 ///
 /// Returns `Vec<BuiltQuery>` because the `per_parameter` shape fans out
@@ -491,6 +585,45 @@ pub fn build_location(
     source_keys: &[&str],
     row_limit: usize,
 ) -> Result<Vec<BuiltQuery>, BuildError> {
+    build_observations(
+        cfg,
+        StationSelect::One(station_id),
+        time_range,
+        source_keys,
+        row_limit,
+    )
+}
+
+/// Build the set-based area statements (#1062): one per observation table
+/// (`long` and `wide` one, `per_parameter` one per requested parameter), each
+/// reading every station in `station_ids` (`<fk> = ANY($1)`, the list shared
+/// between the statements) over the window. Rows carry the same columns as
+/// [`build_location`]'s, led by the station id, and come back ordered by
+/// station, then time; `LIMIT $N` is a bind the engine rewrites to the
+/// remaining response budget before each statement.
+pub fn build_area_set(
+    cfg: &PostgisEngineConfig,
+    station_ids: &Arc<Vec<String>>,
+    time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    source_keys: &[&str],
+    row_limit: usize,
+) -> Result<Vec<BuiltQuery>, BuildError> {
+    build_observations(
+        cfg,
+        StationSelect::Set(station_ids),
+        time_range,
+        source_keys,
+        row_limit,
+    )
+}
+
+fn build_observations(
+    cfg: &PostgisEngineConfig,
+    stations: StationSelect<'_>,
+    time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    source_keys: &[&str],
+    row_limit: usize,
+) -> Result<Vec<BuiltQuery>, BuildError> {
     let effective: Vec<&str> = if source_keys.is_empty() {
         cfg.parameters
             .iter()
@@ -502,15 +635,15 @@ pub fn build_location(
 
     match &cfg.observations {
         ObservationSchema::Long(l) => {
-            let q = build_location_long(l, station_id, time_range, &effective, row_limit)?;
+            let q = build_location_long(l, stations, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
         ObservationSchema::Wide(w) => {
-            let q = build_location_wide(w, station_id, time_range, &effective, row_limit)?;
+            let q = build_location_wide(w, stations, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
         ObservationSchema::PerParameter(pp) => {
-            build_location_per_parameter(pp, station_id, time_range, &effective, row_limit)
+            build_location_per_parameter(pp, stations, time_range, &effective, row_limit)
         }
         // Events have no stations; the engine layer rejects station-keyed
         // queries before reaching the builder.
@@ -650,7 +783,7 @@ pub fn build_events_window(
 
 fn build_location_long(
     shape: &LongShape,
-    station_id: &str,
+    stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
     row_limit: usize,
@@ -662,15 +795,17 @@ fn build_location_long(
     let value_col = quote_ident(&shape.value_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
+    let lead = stations.lead_column(&station_fk);
+    let station_pred = stations.predicate(&station_fk);
 
-    let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
+    let mut params: Vec<SqlParam> = vec![stations.bind()];
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
-        "{time_select} AS time, \
+        "{lead}{time_select} AS time, \
          {param_col} AS parameter, \
          {value_col}::double precision AS value \
          FROM {table} \
-         WHERE {station_fk} = $1"
+         WHERE {station_pred}"
     ));
 
     if let Some((t0, t1)) = time_range {
@@ -688,7 +823,8 @@ fn build_location_long(
         source_keys.iter().map(|s| s.to_string()).collect(),
     ));
 
-    sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+    let order = stations.order_by(&station_fk, &time_col);
+    sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
     params.push(SqlParam::Int(row_limit as i64));
     let limit_idx = params.len() - 1;
 
@@ -697,7 +833,7 @@ fn build_location_long(
 
 fn build_location_wide(
     shape: &WideShape,
-    station_id: &str,
+    stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
     row_limit: usize,
@@ -707,9 +843,11 @@ fn build_location_wide(
     let time_col = quote_ident(&shape.time_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
+    let lead = stations.lead_column(&station_fk);
+    let station_pred = stations.predicate(&station_fk);
 
     // Build the projection list from source_keys by looking up columns.
-    let mut projection = format!("{time_select} AS time");
+    let mut projection = format!("{lead}{time_select} AS time");
     for key in source_keys {
         let column = shape
             .columns
@@ -722,12 +860,12 @@ fn build_location_wide(
         projection.push_str(&format!(", {col_quoted}::double precision AS {alias}"));
     }
 
-    let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
+    let mut params: Vec<SqlParam> = vec![stations.bind()];
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{projection} \
          FROM {table} \
-         WHERE {station_fk} = $1"
+         WHERE {station_pred}"
     ));
     if let Some((t0, t1)) = time_range {
         let rhs_lo = time_filter_rhs("$2", tz);
@@ -739,7 +877,8 @@ fn build_location_wide(
         params.push(SqlParam::Timestamp(t1));
     }
 
-    sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+    let order = stations.order_by(&station_fk, &time_col);
+    sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
     params.push(SqlParam::Int(row_limit as i64));
     let limit_idx = params.len() - 1;
 
@@ -750,7 +889,7 @@ fn build_location_wide(
 
 fn build_location_per_parameter(
     shape: &PerParameterShape,
-    station_id: &str,
+    stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
     row_limit: usize,
@@ -770,14 +909,16 @@ fn build_location_per_parameter(
         let value_col = quote_ident(&table.value_col)?;
         let time_select = time_select_expr(&time_col, table.time_col_tz.as_deref());
         let tz = table.time_col_tz.as_deref();
+        let lead = stations.lead_column(&station_fk);
+        let station_pred = stations.predicate(&station_fk);
 
-        let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
+        let mut params: Vec<SqlParam> = vec![stations.bind()];
         let mut sql = String::from("SELECT ");
         sql.push_str(&format!(
-            "{time_select} AS time, \
+            "{lead}{time_select} AS time, \
              {value_col}::double precision AS value \
              FROM {table_fq} \
-             WHERE {station_fk} = $1"
+             WHERE {station_pred}"
         ));
         if let Some((t0, t1)) = time_range {
             let rhs_lo = time_filter_rhs("$2", tz);
@@ -788,7 +929,8 @@ fn build_location_per_parameter(
             params.push(SqlParam::Timestamp(t0));
             params.push(SqlParam::Timestamp(t1));
         }
-        sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+        let order = stations.order_by(&station_fk, &time_col);
+        sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
         params.push(SqlParam::Int(row_limit as i64));
         let limit_idx = params.len() - 1;
         queries.push(
@@ -1489,6 +1631,187 @@ mod tests {
         let err = build_location(&cfg, "s", None, &["not_a_real_param"], MAX_OBSERVATION_ROWS)
             .unwrap_err();
         assert!(matches!(err, BuildError::UnknownParameter(_)));
+    }
+
+    // ---- set-based area statements (#1062) ---------------------------------
+
+    fn ids(list: &[&str]) -> Arc<Vec<String>> {
+        Arc::new(list.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn area_set_long_binds_the_id_list_and_orders_by_station_then_time() {
+        let cfg = long_cfg();
+        let stations = ids(&["1001", "1002", "1003"]);
+        let qs = build_area_set(
+            &cfg,
+            &stations,
+            Some((t(2026, 4, 1, 6), t(2026, 4, 1, 6))),
+            &["t2m"],
+            MAX_RESPONSE_VALUES,
+        )
+        .unwrap();
+        assert_eq!(qs.len(), 1, "one statement for the whole station set");
+        let q = &qs[0];
+        assert!(
+            q.sql.starts_with(
+                "SELECT \"fmisid\"::text AS mc_station, \"obstime\" AS time, \
+                 \"param_name\" AS parameter, \"value\"::double precision AS value \
+                 FROM \"public\".\"observations\" WHERE \"fmisid\" = ANY($1)"
+            ),
+            "{}",
+            q.sql
+        );
+        assert!(q.sql.contains("\"param_name\" = ANY($4)"));
+        assert!(
+            q.sql.ends_with("ORDER BY \"fmisid\", \"obstime\" LIMIT $5"),
+            "{}",
+            q.sql
+        );
+        // The id list is ONE bind, shared, never inlined.
+        assert_eq!(q.params[0], SqlParam::SharedTextArray(stations.clone()));
+        assert!(!q.sql.contains("1001"));
+        assert_eq!(q.params[1], SqlParam::Timestamp(t(2026, 4, 1, 6)));
+        assert_eq!(q.params[2], SqlParam::Timestamp(t(2026, 4, 1, 6)));
+        assert_eq!(q.params[3], SqlParam::TextArray(vec!["t2m".into()]));
+        assert_eq!(q.row_limit(), Some(MAX_RESPONSE_VALUES));
+        assert_eq!(q.limit_param_idx, Some(4));
+        assert_eq!(q.values_per_row, 1);
+    }
+
+    /// The set-based statement is the single-station one with the station id
+    /// in front, `= ANY` for `=` and the station leading the order, so one
+    /// row decoder reads both (offset by [`first_observation_column`]).
+    #[test]
+    fn area_set_selects_the_single_station_columns_behind_the_station_id() {
+        for cfg in [long_cfg(), wide_cfg(), nexus_per_parameter_cfg()] {
+            let keys: Vec<&str> = cfg
+                .parameters
+                .iter()
+                .map(|p| p.source_key.as_str())
+                .collect();
+            let window = Some((t(2026, 4, 1, 0), t(2026, 4, 1, 12)));
+            let one = build_location(&cfg, "s1", window, &keys, 7).unwrap();
+            let set = build_area_set(&cfg, &ids(&["s1", "s2"]), window, &keys, 7).unwrap();
+            assert_eq!(one.len(), set.len());
+            for (o, s) in one.iter().zip(&set) {
+                let (o_cols, _) = o.sql.split_once(" FROM ").unwrap();
+                let (s_cols, _) = s.sql.split_once(" FROM ").unwrap();
+                // Both start with the same keyword; past it the set-based
+                // list is the station id, then the single-station list.
+                let lead_end = s_cols.find(" AS mc_station, ").unwrap() + " AS mc_station, ".len();
+                let o_list = o_cols.split_once(' ').unwrap().1;
+                assert_eq!(
+                    &s_cols[lead_end..],
+                    o_list,
+                    "same observation columns, same order"
+                );
+                assert_eq!(s.parameter, o.parameter);
+                assert_eq!(s.values_per_row, o.values_per_row);
+                assert_eq!(s.limit_param_idx, o.limit_param_idx);
+                assert_eq!(s.params.len(), o.params.len());
+                // Every bind but the station one is identical.
+                assert_eq!(s.params[1..], o.params[1..]);
+                assert!(s.sql.contains(" = ANY($1)"), "{}", s.sql);
+                assert!(!o.sql.contains("ANY($1)"), "{}", o.sql);
+            }
+        }
+        assert_eq!(first_observation_column(false), 0);
+        assert_eq!(first_observation_column(true), 1);
+    }
+
+    #[test]
+    fn area_set_wide_is_one_statement_weighed_by_selected_columns() {
+        let cfg = wide_cfg();
+        let qs = build_area_set(&cfg, &ids(&["a", "b"]), None, &["t2m", "rh"], 11).unwrap();
+        assert_eq!(qs.len(), 1);
+        let q = &qs[0];
+        assert!(q
+            .sql
+            .contains("\"temp_celsius\"::double precision AS \"t2m\""));
+        assert!(q
+            .sql
+            .contains("\"humidity_pct\"::double precision AS \"rh\""));
+        // No window: no time binds, the whole history of every station.
+        assert!(!q.sql.contains(">= $"), "{}", q.sql);
+        assert!(
+            q.sql
+                .ends_with("ORDER BY \"station_id\", \"valid_time\" LIMIT $2"),
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.values_per_row, 2);
+        assert_eq!(q.row_limit(), Some(11));
+    }
+
+    #[test]
+    fn area_set_per_parameter_is_one_statement_per_table_sharing_the_ids() {
+        let cfg = nexus_per_parameter_cfg();
+        let stations = ids(&["0-246-0-1", "0-246-0-2"]);
+        let qs = build_area_set(
+            &cfg,
+            &stations,
+            Some((t(2026, 6, 15, 0), t(2026, 6, 15, 0))),
+            &["air_temperature", "wind_speed"],
+            MAX_RESPONSE_VALUES,
+        )
+        .unwrap();
+        assert_eq!(qs.len(), 2, "one statement per parameter table");
+        assert_eq!(qs[0].parameter.as_deref(), Some("air_temperature"));
+        assert_eq!(qs[1].parameter.as_deref(), Some("wind_speed"));
+        assert!(qs[0].sql.contains("FROM \"public\".\"airtemperature\""));
+        assert!(qs[1].sql.contains("FROM \"public\".\"wind_speed\""));
+        for q in &qs {
+            // Both share the one id list rather than copying it.
+            match &q.params[0] {
+                SqlParam::SharedTextArray(list) => assert!(Arc::ptr_eq(list, &stations)),
+                other => panic!("expected the shared id list, got {other:?}"),
+            }
+            assert!(q.sql.contains("\"time\" >= ($2 AT TIME ZONE 'UTC')"));
+            assert!(
+                q.sql.ends_with("ORDER BY \"wigos_id\", \"time\" LIMIT $4"),
+                "{}",
+                q.sql
+            );
+        }
+    }
+
+    #[test]
+    fn area_set_quotes_identifiers_and_rejects_unknown_parameters() {
+        let mut cfg = long_cfg();
+        if let ObservationSchema::Long(l) = &mut cfg.observations {
+            l.station_fk_col = "bad\"; DROP TABLE x --".into();
+        }
+        let q = build_area_set(&cfg, &ids(&["1"]), None, &["t2m"], 10)
+            .unwrap()
+            .remove(0);
+        assert!(
+            q.sql.contains("\"bad\"\"; DROP TABLE x --\" = ANY($1)"),
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.sql.matches("SELECT").count(), 1);
+
+        let err = build_area_set(&wide_cfg(), &ids(&["1"]), None, &["nope"], 10).unwrap_err();
+        assert!(matches!(err, BuildError::UnknownParameter(_)));
+        let err = build_area_set(
+            &nexus_per_parameter_cfg(),
+            &ids(&["1"]),
+            None,
+            &["nope"],
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BuildError::UnknownParameter(_)));
+    }
+
+    #[test]
+    fn stations_in_polygon_fetches_one_past_the_memory_guard() {
+        // #1062: the prefilter is a memory guard at 200 000 stations, far
+        // above station networks, not the old 10 001-station ceiling.
+        assert_eq!(MAX_STATIONS_IN_POLYGON, 200_001);
+        let q = build_stations_in_polygon(&long_cfg(), "POLYGON((0 0,1 0,1 1,0 1,0 0))").unwrap();
+        assert!(q.sql.ends_with(" LIMIT 200001"), "{}", q.sql);
     }
 
     // ---- events ------------------------------------------------------------
