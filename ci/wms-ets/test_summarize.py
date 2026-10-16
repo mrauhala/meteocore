@@ -26,6 +26,7 @@ ROOT = "s0001/d1e1_1"
 INDEPENDENT = ROOT + "/d1e10_1"
 PRECONDITIONS = ROOT + "/d1e30_1"
 BASIC = ROOT + "/d1e40_1"
+QUERYABLE = ROOT + "/d1e60_1"
 
 ENTRY = f"""
   <log mode="test">
@@ -198,6 +199,41 @@ class SummarizeTest(unittest.TestCase):
         self.assertIn("basic:blue-lake-sanity-check", dataset_section)
         self.assertNotIn("gif-or-png", dataset_section)
         self.assertNotIn("options-requirements", dataset_section)
+
+    def test_queryable_dataset_tests_collapsed_its_own_test_in_full(self):
+        # The queryable class (#1064) queries the Blue Lake layers, except
+        # getfeatureinfo-supported, which reads MeteoCore's capabilities.
+        queryable = f"""
+  <log mode="test">
+    <starttest local-name="queryable" prefix="queryable" path="{QUERYABLE}">
+      <assertion>The queryable class passes.</assertion>
+    </starttest>
+    <endtest result="5"/>
+    <conformanceClass name="queryable" isBasic="false" result="5"/>
+  </log>
+  <log mode="test">
+    <starttest local-name="getfeatureinfo-supported" prefix="queryable" path="{QUERYABLE}/d1e61_1">
+      <assertion>The server advertises GetFeatureInfo.</assertion>
+    </starttest>
+    <endtest result="6"/>
+  </log>
+  <log mode="test">
+    <starttest local-name="std-data-queryable" prefix="queryable" path="{QUERYABLE}/d1e62_1">
+      <assertion>The CITE standard dataset layers containing polygons are queryable.</assertion>
+    </starttest>
+    <message id="m4"><![CDATA[No layer named Lakes found.]]></message>
+    <endtest result="6"/>
+  </log>"""
+        class_logs, scored, outside = parse(report(ENTRY, CLASSES, queryable))
+        text = summarize.markdown(class_logs, scored, outside, "T")
+        full = text.index("#### queryable (1)")
+        collapsed = text.index("<details><summary>queryable (1): needs OGC's Blue Lake dataset")
+        self.assertLess(full, collapsed)
+        self.assertIn("- **`queryable:getfeatureinfo-supported`**:", text[full:collapsed])
+        self.assertIn(
+            "- **`queryable:std-data-queryable`**: No layer named Lakes found.", text[collapsed:]
+        )
+        self.assertNotIn("getfeatureinfo-supported", text[collapsed:])
 
     def test_past_the_budget_failures_get_one_line(self):
         text = summarize.markdown(self.class_logs, self.scored, self.outside, "T", expand=0)

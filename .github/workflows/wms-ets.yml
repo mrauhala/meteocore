@@ -12,8 +12,8 @@
 # Lake" test dataset (the cite:* layers), which these fixtures do not
 # carry. Every fixture layer is advertised queryable (GetFeatureInfo,
 # #1064): each engine answers EDR position queries, though the collections
-# list only `wms`. The queryable class has no recorded run yet: whether its
-# tests also need Blue Lake is for its first run here to show.
+# list only `wms`. The queryable class's own tests need Blue Lake too,
+# all but queryable:getfeatureinfo-supported.
 # crates/api-wms/README.md lists the expected failures. The job fails only
 # when the suite could not run at all: the server or TEAM Engine did not
 # come up, the server died during the run, the run returned no report, or
@@ -186,10 +186,9 @@ jobs:
       # One synchronous run: TEAM Engine answers once every test has
       # finished, with its CTL log (report_logs.xml). `basic=basic` and
       # `queryable=queryable` request the basic and queryable conformance
-      # classes, the second for GetFeatureInfo (#1064). The `queryable`
-      # name follows `basic`'s pattern; the first run confirms the suite
-      # took it, by listing the class. The data-independent tests always
-      # run. The time, elevation and recommendation classes stay off.
+      # classes, the second for GetFeatureInfo (#1064). The data-independent
+      # tests always run. The time, elevation and recommendation classes stay
+      # off.
       - name: Run ets-wms13
         id: run
         run: |

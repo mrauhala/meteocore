@@ -520,8 +520,9 @@ position queries, though no fixture collection lists `edr`. The job summary
 lists the passed, failed and skipped tests, with
 each failure's message and request. Failures in the classes that need OGC's
 test dataset, below, are collapsed to one line each, except
-`basic:gif-or-png` and `basic:options-requirements`, which test MeteoCore's
-own capabilities and are listed in full. The `wms-ets-report` artifact holds
+`basic:gif-or-png`, `basic:options-requirements` and
+`queryable:getfeatureinfo-supported`, which test MeteoCore's own
+capabilities and are listed in full. The `wms-ets-report` artifact holds
 the full report: TEAM Engine's CTL log, the session directory with every
 test's log and the EARL report (`teamengine-session.tar.gz`), the server log
 and the capabilities document as the server served it at startup.
@@ -533,7 +534,9 @@ these deliberate limits:
 
 - One layer per GetMap (`LayerLimit` 1, #1014): the suite's GetMap requests
   with two or three layers, including its multi-layer `STYLES` tests, get an
-  exception and fail. Its lists naming an undefined layer or style pass: the
+  exception and fail, and so do its GetFeatureInfo requests whose `LAYERS`
+  name two or three layers (`getfeatureinfo:two-query_layers`,
+  `three-query_layers`, `less-query_layers`). Its lists naming an undefined layer or style pass: the
   names are checked before the length.
 - `TRANSPARENT` defaults to `TRUE` (#163), where WMS 1.3.0 says `FALSE`:
   content outside the data is transparent, a pixel of RGBA 0,0,0,0.
@@ -541,10 +544,23 @@ these deliberate limits:
   `TRANSPARENT`, reads only its pixels' red, green and blue, and wants every
   pixel white, the spec default's background. The server returns the empty
   image, transparent, and the test fails.
-- The queryable class has no recorded run yet. Which of its tests read
-  MeteoCore's own layers, and which need the Blue Lake dataset below, is for
-  its first CI run to show. Until then `ci/wms-ets/summarize.py` lists its
-  failures in full, as MeteoCore's own.
+- The queryable class tests the Blue Lake dataset below, except
+  `queryable:getfeatureinfo-supported`, which reads MeteoCore's capabilities
+  and passes. `queryable:std-data-queryable` looks for the `BasicPolygons`,
+  `Forests`, `Lakes` and `NamedPlaces` layers, and the two `feature_count`
+  tests query a Blue Lake layer, so with none served they send empty
+  `LAYERS` and `QUERY_LAYERS`. The data-independent GetFeatureInfo tests
+  read MeteoCore's own layers.
+- The suite picks a layer from the capabilities at random for several
+  tests, so a run's count of failures varies with its picks:
+  - `getmap:transparent-default` wants no transparent pixel without
+    `TRANSPARENT`; it fails when the picked layer has no data in its box,
+    since the empty image is transparent while `TRANSPARENT` defaults to
+    `TRUE` (#163).
+  - `getmap:layerlimit` encodes the picked layer's name twice, so a child
+    layer's `/` arrives as `%2F` and the layer is not defined;
+    `getmap:transparent-opaque-layer` sends an empty `CRS` for a picked
+    child layer. Both pass on a top-level layer.
 - The basic class's dataset tests and the separate data-preconditions class
   need OGC's "Blue Lake" test dataset (the `cite:*` layers), which MeteoCore
   does not serve. They fail.
@@ -591,3 +607,18 @@ a failed subtest), and the data-preconditions class. By cause:
 
 With these fixes the next run should pass the six fixed tests, and
 `getmap:crs` and `getmap:width-and-height` through them.
+
+**With GetFeatureInfo, 2026-10-16** (ets-wms13 1.34, TEAM Engine 6.0.0-RC2,
+the basic and queryable classes, #1064): 177 tests, 141 passed, 21 failed
+directly and 15 through a failed subtest. Every data-independent
+GetFeatureInfo test of one layer passes, `each-queryable-layer` on all seven
+layers and `each-info_format` for all three formats among them. By cause:
+
+| Failures | Tests | Cause | Status |
+|---:|---|---|---|
+| 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | One layer per GetMap (`LayerLimit` 1, #1014) | expected: deliberate |
+| 3 | `getfeatureinfo:two-query_layers`, `three-query_layers`, `less-query_layers` | The same limit: their `LAYERS` name two or three layers | expected: deliberate |
+| 2 | `getmap:bbox-outside-crs`, `transparent-default` | `TRANSPARENT` defaults to `TRUE` (#163); `transparent-default` only when its random layer has no data in its box | expected |
+| 1 | `getmap:no-version` | GetMap without `VERSION` renders | expected: deliberate |
+| 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
+| 3 | `queryable:std-data-queryable`, `feature_count-default`, `feature_count-1` | The same dataset | expected |
