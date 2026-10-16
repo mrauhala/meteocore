@@ -42,7 +42,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use quick_cache::sync::Cache;
 
 use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
@@ -423,32 +422,61 @@ impl CachedRendered {
     }
 }
 
-/// Max distinct `(width, height, background, format)` all-nodata images
-/// retained (see [`background_tile`]). 64 covers any realistic mix of client
-/// viewport sizes and formats; beyond that the LRU recycles.
-const EMPTY_TILE_CACHE_ITEMS: usize = 64;
+/// Which deterministic solid image a [`SOLID_IMAGE_CACHE`] entry holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SolidImage {
+    /// The all-nodata image ([`background_tile`]): every pixel transparent.
+    Empty,
+    /// The WMS error tile ([`error_tile`]): every pixel [`ERROR_TILE_RGBA`].
+    Error,
+}
 
-/// `(width, height, background, format)` of a memoized all-nodata image. The
-/// format carries its encoder quality, so a PNG, a JPEG and a lossy and a
+/// The pixel of the WMS error tile: semi-transparent red, which makes the
+/// failed area of a map visible without hiding the layers under it.
+const ERROR_TILE_RGBA: [u8; 4] = [255, 0, 0, 100];
+
+/// `(image, width, height, background, format)` of a memoized solid image.
+/// The format carries its encoder quality, so a PNG, a JPEG and a lossy and a
 /// lossless WebP of one size are four entries (#1091).
-type EmptyTileKey = (u32, u32, Option<[u8; 3]>, ImageFormat);
+type SolidImageKey = (SolidImage, u32, u32, Option<[u8; 3]>, ImageFormat);
 
-/// Process-global cache of all-nodata images keyed by output dimensions,
-/// background (`None` = transparent) and format with its quality, as
-/// ready-to-serve [`CachedRendered`] entries (bytes + their stable FNV-1a
-/// ETag).
+/// Byte budget of [`SOLID_IMAGE_CACHE`]. A solid lossless WebP stays a few
+/// dozen bytes at any size, but the other formats grow with the pixel count.
+/// A solid 1920 × 1080 image is about 13 kB in PNG and 33 kB in JPEG at the
+/// default quality. At 8000 × 8000, the API cap, which only a raised
+/// `MC_RENDER_MEMORY_MB` admits, about 0.4 MB in PNG, 1 MB in JPEG and nearly
+/// 2 MB in JPEG at quality 100, scaled from measurements at 2048 × 2048.
+/// 32 MiB keeps several hundred full-screen viewports. The 64-entry bound it
+/// replaces let a WIDTH/HEIGHT/FORMAT fan-out pin over 100 MB.
+const SOLID_IMAGE_CACHE_BYTES: u64 = 32 * ds_cache::MIB;
+
+/// Process-global memo of the all-nodata images and the WMS error tile, keyed
+/// by [`SolidImageKey`], as ready-to-serve [`CachedRendered`] entries (bytes +
+/// their stable FNV-1a ETag).
 ///
-/// WMS / Maps / Tiles take an all-nodata fast path on off-coverage views; the
-/// encoded image and its ETag are identical for a given key, so encoding once
-/// per distinct key and cloning the `Arc`-backed bytes is far cheaper than
-/// re-allocating `width·height·4` bytes and re-encoding + re-hashing on every
-/// empty response (#171). The Tiles service's 256×256 PNG global is sourced
-/// from here too, so all three raster APIs share one mechanism. Bounded by
-/// item count so a `?WIDTH=…&HEIGHT=…&BGCOLOR=…&FORMAT=…` fan-out can't pin
-/// unbounded memory — an abuser just cycles the LRU; a real client uses a
-/// handful of viewport sizes.
-static EMPTY_TILE_CACHE: std::sync::LazyLock<Cache<EmptyTileKey, CachedRendered>> =
-    std::sync::LazyLock::new(|| Cache::new(EMPTY_TILE_CACHE_ITEMS));
+/// WMS / Maps / Tiles take an all-nodata fast path on off-coverage views, and
+/// WMS answers a failed render with the error tile; the encoded image and its
+/// ETag are identical for a given key, so encoding once per distinct key and
+/// cloning the `Arc`-backed bytes is far cheaper than re-allocating
+/// `width·height·4` bytes and re-encoding + re-hashing on every such response
+/// (#171, #1093). The Tiles service's 256×256 PNG global is sourced from here
+/// too, so all three raster APIs share one mechanism.
+///
+/// Bounded by bytes ([`SOLID_IMAGE_CACHE_BYTES`]), not entries, so a
+/// `?WIDTH=…&HEIGHT=…&BGCOLOR=…&FORMAT=…` fan-out can't pin unbounded memory
+/// whatever the sizes: an abuser just cycles the LRU; a real client uses a
+/// handful of viewport sizes. One shard, so an entry up to nearly the whole
+/// budget is admitted: the default sharding would split the budget into
+/// slices smaller than one large JPEG, and never keep it.
+static SOLID_IMAGE_CACHE: std::sync::LazyLock<
+    ds_cache::ByteBoundedCache<SolidImageKey, CachedRendered>,
+> = std::sync::LazyLock::new(|| {
+    ds_cache::ByteBoundedCache::new_single_shard(
+        SOLID_IMAGE_CACHE_BYTES,
+        4 * 1024,
+        weigh_cached::<SolidImageKey>,
+    )
+});
 
 /// An all-nodata `width`×`height` image in `format` as a ready-to-serve
 /// [`CachedRendered`], encoded once per distinct size and format and cloned
@@ -456,6 +484,11 @@ static EMPTY_TILE_CACHE: std::sync::LazyLock<Cache<EmptyTileKey, CachedRendered>
 /// no alpha (what [`encode_jpeg`] makes of a transparent pixel). Use this for
 /// the all-nodata fast path instead of allocating and encoding a fresh image
 /// on every empty response.
+///
+/// A miss encodes on the calling thread, and a concurrent caller for the same
+/// image waits for that encode: call it from a blocking worker, such as the
+/// render job that found the view empty (#1093), never from an async request
+/// worker.
 pub fn empty_tile(
     width: u32,
     height: u32,
@@ -470,15 +503,54 @@ pub fn empty_tile(
 /// is background). Encoded by [`encode_rgba`], the entry point every
 /// populated render goes through, so an empty image is the format and quality
 /// the request asked for (#1091). Memoized per
-/// `(width, height, background, format)`.
+/// `(width, height, background, format)`; like [`empty_tile`], call it from a
+/// blocking worker.
 pub fn background_tile(
     width: u32,
     height: u32,
     background: Option<[u8; 3]>,
     format: ImageFormat,
 ) -> Result<CachedRendered, DataServerError> {
-    EMPTY_TILE_CACHE.get_or_insert_with(&(width, height, background, format), || {
-        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    solid_image(SolidImage::Empty, width, height, background, format)
+}
+
+/// The WMS error tile: a `width`×`height` image of semi-transparent red that
+/// a GetMap whose render failed answers with, so the failed area stays
+/// visible. In `format` at its quality like any map image (#1091), composited
+/// over `background` when the request asked for opaque output (always for
+/// JPEG, which has no alpha), so PNG and WebP keep the alpha a JPEG cannot.
+///
+/// Memoized like [`background_tile`], per
+/// `(width, height, background, format)` (#1093): during an engine outage
+/// every GetMap fails, and each would otherwise re-encode the same image.
+/// Single-flight, so concurrent failures of one size share one encode. Like
+/// [`empty_tile`], call it from a blocking worker, such as the render job
+/// whose render failed.
+pub fn error_tile(
+    width: u32,
+    height: u32,
+    background: Option<[u8; 3]>,
+    format: ImageFormat,
+) -> Result<CachedRendered, DataServerError> {
+    solid_image(SolidImage::Error, width, height, background, format)
+}
+
+/// One [`SOLID_IMAGE_CACHE`] entry, encoded by [`encode_rgba`] on a miss.
+/// Concurrent callers for one key share one encode: `get_or_insert_with` is
+/// single-flight, and a failed encode inserts nothing.
+fn solid_image(
+    image: SolidImage,
+    width: u32,
+    height: u32,
+    background: Option<[u8; 3]>,
+    format: ImageFormat,
+) -> Result<CachedRendered, DataServerError> {
+    SOLID_IMAGE_CACHE.get_or_insert_with(&(image, width, height, background, format), || {
+        let pixel = match image {
+            SolidImage::Empty => [0u8; 4],
+            SolidImage::Error => ERROR_TILE_RGBA,
+        };
+        let mut rgba = pixel.repeat(width as usize * height as usize);
         Ok(CachedRendered::new(Bytes::from(encode_rgba(
             &mut rgba, width, height, format, background,
         )?)))
@@ -489,7 +561,8 @@ pub fn background_tile(
 /// (bytes + 18-byte quoted 16-hex-char ETag string + 64-byte overhead).
 /// The length is the whole allocation only because the encoders return
 /// exact-length buffers (#1052): `Bytes::from(vec)` keeps spare capacity.
-fn weigh_rendered(_key: &CacheKey, val: &CachedRendered) -> u64 {
+/// Shared by the rendered cache and the solid-image memo, whatever the key.
+fn weigh_cached<K>(_key: &K, val: &CachedRendered) -> u64 {
     val.bytes().len() as u64 + val.etag().len() as u64 + 64
 }
 
@@ -508,7 +581,7 @@ impl RenderedCache {
             cache: ds_cache::ByteBoundedCache::new(
                 capacity_mb.saturating_mul(ds_cache::MIB),
                 60 * 1024,
-                weigh_rendered,
+                weigh_cached::<CacheKey>,
             ),
         }
     }
@@ -626,8 +699,8 @@ pub fn render_tile_with_background(
 ///
 /// The one encoder entry point for map images: colormapped and composite
 /// renders, meta-tile assembly, the all-nodata image ([`background_tile`])
-/// and the WMS error tile all go through it, so they cannot drift apart in
-/// format, quality or background handling.
+/// and the WMS error tile ([`error_tile`]) all go through it, so they cannot
+/// drift apart in format, quality or background handling.
 pub fn encode_rgba(
     rgba: &mut [u8],
     width: u32,
@@ -1351,10 +1424,92 @@ mod tests {
             b.bytes(),
             "same (w,h) must yield identical bytes"
         );
+        assert_eq!(a.bytes().as_ptr(), b.bytes().as_ptr(), "one encode");
         // Different dimensions → different content (and a different ETag).
         let c = empty_tile(100, 100, ImageFormat::Png).expect("encode empty tile");
         assert_ne!(a.etag(), c.etag(), "different (w,h) must differ");
         assert!(!a.bytes().is_empty(), "an empty tile is still a real PNG");
+    }
+
+    /// #1093: the WMS error tile is memoized like the empty image. Two
+    /// failures of one size and format share one encode (the same
+    /// allocation), each entry is the shared encoder's image of the red pixel
+    /// in its format, over its background, and the error tile never aliases
+    /// the empty image of the same key.
+    #[test]
+    fn error_tile_is_memoized_per_size_background_and_format() {
+        let (w, h) = (37, 23);
+        let red = ERROR_TILE_RGBA.repeat((w * h) as usize);
+        let first = error_tile(w, h, None, ImageFormat::Png).unwrap();
+        let second = error_tile(w, h, None, ImageFormat::Png).unwrap();
+        assert_eq!(
+            first.bytes().as_ptr(),
+            second.bytes().as_ptr(),
+            "the second error tile is the first one's bytes, not a second encode"
+        );
+        assert_eq!(first.etag(), second.etag());
+        assert_eq!(first.bytes().as_ref(), encode_png(&red, w, h).unwrap());
+
+        let white = [255, 255, 255];
+        let jpeg = error_tile(w, h, Some(white), ImageFormat::Jpeg { quality: 40 }).unwrap();
+        let mut on_white = red.clone();
+        flatten_onto(&mut on_white, white);
+        assert_eq!(
+            jpeg.bytes().as_ref(),
+            encode_jpeg(&on_white, w, h, 40).unwrap()
+        );
+        let webp = error_tile(w, h, None, ImageFormat::WEBP).unwrap();
+        assert_eq!(webp.bytes().as_ref(), encode_webp(&red, w, h, 100).unwrap());
+
+        for (other, what) in [
+            (
+                error_tile(w, h, Some(white), ImageFormat::Png),
+                "a background",
+            ),
+            (error_tile(w + 1, h, None, ImageFormat::Png), "another size"),
+            (
+                background_tile(w, h, None, ImageFormat::Png),
+                "the empty image",
+            ),
+        ] {
+            assert_ne!(
+                other.unwrap().etag(),
+                first.etag(),
+                "{what} is another entry"
+            );
+        }
+        assert_eq!(
+            error_tile(w, h, None, ImageFormat::Png)
+                .unwrap()
+                .bytes()
+                .as_ptr(),
+            first.bytes().as_ptr(),
+            "the other entries did not replace the first"
+        );
+    }
+
+    /// Concurrent failures of one size wait for one encode instead of each
+    /// encoding the same image: every caller gets the same allocation.
+    #[test]
+    fn concurrent_error_tiles_share_one_encode() {
+        let (w, h, format) = (311, 197, ImageFormat::Jpeg { quality: 61 });
+        let barrier = std::sync::Barrier::new(8);
+        let pointers: Vec<usize> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let tile = error_tile(w, h, Some([0, 0, 0]), format).unwrap();
+                        tile.bytes().as_ptr() as usize
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert!(
+            pointers.iter().all(|&p| p == pointers[0]),
+            "one encode shared by every caller: {pointers:?}"
+        );
     }
 
     #[test]
@@ -2259,7 +2414,7 @@ mod tests {
     #[test]
     fn rendered_cache_weight_covers_the_encoded_allocation() {
         // #1052: the handlers cache `Bytes::from(render_tile(..))`, which keeps
-        // the whole Vec allocation, and `weigh_rendered` counts the length. A
+        // the whole Vec allocation, and `weigh_cached` counts the length. A
         // sparse tile encodes to a small fraction of the encoders' worst-case
         // reservations, so only an exact-length buffer keeps the weight honest.
         let tile = RasterTile {
@@ -2290,7 +2445,7 @@ mod tests {
                 background: None,
             };
             let cached = CachedRendered::new(Bytes::from(encoded));
-            let weight = weigh_rendered(&key, &cached);
+            let weight = weigh_cached(&key, &cached);
             assert!(
                 weight >= allocation,
                 "{format:?}: weight {weight} B under-counts a {allocation} B allocation"

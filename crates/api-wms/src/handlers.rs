@@ -10,7 +10,9 @@ use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
-use ds_render::{CacheKey, ColorMap, CompositeSpec, ImageFormat, RenderedCache, StyleInfo};
+use ds_render::{
+    CacheKey, CachedRendered, ColorMap, CompositeSpec, ImageFormat, RenderedCache, StyleInfo,
+};
 
 use crate::error::WmsError;
 use crate::params::{WmsQuery, WmsRequestType};
@@ -130,20 +132,72 @@ fn request_base_url(state: &WmsState, headers: &HeaderMap) -> String {
     })
 }
 
-/// Render a semi-transparent red error tile to make failed areas visible, in
-/// the requested `format` at its quality (#1091), composited over
-/// `background` when the request asked for opaque output (always for JPEG,
-/// which has no alpha). Encoded by `ds_render::encode_rgba`, the entry point
-/// a populated render takes, so PNG and WebP keep the alpha a JPEG cannot.
-fn render_error_tile(
+/// A GetMap render's outcome: the encoded image, `None` for an all-nodata
+/// view, and the path it took.
+type Rendered = Result<(Option<Vec<u8>>, RenderPath), DataServerError>;
+
+/// What a GetMap render job hands back: the image to serve, already encoded
+/// on the render worker that held the CPU slot (#1093), never on the async
+/// request worker after it.
+enum Finished {
+    /// A populated image, served `MISS` and inserted in the rendered cache.
+    Image(CachedRendered, RenderPath),
+    /// An all-nodata view, served `EMPTY`: its memoized empty image, or the
+    /// encoder's error.
+    Empty(Result<CachedRendered, DataServerError>, RenderPath),
+    /// A failed render, served `ERROR`: the memoized error tile (or the
+    /// encoder's error), and the render's error for the handler to log.
+    Error(Result<CachedRendered, DataServerError>, DataServerError),
+}
+
+/// Turn a render's outcome into the image a GetMap serves. Runs inside the
+/// render job, after the render, so on a memo miss the empty image and the
+/// error tile are encoded by the worker that holds the CPU slot, under the
+/// render deadline, like every populated image (#1093). A shed or timed-out
+/// render (`ResourceExhausted`, `DeadlineExceeded`) stays an error, the 503,
+/// and encodes nothing.
+fn finish_render(
+    rendered: Rendered,
     width: u32,
     height: u32,
-    format: ImageFormat,
     background: Option<[u8; 3]>,
-) -> Result<Vec<u8>, WmsError> {
-    let mut rgba = [255u8, 0, 0, 100].repeat(width as usize * height as usize);
-    ds_render::encode_rgba(&mut rgba, width, height, format, background)
-        .map_err(|e| WmsError::Internal(format!("Failed to encode error tile: {e}")))
+    format: ImageFormat,
+) -> Result<Finished, DataServerError> {
+    Ok(match rendered {
+        Ok((Some(bytes), path)) => {
+            Finished::Image(CachedRendered::new(bytes::Bytes::from(bytes)), path)
+        }
+        // Transparent, or for opaque output and JPEG solid background,
+        // encoded once per (w, h, background, format) and shared across
+        // WMS/Maps/Tiles (#171).
+        Ok((None, path)) => Finished::Empty(
+            ds_render::background_tile(width, height, background, format),
+            path,
+        ),
+        Err(e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded)) => {
+            return Err(e)
+        }
+        // Semi-transparent red, so the failed area stays visible; encoded
+        // once per (w, h, background, format) like the empty image.
+        Err(e) => Finished::Error(ds_render::error_tile(width, height, background, format), e),
+    })
+}
+
+/// The work a GetMap's `RenderJob` runs: `render`, then [`finish_render`] on
+/// the same blocking worker, which holds the output-memory reservation
+/// `memory` until both are done, also after the request is gone.
+fn render_job(
+    memory: Arc<ds_executor::budget::RenderPermit>,
+    width: u32,
+    height: u32,
+    background: Option<[u8; 3]>,
+    format: ImageFormat,
+    render: impl FnOnce() -> Rendered + Send + 'static,
+) -> impl FnOnce() -> Result<Finished, DataServerError> + Send + 'static {
+    move || {
+        let _memory = memory;
+        finish_render(render(), width, height, background, format)
+    }
 }
 
 /// Cache-Control header value for a WMS response.
@@ -553,7 +607,6 @@ pub async fn wms_handler(
             )
             .await
             .map_err(WmsError::from)?;
-            let worker_memory = memory_permit.clone();
 
             // Admission wait: the `queue` render phase (#147) and the slow
             // log's `sem_wait_ms`.
@@ -590,12 +643,18 @@ pub async fn wms_handler(
             // any wait for a free blocking-pool thread (itself a useful signal: if
             // render_ms greatly exceeds the internal phase sum
             // tile_render_ms+assemble_ms+encode_ms, the gap is scheduling latency).
+            // The job also finishes the image: an empty view's empty image and a
+            // failed render's error tile are encoded there too (#1093), and the
+            // request worker only reads the result.
             let t_render = std::time::Instant::now();
-            let render_outcome = job
-                .run(
-                    move || -> Result<(Option<Vec<u8>>, RenderPath), DataServerError> {
-                        let _memory_permit = worker_memory;
-
+            let finished = job
+                .run(render_job(
+                    memory_permit,
+                    width,
+                    height,
+                    background,
+                    format,
+                    move || -> Rendered {
                         // A composite's bands, in the plane order its spec reads.
                         let bands: Vec<&str> = match &paint {
                             Paint::Composite(spec) => {
@@ -769,23 +828,18 @@ pub async fn wms_handler(
                             direct().map(|(o, phases)| (o, RenderPath::Direct(phases)))
                         }
                     },
-                )
+                ))
                 .await
                 .map_err(WmsError::from)?;
             let render_ms = t_render.elapsed().as_millis() as u64;
 
-            // Split the render outcome: bytes flow into the existing response
-            // match below; the path + timing are logged for slow renders so prod
-            // pinpoints the cost (queue wait vs tile render vs assemble vs encode).
-            // `render_path` is irrelevant on error (the log is gated on success).
-            // `render_path` is `None` on error (no fabricated placeholder); the
-            // slow-log is gated on success anyway, so it's never read on error.
-            let (render_result, render_path): (
-                Result<Option<Vec<u8>>, DataServerError>,
-                Option<RenderPath>,
-            ) = match render_outcome {
-                Ok((bytes, path)) => (Ok(bytes), Some(path)),
-                Err(e) => (Err(e), None),
+            // The path + timing are logged for slow renders so prod pinpoints
+            // the cost (queue wait vs tile render vs assemble vs encode).
+            // `render_path` is `None` for a failed render (no fabricated
+            // placeholder), so the slow-log never reads one.
+            let render_path = match &finished {
+                Ok(Finished::Image(_, path) | Finished::Empty(_, path)) => Some(path),
+                Ok(Finished::Error(..)) | Err(_) => None,
             };
             // `None` exactly for a failed render: an error tile is not a
             // render outcome and records no latency.
@@ -798,7 +852,7 @@ pub async fn wms_handler(
             // diagnosing); errors are surfaced by the WmsError render warn arm
             // below. The arms stay distinct so a meta render that fell back to
             // direct isn't conflated with a genuine non-meta render.
-            if render_ms >= SLOW_RENDER_LOG_MS && render_result.is_ok() {
+            if render_ms >= SLOW_RENDER_LOG_MS {
                 match render_path {
                     Some(RenderPath::Meta(s)) => tracing::info!(
                         layer = %params.layer,
@@ -859,45 +913,36 @@ pub async fn wms_handler(
             // the EMPTY and ERROR fast paths included (WMS 1.3.0 answers
             // the format asked for, #1091), so the Content-Type is the
             // requested one on every exit and never lies about the payload
-            // (#162). Wrap every branch in `CachedRendered` so the response
-            // ETag is FNV-1a over the actual bytes — different pixels,
-            // different ETag — regardless of which exit we take (#145).
-            // Only the populated `Ok(Some(_))` path inserts into the
-            // rendered cache; the EMPTY and ERROR fast-paths intentionally
-            // don't (their bytes are deterministic for fixed dimensions and
-            // format, and the engine error case shouldn't poison the cache).
-            let (cached, x_cache) = match render_result {
-                Ok(Some(bytes)) => {
-                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+            // (#162). Every arm is a `CachedRendered`, so the response ETag
+            // is FNV-1a over the actual bytes — different pixels, different
+            // ETag — regardless of which exit we take (#145). The job
+            // finished them all (`finish_render`, #1093); this only labels
+            // them. Only the populated image inserts into the rendered cache;
+            // the EMPTY and ERROR fast-paths intentionally don't (their bytes
+            // are deterministic for fixed dimensions and format and come from
+            // their own memo, and the engine error case shouldn't poison the
+            // cache).
+            let (cached, x_cache) = match finished {
+                Ok(Finished::Image(cached, _)) => {
                     rendered_cache.insert(cache_key, cached.clone());
                     (cached, "MISS")
                 }
-                Ok(None) => {
-                    // Empty image: transparent — or, for opaque output and
-                    // JPEG, solid background — encoded once per
-                    // (w, h, background, format) and shared across
-                    // WMS/Maps/Tiles (#171). Not inserted into the rendered
-                    // cache — the shared empty-tile cache already serves the
-                    // deterministic empty response.
-                    let cached = ds_render::background_tile(
-                        params.width,
-                        params.height,
-                        params.background,
-                        format,
-                    )
-                    .map_err(|e| WmsError::Internal(format!("Failed to encode empty tile: {e}")))?;
+                Ok(Finished::Empty(tile, _)) => {
+                    let cached = tile.map_err(|e| {
+                        WmsError::Internal(format!("Failed to encode empty tile: {e}"))
+                    })?;
                     (cached, "EMPTY")
                 }
-                Err(
-                    e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
-                ) => {
+                // Only a shed or timed-out render (`ResourceExhausted`,
+                // `DeadlineExceeded`) is an error here, and it encoded nothing.
+                Err(e) => {
                     return Err(WmsError::ServiceUnavailable(e.to_string()));
                 }
-                Err(e) => {
+                Ok(Finished::Error(tile, e)) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
-                    let bytes =
-                        render_error_tile(params.width, params.height, format, params.background)?;
-                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+                    let cached = tile.map_err(|e| {
+                        WmsError::Internal(format!("Failed to encode error tile: {e}"))
+                    })?;
                     (cached, "ERROR")
                 }
             };
@@ -1167,6 +1212,109 @@ impl From<ds_executor::ExecutionError> for WmsError {
         match error {
             ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
             other => Self::ServiceUnavailable(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A render the engine failed.
+    fn failed() -> Rendered {
+        Err(DataServerError::Engine("source unreachable".into()))
+    }
+
+    /// The error tile [`finish_render`] serves for `rendered`.
+    fn error_tile(rendered: Rendered, format: ImageFormat) -> CachedRendered {
+        match finish_render(rendered, 53, 29, None, format) {
+            Ok(Finished::Error(tile, DataServerError::Engine(_))) => tile.unwrap(),
+            _ => panic!("an engine error is served as the error tile"),
+        }
+    }
+
+    /// #1093: during an outage every GetMap fails. Two failed renders of one
+    /// size and format share one encode of the error tile (the second gets
+    /// the first one's bytes), which is the shared encoder's image of the
+    /// red tile in the requested format and quality.
+    #[test]
+    fn failed_renders_share_one_error_tile_encode() {
+        let format = ImageFormat::Webp { quality: 43 };
+        let first = error_tile(failed(), format);
+        let second = error_tile(failed(), format);
+        assert_eq!(
+            first.bytes().as_ptr(),
+            second.bytes().as_ptr(),
+            "the second failure reuses the first one's encode"
+        );
+        assert_eq!(first.etag(), second.etag());
+        let red = [255u8, 0, 0, 100].repeat(53 * 29);
+        assert_eq!(
+            first.bytes().as_ref(),
+            ds_render::encode_webp(&red, 53, 29, 43).unwrap()
+        );
+        assert_ne!(
+            error_tile(failed(), ImageFormat::Png).etag(),
+            first.etag(),
+            "another format is another encode"
+        );
+    }
+
+    /// Two all-nodata views of one size, background and format share one
+    /// encode of the empty image, and keep the render path for the logs.
+    #[test]
+    fn empty_views_share_one_empty_image_encode() {
+        let empty = || {
+            let view = Ok((None, RenderPath::Direct(RenderPhases::default())));
+            match finish_render(view, 59, 31, Some([1, 2, 3]), ImageFormat::JPEG) {
+                Ok(Finished::Empty(tile, RenderPath::Direct(_))) => tile.unwrap(),
+                _ => panic!("an all-nodata view is served as the empty image"),
+            }
+        };
+        let (first, second) = (empty(), empty());
+        assert_eq!(first.bytes().as_ptr(), second.bytes().as_ptr());
+        assert!(first.bytes().starts_with(&[0xFF, 0xD8, 0xFF]), "a JPEG");
+    }
+
+    /// A shed or timed-out render stays its own 503 error, with no image.
+    #[test]
+    fn shed_and_timed_out_renders_stay_the_503_error() {
+        assert!(matches!(
+            finish_render(
+                Err(DataServerError::ResourceExhausted),
+                8,
+                8,
+                None,
+                ImageFormat::Png
+            ),
+            Err(DataServerError::ResourceExhausted)
+        ));
+        assert!(matches!(
+            finish_render(
+                Err(DataServerError::DeadlineExceeded),
+                8,
+                8,
+                None,
+                ImageFormat::Png
+            ),
+            Err(DataServerError::DeadlineExceeded)
+        ));
+    }
+
+    /// A populated render is served as rendered, its ETag over its bytes.
+    #[test]
+    fn a_populated_render_is_served_as_rendered() {
+        let view = Ok((
+            Some(vec![1, 2, 3]),
+            RenderPath::Direct(RenderPhases::default()),
+        ));
+        match finish_render(view, 8, 8, None, ImageFormat::Png) {
+            Ok(Finished::Image(image, _)) => {
+                let expected = CachedRendered::new(bytes::Bytes::from_static(&[1, 2, 3]));
+                assert_eq!(image.bytes(), expected.bytes());
+                assert_eq!(image.etag(), expected.etag());
+            }
+            _ => panic!("a populated render is served as rendered"),
         }
     }
 }

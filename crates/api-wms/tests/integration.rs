@@ -226,7 +226,7 @@ async fn empty_image_is_encoded_in_the_requested_format() {
 }
 
 /// Mock engine whose `get_raster_tile` always fails. Drives the WMS
-/// `Err(e)` branch that emits the red `render_error_tile`, in the
+/// `Err(e)` branch that serves the red `ds_render::error_tile`, in the
 /// requested format, with `X-Cache: ERROR`. WMS is the only handler
 /// that does this — Maps and Tiles propagate engine errors as JSON 500.
 struct FailingMockMapEngine;

@@ -206,8 +206,9 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - Caching: the background is part of the rendered-image `CacheKey` (the
   encoded bytes differ) but NOT of the meta-tile key — cached tiles stay
   RGBA, so opaque and transparent views share them. The all-nodata path uses
-  `ds_render::background_tile` (memoized per size + background + format with
-  its quality); the error tile is flattened too.
+  `ds_render::background_tile` and a failed render `ds_render::error_tile`,
+  both memoized per size + background + format with its quality; the error
+  tile is flattened too.
 - GetCapabilities advertises nothing for these; the layer `opaque` attribute
   is unrelated and unchanged.
 - ets-wms13's `getmap:bbox-outside-crs` fails on the `TRUE` default: it
@@ -226,10 +227,23 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - JPEG has no alpha: the empty image is solid `BGCOLOR` (default white) and
   the semi-transparent error tile is flattened onto it. WebP keeps alpha like
   PNG unless `TRANSPARENT=FALSE`.
-- Neither is inserted into the rendered cache; the empty image comes from
-  `ds_render::background_tile`'s item-bounded memo, keyed on
-  `(width, height, background, format)` so a PNG and a JPEG of one size never
-  share an entry. The ERROR `Cache-Control` stays short.
+- Neither is inserted into the rendered cache. Both come from one
+  process-wide memo in ds-render (`ds_render::background_tile`,
+  `ds_render::error_tile`, #1093), keyed on the image and
+  `(width, height, background, format)` so a PNG and a JPEG of one size, or
+  the empty image and the error tile, never share an entry. The memo is
+  bounded by bytes (32 MiB, one shard), not entries: a solid JPEG grows with
+  the pixel count, to about 1 MB at 8000 × 8000. It has no `/metrics`
+  family. A miss is single-flight, so an outage's concurrent failures of one
+  size share one encode. The ERROR `Cache-Control` stays short.
+- Both are encoded inside the render job, never on the async request worker
+  (#1093): `finish_render` turns the render's outcome into the image to
+  serve on the blocking worker that holds the CPU slot and the memory
+  reservation, under the render deadline, and the handler only labels the
+  result. Keep it there; `background_tile` and `error_tile` encode on a miss
+  and block a caller waiting for another's encode. A `ResourceExhausted` or
+  `DeadlineExceeded` render stays the 503 and encodes nothing. Maps and Tiles
+  finish their empty image in the job the same way (`render_job`).
 
 ## QUALITY / `[wms] webp_quality`
 
