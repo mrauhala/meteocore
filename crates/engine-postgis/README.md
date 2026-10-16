@@ -470,8 +470,9 @@ read-only role's `statement_timeout`), each fetching `max_locations + 1` rows
 and the merged list stopping at `max_locations` (see
 [Station-list cap](#station-list-cap-max_locations)).
 It runs only in the **background metadata refresh** (`metadata_refresh_secs`),
-never on a request; the per-request observation fetch (`WHERE station_fk = $1`)
-is identical in every mode, so request latency is unchanged.
+never on a request; the per-request observation fetch (`WHERE station_fk = $1`,
+or `= ANY($1)` for a set-based area query) is identical in every mode, so
+request latency is unchanged.
 
 Even one table's *full-history* `DISTINCT ON` can exceed a tight
 `statement_timeout` on a large hypertable (the largest nexus table, ~13 M rows,
@@ -647,11 +648,43 @@ suspicious but workable (WARN — the collection still loads).
   engines atomically via `ArcSwap`. Shared pools carry over by identity across
   reloads; dropped URLs' pools close naturally.
 - **Row caps:** every emitted SELECT carries a `LIMIT`. Observation queries
-  are bounded by the response budget (500 000 values a request), the area
-  prefilter by 10 001 stations; past either, the request is an HTTP 400 that
-  names the numbers and what to narrow. Location lists fetch
-  `max_locations + 1` rows (see
+  are bounded by the response budget (500 000 values a request); past it,
+  the request is an HTTP 400 that names the budget and what to narrow. The
+  area prefilter stops at 200 000 stations, a memory guard far above any
+  station network, also a 400 past it: one value a station still makes a
+  coverage a station, which the value budget does not bound. Location
+  lists fetch `max_locations + 1` rows (see
   [Station-list cap](#station-list-cap-max_locations)).
+- **Area queries** (#1062) read the stations inside the polygon, each
+  station once, on one of two paths, which answer the same coverages in
+  the same order (two edge cases aside: only the fan-out stops at 10 000
+  rows a station, and only set-based drops rows whose `citext`-like
+  station key spells the id differently):
+  - **set-based**, for a `datetime` window of at most one hour (an instant,
+    or each instant of a `datetime` list): one statement per observation
+    table (`long` and `wide` one, `per_parameter` one per parameter) for
+    every station at once, `station_fk = ANY($1)`, rows streamed in
+    station and time order and charged against the budget as they arrive.
+    Every station's values at 06 UTC over a 30 000-station network is
+    one statement per table, not 30 000 round trips;
+  - **per-station fan-out** for longer windows and without `datetime`: one
+    statement per station (per station and parameter for `per_parameter`),
+    at most 16 in flight per pool, each using the `(station_fk_col,
+    time_col)` index, at most 20 000 statements a request and 10 000 rows
+    a statement. A longer window over more stations than that runs
+    set-based instead, so the value budget decides.
+
+  Neither changes the role's `statement_timeout`: a network-wide instant
+  must finish within it, which on a large table needs the
+  `(station_fk_col, time_col DESC)` index recommended above. That index
+  matters most for a long window over more than 20 000 statements' worth
+  of stations: run set-based, its 400 is cheap only when the database
+  stops reading at the statement's `LIMIT`, and without the index it can
+  read every row in the window and hit the timeout, a 500 instead of the
+  400. The one-hour threshold is provisional; the database tests print
+  both paths' timings on a TimescaleDB hypertable to tune it, each path's
+  time to that 400 for a week over 20 000 stations, and the set-based
+  statement's query plan.
 
 ## References
 

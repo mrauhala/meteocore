@@ -7,7 +7,7 @@
 //! engine never calls `block_on` from an async context without first
 //! entering `block_in_place`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,9 +29,10 @@ use crate::config::PostgisEngineConfig;
 use crate::health::{Health, HealthSnapshot, HealthStatus, LiveHealth};
 use crate::metadata::{CollectionMeta, LocationsCut, MetadataCache};
 use crate::query::{
-    build_events_area, build_events_window, build_location, build_position,
-    build_stations_in_polygon, params_as_refs, BuiltQuery, WindowAttrs, DEFAULT_POSITION_RADIUS_M,
-    MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON,
+    build_area_set, build_events_area, build_events_window, build_location, build_position,
+    build_stations_in_polygon, first_observation_column, params_as_refs, BuiltQuery, WindowAttrs,
+    DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES,
+    MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use crate::schema::{EventsShape, ObservationSchema};
 
@@ -39,6 +40,26 @@ use crate::schema::{EventsShape, ObservationSchema};
 /// keep the Clippy `type_complexity` lint happy without papering over
 /// the intent.
 type ParamSeries = Vec<(DateTime<Utc>, Option<f64>)>;
+
+/// How an area query reads its stations' observations (#1062). Not part of
+/// the engine contract: [`PostgisEngine::query_area_on`] takes it so the
+/// database tests can run both paths on one dataset.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AreaPath {
+    /// One statement per observation table (`long` and `wide` one,
+    /// `per_parameter` one per requested parameter) for every station in the
+    /// polygon at once, rows ordered by station and time and charged against
+    /// [`MAX_RESPONSE_VALUES`] as they stream in. For short windows: a single
+    /// instant over a whole network is one statement, not one per station.
+    SetBased,
+    /// One statement per station (per station and parameter for
+    /// `per_parameter`), at most 16 in flight, each capped at
+    /// [`MAX_OBSERVATION_ROWS`] rows and the whole fan-out at
+    /// [`MAX_AREA_QUERIES`] statements. For long windows, where each
+    /// station's `(station, time)` index range scan is the cheap unit.
+    FanOut,
+}
 
 /// `SELECT 1` health-ping cadence — the `/health` reachability probe (#110).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -488,9 +509,10 @@ impl EdrEngine for PostgisEngine {
         .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
 
         let (lon, lat) = lookup_station_coords(&self.load_meta(), location_id)?;
+        let decoder = RowDecoder::new(&self.config, &key_refs, false)?;
         let rows_per_query = run_queries_budgeted_sync(&self.pool, queries.clone())?;
-        Ok(CoverageResponse::Single(assemble_query_result(
-            &self.config,
+        Ok(CoverageResponse::Single(assemble_station(
+            &decoder,
             location_id,
             lon,
             lat,
@@ -536,6 +558,32 @@ impl EdrEngine for PostgisEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        self.query_area_on(None, coords, datetime, parameters)
+    }
+}
+
+impl PostgisEngine {
+    /// The EDR area query on `path`, or, with `None`, on the path
+    /// [`EdrEngine::query_area`] takes: set-based for a `datetime` window of at
+    /// most [`SET_BASED_MAX_WINDOW`] and for one the fan-out could not run
+    /// (more than [`MAX_AREA_QUERIES`] statements), the per-station fan-out
+    /// otherwise and without `datetime` (#1062). Both paths answer the same
+    /// coverages in the same order on the same data, with the exceptions
+    /// [`run_area_set`] lists; the choice is otherwise cost only.
+    ///
+    /// Not part of the engine contract: public only so the database tests
+    /// can run both paths on one dataset. A forced path skips `area_path`'s
+    /// rules, so a forced `SetBased` also reads a request without
+    /// `datetime` in one statement. Events collections ignore `path`: they
+    /// always run one statement.
+    #[doc(hidden)]
+    pub fn query_area_on(
+        &self,
+        path: Option<AreaPath>,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         if let ObservationSchema::Events(ev) = &self.config.observations {
             // Clone the shape so the borrow on `self.config` ends here —
             // `query_area_events` needs `&self` too.
@@ -564,20 +612,32 @@ impl EdrEngine for PostgisEngine {
         if stations.is_empty() {
             return Ok(CoverageResponse::Collection(vec![]));
         }
-        let stations = enforce_station_cap(stations)?;
-        enforce_area_query_count(
-            stations.len(),
-            area_queries_per_station(&self.config, &key_refs),
-        )?;
+        check_station_count(stations.len())?;
+        let stations = distinct_stations(stations);
+        let per_station = area_queries_per_station(&self.config, &key_refs);
+        let path = path.unwrap_or_else(|| area_path(datetime, stations.len(), per_station));
 
-        let results = run_area_fanout(
-            &self.pool,
-            &self.pool_key_label,
-            &self.config,
-            &stations,
-            datetime,
-            &key_refs,
-        )?;
+        let results = match path {
+            AreaPath::SetBased => run_area_set(
+                &self.pool,
+                &self.pool_key_label,
+                &self.config,
+                &stations,
+                datetime,
+                &key_refs,
+            )?,
+            AreaPath::FanOut => {
+                enforce_area_query_count(stations.len(), per_station)?;
+                run_area_fanout(
+                    &self.pool,
+                    &self.pool_key_label,
+                    &self.config,
+                    &stations,
+                    datetime,
+                    &key_refs,
+                )?
+            }
+        };
         Ok(CoverageResponse::Collection(results))
     }
 }
@@ -598,19 +658,67 @@ fn stations_in_polygon(locations: &[Location], polygon: &QueryPolygon) -> Vec<Lo
         .collect()
 }
 
-/// Both area prefilters (SQL `LIMIT 10001`, in-memory `.take(10001)`) fetch
-/// one row past the ceiling; a full batch means the polygon matched more
-/// stations than the sanity ceiling. The real per-request gates are the
-/// response-value budget and the fan-out query count — this only bounds the
-/// prefilter buffer. `QueryTooLarge` → HTTP 400.
-fn enforce_station_cap(stations: Vec<Location>) -> Result<Vec<Location>, DataServerError> {
-    if stations.len() >= MAX_STATIONS_IN_POLYGON {
+/// The prefilter's stations with each id once, at its first place. A
+/// stations view without a unique id can list one station twice; both area
+/// paths then read it once, so they answer the same coverages (#1062).
+fn distinct_stations(mut stations: Vec<Location>) -> Vec<Location> {
+    let keep: Vec<bool> = {
+        let mut seen = HashSet::with_capacity(stations.len());
+        stations
+            .iter()
+            .map(|s| seen.insert(s.id.as_str()))
+            .collect()
+    };
+    if keep.iter().all(|&k| k) {
+        return stations;
+    }
+    // `retain` visits every element once, in order.
+    let mut keep = keep.into_iter();
+    stations.retain(|_| keep.next().unwrap_or(true));
+    stations
+}
+
+/// Both area prefilters (SQL `LIMIT`, in-memory `.take`) fetch one station
+/// past the [`MAX_STATIONS_IN_POLYGON`] memory guard; a full batch means the
+/// polygon matched more stations than it allows. The gate on a request's
+/// size is the response-value budget (#1062): this only bounds the
+/// prefilter buffer and the station id list. `QueryTooLarge` → HTTP 400.
+fn check_station_count(matched: usize) -> Result<(), DataServerError> {
+    if matched >= MAX_STATIONS_IN_POLYGON {
         return Err(DataServerError::QueryTooLarge(format!(
             "area query matched more than the {} station ceiling — narrow the polygon",
             MAX_STATIONS_IN_POLYGON - 1
         )));
     }
-    Ok(stations)
+    Ok(())
+}
+
+/// The path an area query takes when the caller does not force one (#1062).
+///
+/// - No `datetime`: the fan-out. Every station's whole history is read, and
+///   the per-station statements keep their row cap.
+/// - A window of at most [`SET_BASED_MAX_WINDOW`] (an instant, each instant
+///   of a `datetime` list): set-based, one statement per observation table.
+/// - A longer window the fan-out could not run (more than
+///   [`MAX_AREA_QUERIES`] statements): set-based, so the value budget decides
+///   rather than the statement count.
+/// - Any other window: the fan-out, whose parallel `(station, time)` index
+///   scans win on long series.
+fn area_path(
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    stations: usize,
+    queries_per_station: usize,
+) -> AreaPath {
+    let Some((start, end)) = datetime else {
+        return AreaPath::FanOut;
+    };
+    if end.signed_duration_since(start) <= SET_BASED_MAX_WINDOW
+        || stations.saturating_mul(queries_per_station) > MAX_AREA_QUERIES
+    {
+        AreaPath::SetBased
+    } else {
+        AreaPath::FanOut
+    }
 }
 
 /// SQL queries one station contributes to an area fan-out: the
@@ -623,9 +731,10 @@ fn area_queries_per_station(cfg: &PostgisEngineConfig, source_keys: &[&str]) -> 
     }
 }
 
-/// Bound total DB work before any of it runs: stations × per-station
-/// queries. This is the dimension the station count and the parameter list
-/// multiply into — 8k stations × 1 parameter passes, 8k × 6 does not.
+/// Bound a fan-out's statements before any of them runs: stations ×
+/// per-station queries. This is the dimension the station count and the
+/// parameter list multiply into — 8k stations × 1 parameter passes, 8k × 6
+/// does not. The set-based path is not bound by it (#1062).
 fn enforce_area_query_count(
     stations: usize,
     queries_per_station: usize,
@@ -804,8 +913,10 @@ fn run_area_fanout(
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
 ) -> Result<Vec<QueryResult>, DataServerError> {
-    let width = (pool.status().max_size.saturating_sub(2)).clamp(1, 16);
+    let width = fanout_width(pool);
     let limiter = fanout_limiter(pool_key, width);
+    let decoder = RowDecoder::new(config, source_keys, false)?;
+    let decoder = &decoder;
     let spent = AtomicUsize::new(0);
     let pool = pool.clone();
     let results: Vec<Option<QueryResult>> = block_on_async(async {
@@ -863,8 +974,8 @@ fn run_area_fanout(
                 // (sparse stations, retired sensors, missing parameter for
                 // that station). Skip it rather than 404'ing the whole
                 // request. Real errors still propagate.
-                match assemble_query_result(
-                    &config,
+                match assemble_station(
+                    decoder,
                     &station.id,
                     station.longitude,
                     station.latitude,
@@ -882,6 +993,130 @@ fn run_area_fanout(
         .await
     })?;
     Ok(results.into_iter().flatten().collect())
+}
+
+/// Area connections one pool key may hold at once: the pool size minus a
+/// two-connection headroom, between 1 and 16.
+fn fanout_width(pool: &Pool) -> usize {
+    (pool.status().max_size.saturating_sub(2)).clamp(1, 16)
+}
+
+/// The set-based area path (#1062): every station in `stations` read by one
+/// statement per observation table (`long`/`wide` one, `per_parameter` one
+/// per parameter), run in turn on one pooled connection that holds one of the
+/// pool key's [`fanout_limiter`] permits, so area requests together keep the
+/// pool's headroom whichever path they take.
+///
+/// Rows stream in ordered by station and time and are charged against
+/// [`MAX_RESPONSE_VALUES`] as they arrive: each statement's `LIMIT` is the
+/// remaining budget in rows plus a sentinel row, so the server stops one row
+/// past it, and the row that crosses the budget is the 400. Each row is
+/// decoded into its station's series at once (no `Row` is kept), by the
+/// same [`RowDecoder`] the fan-out uses, and the coverages are assembled in
+/// `stations` order, so both paths answer the same coverages in the same
+/// order. A station with no row in the window is left out, as in the
+/// fan-out.
+///
+/// Where the two paths differ:
+/// - No per-station row cap: that bounds the fan-out's concurrent buffers,
+///   and here the budget bounds the whole response. A station with more
+///   than [`MAX_OBSERVATION_ROWS`] rows in the window is served here and is
+///   the fan-out's 400.
+/// - Rows are matched to stations by `<fk>::text`. A foreign key whose
+///   comparison ignores what its text keeps (`citext` ignores case) can
+///   match `= ANY` under a spelling other than the requested id's; such
+///   rows are skipped with a WARN, while the fan-out keeps them under the
+///   requested id.
+///
+/// `stations` holds each id once (`distinct_stations`); a repeated id would
+/// keep its first place.
+///
+/// Memory: besides the rows' series, a station costs about 200 bytes here
+/// (the id list, the id index and a series slot), on top of the
+/// prefilter's `Location` (see [`MAX_STATIONS_IN_POLYGON`]).
+fn run_area_set(
+    pool: &Pool,
+    pool_key: &str,
+    config: &PostgisEngineConfig,
+    stations: &[Location],
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    source_keys: &[&str],
+) -> Result<Vec<QueryResult>, DataServerError> {
+    let ids: Arc<Vec<String>> = Arc::new(stations.iter().map(|s| s.id.clone()).collect());
+    let mut queries = build_area_set(config, &ids, datetime, source_keys, MAX_RESPONSE_VALUES)
+        .map_err(|e| DataServerError::Engine(format!("build_area_set: {e}")))?;
+    let decoder = RowDecoder::new(config, source_keys, true)?;
+    // Position of each station id in `stations`, so the coverages come out
+    // in the prefilter's order whatever order the database sorts ids in.
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(stations.len());
+    for (i, station) in stations.iter().enumerate() {
+        index.entry(station.id.as_str()).or_insert(i);
+    }
+    let mut series: Vec<Option<StationRows>> = std::iter::repeat_with(|| None)
+        .take(stations.len())
+        .collect();
+    let limiter = fanout_limiter(pool_key, fanout_width(pool));
+    let pool = pool.clone();
+    let unmatched = block_on_async(async {
+        let _permit = limiter
+            .acquire()
+            .await
+            .map_err(|_| DataServerError::Engine("fanout limiter closed".into()))?;
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+        let mut remaining = MAX_RESPONSE_VALUES;
+        let mut unmatched = 0usize;
+        for i in 0..queries.len() {
+            let per_row = queries[i].values_per_row.max(1);
+            queries[i].set_row_limit(remaining / per_row + 1);
+            let q = &queries[i];
+            let rows = client
+                .query_raw(&q.sql, params_as_refs(&q.params))
+                .await
+                .map_err(|e| map_pg_error(e, q))?;
+            futures::pin_mut!(rows);
+            while let Some(row) = rows.try_next().await.map_err(|e| map_pg_error(e, q))? {
+                if per_row > remaining {
+                    return Err(budget_exceeded());
+                }
+                remaining -= per_row;
+                let id: &str = row
+                    .try_get(0)
+                    .map_err(|e| DataServerError::Engine(format!("decode station: {e}")))?;
+                let Some(&at) = index.get(id) else {
+                    unmatched += 1;
+                    continue;
+                };
+                let station = series[at].get_or_insert_with(|| decoder.station(&queries));
+                decoder.push(station, q, &row)?;
+            }
+        }
+        Ok::<_, DataServerError>(unmatched)
+    })?;
+    if unmatched > 0 {
+        // `<fk>::text` of a row did not spell any requested id, as a column
+        // type whose text form differs from its comparison (citext) would.
+        tracing::warn!(
+            pool_key,
+            unmatched,
+            "postgis: set-based area rows whose station id matched no requested station were skipped"
+        );
+    }
+
+    let mut out = Vec::new();
+    for (station, rows) in stations.iter().zip(series) {
+        let Some(rows) = rows else {
+            continue;
+        };
+        match decoder.finish(&station.id, station.longitude, station.latitude, rows) {
+            Ok(qr) => out.push(qr),
+            Err(DataServerError::LocationNotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
 }
 
 /// Run one built query on a pooled connection (sync bridge). Used by the
@@ -1024,41 +1259,195 @@ pub(crate) fn map_pg_error(e: tokio_postgres::Error, q: &BuiltQuery) -> DataServ
 
 // ─── row assembly ──────────────────────────────────────────────────────────
 
-fn assemble_query_result(
-    cfg: &PostgisEngineConfig,
+/// One station's observations decoded from its rows, before they become a
+/// coverage. Rows are decoded as they arrive, so no `Row` outlives its
+/// decoding.
+#[derive(Debug, Default)]
+struct StationRows {
+    rows: usize,
+    /// `long` and `per_parameter`: one `(time, value)` series per source key,
+    /// in row order.
+    series: HashMap<String, ParamSeries>,
+    /// `wide`: the row times, and one value column per selected source key.
+    times: Vec<DateTime<Utc>>,
+    columns: Vec<Vec<Option<f64>>>,
+}
+
+/// Decodes observation rows into a station's series and assembles its
+/// coverage. The single-station, fan-out and set-based statements select the
+/// same columns in the same order, a set-based row led by the station id
+/// (#1062), so every path fills a station through these same steps and the
+/// same rows give the same coverage whichever path fetched them.
+struct RowDecoder<'a> {
+    cfg: &'a PostgisEngineConfig,
+    /// The selected source keys in projection order: the `wide` value
+    /// columns.
+    keys: &'a [&'a str],
+    /// Column index of the time, the first observation column.
+    first: usize,
+}
+
+impl<'a> RowDecoder<'a> {
+    fn new(
+        cfg: &'a PostgisEngineConfig,
+        keys: &'a [&'a str],
+        set_based: bool,
+    ) -> Result<Self, DataServerError> {
+        if matches!(cfg.observations, ObservationSchema::Events(_)) {
+            // Events never reach the station assembly path — their area
+            // query assembles Point coverages via `assemble_event_coverages`.
+            return Err(DataServerError::Engine(
+                "events shape has no station-keyed assembly".into(),
+            ));
+        }
+        Ok(Self {
+            cfg,
+            keys,
+            first: first_observation_column(set_based),
+        })
+    }
+
+    /// An empty station. `per_parameter` starts with a series per query, so a
+    /// parameter whose table has no row in the window is a range of nulls;
+    /// `wide` with a column per selected key.
+    fn station(&self, queries: &[BuiltQuery]) -> StationRows {
+        let mut station = StationRows::default();
+        match &self.cfg.observations {
+            ObservationSchema::PerParameter(_) => {
+                for key in queries.iter().filter_map(|q| q.parameter.as_ref()) {
+                    station.series.entry(key.clone()).or_default();
+                }
+            }
+            ObservationSchema::Wide(_) => station.columns = vec![Vec::new(); self.keys.len()],
+            ObservationSchema::Long(_) | ObservationSchema::Events(_) => {}
+        }
+        station
+    }
+
+    /// Decode one row of `query` into `station`.
+    fn push(
+        &self,
+        station: &mut StationRows,
+        query: &BuiltQuery,
+        row: &Row,
+    ) -> Result<(), DataServerError> {
+        let i = self.first;
+        let time: DateTime<Utc> = row
+            .try_get(i)
+            .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
+        match &self.cfg.observations {
+            ObservationSchema::Long(_) => {
+                let key: String = row
+                    .try_get(i + 1)
+                    .map_err(|e| DataServerError::Engine(format!("decode parameter: {e}")))?;
+                let value: Option<f64> = row
+                    .try_get(i + 2)
+                    .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
+                station.series.entry(key).or_default().push((time, value));
+            }
+            ObservationSchema::Wide(_) => {
+                station.times.push(time);
+                for (k, column) in station.columns.iter_mut().enumerate() {
+                    let value: Option<f64> = row.try_get(i + 1 + k).map_err(|e| {
+                        DataServerError::Engine(format!("decode {}: {e}", self.keys[k]))
+                    })?;
+                    column.push(value);
+                }
+            }
+            ObservationSchema::PerParameter(_) => {
+                let Some(key) = query.parameter.as_deref() else {
+                    return Err(DataServerError::Engine(
+                        "per_parameter query missing parameter tag".into(),
+                    ));
+                };
+                let value: Option<f64> = row
+                    .try_get(i + 1)
+                    .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
+                match station.series.get_mut(key) {
+                    Some(series) => series.push((time, value)),
+                    None => {
+                        station.series.insert(key.to_string(), vec![(time, value)]);
+                    }
+                }
+            }
+            ObservationSchema::Events(_) => {
+                return Err(DataServerError::Engine(
+                    "events shape has no station-keyed assembly".into(),
+                ))
+            }
+        }
+        station.rows += 1;
+        Ok(())
+    }
+
+    /// The station's `PointSeries` coverage. No row in the window is a
+    /// `LocationNotFound`: the single-station path's 404, a station the area
+    /// paths leave out.
+    fn finish(
+        &self,
+        station_id: &str,
+        lon: f64,
+        lat: f64,
+        station: StationRows,
+    ) -> Result<QueryResult, DataServerError> {
+        if station.rows == 0 {
+            // Match CsvEngine: station exists but has no data in the queried
+            // window ⇒ 404. Better than emitting an empty PointSeries (which
+            // fails CoverageJSON schema validation).
+            return Err(DataServerError::LocationNotFound(format!(
+                "{station_id} (no data in time range)"
+            )));
+        }
+        match &self.cfg.observations {
+            ObservationSchema::Wide(_) => Ok(wide_coverage(
+                self.cfg,
+                lon,
+                lat,
+                self.keys,
+                station.times,
+                station.columns,
+            )),
+            _ => Ok(series_coverage(self.cfg, lon, lat, station.series)),
+        }
+    }
+}
+
+/// Decode one station's rows, query by query, and assemble its coverage:
+/// the single-station and fan-out paths.
+fn assemble_station(
+    decoder: &RowDecoder<'_>,
     station_id: &str,
     lon: f64,
     lat: f64,
     queries: &[BuiltQuery],
     rows_per_query: Vec<Vec<Row>>,
 ) -> Result<QueryResult, DataServerError> {
-    let total_rows: usize = rows_per_query.iter().map(|r| r.len()).sum();
-    if total_rows == 0 {
-        // Match CsvEngine: station exists but has no data in the queried
-        // window ⇒ 404. Better than emitting an empty PointSeries (which
-        // fails CoverageJSON schema validation).
-        return Err(DataServerError::LocationNotFound(format!(
-            "{station_id} (no data in time range)"
-        )));
+    let mut station = decoder.station(queries);
+    for (query, rows) in queries.iter().zip(&rows_per_query) {
+        for row in rows {
+            decoder.push(&mut station, query, row)?;
+        }
     }
-    match &cfg.observations {
-        ObservationSchema::Long(_) => {
-            let rows = rows_per_query.into_iter().next().unwrap_or_default();
-            assemble_long(cfg, station_id, lon, lat, rows)
-        }
-        ObservationSchema::Wide(_) => {
-            let rows = rows_per_query.into_iter().next().unwrap_or_default();
-            assemble_wide(cfg, lon, lat, rows)
-        }
-        ObservationSchema::PerParameter(_) => {
-            assemble_per_parameter(cfg, lon, lat, queries, rows_per_query)
-        }
-        // Events never reach the station assembly path — their area query
-        // assembles Point coverages via `assemble_event_coverages`.
-        ObservationSchema::Events(_) => Err(DataServerError::Engine(
-            "events shape has no station-keyed assembly".into(),
-        )),
-    }
+    decoder.finish(station_id, lon, lat, station)
+}
+
+/// The descriptor of a configured parameter, or a bare one named after it.
+fn parameter_description(cfg: &PostgisEngineConfig, pname: &str) -> ParameterDescription {
+    cfg.parameters
+        .iter()
+        .find(|p| p.name == pname)
+        .map(|p| ParameterDescription {
+            label: p.label.clone(),
+            unit: p.unit.clone(),
+            observed_property: p.observed_property.clone(),
+            standard_name: None,
+        })
+        .unwrap_or_else(|| ParameterDescription {
+            label: pname.to_string(),
+            unit: String::new(),
+            observed_property: pname.to_string(),
+            standard_name: None,
+        })
 }
 
 // ─── event row assembly (events shape) ──────────────────────────────────────
@@ -1121,22 +1510,7 @@ fn assemble_event_coverages(
         .iter()
         .map(|key| {
             let pname = source_key_to_param_name(cfg, key);
-            let desc = cfg
-                .parameters
-                .iter()
-                .find(|p| p.name == pname)
-                .map(|p| ParameterDescription {
-                    label: p.label.clone(),
-                    unit: p.unit.clone(),
-                    observed_property: p.observed_property.clone(),
-                    standard_name: None,
-                })
-                .unwrap_or_else(|| ParameterDescription {
-                    label: pname.clone(),
-                    unit: String::new(),
-                    observed_property: pname.clone(),
-                    standard_name: None,
-                });
+            let desc = parameter_description(cfg, &pname);
             (pname, desc)
         })
         .collect();
@@ -1171,30 +1545,15 @@ fn assemble_event_coverages(
         .collect()
 }
 
-fn assemble_long(
+/// `long` and `per_parameter`: one series per source key on the union of
+/// their times, sorted; a key without a value at a time is null there, and of
+/// two values at one time the later row wins.
+fn series_coverage(
     cfg: &PostgisEngineConfig,
-    _station_id: &str,
     lon: f64,
     lat: f64,
-    rows: Vec<Row>,
-) -> Result<QueryResult, DataServerError> {
-    // Long rows: (time, parameter, value). Group by param, collect times,
-    // build per-param NdArray.
-    let mut per_param: HashMap<String, ParamSeries> = HashMap::new();
-    for row in &rows {
-        let t: DateTime<Utc> = row
-            .try_get("time")
-            .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
-        let p: String = row
-            .try_get("parameter")
-            .map_err(|e| DataServerError::Engine(format!("decode parameter: {e}")))?;
-        let v: Option<f64> = row
-            .try_get("value")
-            .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
-        per_param.entry(p).or_default().push((t, v));
-    }
-
-    // Union of all times across all parameters, sorted.
+    per_param: HashMap<String, ParamSeries>,
+) -> QueryResult {
     let mut all_times: Vec<DateTime<Utc>> = per_param
         .values()
         .flat_map(|rows| rows.iter().map(|(t, _)| *t))
@@ -1202,33 +1561,11 @@ fn assemble_long(
     all_times.sort_unstable();
     all_times.dedup();
 
-    let domain = DomainDescription::PointSeries {
-        x: lon,
-        y: lat,
-        t: all_times.clone(),
-        z: None,
-    };
-
     let mut param_descs = HashMap::new();
     let mut ranges = HashMap::new();
     for (source_key, rows) in per_param {
         let pname = source_key_to_param_name(cfg, &source_key);
-        let desc = cfg
-            .parameters
-            .iter()
-            .find(|p| p.name == pname)
-            .map(|p| ParameterDescription {
-                label: p.label.clone(),
-                unit: p.unit.clone(),
-                observed_property: p.observed_property.clone(),
-                standard_name: None,
-            })
-            .unwrap_or_else(|| ParameterDescription {
-                label: pname.clone(),
-                unit: String::new(),
-                observed_property: pname.clone(),
-                standard_name: None,
-            });
+        let desc = parameter_description(cfg, &pname);
         let row_map: HashMap<DateTime<Utc>, Option<f64>> = rows.into_iter().collect();
         let values: Vec<Option<f64>> = all_times
             .iter()
@@ -1246,95 +1583,33 @@ fn assemble_long(
         param_descs.insert(pname, desc);
     }
 
-    Ok(QueryResult {
-        domain,
+    QueryResult {
+        domain: DomainDescription::PointSeries {
+            x: lon,
+            y: lat,
+            t: all_times,
+            z: None,
+        },
         parameters: param_descs,
         ranges,
-    })
+    }
 }
 
-fn assemble_wide(
+/// `wide`: the row times as they came (ordered by time in SQL), and one
+/// range per selected key.
+fn wide_coverage(
     cfg: &PostgisEngineConfig,
     lon: f64,
     lat: f64,
-    rows: Vec<Row>,
-) -> Result<QueryResult, DataServerError> {
-    // Wide rows: (time, <param_alias_1>::float8, <param_alias_2>::float8, ...).
-    // The BuiltQuery SELECT projected each requested source_key as an alias
-    // named after that source_key — walk `cfg.parameters` in order for the
-    // column list, but we only know which were requested via the row's own
-    // column schema. Iterate row columns to discover the set.
-    // Empty rows are caught upstream by assemble_query_result and turned
-    // into LocationNotFound — by the time we get here, `rows` is non-empty.
-    let first = rows.first().expect("upstream guarantees non-empty rows");
-
-    let time_col_idx = first
-        .columns()
-        .iter()
-        .position(|c| c.name() == "time")
-        .ok_or_else(|| DataServerError::Engine("wide row missing 'time' column".into()))?;
-
-    // Other columns are parameter aliases.
-    let param_keys: Vec<String> = first
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            if i == time_col_idx {
-                None
-            } else {
-                Some(c.name().to_string())
-            }
-        })
-        .collect();
-
-    let mut times: Vec<DateTime<Utc>> = Vec::with_capacity(rows.len());
-    let mut per_param: HashMap<String, Vec<Option<f64>>> = param_keys
-        .iter()
-        .map(|k| (k.clone(), Vec::with_capacity(rows.len())))
-        .collect();
-
-    for row in &rows {
-        let t: DateTime<Utc> = row
-            .try_get::<_, DateTime<Utc>>(time_col_idx)
-            .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
-        times.push(t);
-        for key in &param_keys {
-            let v: Option<f64> = row
-                .try_get(key.as_str())
-                .map_err(|e| DataServerError::Engine(format!("decode {key}: {e}")))?;
-            per_param.get_mut(key).unwrap().push(v);
-        }
-    }
-
-    let domain = DomainDescription::PointSeries {
-        x: lon,
-        y: lat,
-        t: times.clone(),
-        z: None,
-    };
-
+    keys: &[&str],
+    times: Vec<DateTime<Utc>>,
+    columns: Vec<Vec<Option<f64>>>,
+) -> QueryResult {
     let mut param_descs = HashMap::new();
     let mut ranges = HashMap::new();
-    for key in &param_keys {
+    for (key, values) in keys.iter().zip(columns) {
         let pname = source_key_to_param_name(cfg, key);
-        let desc = cfg
-            .parameters
-            .iter()
-            .find(|p| p.name == pname)
-            .map(|p| ParameterDescription {
-                label: p.label.clone(),
-                unit: p.unit.clone(),
-                observed_property: p.observed_property.clone(),
-                standard_name: None,
-            })
-            .unwrap_or_else(|| ParameterDescription {
-                label: pname.clone(),
-                unit: String::new(),
-                observed_property: pname.clone(),
-                standard_name: None,
-            });
-        let values = per_param.remove(key).unwrap();
+        let desc = parameter_description(cfg, &pname);
         let n = values.len();
         ranges.insert(
             pname.clone(),
@@ -1347,101 +1622,16 @@ fn assemble_wide(
         param_descs.insert(pname, desc);
     }
 
-    Ok(QueryResult {
-        domain,
+    QueryResult {
+        domain: DomainDescription::PointSeries {
+            x: lon,
+            y: lat,
+            t: times,
+            z: None,
+        },
         parameters: param_descs,
         ranges,
-    })
-}
-
-fn assemble_per_parameter(
-    cfg: &PostgisEngineConfig,
-    lon: f64,
-    lat: f64,
-    queries: &[BuiltQuery],
-    rows_per_query: Vec<Vec<Row>>,
-) -> Result<QueryResult, DataServerError> {
-    // Each query carries a `parameter` (source_key) tag. Each row is (time,
-    // value). Union times across all queries.
-    let mut per_param: HashMap<String, ParamSeries> = HashMap::new();
-    for (q, rows) in queries.iter().zip(rows_per_query) {
-        let Some(source_key) = q.parameter.as_ref() else {
-            return Err(DataServerError::Engine(
-                "per_parameter query missing parameter tag".into(),
-            ));
-        };
-        let mut entries = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let t: DateTime<Utc> = row
-                .try_get("time")
-                .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
-            let v: Option<f64> = row
-                .try_get("value")
-                .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
-            entries.push((t, v));
-        }
-        per_param.insert(source_key.clone(), entries);
     }
-
-    let mut all_times: Vec<DateTime<Utc>> = per_param
-        .values()
-        .flat_map(|rows| rows.iter().map(|(t, _)| *t))
-        .collect();
-    all_times.sort_unstable();
-    all_times.dedup();
-
-    // Same invariant as wide: empty rows turned into LocationNotFound upstream.
-    debug_assert!(!all_times.is_empty(), "upstream guarantees non-empty rows");
-
-    let domain = DomainDescription::PointSeries {
-        x: lon,
-        y: lat,
-        t: all_times.clone(),
-        z: None,
-    };
-
-    let mut param_descs = HashMap::new();
-    let mut ranges = HashMap::new();
-    for (source_key, rows) in per_param {
-        let pname = source_key_to_param_name(cfg, &source_key);
-        let desc = cfg
-            .parameters
-            .iter()
-            .find(|p| p.name == pname)
-            .map(|p| ParameterDescription {
-                label: p.label.clone(),
-                unit: p.unit.clone(),
-                observed_property: p.observed_property.clone(),
-                standard_name: None,
-            })
-            .unwrap_or_else(|| ParameterDescription {
-                label: pname.clone(),
-                unit: String::new(),
-                observed_property: pname.clone(),
-                standard_name: None,
-            });
-        let row_map: HashMap<DateTime<Utc>, Option<f64>> = rows.into_iter().collect();
-        let values: Vec<Option<f64>> = all_times
-            .iter()
-            .map(|t| row_map.get(t).copied().unwrap_or(None))
-            .collect();
-        let n = values.len();
-        ranges.insert(
-            pname.clone(),
-            NdArray {
-                shape: vec![n],
-                axis_names: vec!["t".into()],
-                values,
-            },
-        );
-        param_descs.insert(pname, desc);
-    }
-
-    Ok(QueryResult {
-        domain,
-        parameters: param_descs,
-        ranges,
-    })
 }
 
 // ─── sync ↔ async bridge ───────────────────────────────────────────────────
@@ -1851,27 +2041,94 @@ mod tests {
 
     #[test]
     fn station_cap_maps_to_query_too_large_not_engine_error() {
+        // The guard sits at 200 000 stations (#1062), far above the old
+        // 10 000 ceiling a 20 000-station network used to hit.
+        const { assert!(MAX_STATIONS_IN_POLYGON > 20_000) };
+        assert!(check_station_count(20_000).is_ok());
         // A full-ceiling batch stays under the limit untouched.
-        let under: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON - 1)
-            .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
-            .collect();
-        assert_eq!(
-            enforce_station_cap(under).unwrap().len(),
-            MAX_STATIONS_IN_POLYGON - 1
-        );
+        assert!(check_station_count(MAX_STATIONS_IN_POLYGON - 1).is_ok());
 
         // A full sentinel batch signals the ceiling was breached →
         // QueryTooLarge (HTTP 400 with the message), never Engine
         // (opaque HTTP 500).
-        let over: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON)
-            .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
-            .collect();
-        match enforce_station_cap(over).unwrap_err() {
+        match check_station_count(MAX_STATIONS_IN_POLYGON).unwrap_err() {
             DataServerError::QueryTooLarge(msg) => {
                 assert!(msg.contains("narrow the polygon"), "message: {msg}")
             }
             other => panic!("expected QueryTooLarge, got: {other:?}"),
         }
+    }
+
+    /// #1062: a stations view without a unique id lists a station twice.
+    /// The area paths read it once, at its first place, so the fan-out
+    /// cannot answer it twice where the set-based path answers it once.
+    #[test]
+    fn area_stations_hold_each_id_once_at_its_first_place() {
+        let stations = vec![
+            loc("b", 1.0, 1.0),
+            loc("a", 2.0, 2.0),
+            loc("b", 3.0, 3.0),
+            loc("c", 4.0, 4.0),
+            loc("a", 5.0, 5.0),
+        ];
+        let kept: Vec<(String, f64)> = distinct_stations(stations)
+            .into_iter()
+            .map(|l| (l.id, l.longitude))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("b".into(), 1.0), ("a".into(), 2.0), ("c".into(), 4.0)]
+        );
+
+        // Without a repeat the list is untouched.
+        let unique = vec![loc("x", 1.0, 1.0), loc("y", 2.0, 2.0)];
+        let ids: Vec<String> = distinct_stations(unique)
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(ids, vec!["x", "y"]);
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// #1062: an instant or a short window runs set-based whatever the
+    /// station count; a long window keeps the fan-out while it can run it.
+    #[test]
+    fn short_windows_run_set_based() {
+        let t0 = at("2026-01-01T06:00:00Z");
+        let instant = Some((t0, t0));
+        let hour = Some((t0, t0 + SET_BASED_MAX_WINDOW));
+        let week = Some((t0, t0 + chrono::Duration::days(7)));
+        for stations in [1, 50, 20_000, 30_000] {
+            for per_station in [1, 2, 8] {
+                assert_eq!(
+                    area_path(instant, stations, per_station),
+                    AreaPath::SetBased
+                );
+                assert_eq!(area_path(hour, stations, per_station), AreaPath::SetBased);
+            }
+        }
+        // Just past the threshold, the fan-out takes what it can run.
+        let longer = Some((t0, t0 + SET_BASED_MAX_WINDOW + chrono::Duration::seconds(1)));
+        assert_eq!(area_path(longer, 100, 1), AreaPath::FanOut);
+        assert_eq!(area_path(week, 8_000, 2), AreaPath::FanOut);
+        assert_eq!(area_path(week, MAX_AREA_QUERIES, 1), AreaPath::FanOut);
+    }
+
+    /// #1062: a long window the fan-out cannot run goes set-based, so the
+    /// value budget decides; without `datetime` the fan-out keeps its
+    /// statement cap.
+    #[test]
+    fn long_windows_past_the_fan_out_cap_run_set_based() {
+        let t0 = at("2026-01-01T06:00:00Z");
+        let week = Some((t0, t0 + chrono::Duration::days(7)));
+        assert_eq!(area_path(week, MAX_AREA_QUERIES + 1, 1), AreaPath::SetBased);
+        assert_eq!(area_path(week, 20_000, 2), AreaPath::SetBased);
+        assert_eq!(area_path(week, 2_501, 8), AreaPath::SetBased);
+        assert_eq!(area_path(None, 1, 1), AreaPath::FanOut);
+        assert_eq!(area_path(None, 30_000, 8), AreaPath::FanOut);
     }
 
     #[test]

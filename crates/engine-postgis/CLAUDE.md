@@ -48,10 +48,11 @@ Derivation rules (hard-won from production timeouts):
   currently-reporting stations. A climate-style collection sets
   `locations_window = "all"` and needs a role `statement_timeout` big
   enough (or a pre-materialized locations table).
-- In modes A/B, position = nearest-by-haversine and area = bbox test,
-  both **in-memory** from the cached location set (polygon area returns its
-  bbox superset, not exact `ST_Within`). The per-request observation fetch
-  (`WHERE station_fk = $1`) is identical in every mode.
+- In modes A/B, position = nearest-by-haversine and area = exact
+  point-in-polygon (#671), both **in-memory** from the cached location set.
+  The per-request observation fetch (`WHERE station_fk = $1`, or
+  `= ANY($1)` on the set-based area path, #1062) is identical in every
+  mode.
 - Scaling for very large tables: pre-materialize a distinct `(id, geom)`
   view and wire it as the `stations` block, and/or raise
   `metadata_refresh_secs`.
@@ -165,11 +166,62 @@ Derivation rules (hard-won from production timeouts):
   `DataServerError::QueryTooLarge` → HTTP 400, never `Engine` (the API
   layer hides that behind an opaque 500 — that misread a too-large polygon
   as a server fault in production).
-- Supporting caps: stations-in-polygon prefilter ceiling `LIMIT 10_001`
-  (bounds the prefilter buffer, not the real gate); `MAX_AREA_QUERIES`
-  20k SQL queries per area request (stations × params for `per_parameter`
-  — the parameter list multiplies DB work); locations
-  `LIMIT max_locations + 1` (above); nearest-station `LIMIT 1`.
+- Supporting caps: stations-in-polygon `MAX_STATIONS_IN_POLYGON` =
+  200 001, one past a 200 000-station ceiling (#1062 raised it from 10 001,
+  which made "every station at 06 UTC" a 400 on a 20 000-station network).
+  It is a memory guard, well above any network: the value budget does not
+  bound per-station memory, because one value a station is still a
+  coverage a station. A request holds about 300 bytes a station before any
+  row (≈ 60 MB at the ceiling) and then a coverage per station with data,
+  of the order of a kilobyte each before serialisation. Fan-out
+  `MAX_AREA_QUERIES` 20k statements (stations × params for `per_parameter`),
+  **fan-out path only**; locations `LIMIT max_locations + 1` (above);
+  nearest-station `LIMIT 1`.
+- **Two area paths (#1062), one result** but for the two edge cases
+  below. `query_area` picks with
+  `area_path`: **set-based** for a `datetime` window of at most
+  `SET_BASED_MAX_WINDOW` (provisional 1 h: an instant, each instant of a
+  `datetime` list, which the API queries one by one) and for a longer
+  window the fan-out could not run (over `MAX_AREA_QUERIES`, so the value
+  budget decides); the **fan-out** otherwise and without `datetime`. The
+  threshold is a window, not stations × steps: both paths pay per station,
+  so what decides is the steps per station, and the engine does not know a
+  collection's cadence. Tune it from the timing table `tests/db.rs` prints.
+  - **Risk of the long-window routing:** a long window over more stations
+    than the fan-out may take used to be the statement-count 400 before
+    any SQL ran. Set-based, it is one `ORDER BY <fk>, <time> LIMIT
+    budget plus one` statement, and its 400 is cheap only when the planner
+    stops at the LIMIT: an ordered scan of the `(<fk>, <time> DESC)` index
+    (`= ANY` on its leading column) under an incremental sort. Without that
+    index, or with a bitmap scan and a full sort, it reads every row in the
+    window and can reach the role's `statement_timeout`, an opaque 500. The
+    timing test prints each path's time to that 400 for a week over 20 000
+    stations, and the statement's `EXPLAIN ANALYZE`.
+  - Set-based (`build_area_set`, `run_area_set`): one statement per
+    observation table (`long`/`wide` one, `per_parameter` one per
+    parameter) with `<fk> = ANY($1)` bound to the station ids (one shared
+    `SqlParam::SharedTextArray`), rows led by `<fk>::text AS mc_station`,
+    `ORDER BY <fk>, <time>`, `LIMIT $N` rewritten to the remaining budget
+    plus one before each statement. Streamed (`query_raw`) and charged per
+    row; the crossing row is the 400. One connection and one
+    `fanout_limiter` permit, so the pool headroom holds across both paths.
+  - The polygon test is unchanged: SQL `ST_Within` in stations-only mode,
+    the cached set in modes A/B; both paths take the same station list,
+    each id once (`distinct_stations`: a stations view without a unique id
+    would otherwise make the fan-out answer a station twice).
+  - Where the paths differ (documented on `run_area_set`): set-based has no
+    per-station row cap (the budget bounds the whole response), so a
+    station over `MAX_OBSERVATION_ROWS` in the window is served there and
+    is the fan-out's 400; and set-based matches rows to stations by
+    `<fk>::text`, so a `citext`-like key whose text spells an id
+    differently from the request drops those rows with a WARN, where the
+    fan-out keeps them.
+  - **One decoder for every path** (`RowDecoder`): the single-station,
+    fan-out and set-based statements select the same columns in the same
+    order (`StationSelect` in `query.rs`), set-based rows offset by one
+    (`first_observation_column`), decoded by position into `StationRows`,
+    coverages assembled in station-list order. Keep it that way: the DB
+    tests pin both paths to identical values in identical order.
 - Observation `LIMIT` is a **bind** (`LIMIT $N`, `SqlParam::Int`,
   `BuiltQuery::{row_limit,set_row_limit}`), not a literal: single-station
   paths (position/location) rewrite it to the remaining budget per query
@@ -206,3 +258,26 @@ Derivation rules (hard-won from production timeouts):
   optional and independently validated. `EventSource::covers` checks full
   containment; absent config returns unknown. Never substitute `extent_bbox`
   or observed strike positions: neither guarantees detection coverage.
+
+## Database tests (`tests/db.rs`, #1062)
+
+- The only tests that run SQL. They read `MC_TEST_POSTGIS_DSN` (a
+  superuser: they create the `postgis`/`timescaledb` extensions and their
+  own `mc1062_*` schemas, dropped first) and skip with a printed line
+  without it, unless `MC_TEST_POSTGIS_REQUIRED=1`, which fails instead.
+  CI's `.github/workflows/postgis-db.yml` runs them against a
+  `timescale/timescaledb-ha:pg17` service container with both set, on PRs
+  touching engine-postgis, its path dependencies (ds-core, ds-poll,
+  ds-cache), api-edr, `Cargo.toml`, `Cargo.lock` or the workflow, and on
+  every main push. `cargo test` elsewhere skips them.
+- They go through the public load path (`PostgisEngineConfig::resolve`,
+  `PoolRegistry`, `PostgisEngine::new`, `refresh_metadata`) and the area
+  query (`query_area_on` forces a path), one shape per test: `long`
+  stations-only, `wide` mode B with a naive-UTC column, `per_parameter`
+  mode A. 20 000 synthetic stations; nulls, missing rows and stations
+  without data in a window are deliberate.
+- The timing test prints both paths by stations × steps on a TimescaleDB
+  hypertable, each path's time to the value-budget 400 for a week over
+  20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It
+  never fails on a number; without TimescaleDB it prints that it skipped.
+  Run with `-- --nocapture --test-threads=1`.

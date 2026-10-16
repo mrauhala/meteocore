@@ -1,0 +1,77 @@
+name: PostGIS DB tests
+
+# engine-postgis queries a real database, which the `Check, Lint & Test` job
+# has none of: there its database tests skip. This workflow runs them against
+# a service container with PostGIS and TimescaleDB (#1062), with
+# `MC_TEST_POSTGIS_REQUIRED=1` so a missing database fails instead of
+# skipping. A separate workflow so the path filters below apply to it alone.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+    # engine-postgis, its path dependencies, the EDR API it serves, and the
+    # manifests and lock file, so a `cargo update` of tokio-postgres or
+    # deadpool runs these tests before it merges.
+    paths:
+      - "crates/engine-postgis/**"
+      - "crates/core/**"
+      - "crates/ds-poll/**"
+      - "crates/ds-cache/**"
+      - "crates/api-edr/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/postgis-db.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  postgis-db:
+    name: PostGIS DB tests
+    runs-on: ubuntu-latest
+    # A cold build plus the tests take minutes; a hung query must not hold
+    # the runner for the 6 h default.
+    timeout-minutes: 30
+
+    services:
+      # PostgreSQL 17 with PostGIS and TimescaleDB preloaded, the stack the
+      # engine is deployed on. Throwaway credentials for a container that
+      # lives as long as this job.
+      postgres:
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      MC_TEST_POSTGIS_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      MC_TEST_POSTGIS_REQUIRED: "1"
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+    # One test at a time: the timing table is meaningful only when nothing
+    # else competes for the database. `--nocapture` prints it in the log.
+    - name: engine-postgis database tests
+      run: cargo test -p engine-postgis --test db -- --nocapture --test-threads=1

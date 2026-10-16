@@ -36,9 +36,10 @@ use crate::source::LocalSource;
 use crate::store::{Ingest, ObsStore, StationInfo};
 use crate::wis2::{WarmupClock, Wis2Source};
 
-/// Stations an `area` query may touch (the postgis convention).
-pub const MAX_STATIONS_IN_POLYGON: usize = 10_001;
-/// Values (stations × parameters × timesteps) one response may carry.
+/// Values (stations × parameters × timesteps) one response may carry. The
+/// only bound on an `area` query's size (#1062): the stations it may touch
+/// are those of the in-memory store, itself bounded by `max_stations`, so a
+/// whole-network instant fits however many stations report.
 pub const MAX_RESPONSE_VALUES: usize = 500_000;
 /// How often the metadata snapshot is rebuilt when the store changed.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
@@ -841,12 +842,6 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
             .filter(|s| polygon.contains(s.lon, s.lat))
             .map(|s| &*s.id)
             .collect();
-        if inside.len() > MAX_STATIONS_IN_POLYGON {
-            return Err(DataServerError::QueryTooLarge(format!(
-                "{} stations inside the polygon (max {MAX_STATIONS_IN_POLYGON}) — narrow the area",
-                inside.len()
-            )));
-        }
         let params = self.selected_params(parameters)?;
         let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         let mut budget = MAX_RESPONSE_VALUES;
@@ -1069,6 +1064,100 @@ mod tests {
         // Entirely outside: no match.
         assert!(!matched(Some(h(9, 1)), None));
         assert!(!matched(None, Some(h(7, 59))));
+    }
+
+    // ---- area: the value budget is the only bound (#1062) ------------------
+
+    /// 20 000 stations on a 200 × 100 grid (in the South Pacific, clear of
+    /// the fixtures), each reporting air temperature and station pressure at
+    /// `times`, in an engine whose `data_path` is an empty directory.
+    fn network(times: &[DateTime<Utc>]) -> (BufrEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufrConfig {
+            data_path: Some(dir.path().to_string_lossy().into_owned()),
+            wis2: None,
+            poll_interval_secs: 60,
+            retention: "P36500D".to_string(),
+            max_stations: 50_000,
+            stale_after: "PT2H".to_string(),
+            position_radius_km: 25.0,
+            builtin_parameters: true,
+            parameters: Vec::new(),
+        };
+        let e = BufrEngine::new(&cfg, "bufr-network").unwrap();
+        {
+            let mut store = e.store.write().unwrap();
+            for n in 0..20_000u32 {
+                for &time in times {
+                    let report = crate::decode::ObsReport {
+                        lon: -170.0 + f64::from(n % 200) * 0.1,
+                        lat: -60.0 + f64::from(n / 200) * 0.1,
+                        elements: vec![
+                            crate::decode::Element {
+                                xy: crate::decode::XY { x: 12, y: 101 },
+                                value: 273.15 + f64::from(n % 30),
+                                period_hours: None,
+                            },
+                            crate::decode::Element {
+                                xy: crate::decode::XY { x: 10, y: 4 },
+                                value: 100_000.0 + f64::from(n % 50),
+                                period_hours: None,
+                            },
+                        ],
+                        ..report(&format!("0-20000-0-{n:05}"), time)
+                    };
+                    assert_ne!(store.ingest(&report, &e.table, time), Ingest::OutOfWindow);
+                }
+            }
+        }
+        e.rebuild_snapshot();
+        (e, dir)
+    }
+
+    const NETWORK_AREA: &str = "POLYGON((-171 -61,-149 -61,-149 -49,-171 -49,-171 -61))";
+
+    /// Every station's value at one instant is a basic observation request:
+    /// past the old 10 001-station ceiling, the 40 000 values fit the budget
+    /// and every station is in the answer.
+    #[test]
+    fn area_instant_over_twenty_thousand_stations_returns_every_station() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 12, 6, 0, 0).unwrap();
+        let (e, _dir) = network(&[t0]);
+        let params = ["air_temperature".to_string(), "pressure".to_string()];
+        let CoverageResponse::Collection(coverages) = e
+            .query_area(NETWORK_AREA, Some((t0, t0)), Some(&params), None, None)
+            .unwrap()
+        else {
+            panic!("an area query answers a collection");
+        };
+        assert_eq!(coverages.len(), 20_000);
+        let mut points = std::collections::HashSet::new();
+        for c in &coverages {
+            let DomainDescription::PointSeries { x, y, t, .. } = &c.domain else {
+                panic!("a station answers a PointSeries");
+            };
+            assert_eq!(t, &vec![t0]);
+            assert_eq!(c.ranges.len(), 2);
+            points.insert((x.to_bits(), y.to_bits()));
+        }
+        assert_eq!(points.len(), 20_000, "every station, each once");
+    }
+
+    /// The same polygon over a week of two reports with every parameter is
+    /// 880 000 values: the 400 names the value budget, not a station count.
+    #[test]
+    fn area_over_the_value_budget_is_a_400_naming_it() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 12, 6, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 9, 12, 7, 0, 0).unwrap();
+        let (e, _dir) = network(&[t0, t1]);
+        assert!(e.table.params.len() * 2 * 20_000 > MAX_RESPONSE_VALUES);
+        let week = (t1 - chrono::Duration::days(7), t1);
+        match e.query_area(NETWORK_AREA, Some(week), None, None, None) {
+            Err(DataServerError::QueryTooLarge(msg)) => {
+                assert!(msg.contains("500000 values"), "message: {msg}");
+            }
+            other => panic!("expected the value budget's QueryTooLarge, got {other:?}"),
+        }
     }
 
     // ---- state snapshots and warm-up (#1002) -----------------------------
