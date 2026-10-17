@@ -112,8 +112,8 @@ pub(crate) async fn get_feature_info(
     // `None`, as for a projected BBOX wholly outside its projection, whose
     // `map.bbox` is NaN (#1089). Otherwise the centre itself is tested:
     // past a pole of a geographic BBOX, or outside a projection's valid
-    // area, checked before the inverse, which is finite but meaningless
-    // past Transverse Mercator's strip.
+    // area, where its inverse has no answer: past the LAEA disk, or past a
+    // pole or 50° from Transverse Mercator's meridian (#1113).
     let position = if map.output_crs.domain_rows(map.bbox, map.height).is_none() {
         None
     } else {

@@ -86,21 +86,14 @@ impl OutputCrs {
     ///
     /// Off the Earth are a geographic point past a pole, and a projected
     /// point outside its projection's valid area
-    /// ([`crate::geo::outside_projection_domain`], #1089). The point is
-    /// tested on its own before the inverse: past the LAEA disk the inverse
-    /// is non-finite, but past the strip Transverse Mercator maps the Earth
-    /// into it is finite and meaningless. Inside that strip, past a pole,
-    /// TM's inverse gives a latitude past 90°, which is off the Earth too.
-    /// Every point of a projected box wholly outside its projection is
-    /// outside. The `Projected` variant ignores `wgs84_bbox`, as
-    /// `project_node` does, so a box with no WGS84 envelope may pass NaN.
+    /// ([`crate::geo::outside_projection_domain`], #1089), where its inverse
+    /// is `None` and `project_node` NaN: past the LAEA disk, and past a pole
+    /// or [`crate::geo::TM_MAX_LON_OFFSET_DEG`] from Transverse Mercator's
+    /// meridian, where its series names no place (#1113). Every point of a
+    /// projected box wholly outside its projection is outside. The
+    /// `Projected` variant ignores `wgs84_bbox`, as `project_node` does, so
+    /// a box with no WGS84 envelope may pass NaN.
     pub fn position_on_earth(&self, wgs84_bbox: [f64; 4], fx: f64, fy: f64) -> Option<(f64, f64)> {
-        if let OutputCrs::Projected { crs, bbox } = self {
-            let (e, n) = projected_point(bbox, fx, fy);
-            if crate::geo::outside_projection_domain(crs, [e, n, e, n]) {
-                return None;
-            }
-        }
         let (lon, lat) = self.project_node(wgs84_bbox, fx, fy);
         (lon.is_finite() && lat.is_finite() && (-90.0..=90.0).contains(&lat)).then_some((lon, lat))
     }
@@ -259,8 +252,8 @@ impl OutputCrs {
     /// Earth, and the answer is `None` (#1089). That test reads the projected
     /// box only, so `wgs84_bbox` may be anything for such a box, which has no
     /// meaningful WGS84 envelope. In a box partly outside, the pixels past
-    /// the LAEA disk are non-finite in [`Self::project_node`] and stay empty;
-    /// those past TM's strip are not, since its inverse is finite there.
+    /// the LAEA disk, and past TM's poles or 50° from its meridian (#1113),
+    /// are non-finite in [`Self::project_node`] and stay empty.
     ///
     /// The box is the request box cut at the outer edges of the first and
     /// last row, so a render of it at `rows.len()` rows samples the full
@@ -1801,7 +1794,7 @@ mod tests {
 
     /// A projected box wholly outside its projection's valid area has no row
     /// inside (#1089): an EPSG:3035 box past the LAEA disk, an EPSG:3067 one
-    /// past the strip TM maps the Earth into, north or south, or so far east
+    /// past a pole, more than 50° from its meridian (#1113), or so far east
     /// that the TM inverse has no finite result. A box reaching into the
     /// area, or enclosing it, keeps every row.
     #[test]
@@ -1816,8 +1809,10 @@ mod tests {
         };
         for (crs, bbox) in [
             (&laea, [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7]),
             (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
             (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
+            (&tm, [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
             (&tm, [1.0e20, 6.5e6, 2.0e20, 7.0e6]),
         ] {
             assert_eq!(
@@ -1833,8 +1828,11 @@ mod tests {
             // Wider than the disk.
             (&laea, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]),
             (&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6]),
-            // Across the TM strip's edge.
-            (&tm, [0.0, 1.9e7, 1.0e6, 2.1e7]),
+            // Across the North Pole, and across 50° east of the meridian.
+            (&tm, [0.0, 9.0e6, 1.0e6, 1.1e7]),
+            (&tm, [1_448_154.7, 7_240_773.4, 2_896_309.4, 8_688_928.1]),
+            // Wider than the TM area.
+            (&tm, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]),
         ] {
             assert_eq!(
                 projected(crs, bbox).domain_rows(wgs84, 64),
@@ -1849,9 +1847,9 @@ mod tests {
 
     /// A point's position is `project_node`'s when the point lies on the
     /// Earth, and `None` past a pole of a geographic box, past the LAEA
-    /// disk, and past the strip Transverse Mercator maps the Earth into or,
-    /// inside it, past a pole (#1064, #1089). A projected output reads its
-    /// own metres, so a NaN WGS84 box does not matter.
+    /// disk, and past a pole or 50° from Transverse Mercator's meridian
+    /// (#1064, #1089, #1113). A projected output reads its own metres, so a
+    /// NaN WGS84 box does not matter.
     #[test]
     fn position_on_earth_is_none_off_the_earth() {
         let laea = projected_output_crs("EPSG:3035").unwrap();
@@ -1881,52 +1879,49 @@ mod tests {
             None
         );
         // Every point of a box wholly outside its projection: past the LAEA
-        // disk, past the TM strip north and south.
+        // disk, past TM's poles, north and south, and past 50° east of its
+        // meridian.
         for (crs, bbox) in [
             (&laea, [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7]),
             (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
             (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
+            (&tm, [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
         ] {
             let out = projected(crs, bbox);
             for (fx, fy) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)] {
                 assert_eq!(out.position_on_earth(nan, fx, fy), None, "{bbox:?}");
             }
         }
-        // A TM box from 85°N across the pole to past the strip: the top
-        // point is past the strip, where the inverse is finite but no
-        // place; the middle is inside the strip past the pole; the bottom
-        // is on the Earth.
+        // A TM box from 81°N across the pole: past it, the top and middle
+        // points name no place, and `project_node` is NaN there as past the
+        // LAEA disk; the bottom is on the Earth.
         let across = projected(&tm, [0.0, 9.0e6, 1.0e6, 2.1e7]);
-        let (lon, lat) = across.project_node(nan, 0.5, 0.0);
-        assert!(
-            lon.is_finite() && lat.is_finite(),
-            "TM's inverse past the strip: {lon}, {lat}"
-        );
-        assert_eq!(across.position_on_earth(nan, 0.5, 0.0), None);
-        assert_eq!(across.position_on_earth(nan, 0.5, 0.5), None);
+        for fy in [0.0, 0.5] {
+            let (lon, lat) = across.project_node(nan, 0.5, fy);
+            assert!(lon.is_nan() && lat.is_nan(), "past the pole: {lon}, {lat}");
+            assert_eq!(across.position_on_earth(nan, 0.5, fy), None);
+        }
         let (_, lat) = across.position_on_earth(nan, 0.5, 1.0).unwrap();
         assert!((80.0..90.0).contains(&lat), "{lat}");
 
-        // Far east of the central meridian, past the strip, the inverse
-        // can land inside ±90°: a place on the Earth the point does not
-        // name. Only the point's own test keeps such a point off the Earth.
-        // The top two rows of this 20 × 4 grid lie past the strip.
-        let far_east = projected(&tm, [1.5e7, 1.9e7, 2.5e7, 2.1e7]);
-        let mut inverse_on_earth = 0;
-        for j in 0..2 {
-            for i in 0..20 {
-                let (fx, fy) = ((f64::from(i) + 0.5) / 20.0, (f64::from(j) + 0.5) / 4.0);
-                let (lon, lat) = far_east.project_node(nan, fx, fy);
-                if lon.is_finite() && (-90.0..=90.0).contains(&lat) {
-                    inverse_on_earth += 1;
-                }
-                assert_eq!(far_east.position_on_earth(nan, fx, fy), None, "({i}, {j})");
-            }
+        // The top row of the #1110 meta-tile, 256 px, runs from 36° to 62°
+        // east of the meridian. Past about 56° the series answered with a
+        // place anywhere, (296.1°, 84.5°) at column 195 with macOS's libm,
+        // and this passed it on (#1113). Now each column is either a place
+        // within 50° or none.
+        let tile = projected(&tm, [1_448_154.7, 7_240_773.4, 2_896_309.4, 8_688_928.1]);
+        let top = |i: u32| tile.position_on_earth(nan, (f64::from(i) + 0.5) / 256.0, 0.5 / 256.0);
+        for i in 0..=100 {
+            let (lon, lat) = top(i).unwrap_or_else(|| panic!("column {i}"));
+            assert!(
+                (36.0..50.0).contains(&(lon - 27.0)) && (72.0..76.0).contains(&lat),
+                "column {i}: {lon}, {lat}"
+            );
         }
-        assert!(
-            inverse_on_earth > 0,
-            "no point past the strip inverse-projects inside ±90°: the point test goes untested"
-        );
+        for i in 107..256 {
+            assert_eq!(top(i), None, "column {i}");
+        }
     }
 
     /// Placing a tile's rows in a taller tile keeps every pixel's value and
@@ -2036,11 +2031,12 @@ mod tests {
         assert!(render([-10.0, 90.0, 10.0, 110.0]).is_none());
         assert!(engine.0.lock().unwrap().is_empty(), "engine called");
         // Nor for a projected box wholly outside its projection (#1089): past
-        // the LAEA disk, or past TM's strip, where the inverse still gives
-        // TM a finite read window.
+        // the LAEA disk, or past TM's pole or 50° from its meridian (#1113).
+        // None of them has a read window.
         for (code, bbox) in [
             ("EPSG:3035", [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
             ("EPSG:3067", [0.0, 2.1e7, 1.0e6, 2.2e7]),
+            ("EPSG:3067", [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
         ] {
             let crs = projected_output_crs(code).unwrap();
             let read = crate::geo::wgs84_envelope(&crs, bbox).unwrap_or([0.0; 4]);
