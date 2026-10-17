@@ -5,7 +5,7 @@
 //! revalidation could never match. The other endpoints hash the body as-is.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
@@ -86,6 +86,47 @@ impl FeatureEngine for MockFeatureEngine {
     }
 }
 
+/// Vertices of each [`dense_areas`] ring, the closing one excluded.
+const AREA_VERTICES: usize = 2_000;
+
+/// A page of 100 polygons at full resolution, about 8 MB of GeoJSON: the
+/// shape of a municipality-boundary collection (#1135).
+fn dense_areas() -> Vec<Feature> {
+    (0..100)
+        .map(|i| {
+            let (lon, lat) = (20.0 + (i % 10) as f64, 60.0 + (i / 10) as f64);
+            let mut exterior: Vec<[f64; 2]> = (0..AREA_VERTICES)
+                .map(|k| {
+                    let a = std::f64::consts::TAU * k as f64 / AREA_VERTICES as f64;
+                    [lon + 0.3 * a.cos(), lat + 0.2 * a.sin()]
+                })
+                .collect();
+            exterior.push(exterior[0]);
+            Feature {
+                id: format!("area-{i}"),
+                geometry: Geometry::Polygon {
+                    exterior,
+                    holes: Vec::new(),
+                }
+                .into(),
+                properties: HashMap::from([(
+                    "name".to_string(),
+                    PropertyValue::String(format!("Area {i}")),
+                )])
+                .into(),
+            }
+        })
+        .collect()
+}
+
+/// The `areas` engine, built once: every request in this file builds a
+/// router, and most never ask for `areas`.
+static AREAS: LazyLock<Arc<dyn FeatureEngine>> = LazyLock::new(|| {
+    Arc::new(MockFeatureEngine {
+        features: dense_areas(),
+    })
+});
+
 fn build_router() -> axum::Router {
     let engine: Arc<dyn FeatureEngine> = Arc::new(MockFeatureEngine::new());
     let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
@@ -118,6 +159,11 @@ fn build_router() -> axum::Router {
             derive_wind: None,
         },
     );
+    engines.insert("areas".to_string(), Arc::clone(&AREAS));
+    let mut areas = collections["cities"].clone();
+    areas.id = "areas".to_string();
+    areas.title = "Areas".to_string();
+    collections.insert("areas".to_string(), areas);
     api_features::router(Arc::new(ArcSwap::from_pointee(FeaturesState {
         engines,
         collections,
@@ -290,4 +336,83 @@ async fn feature_representations_have_distinct_stable_etags_and_vary() {
         header_str(&html, header::CACHE_CONTROL),
         Some(ds_core::http_cache::CACHE_CONTROL_SETTLED)
     );
+}
+
+async fn body_text(resp: axum::response::Response) -> String {
+    String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// The listing's map draws simplified shapes within a vertex budget, so a
+/// page of large polygons stays small (#1135). The page is rendered once:
+/// its ETag is the hash of that render with the generation time blank, and
+/// an identical request revalidates.
+#[tokio::test]
+async fn items_html_of_large_polygons_stays_within_a_byte_budget() {
+    let uri = "/collections/areas/items?f=html&limit=100";
+    let first = get_response(uri, None).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = header_str(&first, header::ETAG).unwrap().to_owned();
+    let html = body_text(first).await;
+    // Full resolution embedded about 8 MB of map data here.
+    assert!(html.len() < 400_000, "{} bytes", html.len());
+    let map_data = html
+        .split_once("<div id=\"map-data\" hidden>")
+        .and_then(|(_, rest)| rest.split_once("</div>"))
+        .map(|(data, _)| data)
+        .unwrap();
+    assert!(
+        map_data.len() < 64_000,
+        "{} bytes of map data",
+        map_data.len()
+    );
+    let map: Value = serde_json::from_str(
+        &map_data
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+    .unwrap();
+    let drawn = map["features"].as_array().unwrap();
+    assert_eq!(drawn.len(), 100, "every feature of the page is drawn");
+    for feature in drawn {
+        let ring = feature["geometry"]["coordinates"][0].as_array().unwrap();
+        assert_eq!(feature["geometry"]["type"], "Polygon");
+        assert!((4..100).contains(&ring.len()), "{} positions", ring.len());
+        assert_eq!(ring.first(), ring.last());
+    }
+
+    let (head, rest) = html.split_once("<time>").unwrap();
+    let (stamp, tail) = rest.split_once("</time>").unwrap();
+    assert!(!stamp.is_empty(), "the page states its generation time");
+    let blank = format!("{head}<time></time>{tail}");
+    assert_eq!(etag, ds_core::http_cache::etag_of(blank.as_bytes()));
+
+    let second = get_response(uri, None).await;
+    assert_eq!(header_str(&second, header::ETAG), Some(etag.as_str()));
+    let revalidated = get_response(uri, Some(&etag)).await;
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+}
+
+/// Only the HTML map is simplified: GeoJSON keeps every vertex.
+#[tokio::test]
+async fn items_geojson_keeps_every_vertex_of_large_polygons() {
+    let resp = get_response("/collections/areas/items?f=json&limit=100", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc: Value = serde_json::from_str(&body_text(resp).await).unwrap();
+    let features = doc["features"].as_array().unwrap();
+    assert_eq!(features.len(), 100);
+    for feature in features {
+        let ring = feature["geometry"]["coordinates"][0].as_array().unwrap();
+        assert_eq!(ring.len(), AREA_VERTICES + 1);
+    }
 }

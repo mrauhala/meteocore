@@ -2762,4 +2762,6 @@ a {
 /* Progressive enhancement must preserve the label/control flex layout. */
 .js .per-page.enhanced{display:flex!important;align-items:center;gap:12px;flex:0 0 auto;white-space:nowrap;margin:0}
 .per-page select{width:auto;min-width:5.5rem;flex:0 0 auto;margin:0}
-@media(max-width:1100px){.items-page .item-layout{grid-template-columns:minmax(0,1fr)}}
+/* One column: the map, full width and short, before the table (#1135).
+   Without a map the "No geometry available" note stays after the results. */
+@media(max-width:1100px){.items-page .item-layout{grid-template-columns:minmax(0,1fr)}.items-page .item-layout>aside{display:flex}.items-page .item-layout>aside:has(#feature-map){order:-1}.items-page .item-layout #feature-map{height:240px}}

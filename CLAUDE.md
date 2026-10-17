@@ -780,6 +780,11 @@ one never implies the other.
   ranking and any narrative cannot drift) and `DEFAULT_CELL_WEIGHTS`. Built
   once per generation; read by feature properties, ranking, narratives and
   the #541 V2.4 model feature row.
+- **`ds_core::simplify`** — the one Douglas–Peucker implementation, for
+  closed rings and open lines, iterative so no input can deepen a worker's
+  stack; the tolerance is in the caller's metric plane. Storm-cell
+  footprints and the Features items map preview (#1135) use it; ds-mvt and
+  any other simplifier should too, rather than add a `geo` dependency.
 - **`ds_render::rasterize::fill_polygon`** — the shared vector→raster fill
   primitive (#397), fed by `ds_core::geo::geometry_to_pixels` (vertices
   projected via `OutputCrs::world_to_fraction`, never per pixel). Vector

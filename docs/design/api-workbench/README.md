@@ -240,7 +240,8 @@ disclosure states survive submission. Primary query controls align at 46 px.
 The listing has no per-feature raw-geometry disclosures. Following layout review,
 the result table grows to the requested limit and scrolls with the document;
 it has no height cap or separate vertical scrolling. On wide screens the map
-sits to the right, as on item details. On narrow screens it follows the table.
+sits to the right, as on item details. Below 1100 px it comes before the table,
+240 px tall (#1135).
 Page-size labels and controls share an explicit flex row with a 12 px gap in
 both catalogs and item lists.
 
@@ -250,7 +251,8 @@ Screenshots: [items desktop](screenshots/items-light.png),
 
 Layout follow-up verification: the 1,000-row table's client height equals its
 scroll height on both desktop and 390 px mobile, confirming no internal vertical
-scroll area. The map lies to the right on desktop and below results on mobile.
+scroll area. The map lay to the right on desktop and below results on mobile;
+#1135 has since moved it above the results below 1100 px.
 Page-size label/select gaps measure 12 px in both item controls and the catalog;
 mobile pages have no horizontal document overflow. All 654 API tests, seven
 cross-API contracts, clippy, formatting and HTTP smoke checks passed again.

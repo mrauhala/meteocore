@@ -2,6 +2,7 @@ pub mod caching;
 pub mod crs;
 pub mod handlers;
 mod html;
+mod map_preview;
 pub mod params;
 pub mod response;
 pub mod shared;
