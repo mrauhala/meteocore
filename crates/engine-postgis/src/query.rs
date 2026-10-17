@@ -229,6 +229,8 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let table = fq_table(&s.table)?;
 
     let mut props = String::new();
@@ -241,8 +243,7 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
     sql.push_str(&format!(
         "{id}::text AS id, \
          {label} AS label, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon{props} \
+         {coordinates}{props}, {geometry_check} AS mc_geometry_valid \
          FROM {table}"
     ));
     // SAFETY: `where_clause` is inlined verbatim — it CANNOT be
@@ -370,14 +371,15 @@ fn obs_locations_query(
     let table_fq = fq_table(table)?;
     let fk = quote_ident(station_fk_col)?;
     let geom = quote_ident(geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let mut params: Vec<SqlParam> = Vec::new();
     // SELECT kept in a plain literal; the format! templates below interpolate
     // only already-quoted identifiers and contain no flagged SQL verb.
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "DISTINCT ON ({fk}) {fk}::text AS id, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon \
+         {coordinates}, {geometry_check} AS mc_geometry_valid \
          FROM {table_fq} \
          WHERE {geom} IS NOT NULL"
     ));
@@ -415,6 +417,8 @@ pub fn build_position(
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let table = fq_table(&s.table)?;
 
     let mut props = String::new();
@@ -427,9 +431,8 @@ pub fn build_position(
     sql.push_str(&format!(
         "{id}::text AS id, \
          {label} AS label, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon{props}, \
-         ST_Distance({geom}::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS dist_m \
+         {coordinates}{props}, \
+         ST_Distance({geom}::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS dist_m, {geometry_check} AS mc_geometry_valid \
          FROM {table}"
     ));
     sql.push_str(&format!(
@@ -475,6 +478,8 @@ pub fn build_stations_in_polygon(
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let table = fq_table(&s.table)?;
 
     let mut props = String::new();
@@ -487,8 +492,7 @@ pub fn build_stations_in_polygon(
     sql.push_str(&format!(
         "{id}::text AS id, \
          {label} AS label, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon{props} \
+         {coordinates}{props}, {geometry_check} AS mc_geometry_valid \
          FROM {table} \
          WHERE {geom} && ST_GeomFromText($1, 4326) \
          AND ST_Within({geom}, ST_GeomFromText($1, 4326))"
@@ -676,11 +680,13 @@ pub fn build_events_area(
     let table = fq_table(&shape.table)?;
     let time_col = quote_ident(&shape.time_col)?;
     let geom = quote_ident(&shape.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let id = quote_ident(&shape.id_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
 
-    let mut projection = format!("{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat");
+    let mut projection = format!("{time_select} AS time, {coordinates}");
     for key in source_keys {
         // source_key == column name == row alias (identifier-validated at
         // config load and at engine resolve).
@@ -688,6 +694,7 @@ pub fn build_events_area(
         projection.push_str(&format!(", {col}::double precision AS {col}"));
     }
 
+    projection.push_str(&format!(", {geometry_check} AS mc_geometry_valid"));
     let rhs_lo = time_filter_rhs("$1", tz);
     let rhs_hi = time_filter_rhs("$2", tz);
     let mut sql = String::from("SELECT ");
@@ -737,6 +744,8 @@ pub fn build_events_window(
     let table = fq_table(&shape.table)?;
     let time_col = quote_ident(&shape.time_col)?;
     let geom = quote_ident(&shape.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let id = quote_ident(&shape.id_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
@@ -768,7 +777,7 @@ pub fn build_events_window(
     }
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
-        "{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat{attr_cols} \
+        "{time_select} AS time, {coordinates}{attr_cols}, {geometry_check} AS mc_geometry_valid \
          FROM {table} \
          WHERE {time_col} > {rhs_lo} AND {time_col} <= {rhs_hi} \
          ORDER BY {time_col} DESC, {id} LIMIT $3"
@@ -1851,8 +1860,8 @@ mod tests {
 
         // Projection: timestamptz time + coords + one cast column per key.
         assert!(q.sql.contains("(\"time\" AT TIME ZONE 'UTC') AS time"));
-        assert!(q.sql.contains("ST_X(\"the_geom\") AS lon"));
-        assert!(q.sql.contains("ST_Y(\"the_geom\") AS lat"));
+        assert!(q.sql.contains("ST_X(\"the_geom\") END AS lon"));
+        assert!(q.sql.contains("ST_Y(\"the_geom\") END AS lat"));
         assert!(q
             .sql
             .contains("\"peak_current\"::double precision AS \"peak_current\""));
@@ -1967,7 +1976,7 @@ mod tests {
         .unwrap();
         assert!(!q.sql.contains("cloud_indicator"));
         assert!(!q.sql.contains("peak_current"));
-        assert!(q.sql.contains("ST_X(\"the_geom\") AS lon"));
+        assert!(q.sql.contains("ST_X(\"the_geom\") END AS lon"));
     }
 
     #[test]

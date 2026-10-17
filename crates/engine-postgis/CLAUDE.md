@@ -82,6 +82,25 @@ Derivation rules (hard-won from production timeouts):
   each load so rebuilt collections on the same DSN join them — DSN sharing
   is a standing invariant, not load-time-only.
 
+## Database schema validation
+
+`validation.rs` checks every resolved timestamp and used geometry mapping on
+initial/periodic metadata refresh, using a dedicated connection and a five-second
+collection deadline. Preserve stricter role statement timeouts. Timestamp types
+and `time_col_tz` must agree; PostgreSQL validates zone names. Never require a UTC
+session. Catalog typmods reject known incompatible geometry; generic views use a
+128-row sample (limit before filtering) and a boolean appended LAST to every
+geometry-producing query. Check that boolean before using coordinates, including
+EDR, metadata, EventSource and map-cache fill paths. No request-time catalogs.
+
+The engine's pending/valid/invalid schema state is separate from ping reachability.
+Only successful validation AND metadata publication permits live DB queries;
+confirmed mismatches also block cached location/feature access. Initial empty
+config-seeded metadata remains available. Ping success retries pending/invalid
+validation but cannot itself clear it. Transient failures preserve previously
+validated snapshots. Keep server live-health mapping and database recovery tests
+in step when changing this lifecycle.
+
 ## Station-list cap (`[postgis] max_locations`, #1061)
 
 - One cap for every station shape: default

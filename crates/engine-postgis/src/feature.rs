@@ -31,6 +31,7 @@ impl FeatureEngine for PostgisEngine {
     }
 
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        self.reject_invalid_schema()?;
         let meta = self.cache().load();
         let filtered: Vec<&FeatureStation> = meta
             .feature_stations
@@ -68,6 +69,7 @@ impl FeatureEngine for PostgisEngine {
     }
 
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        self.reject_invalid_schema()?;
         let meta = self.cache().load();
         let i = *meta
             .station_idx
