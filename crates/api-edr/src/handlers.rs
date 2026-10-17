@@ -909,13 +909,16 @@ const QUERY_ERRORS: &[u16] = &[400, 404, 503, 504];
 const ROUTER_RESPONSES: [u16; 2] = [304, 500];
 
 /// The OpenAPI response of an error `status`: `description` and the body
-/// every JSON error carries, the `exception` schema. A 400 may also be the
-/// framework's text/plain message for a path it cannot decode (see
+/// every JSON error carries, the `exception` schema. A request that asked
+/// for HTML (`f=html`, or a browser's `Accept`) gets the error as an HTML
+/// page with the same status (#1132). A 400 may also be the framework's
+/// text/plain message for a path it cannot decode (see
 /// [`SHARED_RESPONSES`]); a query string that does not parse is the JSON
 /// 400 of `api_common::JsonQuery` (#1121).
 pub(crate) fn error_response(status: u16, description: &str) -> serde_json::Value {
     let mut content = json!({
-        "application/json": {"schema": {"$ref": "#/components/schemas/exception"}}
+        "application/json": {"schema": {"$ref": "#/components/schemas/exception"}},
+        "text/html": {"schema": {"type": "string"}}
     });
     if status == 400 {
         content["text/plain"] = json!({"schema": {"type": "string"}});

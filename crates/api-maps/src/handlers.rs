@@ -568,6 +568,7 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
+        api_common::errors::declare_json_only(&mut collection_paths[&styles_path]);
 
         // GET {mount}/collections/{id}/styles/{styleId}/map
         let styled_map_path = format!("{m}/collections/{id}/styles/{{styleId}}/map");

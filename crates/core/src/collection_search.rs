@@ -38,12 +38,37 @@ const ACCEPTED_BBOX_CRS: &[&str] = &[
 
 /// A bad `/collections` query parameter. The API crates map this to HTTP 400.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{0}")]
-pub struct SearchError(pub String);
+#[error("{message}")]
+pub struct SearchError {
+    message: String,
+    parameter: Option<String>,
+}
 
 impl SearchError {
     fn new(msg: impl Into<String>) -> Self {
-        SearchError(msg.into())
+        SearchError {
+            message: msg.into(),
+            parameter: None,
+        }
+    }
+
+    /// An error about the query parameter `name`.
+    fn at(name: &str, msg: impl Into<String>) -> Self {
+        SearchError {
+            message: msg.into(),
+            parameter: Some(name.to_owned()),
+        }
+    }
+
+    /// The query parameter at fault, as the request named it: an HTML
+    /// catalog marks that field (#1132). `None` when no single one is.
+    pub fn parameter(&self) -> Option<&str> {
+        self.parameter.as_deref()
+    }
+
+    fn naming(mut self, name: &str) -> Self {
+        self.parameter = Some(name.to_owned());
+        self
     }
 }
 
@@ -117,7 +142,8 @@ pub fn parse_search_params(
             .iter()
             .any(|c| c.eq_ignore_ascii_case(crs))
         {
-            return Err(SearchError::new(
+            return Err(SearchError::at(
+                CollectionParameter::BboxCrs.name(),
                 "Only CRS84 is supported for bbox-crs (e.g. \
                  http://www.opengis.net/def/crs/OGC/1.3/CRS84)",
             ));
@@ -125,18 +151,25 @@ pub fn parse_search_params(
     }
 
     let bbox = match bbox.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => Some(parse_bbox(s)?),
+        Some(s) => Some(parse_bbox(s).map_err(|e| e.naming(CollectionParameter::Bbox.name()))?),
         None => None,
     };
 
     let datetime = match datetime.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => {
-            let (start, end) = parse_datetime_interval(s)
-                .map_err(|e| SearchError::new(format!("Invalid datetime: {e}")))?;
+            let (start, end) = parse_datetime_interval(s).map_err(|e| {
+                SearchError::at(
+                    CollectionParameter::Datetime.name(),
+                    format!("Invalid datetime: {e}"),
+                )
+            })?;
             // An inverted interval (end before start) would silently exclude
             // every overlapping collection; reject it as a 400.
             if start > end {
-                return Err(SearchError::new("datetime: start must be <= end"));
+                return Err(SearchError::at(
+                    CollectionParameter::Datetime.name(),
+                    "datetime: start must be <= end",
+                ));
             }
             Some((start, end))
         }
@@ -155,10 +188,16 @@ pub fn parse_search_params(
     let limit = match limit.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => {
             let n: usize = s.parse().map_err(|_| {
-                SearchError::new(format!("Invalid limit: '{s}' is not a positive integer"))
+                SearchError::at(
+                    CollectionParameter::Limit.name(),
+                    format!("Invalid limit: '{s}' is not a positive integer"),
+                )
             })?;
             if n < 1 {
-                return Err(SearchError::new("limit must be >= 1"));
+                return Err(SearchError::at(
+                    CollectionParameter::Limit.name(),
+                    "limit must be >= 1",
+                ));
             }
             n.min(MAX_LIMIT)
         }
@@ -167,9 +206,10 @@ pub fn parse_search_params(
 
     let offset = match offset.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => s.parse().map_err(|_| {
-            SearchError::new(format!(
-                "Invalid offset: '{s}' is not a non-negative integer"
-            ))
+            SearchError::at(
+                CollectionParameter::Offset.name(),
+                format!("Invalid offset: '{s}' is not a non-negative integer"),
+            )
         })?,
         None => 0,
     };
@@ -491,14 +531,17 @@ impl SearchQueryParams {
                 .iter()
                 .find(|p| p.name() == name)
                 .ok_or_else(|| {
-                    SearchError::new(format!(
-                        "Unknown collection query parameter '{name}'; supported: {}",
-                        CollectionParameter::ALL
-                            .iter()
-                            .map(|p| p.name())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
+                    SearchError::at(
+                        &name,
+                        format!(
+                            "Unknown collection query parameter '{name}'; supported: {}",
+                            CollectionParameter::ALL
+                                .iter()
+                                .map(|p| p.name())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
                 })?;
             let slot = match parameter {
                 CollectionParameter::Bbox => &mut params.bbox,
@@ -511,9 +554,10 @@ impl SearchQueryParams {
                 CollectionParameter::Format => &mut params.f,
             };
             if slot.replace(value).is_some() {
-                return Err(SearchError::new(format!(
-                    "Duplicate collection query parameter '{name}'"
-                )));
+                return Err(SearchError::at(
+                    &name,
+                    format!("Duplicate collection query parameter '{name}'"),
+                ));
             }
         }
         Ok(params)
@@ -530,7 +574,8 @@ impl SearchQueryParams {
             self.offset.as_deref(),
         )?;
         if let Some(query) = &self.query {
-            params.query = parse_query(query)?;
+            params.query =
+                parse_query(query).map_err(|e| e.naming(CollectionParameter::Query.name()))?;
         }
         Ok(params)
     }
@@ -896,6 +941,57 @@ mod tests {
             parse_search_params(Some("0,0,1,1"), Some("EPSG:3857"), None, None, None, None)
                 .is_err()
         );
+    }
+
+    /// Each rejection names the parameter at fault, which an HTML catalog
+    /// marks (#1132), and keeps its message.
+    #[test]
+    fn rejections_name_the_parameter_at_fault() {
+        let fault = |pairs: &[(&str, &str)]| {
+            let pairs = pairs
+                .iter()
+                .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            let error = SearchQueryParams::from_pairs(pairs)
+                .and_then(|query| query.parse())
+                .unwrap_err();
+            (error.parameter().map(str::to_owned), error.to_string())
+        };
+        for (pairs, parameter, message) in [
+            (
+                &[("bbox", "1,2,3")][..],
+                "bbox",
+                "bbox must have 4 or 6 numbers",
+            ),
+            (
+                &[("datetime", "yesterday")],
+                "datetime",
+                "Invalid datetime: ",
+            ),
+            (
+                &[("datetime", "2026-01-02T00:00:00Z/2026-01-01T00:00:00Z")],
+                "datetime",
+                "datetime: start must be <= end",
+            ),
+            (&[("bbox-crs", "EPSG:3857")], "bbox-crs", "Only CRS84"),
+            (&[("limit", "0")], "limit", "limit must be >= 1"),
+            (&[("offset", "x")], "offset", "Invalid offset: 'x'"),
+            (&[("query", "+")], "query", "query: '+' and '-'"),
+            (
+                &[("q", "a"), ("q", "b")],
+                "q",
+                "Duplicate collection query parameter 'q'",
+            ),
+            (
+                &[("nope", "1")],
+                "nope",
+                "Unknown collection query parameter 'nope'",
+            ),
+        ] {
+            let (got, text) = fault(pairs);
+            assert_eq!(got.as_deref(), Some(parameter), "{pairs:?}");
+            assert!(text.starts_with(message), "{pairs:?}: {text}");
+        }
     }
 
     #[test]

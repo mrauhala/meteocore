@@ -19,6 +19,23 @@ pub struct ItemsQueryParams {
     pub property_filters: Vec<(String, String)>,
 }
 
+/// A rejected `/items` query parameter: the name the request gave it, which
+/// the HTML data request form marks (#1132), and the 400's reason.
+#[derive(Debug)]
+pub struct ParameterError {
+    pub parameter: String,
+    pub error: DataServerError,
+}
+
+impl ParameterError {
+    fn new(parameter: &str, message: String) -> Self {
+        Self {
+            parameter: parameter.to_owned(),
+            error: DataServerError::InvalidParameter(message),
+        }
+    }
+}
+
 /// Reserved API controls cannot be shadowed by source property names.
 pub fn is_reserved_parameter(name: &str) -> bool {
     matches!(
@@ -41,14 +58,15 @@ pub fn is_reserved_parameter(name: &str) -> bool {
 impl ItemsQueryParams {
     /// Axum decodes the form into pairs first so repeated property predicates
     /// survive. Repeating a control parameter is ambiguous and rejected.
-    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, DataServerError> {
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, ParameterError> {
         let mut params = Self::default();
         let mut seen = std::collections::HashSet::new();
         for (name, value) in pairs {
             if is_reserved_parameter(&name) && !seen.insert(name.clone()) {
-                return Err(DataServerError::InvalidParameter(format!(
-                    "duplicate parameter '{name}'"
-                )));
+                return Err(ParameterError::new(
+                    &name,
+                    format!("duplicate parameter '{name}'"),
+                ));
             }
             match name.as_str() {
                 "f" => params.f = Some(value),
@@ -59,9 +77,7 @@ impl ItemsQueryParams {
                 "bbox-crs" => params.bbox_crs = Some(value),
                 "limit" | "offset" => {
                     let n = value.parse().map_err(|_| {
-                        DataServerError::InvalidParameter(format!(
-                            "{name} must be a non-negative integer"
-                        ))
+                        ParameterError::new(&name, format!("{name} must be a non-negative integer"))
                     })?;
                     if name == "limit" {
                         params.limit = Some(n);
@@ -78,7 +94,7 @@ impl ItemsQueryParams {
     pub fn validate_filters(
         &self,
         names: &std::collections::BTreeSet<String>,
-    ) -> Result<(), DataServerError> {
+    ) -> Result<(), ParameterError> {
         for (name, _) in &self.property_filters {
             if is_reserved_parameter(name) || !names.contains(name) {
                 let valid = names
@@ -87,10 +103,13 @@ impl ItemsQueryParams {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Err(DataServerError::InvalidParameter(format!(
-                    "unsupported parameter '{name}' (valid property filters: {})",
-                    if valid.is_empty() { "none" } else { &valid }
-                )));
+                return Err(ParameterError::new(
+                    name,
+                    format!(
+                        "unsupported parameter '{name}' (valid property filters: {})",
+                        if valid.is_empty() { "none" } else { &valid }
+                    ),
+                ));
             }
         }
         Ok(())
@@ -107,22 +126,26 @@ pub struct ItemQueryParams {
 
 impl ItemQueryParams {
     /// Any other parameter is an `InvalidParameter` naming it (#681).
-    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, DataServerError> {
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, ParameterError> {
         let mut params = Self::default();
         for (name, value) in pairs {
             let slot = match name.as_str() {
                 "f" => &mut params.f,
                 "crs" => &mut params.crs,
                 _ => {
-                    return Err(DataServerError::InvalidParameter(format!(
-                        "unsupported parameter '{name}' on a single feature; only 'f' and 'crs' are accepted"
-                    )))
+                    return Err(ParameterError::new(
+                        &name,
+                        format!(
+                            "unsupported parameter '{name}' on a single feature; only 'f' and 'crs' are accepted"
+                        ),
+                    ))
                 }
             };
             if slot.replace(value).is_some() {
-                return Err(DataServerError::InvalidParameter(format!(
-                    "duplicate parameter '{name}'"
-                )));
+                return Err(ParameterError::new(
+                    &name,
+                    format!("duplicate parameter '{name}'"),
+                ));
             }
         }
         Ok(params)

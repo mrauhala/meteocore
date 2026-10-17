@@ -646,6 +646,176 @@ async fn unsupported_duplicate_and_invalid_parameters_return_structured_400() {
     }
 }
 
+/// A request that asked for HTML, with `f=html` or a browser's `Accept`,
+/// gets each error as a page with the same status on every API; any other
+/// request gets the JSON body (#1132).
+#[tokio::test]
+async fn html_requests_get_errors_as_pages_on_every_surface() {
+    let media = |headers: &HeaderMap| headers[header::CONTENT_TYPE].to_str().unwrap().to_owned();
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let catalog = format!("href=\"https://example.test{prefix}/collections?f=html\"");
+        // 400: the catalog form again, holding the value, the field marked.
+        for (url, accept) in [
+            (
+                format!("{prefix}/collections?datetime=yesterday&f=html"),
+                None,
+            ),
+            (
+                format!("{prefix}/collections?datetime=yesterday"),
+                Some("text/html,*/*;q=0.8"),
+            ),
+        ] {
+            let (status, headers, html) = get(&app, &url, accept).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {url}");
+            assert!(media(&headers).starts_with("text/html"), "{surface} {url}");
+            assert!(
+                html.contains("aria-errormessage=\"datetime-error\""),
+                "{surface}: {html}"
+            );
+            assert!(html.contains("value=\"yesterday\""), "{surface}");
+        }
+        // The same 400 without `f` or a browser's Accept: the JSON body.
+        let url = format!("{prefix}/collections?datetime=yesterday");
+        for accept in [None, Some("application/json")] {
+            let (status, headers, body) = get(&app, &url, accept).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {accept:?}");
+            assert!(
+                media(&headers).starts_with("application/json"),
+                "{surface} {accept:?}"
+            );
+            let error: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(error["code"], "BadRequest", "{surface}");
+        }
+        // A bad `f` is no HTML request: the JSON 400 names the first fault
+        // in the order it always has, the parameters before the format.
+        let (status, _, body) =
+            get(&app, &format!("{prefix}/collections?f=xml&typo=1"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{surface}");
+        assert!(body.contains("'typo'"), "{surface}: {body}");
+        // 404: a page with a way back to the catalog, for `f=html` and for
+        // a browser's Accept with no `f`; JSON otherwise.
+        let url = format!("{prefix}/collections/nope");
+        for (url, accept) in [
+            (format!("{url}?f=html"), None),
+            (
+                url.clone(),
+                Some("text/html,application/xhtml+xml,*/*;q=0.8"),
+            ),
+        ] {
+            let (status, headers, html) = get(&app, &url, accept).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{surface} {accept:?}");
+            assert!(
+                media(&headers).starts_with("text/html"),
+                "{surface} {accept:?}"
+            );
+            assert!(html.contains("HTTP 404"), "{surface}");
+            assert!(html.contains(&catalog), "{surface}: {html}");
+        }
+        let (status, headers, body) = get(&app, &url, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{surface}");
+        assert!(media(&headers).starts_with("application/json"), "{surface}");
+        let error: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["code"], "NotFound", "{surface}");
+    }
+
+    // Features items: the data request form again, the field marked; a
+    // feature that is not there links back to its collection.
+    for surface in ["features", "shared"] {
+        let (app, prefix) = app(surface);
+        let items = format!("{prefix}/collections/c-match/items");
+        let (status, headers, html) = get(&app, &format!("{items}?bbox=1,2,3&f=html"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{surface}");
+        assert!(media(&headers).starts_with("text/html"));
+        assert!(
+            html.contains("aria-errormessage=\"bbox-error\""),
+            "{surface}: {html}"
+        );
+        assert!(html.contains("value=\"1,2,3\""), "{surface}");
+        assert!(html.contains("This request could not run."), "{surface}");
+        // No response to date or page.
+        assert!(!html.contains("Response generated"), "{surface}");
+        assert!(!html.contains("Next page"), "{surface}");
+        let (status, headers, _) = get(&app, &format!("{items}?bbox=1,2,3"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(media(&headers).starts_with("application/json"));
+        // A bad `f` with a bad parameter: that parameter's JSON 400 first.
+        for url in [
+            format!("{items}?f=xml&limit=x"),
+            format!("{items}/missing?f=xml&typo=1"),
+        ] {
+            let (status, headers, body) = get(&app, &url, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {url}");
+            assert!(media(&headers).starts_with("application/json"));
+            assert!(!body.contains("xml"), "{surface} {url}: {body}");
+        }
+        let (status, _, html) = get(&app, &format!("{items}/missing?f=html"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{surface}");
+        assert!(
+            html.contains(&format!(
+                "href=\"https://example.test{prefix}/collections/c-match?f=html\">← Back to c-match"
+            )),
+            "{surface}: {html}"
+        );
+    }
+
+    // Resources served only as JSON answer `f=html` with the 400 naming
+    // JSON, as the legend does, and serve JSON to everyone else. Their
+    // OpenAPI declares that `f` and that 400.
+    let tms = "/tileMatrixSets/{tileMatrixSetId}";
+    for (surface, path, template) in [
+        ("tiles", "/tileMatrixSets", None),
+        ("tiles", "/collections/c-match/tiles", None),
+        (
+            "tiles",
+            "/collections/c-match/tiles/WebMercatorQuad",
+            Some("/collections/c-match/tiles/{tileMatrixSetId}"),
+        ),
+        ("vector-tiles", "/tileMatrixSets/WebMercatorQuad", Some(tms)),
+        ("maps", "/collections/c-match/styles", None),
+        ("shared", "/tileMatrixSets", None),
+        ("shared", "/tileMatrixSets/WebMercatorQuad", Some(tms)),
+        ("shared", "/collections/c-match/styles", None),
+        ("shared", "/collections/c-match/map/tiles", None),
+        (
+            "shared",
+            "/collections/c-match/map/tiles/WebMercatorQuad",
+            Some("/collections/c-match/map/tiles/{tileMatrixSetId}"),
+        ),
+    ] {
+        let (app, prefix) = app(surface);
+        let api = get_json(&app, &format!("{prefix}/api")).await;
+        let key = format!(
+            "{}{}",
+            prefix.strip_prefix("/base").unwrap(),
+            template.unwrap_or(path)
+        );
+        let operation = &api["paths"][&key]["get"];
+        let f = operation["parameters"]
+            .as_array()
+            .and_then(|parameters| parameters.iter().find(|p| p["name"] == "f"));
+        assert_eq!(
+            f.map(|f| f["schema"]["enum"].clone()),
+            Some(json!(["json", "application/json"])),
+            "{surface} {key}"
+        );
+        let rejected = &operation["responses"]["400"]["content"];
+        assert!(rejected["application/json"].is_object(), "{surface} {key}");
+        assert!(rejected["text/html"].is_object(), "{surface} {key}");
+        let url = format!("{prefix}{path}");
+        let (status, headers, html) = get(&app, &format!("{url}?f=html"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {path}: {html}");
+        assert!(media(&headers).starts_with("text/html"), "{surface} {path}");
+        assert!(html.contains("Supported: json"), "{surface} {path}: {html}");
+        let (status, headers, body) = get(&app, &url, Some("text/html")).await;
+        assert_eq!(status, StatusCode::OK, "{surface} {path}: {body}");
+        assert!(
+            media(&headers).starts_with("application/json"),
+            "{surface} {path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn accept_negotiated_html_has_explicit_format_navigation() {
     for surface in SURFACES {

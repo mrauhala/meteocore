@@ -1,6 +1,7 @@
 pub mod caching;
 pub(crate) mod csv;
 mod datetime_list;
+mod error_pages;
 mod executor;
 pub(crate) mod geojson;
 pub mod handlers;
@@ -17,7 +18,7 @@ use axum::Router;
 use handlers::AppState;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(handlers::landing_page))
         .route("/api", get(handlers::api_definition))
         .route("/api/docs", get(handlers::api_docs))
@@ -66,5 +67,12 @@ pub fn router(state: AppState) -> Router {
         )
         // Cache-Control + ETag/If-None-Match on every 200 (#499).
         .layer(axum::middleware::from_fn(caching::conditional_get))
-        .with_state(state)
+        // What an HTML error page adds for a data query (#1132).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            error_pages::error_detail,
+        ))
+        .with_state(state.clone());
+    // A request that asked for HTML gets its error as a page (#1132).
+    error_pages::wrap(router, state, api_common::mounts::EDR)
 }

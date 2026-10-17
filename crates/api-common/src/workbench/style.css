@@ -2299,6 +2299,39 @@ button:disabled {
 .error-text {
   color:var(--error);
 }
+/* Errors as pages (#1132): the field a request was rejected for, and the
+   media type of a link that does not open an HTML page. */
+input[aria-invalid="true"] {
+  border-color:var(--error);
+  box-shadow:0 0 0 1px var(--error);
+}
+.field-error {
+  display:block;
+  margin:6px 0 0;
+  font-size:var(--text-small);
+  overflow-wrap:anywhere;
+}
+.error-page h2 {
+  margin-top:20px;
+}
+.panel.error-page > :first-child {
+  margin-top:0;
+}
+.error-page .action-row {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+}
+.chip.media-type {
+  margin-left:8px;
+  padding:0 6px;
+  font-size:var(--text-small);
+  font-weight:500;
+  vertical-align:middle;
+}
+.resource-alt {
+  margin:0;
+}
 .callout {
   color:var(--ink);
   background:var(--mint);

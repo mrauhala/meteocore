@@ -634,7 +634,8 @@ pub(crate) fn collection_openapi_paths(
             }
         });
 
-        collection_paths[format!("{m}/collections/{id}/tiles")] = json!({
+        let tilesets = format!("{m}/collections/{id}/tiles");
+        collection_paths[&tilesets] = json!({
             "get": {
                 "summary": format!("List tilesets for {}", config.title),
                 "operationId": format!("getTilesets_{id}"),
@@ -644,8 +645,10 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
+        api_common::errors::declare_json_only(&mut collection_paths[&tilesets]);
 
-        collection_paths[format!("{m}/collections/{id}/tiles/{{tileMatrixSetId}}")] = json!({
+        let tileset = format!("{m}/collections/{id}/tiles/{{tileMatrixSetId}}");
+        collection_paths[&tileset] = json!({
             "get": {
                 "summary": format!("Get tileset metadata for {}", config.title),
                 "operationId": format!("getTileset_{id}"),
@@ -663,6 +666,7 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
+        api_common::errors::declare_json_only(&mut collection_paths[&tileset]);
 
         let mut content = serde_json::Map::new();
         if has_raster {
@@ -884,9 +888,10 @@ pub(crate) fn collection_openapi_paths(
     }
 }
 
-/// Tiling-scheme paths, keyed below the mount.
+/// Tiling-scheme paths, keyed below the mount. Both are served only as
+/// JSON (#1132).
 pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, serde_json::Value> {
-    match json!({
+    let mut paths = match json!({
         format!("{m}/tileMatrixSets"): {
             "get": {
                 "summary": "List supported tile matrix sets",
@@ -916,7 +921,11 @@ pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, 
     }) {
         serde_json::Value::Object(paths) => paths,
         _ => serde_json::Map::new(),
+    };
+    for item in paths.values_mut() {
+        api_common::errors::declare_json_only(item);
     }
+    paths
 }
 
 /// Map-tile-only parameter components, after `datetime`, `tile-subset`

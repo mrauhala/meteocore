@@ -78,6 +78,10 @@ impl BuildingBlock for FeaturesBlock {
         contribution(&state, state.collections.get(id)?, root)
     }
 
+    fn serves(&self, id: &str) -> bool {
+        self.state.load().collections.contains_key(id)
+    }
+
     fn openapi(&self, mount: &str) -> OpenApiFragment {
         let state = self.state.load();
         let components = match handlers::openapi_components(shared_name) {

@@ -89,6 +89,10 @@ impl BuildingBlock for TilesBlock {
         Some(contribution(&state, &sources, root))
     }
 
+    fn serves(&self, id: &str) -> bool {
+        handlers::tile_sources(&self.state.load(), id).is_ok()
+    }
+
     fn openapi(&self, mount: &str) -> OpenApiFragment {
         let state = self.state.load();
         let mut paths = handlers::tile_matrix_set_openapi_paths(mount);
@@ -111,15 +115,22 @@ impl BuildingBlock for TilesBlock {
 
     fn routes(&self) -> Router {
         Router::new()
-            .route("/tileMatrixSets", get(handlers::tile_matrix_sets))
+            // Served only as JSON: `f=html` is a 400 naming the format (#1132).
+            .route(
+                "/tileMatrixSets",
+                api_common::errors::json_only_get(handlers::tile_matrix_sets, "tile matrix sets"),
+            )
             .route(
                 "/tileMatrixSets/{tileMatrixSetId}",
-                get(handlers::tile_matrix_set),
+                api_common::errors::json_only_get(handlers::tile_matrix_set, "a tile matrix set"),
             )
-            .route("/collections/{id}/map/tiles", get(handlers::map_tilesets))
+            .route(
+                "/collections/{id}/map/tiles",
+                api_common::errors::json_only_get(handlers::map_tilesets, "a tileset list"),
+            )
             .route(
                 "/collections/{id}/map/tiles/{tileMatrixSetId}",
-                get(handlers::map_tileset),
+                api_common::errors::json_only_get(handlers::map_tileset, "a tileset"),
             )
             .route(
                 "/collections/{id}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
@@ -127,20 +138,23 @@ impl BuildingBlock for TilesBlock {
             )
             .route(
                 "/collections/{id}/styles/{styleId}/map/tiles",
-                get(handlers::styled_map_tilesets),
+                api_common::errors::json_only_get(handlers::styled_map_tilesets, "a tileset list"),
             )
             .route(
                 "/collections/{id}/styles/{styleId}/map/tiles/{tileMatrixSetId}",
-                get(handlers::styled_map_tileset),
+                api_common::errors::json_only_get(handlers::styled_map_tileset, "a tileset"),
             )
             .route(
                 "/collections/{id}/styles/{styleId}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
                 get(handlers::get_styled_tile),
             )
-            .route("/collections/{id}/tiles", get(handlers::vector_tilesets))
+            .route(
+                "/collections/{id}/tiles",
+                api_common::errors::json_only_get(handlers::vector_tilesets, "a tileset list"),
+            )
             .route(
                 "/collections/{id}/tiles/{tileMatrixSetId}",
-                get(handlers::vector_tileset),
+                api_common::errors::json_only_get(handlers::vector_tileset, "a tileset"),
             )
             .route(
                 "/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
@@ -216,24 +230,23 @@ fn tileset_paths(
     tile_content: Value,
 ) {
     let with = |params: Vec<Value>| -> Vec<Value> { extra.iter().cloned().chain(params).collect() };
-    paths.insert(
-        list.clone(),
-        json!({"get": {"summary": format!("{summary} tilesets"),
-            "operationId": format!("get{operation}Tilesets"),
-            "tags": [tag],
-            "parameters": with(vec![]),
-            "responses": {"200": {"description": "Tileset list"},
-                          "404": {"description": "Not found"}}}}),
-    );
-    paths.insert(
-        format!("{list}/{{tileMatrixSetId}}"),
-        json!({"get": {"summary": format!("{summary} tileset"),
-            "operationId": format!("get{operation}Tileset"),
-            "tags": [tag],
-            "parameters": with(vec![tile_matrix_set_parameter()]),
-            "responses": {"200": {"description": "Tileset metadata"},
-                          "404": {"description": "Not found"}}}}),
-    );
+    // The tileset list and tileset are served only as JSON (#1132).
+    let mut tilesets = json!({"get": {"summary": format!("{summary} tilesets"),
+        "operationId": format!("get{operation}Tilesets"),
+        "tags": [tag],
+        "parameters": with(vec![]),
+        "responses": {"200": {"description": "Tileset list"},
+                      "404": {"description": "Not found"}}}});
+    api_common::errors::declare_json_only(&mut tilesets);
+    paths.insert(list.clone(), tilesets);
+    let mut tileset = json!({"get": {"summary": format!("{summary} tileset"),
+        "operationId": format!("get{operation}Tileset"),
+        "tags": [tag],
+        "parameters": with(vec![tile_matrix_set_parameter()]),
+        "responses": {"200": {"description": "Tileset metadata"},
+                      "404": {"description": "Not found"}}}});
+    api_common::errors::declare_json_only(&mut tileset);
+    paths.insert(format!("{list}/{{tileMatrixSetId}}"), tileset);
     let mut parameters = with(tile_parameters());
     parameters.extend(tile_query);
     paths.insert(

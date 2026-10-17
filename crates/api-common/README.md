@@ -84,7 +84,11 @@ the same inventory drives pair validation and OpenAPI generation.
 
 Unsupported controls (`sd`, `resolution`, `sortby`, CQL2 and hierarchy
 controls, for example) and repeated controls return JSON `{code, description}`
-with HTTP 400. This applies to collection lists; it does not change the parameter
+with HTTP 400. An HTML request (`f=html`, or `Accept` listing `text/html`
+without `f`) gets that 400 as the catalog page instead: `CollectionRequest`
+negotiates from the raw `f` and `Accept` before parsing anything else, and
+the search form comes back holding what was sent, the field at fault marked
+`aria-invalid` with the message beside it (#1132). This applies to collection lists; it does not change the parameter
 contracts on feature items, maps, tiles, EDR data queries or instance lists.
 
 ## Text search (draft 25-046 §7.6–7.7)
@@ -191,8 +195,41 @@ Light/dark/system themes persist in the browser. Body text and controls are
 16px; supporting text and code are at least 14px. Navigation, metadata, JSON links
 and paging work without JavaScript; basic collection text search also works.
 JavaScript enables optional query fields, clipboard buttons, view switching,
-property search and return links to the last filtered list. API validation errors
-retain the existing structured JSON error response.
+property search and return links to the last filtered list.
+
+Errors (#1132, `errors`): JSON stays the error contract, and a request that
+asked for HTML gets its error as a page. `errors::wanted` decides from the
+raw query before any parameter is parsed: the first `f` when given and not
+empty, else an `Accept` that ranks `text/html` first, above every other type
+it lists or equal and listed first, with `*/*`, `text/*` and the XML types
+not counted. A browser's header qualifies, while a client naming a data
+type above `text/html` keeps JSON errors. This is stricter than the success
+rule of the metadata pages, `ds_core::html::negotiate`, which serves HTML to
+any `Accept` listing `text/html`: `Accept: application/json, text/html`
+gets an HTML collection page but JSON errors. The catalog and Features items
+form re-renders follow their page's success rule. `errors::html_errors` wraps a whole
+router (the shared root, EDR, Features, Maps and Tiles): for such a request a
+JSON error response becomes `workbench::error_html` with the same status and
+headers, showing the message, the parameter at fault and its value, and links
+back to the collection (when the API serves it) and to Collections. A 5xx page
+shows a generic sentence, never the body. Handlers add what only they know as
+an `errors::ErrorDetail` response extension: the parameter, a heading, a
+replacement message, a hint and the accepted values, each a link re-running
+the request with it (EDR `parameter-name`). `JsonQuery` names the field its
+deserializer rejected. `errors::not_found` is the server's fallback: an HTML
+404 page in the workspace the path is under for a browser, the empty 404
+otherwise. Routes served only as JSON (styles, tilesets, tile matrix sets)
+use `errors::json_only_get`: an `f` other than JSON is the legend's 400
+naming the format, and `errors::declare_json_only` declares that `f` and
+400 in their OpenAPI. The catalog and Features items pages instead re-render
+their form on a 400, and every `datetime` field shows its accepted forms.
+A request with a bad `f` is no HTML request; with another bad parameter its
+JSON 400 names that parameter first, as it always has.
+
+Links that do not open an HTML page carry a media-type badge
+(`media_badge`) in `document_links` and `link_table`. The landing Resources
+panel opens the API reference (`service-doc`) and keeps the raw OpenAPI
+document as a secondary link.
 
 No engine queries run from the renderer. Metadata comes from the existing JSON
 builders. The workbench does not add HTML representations to map images, tiles,

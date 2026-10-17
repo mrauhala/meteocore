@@ -406,6 +406,34 @@ async fn tileset_carries_min_value_into_content_uri() {
     assert_eq!(uri, "content.pnts?quantity=DBZH&min_value=5");
 }
 
+/// The landing document and the collection list are JSON only: `f=html`
+/// is a 400 naming the format they have, as the other APIs' JSON-only
+/// resources answer it (#1132); `f=json` and no `f` serve them.
+#[tokio::test]
+async fn json_only_documents_reject_other_formats() {
+    for (path, what) in [
+        ("/", "the 3D Tiles landing document"),
+        ("/collections", "the 3D Tiles collection list"),
+    ] {
+        for f in ["html", "text%2Fhtml"] {
+            let (status, body, _) = get(&format!("{path}?f={f}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {f}");
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                v["error"],
+                format!(
+                    "Format '{}' is not supported for {what}. Supported: json",
+                    f.replace("%2F", "/")
+                )
+            );
+        }
+        for query in ["", "?f=json", "?f=application%2Fjson"] {
+            let (status, _, _) = get(&format!("{path}{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{path}{query}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn collections_list_and_doc() {
     let (status, body, _h) = get("/collections").await;

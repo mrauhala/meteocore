@@ -2,6 +2,7 @@
 //! and extent policy stays in ds-core; adapters supply metadata and engine facets.
 
 pub mod caching;
+pub mod errors;
 pub mod map_frame;
 pub mod shared;
 pub mod subset;
@@ -16,8 +17,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use ds_core::collection_search::{
-    search, CollectionMatch, CollectionParameter, SearchParams, SearchQueryParams, DEFAULT_LIMIT,
-    MAX_LIMIT,
+    CollectionMatch, CollectionParameter, SearchParams, SearchQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use ds_core::config::CollectionConfig;
 use ds_core::html::{self, LinkView, Wanted};
@@ -140,10 +140,22 @@ pub fn conformance_classes(api_classes: &[&'static str]) -> Vec<&'static str> {
 
 /// Validated collection request. Reject unsupported/duplicate parameters before
 /// accessing engines and return the same structured 400 on every API surface.
+///
+/// The representation is negotiated first, from the raw `f` and `Accept`
+/// (#1132): a JSON request with a bad parameter is that 400, while an HTML
+/// one is extracted with the rejection, and [`collections_response`]
+/// answers it with the catalog form marking the field at fault. A request
+/// with a bad `f` is not HTML: its 400 names the first fault in the order it
+/// always has, the other parameters before the format.
 pub struct CollectionRequest {
-    query: SearchQueryParams,
-    search: SearchParams,
     wanted: Wanted,
+    parsed: Result<(SearchQueryParams, SearchParams), RejectedSearch>,
+}
+
+/// An HTML catalog search whose parameters failed validation.
+struct RejectedSearch {
+    pairs: Vec<(String, String)>,
+    error: ds_core::collection_search::SearchError,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
@@ -153,20 +165,31 @@ impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
         let Query(pairs) = Query::<Vec<(String, String)>>::from_request_parts(parts, state)
             .await
             .map_err(|_| bad_request("Invalid collection query string"))?;
-        let query =
-            SearchQueryParams::from_pairs(pairs).map_err(|e| bad_request(&e.to_string()))?;
-        let search = query.parse().map_err(|e| bad_request(&e.to_string()))?;
         let accept = parts
             .headers
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok());
-        let wanted =
-            html::negotiate(query.f.as_deref(), accept).map_err(|e| bad_request(&e.to_string()))?;
-        Ok(Self {
-            query,
-            search,
-            wanted,
-        })
+        let f = pairs
+            .iter()
+            .find(|(k, _)| k == "f")
+            .map(|(_, v)| v.as_str());
+        let wanted = html::negotiate(f, accept);
+        let parsed = SearchQueryParams::from_pairs(pairs.clone()).and_then(|query| {
+            let search = query.parse()?;
+            Ok((query, search))
+        });
+        match (parsed, wanted) {
+            (Err(error), Ok(Wanted::Json) | Err(_)) => Err(bad_request(&error.to_string())),
+            (_, Err(error)) => Err(bad_request(&error.to_string())),
+            (Ok(parsed), Ok(wanted)) => Ok(Self {
+                wanted,
+                parsed: Ok(parsed),
+            }),
+            (Err(error), Ok(Wanted::Html)) => Ok(Self {
+                wanted: Wanted::Html,
+                parsed: Err(RejectedSearch { pairs, error }),
+            }),
+        }
     }
 }
 
@@ -189,7 +212,16 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         match Query::<T>::from_request_parts(parts, state).await {
             Ok(Query(value)) => Ok(Self(value)),
-            Err(rejection) => Err(bad_request(&rejection.body_text())),
+            Err(rejection) => {
+                let message = rejection.body_text();
+                // An HTML error page names the parameter (#1132); the JSON
+                // body is unchanged.
+                let detail = errors::ErrorDetail {
+                    parameter: errors::rejected_field(&message).map(str::to_owned),
+                    ..Default::default()
+                };
+                Err(detail.attach(bad_request(&message)))
+            }
         }
     }
 }
@@ -221,6 +253,10 @@ pub fn collections_response(
     mut entries: Vec<CollectionEntry<'_>>,
 ) -> Response {
     let url = &format!("{}/collections", surface.root);
+    let (query, search) = match request.parsed {
+        Ok(parsed) => parsed,
+        Err(rejected) => return rejected_search(surface, rejected),
+    };
     entries.sort_by(|a, b| a.config.id.cmp(&b.config.id));
     let facets: Vec<_> = entries
         .iter()
@@ -234,7 +270,7 @@ pub fn collections_response(
             time: entry.time,
         })
         .collect();
-    let result = search(&facets, &request.search);
+    let result = ds_core::collection_search::search(&facets, &search);
     // Explicit formats make both Accept-negotiated HTML and JSON links usable
     // without reproducing the original request headers.
     let (format, alternate, media_type, alternate_type) = match request.wanted {
@@ -244,13 +280,11 @@ pub fn collections_response(
     let href = |offset, f| {
         format!(
             "{url}{}",
-            request
-                .query
-                .query_string_with_format(request.search.limit, offset, f)
+            query.query_string_with_format(search.limit, offset, f)
         )
     };
     let mut nav = vec![LinkView::new(
-        href(request.search.offset, format),
+        href(search.offset, format),
         "self",
         Some("This page"),
     )];
@@ -269,7 +303,7 @@ pub fn collections_response(
         ));
     }
     nav.push(LinkView::new(
-        href(request.search.offset, alternate),
+        href(search.offset, alternate),
         "alternate",
         Some(&format!("This page as {}", alternate.to_uppercase())),
     ));
@@ -310,8 +344,8 @@ pub fn collections_response(
                 .collect();
             Html(workbench::collections_html(
                 surface,
-                &request.query,
-                &request.search,
+                &query,
+                &search,
                 result.number_matched,
                 &metadata,
                 &nav,
@@ -320,6 +354,28 @@ pub fn collections_response(
             .into_response()
         }
     };
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("accept"));
+    response
+}
+
+/// The 400 of an HTML catalog search whose parameters failed: the catalog
+/// form holding what the request gave, the field at fault marked (#1132).
+fn rejected_search(surface: workbench::Surface<'_>, rejected: RejectedSearch) -> Response {
+    let message = rejected.error.to_string();
+    let html = workbench::rejected_collections_html(
+        surface,
+        &rejected.pairs,
+        rejected.error.parameter(),
+        &message,
+    );
+    let mut response = (StatusCode::BAD_REQUEST, Html(html)).into_response();
+    response
+        .extensions_mut()
+        .insert(ds_core::error::ErrorReason(format!(
+            "BadRequest: {message}"
+        )));
     response
         .headers_mut()
         .append(header::VARY, HeaderValue::from_static("accept"));
@@ -592,10 +648,13 @@ pub fn collection_operation() -> Value {
                 }
             },
             "400": {
-                "description": "Unsupported, duplicate or invalid collection query parameter",
-                "content": {"application/json": {"schema": {"type": "object", "required": ["code", "description"], "properties": {
-                    "code": {"type": "string"}, "description": {"type": "string"}
-                }}}}
+                "description": "Unsupported, duplicate or invalid collection query parameter. An HTML request gets the catalog form again, with the field at fault marked.",
+                "content": {
+                    "application/json": {"schema": {"type": "object", "required": ["code", "description"], "properties": {
+                        "code": {"type": "string"}, "description": {"type": "string"}
+                    }}},
+                    "text/html": {"schema": {"type": "string"}}
+                }
             }
         }
     })

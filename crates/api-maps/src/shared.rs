@@ -74,6 +74,10 @@ impl BuildingBlock for MapsBlock {
         contribution(&state, state.collections.get(id)?, root)
     }
 
+    fn serves(&self, id: &str) -> bool {
+        self.state.load().collections.contains_key(id)
+    }
+
     fn openapi(&self, mount: &str) -> OpenApiFragment {
         let state = self.state.load();
         let components = match handlers::openapi_components() {
@@ -89,7 +93,11 @@ impl BuildingBlock for MapsBlock {
     fn routes(&self) -> Router {
         Router::new()
             .route("/collections/{id}/map", get(handlers::get_map))
-            .route("/collections/{id}/styles", get(handlers::styles))
+            // Served only as JSON: `f=html` is a 400 naming the format (#1132).
+            .route(
+                "/collections/{id}/styles",
+                api_common::errors::json_only_get(handlers::styles, "a style list"),
+            )
             .route(
                 "/collections/{id}/styles/{styleId}/map",
                 get(handlers::get_styled_map),

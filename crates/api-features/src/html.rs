@@ -245,8 +245,28 @@ fn coordinate(value: &Value) -> String {
         .unwrap_or_else(|| "Not available".into())
 }
 
-fn query_form(doc: &Value, controls: &FeatureControls) -> String {
+/// The parameter an HTML items request was rejected for, when a single one
+/// is, and the message of its 400 (#1132).
+#[derive(Clone, Copy)]
+pub(crate) struct Invalid<'a> {
+    pub parameter: Option<&'a str>,
+    pub message: &'a str,
+}
+
+fn query_form(doc: &Value, controls: &FeatureControls, invalid: Option<Invalid<'_>>) -> String {
     use api_common::workbench as ui;
+    // The field the request was rejected for carries the message.
+    let mut marked = false;
+    let mut mark = |field: String, name: &str| match invalid {
+        Some(Invalid {
+            parameter: Some(parameter),
+            message,
+        }) if parameter == name => {
+            marked = true;
+            ui::mark_invalid(&field, name, message)
+        }
+        _ => field,
+    };
     let href = href_for(doc, "self");
     let (action, query) = href.split_once('?').unwrap_or((href, ""));
     let pairs: Vec<_> = form_urlencoded::parse(query.as_bytes()).collect();
@@ -270,12 +290,9 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
         out.push_str("</select></label><label>Equals<input data-new-value data-param=\"\" placeholder=\"Exact value\"></label></div>");
     }
     if controls.temporal || !value("datetime").is_empty() {
-        out.push_str(&ui::input(
+        out.push_str(&mark(
+            ui::datetime_input(value("datetime"), true),
             "datetime",
-            value("datetime"),
-            "UTC instant or interval",
-            "text",
-            true,
         ));
     }
     out.push_str("<button class=\"btn primary\">Request features</button></div><p class=\"search-hint\">Filter features within this selected collection. Use Collections to find a different dataset.</p>");
@@ -286,22 +303,31 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             if value.is_empty() {
                 input = input.replace("data-param=", "data-keep-empty=\"true\" data-param=");
             }
+            let input = mark(input, name);
             applied.push_str(&format!("<div data-predicate>{input}<button class=\"btn small\" type=\"button\" data-clear-predicate>Clear {}</button></div>",escape(name)));
         }
     }
     if !applied.is_empty() {
         out.push_str(&format!("<div class=\"fields spaced\">{applied}</div><p class=\"field-help\">Applied predicates are combined with AND. Numeric fields also accept comma-separated alternatives.</p>"));
     }
-    out.push_str("<details class=\"filters\" data-disclosure=\"item-filters\"><summary>Area, ordering &amp; paging</summary><div class=\"fields\">");
-    out.push_str(&ui::input(
+    let open = match invalid {
+        Some(Invalid {
+            parameter: Some("bbox" | "limit" | "offset" | "sortby"),
+            ..
+        }) => " open",
+        _ => "",
+    };
+    out.push_str(&format!("<details class=\"filters\" data-disclosure=\"item-filters\"{open}><summary>Area, ordering &amp; paging</summary><div class=\"fields\">"));
+    let field = ui::input(
         "bbox",
         value("bbox"),
         "CRS84 · west,south,east,north",
         "text",
         true,
-    ));
+    );
+    out.push_str(&mark(field, "bbox"));
     for (key, default) in [("limit", "100"), ("offset", "0")] {
-        out.push_str(&ui::input(
+        let field = ui::input(
             key,
             if value(key).is_empty() {
                 default
@@ -311,19 +337,37 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
             "integer",
             "number",
             false,
-        ));
+        );
+        out.push_str(&mark(field, key));
     }
-    if !controls.sortables.is_empty() {
-        out.push_str(&ui::input(
+    if !controls.sortables.is_empty() || !value("sortby").is_empty() {
+        let field = ui::input(
             "sortby",
             value("sortby"),
             &format!(
                 "Comma-separated; - for descending. Available: {}",
-                controls.sortables.join(", ")
+                if controls.sortables.is_empty() {
+                    "none".to_owned()
+                } else {
+                    controls.sortables.join(", ")
+                }
             ),
             "text",
             true,
-        ));
+        );
+        out.push_str(&mark(field, "sortby"));
+    }
+    // A rejection with no field of its own (an unknown parameter, a
+    // repeated one) is named above the fields.
+    let summary = match invalid {
+        Some(Invalid { message, .. }) if !marked => format!(
+            "<p class=\"error-text field-error\" role=\"alert\">{}</p>",
+            escape(message)
+        ),
+        _ => String::new(),
+    };
+    if let Some(at) = out.find("<div class=\"item-primary-fields\">") {
+        out.insert_str(at, &summary);
     }
     out.push_str(&format!("</div></details><div class=\"filter-controls\">{}</div><details class=\"draft-request\" data-draft-disclosure><summary>Preview data request</summary><small>Draft · submit to update features</small><code data-draft></code></details></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
     out
@@ -358,6 +402,42 @@ pub(crate) fn features_html(
     root: &str,
     controls: &FeatureControls,
 ) -> String {
+    features_page(doc, title, collection_id, base, root, controls, None)
+}
+
+/// The items page of an HTML request rejected for `invalid` (#1132): the
+/// data request form again, holding what the request gave, with the field
+/// at fault marked and no results. `doc` is an empty feature collection
+/// whose `self` link is the rejected request.
+pub(crate) fn rejected_items_html(
+    doc: &Value,
+    title: &str,
+    collection_id: &str,
+    base: &str,
+    root: &str,
+    controls: &FeatureControls,
+    invalid: Invalid<'_>,
+) -> String {
+    features_page(
+        doc,
+        title,
+        collection_id,
+        base,
+        root,
+        controls,
+        Some(invalid),
+    )
+}
+
+fn features_page(
+    doc: &Value,
+    title: &str,
+    collection_id: &str,
+    base: &str,
+    root: &str,
+    controls: &FeatureControls,
+    invalid: Option<Invalid<'_>>,
+) -> String {
     use api_common::workbench as ui;
     let collection_url = format!("{root}/collections/{}", path_segment(collection_id));
     let items_url = format!("{collection_url}/items");
@@ -388,7 +468,7 @@ pub(crate) fn features_html(
             "<div data-results-scope=\"{}\"></div>",
             escape(&items_url)
         ));
-        body.push_str(&format!("<details class=\"item-builder enhanced\" data-disclosure=\"item-builder\"><summary>Build a data request</summary>{}</details>",query_form(doc, controls)));
+        body.push_str(&format!("<details class=\"item-builder enhanced\" data-disclosure=\"item-builder\"{}><summary>Build a data request</summary>{}</details>",if invalid.is_some() {" open"} else {""},query_form(doc, controls, invalid)));
         let applied: String = form_urlencoded::parse(
             href_for(doc, "self")
                 .split_once('?')
@@ -407,13 +487,17 @@ pub(crate) fn features_html(
         if !applied.is_empty() {
             body.push_str(&format!("<div class=\"chip-row applied-item-filters\" aria-label=\"Applied item filters\">{applied}</div>"));
         }
-        let generated = match doc["timeStamp"].as_str() {
-            Some(time) if !time.is_empty() => format!("<time>{}</time>", escape(time)),
-            _ => TIMESTAMP_SLOT.to_owned(),
-        };
-        body.push_str(&format!(
-            "<div class=\"results-head\"><p>Response generated: {generated}</p></div>"
-        ));
+        // A rejected request has no response to date or page (#1132), so
+        // its page has no timestamp slot either.
+        if invalid.is_none() {
+            let generated = match doc["timeStamp"].as_str() {
+                Some(time) if !time.is_empty() => format!("<time>{}</time>", escape(time)),
+                _ => TIMESTAMP_SLOT.to_owned(),
+            };
+            body.push_str(&format!(
+                "<div class=\"results-head\"><p>Response generated: {generated}</p></div>"
+            ));
+        }
         features.as_slice()
     } else {
         std::slice::from_ref(doc)
@@ -434,7 +518,9 @@ pub(crate) fn features_html(
         "<div class=\"detail-layout spaced\"><section class=\"panel\">"
     });
     if is_list {
-        body.push_str(&item_paging(doc, features.len()));
+        if invalid.is_none() {
+            body.push_str(&item_paging(doc, features.len()));
+        }
         if !features.is_empty() {
             body.push_str("<details class=\"column-picker enhanced\"><summary>Choose property columns</summary><p>Showing properties from this response and advertised filter fields. Choose up to eight; your choice is remembered for this collection.</p><div class=\"column-options\">");
             for key in &columns {
@@ -491,6 +577,12 @@ pub(crate) fn features_html(
                 escape(&serde_json::to_string(&properties).expect("properties serialize"))
             ));
             body.push_str(&item_paging(doc, features.len()));
+        } else if let Some(invalid) = invalid {
+            let field = invalid
+                .parameter
+                .map(|p| format!("<p>Check <code>{}</code> and request again.</p>", escape(p)))
+                .unwrap_or_default();
+            body.push_str(&format!("<div class=\"empty\" role=\"alert\"><h2>This request could not run.</h2><p>{}</p>{field}{}</div>",escape(invalid.message),ui::anchor(&ui::with_format(&items_url,"html"),"Clear item filters","btn primary")));
         } else if doc["numberMatched"].as_u64().is_some_and(|n| n > 0) {
             let first = ui::query_edit(
                 &ui::with_format(href_for(doc, "self"), "html"),
@@ -751,7 +843,7 @@ mod tests {
             sortables: vec!["score".into()],
             temporal: true,
         };
-        let html = query_form(&doc, &controls);
+        let html = query_form(&doc, &controls, None);
         assert_eq!(html.matches("data-param=\"name\"").count(), 2);
         assert!(html.contains("value=\"a&amp;b\""));
         assert!(html.contains("data-keep-empty=\"true\""));
@@ -762,10 +854,57 @@ mod tests {
         let plain = query_form(
             &json!({"links":[{"rel":"self","href":"/features/collections/a/items"}]}),
             &FeatureControls::default(),
+            None,
         );
         assert!(!plain.contains("data-param=\"sortby\""));
         assert!(!plain.contains("data-param=\"datetime\""));
         assert!(!plain.contains("data-param=\"name\""));
+    }
+
+    /// A rejected request's form marks the field at fault and opens the
+    /// filters holding it; a parameter with no field is named above them
+    /// (#1132).
+    #[test]
+    fn rejected_requests_mark_the_field_at_fault() {
+        let doc = json!({"links":[{"rel":"self","href":"/features/collections/a/items?sortby=nope&datetime=x&f=html"}]});
+        let controls = FeatureControls {
+            filterables: vec![],
+            sortables: vec!["score".into()],
+            temporal: true,
+        };
+        let invalid = |parameter, message| {
+            Some(Invalid {
+                parameter: Some(parameter),
+                message,
+            })
+        };
+        let html = query_form(
+            &doc,
+            &controls,
+            invalid("sortby", "property 'nope' <is> not sortable"),
+        );
+        assert!(
+            html.contains("data-disclosure=\"item-filters\" open"),
+            "{html}"
+        );
+        assert!(html.contains("<input aria-invalid=\"true\" aria-errormessage=\"sortby-error\" aria-describedby=\"sortby-error\" data-param=\"sortby\""), "{html}");
+        assert!(html.contains(
+            "class=\"error-text field-error\">property &#39;nope&#39; &lt;is&gt; not sortable</span></label>"
+        ));
+        assert_eq!(html.matches("aria-invalid").count(), 1);
+        // The datetime field shows the forms it takes.
+        assert!(html
+            .contains("e.g. 2026-10-17T00:00:00Z/.. or 2026-10-16T00:00:00Z/2026-10-17T00:00:00Z"));
+        let html = query_form(&doc, &controls, invalid("datetime", "bad"));
+        assert!(html.contains("aria-errormessage=\"datetime-error\""));
+        assert!(!html.contains("data-disclosure=\"item-filters\" open"));
+        let html = query_form(
+            &doc,
+            &controls,
+            invalid("typo", "unsupported parameter 'typo'"),
+        );
+        assert!(!html.contains("aria-invalid"));
+        assert!(html.contains("<p class=\"error-text field-error\" role=\"alert\">unsupported parameter &#39;typo&#39;</p><div class=\"item-primary-fields\">"), "{html}");
     }
 
     #[test]

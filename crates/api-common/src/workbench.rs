@@ -122,6 +122,70 @@ pub fn with_format(href: &str, format: &str) -> String {
     )
 }
 
+/// `href` with `key` set to `value` alone, in place of the first value it
+/// had; every other pair, `f` and paging included, is kept in order.
+pub fn query_replace(href: &str, key: &str, value: &str) -> String {
+    let (path, query) = href.split_once('?').unwrap_or((href, ""));
+    let mut out = form_urlencoded::Serializer::new(String::new());
+    let mut placed = false;
+    for (k, v) in form_urlencoded::parse(query.as_bytes()) {
+        if k != key {
+            out.append_pair(&k, &v);
+        } else if !placed {
+            out.append_pair(key, value);
+            placed = true;
+        }
+    }
+    if !placed {
+        out.append_pair(key, value);
+    }
+    format!("{path}?{}", out.finish())
+}
+
+/// The workspace a server path belongs to, as `(kind, mount)`: the per-API
+/// service it is under, else the shared OGC API root.
+pub fn workspace_of(path: &str) -> (&'static str, &'static str) {
+    APIS.iter()
+        .find(|(_, _, mount)| {
+            !mount.is_empty()
+                && path
+                    .strip_prefix(mount)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+        .map_or((crate::shared::WORKSPACE, ""), |(kind, _, mount)| {
+            (*kind, *mount)
+        })
+}
+
+/// A small badge naming the media type of a link that does not open an
+/// HTML page (#1132), so a JSON document or an image is never a surprise.
+/// Empty for `text/html` and for a link whose type is not known.
+pub fn media_badge(media: &str) -> String {
+    let media = media.trim();
+    let essence = media.split(';').next().unwrap_or_default().trim();
+    if essence.is_empty() || essence.eq_ignore_ascii_case("text/html") {
+        return String::new();
+    }
+    let label = match essence.to_ascii_lowercase().as_str() {
+        "application/json" => "JSON",
+        "application/geo+json" => "GeoJSON",
+        "application/vnd.cov+json" | "application/prs.coverage+json" => "CoverageJSON",
+        "application/vnd.oai.openapi+json" => "OpenAPI JSON",
+        "application/vnd.mapbox-vector-tile" => "MVT",
+        "image/png" => "PNG",
+        "image/jpeg" => "JPEG",
+        "image/webp" => "WebP",
+        "text/csv" => "CSV",
+        "application/xml" | "text/xml" => "XML",
+        _ => essence,
+    };
+    format!(
+        "<span class=\"chip media-type\" title=\"Opens {}\">{}</span>",
+        escape(media),
+        escape(label)
+    )
+}
+
 fn safe_href(href: &str) -> &str {
     if href.starts_with("https://")
         || href.starts_with("http://")
@@ -498,11 +562,12 @@ pub fn link_table(links: &Value) -> String {
             format!("<span class=\"link-label\">{}</span>", escape(title))
         };
         out.push_str(&format!(
-            "<tr><td>{rels}</td><td>{}</td><td>{}</td><td><a class=\"table-link\" href=\"{}\">{label}{}</a></td></tr>",
+            "<tr><td>{rels}</td><td>{}</td><td>{}</td><td><a class=\"table-link\" href=\"{}\">{label}{}</a>{}</td></tr>",
             escape(title),
             escape(media_type),
             escape(safe_href(href)),
-            escape(href)
+            escape(href),
+            media_badge(media_type)
         ));
     }
     out.push_str("</tbody></table></div>");
@@ -555,9 +620,12 @@ pub fn document_links(doc: &Value) -> String {
                 href.to_owned()
             };
             body.push_str(&format!(
-                "<div class=\"endpoint\"><div><a class=\"resource-title\" href=\"{}\"><strong>{}</strong><code>{}</code></a><p>{} · {}{}</p></div></div>",
+                "<div class=\"endpoint\"><div><a class=\"resource-title\" href=\"{}\"><strong>{}</strong>{}<code>{}</code></a><p>{} · {}{}</p></div></div>",
                 escape(safe_href(&target)),
                 escape(label),
+                // The HTML view a human relation opens is a page; any other
+                // link opens its own media type.
+                if human { String::new() } else { media_badge(media) },
                 escape(href),
                 escape(rel),
                 escape(link["type"].as_str().unwrap_or("Linked resource")),
@@ -590,21 +658,52 @@ pub fn landing_document(
     let discovery = root;
     let mut body = page_heading(title, description);
     body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resources</h2></div><div class=\"resource-table\">");
-    for link in doc["links"].as_array().into_iter().flatten() {
+    let links = doc["links"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    // The API definition opens as its reference page: the raw OpenAPI
+    // document is up to a megabyte of JSON. It stays a secondary link.
+    let service_doc = links
+        .iter()
+        .find(|l| l["rel"] == "service-doc")
+        .and_then(|l| l["href"].as_str());
+    let mut definition = None;
+    for link in links {
         let rel = link["rel"].as_str().unwrap_or_default();
         let href = link["href"].as_str().unwrap_or_default();
         if !matches!(rel, "data" | "conformance" | "service-desc") {
             continue;
         }
-        let target = if rel == "service-desc" {
-            href.to_owned()
-        } else {
-            with_format(href, "html")
+        let (target, shown, label) = match (rel, service_doc) {
+            ("service-desc", Some(reference)) => {
+                definition = Some(href);
+                (reference.to_owned(), reference, "API reference")
+            }
+            ("service-desc", None) => (href.to_owned(), href, "API definition"),
+            _ => (
+                with_format(href, "html"),
+                href,
+                link["title"].as_str().unwrap_or(rel),
+            ),
         };
-        let label = link["title"].as_str().unwrap_or(rel);
-        body.push_str(&format!("<a class=\"resource-row\" href=\"{}\"><span class=\"method\">GET</span><code>{}</code><span>{}</span>{}</a>",escape(safe_href(&target)),escape(href.strip_prefix(base).unwrap_or(href)),escape(label),icon("arrow")));
+        let badge = if rel == "service-desc" && service_doc.is_none() {
+            media_badge("application/vnd.oai.openapi+json")
+        } else {
+            String::new()
+        };
+        body.push_str(&format!("<a class=\"resource-row\" href=\"{}\"><span class=\"method\">GET</span><code>{}</code><span>{}{badge}</span>{}</a>",escape(safe_href(&target)),escape(shown.strip_prefix(base).unwrap_or(shown)),escape(label),icon("arrow")));
     }
-    body.push_str("</div></section>");
+    body.push_str("</div>");
+    if let Some(definition) = definition {
+        body.push_str(&format!(
+            "<p class=\"panel-body field-help resource-alt\">Raw OpenAPI definition: {}{}</p>",
+            anchor(
+                definition,
+                definition.strip_prefix(base).unwrap_or(definition),
+                ""
+            ),
+            media_badge("application/vnd.oai.openapi+json")
+        ));
+    }
+    body.push_str("</section>");
     let data_guidance = match api {
         "features" => "Open a collection, then use Request data to filter its features by the supported properties, area and time. Inspect the results or copy the GeoJSON request.",
         "edr" => "Open a collection to see its supported data queries and parameters. Choose a location, position or area query, then use the linked API reference to supply the required inputs.",
@@ -641,6 +740,80 @@ pub fn conformance_html(surface: Surface<'_>, classes: &[&str], nav: &[LinkView]
         surface,
         title: "Conformance classes",
         json_url: url,
+    }
+    .render(&body, "")
+}
+
+/// One failed request as its HTML page shows it (#1132).
+pub struct ErrorView<'a> {
+    /// The response status, kept by the page.
+    pub status: u16,
+    /// The heading: the status's reason phrase, or what the handler names.
+    pub title: &'a str,
+    /// The client-visible message (generic for a server error).
+    pub message: &'a str,
+    /// The query parameter at fault and the value the request gave it.
+    pub parameter: Option<(&'a str, Option<&'a str>)>,
+    /// A plain-language explanation beside the message.
+    pub hint: Option<&'a str>,
+    /// Accepted values of `parameter` as `(label, href)`: the request again
+    /// with that value.
+    pub choices: &'a [(String, String)],
+    /// The collection the failed resource belongs to, as `(id, href)`.
+    pub collection: Option<(&'a str, &'a str)>,
+    /// The request as JSON, which the shell's JSON switch opens.
+    pub json_url: &'a str,
+}
+
+/// The workbench page of a failed request: its status, message, the
+/// parameter at fault, and links back to the collection, the catalog and the
+/// API reference of `surface`.
+pub fn error_html(surface: Surface<'_>, view: &ErrorView<'_>) -> String {
+    let root = surface.root;
+    let mut body = format!(
+        "<div class=\"page-title\"><div><span class=\"eyebrow\">HTTP {} · REQUEST NOT COMPLETED</span><h1>{}</h1><p>{}</p></div></div><section class=\"panel panel-body error-page\" role=\"alert\">",
+        view.status,
+        escape(view.title),
+        escape(view.message)
+    );
+    if let Some((name, value)) = view.parameter {
+        body.push_str(&format!(
+            "<p class=\"error-text\">Parameter <code>{}</code>{}</p>",
+            escape(name),
+            value
+                .map(|value| format!(": <code>{}</code>", escape(value)))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(hint) = view.hint {
+        body.push_str(&format!("<p class=\"callout spaced\">{}</p>", escape(hint)));
+    }
+    if !view.choices.is_empty() {
+        body.push_str("<h2 class=\"spaced\">Valid values</h2><p class=\"field-help\">Each link runs this request again with that value.</p><div class=\"chip-row\">");
+        for (label, href) in view.choices {
+            body.push_str(&anchor(href, label, "chip"));
+        }
+        body.push_str("</div>");
+    }
+    body.push_str("<div class=\"action-row spaced\">");
+    if let Some((id, href)) = view.collection {
+        body.push_str(&anchor(href, &format!("← Back to {id}"), "btn primary"));
+    }
+    body.push_str(&anchor(
+        &with_format(&format!("{root}/collections"), "html"),
+        "Collections",
+        if view.collection.is_some() {
+            "btn"
+        } else {
+            "btn primary"
+        },
+    ));
+    body.push_str(&anchor(&format!("{root}/api/docs"), "API reference", "btn"));
+    body.push_str("</div></section>");
+    Page {
+        surface,
+        title: &format!("{} {}", view.status, view.title),
+        json_url: view.json_url,
     }
     .render(&body, "")
 }
@@ -1365,30 +1538,81 @@ fn collection_facts(doc: &Value) -> String {
     facts
 }
 
-pub fn collections_html(
-    surface: Surface<'_>,
-    query: &SearchQueryParams,
-    search: &SearchParams,
-    matched: usize,
-    docs: &[CollectionView<'_>],
-    nav: &[LinkView],
-    links: &Value,
-) -> String {
-    let api = surface.api;
-    let url = &format!("{}/collections", surface.root);
-    let json_url = format!(
-        "{url}{}",
-        query.query_string_with_format(search.limit, search.offset, "json")
+/// Examples of the `datetime` forms a catalog or item search accepts, shown
+/// beside the field (#1132). Not a placeholder: one would read as a value
+/// already applied.
+pub const DATETIME_EXAMPLES: [&str; 2] = [
+    "2026-10-17T00:00:00Z/..",
+    "2026-10-16T00:00:00Z/2026-10-17T00:00:00Z",
+];
+
+/// The help text of a `datetime` field: what it takes, with examples.
+pub fn datetime_help() -> String {
+    format!(
+        "UTC instant or interval, e.g. {} or {}",
+        DATETIME_EXAMPLES[0], DATETIME_EXAMPLES[1]
+    )
+}
+
+/// A `datetime` text field (see [`input`]) with its examples as help.
+pub fn datetime_input(value: &str, enhanced: bool) -> String {
+    input("datetime", value, &datetime_help(), "text", enhanced)
+}
+
+/// `field` (markup holding one `<input>`) marked as the field a request was
+/// rejected for: `aria-invalid`, and `message` beside it (#1132).
+pub fn mark_invalid(field: &str, name: &str, message: &str) -> String {
+    let id = format!("{}-error", path_segment(name));
+    let attributes = format!("aria-invalid=\"true\" aria-errormessage=\"{id}\"");
+    let field = if field.contains("aria-describedby=\"") {
+        field.replacen(
+            "aria-describedby=\"",
+            &format!("{attributes} aria-describedby=\"{id} "),
+            1,
+        )
+    } else {
+        field.replacen(
+            "<input ",
+            &format!("<input {attributes} aria-describedby=\"{id}\" "),
+            1,
+        )
+    };
+    // Inside the field's label, so it stays with the field in any layout.
+    let note = format!(
+        "<span id=\"{id}\" class=\"error-text field-error\">{}</span>",
+        escape(message)
     );
-    let query_string = query.query_string_with_format(search.limit, search.offset, "html");
-    let pairs: Vec<_> =
-        form_urlencoded::parse(query_string.trim_start_matches('?').as_bytes()).collect();
+    match field.rfind("</label>") {
+        Some(at) => format!("{}{note}{}", &field[..at], &field[at..]),
+        None => format!("{field}{note}"),
+    }
+}
+
+/// The catalog search form over the request's decoded `pairs`; `invalid`
+/// is the parameter a rejected request failed on and the message, marked
+/// on its field. `json_url` is the request as JSON.
+fn catalog_form(
+    url: &str,
+    json_url: &str,
+    pairs: &[(String, String)],
+    limit: &str,
+    offset: &str,
+    invalid: Option<(Option<&str>, &str)>,
+) -> String {
     let value = |name: &str| {
         pairs
             .iter()
             .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_ref())
+            .map(|(_, v)| v.as_str())
             .unwrap_or("")
+    };
+    let rejected = |name: &str| match invalid {
+        Some((Some(parameter), message)) if parameter == name => Some(message),
+        _ => None,
+    };
+    let mark = |field: String, name: &str| match rejected(name) {
+        Some(message) => mark_invalid(&field, name, message),
+        None => field,
     };
     let mut primary = String::new();
     let mut advanced = String::new();
@@ -1398,24 +1622,27 @@ pub fn collections_html(
         let current = value(name);
         match parameter {
             CollectionParameter::Format=>{},
-            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">Search text <code>q</code></label><div class=\"search-input-wrap\">{}<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"e.g. radar or GFS\" aria-describedby=\"collection-search-help\"></div></div><button class=\"btn primary\">Find collections {}</button></div><p id=\"collection-search-help\" class=\"search-hint\">Matches titles, descriptions and keywords. Commas separate alternatives.</p>",icon("search"),escape(current),icon("arrow")),
-            CollectionParameter::Limit|CollectionParameter::Offset=>paging.push_str(&input(name,&if name=="limit"{search.limit}else{search.offset}.to_string(),"integer","number",false)),
+            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">Search text <code>q</code></label><div class=\"search-input-wrap\">{}{}</div></div><button class=\"btn primary\">Find collections {}</button></div><p id=\"collection-search-help\" class=\"search-hint\">Matches titles, descriptions and keywords. Commas separate alternatives.</p>",icon("search"),mark(format!("<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"e.g. radar or GFS\" aria-describedby=\"collection-search-help\">",escape(current)),name),icon("arrow")),
+            CollectionParameter::Limit|CollectionParameter::Offset=>paging.push_str(&mark(input(name,if name=="limit"{limit}else{offset},"integer","number",false),name)),
             CollectionParameter::Bbox=>{
                 let bounds:Vec<_>=current.split(',').collect();
-                if current.is_empty()||bounds.len()==4 {
+                if rejected(name).is_none() && (current.is_empty()||bounds.len()==4) {
                     advanced.push_str(&format!("<div class=\"enhanced\"><label>bbox <span class=\"parameter-type\">number[4] · CRS84</span></label><input type=\"hidden\" data-param=\"bbox\" value=\"{}\"><div class=\"bbox-fields\">",escape(current)));
                     for (i,(label,hint)) in [("West","18"),("South","58"),("East","32"),("North","71")].iter().enumerate(){
                         advanced.push_str(&format!("<label>{label}<input data-bbox=\"{i}\" type=\"number\" step=\"any\" value=\"{}\" placeholder=\"{hint}\"></label>",escape(bounds.get(i).copied().unwrap_or_default())));
                     }
                     advanced.push_str("</div><p class=\"field-help\">CRS84 · leave blank for any area</p></div>");
-                } else {advanced.push_str(&input(name,current,"Six-dimensional bounds · CRS84","text",true));}
+                } else if bounds.len()==6 && rejected(name).is_none() {advanced.push_str(&input(name,current,"Six-dimensional bounds · CRS84","text",true));}
+                // A rejected box is shown as typed, to be corrected in place.
+                else {advanced.push_str(&mark(input(name,current,"CRS84 · west,south,east,north","text",true),name));}
             },
             CollectionParameter::BboxCrs if current.is_empty()=>{},
             _=>{
-                let help=match parameter {CollectionParameter::Query=>"string · optional",CollectionParameter::Datetime=>"instant / interval · UTC",_=>"CRS84 coordinate reference system"};
-                let mut field=input(name,current,help,"text",true);
+                let help=match parameter {CollectionParameter::Query=>"string · optional",_=>"CRS84 coordinate reference system"};
+                let mut field=if matches!(parameter,CollectionParameter::Datetime) {datetime_input(current,true)} else {input(name,current,help,"text",true)};
                 if matches!(parameter,CollectionParameter::Query) {field=field.replace("<span>query</span>","<span>Advanced expression <code>query</code></span>");}
                 if matches!(parameter,CollectionParameter::Datetime) {field=field.replace("<span>datetime</span>","<span>Time coverage <code>datetime</code></span>");}
+                field=mark(field,name);
                 if matches!(parameter,CollectionParameter::Query){advanced.insert_str(0,&format!("<div>{field}<p class=\"field-help\">+ requires a term · − excludes it · commas mean OR</p></div>"));}
                 else {advanced.push_str(&field);}
             }
@@ -1436,16 +1663,123 @@ pub fn collections_html(
     }
     let chips = pairs
         .iter()
-        .filter(|(k, v)| ["q", "query", "bbox", "datetime"].contains(&k.as_ref()) && !v.is_empty())
+        .filter(|(k, v)| ["q", "query", "bbox", "datetime"].contains(&k.as_str()) && !v.is_empty())
         .map(|(k, v)| {
             anchor(
-                &query_edit(&json_url, k, None),
+                &query_edit(json_url, k, None),
                 &format!("{k}: {v} ×"),
                 "filter-chip",
             )
         })
         .collect::<String>();
-    let form=format!("<form aria-label=\"Collection search\" class=\"search-panel query-form\" method=\"get\" action=\"{}\"><input type=\"hidden\" name=\"f\" value=\"html\">{primary}<details class=\"filters\" data-disclosure=\"collection-search\"><summary>Advanced search, area and time</summary><div class=\"filters-grid\">{advanced}</div><div class=\"paging-fields\">{paging}</div><div class=\"filter-controls\"><span class=\"field-help\">Collections with unknown extents remain eligible.</span>{}</div></details><div class=\"active-filters\">{chips}</div><details class=\"draft-request enhanced\" data-draft-disclosure><summary>Preview search request</summary><small>Draft · submit to update matches</small><code data-draft></code></details><noscript><p>Enable JavaScript to edit advanced parameters.</p></noscript></form>",escape(url),anchor(&with_format(url,"html"),"Clear filters","quiet"));
+    // A rejected field below the search box opens the filters it is in;
+    // a parameter with no field of its own is named above them.
+    let open = match invalid {
+        Some((Some(parameter), _)) if parameter != "q" => " open",
+        _ => "",
+    };
+    let summary = match invalid {
+        Some((parameter, message))
+            if parameter.is_none_or(|p| {
+                !CollectionParameter::ALL.iter().any(|c| c.name() == p) || p == "f"
+            }) =>
+        {
+            format!(
+                "<p class=\"error-text field-error\" role=\"alert\">{}</p>",
+                escape(message)
+            )
+        }
+        _ => String::new(),
+    };
+    format!("<form aria-label=\"Collection search\" class=\"search-panel query-form\" method=\"get\" action=\"{}\"><input type=\"hidden\" name=\"f\" value=\"html\">{primary}{summary}<details class=\"filters\" data-disclosure=\"collection-search\"{open}><summary>Advanced search, area and time</summary><div class=\"filters-grid\">{advanced}</div><div class=\"paging-fields\">{paging}</div><div class=\"filter-controls\"><span class=\"field-help\">Collections with unknown extents remain eligible.</span>{}</div></details><div class=\"active-filters\">{chips}</div><details class=\"draft-request enhanced\" data-draft-disclosure><summary>Preview search request</summary><small>Draft · submit to update matches</small><code data-draft></code></details><noscript><p>Enable JavaScript to edit advanced parameters.</p></noscript></form>",escape(url),anchor(&with_format(url,"html"),"Clear filters","quiet"))
+}
+
+/// The catalog page of an HTML search whose parameters were rejected
+/// (#1132), answered with status 400: the form again, holding the values the
+/// request gave, the field at fault marked with the message, and no
+/// results. `pairs` are the request's decoded query pairs; `parameter` is
+/// the one at fault, when a single one is.
+pub fn rejected_collections_html(
+    surface: Surface<'_>,
+    pairs: &[(String, String)],
+    parameter: Option<&str>,
+    message: &str,
+) -> String {
+    let url = &format!("{}/collections", surface.root);
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs.iter().filter(|(key, _)| key != "f") {
+        query.append_pair(key, value);
+    }
+    let json_url = with_format(&format!("{url}?{}", query.finish()), "json");
+    let value = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let limit = value("limit").unwrap_or_default().to_owned();
+    let limit = if limit.is_empty() {
+        ds_core::collection_search::DEFAULT_LIMIT.to_string()
+    } else {
+        limit
+    };
+    let offset = value("offset").filter(|v| !v.is_empty()).unwrap_or("0");
+    let form = catalog_form(
+        url,
+        &json_url,
+        pairs,
+        &limit,
+        offset,
+        Some((parameter, message)),
+    );
+    let mut body = page_heading(
+        "Collections",
+        "Find a dataset, then open it to request data.",
+    )
+    .replace(
+        "OGC API · HTML REPRESENTATION",
+        &format!("{} · DATA CATALOG", surface.api.to_uppercase()),
+    );
+    let field = parameter
+        .map(|p| format!("<p>Check <code>{}</code> and search again.</p>", escape(p)))
+        .unwrap_or_default();
+    body.push_str(&format!("<div data-results-scope=\"{}\"></div><div class=\"query-workspace\"><aside class=\"query-builder\">{form}</aside><section class=\"query-results\" aria-label=\"Matching collections\"><div class=\"empty-state\" role=\"alert\"><h2>This search could not run.</h2><p>{}</p>{field}{}</div></section></div>",escape(url),escape(message),anchor(&with_format(url,"html"),"Clear filters","btn primary")));
+    Page {
+        surface,
+        title: "Collections",
+        json_url: &json_url,
+    }
+    .render(&body, "")
+}
+
+pub fn collections_html(
+    surface: Surface<'_>,
+    query: &SearchQueryParams,
+    search: &SearchParams,
+    matched: usize,
+    docs: &[CollectionView<'_>],
+    nav: &[LinkView],
+    links: &Value,
+) -> String {
+    let api = surface.api;
+    let url = &format!("{}/collections", surface.root);
+    let json_url = format!(
+        "{url}{}",
+        query.query_string_with_format(search.limit, search.offset, "json")
+    );
+    let query_string = query.query_string_with_format(search.limit, search.offset, "html");
+    let pairs: Vec<(String, String)> =
+        form_urlencoded::parse(query_string.trim_start_matches('?').as_bytes())
+            .into_owned()
+            .collect();
+    let form = catalog_form(
+        url,
+        &json_url,
+        &pairs,
+        &search.limit.to_string(),
+        &search.offset.to_string(),
+        None,
+    );
     let mut body = page_heading(
         "Collections",
         "Find a dataset, then open it to request data.",
@@ -1748,6 +2082,115 @@ mod tests {
             doc,
             license,
         )
+    }
+
+    /// A rejected catalog search is the form again (#1132): the values the
+    /// request gave, the field at fault marked with the message, its
+    /// filters open; `datetime` shows the forms it takes.
+    #[test]
+    fn rejected_catalog_search_marks_the_field_at_fault() {
+        let pairs: Vec<(String, String)> = [
+            ("q", "radar"),
+            ("datetime", "yesterday <b>"),
+            ("limit", "5"),
+            ("f", "html"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .to_vec();
+        let html = rejected_collections_html(
+            MAPS_PROXY,
+            &pairs,
+            Some("datetime"),
+            "Invalid datetime: <x>",
+        );
+        let field = html
+            .split("data-param=\"datetime\"")
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .unwrap();
+        assert!(html.contains("<input aria-invalid=\"true\" aria-errormessage=\"datetime-error\" aria-describedby=\"datetime-error\" data-param=\"datetime\""), "{html}");
+        assert!(field.contains("value=\"yesterday &lt;b&gt;\""), "{field}");
+        assert!(html.contains("<span id=\"datetime-error\" class=\"error-text field-error\">Invalid datetime: &lt;x&gt;</span></label>"));
+        assert!(html.contains(
+            "UTC instant or interval, e.g. 2026-10-17T00:00:00Z/.. or 2026-10-16T00:00:00Z/2026-10-17T00:00:00Z"
+        ));
+        assert!(html.contains("data-disclosure=\"collection-search\" open"));
+        assert!(html.contains("value=\"radar\""));
+        assert!(html.contains("This search could not run."));
+        assert!(html.contains("<p>Check <code>datetime</code> and search again.</p>"));
+        // The JSON switch is the same search, as JSON.
+        assert!(html.contains(
+            "https://example.test/proxy/maps/collections?q=radar&amp;datetime=yesterday+%3Cb%3E&amp;limit=5&amp;f=json"
+        ));
+        // A parameter without a field of its own is named above them.
+        let html = rejected_collections_html(
+            MAPS_PROXY,
+            &[("typo".into(), "1".into())],
+            Some("typo"),
+            "Unknown collection query parameter 'typo'",
+        );
+        assert!(html.contains(
+            "<p class=\"error-text field-error\" role=\"alert\">Unknown collection query parameter &#39;typo&#39;</p>"
+        ));
+        assert!(!html.contains("aria-errormessage"));
+    }
+
+    /// Links that open something other than an HTML page say what they
+    /// open (#1132); HTML views and human relations do not.
+    #[test]
+    fn non_html_links_carry_a_media_type_badge() {
+        assert_eq!(media_badge("text/html"), "");
+        assert_eq!(media_badge(""), "");
+        assert_eq!(media_badge("text/html; charset=utf-8"), "");
+        assert!(media_badge("application/json").contains(">JSON</span>"));
+        assert!(media_badge("application/vnd.oai.openapi+json;version=3.0")
+            .contains(">OpenAPI JSON</span>"));
+        assert!(media_badge("image/<svg>").contains(">image/&lt;svg&gt;</span>"));
+        let links = json!([
+            {"href": "https://x/collections/a/styles", "rel": "styles", "type": "application/json", "title": "Styles"},
+            {"href": "https://x/collections/a/items", "rel": "items", "type": "application/geo+json", "title": "Items"},
+            {"href": "https://x/collections/a?f=html", "rel": "alternate", "type": "text/html", "title": "HTML"},
+        ]);
+        let table = link_table(&links);
+        assert_eq!(
+            table.matches("class=\"chip media-type\"").count(),
+            2,
+            "{table}"
+        );
+        assert!(table.contains(">GeoJSON</span>"));
+        let resources = document_links(&json!({"links": links}));
+        // Styles open JSON; items open their HTML page.
+        assert_eq!(
+            resources.matches("class=\"chip media-type\"").count(),
+            1,
+            "{resources}"
+        );
+        assert!(resources.contains("<strong>Styles</strong><span class=\"chip media-type\""));
+    }
+
+    /// The landing page's API definition row opens the API reference; the
+    /// raw OpenAPI document stays a secondary link (#1132).
+    #[test]
+    fn landing_resources_open_the_api_reference() {
+        let doc = json!({"links": [
+            {"href": "https://example.test/proxy/maps/api", "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.0", "title": "API definition"},
+            {"href": "https://example.test/proxy/maps/api/docs", "rel": "service-doc", "type": "text/html", "title": "API documentation"},
+            {"href": "https://example.test/proxy/maps/collections", "rel": "data", "type": "application/json", "title": "Collections"},
+        ]});
+        let html = landing_document(MAPS_PROXY, "Maps", "", &doc);
+        assert!(html.contains(
+            "<a class=\"resource-row\" href=\"https://example.test/proxy/maps/api/docs\"><span class=\"method\">GET</span><code>/maps/api/docs</code><span>API reference</span>"
+        ), "{html}");
+        assert!(html.contains("Raw OpenAPI definition: <a"));
+        assert!(html.contains("href=\"https://example.test/proxy/maps/api\""));
+        assert!(!html.contains("<span>API definition"));
+        // Without a reference page the row keeps the definition, badged.
+        let doc = json!({"links": [doc["links"][0].clone()]});
+        let html = landing_document(MAPS_PROXY, "Maps", "", &doc);
+        assert!(
+            html.contains("<span>API definition<span class=\"chip media-type\""),
+            "{html}"
+        );
     }
 
     #[test]
@@ -2189,7 +2632,7 @@ mod tests {
         assert_eq!(html.matches("maps/conformance?f=html").count(), 1);
         assert!(!html.contains(rel::CONFORMANCE));
         // Distinct representations of one resource remain separate entries.
-        assert_eq!(html.matches("image/").count(), 2);
+        assert_eq!(html.matches(" · image/").count(), 2);
         // Differently titled offers of one resource keep their relations.
         for title in ["Tilesets", "Map tilesets", "Vector tilesets"] {
             assert!(

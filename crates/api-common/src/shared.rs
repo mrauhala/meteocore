@@ -91,6 +91,12 @@ pub trait BuildingBlock: Send + Sync + 'static {
     fn collections(&self, root: &str) -> Vec<Contribution>;
     /// One collection, or `None` when this block does not serve it.
     fn collection(&self, id: &str, root: &str) -> Option<Contribution>;
+    /// Whether this block serves collection `id`, without assembling its
+    /// description (an error page's link back, #1132). The default builds
+    /// the contribution; a block with a registry overrides it with a lookup.
+    fn serves(&self, id: &str) -> bool {
+        self.collection(id, "").is_some()
+    }
     /// OpenAPI paths (keys prefixed with `mount`) and components.
     fn openapi(&self, mount: &str) -> OpenApiFragment;
     /// Data-access routes, relative to the shared root.
@@ -168,7 +174,22 @@ pub fn router(api: SharedApi) -> Router {
     for block in &api.blocks {
         router = router.merge(tag_api_kind(block.routes(), block.kind()));
     }
+    // Every block's errors, too, are pages for a browser (#1132).
+    let router = crate::errors::html_errors(router, WORKSPACE, mount, Arc::new(Pages(api)));
     router.layer(Extension(Mount(mount)))
+}
+
+/// What the shared root's error pages know: its base URL and catalog.
+struct Pages(AppState);
+
+impl crate::errors::ErrorPages for Pages {
+    fn base_url(&self, headers: &HeaderMap) -> String {
+        self.0.base(headers)
+    }
+
+    fn has_collection(&self, id: &str) -> bool {
+        self.0.blocks.iter().any(|block| block.serves(id))
+    }
 }
 
 fn error(status: StatusCode, code: &str, description: &str) -> Response {

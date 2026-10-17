@@ -229,6 +229,9 @@ collection.
    project's stricter policy avoids misleading draft-testing clients. Unsupported
    controls such as `sd`, `parent` and `sortby` now return 400 rather than
    silently serving unfiltered results. `offset` and `f` remain supported extensions.
+   An HTML request's 400 is the catalog page with the field at fault marked, and
+   every other error of an HTML request is an HTML page with the same status
+   (#1132); JSON requests keep the JSON body.
 3. Maps and Tiles cache rendered data responses; their Common metadata handlers
    lack the EDR/Features metadata caching middleware. This row is about metadata.
 4. Shared collection metadata now adds HTML alternate links to JSON list/detail

@@ -27,7 +27,12 @@ ordinary URLs, not a separate client-side application.
 - Collection details retain full API metadata, keywords and license labels,
   including free-text licenses without a URL. EDR model-run pages share the shell.
 - Common sorting, hierarchy, `sd` and `resolution` remain unsupported and have
-  no active controls. Existing API validation errors remain structured JSON.
+  no active controls.
+- A request that asks for HTML (`f=html`, or no `f` and an `Accept` that ranks
+  `text/html` first) gets its errors as workbench pages with the same status:
+  the message, the parameter at fault and links back. JSON clients keep the
+  structured JSON body. A repeated `f` whose first value is `html` gets its
+  400 as a page too.
 - Without JavaScript, metadata, navigation, paging, JSON switching and basic
   collection text search work. Advanced/item-query editing and map interaction
   require JavaScript.

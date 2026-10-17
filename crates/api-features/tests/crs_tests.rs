@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -395,13 +395,22 @@ async fn links_keep_the_crs_and_a_crs84_bbox() {
 
 #[tokio::test]
 async fn html_is_crs84_only_but_takes_bbox_crs() {
+    // The 400 is a page for the HTML request it answers (#1132): the items
+    // page with its form, or the error page, each naming the rule.
     for uri in [
         "/collections/places/items?f=html&crs=EPSG%3A3067",
         "/collections/places/items/helsinki?f=html&crs=EPSG%3A4326",
     ] {
-        let (status, _, doc) = get(uri).await;
+        let (status, headers, body) = request(uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
-        assert!(doc["description"].as_str().unwrap().contains("CRS84"));
+        assert!(headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        assert!(
+            body.contains("the HTML representation is CRS84 only"),
+            "{body}"
+        );
     }
     for uri in [
         "/collections/places/items?f=html&crs=OGC%3ACRS84",
