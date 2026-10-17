@@ -134,6 +134,43 @@ pub enum RangeRead {
     Changed,
 }
 
+/// Why a store refused a range read in a way that no retry of the same read
+/// can change (#1074). [`DataStore::get_range_or_refusal`] answers it as
+/// data, not as an error, so a caller tells "the object is gone" from "this
+/// read failed" without matching error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeRefusal {
+    /// 404: no object under the key.
+    NotFound,
+    /// 401 or 403: the store will not serve the key to these credentials.
+    /// Often the credentials or a bucket policy, not this one object.
+    Forbidden,
+    /// 416, or a response naming a total size that ends before the range:
+    /// the object is now shorter than the range, so it was truncated or
+    /// replaced.
+    Truncated,
+}
+
+impl std::fmt::Display for RangeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RangeRefusal::NotFound => "not found",
+            RangeRefusal::Forbidden => "forbidden",
+            RangeRefusal::Truncated => "shorter than the range",
+        })
+    }
+}
+
+/// What [`DataStore::get_range_or_refusal`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum RangeAnswer {
+    /// The bytes of the range.
+    Read(Bytes),
+    /// The store refused the range for good.
+    Refused(RangeRefusal),
+}
+
 /// Synchronous wrapper around an `ObjectStore`.
 ///
 /// Methods use `tokio::runtime::Handle::current().block_on()` to bridge
@@ -237,6 +274,63 @@ impl DataStore {
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
+    }
+
+    /// Like [`Self::get_range`], but a refusal that no retry can change is a
+    /// [`RangeAnswer::Refused`] rather than an error (#1074): a missing
+    /// object (404), a key these credentials may not read (401/403), and a
+    /// range past the object's end (416, or a response whose total size
+    /// ends before the range, which object_store would otherwise clamp into
+    /// a short success). Every other failure, the deadline included, stays
+    /// an `Err`. Under [`FetchBudget::Request`].
+    pub fn get_range_or_refusal(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+    ) -> Result<RangeAnswer, DataServerError> {
+        self.range_or_refusal(None, path, range)
+    }
+
+    /// [`Self::get_range_or_refusal`] driven on an explicitly-provided
+    /// runtime `Handle`, as [`Self::get_range_on`] is to [`Self::get_range`].
+    pub fn get_range_or_refusal_on(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+        handle: &tokio::runtime::Handle,
+    ) -> Result<RangeAnswer, DataServerError> {
+        self.range_or_refusal(Some(handle), path, range)
+    }
+
+    fn range_or_refusal(
+        &self,
+        handle: Option<&tokio::runtime::Handle>,
+        path: &ObjectPath,
+        range: Range<usize>,
+    ) -> Result<RangeAnswer, DataServerError> {
+        let end = range.end as u64;
+        let options = object_store::GetOptions::new().with_range(Some(to_u64(range)));
+        let answer = self.block_on_result(handle, FetchBudget::Request, async {
+            let storage = |e| DataServerError::from(StorageError::from(e));
+            let result = match self.inner.get_opts(path, options).await {
+                Ok(result) => result,
+                Err(e) => {
+                    return match error::range_refusal(&e) {
+                        Some(refusal) => Ok(RangeAnswer::Refused(refusal)),
+                        None => Err(storage(e)),
+                    }
+                }
+            };
+            if result.meta.size < end {
+                return Ok(RangeAnswer::Refused(RangeRefusal::Truncated));
+            }
+            Ok(RangeAnswer::Read(result.bytes().await.map_err(storage)?))
+        })?;
+        if let RangeAnswer::Read(bytes) = &answer {
+            self.bytes_read
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(answer)
     }
 
     /// Read `range` of `path` only if the key still names `version`.
@@ -1689,6 +1783,73 @@ mod range_tests {
             RangeRead::Changed,
             "404"
         );
+    }
+
+    /// A range read that no retry can change is an answer, not an error
+    /// (#1074): a missing key, and a range past the object's end, which
+    /// the store clamps into a short body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_range_of_a_gone_or_shorter_object_is_refused() {
+        let store = DataStore::new(Arc::new(object_store::memory::InMemory::new()));
+        let path = ObjectPath::from("cog.tif");
+        store
+            .inner()
+            .put(&path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        let read = |path: &ObjectPath, range| store.get_range_or_refusal(path, range).unwrap();
+        assert_eq!(
+            read(&path, 2..5),
+            RangeAnswer::Read(Bytes::from_static(b"234"))
+        );
+        assert_eq!(
+            read(&path, 8..12),
+            RangeAnswer::Refused(RangeRefusal::Truncated)
+        );
+        assert_eq!(
+            read(&ObjectPath::from("gone.tif"), 2..5),
+            RangeAnswer::Refused(RangeRefusal::NotFound)
+        );
+        assert_eq!(store.bytes_read(), 3, "a refused range reads nothing");
+    }
+
+    /// Over HTTP, by status: 404 and 403 are refusals, and so is a 416 for
+    /// a range starting past the end, and a 206 naming a total size short
+    /// of the range. object_store keeps 403 and 416 only in its error text
+    /// there, so this pins that text. Any other client error stays an
+    /// error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_range_over_http_is_typed_by_status() {
+        let server = RangeServer::new(b"0123456789", at("2026-10-17T08:00:00Z"));
+        let (store, path) = build_http_store(&format!("{}/object", server.url)).unwrap();
+        let read = |path: &ObjectPath, range| store.get_range_or_refusal(path, range);
+
+        assert_eq!(
+            read(&path, 2..5).unwrap(),
+            RangeAnswer::Read(Bytes::from_static(b"234"))
+        );
+        assert_eq!(
+            read(&ObjectPath::from("missing"), 2..5).unwrap(),
+            RangeAnswer::Refused(RangeRefusal::NotFound)
+        );
+        assert_eq!(
+            read(&path, 12..20).unwrap(),
+            RangeAnswer::Refused(RangeRefusal::Truncated),
+            "416"
+        );
+        assert_eq!(
+            read(&path, 8..12).unwrap(),
+            RangeAnswer::Refused(RangeRefusal::Truncated),
+            "a shorter total size"
+        );
+        server.object.lock().unwrap().status = Some("403 Forbidden");
+        assert_eq!(
+            read(&path, 2..5).unwrap(),
+            RangeAnswer::Refused(RangeRefusal::Forbidden)
+        );
+        server.object.lock().unwrap().status = Some("400 Bad Request");
+        assert!(read(&path, 2..5).is_err(), "not a refusal");
+        assert_eq!(store.bytes_read(), 3);
     }
 
     /// A request limit bounds the operations in flight, and a limit taken

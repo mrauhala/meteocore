@@ -200,7 +200,7 @@ engine-zarr.
   the client's retry fetches the rest
   (`a_deadline_cut_read_keeps_fetched_tiles_for_the_retry`).
 
-## Remote tile read failures (#1051)
+## Remote tile read failures (#1051, #1074)
 
 `reader::read_remote_chunk_with_retry` is the one policy for every remote
 tile read: map renders (WMS, Maps, Tiles), EDR area and radius
@@ -213,8 +213,14 @@ failure a class, `TileReadError`, and the class decides, never the message:
   `Retry-After` in WMS/Maps/Tiles, 503 in EDR. Never an `Ok` tile with
   nodata in its place: the rendered and meta-tile caches keep every `Ok`
   tile with no TTL, and an explicit-time response is browser-cached for a
-  day, so a gap from a short storage outage outlived it. An object deleted
-  after the scan fails the same way until the catalog drops it.
+  day, so a gap from a short storage outage outlived it.
+- **`Refused`**: the store refused the range for good, typed by
+  `DataStore::get_range_or_refusal` (object store) or
+  `read_http_range_answer` (STAC assets) as a `ds_storage::RangeRefusal`:
+  404, 416 or a response whose total size ends before the range, or
+  401/403. Never retried, and recorded in the source's `ObjectHealth`. A
+  gone object's tile is nodata at once; a forbidden one fails the read
+  with `ResourceExhausted`. See "Objects gone after the scan" below.
 - **`Decode`**: the bytes arrived but do not decode. A logged nodata gap at
   once, not retried: the compressed cache already holds the same bytes.
 - **`Fatal`**: decode admission, the deadline and an invalid tile layout
@@ -229,6 +235,50 @@ failure a class, `TileReadError`, and the class decides, never the message:
 The poll-time pre-warm (`prewarm.rs`, `reader::fetch_encoded_range`) is not
 a read under this policy: it caches only bytes that arrived and logs a WARN
 for reads that failed, so it can neither fail a request nor insert a gap.
+
+## Objects gone after the scan (#1074)
+
+A remote object deleted, truncated or forbidden after the scan catalogued
+it answers its tile ranges with a refusal (`Refused` above). What happens
+depends on the kind:
+
+- **Gone (404, 416, shorter):** the request that meets it draws those
+  tiles as nodata (EDR: nulls with 200), as engine-odim draws a missing
+  volume. The refusal is set once in the source's
+  `reader::ObjectHealth`, which every clone of the catalog entry shares,
+  and later reads of that object make no I/O. Every catalog accessor skips
+  the entry at once (`FileEntry::is_gone`): `Catalog::select_timestamp`,
+  so `resolve_time` and `get_raster_tile` still share one selection (#507),
+  `Catalog::live` for `RasterInfo` and `data_age`, and `filter_by_datetime`
+  for EDR. The request path never builds a catalog; it writes only that
+  atomic. `note_object_health` runs after each read (a drop guard on the
+  map path), logs a WARN once per object and refreshes the `RasterInfo`
+  snapshot.
+- **Removal:** the next catalog swap screens the catalog
+  (`gone::GoneObjects::screen`, from `do_scan` before the `max_files` trim,
+  from `store_stac_catalog`, and in `ensure_entries_loaded` before a query
+  counts its window's cold items), removes the entry and keeps it, keyed by
+  path (object key or asset href) and size, the identity the scan's own
+  reuse compares. An object-store listing that still names the key with
+  that size reuses the kept entry without a header read, and the screen
+  removes it again; a key the complete listing no longer names, or names
+  with another size, ends the record. A STAC listing that still names the
+  href with that `file:size` adds a stub, which the screen removes; a new
+  href or size is a new object. A same-size rewrite under the same key is
+  not told apart, as on the scan's reuse path.
+- **`content_version`:** 0 until a timestep the screen removed holds an
+  entry again, then it moves before that catalog is stored. Renders cached
+  under the timestep may hold the gap, or the frame the time snapped to.
+  Do not move it on every drop: a rolling-window bucket deletes frames all
+  the time, and each move leaves every render the collection cached unread.
+- **Forbidden (401/403):** the read fails with `ResourceExhausted`, a 503
+  in every API, without retries. It is the server's credentials or a
+  policy, not the data: a nodata tile would mislead and would stay in the
+  no-TTL caches after the fix (the #1051 lesson). Counted in
+  `ObjectHealth`, never marked gone, so the timestep stays: dropping on it
+  would empty the catalog. A WARN at most once a minute per collection
+  (`gone::ForbiddenWarnings`); `note_object_health` runs before an EDR
+  query returns the error, and from the drop guard on the map path.
 
 ## Rendering gotchas (hard-won)
 

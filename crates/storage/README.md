@@ -35,7 +35,7 @@ decides whether that retry gets to run, so a whole-object fetch names its
 
 `get_with_budget`, `get_range_with_budget`, `get_range_on_with_budget`,
 `get_range_if_unmodified` and `get_many_with_budget` take the budget; `get`,
-`get_range`, `get_range_on` and `get_many` are the request budget. Don't pass the background budget where a
+`get_range`, `get_range_on`, `get_range_or_refusal` and `get_many` are the request budget. Don't pass the background budget where a
 request can wait on the result, directly or through a single-flight cache
 fill.
 
@@ -131,6 +131,16 @@ caller drops what it holds for the file and re-ingests it. A rewrite within
 the same second at the same size, on a server without ETags, is beyond any
 HTTP check. `get_range_if_unmodified_on` drives the read on a supplied
 runtime handle.
+
+`get_range_or_refusal` (and `_on`) reads a byte range without a version and
+answers a refusal no retry can change as `RangeAnswer::Refused`, not an
+error (#1074): `RangeRefusal::NotFound` for a 404, `Forbidden` for a 401 or
+403, and `Truncated` for a 416 or a response whose total size ends before
+the range. object_store types only some of these; a 416, and a 403 from its
+HTTP store, carry the status only in the text of a private error, which
+`error::range_refusal` reads and `range_tests` pins against a real server.
+Every other failure stays an `Err`. engine-geotiff's tile reads use it to
+tell a gone object from a failed read.
 
 # Request limits
 
