@@ -28,6 +28,13 @@
 //! `engine-odim` (composite grid), and any future projected-grid engine.
 //! Keeping it here makes the CLAUDE.md "never project per output pixel" rule
 //! reusable rather than re-derived per engine (#203, #236).
+//!
+//! [`SourceGrid`] builds on it: the shared `f32` sampler a gridded engine
+//! renders a decoded field with (see [`sampler`]).
+
+pub mod sampler;
+
+pub use sampler::{OutputMap, SourceGrid};
 
 /// Initial node spacing, in output pixels. The adaptive refinement in
 /// [`ProjectionGrid::build`] only ever *increases* density from here, so this
