@@ -22,6 +22,8 @@ futures = "0.3"
 flate2 = "1"
 weezl = "0.1"
 ds-cache = { path = "../ds-cache" }
+# The fail-fast byte budget behind `decode_budget`.
+ds-executor = { path = "../ds-executor" }
 rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"

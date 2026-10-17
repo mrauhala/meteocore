@@ -98,6 +98,8 @@ pool: they do not use the Icechunk runtime bridge.
   (pre-scale) value; NaN/±inf map to nodata.
 - **Source memory admission:** `read_budget::BUDGET` is process-wide and
   survives reload/snapshot changes (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB).
+  `read_budget` keeps the planning and deadline checks; the accounting is
+  `ds_executor::budget::ByteBudget`, shared with engine-geotiff.
   Reserve before variable payload reads: native subset + typed conversion +
   raw/physical f64 buffers + axes/window overhead. Cold reads also reserve a
   four-buffer decode/index allowance. Use full stored chunk shapes, not clipped overlaps. Sharded reads

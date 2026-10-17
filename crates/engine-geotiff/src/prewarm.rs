@@ -310,7 +310,7 @@ async fn warm_read(
     stop: &impl Fn() -> bool,
 ) -> ReadResult {
     // The read's input and the per-tile copies coexist until it is cached.
-    let reservation = read.range.len().saturating_mul(2);
+    let reservation = read.range.len().saturating_mul(2) as u64;
     if reservation > decode.background_limit() {
         return ReadResult::Deferred; // never fits, so do not wait for it
     }

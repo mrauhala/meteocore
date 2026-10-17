@@ -1,10 +1,8 @@
 //! Admission for transient native reads and sampling windows, separate from caches.
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, LazyLock,
-};
+use std::sync::{Arc, LazyLock};
 
 use ds_core::{deadline, error::DataServerError};
+use ds_executor::budget::{ByteBudget, BytePermit};
 use zarrs::array::{Array, ArrayShardedExt, ArraySubset};
 
 use crate::store::EngineStore;
@@ -15,69 +13,52 @@ pub(crate) static BUDGET: LazyLock<Arc<Budget>> = LazyLock::new(|| {
     ))
 });
 
+/// Zarr's admission planning and deadline checks over the shared fail-fast
+/// [`ByteBudget`], which keeps the account.
 pub(crate) struct Budget {
-    capacity: u64,
-    used: AtomicU64,
-    rejected: AtomicU64,
+    bytes: Arc<ByteBudget>,
 }
 
 impl Budget {
     pub(crate) fn new(capacity: u64) -> Self {
         Self {
-            capacity,
-            used: AtomicU64::new(0),
-            rejected: AtomicU64::new(0),
+            bytes: Arc::new(ByteBudget::new(capacity)),
         }
     }
 
     pub(crate) fn metrics(&self) -> (u64, u64, u64) {
-        (
-            self.used.load(Ordering::Relaxed),
-            self.capacity,
-            self.rejected.load(Ordering::Relaxed),
-        )
+        self.bytes.metrics()
     }
 
     /// Transient chunk, encoded storage or intermediate codec capacity. Never
     /// wait while holding a native window.
-    pub(crate) fn reserve_bytes(
-        self: &Arc<Self>,
-        bytes: u64,
-    ) -> Result<Arc<Permit>, DataServerError> {
+    pub(crate) fn reserve_bytes(&self, bytes: u64) -> Result<Arc<Permit>, DataServerError> {
         self.try_reserve_bytes(bytes)?.ok_or_else(|| self.reject())
     }
 
     /// Probe another batch slot without counting reduced fan-out as a rejected
     /// request. The caller must reject if even the first slot cannot fit.
     pub(crate) fn try_reserve_bytes(
-        self: &Arc<Self>,
+        &self,
         bytes: u64,
     ) -> Result<Option<Arc<Permit>>, DataServerError> {
         deadline::check()?;
-        let reserved = self
-            .used
-            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                used.checked_add(bytes).filter(|&n| n <= self.capacity)
-            })
-            .is_ok();
-        Ok(reserved.then(|| {
+        Ok(self.bytes.try_reserve(bytes).map(|permit| {
             Arc::new(Permit {
-                budget: self.clone(),
-                bytes,
+                _bytes: permit,
                 parallelism: 1,
             })
         }))
     }
 
     pub(crate) fn reject(&self) -> DataServerError {
-        self.rejected.fetch_add(1, Ordering::Relaxed);
-        DataServerError::ResourceExhausted
+        self.bytes.reject()
     }
 
     /// Fail fast: callers already own an executor slot, and may hold another
     /// window (e.g. across the antimeridian). Waiting here can deadlock them.
     pub(crate) fn reserve(
-        self: &Arc<Self>,
+        &self,
         array: &Array<EngineStore>,
         subset: &ArraySubset,
         extra_bytes: Option<u64>,
@@ -91,33 +72,31 @@ impl Budget {
                 subset,
                 extra_bytes,
                 split_inner_chunks,
-                self.capacity,
+                self.bytes.capacity(),
             )?;
             let bytes = plan
                 .source
                 .checked_add(plan.workspace)
                 .ok_or(DataServerError::ResourceExhausted)?;
-            self.used
-                .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                    used.checked_add(bytes).filter(|&n| n <= self.capacity)
-                })
-                .map_err(|_| DataServerError::ResourceExhausted)?;
+            let permit = self
+                .bytes
+                .try_reserve(bytes)
+                .ok_or(DataServerError::ResourceExhausted)?;
             Ok(Arc::new(Permit {
-                budget: self.clone(),
-                bytes,
+                _bytes: permit,
                 parallelism: plan.parallelism,
             }))
         })();
-        if matches!(result, Err(DataServerError::ResourceExhausted)) {
-            self.rejected.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        result.map_err(|err| match err {
+            DataServerError::ResourceExhausted => self.reject(),
+            err => err,
+        })
     }
 }
 
+/// Returns its bytes to the budget when dropped.
 pub(crate) struct Permit {
-    budget: Arc<Budget>,
-    bytes: u64,
+    _bytes: BytePermit,
     parallelism: usize,
 }
 
@@ -126,12 +105,6 @@ impl Permit {
     /// must still admit each chunk separately after cache lookup.
     pub(crate) fn parallelism(&self) -> usize {
         self.parallelism
-    }
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 

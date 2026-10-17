@@ -1,6 +1,7 @@
 # ds-executor — Claude instructions
 
-Shared Tokio render admission/execution, with no axum or engine dependencies.
+Shared Tokio render admission/execution, plus the engines' fail-fast source
+byte budget, with no axum or engine dependencies.
 Do not put Tokio in ds-core or ds-render; core only carries the absolute
 thread-local deadline. Capture it explicitly when fanning out onto Rayon.
 
@@ -46,3 +47,16 @@ and records nothing, so a hit carries none. Expired deadlines count by stage
 admission) and memory rejections by reason (`rejected_oversize` is an
 immediate 503, `rejected_deadline` an expired memory wait): the counters
 must keep immediate sheds and deadline expiries apart.
+
+`budget::ByteBudget` / `BytePermit` is the engines' source-read admission,
+not render admission: engine-geotiff's `decode_budget::BUDGET`
+(`MC_GEOTIFF_DECODE_MEMORY_MB`) and engine-zarr's `read_budget::BUDGET`
+(`MC_ZARR_READ_MEMORY_MB`) are instances, and the next engine's budget is
+another one, never a copy (#1067). Keep it apart from `RenderBudget`: it
+never waits, because its callers hold an executor slot and may hold another
+reservation. `reserve` fails at once with `ResourceExhausted` and counts a
+rejection; `try_reserve`, a batch's probe for one more slot, and
+`try_reserve_background`, at most half the capacity (#1004), never count
+one. It checks no deadline and reads no environment: the engine owns its
+static, env var, default, deadline checks and planning, and exports
+`metrics()` (used, capacity, rejected) to `/metrics` unchanged.

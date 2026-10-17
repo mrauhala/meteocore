@@ -1,10 +1,7 @@
 //! Shared admission for transient GeoTIFF decode buffers, separate from caches.
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, LazyLock,
-};
+use std::sync::{Arc, LazyLock};
 
-use ds_core::error::DataServerError;
+pub(crate) use ds_executor::budget::{ByteBudget as Budget, BytePermit as Permit};
 
 /// Source-decode budget in bytes, `MC_GEOTIFF_DECODE_MEMORY_MB` (default
 /// 1024 MiB), shared by every GeoTIFF collection and API. Charged per source
@@ -18,130 +15,10 @@ pub(crate) static BUDGET: LazyLock<Arc<Budget>> = LazyLock::new(|| {
         .and_then(|v| v.parse::<usize>().ok())
         .and_then(|v| v.checked_mul(1024 * 1024))
         .unwrap_or(1024 * 1024 * 1024);
-    Arc::new(Budget::new(bytes))
+    Arc::new(Budget::new(bytes as u64))
 });
 
-pub(crate) struct Budget {
-    limit: usize,
-    used: AtomicUsize,
-    rejected: AtomicUsize,
-}
-
-impl Budget {
-    pub(crate) fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            used: AtomicUsize::new(0),
-            rejected: AtomicUsize::new(0),
-        }
-    }
-
-    pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Permit, DataServerError> {
-        if self
-            .used
-            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                used.checked_add(bytes).filter(|&n| n <= self.limit)
-            })
-            .is_err()
-        {
-            self.rejected.fetch_add(1, Ordering::Relaxed);
-            return Err(DataServerError::ResourceExhausted);
-        }
-        Ok(Permit {
-            budget: self.clone(),
-            bytes,
-        })
-    }
-
-    /// The most background work may hold, together with every request:
-    /// half the budget. A background reservation larger than this never fits.
-    pub(crate) fn background_limit(&self) -> usize {
-        self.limit / 2
-    }
-
-    /// Admission for background work, the poll-cycle pre-warm (#1004): it
-    /// fits only while at least half the budget stays free for requests, and
-    /// a refusal is not counted as a rejected admission, which tracks
-    /// requests turned away with 503. `None` means not now: requests hold
-    /// too much, or `bytes` exceeds [`Self::background_limit`].
-    pub(crate) fn try_reserve_background(self: &Arc<Self>, bytes: usize) -> Option<Permit> {
-        self.used
-            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                used.checked_add(bytes)
-                    .filter(|&n| n <= self.background_limit())
-            })
-            .ok()?;
-        Some(Permit {
-            budget: self.clone(),
-            bytes,
-        })
-    }
-}
-
-pub(crate) struct Permit {
-    budget: Arc<Budget>,
-    bytes: usize,
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
-    }
-}
-
 /// (reserved bytes, capacity bytes, rejected admissions).
-pub fn metrics() -> (usize, usize, usize) {
-    (
-        BUDGET.used.load(Ordering::Relaxed),
-        BUDGET.limit,
-        BUDGET.rejected.load(Ordering::Relaxed),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_admission_is_bounded_and_unwind_releases_bytes() {
-        let budget = Arc::new(Budget::new(100));
-        let barrier = Arc::new(std::sync::Barrier::new(20));
-        std::thread::scope(|scope| {
-            for _ in 0..20 {
-                let budget = budget.clone();
-                let barrier = barrier.clone();
-                scope.spawn(move || {
-                    let permit = budget.reserve(10);
-                    barrier.wait();
-                    assert_eq!(budget.used.load(Ordering::Relaxed), 100);
-                    barrier.wait();
-                    drop(permit);
-                });
-            }
-        });
-        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
-        assert_eq!(budget.rejected.load(Ordering::Relaxed), 10);
-        assert!(budget.reserve(usize::MAX).is_err());
-        let _ = std::panic::catch_unwind(|| {
-            let _permit = budget.reserve(100).unwrap();
-            panic!("decoder failed");
-        });
-        assert!(budget.reserve(100).is_ok());
-    }
-
-    /// #1004: background work never takes the second half of the budget
-    /// and is never counted as a rejected request.
-    #[test]
-    fn background_admission_leaves_half_for_requests() {
-        let budget = Arc::new(Budget::new(100));
-        let request = budget.reserve(30).unwrap();
-        let background = budget.try_reserve_background(20).expect("50 of 100 fits");
-        assert!(budget.try_reserve_background(1).is_none(), "past half");
-        assert_eq!(budget.rejected.load(Ordering::Relaxed), 0);
-        // Requests may still use the rest.
-        let rest = budget.reserve(50).unwrap();
-        drop((request, background, rest));
-        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
-        assert!(Arc::new(Budget::new(0)).try_reserve_background(1).is_none());
-    }
+pub fn metrics() -> (u64, u64, u64) {
+    BUDGET.metrics()
 }

@@ -5896,9 +5896,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .is_empty();
     if has_geotiff {
         let (used, limit, rejected) = engine_geotiff::decode_budget::metrics();
-        GEOTIFF_DECODE_USED.set(used.min(i64::MAX as usize) as i64);
-        GEOTIFF_DECODE_LIMIT.set(limit.min(i64::MAX as usize) as i64);
-        GEOTIFF_DECODE_REJECTED.feed(rejected as u64);
+        GEOTIFF_DECODE_USED.set(used.min(i64::MAX as u64) as i64);
+        GEOTIFF_DECODE_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+        GEOTIFF_DECODE_REJECTED.feed(rejected);
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
     }

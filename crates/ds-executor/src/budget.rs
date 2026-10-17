@@ -1,8 +1,13 @@
-//! Process-wide admission accounting for transient raster render buffers.
+//! Process-wide admission accounting for transient raster render buffers, and
+//! the fail-fast byte budget engines charge their source reads against.
 //!
-//! Separate from cache capacity and source decode budgets. The estimate covers
-//! a boxed f64 raster, RGBA, and encoding/assembly scratch (32 bytes/output
-//! pixel), rather than counting only the final four-byte RGBA buffer.
+//! Both are separate from cache capacity. [`RenderBudget`] admits render
+//! output and waits for memory within the render deadline. Its estimate
+//! covers a boxed f64 raster, RGBA, and encoding/assembly scratch (32
+//! bytes/output pixel), rather than counting only the final four-byte RGBA
+//! buffer. [`ByteBudget`] admits an engine's transient source buffers and
+//! never waits.
+use ds_core::error::DataServerError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Notify;
@@ -51,6 +56,9 @@ pub static RENDER_MEMORY: LazyLock<Arc<RenderBudget>> = LazyLock::new(|| {
     ))
 });
 
+/// Waiting admission for render output buffers: a charge that does not fit
+/// yet waits for releases until the render deadline. Distinct from
+/// [`ByteBudget`], the engines' source-read budget, which never waits.
 #[derive(Debug)]
 pub struct RenderBudget {
     capacity: u64,
@@ -154,6 +162,115 @@ impl Drop for RenderPermit {
     }
 }
 
+/// Fail-fast admission for an engine's transient source buffers: the native
+/// reads, decode outputs and conversion copies it holds while it answers a
+/// request. Each engine owns one process-wide instance behind its own
+/// environment variable and static (engine-geotiff's
+/// `MC_GEOTIFF_DECODE_MEMORY_MB`, engine-zarr's `MC_ZARR_READ_MEMORY_MB`);
+/// this type only keeps the account. It is not an allocator-enforced limit.
+///
+/// Distinct from [`RenderBudget`], which counts output pixels and waits in
+/// the render queue until the deadline. A reservation here that does not fit
+/// fails at once with `ResourceExhausted` (HTTP 503): its callers already
+/// hold an executor slot and may hold another reservation, so waiting could
+/// deadlock them. Nothing here checks the request deadline; a caller that
+/// must, checks before reserving.
+#[derive(Debug)]
+pub struct ByteBudget {
+    capacity: u64,
+    used: AtomicU64,
+    /// Request admissions turned away. Probes and background refusals are
+    /// never counted.
+    rejected: AtomicU64,
+}
+
+impl ByteBudget {
+    pub fn new(capacity: u64) -> Self {
+        Self {
+            capacity,
+            used: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// (reserved bytes, capacity bytes, rejected admissions), the triple each
+    /// engine exports to `/metrics`.
+    pub fn metrics(&self) -> (u64, u64, u64) {
+        (
+            self.used.load(Ordering::Relaxed),
+            self.capacity,
+            self.rejected.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Reserve `bytes` for a request, or count a rejected admission and fail
+    /// with `ResourceExhausted` at once.
+    pub fn reserve(self: &Arc<Self>, bytes: u64) -> Result<BytePermit, DataServerError> {
+        self.try_reserve(bytes).ok_or_else(|| self.reject())
+    }
+
+    /// Reserve `bytes` if they fit now, without counting a refusal: a probe
+    /// for one more slot of a batch, whose smaller fan-out is not a rejected
+    /// request. The caller must [`Self::reject`] if even its first slot
+    /// cannot fit.
+    pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<BytePermit> {
+        self.admit(bytes, self.capacity)
+    }
+
+    /// Count one rejected admission and return its error, for a caller whose
+    /// own estimate shows the request cannot fit.
+    pub fn reject(&self) -> DataServerError {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        DataServerError::ResourceExhausted
+    }
+
+    /// The most background work may hold, together with every request:
+    /// half the budget. A background reservation larger than this never fits.
+    pub fn background_limit(&self) -> u64 {
+        self.capacity / 2
+    }
+
+    /// Admission for background work, such as engine-geotiff's poll-cycle
+    /// pre-warm (#1004): it fits only while at least half the budget stays
+    /// free for requests, and a refusal is not counted as a rejected
+    /// admission, which tracks requests turned away with 503. `None` means
+    /// not now: requests hold too much, or `bytes` exceeds
+    /// [`Self::background_limit`].
+    pub fn try_reserve_background(self: &Arc<Self>, bytes: u64) -> Option<BytePermit> {
+        self.admit(bytes, self.background_limit())
+    }
+
+    fn admit(self: &Arc<Self>, bytes: u64, limit: u64) -> Option<BytePermit> {
+        self.used
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|&n| n <= limit)
+            })
+            .ok()?;
+        Some(BytePermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Bytes held from a [`ByteBudget`], released when the permit drops,
+/// including on unwind.
+#[derive(Debug)]
+pub struct BytePermit {
+    budget: Arc<ByteBudget>,
+    bytes: u64,
+}
+
+impl Drop for BytePermit {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +348,102 @@ mod tests {
             assert_eq!(budget.rejected(), 0);
         });
         assert_eq!(budget.available(), budget.capacity());
+    }
+
+    #[test]
+    fn byte_reserve_releases_on_drop_and_counts_each_rejection() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let first = budget.reserve(60).unwrap();
+        let second = budget.reserve(40).unwrap();
+        assert_eq!(budget.metrics(), (100, 100, 0));
+        assert!(matches!(
+            budget.reserve(1),
+            Err(DataServerError::ResourceExhausted)
+        ));
+        assert_eq!(budget.metrics(), (100, 100, 1));
+        drop(first);
+        assert_eq!(budget.metrics(), (40, 100, 1));
+        assert!(budget.reserve(61).is_err());
+        assert_eq!(budget.metrics(), (40, 100, 2));
+        let rest = budget.reserve(60).unwrap();
+        drop((second, rest));
+        assert_eq!(budget.metrics(), (0, 100, 2));
+        // Overflowing the running total never fits.
+        let held = budget.reserve(1).unwrap();
+        assert!(budget.reserve(u64::MAX).is_err());
+        drop(held);
+        assert!(matches!(
+            budget.reject(),
+            DataServerError::ResourceExhausted
+        ));
+        assert_eq!(budget.metrics(), (0, 100, 4));
+        // A zero budget still admits nothing larger than zero bytes.
+        let zero = Arc::new(ByteBudget::new(0));
+        assert!(zero.reserve(0).is_ok());
+        assert!(zero.reserve(1).is_err());
+        assert_eq!(zero.metrics(), (0, 0, 1));
+    }
+
+    /// A batch probing for one more slot is not a rejected request.
+    #[test]
+    fn byte_probe_never_counts_a_refusal() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let held = budget.try_reserve(60).unwrap();
+        assert!(budget.try_reserve(60).is_none());
+        assert!(budget.try_reserve(u64::MAX).is_none());
+        assert_eq!(budget.metrics(), (60, 100, 0));
+        let rest = budget.try_reserve(40).unwrap();
+        assert_eq!(budget.metrics(), (100, 100, 0));
+        drop((held, rest));
+        assert_eq!(budget.metrics(), (0, 100, 0));
+    }
+
+    #[test]
+    fn concurrent_byte_admission_is_bounded_and_unwind_releases_bytes() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let barrier = Arc::new(std::sync::Barrier::new(20));
+        std::thread::scope(|scope| {
+            for _ in 0..20 {
+                let budget = budget.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let permit = budget.reserve(10);
+                    barrier.wait();
+                    assert_eq!(budget.metrics().0, 100);
+                    barrier.wait();
+                    drop(permit);
+                });
+            }
+        });
+        assert_eq!(budget.metrics(), (0, 100, 10));
+        let _ = std::panic::catch_unwind(|| {
+            let _permit = budget.reserve(100).unwrap();
+            panic!("decoder failed");
+        });
+        assert!(budget.reserve(100).is_ok());
+    }
+
+    /// #1004: background work never takes the second half of the budget
+    /// and is never counted as a rejected request.
+    #[test]
+    fn background_admission_leaves_half_for_requests() {
+        let budget = Arc::new(ByteBudget::new(100));
+        assert_eq!(budget.background_limit(), 50);
+        let request = budget.reserve(30).unwrap();
+        let background = budget.try_reserve_background(20).expect("50 of 100 fits");
+        assert!(budget.try_reserve_background(1).is_none(), "past half");
+        assert_eq!(budget.metrics(), (50, 100, 0));
+        // Requests may still use the rest.
+        let rest = budget.reserve(50).unwrap();
+        drop((request, background, rest));
+        assert_eq!(budget.metrics(), (0, 100, 0));
+        // Larger than half never fits, even on an idle budget.
+        assert!(budget.try_reserve_background(51).is_none());
+        assert_eq!(budget.metrics(), (0, 100, 0));
+        assert!(Arc::new(ByteBudget::new(0))
+            .try_reserve_background(1)
+            .is_none());
+        // An odd capacity rounds the background half down.
+        assert_eq!(ByteBudget::new(101).background_limit(), 50);
     }
 }
