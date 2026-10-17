@@ -30,7 +30,7 @@
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -43,7 +43,7 @@ use ds_poll::{FirstTick, Shutdown};
 
 use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
-    TimeWindow,
+    Schedule, Settling, TemplateProber, TemplateSpec, TimeWindow, MAX_TEMPLATE_SLOTS,
 };
 
 use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, CatalogError, Location};
@@ -128,31 +128,19 @@ enum Source {
         time_window: Option<TimeWindow>,
     },
     /// A non-listable HTTP(S) directory discovered by **template probe**
-    /// (#287): instead of `list`, candidate filenames are built from
-    /// `template` (the strftime `filename_template`) for timestamps walked
-    /// back from now over `cadence`, and each is `HEAD`-probed. For
-    /// autoindex servers (DWD opendata) where `list` (WebDAV `PROPFIND`)
-    /// returns nothing. `time_window` bounds how far back to walk;
-    /// `base_url` is diagnostics only.
+    /// (#287): instead of `list`, the shared
+    /// [`ds_storage::discovery::TemplateProber`] builds candidate filenames
+    /// from the strftime `filename_template` for timestamps walked back
+    /// from now over `cadence_secs`, and HEADs them. For autoindex servers
+    /// (DWD opendata) where `list` (WebDAV `PROPFIND`) returns nothing. The
+    /// prober keeps what it found between polls; `base_url` is diagnostics
+    /// only.
     TemplateHttp {
         store: ds_storage::DataStore,
         base_url: String,
-        base_prefix: String,
-        template: String,
-        cadence: Duration,
-        time_window: Option<TimeWindow>,
+        prober: Arc<Mutex<TemplateProber>>,
     },
 }
-
-/// Hard cap on candidate timestamps probed per template scan — a backstop
-/// against an unbounded walk when neither `time_window` nor `max_files`
-/// bounds it. 288 = 24 h at a 5-minute cadence. The probes are concurrent
-/// `HEAD`s (cheap), so this is generous; `time_window`/`max_files` clamp it
-/// far lower in practice (DWD `-PT2H` @ 300 s → 25 probes).
-const HARD_MAX_PROBES: usize = 288;
-
-/// Max concurrent `HEAD` probes in a template scan.
-const PROBE_CONCURRENCY: usize = 16;
 
 /// Diagnostic descriptor for a [`Source::Remote`] store — names the
 /// backend in logs and error messages. The `store` does the real work;
@@ -184,11 +172,6 @@ fn scan_source(
     source: &Source,
     matcher: &FilenameMatcher,
     max_files: Option<usize>,
-    // The current catalog, used only by the template-probe source to skip
-    // re-probing already-known slots. Empty at construction; the poll
-    // passes the live catalog. List-based sources ignore it (one `list`
-    // call already returns the whole set cheaply).
-    known: &[CatalogEntry],
 ) -> Result<Vec<CatalogEntry>, EngineError> {
     match source {
         Source::Local {
@@ -231,149 +214,61 @@ fn scan_source(
                 max_files,
             )?)
         }
-        Source::TemplateHttp {
-            store,
-            base_prefix,
-            template,
-            cadence,
-            time_window,
-            ..
-        } => Ok(discover_template_at(
-            Utc::now(),
-            store,
-            base_prefix,
-            template,
-            *cadence,
-            time_window.as_ref(),
-            max_files,
-            known,
-        )?),
+        Source::TemplateHttp { store, prober, .. } => {
+            let mut prober = prober.lock().unwrap_or_else(PoisonError::into_inner);
+            prober.poll(store, Utc::now())?;
+            Ok(template_catalog(store, &prober))
+        }
     }
 }
 
-/// Discover ODIM files on a non-listable HTTP source by **probing**
-/// candidate filenames instead of listing the directory.
-///
-/// Builds one candidate per timestamp from `now` walked back by `cadence`
-/// — `N = min(window/cadence, max_files, HARD_MAX_PROBES)` steps — and
-/// renders each filename with `time.format(template)` (the strftime
-/// inverse of the catalog matcher) joined under `base_prefix`.
-///
-/// **Incremental.** A candidate already present in `known` (the current
-/// catalog) is carried forward unchanged — radar files are immutable once
-/// published, so re-`HEAD`-ing them is pure overhead. Only the candidates
-/// *not* in `known` are `HEAD`-probed (concurrently): the freshly-arrived
-/// newest slot, plus any still-missing slots (a gap or a late upload),
-/// which keep being retried until they arrive or age out of the window.
-/// So the first scan probes the whole window, but each subsequent poll
-/// probes only ~one slot. Survivors (carried + newly-found) become
-/// [`CatalogEntry`] values whose timestamp is the one we generated (no
-/// parsing); bytes are fetched lazily on render via [`fetch_bytes`].
-/// Sorted ascending, deduped by timestamp.
-///
-/// `now` is a parameter (not `Utc::now()` inside) so the probe is
-/// deterministically testable against a controlled clock.
-#[allow(clippy::too_many_arguments)]
-fn discover_template_at(
-    now: DateTime<Utc>,
-    store: &ds_storage::DataStore,
-    base_prefix: &str,
-    template: &str,
-    cadence: Duration,
-    time_window: Option<&TimeWindow>,
+/// The catalog of a template-probe source: the files its prober published,
+/// oldest first. Radar composites are one file per timestamp, without leads.
+fn template_catalog(store: &ds_storage::DataStore, prober: &TemplateProber) -> Vec<CatalogEntry> {
+    prober
+        .files()
+        .into_iter()
+        .map(|file| CatalogEntry {
+            time: file.time,
+            location: Location::Remote {
+                store: store.clone(),
+                key: file.key,
+            },
+        })
+        .collect()
+}
+
+/// The probe a `discovery = "template"` source runs (#287): one composite
+/// per `cadence_secs` step back from now over `time_window`, at most
+/// `max_files` steps and [`MAX_TEMPLATE_SLOTS`], each HEADed under
+/// `base_prefix` until found. A file found is catalogued at once and never
+/// HEADed again: radar composites are renamed into place complete and are
+/// immutable once published, so only the newest step and still-missing
+/// steps cost a HEAD on each poll. Objects over
+/// [`crate::catalog::MAX_REMOTE_FILE_SIZE`] are skipped.
+fn template_prober(
+    collection_id: &str,
+    base_prefix: String,
+    template: String,
+    cadence_secs: u64,
+    time_window: Option<TimeWindow>,
     max_files: Option<usize>,
-    known: &[CatalogEntry],
-) -> Result<Vec<CatalogEntry>, EngineError> {
-    use ds_storage::object_store::path::Path as ObjectPath;
-    use std::collections::HashMap;
-
-    let cadence_secs = (cadence.as_secs().max(1)) as i64;
-
-    // How many timestamp slots back to probe.
-    let window_steps = match time_window {
-        Some(tw) => {
-            let (start, end) = tw.to_range(now);
-            // +1 so the walk includes `now`'s own (aligned) slot.
-            ((end - start).num_seconds().abs() / cadence_secs) as usize + 1
-        }
-        None => HARD_MAX_PROBES,
-    };
-    let bounded = window_steps
-        .min(max_files.unwrap_or(usize::MAX))
-        .min(HARD_MAX_PROBES);
-    let n = bounded.max(1);
-
-    // Align `now` down to the cadence grid (epoch-aligned), then walk back.
-    let now_ts = now.timestamp();
-    let aligned = now_ts - now_ts.rem_euclid(cadence_secs);
-    let stamps: Vec<DateTime<Utc>> = (0..n)
-        .filter_map(|i| DateTime::<Utc>::from_timestamp(aligned - (i as i64) * cadence_secs, 0))
-        .collect();
-
-    // Carry forward already-known in-window entries (no re-probe); collect
-    // the rest as the slots to actually HEAD.
-    let known_by_time: HashMap<DateTime<Utc>, &CatalogEntry> =
-        known.iter().map(|e| (e.time, e)).collect();
-    let mut entries: Vec<CatalogEntry> = Vec::new();
-    let mut probe_stamps: Vec<DateTime<Utc>> = Vec::new();
-    for stamp in &stamps {
-        match known_by_time.get(stamp) {
-            Some(entry) => entries.push((*entry).clone()),
-            None => probe_stamps.push(*stamp),
-        }
-    }
-
-    // Render + probe only the unknown candidates' filenames concurrently.
-    let probe_keys: Vec<String> = probe_stamps
-        .iter()
-        .map(|t| join_prefix(base_prefix, &t.format(template).to_string()))
-        .collect();
-    let paths: Vec<ObjectPath> = probe_keys
-        .iter()
-        .map(|k| ObjectPath::from(k.as_str()))
-        .collect();
-    let probed = store.head_many(&paths, PROBE_CONCURRENCY)?;
-
-    for ((time, key), result) in probe_stamps
-        .iter()
-        .zip(probe_keys.iter())
-        .zip(probed.iter())
-    {
-        match result {
-            Ok(Some(meta)) => {
-                if meta.size > crate::catalog::MAX_REMOTE_FILE_SIZE {
-                    tracing::warn!(
-                        "[odim-template] skipping oversized object `{key}` ({} bytes)",
-                        meta.size
-                    );
-                    continue;
-                }
-                entries.push(CatalogEntry {
-                    time: *time,
-                    location: Location::Remote {
-                        store: store.clone(),
-                        key: key.clone(),
-                    },
-                });
-            }
-            Ok(None) => {} // absent — expected for most candidate slots
-            Err(e) => tracing::warn!("[odim-template] HEAD `{key}` failed: {e}"),
-        }
-    }
-
-    entries.sort_by_key(|e| e.time);
-    entries.dedup_by(|a, b| a.time == b.time);
-    Ok(entries)
-}
-
-/// Join a base prefix and a filename with exactly one `/` (and none when
-/// the base is empty — an `http(s)://host/` URL pointing at the root).
-fn join_prefix(base_prefix: &str, filename: &str) -> String {
-    if base_prefix.is_empty() {
-        filename.to_string()
-    } else {
-        format!("{}/{}", base_prefix.trim_end_matches('/'), filename)
-    }
+) -> Result<TemplateProber, EngineError> {
+    let cadence = chrono::Duration::seconds(i64::try_from(cadence_secs).unwrap_or(i64::MAX));
+    Ok(TemplateProber::new(TemplateSpec {
+        time_window,
+        max_slots: max_files,
+        max_heads_per_poll: MAX_TEMPLATE_SLOTS,
+        settling: Settling::OnSight,
+        immutable: true,
+        max_size: Some(crate::catalog::MAX_REMOTE_FILE_SIZE),
+        ..TemplateSpec::new(
+            base_prefix,
+            template,
+            Schedule::Cadence(cadence),
+            collection_id,
+        )
+    })?)
 }
 
 /// Fetch the raw bytes of one ODIM file from its catalog location.
@@ -619,9 +514,9 @@ impl OdimEngine {
         max_files: Option<usize>,
         poll_interval_secs: u64,
     ) -> Result<Self, EngineError> {
-        // Construction: no prior catalog, so the template probe scans the
-        // whole window (`known` is empty).
-        let catalog = scan_source(&source, &matcher, max_files, &[])?;
+        // Construction: the template probe's prober has found nothing yet,
+        // so it probes the whole window.
+        let catalog = scan_source(&source, &matcher, max_files)?;
         if catalog.is_empty() {
             return Err(EngineError::NoFiles {
                 location: source_label(&source),
@@ -711,36 +606,31 @@ impl OdimEngine {
         )
     }
 
-    /// Drive the #287 template-discovery probe against a controlled clock —
-    /// the seam the integration suite uses to test the listing-free HTTP
-    /// discovery deterministically (over a `LocalFileSystem`-backed
-    /// `DataStore`, whose `head` returns `NotFound` for absent candidates).
+    /// The #287 template-discovery prober a `discovery = "template"`
+    /// source runs — the seam the integration suite uses to drive the
+    /// listing-free HTTP discovery against a controlled clock
+    /// (`TemplateProber::poll` takes `now`), over a `LocalFileSystem`-backed
+    /// `DataStore`, whose `head` returns `NotFound` for absent candidates.
     /// `time_window` is an ISO 8601 duration string (e.g. `"-PT1H"`).
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn discover_template_for_test(
-        now: DateTime<Utc>,
-        store: ds_storage::DataStore,
+    pub fn template_prober_for_test(
         base_prefix: &str,
         template: &str,
         cadence_secs: u64,
         time_window: Option<&str>,
         max_files: Option<usize>,
-        known: &[CatalogEntry],
-    ) -> Result<Vec<CatalogEntry>, EngineError> {
-        let tw = match time_window {
+    ) -> Result<TemplateProber, EngineError> {
+        let time_window = match time_window {
             Some(s) => Some(TimeWindow::parse(s)?),
             None => None,
         };
-        discover_template_at(
-            now,
-            &store,
-            base_prefix,
-            template,
-            Duration::from_secs(cadence_secs),
-            tw.as_ref(),
+        template_prober(
+            "test",
+            base_prefix.to_string(),
+            template.to_string(),
+            cadence_secs,
+            time_window,
             max_files,
-            known,
         )
     }
 
@@ -778,15 +668,11 @@ impl OdimEngine {
     }
 
     fn poll_once(&self) {
-        // Snapshot the current catalog *before* scanning so the template
-        // probe can carry forward already-known slots and HEAD only the new
-        // ones (list-based sources ignore it). Held across the scan — a
-        // cheap `ArcSwap` guard on the background poll path.
         let prev = self.catalog.load_full();
         // Direct (not `spawn_blocking`) so a remote scan's `ds-storage`
         // `block_in_place` runs on the multi-thread poll-runtime worker —
         // valid there, panics on a `spawn_blocking` thread. See `poll_loop`.
-        let scan = match scan_source(&self.source, &self.matcher, self.max_files, &prev) {
+        let scan = match scan_source(&self.source, &self.matcher, self.max_files) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -1023,13 +909,18 @@ fn build_source(
                              cadence={cadence_secs}s",
                             collection_id
                         );
+                        let prober = template_prober(
+                            collection_id,
+                            base_prefix,
+                            template,
+                            cadence_secs,
+                            time_window,
+                            config.max_files,
+                        )?;
                         Ok(Source::TemplateHttp {
                             store,
                             base_url: data_path.to_string(),
-                            base_prefix,
-                            template,
-                            cadence: Duration::from_secs(cadence_secs),
-                            time_window,
+                            prober: Arc::new(Mutex::new(prober)),
                         })
                     }
                     // List mode (default) — WebDAV `PROPFIND`. NOTE: a plain
@@ -1128,10 +1019,14 @@ fn source_label(source: &Source) -> String {
             }
         },
         Source::TemplateHttp {
-            base_url,
-            base_prefix,
-            ..
-        } => format!("http {base_url} (template-probe, prefix '{base_prefix}')"),
+            base_url, prober, ..
+        } => {
+            let prober = prober.lock().unwrap_or_else(PoisonError::into_inner);
+            format!(
+                "http {base_url} (template-probe, prefix '{}')",
+                prober.spec().base
+            )
+        }
     }
 }
 
@@ -1632,17 +1527,19 @@ mod tests {
         )
         .expect("template-mode http source builds");
         match &source {
-            Source::TemplateHttp {
-                base_prefix,
-                template,
-                cadence,
-                time_window,
-                ..
-            } => {
-                assert_eq!(base_prefix, "weather/radar/composite/hx");
-                assert_eq!(template, "composite_hx_%Y%m%d_%H%M-hd5");
-                assert_eq!(*cadence, Duration::from_secs(300));
-                assert!(time_window.is_some());
+            Source::TemplateHttp { prober, .. } => {
+                let prober = prober.lock().unwrap();
+                let spec = prober.spec();
+                assert_eq!(spec.base, "weather/radar/composite/hx");
+                assert_eq!(spec.filename_template, "composite_hx_%Y%m%d_%H%M-hd5");
+                assert_eq!(
+                    spec.schedule,
+                    Schedule::Cadence(chrono::Duration::seconds(300))
+                );
+                assert!(spec.time_window.is_some());
+                // Radar composites are immutable once found.
+                assert!(spec.immutable);
+                assert_eq!(spec.settling, Settling::OnSight);
             }
             _ => panic!("discovery=template must build a TemplateHttp source"),
         }

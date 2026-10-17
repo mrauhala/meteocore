@@ -39,7 +39,7 @@ use chrono::{DateTime, Utc};
 use ds_poll::Shutdown;
 use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
-    ScanSpec, TimeWindow,
+    PendingFile, ScanSpec, TimeWindow,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
-use crate::catalog::{scan_directory, scan_remote, Catalog, PendingFile};
+use crate::catalog::{scan_directory, scan_remote, Catalog};
 
 /// Tracks STAC entries currently being loaded, deduplicating concurrent
 /// loads: the first caller claims the path and loads, later callers park on

@@ -744,7 +744,7 @@ Values are converted to `f64` internally. Physical values: `physical = raw * sca
 
 The engine polls for new files at a configurable interval (`poll_interval_secs`, default 30s):
 
-- **Local files:** New files are held in a "pending" state for one poll cycle to confirm they are fully written (size stability check).
+- **Local files:** A new file is held in a "pending" state until two more poll cycles see the same size, to confirm it is fully written (size stability check).
 - **Excluded files:** Local files and remote objects whose names match `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped before the filename is matched, so a partial upload never replaces the finished file of the same timestamp or counts toward `max_files`. Hidden files (`.name`) are skipped whatever `exclude_patterns` holds.
 - **Remote files:** Uses COG byte-range reads to fetch only the first 512 KB, which hold a COG's IFD header, for metadata. Falls back to a full download only when those bytes do not parse as a COG. When the range read itself fails, for example on a storage timeout, the file is skipped for that poll cycle and its header is read again on the next one.
 - **Metadata caching:** Files with unchanged size reuse their cached metadata across poll cycles.

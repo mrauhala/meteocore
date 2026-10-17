@@ -292,6 +292,15 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   The local scan follows symlinks to files (`Symlinks::Follow`). The engine
   keeps only its error policy: all prefixes failing with nothing kept is an
   error, some failing is a WARN.
+- COMP `discovery = "template"` (#287) runs the shared
+  `ds_storage::discovery::TemplateProber` (#1067), configured by
+  `template_prober` in `src/engine.rs`: `Schedule::Cadence` of
+  `cadence_secs`, `max_files` as `max_slots`, at most `MAX_TEMPLATE_SLOTS`
+  HEADs per poll, `Settling::OnSight` and `immutable`, so a found composite
+  is catalogued at once and never HEADed again, and objects over
+  `MAX_REMOTE_FILE_SIZE` are skipped. `Source::TemplateHttp` keeps the
+  prober, and with it what it found, between polls. Never re-implement the
+  probing here.
 - PVOL `enumerate_remote` uses no template: `parse_key_timestamp` reads the
   basename's first 12-digit run, only as a pre-fetch window filter. It lists
   through the shared bounded-concurrent `discovery::list_prefixes`, never a
