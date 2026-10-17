@@ -514,10 +514,15 @@ the repository:
 | `ets-geotiff` | A plain raster: one GeoTIFF on a projected grid (EPSG:3067) |
 | `ets-radar` | A time axis: five radar frames |
 | `ets-grib-pressure` | An elevation axis (GRIB pressure levels) and a model-run axis (`reference_time`), one value each |
-| `ets-arpege/<param>` | A multi-parameter forecast: a parent layer with one child layer per parameter, a model-run axis of one run, and an `<Attribution>` |
+| `ets-multi/<param>` | A multi-parameter forecast: a parent layer with one child layer per parameter, a model-run axis of one run, and an `<Attribution>` |
 
 No committed fixture holds several model runs or several pressure levels, so
 those axes are tested with a single value.
+
+GetCapabilities lists the layers in collection-id order, the order of the
+OGC API `/collections` list (#1102). Several tests take the first or the last
+named layer, so the ids decide which layers the suite tests, and every run
+tests the same ones.
 
 The run requests the basic conformance class and, since GetFeatureInfo
 (#1064), the queryable class; the data-independent tests always run. Every
@@ -557,16 +562,20 @@ these deliberate limits:
   tests query a Blue Lake layer, so with none served they send empty
   `LAYERS` and `QUERY_LAYERS`. The data-independent GetFeatureInfo tests
   read MeteoCore's own layers.
-- The suite picks a layer from the capabilities at random for several
-  tests, so a run's count of failures varies with its picks:
-  - `getmap:transparent-default` wants no transparent pixel without
-    `TRANSPARENT`; it fails when the picked layer has no data in its box,
-    since the empty image is transparent while `TRANSPARENT` defaults to
-    `TRUE` (#163).
-  - `getmap:layerlimit` encodes the picked layer's name twice, so a child
-    layer's `/` arrives as `%2F` and the layer is not defined;
-    `getmap:transparent-opaque-layer` sends an empty `CRS` for a picked
-    child layer. Both pass on a top-level layer.
+- The first named layer is `ets-geotiff`, a top-level layer with no data at
+  0°N 0°E. The results of three tests depend on that choice:
+  - `getmap:transparent-default` asks for a box around 0°N 0°E without
+    `TRANSPARENT` and wants no transparent pixel. The empty image is
+    transparent while `TRANSPARENT` defaults to `TRUE` (#163), and the test
+    fails. Over data, as on the global `ets-grib-pressure`, it would pass
+    whatever the default.
+  - `getmap:layerlimit` and `getmap:transparent-opaque-layer` pass. On a
+    child layer, such as `ets-multi/10wdir`, both fail on the request
+    ets-wms13 1.34 builds: `layerlimit` percent-encodes the name twice, so
+    the `/` arrives as `%2F` and the layer is not defined, and
+    `transparent-opaque-layer` sends an empty `CRS` and the box `0,0,1,1`
+    for a layer that inherits its `BoundingBox` and `CRS` from its parent,
+    as WMS 1.3.0 §7.2.4.8 allows.
 - The basic class's dataset tests and the separate data-preconditions class
   need OGC's "Blue Lake" test dataset (the `cite:*` layers), which MeteoCore
   does not serve. They fail.

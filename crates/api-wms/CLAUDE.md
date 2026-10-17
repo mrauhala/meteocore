@@ -298,6 +298,10 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   namespace (GeoServer and MapServer write it the same way). A
   `<GetLegendGraphic>` in the WMS namespace is invalid. A new operation
   that is not WMS's own needs its namespace and schema pair too.
+- The collections' layers come in collection-id order, never the
+  registry's HashMap order, which changes with every process (#1102). The
+  OGC test suite tests the first or last named layer; `ci/wms-ets/config.toml`
+  picks its ids for that.
 - `<Capability>` is `Request`, `Exception`, then the root `Layer`, the
   schema's sequence. `<Exception>` lists `EXCEPTION_FORMATS`, `XML` only:
   every request error is a ServiceExceptionReport, served as `text/xml`

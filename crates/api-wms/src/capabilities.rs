@@ -83,8 +83,14 @@ pub fn get_capabilities_xml(
         write_text_element(&mut writer, "CRS", crs);
     }
 
-    // Individual layers (one per collection)
-    for (id, config) in collections {
+    // Individual layers (one per collection), in collection-id order, as the
+    // OGC API `/collections` list. The registry is a HashMap, whose order
+    // changes with every process: clients saw the layers reshuffled at each
+    // restart, and the OGC test suite, which picks the first or last named
+    // layer, picked a different one each run (#1102).
+    let mut ordered: Vec<(&String, &CollectionConfig)> = collections.iter().collect();
+    ordered.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (id, config) in ordered {
         if let Some(engine) = engines.get(id) {
             let info = engine.raster_info_shared();
 

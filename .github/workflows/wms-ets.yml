@@ -154,7 +154,7 @@ jobs:
               && grep -qF '<Name>ets-geotiff</Name>' ets-report/capabilities.xml \
               && grep -qF '<Name>ets-radar</Name>' ets-report/capabilities.xml \
               && grep -qF '<Name>ets-grib-pressure</Name>' ets-report/capabilities.xml \
-              && grep -qF '<Name>ets-arpege/' ets-report/capabilities.xml; then
+              && grep -qF '<Name>ets-multi/' ets-report/capabilities.xml; then
               echo "Server ready."
               exit 0
             fi

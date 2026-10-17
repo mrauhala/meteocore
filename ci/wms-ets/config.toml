@@ -17,11 +17,25 @@
 #                       model-run axis (`reference_time`). The committed
 #                       fixture holds one level (150 hPa) of one run, so
 #                       both axes have a single value.
-# - ets-arpege:         a multi-parameter GRIB forecast: a parent layer
-#                       with one child layer per parameter, a model-run axis
-#                       of one run, and an <Attribution>.
+# - ets-multi:          a multi-parameter GRIB forecast (ARPEGE 10 m wind):
+#                       a parent layer with one child layer per parameter,
+#                       a model-run axis of one run, and an <Attribution>.
 #
 # No committed fixture has several model runs or several pressure levels.
+#
+# The ids decide which layer the suite tests. GetCapabilities lists the
+# layers in collection-id order, ets-geotiff, ets-grib-pressure,
+# ets-multi/<param>, ets-radar, and several tests take the first named layer,
+# so every run tests the same layers (#1102). Keep a top-level layer without
+# data at 0°N 0°E first:
+#
+# - On a child layer, getmap:layerlimit and getmap:transparent-opaque-layer
+#   fail on the suite's own request: the first encodes the name twice, the
+#   second sends an empty CRS for a layer that inherits its BoundingBox.
+# - getmap:transparent-default asks for a box around 0°N 0°E without
+#   TRANSPARENT. Over no data it meets the TRANSPARENT=TRUE default (#163)
+#   and fails; over data, such as the global ets-grib-pressure, it passes
+#   whatever the default.
 
 [server]
 # The suite's container shares the runner's network (`--network host`), so
@@ -83,7 +97,8 @@ poll_interval_secs = 3600
 colormap = "viridis"
 
 [[collections]]
-id = "ets-arpege"
+# Not `ets-arpege`, which would sort first and put a child layer first.
+id = "ets-multi"
 title = "Multi-parameter forecast (GRIB)"
 description = "ARPEGE 10 m wind components, speed and direction from one run"
 engine_type = "grib"
