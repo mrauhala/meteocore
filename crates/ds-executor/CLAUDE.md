@@ -1,7 +1,7 @@
 # ds-executor — Claude instructions
 
-Shared Tokio render admission/execution, plus the engines' fail-fast source
-byte budget, with no axum or engine dependencies.
+Shared Tokio render admission/execution and the one query runtime, plus the
+engines' fail-fast source byte budget, with no axum or engine dependencies.
 Do not put Tokio in ds-core or ds-render; core only carries the absolute
 thread-local deadline. Capture it explicitly when fanning out onto Rayon.
 
@@ -20,21 +20,46 @@ waiters, deadline expiry, and worker permit ownership.
 
 Two ways to run admitted work, sharing one worker wrapper and one join:
 `RenderJob::run`, a `spawn_blocking` thread of the caller's runtime, for a
-render; and `RenderJob::run_query`, a task on the process-wide
-`QUERY_RUNTIME` (multi-thread, 2–8 workers like api-edr's, threads named
-`render-query`), for a synchronous engine *query* such as WMS
-GetFeatureInfo's EDR position call (#1064). An engine query may take
-`Handle::current()` and spawn: GRIB's field jobs, the `DataStore` bridge.
-From `run`, that handle is the serving runtime, so the blocking work lands
-on request workers (root CLAUDE.md Critical Rule 7). From `run_query` it is
-the query runtime, where `block_in_place` is valid. The slot, the deadline
-and the abort-before-start semantics are the same for both.
+render; and `RenderJob::run_query`, a task on the shared query runtime, for
+a synchronous engine *query* such as WMS GetFeatureInfo's EDR position call
+(#1064). An engine query may take `Handle::current()` and spawn: GRIB's
+field jobs, the `DataStore` bridge. From `run`, that handle is the serving
+runtime, so the blocking work lands on request workers (root CLAUDE.md
+Critical Rule 7). From `run_query` it is the query runtime, where
+`block_in_place` is valid. The slot, the deadline and the abort-before-start
+semantics are the same for both.
+
+The query runtime is ONE per process (#1103), and its API is stable:
+`query_runtime()` returns its `&'static Handle`, `query_workers()` its worker
+count (available CPUs, 2–8), and `QUERY_THREAD_NAME` (`mc-query`) names its
+worker and blocking threads. api-edr runs every data query on it, under its
+own admission (`query_workers()` running, 32 more waiting) and 30 s
+deadline, a cross-section trajectory on its blocking pool; GetFeatureInfo
+runs on it through `run_query`, under the render slots. Never build a
+second query runtime for an API: share this one and keep the API's own
+admission and deadline. Each API's admission bounds what it puts there; a
+query waiting for a worker counts against its own deadline. Tests pin the
+runtime by `Handle::id()` and the thread name:
+`run_query_runs_engine_work_on_the_query_runtime` here, api-edr's
+`queries_run_on_the_shared_query_runtime_under_the_edr_deadline`, and the
+server's `edr_and_get_feature_info_share_one_query_runtime`.
+
+GetFeatureInfo admits with `RenderJob::acquire_feature_info`: the render
+slots and queue, no memory (one point), under its own deadline,
+`MC_FEATURE_INFO_TIMEOUT_MS` (10 000 by default, at most one day), not the
+render deadline: a cold GRIB position query can need more than 3 s. As for
+every job, the deadline starts at admission, so it covers the wait for a
+slot as well as the query, and its expiries count in the same `queue` and
+`render` stages as a render's. Pinned by
+`feature_info_has_a_deadline_of_its_own` here and in api-wms's
+`get_feature_info` tests.
 
 Slot count: `render_concurrency()`, fixed by its first read — the server's
 `[server] render_concurrency` via `set_render_concurrency` at boot, else
 `default_render_concurrency()` (2× CPUs, min 8). Nothing may read the slots,
 queue or metrics before the server sets it; tests of it need process isolation.
-Raster default: MC_RENDER_TIMEOUT_MS=3000. Shared 3D points/meshes use 30 s.
+Raster default: MC_RENDER_TIMEOUT_MS=3000. Shared 3D points/meshes use 30 s,
+GetFeatureInfo MC_FEATURE_INFO_TIMEOUT_MS=10000.
 MC_RENDER_QUEUE_CAPACITY defaults to 3× render concurrency; zero permits no
 waiting. Global slots and queue survive reload. Metrics snapshot is exported
 through server and its Grafana dashboard. `RenderTiming` is the response

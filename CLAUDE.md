@@ -15,7 +15,8 @@ per-run publication) and the shared `PendingFile` settling rule (#1067);
 per-host request limits for files read in place),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
-`ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure,
+`ds-executor` (shared Tokio render admission/deadline execution and the one
+query runtime EDR and WMS GetFeatureInfo share; API-facing infrastructure,
 plus `budget::ByteBudget`, the fail-fast byte budget each engine's source-read
 admission is an instance of — never another copy, #1067),
 `ds-poll` (shared poll-loop lifecycle: the `Shutdown` handle + `PollTicker`
@@ -39,7 +40,7 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 of these crates, read its file — it holds that crate's rules and gotchas:
 
 - `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership,
-  the engines' fail-fast `ByteBudget`.
+  the shared query runtime, the engines' fail-fast `ByteBudget`.
 - `crates/server/CLAUDE.md` — CLI flags, no-config boot, auto-collections,
   reload/watcher trust model, proxy headers.
 - `crates/api-common/CLAUDE.md` — shared discovery validation, metadata/navigation, OpenAPI and conformance.
@@ -118,9 +119,10 @@ Violating these has caused production incidents. Never break them.
    (`block_in_place(|| handle.block_on(..))`). Keep its runtime context
    explicit:
    - Call it from the background poll runtime (or another dedicated runtime).
-     A request's engine *query* runs as a task on a dedicated query
-     runtime: api-edr's executor, and `ds_executor::RenderJob::run_query`
-     for WMS GetFeatureInfo (#1064).
+     A request's engine *query* runs as a task on the one shared query
+     runtime, `ds_executor::query_runtime()` (threads `mc-query`, #1103):
+     api-edr's executor, and `ds_executor::RenderJob::run_query` for WMS
+     GetFeatureInfo (#1064). Each keeps its own admission and deadline.
    - Never from a request-handler task — it parks a request worker.
    - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
      `get_range_on`, `get_range_on_with_budget`,
@@ -305,7 +307,7 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   pre-warm) uses `new_with_hot_allocation` (engine-odim's `PIXEL_CACHE`,
   0.5, #992). The hot share also caps the largest entry a shard admits.
 - **API crates depend on ds-core and api-common** (shared Common HTTP glue),
-  plus ds-executor for bounded render execution,
+  plus ds-executor for bounded render execution and the shared query runtime,
   ds-render for
   api-wms/api-maps, and api-edr for its `f=png` time-series plots — never on
   engine crates. The one API-to-API edge is api-edr → api-features: EDR

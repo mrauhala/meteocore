@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
@@ -79,6 +80,8 @@ struct Nwp {
     answer: Answer,
     unit: &'static str,
     content_version: u64,
+    /// How long a position query takes.
+    delay: Duration,
     calls: Mutex<Vec<Call>>,
 }
 
@@ -88,6 +91,18 @@ impl Nwp {
             answer,
             unit: "K",
             content_version: 0,
+            delay: Duration::ZERO,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// An engine whose position query takes `delay`, then answers 280 K.
+    fn slow(delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Answer::Value(280.0),
+            unit: "K",
+            content_version: 0,
+            delay,
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -249,6 +264,7 @@ impl EdrEngine for Nwp {
             z: z.map(<[f64]>::to_vec),
             reference_time,
         });
+        std::thread::sleep(self.delay);
         let value = match self.answer {
             Answer::Value(value) => Some(value),
             Answer::Nodata => None,
@@ -727,6 +743,7 @@ async fn text_formats_list_the_fields_and_html_escapes_them() {
         answer: Answer::Value(271.25),
         unit: "<b>K</b> & co",
         content_version: 0,
+        delay: Duration::ZERO,
         calls: Mutex::new(Vec::new()),
     });
     let app = router(engine);
@@ -925,6 +942,46 @@ async fn an_overloaded_engine_is_503_and_a_failing_one_leaks_nothing() {
     assert!(!reply.body.contains("10.0.0.5"), "{}", reply.body);
 }
 
+/// GetFeatureInfo's deadline is its own (#1103): `MC_FEATURE_INFO_TIMEOUT_MS`,
+/// 10 s by default, not GetMap's render deadline of 3 s. Scaled down here
+/// to 1 s and 100 ms: a 300 ms query, past the render deadline, answers,
+/// and a 1.5 s one, past its own, is the 503. The deadlines are fixed by
+/// their first read, so the test runs in a child process.
+#[test]
+fn get_feature_info_has_a_deadline_of_its_own() {
+    const TEST: &str = "get_feature_info_has_a_deadline_of_its_own";
+    const CHILD: &str = "MC_TEST_FEATURE_INFO_DEADLINE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("MC_RENDER_TIMEOUT_MS", "100")
+            .env("MC_FEATURE_INFO_TIMEOUT_MS", "1000")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{TEST} failed in its child process");
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let query = gfi("nwp/t2m", 0, 0, "&INFO_FORMAT=application/json");
+        let past_render = get(&router(Nwp::slow(Duration::from_millis(300))), &query).await;
+        assert_eq!(past_render.status, StatusCode::OK, "{}", past_render.body);
+        assert_eq!(
+            json(&past_render)["features"][0]["properties"]["value"],
+            280.0
+        );
+
+        let past_own = get(&router(Nwp::slow(Duration::from_millis(1500))), &query).await;
+        assert_eq!(
+            past_own.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            past_own.body
+        );
+        assert_eq!(past_own.retry_after.as_deref(), Some("1"));
+    });
+}
+
 /// As GetMap: `immutable` only for an explicit TIME over content the
 /// engine never revises in place. A null value is never pinned: an engine
 /// may answer a transient read failure with one.
@@ -950,6 +1007,7 @@ async fn cache_control_is_get_maps() {
         answer: Answer::Value(1.0),
         unit: "K",
         content_version: 7,
+        delay: Duration::ZERO,
         calls: Mutex::new(Vec::new()),
     });
     assert_eq!(get(&router(revised), &pinned).await.cache_control, SHORT);

@@ -12,10 +12,14 @@
 //!
 //! Neither collection lists `edr` for the WMS: the WMS state carries the
 //! engine's EDR side in `point_engines`, as the server wires it.
+//!
+//! A probe engine checks that both APIs run their engine queries on the one
+//! shared query runtime (#1103).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
@@ -24,9 +28,15 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
+use chrono::{DateTime, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::edr_engine::EdrEngine;
-use ds_core::map_engine::MapEngine;
+use ds_core::error::DataServerError;
+use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
+};
 use ds_core::wind::DerivedWind;
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 use engine_geotiff::GeoTiffEngine;
@@ -405,4 +415,173 @@ async fn capabilities_mark_the_layers_queryable() {
             .body
             .contains("<GetFeatureInfo><Format>text/plain</Format>"));
     }
+}
+
+/// Where a position query ran, and the deadline it ran under.
+struct Ran {
+    runtime: tokio::runtime::Id,
+    thread: Option<String>,
+    deadline: Option<Instant>,
+}
+
+/// The one step of the probe's position answers.
+fn probe_time() -> DateTime<Utc> {
+    "2026-10-17T00:00:00Z".parse().unwrap()
+}
+
+/// A one-parameter engine over 0–10°E, 0–10°N that records where each
+/// position query runs and answers 1.0.
+#[derive(Default)]
+struct Probe {
+    ran: Mutex<Vec<Ran>>,
+}
+
+impl MapEngine for Probe {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<DateTime<Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(1.0); (width * height) as usize].into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
+            times: Vec::new(),
+            parameter: "v".into(),
+            unit: "1".into(),
+            parameters: vec![ParameterInfo {
+                name: "v".into(),
+                title: "v".into(),
+                unit: "1".into(),
+            }],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        }
+    }
+}
+
+impl EdrEngine for Probe {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
+    }
+
+    fn query_location(
+        &self,
+        _location_id: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::LocationNotFound("none".into()))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["v".into()]
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((probe_time(), probe_time()))
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([0.0, 0.0, 10.0, 10.0])
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["position".into()]
+    }
+
+    fn query_position(
+        &self,
+        coords: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.ran.lock().unwrap().push(Ran {
+            runtime: tokio::runtime::Handle::current().id(),
+            thread: std::thread::current().name().map(str::to_owned),
+            deadline: ds_core::deadline::current(),
+        });
+        let (lat, lon) = ds_core::feature::parse_point_coords(coords)?;
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::PointSeries {
+                x: lon,
+                y: lat,
+                t: vec![probe_time()],
+                z: None,
+            },
+            parameters: HashMap::from([(
+                "v".to_string(),
+                ParameterDescription {
+                    label: "v".into(),
+                    unit: "1".into(),
+                    observed_property: "v".into(),
+                    standard_name: None,
+                },
+            )]),
+            ranges: HashMap::from([(
+                "v".to_string(),
+                NdArray {
+                    shape: vec![1],
+                    axis_names: vec!["t".into()],
+                    values: vec![Some(1.0)],
+                },
+            )]),
+        }))
+    }
+}
+
+/// EDR and WMS GetFeatureInfo run their engine queries on one shared query
+/// runtime (#1103), ds-executor's, never on the runtime serving the
+/// request, and each under its own deadline: an EDR query keeps its 30 s.
+/// Before #1103 each API had a runtime of its own.
+#[tokio::test]
+async fn edr_and_get_feature_info_share_one_query_runtime() {
+    let probe = Arc::new(Probe::default());
+    let Apis { wms, edr } = apis("probe", "geotiff", probe.clone(), &[]);
+    let serving = tokio::runtime::Handle::current().id();
+
+    let info = feature_info(&wms, "probe", "CRS:84", "0,0,10,10", (2, 2), (0, 0), "").await;
+    assert_eq!(info.value, 1.0);
+    let start = Instant::now();
+    let position = edr_position(&edr, "probe", "v", (2.5, 7.5), "2026-10-17T00:00:00Z").await;
+    assert_eq!(position, 1.0);
+
+    let ran = probe.ran.lock().unwrap();
+    let [get_feature_info, edr] = &ran[..] else {
+        panic!("{} queries", ran.len());
+    };
+    assert_eq!(get_feature_info.runtime, edr.runtime);
+    assert_eq!(edr.runtime, ds_executor::query_runtime().id());
+    assert_ne!(edr.runtime, serving);
+    for query in [get_feature_info, edr] {
+        assert_eq!(
+            query.thread.as_deref(),
+            Some(ds_executor::QUERY_THREAD_NAME)
+        );
+    }
+    let budget = edr.deadline.expect("an EDR query runs under its deadline") - start;
+    assert!(
+        Duration::from_secs(30) <= budget && budget < Duration::from_secs(31),
+        "{budget:?}"
+    );
+    assert!(get_feature_info.deadline.is_some());
 }
