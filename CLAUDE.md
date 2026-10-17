@@ -602,7 +602,7 @@ one never implies the other.
 | `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
 | engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
 | engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing; a remote fill detached from its request and a poll's prewarm reserve it too | `MC_NETCDF_READ_MEMORY_MB`, 1024 MiB | 503 |
-| engine-netcdf `edr::QUERY_BYTES` | decoded bytes of the fields one EDR query reads: steps × levels × variables read × one field (`FieldRead::decoded_bytes`, 4.06 MB for MEPS), from the file metadata | `MC_NETCDF_EDR_QUERY_MB`, 544 MiB: one parameter over one MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both components (134 fields); not three variables over a run | 400 "Query too large: Query would decode N fields …", before any read |
+| engine-netcdf `edr::QUERY_BYTES` | decoded bytes of the fields one EDR query reads: steps × levels × variables read × one field (`FieldRead::decoded_bytes`, 4.06 MB for MEPS), from the file metadata | `MC_NETCDF_EDR_QUERY_MB`, 544 MiB: one parameter over one MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both components (134 fields); not three variables over a run, nor one over a run at all 13 MEPS pressure levels (871 fields: name the levels with `z`) | 400 "Query too large: Query would decode N fields …", before any read |
 | `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
 | `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
@@ -669,7 +669,12 @@ one never implies the other.
   - `grid(crs, &x, &y)` over `RegularAxis` values: units through
     `coordinate_scale`, a north-up `GeoTransform`, and `flipped` for an
     ascending `y` (row 0 south, as MEPS), which the reader reverses once at
-    decode.
+    decode;
+  - `PressureUnit`: a pressure vertical coordinate, known by its units
+    (CF §4.3: `Pa`, `hPa`, `mbar`, …) once the reader has ruled out a
+    parametric coordinate (`formula_terms`, a hybrid `standard_name`), and
+    its levels in hPa to six significant digits (85000 Pa is exactly 850
+    hPa; a `float` 0.85 bar is 850, not 850.0000238).
 - **`ds_core::units`** — unit spellings, display conversions and vocabularies
   (#1067 PR 6). `canonical_unit` reduces every spelling of a product of
   powers to one (`kg/m^2`, `kg m**-2`, `kg.m-2` → `kg m-2`; `m/s` → `m s-1`;
@@ -742,7 +747,9 @@ one never implies the other.
   well-formed `z` (EDR 1.2 `/req/edr/z-response` A makes that a SHALL;
   a malformed one is still a 400), while WMS `ELEVATION` and Maps/Tiles
   `elevation` reject it with HTTP 400. The ODIM PVOL engine uses it for
-  radar elevation angle.
+  radar elevation angle, GRIB's level views for pressure and model levels,
+  and engine-netcdf for a CF pressure axis (#1067: hPa, bottom first, a map
+  without `z` drawing the bottom level, EDR without `z` every level).
 - **`ds_core::radar_sites`** — `RadarSiteInfo` + the data-only
   `RadarSiteSource` trait (one catalog snapshot per call, never I/O) that a
   polar-volume engine implements and the nowcast's per-cell beam-geometry
@@ -840,7 +847,7 @@ one never implies the other.
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields only. EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position; a query decodes at most `MC_NETCDF_EDR_QUERY_MB`; derived wind speed from CF `x_wind`/`y_wind` (no direction on MEPS's Lambert grid). Pressure levels are #1067 PR 8 |
+| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid) |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
 
 ## Config Format
@@ -1043,7 +1050,9 @@ colormap = "radar_dbz"
 # CF-NetCDF gridded data (#1067): one file family, in a local directory or,
 # with an http(s) data_path, read in place by HTTP range from a server found
 # by template probing (collections.d/meps-netcdf-thredds.toml.disabled). Valid
-# times come from each file's `time`, runs from `forecast_reference_time`.
+# times come from each file's `time`, runs from `forecast_reference_time`. A
+# family on pressure levels (MEPS `pl`, collections.d/meps-netcdf-pl-local.toml)
+# is a collection of its own: its levels are the vertical axis.
 # See crates/engine-netcdf/CLAUDE.md.
 [[collections]]
 id = "meps-netcdf-local"

@@ -1228,3 +1228,488 @@ fn edr_queries_run_on_the_query_runtime() {
         on_query_runtime.ranges["air_temperature_2m"].values[1..2]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pressure levels (#1067 PR 8)
+// ---------------------------------------------------------------------------
+
+use ds_core::vertical::{VerticalDimension, VerticalKind};
+
+/// The MEPS pressure-level fixture as its example configures it: the `pl`
+/// family's names and five variables on 300, 500, 850 and 1000 hPa.
+fn meps_pl() -> NetcdfEngine {
+    let config = config(
+        &testdata("meps-netcdf-pl"),
+        r#"filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
+           variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl", "geopotential_pl",
+                        "relative_humidity_pl"]"#,
+    );
+    let engine = NetcdfEngine::new("meps-pl", &config).unwrap();
+    engine.poll_once();
+    engine
+}
+
+/// The fixture's levels as stored, top first: stored index of each.
+const PL_STORED: [f64; 4] = [300.0, 500.0, 850.0, 1000.0];
+
+/// A stored field of a `meps-netcdf-pl` file at `hpa`, `[row][column]`
+/// with row 0 south.
+fn stored_pl(file: &str, variable: &str, hpa: f64) -> Vec<Vec<f64>> {
+    let k = PL_STORED.iter().position(|&l| l == hpa).unwrap();
+    stored(&format!("meps-netcdf-pl/{file}"), variable)[k * 11..(k + 1) * 11].to_vec()
+}
+
+/// The value drawn at `(lon, lat)` at level `z`.
+fn value_at_level(
+    engine: &dyn MapEngine,
+    (lon, lat): (f64, f64),
+    parameter: &str,
+    time: DateTime<Utc>,
+    z: Option<f64>,
+) -> Result<Option<f64>, DataServerError> {
+    let d = 1e-4;
+    let tile = engine.get_raster_tile(
+        [lon - d, lat - d, lon + d, lat + d],
+        1,
+        1,
+        Some(time),
+        &OutputCrs::Wgs84,
+        Some(parameter),
+        z,
+        None,
+    )?;
+    Ok(tile.values.value_at(0))
+}
+
+/// MET Norway's own coordinates of fixture cell `(j, i)`, row 0 south.
+fn met_cell((j, i): (usize, usize)) -> (f64, f64) {
+    let (lat, lon) = met_latlon();
+    (lon[j][i], lat[j][i])
+}
+
+/// A multi-level pressure dimension is the collection's vertical axis:
+/// `VerticalKind::Pressure` in hPa, bottom first, on the map side
+/// (`RasterInfo::vertical`, WMS `ELEVATION`, Maps/Tiles `elevation`) and the
+/// EDR side (`z`) alike. The surface family has none.
+#[test]
+fn pressure_levels_are_the_vertical_axis() {
+    let engine = meps_pl();
+    let info = engine.raster_info();
+    let axis = VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0, 500.0, 300.0]);
+    assert_eq!(info.vertical.as_ref(), Some(&axis));
+    assert_eq!(axis.unit(), "hPa");
+    assert_eq!(EdrEngine::get_vertical_extent(&engine), Some(axis));
+    assert_eq!(engine.raster_info_shared().vertical, info.vertical);
+    let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "air_temperature_pl",
+            "x_wind_pl",
+            "y_wind_pl",
+            "geopotential_pl",
+            "relative_humidity_pl"
+        ]
+    );
+    assert_eq!(info.parameters[3].unit, "m^2/s^2");
+    assert_eq!(
+        info.reference_times,
+        [at("2026-10-15T06:00:00Z"), at("2026-10-15T09:00:00Z")]
+    );
+    let hours: Vec<u32> = info.times.iter().map(chrono::Timelike::hour).collect();
+    assert_eq!(hours, [6, 7, 8, 9, 10]);
+
+    let surface = meps();
+    assert_eq!(surface.raster_info().vertical, None);
+    assert_eq!(EdrEngine::get_vertical_extent(&surface), None);
+}
+
+/// `ELEVATION`/`elevation` select a level exactly: each draws its own
+/// stored field, a level the collection lacks is a 400 naming the levels,
+/// and several bands at one level sample that level. Each level is a field
+/// of its own in the field cache: two levels are two decodes, and drawing
+/// one again decodes nothing.
+#[test]
+fn each_pressure_level_draws_its_own_field() {
+    let engine = meps_pl();
+    let ten = at("2026-10-15T10:00:00Z");
+    let (j, i) = (5, 4);
+    let cell = met_cell((j, i));
+    let mut drawn = Vec::new();
+    for hpa in [1000.0, 850.0, 500.0, 300.0] {
+        let value = value_at_level(&engine, cell, "air_temperature_pl", ten, Some(hpa))
+            .unwrap()
+            .unwrap();
+        let stored = stored_pl("meps_pl_01_20261015T09Z.nc", "air_temperature_pl", hpa)[j][i];
+        assert!((value - stored).abs() < 1e-3, "{hpa}: {value} {stored}");
+        drawn.push(value);
+    }
+    assert!(
+        drawn.windows(2).all(|pair| pair[0] > pair[1]),
+        "colder aloft: {drawn:?}"
+    );
+    let missing = value_at_level(&engine, cell, "air_temperature_pl", ten, Some(600.0));
+    assert!(
+        matches!(&missing, Err(DataServerError::InvalidParameter(m)) if m.contains("1000, 850, 500, 300 hPa")),
+        "{missing:?}"
+    );
+    // Several bands at one level, from one output map.
+    let bbox = [5.0, 55.0, 30.0, 70.0];
+    let bands = engine
+        .get_raster_tiles(
+            bbox,
+            16,
+            12,
+            Some(ten),
+            &OutputCrs::Wgs84,
+            &["air_temperature_pl", "geopotential_pl"],
+            Some(500.0),
+            None,
+        )
+        .unwrap();
+    for (band, parameter) in bands.iter().zip(["air_temperature_pl", "geopotential_pl"]) {
+        let one = engine
+            .get_raster_tile(
+                bbox,
+                16,
+                12,
+                Some(ten),
+                &OutputCrs::Wgs84,
+                Some(parameter),
+                Some(500.0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(values(band), values(&one), "{parameter}");
+    }
+
+    // A fresh time: two levels are two fields; again, none.
+    let six = at("2026-10-15T06:00:00Z");
+    let before = engine.field_decodes();
+    for hpa in [850.0, 300.0] {
+        value_at_level(&engine, cell, "y_wind_pl", six, Some(hpa)).unwrap();
+    }
+    assert_eq!(engine.field_decodes() - before, 2);
+    for hpa in [850.0, 300.0] {
+        value_at_level(&engine, cell, "y_wind_pl", six, Some(hpa)).unwrap();
+    }
+    assert_eq!(engine.field_decodes() - before, 2, "both levels cached");
+}
+
+/// A map without `ELEVATION` draws the first advertised level, the bottom
+/// one (1000 hPa), so the default `resolve_elevation` names the level drawn
+/// and GetFeatureInfo, which queries that level, reads what GetMap drew.
+#[test]
+fn a_map_without_elevation_draws_the_level_get_feature_info_queries() {
+    let engine = meps_pl();
+    let nine = at("2026-10-15T09:00:00Z");
+    let bbox = [5.0, 55.0, 30.0, 70.0];
+    let tile = |z: Option<f64>| {
+        engine
+            .get_raster_tile(
+                bbox,
+                24,
+                16,
+                Some(nine),
+                &OutputCrs::Wgs84,
+                Some("geopotential_pl"),
+                z,
+                None,
+            )
+            .unwrap()
+    };
+    let default = values(&tile(None));
+    assert!(default.iter().any(Option::is_some));
+    assert_eq!(default, values(&tile(Some(1000.0))));
+    assert_ne!(default, values(&tile(Some(300.0))));
+    let level = engine.resolve_elevation(Some("geopotential_pl"), None, Some(nine), None);
+    assert_eq!(level, Some(1000.0));
+    assert_eq!(
+        engine.resolve_elevation(Some("geopotential_pl"), Some(500.0), Some(nine), None),
+        Some(500.0)
+    );
+
+    // GetFeatureInfo's query: the resolved level, the drawn step.
+    let cell = met_cell((6, 3));
+    let drawn = value_at_level(&engine, cell, "geopotential_pl", nine, None)
+        .unwrap()
+        .unwrap();
+    let result = single(
+        engine
+            .query_position(
+                &format!("POINT({} {})", cell.0, cell.1),
+                Some((nine, nine)),
+                Some(&names(&["geopotential_pl"])),
+                Some(&[level.unwrap()]),
+                None,
+            )
+            .unwrap(),
+    );
+    let queried = result.ranges["geopotential_pl"].values[0].unwrap();
+    assert!((queried - drawn).abs() < 1e-2, "{queried} {drawn}");
+}
+
+/// EDR `z`: one level is a series with a one-value `z` axis; several, or
+/// every level without `z`, a vertical profile per step, in `z`'s order;
+/// an area puts the levels on a `z` axis, `[t, z, y, x]`. A `z` naming
+/// none of the levels is a 400.
+#[test]
+fn edr_z_selects_the_levels_a_query_reads() {
+    let engine = meps_pl();
+    let (j, i) = (4, 6);
+    let cell = met_cell((j, i));
+    let point = format!("POINT({} {})", cell.0, cell.1);
+    let ten = at("2026-10-15T10:00:00Z");
+    let file = "meps_pl_01_20261015T09Z.nc";
+    let query = |datetime: Option<(DateTime<Utc>, DateTime<Utc>)>, z: Option<&[f64]>| {
+        engine.query_position(
+            &point,
+            datetime,
+            Some(&names(&["air_temperature_pl", "relative_humidity_pl"])),
+            z,
+            None,
+        )
+    };
+
+    // Two levels at one step: one vertical profile, in `z`'s order.
+    let CoverageResponse::Collection(profiles) =
+        query(Some((ten, ten)), Some(&[850.0, 500.0])).unwrap()
+    else {
+        panic!("a profile per step");
+    };
+    assert_eq!(profiles.len(), 1);
+    let DomainDescription::VerticalProfile { t, z, .. } = &profiles[0].domain else {
+        panic!("{:?}", profiles[0].domain);
+    };
+    assert_eq!(
+        (*t, z.kind, z.values.clone()),
+        (Some(ten), VerticalKind::Pressure, vec![850.0, 500.0])
+    );
+    for parameter in ["air_temperature_pl", "relative_humidity_pl"] {
+        let range = &profiles[0].ranges[parameter];
+        assert_eq!(
+            (range.shape.as_slice(), range.axis_names.as_slice()),
+            (&[2][..], &["z".to_string()][..])
+        );
+        for (value, hpa) in range.values.iter().zip([850.0, 500.0]) {
+            let stored = stored_pl(file, parameter, hpa)[j][i];
+            assert!((value.unwrap() - stored).abs() < 1e-3, "{parameter} {hpa}");
+        }
+    }
+
+    // Without `z`: every level of every step of the newest run.
+    let CoverageResponse::Collection(profiles) = query(None, None).unwrap() else {
+        panic!("a profile per step");
+    };
+    let steps: Vec<Option<DateTime<Utc>>> = profiles
+        .iter()
+        .map(|p| match &p.domain {
+            DomainDescription::VerticalProfile { t, z, .. } => {
+                assert_eq!(z.values, [1000.0, 850.0, 500.0, 300.0]);
+                *t
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(steps, [Some(at("2026-10-15T09:00:00Z")), Some(ten)]);
+    let at_850 = profiles[1].ranges["air_temperature_pl"].values[1].unwrap();
+    assert!((at_850 - stored_pl(file, "air_temperature_pl", 850.0)[j][i]).abs() < 1e-3);
+
+    // One level: a series over the run's steps with a one-value `z` axis.
+    let series = single(query(None, Some(&[300.0])).unwrap());
+    let DomainDescription::PointSeries { t, z, .. } = &series.domain else {
+        panic!("{:?}", series.domain);
+    };
+    assert_eq!(t.len(), 2);
+    assert_eq!(z.as_ref().map(|z| z.values.clone()), Some(vec![300.0]));
+    let stored = stored_pl(file, "relative_humidity_pl", 300.0)[j][i];
+    let value = series.ranges["relative_humidity_pl"].values[1].unwrap();
+    assert!((value - stored).abs() < 1e-3, "{value} {stored}");
+
+    // None of the levels: a 400.
+    assert!(matches!(
+        query(Some((ten, ten)), Some(&[925.0])),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+
+    // An area: the levels on a `z` axis, each the single level's grid.
+    let area = |z: &[f64]| {
+        single(
+            engine
+                .query_area(
+                    "POLYGON((10 58,20 58,20 64,10 64,10 58))",
+                    Some((at("2026-10-15T09:00:00Z"), ten)),
+                    Some(&names(&["air_temperature_pl"])),
+                    Some(z),
+                    None,
+                )
+                .unwrap(),
+        )
+    };
+    let both = area(&[1000.0, 300.0]);
+    let DomainDescription::Grid { x, y, t, z } = &both.domain else {
+        panic!("{:?}", both.domain);
+    };
+    assert_eq!(t.as_ref().map(Vec::len), Some(2));
+    assert_eq!(
+        z.as_ref().map(|z| z.values.clone()),
+        Some(vec![1000.0, 300.0])
+    );
+    let range = &both.ranges["air_temperature_pl"];
+    let (ny, nx) = (y.len(), x.len());
+    assert_eq!(range.shape, [2, 2, ny, nx]);
+    assert_eq!(range.axis_names, ["t", "z", "y", "x"]);
+    let upper = area(&[300.0]);
+    let one = &upper.ranges["air_temperature_pl"];
+    assert_eq!(one.shape, [2, 1, ny, nx]);
+    let plane = ny * nx;
+    for step in 0..2 {
+        assert_eq!(
+            range.values[(step * 2 + 1) * plane..(step * 2 + 2) * plane],
+            one.values[step * plane..(step + 1) * plane],
+            "step {step}: the 300 hPa plane"
+        );
+    }
+}
+
+/// Derived wind on pressure levels: `x_wind_pl`/`y_wind_pl` have no pairing
+/// level (they span the vertical axis) and pair into `wind_speed_pl`, read
+/// at the one level asked for, on the map and in EDR, speed only on the
+/// Lambert grid. The fixture's 300 hPa jet passes the surface components'
+/// ±40 m/s, which is why the pressure-level styles are wider.
+#[test]
+fn derived_wind_pairs_the_components_level_by_level() {
+    use ds_core::wind::{DerivedWind, VectorFrame, WindSource};
+    let engine = Arc::new(meps_pl());
+    let facts = engine.wind_facts();
+    let u = facts
+        .parameters
+        .iter()
+        .find(|p| p.name == "x_wind_pl")
+        .unwrap();
+    assert_eq!((u.frame, u.level.as_deref()), (VectorFrame::Grid, None));
+    let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = outcomes.clone();
+    let wind = DerivedWind::new(
+        "meps-pl",
+        engine.clone(),
+        Arc::new(move |_: &str, outcome: &ds_core::wind::PairOutcome| {
+            log.lock().unwrap().push(outcome.clone());
+        }),
+    );
+    let outcome = outcomes.lock().unwrap()[0].clone();
+    assert_eq!(outcome.speed.as_deref(), Ok("wind_speed_pl"));
+    assert!(outcome.direction.is_err(), "{outcome:?}");
+    let info = MapEngine::raster_info(&wind);
+    let speed = info
+        .parameters
+        .iter()
+        .find(|p| p.name == "wind_speed_pl")
+        .unwrap();
+    assert_eq!(
+        (speed.title.as_str(), speed.unit.as_str()),
+        ("Wind speed", "m/s")
+    );
+    assert_eq!(info.vertical, engine.raster_info().vertical);
+
+    let six = at("2026-10-15T06:00:00Z");
+    let (j, i) = (4, 0);
+    let cell = met_cell((j, i));
+    let file = "meps_pl_00_20261015T06Z.nc";
+    let hypot = |hpa: f64| {
+        stored_pl(file, "x_wind_pl", hpa)[j][i].hypot(stored_pl(file, "y_wind_pl", hpa)[j][i])
+    };
+    assert!(
+        stored_pl(file, "x_wind_pl", 300.0)[j][i] > 40.0,
+        "the 300 hPa jet in the fixture"
+    );
+    let CoverageResponse::Collection(profiles) = EdrEngine::query_position(
+        &wind,
+        &format!("POINT({} {})", cell.0, cell.1),
+        Some((six, six)),
+        Some(&names(&["wind_speed_pl"])),
+        Some(&[300.0, 850.0]),
+        Some(six),
+    )
+    .unwrap() else {
+        panic!("a profile");
+    };
+    let values = &profiles[0].ranges["wind_speed_pl"].values;
+    for (value, hpa) in values.iter().zip([300.0, 850.0]) {
+        let value = value.unwrap();
+        assert!(
+            (value - hypot(hpa)).abs() < 1e-3,
+            "{hpa}: {value} {}",
+            hypot(hpa)
+        );
+        let drawn = value_at_level(&wind, cell, "wind_speed_pl", six, Some(hpa))
+            .unwrap()
+            .unwrap();
+        assert!((drawn - value).abs() < 1e-3, "{hpa}: {drawn} {value}");
+    }
+    assert!(values[0].unwrap() > values[1].unwrap(), "faster aloft");
+}
+
+/// A pressure axis stored in Pa (`level`, 50000/85000/100000 Pa, top first)
+/// is served in hPa, bottom first, and selected in hPa. On a
+/// latitude/longitude grid earth-relative u/v (`eastward_wind`/
+/// `northward_wind`) give speed and direction at every level.
+#[test]
+fn pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level() {
+    use ds_core::wind::DerivedWind;
+    let engine =
+        Arc::new(NetcdfEngine::new("pa", &config(&testdata("netcdf-pressure-pa"), "")).unwrap());
+    let info = engine.raster_info();
+    assert_eq!(
+        info.vertical,
+        Some(VerticalDimension::new(
+            VerticalKind::Pressure,
+            vec![1000.0, 850.0, 500.0]
+        ))
+    );
+    assert!(info.reference_times.is_empty());
+    let six = at("2026-01-01T06:00:00Z");
+    // Column 2 (22°E), row 1 (61°N), step 1: t = 300 - 0.05 hPa + 1 + 0.2 - 0.2.
+    let cell = (22.0, 61.0);
+    let t850 = value_at_level(engine.as_ref(), cell, "t", six, Some(850.0))
+        .unwrap()
+        .unwrap();
+    assert!((t850 - 258.5).abs() < 1e-4, "{t850}");
+    let t_default = value_at_level(engine.as_ref(), cell, "t", six, None)
+        .unwrap()
+        .unwrap();
+    assert!((t_default - 251.0).abs() < 1e-4, "1000 hPa: {t_default}");
+    assert!(value_at_level(engine.as_ref(), cell, "t", six, Some(85000.0)).is_err());
+
+    let wind = DerivedWind::new(
+        "pa",
+        engine.clone(),
+        Arc::new(|_: &str, _: &ds_core::wind::PairOutcome| {}),
+    );
+    let CoverageResponse::Collection(profiles) = EdrEngine::query_position(
+        &wind,
+        "POINT(22 61)",
+        Some((six, six)),
+        Some(&names(&["ws", "wdir"])),
+        Some(&[1000.0, 500.0]),
+        None,
+    )
+    .unwrap() else {
+        panic!("a profile");
+    };
+    // u = 10 (k + 1) + 1 + 1, v = -5 (k + 1) + 0.25 at stored index k:
+    // 1000 hPa is k = 2, 500 hPa k = 0.
+    for (n, (u, v)) in [(32.0_f64, -14.75_f64), (12.0, -4.75)]
+        .into_iter()
+        .enumerate()
+    {
+        let speed = profiles[0].ranges["ws"].values[n].unwrap();
+        let direction = profiles[0].ranges["wdir"].values[n].unwrap();
+        assert!((speed - u.hypot(v)).abs() < 1e-4, "{n}: {speed}");
+        let expected = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
+        assert!(
+            (direction - expected).abs() < 1e-3,
+            "{n}: {direction} {expected}"
+        );
+    }
+}

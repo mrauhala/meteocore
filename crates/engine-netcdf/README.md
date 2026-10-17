@@ -21,8 +21,11 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
 - Valid times from the fields' `time` axis; model runs from
   `forecast_reference_time`, each run a WMS `reference_time` value. Files
   without one form one timeline without runs.
-- Single-level fields: any axis other than time and ensemble must have one
-  value. Ensemble files are read at one member.
+- Single-level fields (any axis other than time and ensemble has one
+  value), or fields on one pressure axis: a dimension whose coordinate's
+  units are a pressure (`hPa`, `Pa`, `mbar`, …). Its levels, in hPa, are
+  the collection's vertical axis (below). Ensemble files are read at one
+  member.
 - CF packing and masking: `scale_factor`/`add_offset`, `_FillValue`,
   `missing_value`, NaN.
 - EDR position (one point or several), area and radius, each model run an
@@ -30,12 +33,15 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
   position query.
 - Wind speed derived from u/v components the CF `standard_name` identifies
   (`x_wind`/`y_wind`, `eastward_wind`/`northward_wind`), on every API:
-  MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`. Grid-relative
-  components on a projected grid give no direction yet.
+  MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`, and on pressure
+  levels `x_wind_pl`/`y_wind_pl` give `wind_speed_pl`, level by level.
+  Grid-relative components on a projected grid give no direction yet.
 
-**Out (later phases of #1067):**
+**Not yet:**
 
-- Pressure levels as a vertical axis (PR 8), EDR trajectory and cube, wind
+- Height above ground and hybrid model levels (MEPS `hl`, `ml`): their axes
+  are not served (`VerticalKind::Height` is height above mean sea level,
+  and `ModelLevel` expects ordinal levels). EDR trajectory and cube, wind
   direction from grid-relative components (rotation by the convergence
   angle, #897).
 - Per-variable file layouts, curvilinear 2-D latitude/longitude grids,
@@ -63,7 +69,8 @@ precipitation_amount_acc = "Precipitation accumulated since run start"
 ```
 
 `collections.d/meps-netcdf-local.toml` is a runnable example on the
-committed MEPS sample. Values are served in the files' own units (K, Pa,
+committed MEPS sample, and `collections.d/meps-netcdf-pl-local.toml` one on
+the committed pressure-level sample (below). Values are served in the files' own units (K, Pa,
 m/s, kg/m², fractions), never converted, and units are reported as the
 files spell them (`kg/m^2`). Layers without a `[[wms.parameters]]` entry
 take the built-in default style their name and unit select, matched in any
@@ -72,6 +79,53 @@ pascals, wind speed and gusts, the grid-relative `x_wind_10m`/`y_wind_10m`
 components (±40 m/s), relative humidity and cloud and fog area fractions in
 unit `1` (0–1), and the run-start `precipitation_amount_acc` (0–200 mm,
 `precipitation_accumulation`).
+
+### Pressure levels
+
+A collection has one vertical axis, so a family on pressure levels, such as
+MEPS's per-lead `pl` files (18 variables on 13 levels, 1000 to 50 hPa), is
+a collection of its own:
+
+```toml
+[netcdf]
+data_path = "testdata/meps-netcdf-pl"
+filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
+variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl", "geopotential_pl",
+             "relative_humidity_pl"]
+```
+
+- **The axis:** `RasterInfo.vertical` and EDR's `extent.vertical` are
+  `VerticalKind::Pressure` in hPa, bottom first (the largest pressure
+  first, as GRIB's pressure views). A file storing Pa (ERA5 and many CF
+  writers) is converted; MEPS stores hPa.
+- **Selecting a level:** WMS `ELEVATION`, Maps/Tiles `elevation` and EDR
+  `z` match a level exactly; a level the collection lacks is a 400 (WMS
+  GetMap: the error image). A map without one draws the first, bottom
+  level (1000 hPa for MEPS), and GetFeatureInfo reports and reads that
+  level.
+- **EDR `z`:** a level, a list, an interval or `Rn/min/step`, the levels
+  kept in request order; without `z` every level. One level is a
+  `PointSeries` with a one-value `z` axis, several a `VerticalProfile` per
+  step; an area puts the levels on a `z` axis, `[t, z, y, x]`.
+- **One level is one field:** fetched (one ~1.4 MB chunk for MEPS),
+  decoded, cached and counted by the query cap on its own, so a query
+  reads steps × levels × variables fields. A position series over a whole
+  MEPS run at all 13 levels (871 fields) is past the cap: name the levels.
+- **One axis per collection:** with `variables`, every listed variable must
+  be on the same levels, else the file is skipped naming the one that is
+  not; without, the largest group of the first file's fields on the same
+  levels wins (single-level fields on a tie) and the rest are skipped with a WARN. Later files must
+  have the same levels.
+- **Styles:** the built-in defaults give `x_wind_pl`/`y_wind_pl` ±80 m/s and
+  the derived `wind_speed_pl` 0–80 m/s, twice the surface scale: one range
+  serves every level, and the jet at 300–250 hPa reaches 60–80 m/s (the
+  committed sample's 300 hPa x component, 72 m/s). Temperature,
+  geopotential and relative humidity keep their all-levels ranges.
+
+`collections.d/meps-netcdf-pl-thredds.toml.disabled` reads the MEPS `pl`
+family, control member, 67 leads, from thredds.met.no, with its traffic
+stated (measured 2026-10-18: 4 GETs and 1.23 MB to open a pl file for one
+variable, 1.42 MB per field).
 
 ### EDR
 
@@ -98,10 +152,11 @@ unit `1` (0–1), and the run-start `precipitation_amount_acc` (0–200 mm,
   progress. A query may decode at most `MC_NETCDF_EDR_QUERY_MB` (544 MiB):
   one parameter over one MEPS run of 67 leads as the client sees it,
   including a derived wind speed; more is a 400 that names the fields and
-  the limit, before anything is read. The cap counts the variables read: a
-  derived wind speed reads both of its components, 134 fields over a whole
-  run, and three variables over a run do not fit. A query whose points all
-  lie off the grid reads nothing.
+  the limit, before anything is read. The cap counts the fields read, steps
+  × levels × variables: a derived wind speed reads both of its components,
+  134 fields over a whole run, and three variables over a run do not fit,
+  nor one variable over a run at all 13 MEPS pressure levels. A query whose
+  points all lie off the grid reads nothing.
 
 ### Remote files
 
@@ -115,7 +170,7 @@ leads = [0, 1, 2]                                     # {lead}; the first is the
 time_window = "-PT12H"                                # required: runs probed
 min_age = "PT10M"                                     # a file this old is used at once
 run_grace = "PT30M"                                   # a run missing leads is served after this
-prewarm_variables = []                                # newest run fetched ahead
+prewarm_variables = []                                # newest run fetched ahead (bottom level)
 ```
 
 A run not yet out costs one HEAD per poll (its first lead's); once it
@@ -133,7 +188,8 @@ at most 15 s; its poll loop opens the rest at once.
 member, 67 leads, with its traffic stated (about 125 MB of metadata per run
 serving eight variables; ~1.5 MB per field first drawn; ~100 MB per prewarm
 variable and run) and `max_runs = 2`: each kept file holds about 820 KB of
-parsed metadata, so 67 leads × 2 runs is some 110 MB.
+parsed metadata, so 67 leads × 2 runs is some 110 MB. Prewarm fetches the
+level a map without `ELEVATION` draws, the bottom one on a pressure family.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -141,7 +197,7 @@ parsed metadata, so 67 leads × 2 runs is some 110 MB.
 | `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files (~1.5 MB per MEPS field) |
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files; at least 8 |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Transient buffers of field reads in progress; a read that does not fit is a 503 |
-| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read, counted from the metadata before any read: steps × variables read × one field (4.06 MB for MEPS); over it a 400. The default admits one parameter over one MEPS run, including a derived wind speed, which reads both components |
+| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read, counted from the metadata before any read: steps × pressure levels × variables read × one field (4.06 MB for MEPS); over it a 400. The default admits one parameter over one MEPS run, including a derived wind speed, which reads both components |
 
 Each catalogued file stays open with its metadata while the catalog keeps
 it, one file descriptor each for local files. Developer notes, measurements

@@ -549,30 +549,40 @@ fn a_read_failure_is_found_through_the_readers_errors() {
     assert_eq!(origin("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
 }
 
-/// The shipped thredds.met.no example is valid and names MET Norway's own
-/// paths, checked without contacting the server.
+/// The shipped thredds.met.no examples, surface (sfc) and pressure levels
+/// (pl, #1067 PR 8), are valid and name MET Norway's own paths, checked
+/// without contacting the server.
 #[test]
-fn the_thredds_example_names_met_norways_files() {
-    let text = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../collections.d/meps-netcdf-thredds.toml.disabled"
-    ))
-    .unwrap();
-    let table: toml::Table = toml::from_str(&text).unwrap();
-    let config: NetcdfConfig = table["netcdf"].clone().try_into().unwrap();
-    ds_core::config::validate_netcdf("meps-netcdf-thredds", &config).unwrap();
-    assert_eq!(config.leads.as_deref().map(<[u32]>::len), Some(67));
-    let remote = NetcdfEngine::remote("meps-netcdf-thredds", &config, Tuning::DEFAULT).unwrap();
-    let key = remote
-        .prober
-        .lock()
-        .unwrap()
-        .key(at("2026-10-16T06:00:00Z"), Some(12));
-    assert_eq!(
-        format!("{}/{key}", remote.origin),
-        "https://thredds.met.no/thredds/fileServer/meps25epsarchive/2026/10/16/06/member_00/\
-         meps_sfc_12_20261016T06Z.nc"
-    );
+fn the_thredds_examples_name_met_norways_files() {
+    for (id, family) in [
+        ("meps-netcdf-thredds", "sfc"),
+        ("meps-netcdf-pl-thredds", "pl"),
+    ] {
+        let path = format!(
+            "{}/../../collections.d/{id}.toml.disabled",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(table["id"].as_str(), Some(id));
+        let config: NetcdfConfig = table["netcdf"].clone().try_into().unwrap();
+        ds_core::config::validate_netcdf(id, &config).unwrap();
+        assert_eq!(config.leads.as_deref().map(<[u32]>::len), Some(67));
+        assert_eq!(config.max_runs, 2, "{id}");
+        let remote = NetcdfEngine::remote(id, &config, Tuning::DEFAULT).unwrap();
+        let key = remote
+            .prober
+            .lock()
+            .unwrap()
+            .key(at("2026-10-16T06:00:00Z"), Some(12));
+        assert_eq!(
+            format!("{}/{key}", remote.origin),
+            format!(
+                "https://thredds.met.no/thredds/fileServer/meps25epsarchive/2026/10/16/06/\
+                 member_00/meps_{family}_12_20261016T06Z.nc"
+            )
+        );
+    }
 }
 
 /// An EDR position series of `parameter` at the middle of the fixture's
@@ -690,4 +700,142 @@ fn a_query_past_its_deadline_leaves_its_chunks_cached() {
     };
     assert!(series.iter().all(Option::is_some));
     assert_eq!(gets(&server.take()).len(), 2, "the first query's GETs only");
+}
+
+/// Read sizes for the pressure-level fixture, whose chunks (one level of
+/// an 11 × 10 field) are about 330 bytes compressed: each is a chunk read.
+const PL_TUNING: Tuning = Tuning {
+    block: 64,
+    first_read: 1024,
+    bypass_over: 128,
+};
+
+/// testdata/meps-netcdf-pl's run 06Z lead 00 (four pressure levels), read
+/// over HTTP from [`slot`] for `air_temperature_pl`.
+fn pl_engine(server: &TestServer) -> NetcdfEngine {
+    let file = format!(
+        "{}/../../testdata/meps-netcdf-pl/meps_pl_00_20261015T06Z.nc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let key = format!(
+        "thredds/fileServer/meps25epsarchive/{}/member_00/meps_pl_00_{}Z.nc",
+        slot().format("%Y/%m/%d/%H"),
+        slot().format("%Y%m%dT%H")
+    );
+    server.put(&key, std::fs::read(file).unwrap(), old());
+    let hours: Vec<String> = (0..24).map(|h| h.to_string()).collect();
+    let config: NetcdfConfig = toml::from_str(&format!(
+        r#"data_path = "{}/thredds/fileServer/meps25epsarchive/"
+           prefix_pattern = "%Y/%m/%d/{{run}}/member_00/"
+           filename_template = "meps_pl_{{lead}}_%Y%m%dT{{run}}Z.nc"
+           run_hours = [{}]
+           leads = [0]
+           time_window = "-PT3H"
+           variables = ["air_temperature_pl"]"#,
+        server.url,
+        hours.join(", ")
+    ))
+    .unwrap();
+    NetcdfEngine::with_tuning("remote-pl", &config, PL_TUNING).unwrap()
+}
+
+/// [`render`] of `air_temperature_pl` at level `z` under a deadline `ms`
+/// from now.
+fn render_level_within(
+    engine: &NetcdfEngine,
+    ms: u64,
+    z: f64,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let _deadline = deadline::enter(Some(Instant::now() + Duration::from_millis(ms)));
+    let extent = engine.raster_info().spatial_extent.unwrap();
+    let (dx, dy) = (extent[2] - extent[0], extent[3] - extent[1]);
+    let bbox = [
+        extent[0] + dx * 0.3,
+        extent[1] + dy * 0.3,
+        extent[2] - dx * 0.3,
+        extent[3] - dy * 0.3,
+    ];
+    let tile = engine.get_raster_tile(
+        bbox,
+        24,
+        24,
+        Some(at(LEAD_0)),
+        &OutputCrs::Wgs84,
+        Some("air_temperature_pl"),
+        Some(z),
+        None,
+    )?;
+    Ok((0..24 * 24).map(|i| tile.values.value_at(i)).collect())
+}
+
+/// Each pressure level is a field of its own (#1067 PR 8): cold fetches of
+/// two levels of one variable, both slower than their requests' deadlines,
+/// fail those requests and fill the caches detached, each level its own
+/// chunk GET (another byte range of the file) and its own decode. The
+/// levels then draw their own values, as the local file does, and repeats
+/// fetch and decode nothing.
+#[test]
+fn each_pressure_level_is_a_detached_fill_and_a_decode_of_its_own() {
+    let server = TestServer::new();
+    let engine = pl_engine(&server);
+    assert_eq!(
+        engine.raster_info().vertical.unwrap().levels,
+        [1000.0, 850.0, 500.0, 300.0]
+    );
+    server.take();
+    server.slow_over(PL_TUNING.bypass_over, Duration::from_millis(400));
+    let started = Instant::now();
+    for z in [850.0, 300.0] {
+        let late = render_level_within(&engine, 100, z);
+        assert!(
+            matches!(late, Err(DataServerError::DeadlineExceeded)),
+            "{z}: {late:?}"
+        );
+    }
+    let mut drawn = Vec::new();
+    for z in [850.0, 300.0] {
+        drawn.push(loop {
+            match render_level_within(&engine, 50, z) {
+                Ok(values) => break values,
+                Err(DataServerError::DeadlineExceeded) => {
+                    assert!(started.elapsed() < Duration::from_secs(5), "never filled");
+                }
+                Err(e) => panic!("{e}"),
+            }
+        });
+    }
+    let fetched = server.take();
+    let mut ranges: Vec<(u64, u64)> = gets(&fetched).iter().map(|g| g.range.unwrap()).collect();
+    ranges.sort_unstable();
+    assert_eq!(ranges.len(), 2, "one chunk GET per level: {fetched:#?}");
+    assert_ne!(ranges[0], ranges[1]);
+    assert!(ranges
+        .iter()
+        .all(|&(start, end)| end + 1 - start > PL_TUNING.bypass_over));
+    assert_eq!(engine.field_decodes(), 2);
+
+    let local: NetcdfConfig = toml::from_str(&format!(
+        r#"data_path = "{}/../../testdata/meps-netcdf-pl"
+           filename_template = "meps_pl_{{lead}}_%Y%m%dT{{run}}Z.nc"
+           variables = ["air_temperature_pl"]"#,
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let local = NetcdfEngine::new("local-pl", &local).unwrap();
+    assert_eq!(
+        drawn[0],
+        render_level_within(&local, 30_000, 850.0).unwrap()
+    );
+    assert_eq!(
+        drawn[1],
+        render_level_within(&local, 30_000, 300.0).unwrap()
+    );
+    assert_ne!(drawn[0], drawn[1]);
+    assert!(drawn.iter().flatten().all(Option::is_some));
+
+    for z in [850.0, 300.0] {
+        render_level_within(&engine, 30_000, z).unwrap();
+    }
+    assert!(gets(&server.take()).is_empty(), "repeats are cached");
+    assert_eq!(engine.field_decodes(), 2);
 }

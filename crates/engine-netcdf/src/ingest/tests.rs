@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use netcdf_reader::{Storage, StorageBuffer};
+use netcdf_reader::{NcAttribute, NcDimension, Storage, StorageBuffer};
 
 use super::*;
 
@@ -75,10 +75,10 @@ fn an_ingested_field_reads_only_its_index_and_chunk() {
         }
         storage.take();
         let read = &inspected.fields[0].read;
-        nc.read_variable_slice::<f32>(&read.name, &read.selection(0))
+        nc.read_variable_slice::<f32>(&read.name, &read.selection(0, 0))
             .unwrap();
         let (first, _) = storage.take();
-        nc.read_variable_slice::<f32>(&read.name, &read.selection(0))
+        nc.read_variable_slice::<f32>(&read.name, &read.selection(0, 0))
             .unwrap();
         assert_eq!(storage.take().0, 1, "warm={warm}: a repeat reads the chunk");
         nc.variables().unwrap();
@@ -197,6 +197,11 @@ fn dims(spec: &[(&str, u64, AxisRole)]) -> Vec<(String, u64, AxisRole)> {
         .collect()
 }
 
+/// No dimension is a pressure axis.
+fn no_pressure(_: &str) -> bool {
+    false
+}
+
 #[test]
 fn single_level_fields_on_a_time_axis_are_served() {
     use AxisRole::*;
@@ -208,6 +213,7 @@ fn single_level_fields_on_a_time_axis_are_served() {
             ("x", 949, ProjectionX),
         ]),
         0,
+        no_pressure,
     )
     .unwrap();
     assert_eq!(
@@ -229,6 +235,7 @@ fn single_level_fields_on_a_time_axis_are_served() {
             ("lon", 20, Lon),
         ]),
         2,
+        no_pressure,
     )
     .unwrap();
     assert_eq!(
@@ -247,9 +254,11 @@ fn single_level_fields_on_a_time_axis_are_served() {
 #[test]
 fn fields_that_cannot_be_served_say_why() {
     use AxisRole::*;
-    let reason =
-        |spec: &[(&str, u64, AxisRole)], member| classify(&dims(spec), member).unwrap_err();
-    // Pressure levels are an axis, never pinned to one silently.
+    let reason = |spec: &[(&str, u64, AxisRole)], member| {
+        classify(&dims(spec), member, no_pressure).unwrap_err()
+    };
+    // An axis of several levels that is not a pressure axis, never pinned
+    // to one level silently.
     let error = reason(
         &[
             ("time", 1, Time),
@@ -314,6 +323,7 @@ fn same_quantity_reads_units_in_any_spelling() {
             value: level,
             units: level_units.into(),
         }],
+        pressure: None,
     };
     let served = var("kg/m^2", 0.0, "m");
     for same in [
@@ -336,4 +346,397 @@ fn same_quantity_reads_units_in_any_spelling() {
     ] {
         assert!(!served.same_quantity(&other), "{other:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pressure levels (#1067 PR 8)
+// ---------------------------------------------------------------------------
+
+const MEPS_PL_00: &str = "meps-netcdf-pl/meps_pl_00_20261015T06Z.nc";
+
+/// MEPS's pressure-level fields sit on one `pressure` axis in hPa, stored
+/// top first (300, 500, 850, 1000 in the fixture): served bottom first,
+/// each served level read at its stored index, one level per read.
+#[test]
+fn meps_pressure_level_fields_are_on_the_pressure_axis_bottom_first() {
+    let (nc, storage) = open_fixture(MEPS_PL_00);
+    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    let mut skipped: Vec<&str> = inspected.skipped.iter().map(|(n, _)| n.as_str()).collect();
+    skipped.sort_unstable();
+    assert_eq!(
+        skipped,
+        ["latitude", "longitude"],
+        "{:?}",
+        inspected.skipped
+    );
+    let mut names: Vec<&str> = inspected.fields.iter().map(|f| &*f.variable.name).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "air_temperature_pl",
+            "geopotential_pl",
+            "relative_humidity_pl",
+            "x_wind_pl",
+            "y_wind_pl"
+        ]
+    );
+    for field in &inspected.fields {
+        assert_eq!(
+            field.variable.pressure.as_deref(),
+            Some(&[1000.0, 850.0, 500.0, 300.0][..]),
+            "{}",
+            field.variable.name
+        );
+        assert!(field.variable.levels.is_empty(), "no single-level identity");
+        let read = &field.read;
+        assert_eq!(
+            read.dims,
+            [Dim::Time, Dim::Level, Dim::Whole(11), Dim::Whole(10)]
+        );
+        assert_eq!(read.levels, [3, 2, 1, 0]);
+        // One level per chunk: a read decodes one field.
+        assert_eq!((read.field_bytes, read.chunk_bytes), (440, 440));
+        assert_eq!(read.decoded_bytes(), 440);
+    }
+    // Served level 1 (850 hPa) is stored at index 2.
+    let read = &inspected
+        .fields
+        .iter()
+        .find(|f| &*f.variable.name == "air_temperature_pl")
+        .unwrap()
+        .read;
+    let selection = read.selection(0, 1);
+    assert_eq!(
+        selection.selections[..2],
+        [NcSliceInfoElem::Index(0), NcSliceInfoElem::Index(2)]
+    );
+    let values = nc
+        .read_variable_slice::<f32>(&read.name, &selection)
+        .unwrap();
+    let all = nc.read_variable_as_f64("air_temperature_pl").unwrap();
+    let all: Vec<f64> = all.iter().copied().collect();
+    let stored_850: Vec<f64> = all[2 * 110..3 * 110].to_vec();
+    let read_850: Vec<f64> = values.iter().map(|&v| f64::from(v)).collect();
+    assert_eq!(read_850.len(), 110);
+    for (a, b) in read_850.iter().zip(&stored_850) {
+        assert!((a - b).abs() < 1e-3, "{a} {b}");
+    }
+}
+
+/// A pressure axis stored in Pa, top first, is served in hPa bottom first:
+/// stored 50000, 85000, 100000 Pa (top first) are served as 1000, 850,
+/// 500 hPa (bottom first), exactly.
+#[test]
+fn pressure_levels_in_pa_are_served_in_hpa() {
+    let (nc, storage) = open_fixture("netcdf-pressure-pa/pressure_levels_pa.nc");
+    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    assert!(inspected.skipped.is_empty(), "{:?}", inspected.skipped);
+    assert_eq!(inspected.fields.len(), 3);
+    for field in &inspected.fields {
+        assert_eq!(
+            field.variable.pressure.as_deref(),
+            Some(&[1000.0, 850.0, 500.0][..])
+        );
+        assert_eq!(field.read.levels, [2, 1, 0]);
+    }
+    assert_eq!(inspected.grid.transform.crs, Crs::Wgs84);
+    assert_eq!(inspected.run, None);
+}
+
+/// Classification: a dimension the coordinate's units make a pressure axis
+/// is the field's vertical axis, at most one; a size-1 pressure axis stays
+/// a single level's identity; any other axis of several values (height
+/// above ground, hybrid levels) is not served.
+#[test]
+fn a_pressure_axis_is_the_one_vertical_axis() {
+    use AxisRole::*;
+    let pressure = |name: &str| name.starts_with("pressure");
+    let shape = classify(
+        &dims(&[
+            ("time", 1, Time),
+            ("pressure", 13, Other),
+            ("y", 1069, ProjectionY),
+            ("x", 949, ProjectionX),
+        ]),
+        0,
+        pressure,
+    )
+    .unwrap();
+    assert_eq!(
+        shape.dims,
+        [Dim::Time, Dim::Level, Dim::Whole(1069), Dim::Whole(949)]
+    );
+    assert_eq!(shape.vertical, Some(1));
+    assert!(shape.levels.is_empty());
+    // One pressure level is a level's identity, as before.
+    let shape = classify(
+        &dims(&[
+            ("time", 1, Time),
+            ("pressure0", 1, Other),
+            ("y", 4, ProjectionY),
+            ("x", 4, ProjectionX),
+        ]),
+        0,
+        pressure,
+    )
+    .unwrap();
+    assert_eq!(shape.vertical, None);
+    assert_eq!(shape.levels, [1]);
+    // A second pressure axis, or another axis of several levels.
+    for (spec, error) in [
+        (
+            [
+                ("time", 1, Time),
+                ("pressure", 13, Other),
+                ("pressure1", 4, Other),
+                ("y", 4, ProjectionY),
+                ("x", 4, ProjectionX),
+            ],
+            "4 values on its 'pressure1' axis",
+        ),
+        (
+            [
+                ("time", 1, Time),
+                ("height_above_ground", 3, Other),
+                ("pressure", 13, Other),
+                ("y", 4, ProjectionY),
+                ("x", 4, ProjectionX),
+            ],
+            "3 values on its 'height_above_ground' axis",
+        ),
+    ] {
+        let reason = classify(&dims(&spec), 0, pressure).unwrap_err();
+        assert!(reason.contains(error), "{reason}");
+    }
+}
+
+/// A `float` variable `name(dims)` with text attributes, as the metadata
+/// lists it.
+fn variable(name: &str, dims: &[(&str, u64)], attrs: &[(&str, &str)]) -> NcVariable {
+    NcVariable {
+        name: name.to_string(),
+        dimensions: dims
+            .iter()
+            .map(|&(name, size)| NcDimension {
+                name: name.to_string(),
+                size,
+                is_unlimited: false,
+            })
+            .collect(),
+        dtype: NcType::Float,
+        attributes: attrs
+            .iter()
+            .map(|&(name, value)| NcAttribute {
+                name: name.to_string(),
+                value: NcAttrValue::Chars(value.to_string()),
+            })
+            .collect(),
+        data_offset: 0,
+        _data_size: 0,
+        is_record_var: false,
+        record_size: 0,
+    }
+}
+
+/// A CF parametric (hybrid) vertical coordinate is not a pressure axis,
+/// whatever its units (CF 4.3.3): CESM/CAM's `lev` has `units = "hPa"`,
+/// a hybrid `standard_name` and `formula_terms`, and a field on it is not
+/// served, for the reason any other axis of several levels gives. An
+/// `air_pressure` coordinate, or one without a `standard_name` (old ERA5
+/// files' `level` in millibars), is one.
+#[test]
+fn a_hybrid_coordinate_in_pressure_units_is_not_a_pressure_axis() {
+    let hybrid = [
+        (
+            "standard_name",
+            "atmosphere_hybrid_sigma_pressure_coordinate",
+        ),
+        ("units", "hPa"),
+        ("positive", "down"),
+        ("formula_terms", "a: hyam b: hybm p0: P0 ps: PS"),
+    ];
+    let axis = |attrs: &[(&str, &str)]| {
+        let variables = [variable("lev", &[("lev", 32)], attrs)];
+        pressure_unit(&variables, "lev")
+    };
+    assert_eq!(axis(&hybrid), None, "CESM/CAM");
+    assert_eq!(axis(&hybrid[..3]), None, "a hybrid standard_name alone");
+    assert_eq!(
+        axis(&[("units", "hPa"), ("formula_terms", "a: hyam b: hybm")]),
+        None,
+        "formula_terms alone"
+    );
+    assert_eq!(
+        axis(&[("standard_name", "air_pressure"), ("units", "Pa")]),
+        Some(PressureUnit::Pa)
+    );
+    assert_eq!(
+        axis(&[("long_name", "pressure_level"), ("units", "millibars")]),
+        Some(PressureUnit::HPa)
+    );
+    assert_eq!(axis(&[("standard_name", "air_pressure")]), None, "no units");
+
+    // A CAM temperature on that `lev` is not served.
+    let variables = [
+        variable(
+            "time",
+            &[("time", 1)],
+            &[("units", "days since 2000-01-01 00:00:00")],
+        ),
+        variable("lev", &[("lev", 32)], &hybrid),
+        variable("lat", &[("lat", 4)], &[("units", "degrees_north")]),
+        variable("lon", &[("lon", 5)], &[("units", "degrees_east")]),
+        variable(
+            "T",
+            &[("time", 1), ("lev", 32), ("lat", 4), ("lon", 5)],
+            &[("units", "K")],
+        ),
+    ];
+    let (nc, _) = open_fixture(MEPS_PL_00);
+    let reason = field(&nc, None, &variables, &variables[4], 0)
+        .err()
+        .unwrap();
+    assert_eq!(
+        reason,
+        "has 32 values on its 'lev' axis; only fields with one level, or with levels on one \
+         pressure axis, are served"
+    );
+}
+
+/// A served field of `name` with `pressure` levels, for the vertical-axis
+/// rule.
+fn field_on(name: &str, pressure: Option<&[f64]>) -> Field {
+    Field {
+        variable: Variable {
+            name: name.into(),
+            title: name.into(),
+            units: "K".into(),
+            standard_name: None,
+            levels: Vec::new(),
+            pressure: pressure.map(<[f64]>::to_vec),
+        },
+        read: FieldRead {
+            name: name.into(),
+            dims: vec![Dim::Time, Dim::Whole(2), Dim::Whole(2)],
+            stored: Stored::Float,
+            packing: Packing {
+                scale: 1.0,
+                offset: 0.0,
+                fill: Vec::new(),
+            },
+            chunk_bytes: 16,
+            field_bytes: 16,
+            levels: Vec::new(),
+        },
+    }
+}
+
+/// One vertical axis per collection: with an allowlist the first listed
+/// variable decides and a variable on another axis fails the file; without
+/// one the largest group of fields on the same levels wins (one level on a
+/// tie) and the others are skipped with why.
+#[test]
+fn a_collection_serves_one_vertical_axis() {
+    let levels = [1000.0, 850.0, 500.0];
+    let names = |fields: &[Field]| -> Vec<String> {
+        fields.iter().map(|f| f.variable.name.to_string()).collect()
+    };
+    // Without an allowlist: two on levels outvote one single-level field.
+    let mut skipped = Vec::new();
+    let kept = one_vertical_axis(
+        vec![
+            field_on("surface_air_pressure", None),
+            field_on("t_pl", Some(&levels)),
+            field_on("u_pl", Some(&levels)),
+            field_on("w_pl", Some(&[700.0])),
+        ],
+        &Wanted::All,
+        &mut skipped,
+    )
+    .unwrap();
+    assert_eq!(names(&kept), ["t_pl", "u_pl"]);
+    let reasons: Vec<&str> = skipped.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(reasons, ["surface_air_pressure", "w_pl"]);
+    assert!(skipped[0].1.contains("one vertical axis"), "{skipped:?}");
+    assert!(skipped[1].1.contains("700 hPa"), "{skipped:?}");
+    // A tie keeps the single-level fields, as an sfc file is served.
+    let mut skipped = Vec::new();
+    let kept = one_vertical_axis(
+        vec![field_on("t_pl", Some(&levels)), field_on("t2m", None)],
+        &Wanted::All,
+        &mut skipped,
+    )
+    .unwrap();
+    assert_eq!(names(&kept), ["t2m"]);
+    assert!(skipped[0].1.contains("3 pressure levels"), "{skipped:?}");
+    // Groups are counted by their levels: three single-level fields beat
+    // two pressure groups of two, though four fields are on pressure
+    // levels.
+    let upper = [500.0, 300.0];
+    let mut skipped = Vec::new();
+    let kept = one_vertical_axis(
+        vec![
+            field_on("t_lower", Some(&levels[..2])),
+            field_on("t2m", None),
+            field_on("u_lower", Some(&levels[..2])),
+            field_on("t_upper", Some(&upper)),
+            field_on("u_upper", Some(&upper)),
+            field_on("rh2m", None),
+            field_on("msl", None),
+        ],
+        &Wanted::All,
+        &mut skipped,
+    )
+    .unwrap();
+    assert_eq!(names(&kept), ["t2m", "rh2m", "msl"]);
+    assert_eq!(skipped.len(), 4, "{skipped:?}");
+    // The largest pressure group wins, not the first field's levels; of
+    // groups as large, the first found.
+    let mut skipped = Vec::new();
+    let kept = one_vertical_axis(
+        vec![
+            field_on("t_lower", Some(&levels[..2])),
+            field_on("t_upper", Some(&upper)),
+            field_on("u_upper", Some(&upper)),
+            field_on("t2m", None),
+        ],
+        &Wanted::All,
+        &mut skipped,
+    )
+    .unwrap();
+    assert_eq!(names(&kept), ["t_upper", "u_upper"]);
+    assert!(skipped[0].1.contains("500, 300 hPa"), "{skipped:?}");
+    let kept = one_vertical_axis(
+        vec![
+            field_on("t_lower", Some(&levels[..2])),
+            field_on("t_upper", Some(&upper)),
+        ],
+        &Wanted::All,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(names(&kept), ["t_lower"]);
+    // An allowlist: the first listed decides, and a mix fails the file.
+    let listed = vec!["t_pl".to_string(), "t2m".to_string()];
+    let error = one_vertical_axis(
+        vec![field_on("t_pl", Some(&levels)), field_on("t2m", None)],
+        &Wanted::Listed(&listed),
+        &mut Vec::new(),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("variable 't2m' has one level"), "{error}");
+}
+
+/// A later file of a pressure family must have the same levels, in hPa,
+/// whatever its own unit or order.
+#[test]
+fn same_quantity_compares_pressure_levels() {
+    let on = |pressure: Option<&[f64]>| field_on("t_pl", pressure).variable;
+    let served = on(Some(&[1000.0, 850.0]));
+    assert!(served.same_quantity(&on(Some(&[1000.0, 850.0]))));
+    assert!(!served.same_quantity(&on(Some(&[1000.0, 850.0, 500.0]))));
+    assert!(!served.same_quantity(&on(Some(&[925.0, 850.0]))));
+    assert!(!served.same_quantity(&on(None)));
 }
