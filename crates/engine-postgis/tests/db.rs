@@ -800,3 +800,6 @@ async fn timing_set_based_and_fan_out_on_a_hypertable() {
 
 #[path = "support/schema_validation.rs"]
 mod schema_validation;
+
+#[path = "support/privileges.rs"]
+mod privileges;

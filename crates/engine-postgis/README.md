@@ -38,7 +38,7 @@ retention or continuous aggregates.
 ## Database setup
 
 Create a dedicated read-only login, adapting the database, password and table
-names. Set session limits on the role: the engine does not apply them itself.
+names. Set role-level limits for normal data queries:
 
 ```sql
 CREATE ROLE meteocore_ro LOGIN PASSWORD '<password>' NOINHERIT;
@@ -57,7 +57,23 @@ CREATE INDEX observations_station_time_idx
 For `per_parameter`, grant and index every observation table. For events,
 start with a B-tree on time and a GiST index on geometry. Check plans for
 queries and metadata refreshes against your data, and adjust timeouts and
-indexes accordingly. **There are no startup privilege or index self-checks.**
+indexes accordingly. Index checks are not implemented.
+
+At initialization and after a changed mapping is rebuilt, an advisory audit
+warns about superusers and effective `INSERT`, `UPDATE` or `DELETE` privileges
+on mapped relations, including inherited, ownership and column-level grants.
+It uses read-only catalog queries with a two-second deadline, including pool
+acquisition. It neither attempts writes nor changes grants. Extra readable
+columns are allowed.
+
+An unsuccessful audit logs **unchecked** and retries on metadata refresh or a
+successful health ping, without changing collection availability. A completed
+audit is not repeated on requests or periodic refreshes. Identical warnings for
+a role/relation are shared across collections using the same pool; the warning
+names the first collection that detected it. Rebuild a collection or restart
+to recheck changed grants. Diagnostics stay in server logs. This checks mapped
+write grants, not every way a role could modify the database; keep the role
+settings above even when the audit finds no write privileges.
 
 Supply the DSN through the server process's environment:
 

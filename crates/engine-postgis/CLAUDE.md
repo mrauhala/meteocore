@@ -82,6 +82,21 @@ Derivation rules (hard-won from production timeouts):
   each load so rebuilt collections on the same DSN join them — DSN sharing
   is a standing invariant, not load-time-only.
 
+## Advisory privilege audit
+
+`privileges.rs` inspects the effective pool connection role and all mapped
+relations once per engine build. Use PostgreSQL's privilege functions for
+inherited/owner/table/column grants; never probe a write or warn on extra SELECT
+columns. The read-only transaction has a two-second deadline including pool
+acquisition, preserves stricter role timeouts and restores session settings.
+Discard unfinished connections on timeout/error/cancellation.
+
+A failed audit logs unchecked once and retries on refresh or a reachable ping;
+it never changes metadata, readiness or public API errors. Successful audits
+skip subsequent I/O. Warnings are deduplicated by role/relation/privileges within
+the shared pool, including across incremental reloads, but rebuilt engines
+inspect permissions afresh. The weak registry must not retain dead pools.
+
 ## Database schema validation
 
 `validation.rs` checks every resolved timestamp and used geometry mapping on
