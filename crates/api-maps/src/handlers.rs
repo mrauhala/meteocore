@@ -12,7 +12,7 @@ use axum::Json;
 use serde_json::json;
 
 use api_common::workbench::Surface;
-use api_common::{mounts, rel, Mount};
+use api_common::{mounts, rel, JsonQuery, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, RasterInfo};
@@ -1131,9 +1131,13 @@ pub async fn styles(
 /// immutable: palettes are hot-reloadable.
 pub async fn style_legend(
     Path((id, style_id)): Path<(String, String)>,
-    Query(params): Query<LegendQueryParams>,
+    JsonQuery(params): JsonQuery<LegendQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, MapsError> {
+    // As on the map routes, a parameter the legend does not take is a 400,
+    // never dropped (#1073).
+    params::reject_unknown_parameters(query.as_deref(), params::LEGEND_PARAMETERS)?;
     let state = state.load_full();
     let (engine, _config) = lookup_engine(&state, &id)?;
     let format = params.validate()?;
@@ -1284,7 +1288,7 @@ async fn composite_legend(
 pub async fn get_map(
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<MapQueryParams>,
+    JsonQuery(params): JsonQuery<MapQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, MapsError> {
@@ -1298,7 +1302,7 @@ pub async fn get_map(
 pub async fn get_styled_map(
     headers: HeaderMap,
     Path((id, style_id)): Path<(String, String)>,
-    Query(params): Query<MapQueryParams>,
+    JsonQuery(params): JsonQuery<MapQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, MapsError> {

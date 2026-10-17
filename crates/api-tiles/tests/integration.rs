@@ -1557,6 +1557,45 @@ mod style_legend {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    /// The legend takes `f` and `parameter-name`; any other parameter is
+    /// the tile routes' 400 naming those two, never silently ignored
+    /// (#1073).
+    #[tokio::test]
+    async fn unknown_parameters_are_400_naming_the_accepted_ones() {
+        const LEGEND: &str = "/collections/radar/styles/default/legend";
+        for (query, name) in [
+            ("width=100", "width"),
+            ("f=png&parameter_name=t", "parameter_name"),
+            ("_=1700000000000", "_"),
+            ("F=png", "F"),
+        ] {
+            let uri = format!("{LEGEND}?{query}");
+            let (status, json) = get(&uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+            assert_eq!(json["code"], "BadRequest", "{uri}");
+            assert_eq!(
+                json["description"],
+                format!("Unknown query parameter '{name}'. Supported: f, parameter-name"),
+                "{uri}"
+            );
+        }
+        for query in [
+            "",
+            "f=json",
+            "f=png",
+            "parameter-name=reflectivity&f=image/png",
+        ] {
+            let uri = format!("{LEGEND}?{query}");
+            let (status, _, body) = get_raw(&uri).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
     /// The collection metadata links every style's legend, so a client that
     /// read `/collections/{id}` can fetch the palette without guessing a URL.
     #[tokio::test]
@@ -1595,6 +1634,15 @@ mod style_legend {
             "#/components/schemas/legend"
         );
         assert!(json["components"]["schemas"]["legend"].is_object());
+        // It documents exactly the query parameters the route accepts.
+        let query: Vec<&str> = path["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|parameter| parameter["in"] == "query")
+            .map(|parameter| parameter["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(query, api_tiles::params::LEGEND_PARAMETERS);
     }
 }
 
@@ -4416,6 +4464,45 @@ mod map_tile_parameters {
                 format!("{prefix}/1/0/1?f=image/webp&quality=80&datetime={T1}&parameter-name=t");
             assert_ne!(fetch(&app, &uri).await.0, StatusCode::BAD_REQUEST, "{uri}");
         }
+    }
+
+    /// A parameter given twice fails the query extractor before the handler
+    /// runs. It is the JSON 400 every other bad parameter gets, not axum's
+    /// plain text (#1073): map tiles, vector tiles and the legend.
+    #[tokio::test]
+    async fn repeated_parameters_are_the_json_400() {
+        let engine = Arc::new(Engine::default());
+        let mut requests: Vec<(axum::Router, String)> = surfaces(engine.clone())
+            .into_iter()
+            .map(|(app, prefix)| (app, format!("{prefix}/1/0/1?width=8&width=16")))
+            .collect();
+        let state = state(engine.clone());
+        requests.push((
+            super::shared_router(state.clone()),
+            "/collections/radar/tiles/WebMercatorQuad/1/0/1?datetime=a&datetime=b".into(),
+        ));
+        requests.push((
+            api_tiles::router(state),
+            "/collections/radar/styles/default/legend?f=png&f=json".into(),
+        ));
+        for (app, uri) in requests {
+            let (status, headers, body) = fetch(&app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                header(&headers, "content-type"),
+                Some("application/json"),
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "BadRequest", "{uri}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains("duplicate field"),
+                "{uri}: {description}"
+            );
+        }
+        assert_eq!(render_count(&engine), 0);
     }
 }
 

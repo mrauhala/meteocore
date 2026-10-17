@@ -1931,7 +1931,7 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 | `transparent` | no | — | Accepted but currently a no-op |
 | `quality` | no | see description | MeteoCore extension: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range: 400. |
 
-Any other query parameter, a misspelling such as `heigth` included, is a 400 naming these, on the per-API routes and at the shared root alike.
+Any other query parameter, a misspelling such as `heigth` included, is a 400 naming these, on the per-API routes and at the shared root alike. So is one given twice, such as `width=1&width=2`; only `subset` repeats. The style legend, `…/styles/{styleId}/legend`, takes `f` (`json`, the default, or `png`) and `parameter-name`, under the same rules.
 
 `width × height`, given or derived, is additionally capped at `MAX_MAP_PIXELS = 64,000,000` (= 8000²), so a request at the per-dimension cap never trips the pixel cap with a confusing second error. A derived size over a cap is a 400 naming what set it. See also [Map requests](#map-requests-ogc-api---maps).
 
@@ -2000,7 +2000,7 @@ Both support `tileMatrix` 0–24 (capped by `MAX_ZOOM_LEVEL`). `tileMatrixSetLim
 | `parameter-name` | no | engine default | Same semantics as Maps `parameter-name`. Map tiles only. |
 | `quality` | no | see description | Raster only, same semantics as Maps `quality`: 1–100 for `image/webp` (100 = lossless, default the collection's `[wms] webp_quality`, else lossless) and `image/jpeg` (default 85). With `image/png`, out of range or on a vector tile: 400. |
 
-`tileMatrix > 24` returns 400. Tile coordinates outside the matrix (e.g. `row=1` at `z=0` on `WebMercatorQuad`) return 404. Any other query parameter is a 400 naming the accepted ones; a vector tile takes only `f`, `datetime` and `subset`.
+`tileMatrix > 24` returns 400. Tile coordinates outside the matrix (e.g. `row=1` at `z=0` on `WebMercatorQuad`) return 404. Any other query parameter is a 400 naming the accepted ones; a vector tile takes only `f`, `datetime` and `subset`. So is one given twice; only `subset` repeats. The style legend, `/tiles/collections/{id}/styles/{styleId}/legend`, takes `f` (`json`, the default, or `png`) and `parameter-name`, under the same rules.
 
 ### Raster Tiles
 
