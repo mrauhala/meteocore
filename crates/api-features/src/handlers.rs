@@ -949,25 +949,30 @@ pub async fn items(
     );
     let mut doc = feature_page_to_geojson(&page, &id, limit, offset, &filters, "", root, &crs);
     crate::html::representation_links(&mut doc, wanted);
-    let render = |doc: &serde_json::Value| match wanted {
-        ds_core::html::Wanted::Json => {
-            serde_json::to_string(doc).expect("GeoJSON Value serializes")
-        }
-        ds_core::html::Wanted::Html => crate::html::features_html(
-            doc,
-            &config.title,
-            &id,
-            base,
-            root,
-            &html_controls(engine.as_ref()),
-        ),
-    };
+    let time_stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     // Hash the selected representation with the volatile timestamp blanked.
-    let etag = ds_core::http_cache::etag_of(render(&doc).as_bytes());
-    doc["timeStamp"] = json!(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    let mut resp = match wanted {
-        ds_core::html::Wanted::Json => GeoJsonResponse(doc).into_response(),
-        ds_core::html::Wanted::Html => Html(render(&doc)).into_response(),
+    // The HTML page is rendered once: the hash covers that render, and the
+    // generation time is written into it afterwards (#1135).
+    let (etag, mut resp) = match wanted {
+        ds_core::html::Wanted::Json => {
+            let blank = serde_json::to_string(&doc).expect("GeoJSON Value serializes");
+            let etag = ds_core::http_cache::etag_of(blank.as_bytes());
+            doc["timeStamp"] = json!(time_stamp);
+            (etag, GeoJsonResponse(doc).into_response())
+        }
+        ds_core::html::Wanted::Html => {
+            let mut page = crate::html::features_html(
+                &doc,
+                &config.title,
+                &id,
+                base,
+                root,
+                &html_controls(engine.as_ref()),
+            );
+            let etag = ds_core::http_cache::etag_of(page.as_bytes());
+            crate::html::stamp_generation_time(&mut page, &time_stamp);
+            (etag, Html(page).into_response())
+        }
     };
     resp.headers_mut().insert(
         header::ETAG,
