@@ -1776,6 +1776,47 @@ fn child_layer_titles_are_site_prefixed_for_flat_clients() {
     );
 }
 
+/// Top-level layers come in collection-id order, whatever the registry's
+/// HashMap order, with a multi-parameter collection's child layers under its
+/// parent. The HashMap order changed with every process, and with it the
+/// layer the OGC test suite picks as the first or last named one (#1102).
+#[test]
+fn capabilities_list_layers_in_collection_id_order() {
+    let ids: Vec<String> = (0..16).rev().map(|n| format!("grid-{n:02}")).collect();
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    for id in &ids {
+        let engine: Arc<dyn MapEngine> = if id == "grid-07" {
+            Arc::new(SiteMockMapEngine)
+        } else {
+            Arc::new(ExtentMockMapEngine([20.0, 58.0, 28.0, 62.0]))
+        };
+        engines.insert(id.clone(), engine);
+        collections.insert(id.clone(), site_collection_config(id));
+    }
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &HashMap::new(),
+        &HashMap::new(),
+        "",
+    );
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    let names: Vec<&str> = xml
+        .split("<Name>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Name>").map(|(name, _)| name))
+        .filter(|name| name.starts_with("grid-"))
+        .collect();
+    let mut expected: Vec<String> = (0..16).map(|n| format!("grid-{n:02}")).collect();
+    expected.splice(
+        7..8,
+        ["grid-07/DBZH".to_string(), "grid-07/VRADH".to_string()],
+    );
+    assert_eq!(names, expected, "layers must follow the collection ids");
+}
+
 /// Per-collection keywords surface as a `<KeywordList>` and the license as an
 /// `<Attribution>` in the capabilities XML (on the parent layer of a
 /// multi-param collection). Element order follows the WMS 1.3.0 schema.
