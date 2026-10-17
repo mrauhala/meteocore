@@ -114,7 +114,7 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | `SERVICE` | yes | Must be `WMS` |
 | `VERSION` | no | Must be `1.3.0`, the default when omitted. Deliberate: ets-wms13's `getmap:no-version` expects an exception |
 | `REQUEST` | yes | `GetMap` |
-| `LAYERS` | yes | Layer name (= collection ID). Only one layer per request (`LayerLimit` 1): a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, a list of served layers `InvalidParameterValue` |
+| `LAYERS` | yes | Layer name: a collection ID, or `collection/parameter` for one parameter of a multi-parameter collection. A multi-parameter collection's own layer is not advertised, but `LAYERS=collection` is accepted and draws its default parameter with that parameter's style: the image and legend `collection/<default parameter>` gives. Only one layer per request (`LayerLimit` 1): a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, a list of served layers `InvalidParameterValue` |
 | `CRS` | yes | Coordinate reference system (see below) |
 | `BBOX` | yes | Bounding box (axis order depends on CRS) |
 | `WIDTH` | yes | Output image width in pixels (1–8000) |
@@ -150,20 +150,29 @@ where no point maps to the Earth, is the empty image too, in the requested
 
 - EPSG:3035: a box past the LAEA disk, of radius about 12 742 km around
   (4 321 000, 3 210 000).
-- EPSG:3067: a box past the strip Transverse Mercator maps the Earth into,
-  northings more than 19 995 930 m from the equator, at any easting. So is
-  a box at eastings so far out (10²⁰ m) that the TM inverse has no finite
-  result.
+- EPSG:3067: a box past a pole, northings more than 9 997 965 m from the
+  equator, or more than 50° of longitude from the central meridian, 27°E
+  (#1113). Transverse Mercator itself reaches further, but the series
+  MeteoCore computes it with is 27 km off at 50° on the equator and stops
+  converging from about 56°, where it named places anywhere. So EPSG:3067
+  maps show nothing west of 23°W, which cuts western Iceland (the
+  Westfjords, Snæfellsnes), most of Greenland, the Azores and the
+  westernmost 0.5° of the ICON-EU domain, nor east of 77°E. An exact
+  Transverse Mercator could lift the bound (#1130).
 
-A box partly outside renders what lies inside. In EPSG:3035 its pixels past
-the disk are empty. In EPSG:3067 the pixels past the strip are not
-guaranteed empty: TM's inverse gives them meaningless coordinates, so an
-engine may draw there. Two boxes stay `InvalidParameterValue`:
+A box partly outside renders what lies inside, and its pixels past the
+area are empty. Along the area's edge a strip up to 2 px wide stays
+empty, and where the LAEA disk's rim crosses a box edge between two of the
+box's edge samples, 20 a side, the read window can stop short of the rim
+by up to their spacing. Two boxes stay `InvalidParameterValue`:
 
 - a malformed one: min ≥ max, or a value that is no finite number;
-- one whose edge samples all miss the valid area inside it. That is an
-  EPSG:3035 box wider than the disk, or a very tall one whose edges cross
-  the disk only between samples. Its edges give no area to read.
+- an EPSG:3035 one whose edge samples all miss the disk inside it: a box
+  wider than the disk, or a very tall one whose edges cross it only
+  between samples. Its edges give no area to read. An EPSG:3067 box that
+  meets the area always has a read window: around the whole area it holds
+  both poles, and where the meridians 50° out cross it, where they enter
+  and leave it bounds the window.
 
 ## GetFeatureInfo
 
@@ -248,9 +257,7 @@ pixel whose centre is not on the Earth has no position either: its JSON
 - anywhere in an EPSG:3067 or EPSG:3035 `BBOX` wholly outside its
   projection's valid area, the `BBOX` GetMap answers with the empty image;
 - outside that area in a `BBOX` partly outside it: past the LAEA disk, or
-  past the strip Transverse Mercator maps the Earth into, where its inverse
-  still gives coordinates, but meaningless ones. An EPSG:3067 centre
-  inside the strip but past a pole is not on the Earth either.
+  past a pole or more than 50° from EPSG:3067's central meridian.
 
 **Queryable layers.** A layer is `queryable="1"` in GetCapabilities exactly
 when its collection's engine answers EDR position queries for the layer's

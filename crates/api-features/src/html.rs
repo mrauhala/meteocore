@@ -329,6 +329,25 @@ fn query_form(doc: &Value, controls: &FeatureControls) -> String {
     out
 }
 
+/// Where an items listing's generation time goes. Rendered with a blank
+/// `timeStamp`, a listing carries this slot empty, as api-edr's items page
+/// does.
+pub(crate) const TIMESTAMP_SLOT: &str = "<time></time>";
+
+/// Fill the [`TIMESTAMP_SLOT`] of an items page in place. The handler hashes
+/// the page with the slot empty for the ETag (#499) and then fills it, so
+/// the page is rendered once per request (#1135). The slot is the page's
+/// first: it sits in the results head, above every row and the map data, and
+/// every data string on the page is escaped, so none can forge it.
+pub(crate) fn stamp_generation_time(html: &mut String, time_stamp: &str) {
+    let at = html.find(TIMESTAMP_SLOT);
+    debug_assert!(at.is_some(), "an items listing has a timestamp slot");
+    if let Some(at) = at {
+        let filled = format!("<time>{}</time>", escape(time_stamp));
+        html.replace_range(at..at + TIMESTAMP_SLOT.len(), &filled);
+    }
+}
+
 /// `base` is the external base URL (shared assets); `root` the absolute URL
 /// of the API root serving the collection (#789).
 pub(crate) fn features_html(
@@ -388,18 +407,25 @@ pub(crate) fn features_html(
         if !applied.is_empty() {
             body.push_str(&format!("<div class=\"chip-row applied-item-filters\" aria-label=\"Applied item filters\">{applied}</div>"));
         }
+        let generated = match doc["timeStamp"].as_str() {
+            Some(time) if !time.is_empty() => format!("<time>{}</time>", escape(time)),
+            _ => TIMESTAMP_SLOT.to_owned(),
+        };
         body.push_str(&format!(
-            "<div class=\"results-head\"><p>Response generated: <time>{}</time></p></div>",
-            escape(doc["timeStamp"].as_str().unwrap_or_default())
+            "<div class=\"results-head\"><p>Response generated: {generated}</p></div>"
         ));
         features.as_slice()
     } else {
         std::slice::from_ref(doc)
     };
     let (columns, defaults) = property_columns(features, controls);
-    let map_features: Vec<_> = features.iter().filter(|f|!f["geometry"].is_null()).map(|f| {
+    // A listing's map draws each shape simplified, within a page budget
+    // (#1135); an item's map draws its whole geometry.
+    let preview = is_list.then(|| crate::map_preview::preview_geometries(features));
+    let map_features: Vec<_> = features.iter().enumerate().filter(|(_, f)|!f["geometry"].is_null()).map(|(i, f)| {
         let facts: serde_json::Map<String,Value> = defaults.iter().filter_map(|key| f["properties"].get(key).map(|v|(key.clone(),v.clone()))).collect();
-        json!({"type":"Feature","id":f["id"],"geometry":f["geometry"],"properties":{"label":feature_title(f),"href":href_for(f,"self"),"facts":facts}})
+        let geometry = preview.as_ref().map_or(&f["geometry"], |p| &p[i]);
+        json!({"type":"Feature","id":f["id"],"geometry":geometry,"properties":{"label":feature_title(f),"href":href_for(f,"self"),"facts":facts}})
     }).collect();
     let mut head = String::new();
     body.push_str(if is_list {

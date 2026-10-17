@@ -607,7 +607,7 @@ use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
 fn single(response: CoverageResponse) -> QueryResult {
     match response {
         CoverageResponse::Single(result) => result,
-        CoverageResponse::Collection(results) => panic!("{} coverages", results.len()),
+        CoverageResponse::Collection(_) => panic!("expected a single coverage"),
     }
 }
 
@@ -1147,8 +1147,7 @@ fn derived_wind_is_the_speed_of_the_grid_relative_components() {
     let speed = result.ranges["wind_speed_10m"].values[0].unwrap();
     assert!(
         (speed - x.hypot(y)).abs() < 1e-3,
-        "{speed} vs {}",
-        x.hypot(y)
+        "the derived speed is not the hypot of the stored components"
     );
     let drawn = wind
         .get_raster_tile(

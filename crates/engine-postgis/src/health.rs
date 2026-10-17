@@ -7,8 +7,9 @@
 //! collection has no engine; the server's boot health snapshot owns that case.
 //!
 //! [`LiveHealth`] is what `/health` reports: the ping's verdict with the
-//! metadata snapshot's state on top — a station list, or a mode-B station
-//! registry, cut at `max_locations` degrades a reachable collection (#1061).
+//! schema validation and metadata snapshot state on top — a station list, or
+//! a mode-B station registry, cut at `max_locations` degrades a reachable
+//! collection (#1061).
 //!
 //! The same struct carries the cheap counters the `/metrics` endpoint scrapes
 //! (ping failures, metadata-refresh totals/failures, last-refresh duration).
@@ -35,6 +36,10 @@ pub enum HealthStatus {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LiveHealth {
     Ready,
+    /// No successful validation/metadata publication yet.
+    ValidationPending,
+    /// A confirmed schema mismatch; reachability cannot clear this.
+    SchemaInvalid,
     /// The latest `SELECT 1` ping failed.
     Unreachable,
     /// The database answers, but `max_locations` cut the cached station
@@ -74,6 +79,8 @@ impl LiveHealth {
     pub fn degraded_reason(self) -> Option<String> {
         match self {
             Self::Ready => None,
+            Self::ValidationPending => Some(crate::validation::PENDING_ERROR.into()),
+            Self::SchemaInvalid => Some(crate::validation::SCHEMA_ERROR.into()),
             Self::Unreachable => Some("database unreachable (health ping failed)".to_string()),
             Self::LocationsTruncated { max_locations, cut } => Some(cut.reason(max_locations)),
         }

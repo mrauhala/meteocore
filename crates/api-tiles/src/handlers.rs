@@ -99,30 +99,30 @@ fn lookup_engine<'a>(
     Ok((engine, config))
 }
 
-/// Resolve the style map a request should be styled from.
-///
-/// Multi-parameter collections register one style map per parameter under
-/// `"{collection}/{param}"` alongside the collection-level map, and only the
-/// per-parameter map carries that parameter's colormap (from
-/// `[[wms.parameters]]`, a bundle parameter entry, or a built-in parameter
-/// default). A request that names a parameter must therefore resolve its
-/// style there first, falling back to the collection map when the collection
-/// has no such layer (single-parameter engines, unknown parameter names that
-/// the engine ignores). Mirrors how WMS GetMap resolves `LAYERS=coll/param`.
-fn layer_style_map<'a>(
+/// The style `style` a request on `collection_id` draws with, and the
+/// parameter it draws: [`ds_render::resolve_layer_style`], the resolution
+/// WMS and Maps share, with this API's errors. A `parameter-name` styles
+/// from that parameter's own layer, and a request without one on a
+/// multi-parameter collection from the default parameter's (#1133), so the
+/// default parameter draws as it does when named.
+fn layer_style<'a>(
     styles: &'a HashMap<String, HashMap<String, StyleInfo>>,
     collection_id: &str,
-    parameter: Option<&str>,
-) -> Option<(String, &'a HashMap<String, StyleInfo>)> {
-    if let Some(p) = parameter {
-        let key = format!("{collection_id}/{p}");
-        if let Some(m) = styles.get(&key) {
-            return Some((key, m));
-        }
-    }
-    styles
-        .get(collection_id)
-        .map(|m| (collection_id.to_string(), m))
+    parameter: Option<&'a str>,
+    info: &'a RasterInfo,
+    style: &str,
+) -> Result<ds_render::LayerStyle<'a>, TilesError> {
+    ds_render::resolve_layer_style(styles, collection_id, parameter, Some(info), style).map_err(
+        |error| match error {
+            ds_render::LayerStyleError::UnknownLayer => {
+                TilesError::NotFound(format!("Collection '{collection_id}' not found"))
+            }
+            ds_render::LayerStyleError::UnknownStyle(offered) => TilesError::NotFound(format!(
+                "Style '{style}' not found for collection '{collection_id}'. Available: {}",
+                offered.keys().cloned().collect::<Vec<_>>().join(", ")
+            )),
+        },
+    )
 }
 
 /// How a tile render turns engine output into pixels.
@@ -2125,20 +2125,20 @@ pub async fn style_legend(
         return composite_legend(engine.as_ref(), spec, format).await;
     }
 
-    // `?parameter-name=` selects the per-parameter style layer, so the legend
-    // a client draws matches the pixels the tile routes render for that same
-    // parameter.
-    let (_, layer_styles) =
-        layer_style_map(&state.styles, &id, params.parameter_name.as_deref())
-            .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
-    let style_info = layer_styles.get(&style_id).ok_or_else(|| {
-        TilesError::NotFound(format!(
-            "Style '{style_id}' not found for collection '{id}'. Available: {}",
-            layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))
-    })?;
-
+    // The style resolves as on the tile routes: `?parameter-name=` selects
+    // the per-parameter style layer, and without it, on a multi-parameter
+    // collection, the default parameter's (#1133), so the legend a client draws matches the pixels the tile
+    // routes render for that same request.
     let info = engine.raster_info_shared();
+    let resolved = layer_style(
+        &state.styles,
+        &id,
+        params.parameter_name.as_deref(),
+        &info,
+        &style_id,
+    )?;
+    let style_info = resolved.style;
+
     // Mirror the render path's validation: an unknown `parameter-name` must
     // 400 with the available list, not fall back to the collection style and
     // emit a legend labelled with a parameter that doesn't exist.
@@ -2148,8 +2148,7 @@ pub async fn style_legend(
         &id,
         params.parameter_name.as_deref(),
     )?;
-    let (parameter, unit) =
-        ds_render::legend_parameter_unit(style_info, &info, params.parameter_name.as_deref());
+    let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info, resolved.parameter);
 
     match format {
         LegendFormat::Json => {
@@ -2399,11 +2398,21 @@ async fn render_tile(
     // channels, and its one style is `default`.
     let composite = composite_parameter(engine.as_ref(), validated.parameter_name.as_deref());
 
-    // Look up style. A `?parameter-name=` request styles from that
-    // parameter's own layer when the collection registers one — otherwise a
-    // per-parameter colormap would be unreachable through Tiles and every
-    // parameter would render with the collection-level default.
-    let (style_layer_key, paint, style_parameter) = match &composite {
+    // Single `raster_info_shared()` call covers style resolution,
+    // default-time resolution and parameter-name validation. Trait contract
+    // is O(1) but we still avoid the redundant call.
+    let raster_info = engine.raster_info_shared();
+
+    // Look up style, and the parameter it draws. A `?parameter-name=`
+    // request styles from that parameter's own layer when the collection
+    // registers one — otherwise a per-parameter colormap would be
+    // unreachable through Tiles and every parameter would render with the
+    // collection-level default. Without one, on a multi-parameter
+    // collection, the default parameter's layer styles it (#1133), as when
+    // the request names it. For a composite, the
+    // parameter is its name: the engine resolves its time axis, the scans
+    // every band has, like a parameter's.
+    let (style_layer_key, paint, effective_parameter) = match &composite {
         Some(spec) => {
             if style_name != ds_render::COMPOSITE_STYLE {
                 return Err(composite_style_not_found(
@@ -2415,29 +2424,21 @@ async fn render_tile(
             (
                 format!("{collection_id}/{}", spec.name),
                 Paint::Composite(spec.clone()),
-                None,
+                validated.parameter_name.clone(),
             )
         }
         None => {
-            let (style_layer_key, layer_styles) = layer_style_map(
+            let resolved = layer_style(
                 &state.styles,
                 collection_id,
                 validated.parameter_name.as_deref(),
-            )
-            .ok_or_else(|| {
-                TilesError::NotFound(format!("Collection '{collection_id}' not found"))
-            })?;
-
-            let style_info = layer_styles.get(style_name).ok_or_else(|| {
-                TilesError::NotFound(format!(
-                    "Style '{style_name}' not found for collection '{collection_id}'. Available: {}",
-                    layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-                ))
-            })?;
+                &raster_info,
+                style_name,
+            )?;
             (
-                style_layer_key,
-                Paint::Colormap(style_info.colormap.clone()),
-                style_info.parameter.clone(),
+                resolved.layer.to_string(),
+                Paint::Colormap(resolved.style.colormap.clone()),
+                resolved.parameter.map(str::to_string),
             )
         }
     };
@@ -2462,11 +2463,6 @@ async fn render_tile(
         _ => crs_to_uri("CRS:84"),
     };
 
-    // Single `raster_info_shared()` call covers both default-time resolution and
-    // parameter-name validation. Trait contract is O(1) but we still avoid
-    // the redundant call.
-    let raster_info = engine.raster_info_shared();
-
     // Parameter selection: ?parameter-name= wins over style.parameter. Mirror
     // the precedence and validation used by api-maps + api-wms so the SPA
     // dropdown works identically across all three raster routes. Engines
@@ -2478,9 +2474,6 @@ async fn render_tile(
         collection_id,
         validated.parameter_name.as_deref(),
     )?;
-    // For a composite, its name: the engine resolves its time axis, the
-    // scans every band has, like a parameter's.
-    let effective_parameter = validated.parameter_name.clone().or(style_parameter);
 
     // Reject an `elevation` against a collection with no vertical axis.
     if validated.z.is_some() && raster_info.vertical.is_none() {
@@ -2546,7 +2539,9 @@ async fn render_tile(
     // Build cache key
     let cache_key = CacheKey {
         // The RESOLVED style-layer key — see api-maps render_map: prevents a
-        // parameter-layer style aliasing a same-named collection style.
+        // parameter-layer style aliasing a same-named collection style, and
+        // keys a tile without `parameter-name` that resolved to its default
+        // parameter's layer like one naming that parameter (#1133).
         layer: style_layer_key,
         style: style_name.to_string(),
         format,

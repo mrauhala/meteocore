@@ -28,3 +28,6 @@ arc-swap = "1"
 tracing = "0.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"

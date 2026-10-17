@@ -20,6 +20,7 @@
 //! quantity (the ODIM engine only computes cells for dBZ-unit quantities).
 
 use crate::geo::{destination_point, EARTH_RADIUS_M};
+use crate::simplify::douglas_peucker_closed;
 use crate::volume::VoxelGrid;
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
@@ -860,82 +861,6 @@ fn shoelace(points: impl Iterator<Item = (f64, f64)>) -> f64 {
         sum += x0 * y1 - x1 * y0;
     }
     sum / 2.0
-}
-
-/// Douglas–Peucker on a closed loop: anchor the two farthest-apart vertices,
-/// simplify each arc, return kept indices (ascending). Always keeps ≥ 3
-/// vertices so the ring stays a polygon.
-fn douglas_peucker_closed(points: &[(f64, f64)], tol: f64) -> Vec<usize> {
-    let n = points.len();
-    if n <= 4 {
-        return (0..n).collect();
-    }
-    // Anchors: vertex 0 and the vertex farthest from it.
-    let far = (1..n)
-        .max_by(|&a, &b| {
-            let d = |i: usize| {
-                let (x, y) = points[i];
-                let (x0, y0) = points[0];
-                (x - x0).hypot(y - y0)
-            };
-            d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .expect("n > 1");
-    let mut keep = vec![false; n];
-    keep[0] = true;
-    keep[far] = true;
-    dp_arc(points, 0, far, tol, &mut keep);
-    dp_arc_wrapping(points, far, n, tol, &mut keep);
-    let kept: Vec<usize> = (0..n).filter(|&i| keep[i]).collect();
-    if kept.len() < 3 {
-        // Degenerate (collinear loop) — keep a triangle's worth of vertices.
-        return vec![0, n / 3, 2 * n / 3];
-    }
-    kept
-}
-
-/// Simplify the open arc `points[i0..=i1]` in place (marks kept indices).
-fn dp_arc(points: &[(f64, f64)], i0: usize, i1: usize, tol: f64, keep: &mut [bool]) {
-    if i1 <= i0 + 1 {
-        return;
-    }
-    let (ax, ay) = points[i0];
-    let (bx, by) = points[i1];
-    let (dx, dy) = (bx - ax, by - ay);
-    let len = dx.hypot(dy);
-    let mut worst = (0usize, 0.0f64);
-    for (i, &(px, py)) in points.iter().enumerate().take(i1).skip(i0 + 1) {
-        let dist = if len <= f64::EPSILON {
-            (px - ax).hypot(py - ay)
-        } else {
-            ((px - ax) * dy - (py - ay) * dx).abs() / len
-        };
-        if dist > worst.1 {
-            worst = (i, dist);
-        }
-    }
-    if worst.1 > tol {
-        keep[worst.0] = true;
-        dp_arc(points, i0, worst.0, tol, keep);
-        dp_arc(points, worst.0, i1, tol, keep);
-    }
-}
-
-/// Simplify the arc from `i0` back around to vertex 0 (i.e. `i0..n` plus the
-/// implicit wrap to index 0).
-fn dp_arc_wrapping(points: &[(f64, f64)], i0: usize, n: usize, tol: f64, keep: &mut [bool]) {
-    // Materialise the wrapped arc with the closing vertex appended; indices
-    // map back as (i0 + k) % n.
-    let arc: Vec<(f64, f64)> = (i0..=n).map(|k| points[k % n]).collect();
-    let mut arc_keep = vec![false; arc.len()];
-    arc_keep[0] = true;
-    *arc_keep.last_mut().expect("non-empty arc") = true;
-    dp_arc(&arc, 0, arc.len() - 1, tol, &mut arc_keep);
-    for (k, &kept) in arc_keep.iter().enumerate() {
-        if kept {
-            keep[(i0 + k) % n] = true;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

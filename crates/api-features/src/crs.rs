@@ -127,7 +127,11 @@ impl FeatureCrs {
     ///   is the envelope of densely sampled edge points, widened to a pole the
     ///   box contains, and crossing the antimeridian when that is narrower.
     ///   The envelope can hold features just outside the projected rectangle
-    ///   near its corners; it never misses one inside.
+    ///   near its corners. EPSG:3067 has places only up to the poles and
+    ///   50° from its meridian (#1113); where that edge crosses the box,
+    ///   the envelope reaches it. Only where the LAEA disk's rim crosses a
+    ///   box edge between two edge points can it stop short, by up to their
+    ///   spacing.
     pub fn bbox_to_crs84(self, values: [f64; 4]) -> Result<Bbox, DataServerError> {
         let invalid = |msg: String| DataServerError::InvalidBbox(msg);
         if !values.iter().all(|v| v.is_finite()) {
@@ -281,7 +285,13 @@ fn inverse_point(projection: &Crs, x: f64, y: f64) -> Option<(f64, f64)> {
 }
 
 /// CRS84 envelope of the projected box `[min_e, min_n, max_e, max_n]`, or
-/// `None` when no edge point inverse-projects.
+/// `None` when it holds no place: no edge point inverse-projects, and no
+/// edge of EPSG:3067's area runs inside it.
+///
+/// EPSG:3067's area ends at the poles and 50° of longitude from its
+/// meridian (#1113). Where that edge crosses the box, the edge points stop
+/// short of it, and a box around the whole area has none at all, so
+/// `geo::area_edge_points` adds where it runs inside the box.
 fn projected_envelope(projection: &Crs, bbox: [f64; 4]) -> Option<Bbox> {
     let [min_e, min_n, max_e, max_n] = bbox;
     let mut points = Vec::with_capacity(4 * (BBOX_EDGE_SAMPLES + 1));
@@ -293,19 +303,20 @@ fn projected_envelope(projection: &Crs, bbox: [f64; 4]) -> Option<Bbox> {
             points.extend(inverse_point(projection, x, y));
         }
     }
+    points.extend(
+        geo::area_edge_points(projection, bbox)
+            .into_iter()
+            .map(|(lon, lat)| (geo::wrap_lon(lon), lat)),
+    );
     if points.is_empty() {
         return None;
     }
     // A pole inside the box is its latitude extreme and spans every
     // longitude, but no edge point reaches it.
-    let contains = |lat: f64| {
-        let (e, n) = projection.forward(0.0, lat);
-        e.is_finite()
-            && n.is_finite()
-            && (min_e..=max_e).contains(&e)
-            && (min_n..=max_n).contains(&n)
-    };
-    let (north_pole, south_pole) = (contains(90.0), contains(-90.0));
+    let (north_pole, south_pole) = (
+        geo::holds_pole(projection, bbox, 90.0),
+        geo::holds_pole(projection, bbox, -90.0),
+    );
     let mut south = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let mut north = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
     if north_pole {
@@ -585,6 +596,45 @@ mod tests {
             .unwrap();
         assert_eq!((bbox.west, bbox.east, bbox.north), (-180.0, 180.0, 90.0));
         assert!(bbox.south > 88.0 && bbox.south < 90.0, "{bbox:?}");
+    }
+
+    /// EPSG:3067 has places only up to the poles and 50° from 27°E (#1113),
+    /// where its edge points can miss them. A box around the whole area,
+    /// whose edge points all lie past it, holds both poles and matches
+    /// every feature, as does any CRS84 box over the world. So does a box
+    /// over the North Pole whose bottom edge lies 5 km short of it, past the
+    /// area too. A box crossing the meridians 50° out reaches them, 23°W
+    /// and 77°E, between its edge points: 76.5°E 84°N is (1 009 518.339,
+    /// 9 561 997.506), `cs2cs -d 3 EPSG:4326 EPSG:3067`, inside it. A box
+    /// whose west edge is the pole's easting, 500 000 m, holds the pole.
+    #[test]
+    fn epsg_3067_boxes_reach_the_edge_of_its_area() {
+        for whole in [
+            [-20_000_000.0, -10_000_000.0, 20_000_000.0, 20_000_000.0],
+            [-7_000_000.0, -12_000_000.0, 8_000_000.0, 12_000_000.0],
+        ] {
+            let bbox = FeatureCrs::Epsg3067.bbox_to_crs84(whole).unwrap();
+            bbox_close(&bbox, [-180.0, -90.0, 180.0, 90.0], 0.0);
+        }
+        // The North Pole is (500 000, 9 997 964.943), `cs2cs EPSG:4326
+        // EPSG:3067` of 90°N 27°E.
+        let bbox = FeatureCrs::Epsg3067
+            .bbox_to_crs84([-1_030_000.0, 9_992_965.0, 1_970_000.0, 10_997_965.0])
+            .unwrap();
+        assert_eq!((bbox.west, bbox.east, bbox.north), (-180.0, 180.0, 90.0));
+        assert!((89.9..90.0).contains(&bbox.south), "{bbox:?}");
+        let bbox = FeatureCrs::Epsg3067
+            .bbox_to_crs84([-1_000_000.0, 6_000_000.0, 2_000_000.0, 9_900_000.0])
+            .unwrap();
+        assert!(
+            (bbox.west + 23.0).abs() < 1e-9 && (bbox.east - 77.0).abs() < 1e-9,
+            "{bbox:?}"
+        );
+        assert!(bbox.contains(76.5, 84.0), "{bbox:?}");
+        let bbox = FeatureCrs::Epsg3067
+            .bbox_to_crs84([500_000.0, 9_000_000.0, 1_000_000.0, 10_500_000.0])
+            .unwrap();
+        assert_eq!((bbox.west, bbox.east, bbox.north), (-180.0, 180.0, 90.0));
     }
 
     #[test]

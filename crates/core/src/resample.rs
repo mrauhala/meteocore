@@ -317,13 +317,11 @@ impl ProjectionGrid {
     /// the error budget and must not be read.
     ///
     /// Outside a source's footprint the mapping need not be smooth, and
-    /// refining for it then never converges (#1110). A projected output's
-    /// inverse breaks down far from the area it is made for: EPSG:3067's
-    /// returns latitudes of hundreds of degrees some 60° east of its central
-    /// meridian. A conic source's forward transform jumps a cone's gap
-    /// where longitude wraps, half a turn from the source. Over the pole,
-    /// either drove a 256 px meta-tile to [`MAX_CELLS`]: a million and a
-    /// half projections for pixels the footprint guard then left empty.
+    /// refining for it then never converges (#1110). A conic source's
+    /// forward transform jumps a cone's gap where longitude wraps, half a
+    /// turn from the source. Over the pole that drove a 256 px meta-tile to
+    /// [`MAX_CELLS`]: a million and a half projections for pixels the
+    /// footprint guard then left empty.
     ///
     /// [`OutputCrs::footprint_pixel_window`]: crate::map_engine::OutputCrs::footprint_pixel_window
     pub fn build_2d_within(
@@ -418,20 +416,30 @@ impl ProjectionGrid {
         overlaps(cx, self.cell_w, x_lo, x_hi) && overlaps(cy, self.cell_h, y_lo, y_hi)
     }
 
-    /// Give every cell on a domain boundary — some corner nodes finite,
-    /// some not — a sub-grid at [`BOUNDARY_STEP_PX`] spacing, so the
-    /// boundary is resolved to that many pixels instead of blanking the
-    /// whole cell. A cell bracketing a pole of a periodic column axis gets
-    /// one too, confining the pole's singularity to one sub-cell.
+    /// Give every cell on a domain boundary a sub-grid at
+    /// [`BOUNDARY_STEP_PX`] spacing, so the boundary is resolved to that
+    /// many pixels instead of blanking the whole cell. A cell is on it when
+    /// some corner nodes are finite and some not, or when the domain
+    /// reaches in between corners that all miss it. The domain's edge does
+    /// that where it has a corner, as Transverse Mercator's area does at a
+    /// pole (#1113): low in a 32 px cell, the pole and the tip of the area
+    /// below it miss every corner. The domain then reaches the cell across
+    /// a side, from a neighbour whose sub-grid has a finite node along it,
+    /// or from past the grid or the cells `read` holds, where the cell's
+    /// own side is probed at the sub-grid spacing. A cell bracketing a
+    /// pole of a periodic column axis gets a sub-grid too, confining the
+    /// pole's singularity to one sub-cell.
     ///
     /// This stays a coarse-grid mapping (Critical Rule 5): a boundary curve
     /// crosses O(perimeter / cell) cells, each costing
     /// `(cell / BOUNDARY_STEP_PX)²` projections, so a limb-sized curve costs
-    /// on the order of its perimeter in pixels times four. Total sub-grid
-    /// nodes are capped at a quarter of the per-pixel cost; a mapping with
-    /// scattered non-finite nodes stops refining there, and its remaining
-    /// boundary cells stay unfilled. A cell holding no pixel of `read` is
-    /// never sampled and gets none.
+    /// on the order of its perimeter in pixels times four. The probes cost
+    /// at most half the perimeter of the grid, or of the cells `read`
+    /// holds, in pixels. Total sub-grid nodes and probes are capped at a
+    /// quarter of the per-pixel cost; a mapping with scattered non-finite
+    /// nodes stops refining there, and its remaining boundary cells stay
+    /// unfilled. A cell holding no pixel of `read` is never sampled and
+    /// gets none.
     fn refine_boundary(
         &mut self,
         out_width: u32,
@@ -441,51 +449,122 @@ impl ProjectionGrid {
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) {
         let finite = |(c, r): (f64, f64)| c.is_finite() && r.is_finite();
+        let (cells_x, cells_y, stride) = (self.cells_x, self.cells_y, self.stride);
         let sub_x = (self.cell_w / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
         let sub_y = (self.cell_h / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
         let per_cell = (sub_x + 1) * (sub_y + 1);
         let mut budget = (out_width as usize * out_height as usize / 4).max(4096);
-        for cy in 0..self.cells_y {
-            for cx in 0..self.cells_x {
+        let corners = |cx: usize, cy: usize| {
+            let n = cy * stride + cx;
+            [
+                self.nodes[n],
+                self.nodes[n + 1],
+                self.nodes[n + stride],
+                self.nodes[n + stride + 1],
+            ]
+        };
+        // Sub-grid node (i, j) of cell (cx, cy).
+        let node = |cx: usize, cy: usize, i: usize, j: usize| {
+            let fx = (cx as f64 + i as f64 / sub_x as f64) / cells_x as f64;
+            let fy = (cy as f64 + j as f64 / sub_y as f64) / cells_y as f64;
+            let (lon, lat) = out_to_world(fx, fy);
+            world_to_src_px(lon, lat)
+        };
+        // A cell's sides, top, bottom, left and right: the sub-grid nodes
+        // between its corners, and the read cell across, if any.
+        let side = |s: usize| -> Vec<(usize, usize)> {
+            match s {
+                0 => (1..sub_x).map(|i| (i, 0)).collect(),
+                1 => (1..sub_x).map(|i| (i, sub_y)).collect(),
+                2 => (1..sub_y).map(|j| (0, j)).collect(),
+                _ => (1..sub_y).map(|j| (sub_x, j)).collect(),
+            }
+        };
+        let across = |cx: usize, cy: usize, s: usize| {
+            let (x, y) = match s {
+                0 => (Some(cx), cy.checked_sub(1)),
+                1 => (Some(cx), Some(cy + 1)),
+                2 => (cx.checked_sub(1), Some(cy)),
+                _ => (Some(cx + 1), Some(cy)),
+            };
+            let (x, y) = (x?, y?);
+            (x < cells_x && y < cells_y && self.reads_cell(read, x, y)).then_some((x, y))
+        };
+        let mut queued = vec![false; cells_x * cells_y];
+        let mut work = Vec::new();
+        for cy in 0..cells_y {
+            for cx in 0..cells_x {
                 if !self.reads_cell(read, cx, cy) {
                     continue;
                 }
-                let n = cy * self.stride + cx;
-                let corners = [
-                    self.nodes[n],
-                    self.nodes[n + 1],
-                    self.nodes[n + self.stride],
-                    self.nodes[n + self.stride + 1],
-                ];
+                let corners = corners(cx, cy);
                 let valid = corners.iter().filter(|&&c| finite(c)).count();
                 let pole = valid == 4 && brackets_pole(&corners, self.col_period);
-                if valid == 0 || (valid == 4 && !pole) {
-                    continue;
+                let on_boundary = match valid {
+                    // The domain can reach in only across a side no other
+                    // cell's sub-grid runs along.
+                    0 => (0..4).filter(|&s| across(cx, cy, s).is_none()).any(|s| {
+                        let probes = side(s);
+                        if probes.len() > budget {
+                            return false;
+                        }
+                        budget -= probes.len();
+                        probes.into_iter().any(|(i, j)| finite(node(cx, cy, i, j)))
+                    }),
+                    4 => pole,
+                    _ => true,
+                };
+                if on_boundary {
+                    queued[cy * cells_x + cx] = true;
+                    work.push((cx, cy, pole));
                 }
-                if per_cell > budget {
-                    return;
-                }
-                budget -= per_cell;
-                self.pole_cells |= pole;
-                let mut nodes = Vec::with_capacity(per_cell);
-                for j in 0..=sub_y {
-                    let fy = (cy as f64 + j as f64 / sub_y as f64) / self.cells_y as f64;
-                    for i in 0..=sub_x {
-                        let fx = (cx as f64 + i as f64 / sub_x as f64) / self.cells_x as f64;
-                        let (lon, lat) = out_to_world(fx, fy);
-                        nodes.push(world_to_src_px(lon, lat));
-                    }
-                }
-                self.boundary.push((
-                    n,
-                    SubGrid {
-                        cells_x: sub_x,
-                        cells_y: sub_y,
-                        nodes,
-                    },
-                ));
             }
         }
+        let mut boundary = Vec::with_capacity(work.len());
+        let mut pole_cells = false;
+        let mut next = 0;
+        while let Some(&(cx, cy, pole)) = work.get(next) {
+            next += 1;
+            if per_cell > budget {
+                break;
+            }
+            budget -= per_cell;
+            pole_cells |= pole;
+            let mut nodes = Vec::with_capacity(per_cell);
+            for j in 0..=sub_y {
+                for i in 0..=sub_x {
+                    nodes.push(node(cx, cy, i, j));
+                }
+            }
+            // The domain reaching on across a side into a cell whose
+            // corners all miss it.
+            for s in 0..4 {
+                let Some((x, y)) = across(cx, cy, s) else {
+                    continue;
+                };
+                if queued[y * cells_x + x] || corners(x, y).into_iter().any(finite) {
+                    continue;
+                }
+                if side(s)
+                    .into_iter()
+                    .any(|(i, j)| finite(nodes[j * (sub_x + 1) + i]))
+                {
+                    queued[y * cells_x + x] = true;
+                    work.push((x, y, false));
+                }
+            }
+            boundary.push((
+                cy * stride + cx,
+                SubGrid {
+                    cells_x: sub_x,
+                    cells_y: sub_y,
+                    nodes,
+                },
+            ));
+        }
+        boundary.sort_unstable_by_key(|&(n, _)| n);
+        self.boundary = boundary;
+        self.pole_cells = pole_cells;
     }
 
     /// Build a grid with an explicit cell count (no refinement).
@@ -1169,6 +1248,89 @@ mod tests {
                 };
                 assert!(km < limit, "pixel ({ox}, {oy}) {km:.2} km off (texel 4 km)");
             }
+        }
+    }
+
+    /// EPSG:3067's area narrows to a point at the North Pole between the
+    /// meridians 50° either side of 27°E (#1113): below the pole, a wedge
+    /// about 100° wide. In a 256 px tile at 5 km a pixel, a pole 6 px above
+    /// a 32 px cell's bottom side lies 16 px from that side's corners, and
+    /// the tip of the wedge misses all four. Once with the cell below in
+    /// the tile, whose sub-grid reaches the tip along their shared side, and
+    /// once with the cell's bottom side the tile's own, where no node is on
+    /// the Earth and only the side's probes find the tip. The source is the
+    /// tile's own grid, so the map is the identity and the grid stays at
+    /// its 32 px cells. Every pixel whose 2 px surroundings, a sub-grid step,
+    /// lie in the area is drawn where it lies, and no pixel past the area.
+    /// The pole is (500 000, 9 997 964.943), PROJ 9.8.1's `cs2cs -d 3
+    /// EPSG:4326 EPSG:3067` of 90°N 27°E.
+    #[test]
+    fn the_tip_of_a_tm_area_at_its_pole_is_drawn() {
+        let tm = crate::geo::projected_output_crs("EPSG:3067").unwrap();
+        let (pole_e, pole_n, px, size) = (500_000.0, 9_997_964.943, 5_000.0, 256_u32);
+        let side = f64::from(size) * px;
+        for (col, row) in [(80.0, 26.0), (80.0, 250.0)] {
+            let (west, north) = (pole_e - col * px, pole_n + row * px);
+            let bbox = [west, north - side, west + side, north];
+            let output = crate::map_engine::OutputCrs::Projected {
+                crs: tm.clone(),
+                bbox,
+            };
+            let place = |x: f64, y: f64| {
+                let (fx, fy) = (x / f64::from(size), y / f64::from(size));
+                output.position_on_earth([f64::NAN; 4], fx, fy).is_some()
+            };
+            let to_src = |lon: f64, lat: f64| {
+                let (x, y) = tm.forward(lon, lat);
+                ((x - west) / px, (north - y) / px)
+            };
+            let grid = ProjectionGrid::build_2d(
+                size,
+                size,
+                size,
+                size,
+                |fx, fy| output.project_node([f64::NAN; 4], fx, fy),
+                to_src,
+            );
+            assert_eq!(
+                (grid.cells_x, grid.cells_y),
+                (8, 8),
+                "pole at ({col}, {row})"
+            );
+            // The pole's cell, from 64 px across and its row down.
+            let (cx, cy) = (2, (row / 32.0) as usize);
+            let n = cy * grid.stride + cx;
+            let corners = [n, n + 1, n + grid.stride, n + grid.stride + 1];
+            assert!(
+                corners.iter().all(|&k| !grid.nodes[k].0.is_finite()),
+                "pole at ({col}, {row}): a corner of its cell is on the Earth"
+            );
+            let mut drawn = 0;
+            for oy in 0..size {
+                for ox in 0..size {
+                    let (x, y) = (f64::from(ox) + 0.5, f64::from(oy) + 0.5);
+                    let (c, r) = grid.sample(ox, oy);
+                    if !place(x, y) {
+                        assert!(c.is_nan() || r.is_nan(), "({ox}, {oy}) off the Earth");
+                    } else if [(-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)]
+                        .iter()
+                        .all(|&(dx, dy)| place(x + dx, y + dy))
+                    {
+                        assert!(
+                            (c - x).abs() < 0.5 && (r - y).abs() < 0.5,
+                            "pole at ({col}, {row}): ({ox}, {oy}) drawn at ({c}, {r})"
+                        );
+                        drawn += usize::from(oy < 32 * (cy as u32 + 1));
+                    }
+                }
+            }
+            // The tip inside the pole's own cell row, 4 px below the pole.
+            let (c, r) = grid.sample(80, row as u32 + 4);
+            assert!(
+                c.is_finite() && r.is_finite(),
+                "pole at ({col}, {row}): the tip is empty"
+            );
+            assert!(drawn > 0, "pole at ({col}, {row})");
         }
     }
 

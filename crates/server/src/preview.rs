@@ -289,13 +289,13 @@ pub async fn manifest_handler(
 ///
 /// Pure: takes `&AdminState`, returns JSON. Used by the handler and by tests.
 ///
-/// **Snapshot semantics.** The five `load_full()` calls below are *not*
+/// **Snapshot semantics.** The six `load_full()` calls below are *not*
 /// atomic — a concurrent `POST /admin/collections/reload` racing between
 /// them can produce a torn snapshot where a collection is in EDR's view
 /// but not Tiles' (or vice versa). The cost would be momentarily-wrong
 /// `apis[]`/extents on the next request after a reload; the LRU clears
-/// once all five `ArcSwap`s settle. This is an accepted trade-off of
-/// the per-API `ArcSwap` pattern — wrapping all five in a single outer
+/// once all six `ArcSwap`s settle. This is an accepted trade-off of
+/// the per-API `ArcSwap` pattern — wrapping all six in a single outer
 /// `ArcSwap` would fix it but is out of scope for this PR.
 #[cfg(test)]
 pub(crate) fn build_manifest(state: &AdminState, offset: usize, limit: usize) -> Value {
@@ -326,6 +326,7 @@ pub(crate) fn build_manifest_with_base(
     let maps = state.maps.load_full();
     let tiles = state.tiles.load_full();
     let wms = state.wms.load_full();
+    let tiles_3d = state.tiles_3d.load_full();
 
     // Build the canonical id ordering: union of all *State.collections keys,
     // sorted lexicographically. Stable across reloads when configs are stable.
@@ -343,7 +344,11 @@ pub(crate) fn build_manifest_with_base(
 
     let entries: Vec<Value> = returned
         .into_iter()
-        .map(|id| build_entry(id, base_url, &edr, &features, &maps, &tiles, &wms))
+        .map(|id| {
+            build_entry(
+                id, base_url, &edr, &features, &maps, &tiles, &wms, &tiles_3d,
+            )
+        })
         .collect();
 
     let next = if offset + returned_count < total {
@@ -373,17 +378,18 @@ fn build_entry(
     maps: &api_maps::handlers::MapsState,
     tiles: &api_tiles::handlers::TilesState,
     wms: &api_wms::handlers::WmsState,
+    tiles_3d: &api_3dtiles::TilesState3d,
 ) -> Value {
     // Pull a CollectionConfig from whichever state was the first to register
-    // this id. They all carry the same `apis`/`title`/`description` because
-    // they're cloned from the same source CollectionConfig at load time.
+    // this id, for its title and description. Its `apis` are NOT what the
+    // collection serves: a radar network's base id lists every API but is
+    // registered only as a Features inventory, and its per-site collections
+    // inherit `features` without serving it (#1134).
     let config = first_config(id, edr, features, maps, tiles, wms);
 
     let title = config.map(|c| c.title.as_str()).unwrap_or(id);
     let description = config.map(|c| c.description.as_str()).unwrap_or("");
-    let apis: Vec<&str> = config
-        .map(|c| c.apis.iter().map(String::as_str).collect())
-        .unwrap_or_default();
+    let apis = served_apis(id, edr, features, maps, tiles, wms, tiles_3d);
 
     let mut entry = json!({
         "id": id,
@@ -391,6 +397,10 @@ fn build_entry(
         "description": description,
         "apis": apis,
     });
+
+    if let Some(page) = collection_page_url(id, base_url, &apis) {
+        entry["page_url"] = json!(page);
+    }
 
     if let Some(extent) = resolve_spatial_extent(id, edr, features, maps, tiles, wms) {
         entry["spatial_extent"] = json!(extent);
@@ -447,8 +457,64 @@ fn build_entry(
     entry
 }
 
+/// The APIs that serve `id`, in a fixed order: membership of each API's
+/// engine registry, the registries its routes look the collection up in.
+/// The configured `apis` overstate it: the server registers a collection
+/// only where its engine supports the API, and derives some ids (a radar
+/// network's site inventory, its per-site collections) with a subset.
+#[allow(clippy::too_many_arguments)]
+fn served_apis(
+    id: &str,
+    edr: &api_edr::handlers::EdrState,
+    features: &api_features::handlers::FeaturesState,
+    maps: &api_maps::handlers::MapsState,
+    tiles: &api_tiles::handlers::TilesState,
+    wms: &api_wms::handlers::WmsState,
+    tiles_3d: &api_3dtiles::TilesState3d,
+) -> Vec<&'static str> {
+    [
+        ("edr", edr.engines.contains_key(id)),
+        ("features", features.engines.contains_key(id)),
+        ("maps", maps.engines.contains_key(id)),
+        (
+            "tiles",
+            tiles.map_engines.contains_key(id) || tiles.feature_engines.contains_key(id),
+        ),
+        ("wms", wms.engines.contains_key(id)),
+        ("3dtiles", tiles_3d.volume_engines.contains_key(id)),
+    ]
+    .into_iter()
+    .filter_map(|(api, served)| served.then_some(api))
+    .collect()
+}
+
+/// The collection's HTML page: at the shared OGC API root (#789) when Maps,
+/// Tiles or Features serves it, else under EDR. `None` for a collection
+/// with neither (WMS only), which has no collection page.
+fn collection_page_url(id: &str, base_url: &str, apis: &[&str]) -> Option<String> {
+    let mount = if apis
+        .iter()
+        .any(|api| matches!(*api, "maps" | "tiles" | "features"))
+    {
+        // The shared root's mount (`SharedApi::new("")` in `main.rs`), as
+        // the tile templates below assume.
+        ""
+    } else if apis.contains(&"edr") {
+        api_common::mounts::EDR
+    } else {
+        return None;
+    };
+    Some(format!("{base_url}{mount}/collections/{id}?f=html"))
+}
+
 /// Parameter list emitted as `parameters: [{name, title, unit}]` in the
 /// per-collection manifest entry. Sorted by name for stable ordering.
+///
+/// The engine's default parameter, `raster_info().parameter`, carries
+/// `"default": true`: the one Maps, Tiles and WMS render without
+/// `parameter-name`, and the one the SPA selects first. The alphabetical
+/// first is often a parameter nobody opens on, or one that is costly to
+/// draw (a radar volume's `CELLS` overlay before its `DBZH`, #1134).
 ///
 /// The collection's RGB composites (`MapEngine::composites`, #819) are
 /// listed too, marked `"composite": true`, with an empty unit and their own
@@ -489,7 +555,9 @@ fn collection_parameters(
         .get(id)
         .or_else(|| tiles.map_engines.get(id))
         .or_else(|| wms.engines.get(id))?;
-    let raster_params = engine.raster_info().parameters;
+    let info = engine.raster_info();
+    let default_parameter = default_parameter_name(&info);
+    let raster_params = info.parameters;
 
     // Single-band engine → no meaningful per-request selection.
     if raster_params.is_empty() {
@@ -512,6 +580,9 @@ fn collection_parameters(
                 .map(|d| (d.label.clone(), d.unit.clone()))
                 .unwrap_or((title, parameter.unit));
             let mut entry = json!({ "name": name, "title": label, "unit": unit });
+            if default_parameter.as_deref() == Some(name.as_str()) {
+                entry["default"] = json!(true);
+            }
             if let Some(times) = engine.parameter_times(&name) {
                 entry["temporal_extent"] =
                     parameter_temporal_extent(id, config, engine.as_ref(), &times);
@@ -540,6 +611,25 @@ fn collection_parameters(
             .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
     });
     Some(out)
+}
+
+/// The `parameters[]` name of the engine's default, `info.parameter`.
+/// Engines name it as they list it, except QueryData, whose default is the
+/// descriptor's full name ("2 Metre Temperature (2t)"), listed as the title
+/// of `2t`: a default no name matches is the one parameter with that title.
+fn default_parameter_name(info: &ds_core::map_engine::RasterInfo) -> Option<String> {
+    let default = info.parameter.as_str();
+    if default.is_empty() {
+        return None;
+    }
+    if info.parameters.iter().any(|p| p.name == default) {
+        return Some(default.to_string());
+    }
+    let mut titled = info.parameters.iter().filter(|p| p.title == default);
+    match (titled.next(), titled.next()) {
+        (Some(p), None) => Some(p.name.clone()),
+        _ => None,
+    }
 }
 
 /// One parameter's own time axis in the manifest's `temporal_extent` shape.
@@ -1063,12 +1153,34 @@ mod tests {
         }
     }
 
+    fn empty_tiles_3d() -> api_3dtiles::TilesState3d {
+        api_3dtiles::TilesState3d {
+            volume_engines: HashMap::new(),
+            collections: HashMap::new(),
+            colormap: api_3dtiles::default_point_colormap(),
+            content_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            base_url: String::new(),
+            trust_proxy_headers: false,
+        }
+    }
+
     fn make_state(
         edr: api_edr::handlers::EdrState,
         features: api_features::handlers::FeaturesState,
         maps: api_maps::handlers::MapsState,
         tiles: api_tiles::TilesState,
         wms: api_wms::handlers::WmsState,
+    ) -> AdminState {
+        make_state_with_3d(edr, features, maps, tiles, wms, empty_tiles_3d())
+    }
+
+    fn make_state_with_3d(
+        edr: api_edr::handlers::EdrState,
+        features: api_features::handlers::FeaturesState,
+        maps: api_maps::handlers::MapsState,
+        tiles: api_tiles::TilesState,
+        wms: api_wms::handlers::WmsState,
+        tiles_3d: api_3dtiles::TilesState3d,
     ) -> AdminState {
         Arc::new(ServerState {
             edr: Arc::new(ArcSwap::from_pointee(edr)),
@@ -1077,14 +1189,7 @@ mod tests {
             wms: Arc::new(ArcSwap::from_pointee(wms)),
             maps: Arc::new(ArcSwap::from_pointee(maps)),
             tiles: Arc::new(ArcSwap::from_pointee(tiles)),
-            tiles_3d: Arc::new(ArcSwap::from_pointee(api_3dtiles::TilesState3d {
-                volume_engines: std::collections::HashMap::new(),
-                collections: std::collections::HashMap::new(),
-                colormap: api_3dtiles::default_point_colormap(),
-                content_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-                base_url: String::new(),
-                trust_proxy_headers: false,
-            })),
+            tiles_3d: Arc::new(ArcSwap::from_pointee(tiles_3d)),
             accepted_load: RwLock::new(None),
             recovery_shutdown: ds_poll::Shutdown::new(),
             config_path: String::new(),
@@ -1429,8 +1534,18 @@ mod tests {
     fn collection_in_multiple_apis_appears_once() {
         let mut edr = empty_edr();
         let mut features = empty_features();
+        edr.engines.insert(
+            "dual".into(),
+            Arc::new(EdrMock {
+                extent: None,
+                times: Vec::new(),
+            }),
+        );
         edr.collections
             .insert("dual".into(), config("dual", &["edr", "features"]));
+        features
+            .engines
+            .insert("dual".into(), Arc::new(PointFeatureMock { extent: None }));
         features
             .collections
             .insert("dual".into(), config("dual", &["edr", "features"]));
@@ -2485,6 +2600,268 @@ mod tests {
         assert_eq!(params[0]["title"], "Temperature");
     }
 
+    /// The engine's default parameter (`raster_info().parameter`, what Maps
+    /// and WMS render without `parameter-name`) is marked, in a list that
+    /// stays alphabetical (#1134): a radar volume's `CELLS` sorts first, but
+    /// the SPA must open on `DBZH`.
+    #[test]
+    fn manifest_marks_the_engines_default_parameter() {
+        let mut tiles = empty_tiles();
+        tiles.map_engines.insert(
+            "site".into(),
+            Arc::new(RasterMock {
+                parameter: "DBZH".into(),
+                unit: "dBZ".into(),
+                parameters: [("VRADH", "m/s"), ("CELLS", "dBZ"), ("DBZH", "dBZ")]
+                    .map(|(name, unit)| ds_core::map_engine::ParameterInfo {
+                        name: name.into(),
+                        title: name.into(),
+                        unit: unit.into(),
+                    })
+                    .into(),
+                ..RasterMock::default()
+            }),
+        );
+        tiles
+            .collections
+            .insert("site".into(), config("site", &["tiles"]));
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let manifest = build_manifest(&state, 0, 100);
+        let params = manifest["collections"][0]["parameters"].as_array().unwrap();
+        let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["CELLS", "DBZH", "VRADH"],
+            "the list stays alphabetical"
+        );
+        let defaults: Vec<&str> = params
+            .iter()
+            .filter(|p| p["default"] == json!(true))
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(defaults, ["DBZH"]);
+        assert!(params[0].get("default").is_none());
+        assert!(params[2].get("default").is_none());
+    }
+
+    /// A default the parameter list does not hold marks nothing: the SPA
+    /// then falls back to the first entry.
+    #[test]
+    fn manifest_marks_no_default_outside_the_parameter_list() {
+        let mut tiles = empty_tiles();
+        tiles.map_engines.insert(
+            "grid".into(),
+            Arc::new(RasterMock {
+                // A default no parameter carries as its name or title,
+                // as GRIB's hard-coded fallback can be.
+                parameter: "value".into(),
+                parameters: ["msl", "t2m"]
+                    .map(|name| ds_core::map_engine::ParameterInfo {
+                        name: name.into(),
+                        title: name.into(),
+                        unit: String::new(),
+                    })
+                    .into(),
+                ..RasterMock::default()
+            }),
+        );
+        tiles
+            .collections
+            .insert("grid".into(), config("grid", &["tiles"]));
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let manifest = build_manifest(&state, 0, 100);
+        let params = manifest["collections"][0]["parameters"].as_array().unwrap();
+        assert!(params.iter().all(|p| p.get("default").is_none()));
+    }
+
+    /// QueryData names its default by the descriptor's full name, which it
+    /// lists as the short-named parameter's title.
+    #[test]
+    fn manifest_marks_a_default_named_by_its_title() {
+        let mut tiles = empty_tiles();
+        tiles.map_engines.insert(
+            "sqd".into(),
+            Arc::new(RasterMock {
+                parameter: "2 Metre Temperature (2t)".into(),
+                parameters: [
+                    ("10u", "10 Metre U Wind Component (10u)"),
+                    ("2t", "2 Metre Temperature (2t)"),
+                ]
+                .map(|(name, title)| ds_core::map_engine::ParameterInfo {
+                    name: name.into(),
+                    title: title.into(),
+                    unit: String::new(),
+                })
+                .into(),
+                ..RasterMock::default()
+            }),
+        );
+        tiles
+            .collections
+            .insert("sqd".into(), config("sqd", &["tiles"]));
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let manifest = build_manifest(&state, 0, 100);
+        let params = manifest["collections"][0]["parameters"].as_array().unwrap();
+        assert_eq!(params[0]["name"], "10u");
+        assert!(params[0].get("default").is_none());
+        assert_eq!(params[1]["name"], "2t");
+        assert_eq!(params[1]["default"], true);
+    }
+
+    struct VolumeMock;
+
+    impl ds_core::volume::VolumeEngine for VolumeMock {
+        fn read_point_cloud(
+            &self,
+            _quantity: Option<&str>,
+            _time: Option<DateTime<Utc>>,
+            _min_value: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<ds_core::volume::VolumePointCloud, DataServerError> {
+            unimplemented!()
+        }
+        fn volume_info(&self) -> Arc<ds_core::volume::VolumeInfo> {
+            unimplemented!()
+        }
+    }
+
+    /// The badges list the APIs whose registries hold the collection, not
+    /// its configured `apis` (#1134). A radar network's base id lists every
+    /// API but only its Features site inventory is registered; each site
+    /// inherits `features` but serves everything else.
+    #[test]
+    fn manifest_apis_are_the_registries_that_serve_the_collection() {
+        let every_api = ["edr", "wms", "maps", "tiles", "3dtiles", "features"];
+        let mut edr = empty_edr();
+        let mut features = empty_features();
+        let mut maps = empty_maps();
+        let mut tiles = empty_tiles();
+        tiles.base_url = "https://api.example.com".into();
+        let mut wms = empty_wms();
+        let mut tiles_3d = empty_tiles_3d();
+
+        // The network's site inventory: Features only.
+        features.engines.insert(
+            "net".into(),
+            Arc::new(PointFeatureMock {
+                extent: Some([20.0, 60.0, 30.0, 70.0]),
+            }),
+        );
+        features
+            .collections
+            .insert("net".into(), config("net", &every_api));
+
+        // One site: everything but Features.
+        let site = config("net-fivih", &every_api);
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock::default());
+        edr.engines.insert(
+            "net-fivih".into(),
+            Arc::new(EdrMock {
+                extent: None,
+                times: Vec::new(),
+            }),
+        );
+        edr.collections.insert("net-fivih".into(), site.clone());
+        maps.engines.insert("net-fivih".into(), raster.clone());
+        maps.collections.insert("net-fivih".into(), site.clone());
+        tiles.map_engines.insert("net-fivih".into(), raster.clone());
+        tiles.collections.insert("net-fivih".into(), site.clone());
+        wms.engines.insert("net-fivih".into(), raster);
+        wms.collections.insert("net-fivih".into(), site.clone());
+        tiles_3d
+            .volume_engines
+            .insert("net-fivih".into(), Arc::new(VolumeMock));
+        tiles_3d.collections.insert("net-fivih".into(), site);
+
+        // An EDR-only collection configured for more.
+        edr.engines.insert(
+            "lightning".into(),
+            Arc::new(EdrMock {
+                extent: None,
+                times: Vec::new(),
+            }),
+        );
+        edr.collections.insert(
+            "lightning".into(),
+            config("lightning", &["edr", "wms", "maps", "tiles"]),
+        );
+
+        let state = make_state_with_3d(edr, features, maps, tiles, wms, tiles_3d);
+        let m = build_manifest(&state, 0, 100);
+        let by_id: HashMap<&str, &Value> = m["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["id"].as_str().unwrap(), c))
+            .collect();
+
+        let net = by_id["net"];
+        assert_eq!(net["apis"], json!(["features"]));
+        assert!(net.get("tiles").is_none(), "no map layer to switch on");
+        assert_eq!(
+            net["page_url"],
+            "https://api.example.com/collections/net?f=html"
+        );
+
+        let site = by_id["net-fivih"];
+        assert_eq!(
+            site["apis"],
+            json!(["edr", "maps", "tiles", "wms", "3dtiles"])
+        );
+        assert!(site["tiles"]["raster"].is_object());
+        assert_eq!(
+            site["page_url"],
+            "https://api.example.com/collections/net-fivih?f=html"
+        );
+
+        let lightning = by_id["lightning"];
+        assert_eq!(lightning["apis"], json!(["edr"]));
+        assert!(lightning.get("tiles").is_none());
+        assert_eq!(
+            lightning["page_url"],
+            "https://api.example.com/edr/collections/lightning?f=html"
+        );
+    }
+
+    /// A WMS-only collection has no collection page to link to.
+    #[test]
+    fn manifest_omits_the_page_of_a_wms_only_collection() {
+        let mut wms = empty_wms();
+        wms.engines
+            .insert("wms-only".into(), Arc::new(RasterMock::default()));
+        wms.collections
+            .insert("wms-only".into(), config("wms-only", &["wms"]));
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            wms,
+        );
+        let m = build_manifest(&state, 0, 100);
+        let c = &m["collections"][0];
+        assert_eq!(c["apis"], json!(["wms"]));
+        assert!(c.get("page_url").is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Static-asset handler tests
     // -----------------------------------------------------------------------
@@ -2717,6 +3094,28 @@ mod tests {
              that via innerHTML and would execute script from a malicious \
              collection title. Drop the field or HTML-escape the value."
         );
+    }
+
+    /// Companion to the manifest tests of #1134: the SPA reads the fields
+    /// they pin. Literal source text, with the tradeoff described in
+    /// `app_js_rewrites_ogc_tile_placeholders_for_maplibre`.
+    #[tokio::test]
+    async fn app_js_reads_the_default_parameter_and_page_url() {
+        let resp = asset_handler(
+            axum::extract::Path("app.js".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        for needle in ["p.default === true", "collection.page_url"] {
+            assert!(
+                body_str.contains(needle),
+                "app.js no longer reads the manifest field behind `{needle}`"
+            );
+        }
     }
 
     #[tokio::test]

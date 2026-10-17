@@ -94,21 +94,33 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   call the engine directly: a box just past the LAEA disk has covering
   tiles that cross it.
 - `params::parse_bbox` asks `outside_projection_domain` before
-  `wgs84_envelope`, which samples only the box's edges. Wholly outside is
-  the empty image, with read window `NO_READ_WINDOW` (NaN, never read). An
-  envelope of `None` for any other box means the edges miss a valid area
-  inside it: an EPSG:3035 box wider than the disk, or a tall one crossing
-  it between samples. That stays `InvalidParameterValue`: there is no read
-  window, and a global one would read whole datasets. Malformed boxes are
-  rejected before either. An envelope of `Some` does not mean inside:
-  TM's inverse is finite past its strip, |N| > 19 995 930 m for
-  EPSG:3067. So `outside_projection_domain` tests that strip itself, and in
-  a box partly past it those pixels still reach the engine.
+  `wgs84_envelope`, which samples the box's edges and adds a pole the box
+  holds and, for EPSG:3067, where the meridians 50° out enter and leave it
+  (`geo::area_edge_points`). Wholly outside is the empty image, with read
+  window `NO_READ_WINDOW` (NaN, never read). An envelope of `None` for any
+  other box means the edges miss a valid area inside it: an EPSG:3035 box
+  wider than the disk, or a tall one crossing the disk between samples.
+  That stays `InvalidParameterValue`: there is no read window, and a global
+  one would read whole datasets. An EPSG:3067 box that meets the area
+  always has an envelope. Malformed boxes are rejected before
+  either. Both projections' inverses are `None` past their area: the LAEA
+  disk, and for EPSG:3067 past a pole or more than
+  `ds_core::geo::TM_MAX_LON_OFFSET_DEG` (50°) from 27°E (#1113). In a box
+  partly outside, `project_node` gives those pixels NaN and they stay
+  empty. A meta-tile wholly outside is an all-nodata tile with no engine
+  call, so a zoomed-out view of the north stays meta-tiled.
 
 ## Rendered-image cache (#1010)
 
 `ds_render::RenderedCache`, shared with Maps and Tiles, holds encoded images
-under the exact request (`CacheKey`). Every successful non-empty render is
+under the request as resolved (`CacheKey`): the style layer and style name
+`ds_render::resolve_layer_style` returns, not the raw `LAYERS`/`STYLES`, so
+`STYLES=` and `STYLES=default`, and a multi-parameter collection's root
+layer and `coll/<default>`, share entries (#1133); the meta-tile
+`TileKeyPrefix` keys the same pair. Maps keys the same way into the same
+instance, so a WMS view and a Maps request whose keys match (CRS code,
+envelope, size, style, parameter, time) share one entry, whichever render
+path filled it; Tiles keys its TileMatrixSet id as the CRS. Every successful non-empty render is
 inserted on its first render, a meta-tiled viewport included; empty and
 error images never are. Measured on a day of a live deployment's GetMaps
 (85 000, every one an EPSG:3857 viewport, none tile-shaped):
@@ -148,7 +160,8 @@ error images never are. Measured on a day of a live deployment's GetMaps
   layer (`coll/param`) re-declares `<Dimension name="time">` with its own
   values and default — WMS 1.3.0 Table 7 makes Dimension inheritance
   "replace". GetMap settles the parameter (`LAYERS=coll/param`, then the
-  style's) before defaulting TIME, resolves the run with
+  style's, then on a multi-parameter collection's root layer the default
+  parameter whose style layer it draws with, #1133) before defaulting TIME, resolves the run with
   `resolve_parameter_reference_time` (GRIB's run depends on the parameter,
   #1005) and snaps with `resolve_parameter_time`, so the caches key the
   parameter's own run and timestep.
@@ -360,10 +373,9 @@ meta-tiles by nearest neighbour).
   JSON `geometry` and `value` are null. That is every pixel of a map whose
   `domain_rows` is `None` (GetMap's empty image without a read, #1089), a
   centre past a pole, and a projected centre outside the projection's
-  valid area, which `position_on_earth` tests with
-  `outside_projection_domain` before the inverse: past TM's strip the
-  inverse is finite but names no place, inside it past a pole it gives a
-  latitude past 90°. `I`/`J` outside the image, negative or non-integer is
+  valid area, where its inverse is `None`: past the LAEA disk, and past a
+  pole or `ds_core::geo::TM_MAX_LON_OFFSET_DEG` (50°) from TM's meridian
+  (#1113). `I`/`J` outside the image, negative or non-integer is
   `InvalidPoint`.
 - **Dimensions.** The resolved time as `datetime` `(t, t)`, the resolved run
   as `reference_time`, and as `z` the level GetMap draws:

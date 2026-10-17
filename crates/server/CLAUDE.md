@@ -272,6 +272,16 @@ need no reload pruning.
   `"composite": true`, an empty unit and their own `temporal_extent`. The SPA
   requests them on the unstyled tile route: a composite has only the
   `default` style.
+- The manifest describes what is served, never the configured `apis`
+  (#1134): an entry's `apis` are the registries holding its engine (a radar
+  network's base id lists every API but serves Features only; its sites
+  inherit `features` and serve everything else), `page_url` is its HTML
+  page (shared root, else EDR; none for WMS only), and
+  `parameters[].default` marks `raster_info().parameter`, which Maps and
+  WMS render without `parameter-name` (QueryData names it by the full
+  descriptor, its entry's title). The parameter list stays
+  alphabetical; the SPA opens on the marked entry. An entry without a
+  `tiles` block gets no layer switch, only "No map layer" and that link.
 - First enabling a preview collection fits its extent without animation,
   before setting its layers visible. Keep that order: a visible source during
   the initial flight requests intermediate zoom levels and can exhaust cold

@@ -643,10 +643,17 @@ one never implies the other.
   Geostationary, WebMercator), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
   `geodetic_to_ecef`, `OutputCrs::footprint_pixel_window` (low-zoom ghost
   guard, #453). `Crs::WebMercator`'s northing is unbounded at the poles.
-  `Crs::Geostationary` is the one **partial** transform:
+  `Crs::Geostationary` is the one **partial** transform both ways:
   `forward` is NaN on the far side of the Earth and `inverse` `None` off the
   disk, so code mapping many points must skip non-finite results; its
   `GeoTransform::bbox` comes from the limb and may be `west > east` (#819).
+  `Crs::TransverseMercator`'s **inverse** is partial too: `None` past a pole
+  or more than `TM_MAX_LON_OFFSET_DEG` (50°) from its central meridian,
+  where its Snyder series stops naming places (#1113); its `forward` stays
+  total but is that series, km off PROJ that far out. Edge samples miss
+  that edge between them, so `wgs84_envelope` adds `area_edge_points`
+  (where those meridians enter and leave the box) and a pole the box holds
+  (`holds_pole`, projected from the central meridian).
 - **`ds_core::cf`** — CF semantics shared by NetCDF and Zarr readers,
   which pass plain values or an attribute lookup (no reader library here):
   - time units and `decode_times` (`… since 1970-01-01 00:00:00 +00:00`,
@@ -773,12 +780,29 @@ one never implies the other.
   ranking and any narrative cannot drift) and `DEFAULT_CELL_WEIGHTS`. Built
   once per generation; read by feature properties, ranking, narratives and
   the #541 V2.4 model feature row.
+- **`ds_core::simplify`** — the one Douglas–Peucker implementation, for
+  closed rings and open lines, iterative so no input can deepen a worker's
+  stack; the tolerance is in the caller's metric plane. Storm-cell
+  footprints and the Features items map preview (#1135) use it; ds-mvt and
+  any other simplifier should too, rather than add a `geo` dependency.
 - **`ds_render::rasterize::fill_polygon`** — the shared vector→raster fill
   primitive (#397), fed by `ds_core::geo::geometry_to_pixels` (vertices
   projected via `OutputCrs::world_to_fraction`, never per pixel). Vector
   `MapEngine`s (engine-cap today) may depend on ds-render for it — an
   approved exception; engines still return `RasterTile` domain types and
   colorization stays in the API layer.
+- **`ds_render::resolve_layer_style`** — the one style lookup for WMS GetMap
+  and GetLegendGraphic, and the Maps and Tiles map, tile and legend routes
+  (#1133). A named parameter styles from `"{collection}/{param}"`, else the
+  collection; on a multi-parameter collection (`RasterInfo.parameters`
+  longer than one) a request naming none draws the engine's default
+  parameter with its own layer's style, so `LAYERS=coll` and Maps/Tiles
+  without `parameter-name` match `coll/<default>`. A single-parameter
+  collection keeps its collection style, the one WMS advertises for its
+  one layer. The rendered and meta-tile caches key on the `LayerStyle` it
+  returns (layer, style, parameter), never the raw request. Never resolve
+  the style a map, tile or legend is drawn with by hand; the capability
+  and collection-metadata style listings read the style maps directly.
 - **`ds_core::wind`** — wind speed and direction derived from u/v
   components (#897), the one home for the formulas (`hypot(u, v)`; the
   direction the wind blows **from**, `atan2(-u, -v)`, calm → null), the frame
