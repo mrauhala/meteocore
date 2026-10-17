@@ -250,7 +250,23 @@ and then given its generation time (#1135). A closed
 `datetime` window entirely in the past gets the long cache policy.
 
 Error bodies are `{ "code", "description" }`; 500s never leak internals.
-Structured `ErrorReason` codes are #119.
+Structured `ErrorReason` codes are #119. A request that asked for HTML gets
+each error as an HTML page with the same status instead (#1132): the
+message, the parameter at fault, and links back to the collection and to
+Collections; a 5xx page carries no details. `f` is read from the raw query
+before the other parameters, and an empty `f` counts as none. On `/items`, a
+rejected `bbox`, `bbox-crs`, `datetime`, `sortby`, `limit`, `offset`,
+property filter or `crs` follows the items page's own negotiation: `f=html`,
+or without `f` an `Accept` listing `text/html`. Its 400 is the items page
+again: the data request form holding what was sent, the field at fault
+marked `aria-invalid` with the message beside it, and the `datetime` field
+showing its accepted forms. Every other error is a page for `f=html`, or
+without `f` an `Accept` that ranks `text/html` first, as a browser's does:
+above every other type it lists, or equal and listed first, where `*/*`,
+`text/*` and the XML types do not count. A bad `f` is no HTML request, and
+with another bad parameter its JSON 400 names that parameter first, as it
+always has. JSON requests get the JSON body unchanged; `/api` lists both
+media types on the items and item 4xx and 500 responses.
 
 `/api/docs` uses embedded Swagger UI 5.33.0 assets, served under
 `/api/docs/{asset}`, with a same-origin script policy and `nosniff` headers.

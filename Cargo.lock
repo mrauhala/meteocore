@@ -139,6 +139,8 @@ dependencies = [
  "ds-core",
  "form_urlencoded",
  "serde_json",
+ "tokio",
+ "tower",
  "tracing",
 ]
 

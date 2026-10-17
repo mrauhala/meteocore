@@ -54,7 +54,9 @@
     if (!form) return;
     const prefix = details.dataset.disclosure === 'collection-search' ? 'meteocore-search-disclosure:' : 'meteocore-disclosure:' + details.dataset.disclosure + ':';
     const key = prefix + new URL(form.action,location.href).pathname;
-    try { details.open = sessionStorage.getItem(key) === 'open'; } catch (_) {}
+    // A field the request was rejected for stays in view (#1132).
+    const invalid = details.querySelector('[aria-invalid="true"]') !== null;
+    try { details.open = invalid || sessionStorage.getItem(key) === 'open'; } catch (_) {}
     const remember = () => {
       try { sessionStorage.setItem(key,details.open ? 'open' : 'closed'); } catch (_) {}
     };

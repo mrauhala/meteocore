@@ -1170,14 +1170,36 @@ pub async fn get_voxel_content(
 // Landing / collections
 // ---------------------------------------------------------------------------
 
+/// The 400 of a JSON-only document whose `f` names another format, `html`
+/// included (#1132): the wording other APIs' JSON-only resources use,
+/// naming the one format served. `what` names the document.
+fn json_only(pairs: &[(String, String)], what: &str) -> Result<(), Tiles3dError> {
+    let f = pairs
+        .iter()
+        .find(|(key, _)| key == "f")
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty());
+    match f {
+        None => Ok(()),
+        Some(f) if f.eq_ignore_ascii_case("json") || f.eq_ignore_ascii_case("application/json") => {
+            Ok(())
+        }
+        Some(other) => Err(Tiles3dError::BadRequest(format!(
+            "Format '{other}' is not supported for {what}. Supported: json"
+        ))),
+    }
+}
+
 /// `GET /` — API landing document.
 pub async fn landing_page(
     State(state): State<AppState>,
+    Query(pairs): Query<Vec<(String, String)>>,
     headers: HeaderMap,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, Tiles3dError> {
+    json_only(&pairs, "the 3D Tiles landing document")?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
-    Json(json!({
+    Ok(Json(json!({
         "title": "MeteoCore — 3D Tiles",
         "description": "Volumetric weather data as OGC 3D Tiles (radar polar volumes)",
         "links": [
@@ -1185,14 +1207,16 @@ pub async fn landing_page(
             { "href": format!("{base}/3dtiles/collections"), "rel": "data", "type": "application/json", "title": "Collections" },
             { "href": format!("{base}/3dtiles/viewer"), "rel": "alternate", "type": "text/html", "title": "Interactive 3D Tiles viewer" },
         ]
-    }))
+    })))
 }
 
 /// `GET /collections` — list 3D-Tiles-capable collections.
 pub async fn collections(
     State(state): State<AppState>,
+    Query(pairs): Query<Vec<(String, String)>>,
     headers: HeaderMap,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, Tiles3dError> {
+    json_only(&pairs, "the 3D Tiles collection list")?;
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
     let mut ids: Vec<&String> = state.volume_engines.keys().collect();
@@ -1201,7 +1225,7 @@ pub async fn collections(
         .iter()
         .map(|id| collection_doc(&state, id, base))
         .collect();
-    Json(json!({ "collections": items }))
+    Ok(Json(json!({ "collections": items })))
 }
 
 /// `GET /collections/{id}` — one collection document.

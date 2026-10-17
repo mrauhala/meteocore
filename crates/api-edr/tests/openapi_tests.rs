@@ -611,6 +611,11 @@ async fn every_operation_lists_its_status_classes_and_parameters() {
                     json!(["code", "description"]),
                     "{path} {status}"
                 );
+                // An HTML request gets the error as a page (#1132).
+                assert!(
+                    response["content"]["text/html"].is_object(),
+                    "{path} {status}: {response}"
+                );
             }
         }
         if !data_query(path) {

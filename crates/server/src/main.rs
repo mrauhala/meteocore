@@ -882,13 +882,21 @@ async fn main() {
         post(admin::reload_handler).with_state(server_state.clone()),
     );
 
-    let app = public
-        .merge(admin_routes)
-        .layer(middleware::from_fn(admin::metrics_middleware))
-        .layer(middleware::from_fn(admin::request_logging_middleware))
-        .layer(middleware::from_fn(admin::correlation_id_middleware))
-        .layer(CorsLayer::permissive())
-        .layer(CompressionLayer::new());
+    // The 404 page's base URL comes from the reloadable EDR state, as every
+    // API's links do, so a reload that changes `base_url` or
+    // `trust_proxy_headers` moves it too.
+    let edr_state = server_state.edr.clone();
+    let app = with_not_found(public.merge(admin_routes), move |headers| {
+        let edr = edr_state.load();
+        ds_core::proxy::resolve_base_url(&edr.base_url, edr.trust_proxy_headers, |name| {
+            headers.get(name).and_then(|v| v.to_str().ok())
+        })
+    })
+    .layer(middleware::from_fn(admin::metrics_middleware))
+    .layer(middleware::from_fn(admin::request_logging_middleware))
+    .layer(middleware::from_fn(admin::correlation_id_middleware))
+    .layer(CorsLayer::permissive())
+    .layer(CompressionLayer::new());
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
@@ -1045,9 +1053,85 @@ fn related_services() -> Vec<api_common::shared::RelatedLink> {
     ]
 }
 
+/// `router` answering a path no route serves (#1132): an HTML 404 page for
+/// a request that asked for HTML, the empty 404 for any other. Nested APIs
+/// without a fallback of their own inherit it. `base_url` resolves the
+/// external base URL of a request, as every API's links do.
+fn with_not_found<B>(router: Router, base_url: B) -> Router
+where
+    B: Fn(&axum::http::HeaderMap) -> String + Clone + Send + Sync + 'static,
+{
+    router.fallback(
+        move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+              headers: axum::http::HeaderMap| {
+            let base = base_url(&headers);
+            async move { api_common::errors::not_found(&base, &uri, &headers) }
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unknown path is an HTML 404 page for a browser, in the workspace
+    /// its path is under, nested APIs included; any other client gets the
+    /// empty 404 (#1132).
+    #[tokio::test]
+    async fn unknown_paths_are_an_html_404_for_browsers_only() {
+        use tower::ServiceExt;
+        let edr = api_common::errors::html_errors(
+            Router::new().route("/collections", get(|| async { "ok" })),
+            "edr",
+            api_common::mounts::EDR,
+            api_common::errors::pages(|_| "https://x".into(), |_| false),
+        );
+        let app = with_not_found(Router::new().nest(api_common::mounts::EDR, edr), |_| {
+            "https://x".to_owned()
+        });
+        let fetch = |uri: &str, accept: Option<&str>| {
+            let mut request = axum::http::Request::builder().uri(uri);
+            if let Some(accept) = accept {
+                request = request.header(axum::http::header::ACCEPT, accept);
+            }
+            let request = request.body(Body::empty()).unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let media = response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .map(|v| v.to_str().unwrap().to_owned());
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, media, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+        let browser = Some("text/html,application/xhtml+xml,*/*;q=0.8");
+        for (uri, accept, catalog) in [
+            ("/nope", browser, "https://x/collections?f=html"),
+            ("/edr/nope", browser, "https://x/edr/collections?f=html"),
+            ("/edr/collections/a/nope?x=1", None, ""),
+            ("/nope?f=html", None, "https://x/collections?f=html"),
+        ] {
+            let (status, media, body) = fetch(uri, accept).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
+            if catalog.is_empty() {
+                assert!(body.is_empty(), "{uri}: {body}");
+                continue;
+            }
+            assert_eq!(media.as_deref(), Some("text/html; charset=utf-8"), "{uri}");
+            assert!(body.contains("Page not found"), "{uri}");
+            assert!(
+                body.contains(&format!("href=\"{catalog}\"")),
+                "{uri}: {body}"
+            );
+        }
+        let (status, _, body) = fetch("/edr/collections", browser).await;
+        assert_eq!((status, body.as_str()), (axum::http::StatusCode::OK, "ok"));
+    }
 
     #[test]
     fn parse_collection_list_trims_and_drops_empties() {

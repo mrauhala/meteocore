@@ -114,6 +114,22 @@ fn lookup_collection<'a>(
     Ok((engine, config))
 }
 
+/// The OpenAPI response of an error: the JSON body every error carries, or,
+/// for a request that asked for HTML, a page with the same status (#1132).
+fn error_response(description: &str) -> Value {
+    json!({
+        "description": description,
+        "content": {
+            "application/json": {"schema": {
+                "type": "object",
+                "required": ["code", "description"],
+                "properties": {"code": {"type": "string"}, "description": {"type": "string"}}
+            }},
+            "text/html": {"schema": {"type": "string"}}
+        }
+    })
+}
+
 /// Converting through [`JsonError`] is what attaches the `ErrorReason` the
 /// request log reads (#119); a `(StatusCode, Json)` tuple converts via `?`.
 type HandlerError = JsonError;
@@ -408,9 +424,9 @@ pub(crate) fn items_openapi_paths(
                                 "text/html": {"schema": {"type": "string"}}
                             }
                         },
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Collection not found"},
-                        "500": {"description": "Server error"}
+                        "400": error_response("Bad request. An HTML request gets the items page again, the field at fault marked."),
+                        "404": error_response("Collection not found"),
+                        "500": error_response("Server error")
                     }
                 }
             }),
@@ -442,9 +458,9 @@ pub(crate) fn items_openapi_paths(
                                 "text/html": {"schema": {"type": "string"}}
                             }
                         },
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Feature not found"},
-                        "500": {"description": "Server error"}
+                        "400": error_response("Bad request"),
+                        "404": error_response("Feature not found"),
+                        "500": error_response("Server error")
                     }
                 }
             }),
@@ -832,101 +848,52 @@ pub async fn items(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, HandlerError> {
+) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);
     let (engine, config) = lookup_items_collection(&state, &id)?;
-    let bad_request = |e: ds_core::error::DataServerError| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
+    // The representation is negotiated before any other parameter is parsed,
+    // from the raw `f` and `Accept`, so a request for the HTML page whose
+    // filters fail gets the page back with the field marked (#1132).
+    let f = pairs
+        .iter()
+        .find(|(k, _)| k == "f")
+        .map(|(_, v)| v.as_str());
+    let wanted = match negotiate_feature(f, &headers) {
+        Ok(wanted) => wanted,
+        // A bad `f` is no HTML request: its 400 names the first fault in
+        // the order it always has, the parameters' shape before the format.
+        Err(error) => {
+            return Err(match ItemsQueryParams::from_pairs(pairs) {
+                Err(e) => bad_request_msg(&e.error.to_string()),
+                Ok(_) => error,
+            })
+        }
     };
-    let params = ItemsQueryParams::from_pairs(pairs).map_err(bad_request)?;
-    let wanted = negotiate_feature(params.f.as_deref(), &headers)?;
-    params
-        .validate_filters(&engine.filterables())
-        .map_err(bad_request)?;
-    let crs = response_crs(params.crs.as_deref(), wanted)?;
-
-    // `bbox-crs` is validated even without a `bbox`; the engine always gets a
-    // CRS84 box, which the pagination links then carry.
-    let bbox_crs = params
-        .bbox_crs
-        .as_deref()
-        .map(|value| FeatureCrs::parse(value, "bbox-crs"))
-        .transpose()
-        .map_err(bad_request)?
-        .unwrap_or(FeatureCrs::Crs84);
-    let bbox = params
-        .bbox
-        .as_deref()
-        .map(|value| bbox_crs.bbox_to_crs84(parse_bbox_values(value)?))
-        .transpose()
-        .map_err(bad_request)?;
-
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime)
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?;
-    // A collection whose features carry no time cannot filter by it: a 400,
-    // not the full set with 200 (#682).
-    if datetime.is_some() && !engine.has_time_dimension() {
-        return Err(JsonError(
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "code": "BadRequest",
-                "description": format!(
-                    "Collection '{id}' has no time dimension; datetime is not supported"
-                )
-            })),
-        ));
-    }
-
-    // Validated against what this engine can actually sort on, so an unknown
-    // property is a 400 naming the valid ones rather than a parameter that
-    // quietly does nothing (OGC API - Features Part 8, draft 24-030).
-    let sortby = params
-        .sortby
-        .as_deref()
-        .map(|s| parse_sortby(s, engine.sortables()))
-        .transpose()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            )
-        })?
-        .unwrap_or_default();
-
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let offset = params.offset.unwrap_or(0);
-
-    // Cache-Control policy (#499): a settled window (closed datetime interval
-    // entirely in the past) gets the long policy, everything else the short
-    // one — captured before `datetime` moves into the query.
-    let (window_start, window_end) = datetime
-        .as_ref()
-        .map(|d| (d.start, d.end))
-        .unwrap_or((None, None));
-    let cache_control =
-        ds_core::http_cache::data_cache_control(window_start, window_end, Utc::now());
-
-    let query = FeatureQuery {
-        bbox,
+    let ItemsRequest {
+        query,
+        crs,
         limit,
         offset,
-        datetime,
-        sortby,
-        property_filters: params.property_filters,
+        cache_control,
+    } = match items_request(engine.as_ref(), &id, pairs.clone(), wanted) {
+        Ok(request) => request,
+        Err(rejected)
+            if wanted == ds_core::html::Wanted::Html
+                && rejected.error.0 == StatusCode::BAD_REQUEST =>
+        {
+            return Ok(rejected_items(
+                engine.as_ref(),
+                &config.title,
+                &id,
+                &pairs,
+                base,
+                root,
+                rejected,
+            ));
+        }
+        Err(rejected) => return Err(rejected.error),
     };
 
     let page = engine.get_features(&query).map_err(|_| {
@@ -988,6 +955,173 @@ pub async fn items(
     Ok(with_vary(with_content_crs(resp, &crs)))
 }
 
+/// A validated `/items` request.
+struct ItemsRequest {
+    query: FeatureQuery,
+    crs: ResponseCrs,
+    limit: usize,
+    offset: usize,
+    cache_control: &'static str,
+}
+
+/// An `/items` request rejected before the engine ran: the parameter at
+/// fault, when one is, and the error response.
+struct Rejected {
+    parameter: Option<String>,
+    error: HandlerError,
+}
+
+impl Rejected {
+    fn at(parameter: &str, error: HandlerError) -> Self {
+        Self {
+            parameter: Some(parameter.to_owned()),
+            error,
+        }
+    }
+}
+
+/// Validate the `/items` query `pairs` of collection `id` for the
+/// representation `wanted`. Every 400 names the parameter it is about.
+fn items_request(
+    engine: &dyn FeatureEngine,
+    id: &str,
+    pairs: Vec<(String, String)>,
+    wanted: ds_core::html::Wanted,
+) -> Result<ItemsRequest, Rejected> {
+    let bad_request = |e: ds_core::error::DataServerError| bad_request_msg(&e.to_string());
+    let named = |e: crate::params::ParameterError| Rejected::at(&e.parameter, bad_request(e.error));
+    let params = ItemsQueryParams::from_pairs(pairs).map_err(named)?;
+    params
+        .validate_filters(&engine.filterables())
+        .map_err(named)?;
+    let crs = response_crs(params.crs.as_deref(), wanted).map_err(|e| Rejected::at("crs", e))?;
+
+    // `bbox-crs` is validated even without a `bbox`; the engine always gets a
+    // CRS84 box, which the pagination links then carry.
+    let bbox_crs = params
+        .bbox_crs
+        .as_deref()
+        .map(|value| FeatureCrs::parse(value, "bbox-crs"))
+        .transpose()
+        .map_err(|e| Rejected::at("bbox-crs", bad_request(e)))?
+        .unwrap_or(FeatureCrs::Crs84);
+    let bbox = params
+        .bbox
+        .as_deref()
+        .map(|value| bbox_crs.bbox_to_crs84(parse_bbox_values(value)?))
+        .transpose()
+        .map_err(|e| Rejected::at("bbox", bad_request(e)))?;
+
+    let datetime = params
+        .datetime
+        .as_deref()
+        .map(parse_datetime)
+        .transpose()
+        .map_err(|e| Rejected::at("datetime", bad_request_msg(&e.to_string())))?;
+    // A collection whose features carry no time cannot filter by it: a 400,
+    // not the full set with 200 (#682).
+    if datetime.is_some() && !engine.has_time_dimension() {
+        return Err(Rejected::at(
+            "datetime",
+            bad_request_msg(&format!(
+                "Collection '{id}' has no time dimension; datetime is not supported"
+            )),
+        ));
+    }
+
+    // Validated against what this engine can actually sort on, so an unknown
+    // property is a 400 naming the valid ones rather than a parameter that
+    // quietly does nothing (OGC API - Features Part 8, draft 24-030).
+    let sortby = params
+        .sortby
+        .as_deref()
+        .map(|s| parse_sortby(s, engine.sortables()))
+        .transpose()
+        .map_err(|e| Rejected::at("sortby", bad_request(e)))?
+        .unwrap_or_default();
+
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+
+    // Cache-Control policy (#499): a settled window (closed datetime interval
+    // entirely in the past) gets the long policy, everything else the short
+    // one — captured before `datetime` moves into the query.
+    let (window_start, window_end) = datetime
+        .as_ref()
+        .map(|d| (d.start, d.end))
+        .unwrap_or((None, None));
+    let cache_control =
+        ds_core::http_cache::data_cache_control(window_start, window_end, Utc::now());
+
+    Ok(ItemsRequest {
+        query: FeatureQuery {
+            bbox,
+            limit,
+            offset,
+            datetime,
+            sortby,
+            property_filters: params.property_filters,
+        },
+        crs,
+        limit,
+        offset,
+        cache_control,
+    })
+}
+
+/// The 400 of an HTML items request whose parameters were rejected (#1132):
+/// the items page with the data request form holding what the request gave,
+/// the field at fault marked with the message, and no results.
+fn rejected_items(
+    engine: &dyn FeatureEngine,
+    title: &str,
+    id: &str,
+    pairs: &[(String, String)],
+    base: &str,
+    root: &str,
+    rejected: Rejected,
+) -> Response {
+    let JsonError(status, Json(body)) = rejected.error;
+    let message = body["description"].as_str().unwrap_or("Invalid request");
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs.iter().filter(|(key, _)| key != "f") {
+        query.append_pair(key, value);
+    }
+    let query = query.finish();
+    let items = format!("{root}/collections/{}/items", crate::html::path_segment(id));
+    let href = if query.is_empty() {
+        items
+    } else {
+        format!("{items}?{query}")
+    };
+    let mut doc = json!({
+        "type": "FeatureCollection",
+        "features": [],
+        "links": [{"href": href, "rel": "self"}],
+    });
+    crate::html::representation_links(&mut doc, ds_core::html::Wanted::Html);
+    let html = crate::html::rejected_items_html(
+        &doc,
+        title,
+        id,
+        base,
+        root,
+        &html_controls(engine),
+        crate::html::Invalid {
+            parameter: rejected.parameter.as_deref(),
+            message,
+        },
+    );
+    let mut response = (status, Html(html)).into_response();
+    response
+        .extensions_mut()
+        .insert(ds_core::error::ErrorReason(format!(
+            "{}: {message}",
+            body["code"].as_str().unwrap_or("BadRequest")
+        )));
+    with_vary(response)
+}
+
 pub async fn item(
     Path((id, feature_id)): Path<(String, String)>,
     Query(pairs): Query<Vec<(String, String)>>,
@@ -998,17 +1132,35 @@ pub async fn item(
     let state = state.load_full();
     let (engine, config) = lookup_items_collection(&state, &id)?;
 
+    // Negotiated first, from the raw `f` and `Accept` (#1132). A bad `f`
+    // still reports a bad parameter first, as it always has.
+    let f = pairs
+        .iter()
+        .find(|(k, _)| k == "f")
+        .map(|(_, v)| v.as_str());
+    let wanted = match negotiate_feature(f, &headers) {
+        Ok(wanted) => wanted,
+        Err(error) => {
+            return Err(match ItemQueryParams::from_pairs(pairs) {
+                Err(e) => bad_request_msg(&e.error.to_string()),
+                Ok(_) => error,
+            })
+        }
+    };
     // A single feature takes only `f` and `crs`. Anything else
     // (`properties`, a filter, a typo) would be ignored with a 200, so it is
     // a 400 naming it (#681; root CLAUDE.md: never silently ignore a
-    // parameter).
-    let params = ItemQueryParams::from_pairs(pairs).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    let wanted = negotiate_feature(params.f.as_deref(), &headers)?;
+    // parameter). Its HTML error page names the parameter too.
+    let params = match ItemQueryParams::from_pairs(pairs) {
+        Ok(params) => params,
+        Err(e) => {
+            let detail = api_common::errors::ErrorDetail {
+                parameter: Some(e.parameter),
+                ..Default::default()
+            };
+            return Ok(detail.attach(bad_request_msg(&e.error.to_string())));
+        }
+    };
     let crs = response_crs(params.crs.as_deref(), wanted)?;
     let feature = engine.get_feature(&feature_id).map_err(|e| match &e {
         ds_core::error::DataServerError::FeatureNotFound(_) => (

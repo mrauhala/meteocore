@@ -99,7 +99,25 @@ ones and `api_definition()` assigns them by class:
 | 204 | `/locations/{locId}` | a list of known ids, none with data |
 
 Every JSON error is the `exception` schema, `{code, description}`, both
-strings. A query string that does not parse into an operation's parameters
+strings. A request that asked for HTML, with `f=html` or, without `f`, an
+`Accept` that ranks `text/html` first, gets each error as an HTML page
+instead, with the same status (#1132). Ranking first means above every other
+type the header lists, or equal and listed first; `*/*`, `text/*` and the
+XML types do not count, so a browser's header asks for the page and
+`application/vnd.cov+json, text/html;q=0.1` keeps JSON errors. A data
+query's success breaks an equal q-value in the server's order instead,
+CoverageJSON first, so `text/html, application/vnd.cov+json` gets
+CoverageJSON on success and a page on error: send `f` to pin both. The page
+shows the message, the parameter at
+fault and its value, and links back to the collection and the catalog. The
+representation is read from the raw query before any parameter is parsed, so
+a request whose other parameters fail still gets the page. An unknown
+`parameter-name` lists the collection's parameters as links that re-run the
+query with each, and a data query with no data says so in words for its
+query type (area, position, path) with the collection's advertised time
+range. A 5xx page carries no details. JSON requests get the JSON body
+unchanged. Every error response in `/api` lists `application/json` and
+`text/html`. A query string that does not parse into an operation's parameters
 at all, such as a position query without `coords`, a `width` that is not a
 number or an `f` given twice, is that JSON 400 too, on the landing page,
 conformance, collection and instance routes and every data query
