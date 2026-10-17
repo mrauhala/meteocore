@@ -11,7 +11,10 @@
 //! ([`catalog::OpenFile`]); a render reads one 2-D field through the
 //! engine-wide field cache ([`field`]) and resamples it with
 //! `ds_core::resample::SourceGrid`. A remote file is read in place by HTTP
-//! range, never downloaded whole.
+//! range, never downloaded whole. A family on a CF pressure axis (MEPS's
+//! `pl` files) serves its levels as the collection's vertical axis, in hPa,
+//! bottom first: one field is one level ([`catalog::Layout::map_level`],
+//! [`catalog::Layout::query_levels`]).
 
 mod catalog;
 pub mod decode_budget;
@@ -937,7 +940,10 @@ impl NetcdfEngine {
                 let Some(&(step, index)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) else {
                     break;
                 };
-                match field::prewarm(&step.file, index, step.index, flipped) {
+                // The level a map without ELEVATION draws (the bottom one
+                // on a pressure axis): prewarming every level would be
+                // 13 MEPS fields per step and variable.
+                match field::prewarm(&step.file, index, step.index, 0, flipped) {
                     Ok(_) => done.lock().unwrap_or_else(|e| e.into_inner()).push((
                         step.file.id,
                         index,
@@ -1027,9 +1033,20 @@ impl NetcdfEngine {
         for (served, field) in layout.variables.iter().zip(&inspected.fields) {
             let found = &field.variable;
             if !served.same_quantity(found) {
+                let pressure = |levels: &Option<Vec<f64>>| match levels {
+                    Some(levels) => format!(" on {} hPa", ingest::list_levels(levels)),
+                    None => String::new(),
+                };
                 return Err(format!(
-                    "variable '{}' has units '{}' at levels {:?}, the collection's has '{}' at {:?}",
-                    served.name, found.units, found.levels, served.units, served.levels
+                    "variable '{}' has units '{}' at levels {:?}{}, the collection's has '{}' at \
+                     {:?}{}",
+                    served.name,
+                    found.units,
+                    found.levels,
+                    pressure(&found.pressure),
+                    served.units,
+                    served.levels,
+                    pressure(&served.pressure)
                 ));
             }
         }
@@ -1147,17 +1164,20 @@ impl NetcdfEngine {
         }
     }
 
-    /// The decoded field of variable `index` at `step`.
+    /// The decoded field of variable `index` at `step`, served level
+    /// `level` ([`Layout::map_level`]).
     fn field(
         &self,
         layout: &Layout,
         step: &Step,
         index: usize,
+        level: usize,
     ) -> Result<field::Values, DataServerError> {
         field::read(
             &step.file,
             index,
             step.index,
+            level,
             layout.grid.flipped,
             &self.decodes,
         )
@@ -1174,7 +1194,7 @@ impl MapEngine for NetcdfEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
         parameter: Option<&str>,
-        _z: Option<f64>,
+        z: Option<f64>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let catalog = self.catalog.load_full();
@@ -1184,14 +1204,16 @@ impl MapEngine for NetcdfEngine {
             .as_ref()
             .ok_or_else(|| DataServerError::Engine("No NetCDF data available yet".to_string()))?;
         let index = Self::variable_index(layout, parameter)?;
-        let values = self.field(layout, selected.step, index)?;
+        let level = layout.map_level(z)?;
+        let values = self.field(layout, selected.step, index, level)?;
         layout
             .source
             .render_f32(&values, None, bbox, width, height, output_crs)
     }
 
-    /// Every band from the one step `select` picks, sampled from one
-    /// output→source map: the variables share the grid.
+    /// Every band from the one step `select` picks and the one level
+    /// `map_level` picks, sampled from one output→source map: the variables
+    /// share the grid.
     #[allow(clippy::too_many_arguments)] // mirrors get_raster_tile
     fn get_raster_tiles(
         &self,
@@ -1201,7 +1223,7 @@ impl MapEngine for NetcdfEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
         parameters: &[&str],
-        _z: Option<f64>,
+        z: Option<f64>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<Vec<RasterTile>, DataServerError> {
         if parameters.is_empty() {
@@ -1217,10 +1239,11 @@ impl MapEngine for NetcdfEngine {
             .iter()
             .map(|&p| Self::variable_index(layout, Some(p)))
             .collect::<Result<Vec<_>, _>>()?;
+        let level = layout.map_level(z)?;
         let map = layout.source.output_map(bbox, width, height, output_crs);
         indices
             .into_iter()
-            .map(|index| map.sample_f32(&self.field(layout, selected.step, index)?, None))
+            .map(|index| map.sample_f32(&self.field(layout, selected.step, index, level)?, None))
             .collect()
     }
 

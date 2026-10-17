@@ -11,7 +11,10 @@
 //!   nodes.
 //! - NetCDF: `testdata/meps-netcdf`, a crop of MET Norway's MEPS files on
 //!   their Lambert grid, two runs, wrapped in `DerivedWind` for the speed of
-//!   its grid-relative 10 m wind (#1067).
+//!   its grid-relative 10 m wind (#1067); and `testdata/meps-netcdf-pl`, the
+//!   same grid on four pressure levels, where GetMap and GetFeatureInfo
+//!   without `ELEVATION` use one level, and OGC API Maps' `elevation`
+//!   selects the same levels.
 //!
 //! No collection lists `edr` for the WMS: the WMS state carries the
 //! engine's EDR side in `point_engines`, as the server wires it.
@@ -59,15 +62,17 @@ fn collection(id: &str, engine_type: &str, api: &str) -> CollectionConfig {
     .unwrap()
 }
 
+/// One style for every layer: the data-valued wind-speed palette, whose
+/// stops (0-50) separate the values GetMap draws.
 fn style() -> HashMap<String, StyleInfo> {
     HashMap::from([(
         "default".to_string(),
         StyleInfo {
             name: "default".into(),
             title: "Default".into(),
-            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
+            palette: ds_render::builtin_palette_arc("wind_speed").unwrap(),
             colormap: Arc::new(LutColorMap::from_builtin(
-                BuiltinColormap::Viridis,
+                BuiltinColormap::WindSpeed,
                 0.0,
                 70.0,
             )),
@@ -495,6 +500,220 @@ async fn netcdf_pixels_read_the_edr_position_value(wms: axum::Router, edr: axum:
         assert!(info.value.is_number(), "{parameter}: {}", info.value);
         assert_eq!(info.value, position, "{parameter}");
     }
+}
+
+/// `testdata/meps-netcdf-pl`'s temperature and wind, wrapped in
+/// `DerivedWind` as the server registers it.
+fn meps_pl_engine() -> Arc<DerivedWind> {
+    let config = serde_json::from_value(serde_json::json!({
+        "data_path": testdata("meps-netcdf-pl").to_str().unwrap(),
+        "filename_template": "meps_pl_{lead}_%Y%m%dT{run}Z.nc",
+        "variables": ["air_temperature_pl", "x_wind_pl", "y_wind_pl"],
+    }))
+    .unwrap();
+    let netcdf = Arc::new(NetcdfEngine::new("meps-pl", &config).unwrap());
+    Arc::new(DerivedWind::new(
+        "meps-pl",
+        netcdf,
+        Arc::new(|_: &str, _: &ds_core::wind::PairOutcome| {}),
+    ))
+}
+
+fn meps_pl() -> Apis {
+    apis(
+        "meps-pl",
+        "netcdf",
+        meps_pl_engine(),
+        &[
+            "air_temperature_pl",
+            "x_wind_pl",
+            "y_wind_pl",
+            "wind_speed_pl",
+        ],
+    )
+}
+
+/// `testdata/meps-netcdf-pl` at [`MEPS_CELL`] in `meps_pl_01_20261015T09Z`
+/// (10Z, the default step), as the CDL holds them: per level (1000, 850,
+/// 500, 300 hPa) the temperature in K and the wind along the grid's x and
+/// y in m/s.
+const MEPS_PL_CELL_10Z: [(f64, f64, f64, f64); 4] = [
+    (1000.0, 281.9298, 0.607_873_9, 5.187_544),
+    (850.0, 277.650_57, 20.274_448, 14.588_396),
+    (500.0, 260.222, 20.465_487, 18.797_607),
+    (300.0, 231.872_45, 36.897_503, 15.632_816),
+];
+
+/// Pressure levels (#1067 PR 8): GetMap and GetFeatureInfo without
+/// `ELEVATION` use one level, the first advertised (1000 hPa): the GetMap
+/// image is the one `ELEVATION=1000` draws, and GetFeatureInfo reports
+/// that level and reads its stored value, as the EDR position query at it
+/// does. With `ELEVATION` each reads its own level, the derived speed from
+/// both components at that level. Capabilities advertise the levels.
+#[test]
+fn a_netcdf_pressure_level_pixel_reads_the_level_get_map_draws() {
+    let Apis { wms, edr } = meps_pl();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(netcdf_pressure_level_pixels(wms, edr));
+}
+
+async fn netcdf_pressure_level_pixels(wms: axum::Router, edr: axum::Router) {
+    let (lon, lat) = MEPS_CELL;
+    let d = 0.01;
+    let bbox = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
+    let layer = "meps-pl/air_temperature_pl";
+    // The image of the wind speed, which the test style's palette
+    // separates by level, as bytes.
+    let get_map = |extra: &str| {
+        let uri = format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=meps-pl/wind_speed_pl&STYLES=\
+             &CRS=EPSG:3857&BBOX=1300000,8500000,2300000,9500000&WIDTH=32&HEIGHT=32\
+             &FORMAT=image/png{extra}"
+        );
+        let wms = wms.clone();
+        async move {
+            let response = wms
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_ne!(
+                response
+                    .headers()
+                    .get("x-cache")
+                    .map(|v| v.to_str().unwrap()),
+                Some("ERROR")
+            );
+            response.into_body().collect().await.unwrap().to_bytes()
+        }
+    };
+    let default = get_map("").await;
+    let bottom = get_map("&ELEVATION=1000").await;
+    let top = get_map("&ELEVATION=300").await;
+    assert_eq!(default, bottom, "GetMap draws 1000 hPa by default");
+    assert_ne!(default, top);
+
+    let info = feature_info(&wms, layer, "CRS:84", &bbox, (3, 3), (1, 1), "").await;
+    let reply = get(
+        &wms,
+        &format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS={layer}&STYLES=\
+             &CRS=CRS:84&BBOX={bbox}&WIDTH=3&HEIGHT=3&QUERY_LAYERS={layer}&I=1&J=1\
+             &INFO_FORMAT=application/json"
+        ),
+    )
+    .await;
+    assert_eq!(
+        json(&reply)["features"][0]["properties"]["elevation"],
+        serde_json::json!(1000.0),
+        "GetFeatureInfo reports the level GetMap draws"
+    );
+    assert_eq!(info.time, "2026-10-15T10:00:00Z");
+    assert_eq!(info.reference_time, "2026-10-15T09:00:00Z");
+    for (hpa, t, u, v) in MEPS_PL_CELL_10Z {
+        // 1000 hPa without ELEVATION: the level GetMap draws by default.
+        let extra = if hpa == 1000.0 {
+            String::new()
+        } else {
+            format!("&ELEVATION={hpa}")
+        };
+        let info = feature_info(&wms, layer, "CRS:84", &bbox, (3, 3), (1, 1), &extra).await;
+        let value = info.value.as_f64().unwrap();
+        assert!((value - t).abs() < 1e-3, "{hpa}: {value} {t}");
+        let speed = feature_info(
+            &wms,
+            "meps-pl/wind_speed_pl",
+            "CRS:84",
+            &bbox,
+            (3, 3),
+            (1, 1),
+            &format!("&ELEVATION={hpa}"),
+        )
+        .await;
+        let value = speed.value.as_f64().unwrap();
+        assert!((value - u.hypot(v)).abs() < 1e-3, "{hpa}: {value}");
+        let position = get(
+            &edr,
+            &format!(
+                "/collections/meps-pl/position?coords=POINT({}%20{})\
+                 &parameter-name=air_temperature_pl&datetime=2026-10-15T10:00:00Z&z={hpa}",
+                info.lon, info.lat
+            ),
+        )
+        .await;
+        assert_eq!(position.status, StatusCode::OK, "{}", position.body);
+        assert_eq!(
+            json(&position)["ranges"]["air_temperature_pl"]["values"][0],
+            info.value,
+            "{hpa}"
+        );
+    }
+
+    let capabilities = get(&wms, "/?SERVICE=WMS&REQUEST=GetCapabilities").await;
+    assert!(
+        capabilities.body.contains(
+            "<Dimension name=\"elevation\" units=\"hPa\" default=\"1000\" \
+             nearestValue=\"1\">1000,850,500,300</Dimension>"
+        ),
+        "{}",
+        capabilities.body
+    );
+}
+
+/// OGC API Maps `elevation` on pressure levels (#1067 PR 8): a map without
+/// it draws the bottom level, as `elevation=1000` does, `elevation=300`
+/// another image, and a level the collection lacks is a 400.
+#[test]
+fn a_netcdf_pressure_level_map_draws_the_elevation_asked_for() {
+    let id = "meps-pl";
+    let maps = api_maps::router(Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
+        engines: HashMap::from([(id.to_string(), meps_pl_engine() as Arc<dyn MapEngine>)]),
+        collections: HashMap::from([(id.to_string(), collection(id, "netcdf", "maps"))]),
+        styles: HashMap::from([(id.to_string(), style())]),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+        map_tileset_ids: Default::default(),
+    })));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let map = |extra: &str| {
+                let uri = format!(
+                    "/collections/{id}/map?bbox=11.7,60.6,20.7,64.9&width=32&height=32\
+                     &parameter-name=wind_speed_pl{extra}"
+                );
+                let maps = maps.clone();
+                async move {
+                    let response = maps
+                        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    (
+                        status,
+                        response.into_body().collect().await.unwrap().to_bytes(),
+                    )
+                }
+            };
+            let (status, default) = map("").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(default.starts_with(b"\x89PNG"));
+            let (status, bottom) = map("&elevation=1000").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(default, bottom, "Maps draws 1000 hPa by default");
+            let (status, top) = map("&elevation=300").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(default, top, "300 hPa is another image");
+            let (status, body) = map("&elevation=600").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        });
 }
 
 /// The layers GetCapabilities marks queryable are the ones answered above.

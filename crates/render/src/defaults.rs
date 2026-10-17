@@ -144,6 +144,39 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(&["mm", "kgm2"], 0.0, 50.0)],
         fallback_range: None,
     },
+    // Wind components on pressure levels (#1067 PR 8): MET Norway's MEPS
+    // `x_wind_pl`/`y_wind_pl`. The matcher never sees the level, so one
+    // range serves every level, and it must hold the jet: at 300–250 hPa the
+    // jet stream's core commonly runs at 60–80 m/s over the Nordic domain
+    // (the committed sample's 300 hPa x component reaches 72 m/s), which the
+    // surface components' ±40 m/s would paint one colour. Twice the surface
+    // range, symmetric so zero stays on the white midpoint. Exact names:
+    // GRIB's level-view `u`/`v` keep the surface scale below.
+    DefaultRule {
+        names: &["xwindpl", "ywindpl"],
+        contains: &[],
+        palette: "diverging",
+        unit_ranges: &[
+            (&["ms", "ms1", "mps"], -80.0, 80.0),
+            (&["kt", "kn", "knots"], -160.0, 160.0),
+        ],
+        fallback_range: None,
+    },
+    // The speed derived from those components (`wind_speed_pl`), on the
+    // same 0–80 m/s scale. The wind-speed palette's stops end at 50 m/s, so
+    // a faster jet core takes its last colour (#823: a range overlapping a
+    // data-valued palette clips, never rescales). Before the generic speed
+    // rule, whose `windspeed` would claim the name.
+    DefaultRule {
+        names: &["windspeedpl"],
+        contains: &[],
+        palette: "wind_speed",
+        unit_ranges: &[
+            (&["ms", "ms1", "mps"], 0.0, 80.0),
+            (&["kt", "kn", "knots"], 0.0, 160.0),
+        ],
+        fallback_range: Some((0.0, 80.0)),
+    },
     // Signed wind components (u/v) — diverging about zero, on the wind-speed
     // rule's scale. Before it, so a "u-component of wind gust" title stays
     // signed. CF's grid-relative `x_wind`/`y_wind` and MET Norway's
@@ -214,7 +247,8 @@ static RULES: &[DefaultRule] = &[
     // so one range serves every pressure level: 0–21 000 gpm spans 1000 hPa
     // up to 50 hPa (~20.6 km), and 206 000 m2 s-2 is the same height as
     // geopotential. Names only: a "Geopotential height anomaly" title is
-    // signed and must not match.
+    // signed and must not match. MEPS's `geopotential_pl` (#1067 PR 8) is
+    // in m^2/s^2.
     DefaultRule {
         names: &[
             "z",
@@ -224,6 +258,7 @@ static RULES: &[DefaultRule] = &[
             "zg",
             "geopotential",
             "geopotentialheight",
+            "geopotentialpl",
         ],
         contains: &[],
         palette: "viridis",
@@ -1138,6 +1173,97 @@ mod tests {
             assert_eq!(m.palette, palette, "{name} / {title}");
             assert_eq!(m.range, range, "{name} / {title}");
         }
+    }
+
+    /// #1067 PR 8: MEPS's pressure-level variables, with the titles and units
+    /// engine-netcdf reports for them (testdata/meps-netcdf-pl). Their wind
+    /// components and the speed derived from them span ±80 / 0–80 m/s, twice
+    /// the surface scale, for the jet; temperature, geopotential and
+    /// relative humidity keep their all-levels ranges. The surface
+    /// components and speeds keep theirs.
+    #[test]
+    fn meps_pressure_level_names_get_their_defaults() {
+        let d = builtin();
+        for (name, title, unit, palette, range) in [
+            (
+                "x_wind_pl",
+                "Wind along x-coordinate on pressure levels",
+                "m/s",
+                "diverging",
+                Some((-80.0, 80.0)),
+            ),
+            (
+                "y_wind_pl",
+                "Wind along y-coordinate on pressure levels",
+                "m/s",
+                "diverging",
+                Some((-80.0, 80.0)),
+            ),
+            (
+                "wind_speed_pl",
+                "Wind speed",
+                "m/s",
+                "wind_speed",
+                Some((0.0, 80.0)),
+            ),
+            (
+                "air_temperature_pl",
+                "Air temperature pressure levels",
+                "K",
+                "temperature",
+                Some((183.15, 323.15)),
+            ),
+            (
+                "geopotential_pl",
+                "Geopotential pressure levels",
+                "m^2/s^2",
+                "viridis",
+                Some((0.0, 206_000.0)),
+            ),
+            (
+                "relative_humidity_pl",
+                "Relative humidity pressure levels",
+                "1",
+                "humidity_fraction",
+                Some((0.0, 1.0)),
+            ),
+            (
+                "x_wind_10m",
+                "10 metre wind along x-coordinate (U10M)",
+                "m/s",
+                "diverging",
+                Some((-40.0, 40.0)),
+            ),
+            (
+                "wind_speed_10m",
+                "Wind speed (10 m)",
+                "m/s",
+                "wind_speed",
+                Some((0.0, 40.0)),
+            ),
+            (
+                "u",
+                "U component of wind",
+                "m s**-1",
+                "diverging",
+                Some((-40.0, 40.0)),
+            ),
+        ] {
+            let m = d
+                .match_default(name, title, Some(unit))
+                .unwrap_or_else(|| panic!("no default for {name}"));
+            assert_eq!(m.palette, palette, "{name} / {title}");
+            assert_eq!(m.range, range, "{name} / {title}");
+        }
+        // The components are unit-gated: a pressure title never reaches the
+        // MSLP rule's pressure range.
+        assert!(d
+            .match_default(
+                "x_wind_pl",
+                "Wind along x-coordinate on pressure levels",
+                None
+            )
+            .is_none());
     }
 
     /// The CF cloud and fog fractions: 0..1 in unit `1`, 0..100 in percent.

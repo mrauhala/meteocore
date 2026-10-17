@@ -1,9 +1,10 @@
 //! engine-netcdf through the EDR API (#1067), end to end on the committed
-//! MEPS sample (`testdata/meps-netcdf`: two runs on MET Norway's Lambert
-//! grid), wrapped in `DerivedWind` as the server registers it: every
-//! CoverageJSON body validates against `schemas/coveragejson.json`
-//! (Critical Rule 12), and the collection and its instances against the EDR
-//! 1.1 and 1.2 schemas.
+//! MEPS samples (`testdata/meps-netcdf`: two runs on MET Norway's Lambert
+//! grid; `testdata/meps-netcdf-pl`: the same on four pressure levels),
+//! wrapped in `DerivedWind` as the server registers it: every CoverageJSON
+//! body validates against `schemas/coveragejson.json` (Critical Rule 12),
+//! and the collections and their instances against the EDR 1.1 and 1.2
+//! schemas.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,28 +28,45 @@ mod edr_schema;
 const ID: &str = "meps";
 
 fn router() -> axum::Router {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/meps-netcdf");
+    edr_router(
+        ID,
+        "meps-netcdf",
+        "meps_sfc_{lead}_%Y%m%dT{run}Z.nc",
+        &[
+            "air_temperature_2m",
+            "x_wind_10m",
+            "y_wind_10m",
+            "air_pressure_at_sea_level",
+        ],
+    )
+}
+
+/// An EDR of collection `id` over `testdata/<dir>`, its engine wrapped in
+/// `DerivedWind` as the server registers it.
+fn edr_router(id: &str, dir: &str, template: &str, variables: &[&str]) -> axum::Router {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata")
+        .join(dir);
     let config: CollectionConfig = serde_json::from_value(serde_json::json!({
-        "id": ID, "title": "MEPS", "description": "MEPS sample", "engine_type": "netcdf",
+        "id": id, "title": "MEPS", "description": "MEPS sample", "engine_type": "netcdf",
         "netcdf": {
             "data_path": dir.to_str().unwrap(),
-            "filename_template": "meps_sfc_{lead}_%Y%m%dT{run}Z.nc",
-            "variables": ["air_temperature_2m", "x_wind_10m", "y_wind_10m",
-                          "air_pressure_at_sea_level"],
+            "filename_template": template,
+            "variables": variables,
         },
     }))
     .unwrap();
     assert_eq!(config.apis, ["edr"], "the default apis");
-    let netcdf = Arc::new(NetcdfEngine::new(ID, config.netcdf.as_ref().unwrap()).unwrap());
+    let netcdf = Arc::new(NetcdfEngine::new(id, config.netcdf.as_ref().unwrap()).unwrap());
     let engine = Arc::new(DerivedWind::new(
-        ID,
+        id,
         netcdf,
         Arc::new(|_: &str, _: &ds_core::wind::PairOutcome| {}),
     ));
     let state = Arc::new(ArcSwap::from_pointee(api_edr::handlers::EdrState {
-        engines: HashMap::from([(ID.to_string(), engine as Arc<dyn EdrEngine>)]),
+        engines: HashMap::from([(id.to_string(), engine as Arc<dyn EdrEngine>)]),
         feature_engines: HashMap::new(),
-        collections: HashMap::from([(ID.to_string(), config)]),
+        collections: HashMap::from([(id.to_string(), config)]),
         styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
@@ -207,5 +225,124 @@ async fn netcdf_edr_responses_validate() {
         edr_schema::JSON,
         &instances,
         "EDR instances",
+    );
+}
+
+/// Pressure levels (#1067 PR 8) through the EDR API: `z` in every form
+/// (a level, a list, an interval, a recurring interval) selects levels of
+/// the advertised `extent.vertical`, without `z` every level; one level is
+/// a series with a one-value `z` axis, several a vertical profile per step,
+/// an area a `z` axis; the derived speed reads both components at each
+/// level. Every body validates against the CoverageJSON schema and the
+/// collection against the EDR schemas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn netcdf_pressure_level_responses_validate() {
+    let app = tokio::task::spawn_blocking(|| {
+        edr_router(
+            "meps-pl",
+            "meps-netcdf-pl",
+            "meps_pl_{lead}_%Y%m%dT{run}Z.nc",
+            &[
+                "air_temperature_pl",
+                "x_wind_pl",
+                "y_wind_pl",
+                "geopotential_pl",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    let covjson = coverage_json_schema();
+    let base = "/collections/meps-pl";
+    let point = "coords=POINT(13.83%2062.55)";
+    let queries = [
+        ("one level", format!("position?{point}&z=850&parameter-name=air_temperature_pl,wind_speed_pl")),
+        ("level list", format!("position?{point}&z=500,1000&datetime=2026-10-15T10:00:00Z&parameter-name=air_temperature_pl")),
+        ("every level", format!("position?{point}&parameter-name=geopotential_pl")),
+        ("z interval", format!("position?{point}&z=400/900&datetime=2026-10-15T07:00:00Z")),
+        ("recurring z", format!("position?{point}&z=R2/500/350&datetime=2026-10-15T09:00:00Z&parameter-name=wind_speed_pl")),
+        ("datetime list", format!("position?{point}&z=300&datetime=2026-10-15T07:00:00Z,2026-10-15T10:00:00Z&parameter-name=air_temperature_pl")),
+        ("area levels", "area?coords=10,58,20,64&z=1000,300&datetime=2026-10-15T09:00:00Z/2026-10-15T10:00:00Z&parameter-name=air_temperature_pl,wind_speed_pl".to_string()),
+        ("area one level", "area?coords=POLYGON((5%2055,30%2055,5%2068,5%2055))&z=500&parameter-name=geopotential_pl".to_string()),
+        ("radius", "radius?coords=POINT(15%2063)&within=300&within-units=km&z=850&parameter-name=wind_speed_pl".to_string()),
+        ("instance", format!("instances/2026-10-15T06:00:00Z/position?{point}&z=850,500&parameter-name=air_temperature_pl")),
+    ];
+    let mut answers = HashMap::new();
+    for (what, query) in &queries {
+        let (status, json) = get(&app, &format!("{base}/{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {json}");
+        assert_valid(&covjson, &json, what);
+        answers.insert(*what, json);
+    }
+    let z = |coverage: &Value| coverage["domain"]["axes"]["z"]["values"].clone();
+    let one = &answers["one level"];
+    assert_eq!(one["domain"]["domainType"], "PointSeries");
+    assert_eq!(z(one), serde_json::json!([850.0]));
+    assert_eq!(times(one).len(), 2, "the newest run's steps");
+    assert!(one["ranges"]["wind_speed_pl"]["values"][0].is_number());
+    let list = &answers["level list"];
+    assert_eq!(list["type"], "CoverageCollection");
+    let profile = &list["coverages"][0];
+    assert_eq!(profile["domain"]["domainType"], "VerticalProfile");
+    assert_eq!(z(profile), serde_json::json!([500.0, 1000.0]), "z's order");
+    assert_eq!(
+        profile["ranges"]["air_temperature_pl"]["axisNames"],
+        serde_json::json!(["z"])
+    );
+    let every = &answers["every level"];
+    let coverages = every["coverages"].as_array().unwrap();
+    assert_eq!(coverages.len(), 2, "a profile per step");
+    assert_eq!(
+        z(&coverages[0]),
+        serde_json::json!([1000.0, 850.0, 500.0, 300.0])
+    );
+    assert_eq!(
+        z(&answers["z interval"]["coverages"][0]),
+        serde_json::json!([850.0, 500.0])
+    );
+    assert_eq!(
+        z(&answers["recurring z"]["coverages"][0]),
+        serde_json::json!([500.0, 850.0])
+    );
+    assert_eq!(
+        times(&answers["datetime list"]),
+        ["2026-10-15T07:00:00+00:00", "2026-10-15T10:00:00+00:00"]
+    );
+    let area = &answers["area levels"];
+    assert_eq!(z(area), serde_json::json!([1000.0, 300.0]));
+    assert_eq!(
+        area["ranges"]["wind_speed_pl"]["axisNames"],
+        serde_json::json!(["t", "z", "y", "x"])
+    );
+    assert_eq!(
+        answers["area one level"]["ranges"]["geopotential_pl"]["axisNames"],
+        serde_json::json!(["z", "y", "x"])
+    );
+
+    // A level the collection lacks: 400; a malformed z: 400.
+    for query in [
+        format!("position?{point}&z=925"),
+        format!("position?{point}&z=1100/1200"),
+        format!("position?{point}&z=abc"),
+    ] {
+        let (status, json) = get(&app, &format!("{base}/{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");
+    }
+
+    let (status, collection) = get(&app, base).await;
+    assert_eq!(status, StatusCode::OK);
+    let vertical = &collection["extent"]["vertical"];
+    assert_eq!(vertical["interval"], serde_json::json!([["300", "1000"]]));
+    assert_eq!(
+        vertical["values"],
+        serde_json::json!(["1000", "850", "500", "300"]),
+        "bottom first"
+    );
+    assert!(collection["parameter_names"]["wind_speed_pl"].is_object());
+    edr_schema::assert_valid(
+        "/collections/{collectionId}",
+        edr_schema::JSON,
+        &collection,
+        "EDR collection with a vertical extent",
     );
 }

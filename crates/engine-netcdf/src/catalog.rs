@@ -10,6 +10,7 @@ use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
 use ds_core::resample::SourceGrid;
+use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 use ds_storage::ObjectVersion;
 use netcdf_reader::NcFile;
@@ -61,17 +62,86 @@ pub(crate) struct Layout {
     /// `ds_core::wind::DerivedWind`: built once with the layout, so the
     /// snapshot is the same `Arc` for the engine's life (#897).
     pub wind: Arc<WindFacts>,
+    /// The collection's vertical axis (#1067 PR 8): its variables' pressure
+    /// levels in hPa, bottom first ([`Variable::pressure`]), as
+    /// `RasterInfo::vertical` and EDR's vertical extent advertise it. `None`
+    /// when the variables have one level each.
+    pub vertical: Option<VerticalDimension>,
 }
 
 impl Layout {
     pub(crate) fn new(variables: Vec<Variable>, grid: FileGrid) -> Self {
         let wind = Arc::new(wind_facts(&variables, &grid.transform.crs));
+        // Every variable of a layout is on the same levels, or none is
+        // (`ingest::one_vertical_axis`).
+        let vertical = variables
+            .first()
+            .and_then(|v| v.pressure.clone())
+            .map(|levels| VerticalDimension::new(VerticalKind::Pressure, levels));
         Self {
             source: SourceGrid::new(grid.transform.clone()),
             variables,
             grid,
             wind,
+            vertical,
         }
+    }
+
+    /// The level a map draws, as an index into the vertical axis's levels:
+    /// `z` (WMS `ELEVATION`, Maps/Tiles `elevation`), which must be one of
+    /// them exactly, else the first, the bottom level. 0 without a vertical
+    /// axis, where the API layers refuse a `z` before it gets here.
+    ///
+    /// The render's one level selection, so the default
+    /// `MapEngine::resolve_elevation` (`z`, else the first advertised level)
+    /// names the level drawn: GetFeatureInfo queries that level, and the
+    /// rendered caches, which key on the requested `z`, hold one level per
+    /// key.
+    pub(crate) fn map_level(&self, z: Option<f64>) -> Result<usize, DataServerError> {
+        let (Some(vertical), Some(z)) = (&self.vertical, z) else {
+            return Ok(0);
+        };
+        vertical
+            .levels
+            .iter()
+            .position(|&level| level == z)
+            .ok_or_else(|| {
+                DataServerError::InvalidParameter(format!(
+                    "Level {z} is not one of this collection's pressure levels: {} hPa",
+                    crate::ingest::list_levels(&vertical.levels)
+                ))
+            })
+    }
+
+    /// The levels an EDR query reads, as indices into the vertical axis's
+    /// levels: every level without `z` (`/req/edr/z-response` F, as
+    /// engine-grib's level views answer); else those `z` names, in request
+    /// order and each once, a level the collection lacks dropped
+    /// (clause B), and none of them a 400. `[0]` without a vertical axis,
+    /// where api-edr has already ignored any `z` (clause A).
+    pub(crate) fn query_levels(&self, z: Option<&[f64]>) -> Result<Vec<usize>, DataServerError> {
+        let Some(vertical) = &self.vertical else {
+            return Ok(vec![0]);
+        };
+        let Some(z) = z else {
+            return Ok((0..vertical.levels.len()).collect());
+        };
+        let mut levels = Vec::with_capacity(z.len());
+        for value in z {
+            if let Some(i) = vertical.levels.iter().position(|level| level == value) {
+                if !levels.contains(&i) {
+                    levels.push(i);
+                }
+            }
+        }
+        if levels.is_empty() {
+            return Err(DataServerError::InvalidParameter(format!(
+                "The requested vertical levels select none of this collection's pressure \
+                 levels: {} hPa",
+                crate::ingest::list_levels(&vertical.levels)
+            )));
+        }
+        Ok(levels)
     }
 }
 
@@ -79,7 +149,11 @@ impl Layout {
 /// `standard_name` says whether it is a component and in which frame
 /// (`x_wind`/`y_wind`: along the grid's axes; `eastward_wind`/
 /// `northward_wind`: along east and north), its single level is the
-/// pairing level, and the grid's projection says how its axes lie. MEPS's
+/// pairing level, and the grid's projection says how its axes lie. A
+/// variable on the pressure axis has no pairing level (`level: None`, as
+/// `ParameterFacts` asks of a parameter spanning the vertical axis):
+/// `DerivedWind` reads u and v at the one `z` it is asked for, so
+/// `x_wind_pl`/`y_wind_pl` pair level by level (#1067 PR 8). MEPS's
 /// Lambert grid is `GridAxes::Rotated`, so its grid-relative 10 m wind
 /// gives a speed and no direction until the components are turned by the
 /// convergence angle (a follow-up on #897). Nothing is taken from a name.
@@ -371,7 +445,7 @@ pub(crate) fn raster_info(
             .map(|p| p.unit.clone())
             .unwrap_or_default(),
         parameters,
-        vertical: None,
+        vertical: layout.and_then(|layout| layout.vertical.clone()),
         grid_size: transform.map(|t| [t.width, t.height]),
         layer_subtitle: None,
         reference_times: runs.keys().flatten().copied().collect(),

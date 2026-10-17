@@ -4,8 +4,9 @@ CF-NetCDF gridded forecasts and analyses (#1067), first for MET Norway's
 MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7, 9 and 10
 shape this crate. Today: local directories and remote files read in place
 by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius
-with runs as instances, GetFeatureInfo, derived wind speed. Pressure
-levels (PR 8) come later; keep the seams below where they are.
+with runs as instances, GetFeatureInfo, derived wind speed, and a CF
+pressure axis as the collection's vertical axis (PR 8, the last of the
+#1067 plan).
 
 ## Model
 
@@ -30,14 +31,71 @@ levels (PR 8) come later; keep the seams below where they are.
   crs_from_grid_mapping, RegularAxis, grid}`); one time axis; an ensemble
   axis read at `member`; every other axis of size 1, whose coordinate value
   and units are the level identity (MEPS puts 10 m wind on `height6`,
-  `height7` or `height2` by family: never compare dimension names). Another
-  axis longer than 1 skips the variable with a WARN (PR 8 adds pressure).
+  `height7` or `height2` by family: never compare dimension names). At most
+  one axis longer than 1 may be a **pressure axis** (its coordinate's units
+  are a pressure, `ds_core::cf::PressureUnit`, and it is no parametric
+  coordinate; see "Pressure levels"); any
+  other axis longer than 1 (MEPS `hl` height above ground, `ml` hybrid
+  levels) skips the variable with a WARN.
   Numeric types are read through the matching typed slice; CF
   `scale_factor`/`add_offset`, `_FillValue`, `missing_value` (compared in
   the stored type), netCDF's default float fill without a `_FillValue`,
   and NaN apply. `valid_range` is not applied.
 - **2-D latitude/longitude auxiliaries are never read** (MEPS carries them as
   Float64 next to every field): the grid is the projected axes.
+
+## Pressure levels (#1067 PR 8)
+
+- **Identity:** a dimension is a pressure axis when its 1-D coordinate's
+  `units` are a pressure (`PressureUnit::parse`: `Pa`, `hPa`, `mbar`, …;
+  CF 1.11 §4.3 needs no more), by value, never by name (MEPS's is
+  `pressure`, ERA5's `level`), unless it is a parametric coordinate
+  (`ingest::pressure_unit`): one with `formula_terms` or a `standard_name`
+  other than `air_pressure` is not, whatever its units (CF 4.3.3; CESM/CAM's
+  hybrid `lev` is in hPa). A size-1 pressure axis stays a single
+  level's identity, as before. `ingest::classify` gives it `Dim::Level`.
+- **Levels:** `Variable::pressure`, in hPa (`PressureUnit::to_hpa`: Pa ÷ 100,
+  so 85000 Pa is exactly 850, rounded to six significant digits, so a
+  `float` 0.85 bar is 850, not 850.0000238), **bottom first** (largest
+  pressure first, as engine-grib's pressure views), finite, positive and
+  distinct, and
+  `FieldRead::levels` the stored index of each served level (MEPS stores
+  50…1000 hPa ascending, so served 0 = stored 12). `same_quantity` compares
+  them: a later file on other levels is skipped.
+- **One vertical axis per collection** (`ingest::one_vertical_axis`): the
+  layout's variables are all on the same levels, or none has any. With an
+  allowlist the first listed decides and a mismatch fails the file naming
+  the variable; without, the fields are grouped by their levels (one
+  level, or each distinct level set) and the largest group wins,
+  single-level on a tie (so an sfc file stays as before), else the first
+  group found, and the rest are skipped with why. MEPS's
+  `pl` family is its own collection.
+- **The axis:** `Layout::vertical`, `VerticalDimension(Pressure, levels)`,
+  is `RasterInfo.vertical` (built once per poll) and
+  `EdrEngine::get_vertical_extent` (from the same snapshot).
+- **Map level:** `Layout::map_level(z)`, the one selection behind
+  `get_raster_tile(s)`: `z` matched exactly (else `InvalidParameter` naming
+  the levels), `None` ⇒ index 0, the bottom level. That is exactly the
+  default `MapEngine::resolve_elevation` (`z`, else `levels[0]`), so there
+  is no override and GetFeatureInfo queries the level GetMap draws; the
+  rendered caches key on the requested `z`, one level per key. Pinned by
+  `tests/integration.rs` `a_map_without_elevation_draws_the_level_get_feature_info_queries`
+  and the server's `wms_get_feature_info`
+  `a_netcdf_pressure_level_pixel_reads_the_level_get_map_draws` (GetMap
+  bytes and GetFeatureInfo's reported level). Exact, as GRIB, though WMS
+  capabilities say `nearestValue="1"` on every `ELEVATION` dimension (a
+  radar volume does draw the nearest sweep).
+- **EDR levels:** `Layout::query_levels(z)`: `z`'s levels kept in request
+  order, each once, a missing one dropped, none ⇒ 400; without `z`, every
+  level (clause F, as GRIB). Responses: one level ⇒ `PointSeries` with a
+  one-value `z`; several ⇒ a `VerticalProfile` per step; area ⇒ a `z` axis
+  even for one (`[t, z, y, x]`).
+- **Per-level everything:** `FieldKey.level` is the served index, so the
+  field cache, single-flight, detached fills and the decode budget work per
+  level; the EDR cap counts steps × levels × variables. Prewarm fetches
+  index 0 only (13 MEPS levels would be 1.3 GB per variable and run).
+- **Not served:** height above ground (`VerticalKind::Height` is above
+  MSL) and hybrid levels (`ModelLevel` expects ordinal levels).
 
 ## Discovery
 
@@ -262,7 +320,8 @@ Read in place by HTTP range, never downloaded whole (decision 4).
 - **One engine-wide `ByteBoundedCache`** (`FIELDS`, `MC_NETCDF_FIELD_CACHE_MB`,
   default 256), process-global across collections, keyed by the file's
   ingest id (unique in the process: a replaced file never reads the old
-  file's fields), variable, time index and level index (0 until PR 8).
+  file's fields), variable, time index and level (the served pressure-level
+  index, 0 for a single-level field).
   Values are `Arc<[f32]>`, north-up, NaN for nodata: a flipped (south-up)
   grid's rows are reversed once, while decoding.
 - **Single-flight:** `get_or_insert_with_timeout` inside `io::blocking`
@@ -326,7 +385,9 @@ Read in place by HTTP range, never downloaded whole (decision 4).
 `ds_core::resample::SourceGrid::render_f32` → `RasterValues::F32`. The
 `SourceGrid` is built once per layout (its WGS84 envelope is
 inverse-projected once). `get_raster_tiles` builds the output map once and
-samples every band from it. `z` is ignored (no vertical axis yet).
+samples every band from it, all at one level. `z` selects the level through
+`Layout::map_level` (ignored without a vertical axis, where the API layers
+refuse it first).
 
 `RasterInfo` is built once per poll (`raster_info_shared` is O(1), Critical
 Rule 10): `native_crs` `CRS:84` only for latitude/longitude axes, else
@@ -366,7 +427,8 @@ locations, trajectory or cube.
   A point or cell off the grid (`SourceGrid::covers`, the rule `value_at`
   applies) is dropped before sampling, and a query with none on the grid
   reads no field: `POINT(-100 10)` on remote MEPS costs no fetch.
-- **Field jobs:** one per (variable, step), through
+- **Field jobs:** one per (variable, step, level), each variable's slots
+  step-major (`[t][z]`), through
   `ds_executor::field_jobs::run_field_jobs` (engine-grib's scheduler, moved
   there): four at once as tasks on the query runtime (fallback
   `ds_executor::query_runtime()` outside any runtime), each re-entering
@@ -386,7 +448,8 @@ locations, trajectory or cube.
   the deadline `DeadlineExceeded` (504), any other remote failure
   `Storage` (an opaque 500 in EDR).
 - **Query-shape cap** (`QUERY_BYTES`, `MC_NETCDF_EDR_QUERY_MB`, default 544
-  MiB): steps × the sum over the variables of `FieldRead::decoded_bytes`
+  MiB): steps × levels × the sum over the variables of
+  `FieldRead::decoded_bytes`
   (the `f32` field, or its chunk when larger), from the first step's file,
   before any read; over it a 400 `QueryTooLarge` naming the fields, the
   MiB and the limit. The default admits one parameter over one MEPS run
@@ -394,9 +457,11 @@ locations, trajectory or cube.
   #1067, twice the issue's 272 MiB). It counts the variables the engine
   reads, and `DerivedWind` asks for both components of a derived speed: a
   `wind_speed_10m` series over a whole run is 134 × 4.06 MB, 519 MiB, and
-  three variables over a run (201 fields) are a 400; every doc of the cap
-  says so (root and engine READMEs, api-edr's matrix, the pixel-budget
-  row, the thredds example). Then `check_area_budget` (values) and, for
+  three variables over a run (201 fields) are a 400, as is one variable
+  over a run at all 13 MEPS pressure levels (871 fields; the message names
+  the levels and asks for fewer, `edr::tests::the_cap_counts_pressure_levels`);
+  every doc of the cap says so (root and engine READMEs, api-edr's matrix,
+  the pixel-budget row, the thredds examples). Then `check_area_budget` (values) and, for
   areas, `check_mask_budget`. Measured live 2026-10-17 (laptop link, debug
   build, `tests/live_thredds.rs`): a 3-lead series whose first field a map
   had drawn, 2 GETs, 3.1 MB, 3.6 s.
@@ -417,7 +482,14 @@ units) as the pairing level; the grid's `GridAxes::of(crs)`. MEPS's Lambert
 grid is `Rotated`, so `x_wind_10m`/`y_wind_10m` give `wind_speed_10m` and no
 direction (decision 6; rotation by the convergence angle is a follow-up on
 #897). The server wraps the engine in `DerivedWind` (`wind_wrapped`), which
-derives on every API from the components' own reads.
+derives on every API from the components' own reads. Components on the
+pressure axis (`x_wind_pl`/`y_wind_pl`) have no pairing level, as
+`ParameterFacts::level` asks of a parameter spanning the vertical axis:
+they pair into `wind_speed_pl`, and `DerivedWind` reads both at the one `z`
+of each request, so the speed is per level
+(`tests/integration.rs` `derived_wind_pairs_the_components_level_by_level`;
+a Pa file with earth-relative `u`/`v` on lat/lon gives `ws` and `wdir` per
+level, `pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level`).
 
 ## Runs (`catalog.rs`)
 
@@ -461,6 +533,14 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   point (11 × 10, south-up), two runs (06Z leads 0–3, 09Z leads 0–2: 09Z is
   in both), with MET Norway's 2-D lat/lon; built by `make_cdl.py` from
   OPeNDAP ASCII subsets, provenance in its README.
+- `testdata/meps-netcdf-pl/`: five real MEPS pl files cropped the same way
+  (11 × 10), two runs (06Z leads 0–2, 09Z leads 0–1), five variables at
+  1000/850/500/300 hPa (stored top first, as the source), one level per
+  chunk; built by its `make_cdl.py` from OPeNDAP ASCII subsets, provenance
+  in its README (fetched 2026-10-18, ~265 KB).
+- `testdata/netcdf-pressure-pa/`: synthetic, a Pa pressure axis (50000,
+  85000, 100000) on a 1° lat/lon grid, two steps, no run, earth-relative
+  `u`/`v` and `t`, each value a formula of its indices (`make_cdl.py`).
 - `testdata/netcdf-global/`: synthetic 5° global grid, north-up, three
   steps, no run; a packed `short` variable with a fill box.
 - `testdata/netcdf-remote/`: two synthetic MEPS-like per-lead files (one
@@ -476,11 +556,17 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   the cache warm, a replaced file (412 → 503, content version, re-probe,
   new file), prewarm, the bounded first scan opening only the newest run,
   the runtime contexts, EDR and GetFeatureInfo queries on the query
-  runtime, a query past its deadline leaving its chunks cached, and the
-  shipped thredds example (offline).
+  runtime, a query past its deadline leaving its chunks cached, two
+  pressure levels' detached fills each its own chunk GET and decode
+  (`each_pressure_level_is_a_detached_fill_and_a_decode_of_its_own`), and
+  the shipped thredds example (offline).
 - `tests/live_thredds.rs`: `#[ignore]`, against thredds.met.no: leads
   00-02 of the newest run, `air_temperature_2m`, one field and an EDR
-  position series over the three leads, ~9 MB, and a 1 KiB ranged GET of
+  position series over the three leads, ~9 MB; leads 00-01 of the newest
+  pl run and one position query at 850 and 500 hPa (measured 2026-10-18,
+  laptop link, debug build: first scan 4.2 s, 4 HEADs, 8 GETs, 2.46 MB,
+  1.23 MB per pl file serving one variable; the query 4 GETs, 5.68 MB,
+  1.1 s; the levels 1000…50 hPa bottom first); and a 1 KiB ranged GET of
   an archived file. Run by hand only (`cargo test -p
   engine-netcdf --test live_thredds -- --ignored --nocapture`); it prints
   requests, bytes, timings and the heap per kept handle
@@ -499,7 +585,16 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   masking and `t` axes, instances, the derived speed against the stored
   components, and queries on the query runtime and a GetFeatureInfo job.
   `edr::tests` pin the query-shape cap; the server's
-  `wms_get_feature_info` test reads a pixel at a fixture cell.
+  `wms_get_feature_info` test reads a pixel at a fixture cell. Pressure
+  levels: `ingest::tests` (the axis by units, hPa bottom first, Pa
+  converted, one vertical axis per collection), `tests/integration.rs`
+  (`pressure_levels_are_the_vertical_axis`, each level's stored field and
+  one decode per level, the default-level parity, EDR `z` shapes and
+  values, derived wind per level, the Pa fixture), `edr::tests` (the cap
+  counting levels, `z` selection), the server's `netcdf_edr`
+  `netcdf_pressure_level_responses_validate` (every `z` form, CoverageJSON
+  and EDR schemas) and `admin::tests`
+  `meps_netcdf_pressure_level_example_serves_its_levels_and_styles`.
   `field::tests` pins single-flight with a slow storage (8 readers, one
   decode). `ingest::tests`, `catalog::tests`, `discover::tests` are unit
   tests; `server` has

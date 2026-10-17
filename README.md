@@ -29,7 +29,7 @@ Each engine implements one or more of the core traits.
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
 | `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans, Himawari-9 AHI ISatSS tiles and NOAA's hourly GMGSI global mosaic (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
-| `engine-netcdf` | `MapEngine` + `EdrEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server that cannot be listed (thredds.met.no): one layer per variable, model runs from `forecast_reference_time` as EDR instances, EDR position/area/radius, wind speed derived from u/v |
+| `engine-netcdf` | `MapEngine` + `EdrEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server that cannot be listed (thredds.met.no): one layer per variable, pressure levels as the vertical axis, model runs from `forecast_reference_time` as EDR instances, EDR position/area/radius, wind speed derived from u/v |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
@@ -203,7 +203,7 @@ not re-scan the auto roots.
 | `MC_NETCDF_FIELD_CACHE_MB` | `256` | NetCDF decoded fields (`f32`, ~4 MB per MEPS field), in MB, shared by every NetCDF collection. Concurrent renders of one field decode it once. `0` disables retention. |
 | `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote NetCDF files (~1.5 MB per MEPS field, about 340 fields), in MB, shared by every NetCDF collection. A field drawn again after its decoded copy was evicted is decoded from here without a request. `0` disables retention. |
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote NetCDF files, in MB, shared by every NetCDF collection: what the reader parses when it opens a file (its first 1 MiB) and the blocks of the chunk indexes. At least 8: without it every metadata read would be a request. |
-| `MC_NETCDF_EDR_QUERY_MB` | `544` | Most decoded bytes one NetCDF EDR query may read, in MiB, counted from the files' metadata before any read: timesteps × variables read × one field (4.06 MB for MEPS). The default admits one parameter over a whole MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both of its components (134 fields, 519 MiB); three variables over a run do not fit. Over it the query is a 400 naming the fields and the limit. |
+| `MC_NETCDF_EDR_QUERY_MB` | `544` | Most decoded bytes one NetCDF EDR query may read, in MiB, counted from the files' metadata before any read: timesteps × pressure levels × variables read × one field (4.06 MB for MEPS). The default admits one parameter over a whole MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both of its components (134 fields, 519 MiB); three variables over a run do not fit, nor one over a run at all 13 MEPS pressure levels (871 fields). Over it the query is a 400 naming the fields and the limit. |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Process-wide admission budget for NetCDF field reads in progress, in MiB: a cold field read reserves three times its decoded chunk plus three times its compressed chunk (~24 MB for MEPS); cache hits and readers waiting for another's read reserve nothing. A read that does not fit fails at once with 503. Restart to change. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
 | `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. `0` turns the pre-warm off. Restart to change. |
@@ -1334,12 +1334,13 @@ them (#897, `ds_core::wind`), named in the source's own vocabulary: ECMWF
 `u`/`v` → `ws`/`wdir`, wgrib2 `UGRD`/`VGRD` → `WIND`/`WDIR`, FMI
 `WindUMS`/`WindVMS` → `WindSpeedMS`/`WindDirection`, and CF stores by
 `standard_name` (`wind_u_10m` → `wind_speed_10m`, MEPS NetCDF `x_wind_10m` →
-`wind_speed_10m`). `100wdir` is MeteoCore's
+`wind_speed_10m`, `x_wind_pl` → `wind_speed_pl` per pressure level). `100wdir` is MeteoCore's
 name, not an ECMWF short name: ECMWF's parameter database has no 100 m wind
 direction, so it follows `10wdir`. The
 speed is a WMS/Maps/Tiles layer with the built-in `wind_speed` style
-(0–40 m/s); the direction (where the wind blows from, 0° = north) is served
-by EDR only. A parameter the collection already has is not derived again.
+(0–40 m/s; 0–80 m/s for MEPS's pressure-level `wind_speed_pl`, whose
+components' default is ±80 m/s for the jet); the direction (where the wind
+blows from, 0° = north) is served by EDR only. A parameter the collection already has is not derived again.
 
 Direction needs to know whether u and v are earth- or grid-relative, and
 that comes from the source: the GRIB2 resolution-and-component flag, the CF
@@ -1491,8 +1492,8 @@ Gridded CF-NetCDF data (`engine_type = "netcdf"`, #1067), served through WMS, OG
 
 - **Times come from the files.** Each file's valid times are its `time` axis and its model run its `forecast_reference_time`. Runs are the WMS `reference_time` dimension: a map draws from the newest run whose steps span the requested time, so a newer run still arriving does not hide an older one, and a pinned run draws from that run or fails. Files without `forecast_reference_time` form one timeline without runs. File names only select the files and order the opening (`filename_template`, with `{run}` and `{lead}` as in ds-storage's discovery, default `*.nc`), and global time attributes are never read.
 - **Grids:** 1-D latitude/longitude, or 1-D projected x/y with a CF `grid_mapping` (`lambert_conformal_conic`, as MEPS; `geostationary`). Rows stored south to north are drawn north-up. A projected grid has no `storageCrs`: its native CRS has no OGC URI.
-- **Fields** have one level: any axis other than time and an ensemble must have a single value, identified by its coordinate (2 m, 10 m), never its dimension name. Files with an ensemble axis are read at `member`. Packed values are unpacked, and `_FillValue`, `missing_value` and NaN are transparent. Values keep the files' units (K, Pa, m/s, kg/m², fractions).
-- **The first file fixes the layout:** its variables (the `variables` allowlist, else every variable on its grid) and its grid. A later file missing one, or on another grid, is skipped with a WARN. A file replaced in place is read again, and tiles drawn from it before are not served again.
+- **Fields** have one level, or levels on one pressure axis. A single level is identified by its coordinate (2 m, 10 m), never its dimension name. A pressure axis is a dimension whose coordinate's units are a pressure (CF: `hPa`, `Pa`, `mbar`, …), unless it is a parametric coordinate (`formula_terms`, or a hybrid `standard_name`); its levels, in hPa (converted from Pa where the file stores Pa), are the collection's vertical axis (see **Pressure levels** below). Any other axis of several values (height above ground, hybrid model levels) is not served. Files with an ensemble axis are read at `member`. Packed values are unpacked, and `_FillValue`, `missing_value` and NaN are transparent. Values keep the files' units (K, Pa, m/s, kg/m², fractions).
+- **The first file fixes the layout:** its variables (the `variables` allowlist, else every variable on its grid) and its grid. A later file missing one, on another grid or on other pressure levels, is skipped with a WARN. A file replaced in place is read again, and tiles drawn from it before are not served again.
 - **Files stay open** while the collection keeps them: the newest `max_runs` runs, at most `max_files` files. Requests read one 2-D field per layer and time through a field cache shared by every NetCDF collection (`MC_NETCDF_FIELD_CACHE_MB`), never the whole file.
 
 ```toml
@@ -1536,9 +1537,11 @@ variables = ["air_temperature_2m"]
 
 **EDR and GetFeatureInfo.** Position (one point or several), area and radius, each model run an EDR instance; the WMS layers answer GetFeatureInfo through the position query. A position series is every step of the newest run without `datetime`, or the steps in the window of the run EDR selects as for GRIB; an instant is the step at exactly that time, and a window without one is a 404, which a `datetime` list skips. An area is a CRS84 grid over the polygon's bbox at the grid's mean cell size in degrees (at most 256 cells per axis), without `datetime` the step a map without `TIME` draws. Every point and area cell is projected onto the grid once and sampled as the map draws it. Each field is read once per query for all its points, four at a time, and not kept in the field cache, so a series does not evict the frames being drawn; a remote field's chunk is, and a read that outlives the 30 s query deadline still lands there, so a retry makes progress. A query decodes at most `MC_NETCDF_EDR_QUERY_MB`: by default one parameter over one MEPS run as the client sees it, including a derived wind speed, which reads both of its components. A query whose points all lie off the grid reads nothing. See `crates/api-edr/README.md`.
 
-**Derived wind.** u/v components that their CF `standard_name` identifies give a wind speed on every API: MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`. MEPS's components are relative to its Lambert grid, so they give no direction until they are turned to true north (#897); `derive_wind = false` turns it off.
+**Pressure levels.** A collection has one vertical axis, so a family on pressure levels, such as MEPS's per-lead `pl` files (13 levels, 1000 to 50 hPa), is a collection of its own, apart from the surface family. Its levels are `VerticalKind::Pressure` in hPa, listed bottom first (the largest pressure first): the WMS `ELEVATION` dimension (`units="hPa"`), Maps/Tiles `elevation` and EDR `z`, matched exactly, so a level the collection lacks is a 400 (on WMS GetMap, the error image). A map without one draws the first, bottom level, and GetFeatureInfo reports and reads that level. EDR `z` takes a level, a list, an interval or `Rn/min/step`, and without `z` reads every level: one level is a `PointSeries` with a one-value `z` axis, several a `VerticalProfile` per step; an area puts the levels on a `z` axis (`[t, z, y, x]`). Each level is a field of its own, read, cached and counted by the query cap alone, so name the levels a query needs. With an allowlist every listed variable must be on the same levels; without one the largest group of the first file's fields on the same levels wins, single-level fields on a tie. Height above ground and hybrid model levels are not served. `collections.d/meps-netcdf-pl-local.toml` is a runnable example on a committed sample (`testdata/meps-netcdf-pl`: five MEPS pl files at 1000, 850, 500 and 300 hPa); `collections.d/meps-netcdf-pl-thredds.toml.disabled` reads the family from thredds.met.no, with its traffic stated: 1.23 MB of metadata per file measured serving one variable, about 1.5 MB serving the example's five, ~1.4 MB per field first drawn, and a field is one variable at one level, 13 per variable and lead. `prewarm_variables` fetches the bottom level only.
 
-Not yet: pressure levels as a vertical axis, EDR trajectory and cube, and per-variable file layouts (#1067).
+**Derived wind.** u/v components that their CF `standard_name` identifies give a wind speed on every API: MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`, and on pressure levels `x_wind_pl`/`y_wind_pl` give `wind_speed_pl`, both components read at the one level asked for. MEPS's components are relative to its Lambert grid, so they give no direction until they are turned to true north (#897); `derive_wind = false` turns it off.
+
+Not yet: height-above-ground and hybrid model-level axes, EDR trajectory and cube, and per-variable file layouts.
 
 ## OGC 3D Tiles
 
@@ -1807,10 +1810,13 @@ title does. Precipitation accumulated from a run's start
 over 0–200 mm. Signed fields take
 `diverging` centred on zero: `u`/`v`/`10u`/`10v` wind components and the
 grid-relative `x_wind`/`y_wind`/`x_wind_10m`/`y_wind_10m` (±40 m/s,
-±80 kt), vertical velocity `w` (±2 Pa/s; geometric ±1 m/s), vorticity
-`vo` (±2·10⁻⁴ s⁻¹) and
-divergence `d` (±1·10⁻⁴ s⁻¹). `viridis` covers geopotential `z`/`gh`
-(0–21 000 gpm, every pressure level up to 50 hPa), surface pressure `sp`
+±80 kt), MEPS's pressure-level `x_wind_pl`/`y_wind_pl` (±80 m/s, ±160 kt:
+one range serves every level, and the jet at 300–250 hPa reaches 60–80 m/s;
+their derived `wind_speed_pl` takes `wind_speed` over 0–80 m/s), vertical
+velocity `w` (±2 Pa/s; geometric ±1 m/s), vorticity `vo` (±2·10⁻⁴ s⁻¹) and
+divergence `d` (±1·10⁻⁴ s⁻¹). `viridis` covers geopotential `z`/`gh`/
+`geopotential_pl` (0–21 000 gpm or 0–206 000 m² s⁻², every pressure level up
+to 50 hPa), surface pressure `sp`
 (500–1050 hPa, apart from MSLP), specific humidity `q` (0–0.02 kg/kg or
 0–20 g/kg, never the relative-humidity percent range) and total column
 water vapour `tcwv` (0–70 mm); snowfall `sf` (mm) takes `precipitation`.

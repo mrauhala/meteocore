@@ -2,7 +2,7 @@
 //! reads a file.
 //!
 //! Every field read goes through [`FIELDS`], keyed by the file's ingest,
-//! the variable and the time step. Its single-flight guard makes N
+//! the variable, the time step and the pressure level. Its single-flight guard makes N
 //! concurrent renders of one cold field decode it once: the first reader
 //! owns the fill and reserves the transient peak from the decode budget,
 //! the others wait for its value and reserve nothing, and a hit reserves
@@ -48,8 +48,9 @@ pub(crate) struct FieldKey {
     pub file: u64,
     pub variable: Arc<str>,
     pub time: u32,
-    /// The index along a vertical axis. Always 0 while a field has a single
-    /// level.
+    /// The served level: an index into the layout's pressure levels
+    /// (#1067 PR 8), 0 for a field with one level. One level is one field:
+    /// it is fetched, decoded, cached and budgeted alone.
     pub level: u32,
 }
 
@@ -171,23 +172,20 @@ fn peak_bytes(read: &FieldRead) -> u64 {
         .saturating_add(read.chunk_bytes.saturating_mul(3))
 }
 
-/// Variable `index` of `file` at time step `time`, from the cache or decoded
-/// once for every concurrent reader. `flipped` reverses the stored rows to
-/// north-up; `decodes` counts the fills this call makes.
+/// Variable `index` of `file` at time step `time` and served level `level`,
+/// from the cache or decoded once for every concurrent reader. `flipped`
+/// reverses the stored rows to north-up; `decodes` counts the fills this
+/// call makes.
 pub(crate) fn read(
     file: &Arc<OpenFile>,
     index: usize,
     time: u32,
+    level: usize,
     flipped: bool,
     decodes: &Arc<AtomicU64>,
 ) -> Result<Values, DataServerError> {
     deadline::check()?;
-    let key = FieldKey {
-        file: file.id,
-        variable: file.reads[index].name.clone(),
-        time,
-        level: 0,
-    };
+    let key = field_key(file, index, time, level);
     if let Some(values) = FIELDS.get_untracked(&key) {
         FIELDS.record_hit();
         return Ok(values);
@@ -196,6 +194,7 @@ pub(crate) fn read(
         file,
         index,
         time,
+        level,
         flipped,
         decodes,
         end: deadline::current(),
@@ -236,16 +235,12 @@ pub(crate) fn read_uncached(
     file: &Arc<OpenFile>,
     index: usize,
     time: u32,
+    level: usize,
     flipped: bool,
     decodes: &Arc<AtomicU64>,
 ) -> Result<Values, DataServerError> {
     deadline::check()?;
-    let key = FieldKey {
-        file: file.id,
-        variable: file.reads[index].name.clone(),
-        time,
-        level: 0,
-    };
+    let key = field_key(file, index, time, level);
     if let Some(values) = FIELDS.get_untracked(&key) {
         return Ok(values);
     }
@@ -253,7 +248,7 @@ pub(crate) fn read_uncached(
     let result = io::blocking(|| {
         let slot = file.remote.as_ref().and_then(|_| QUERY_READS.claim());
         let Some(slot) = slot else {
-            return fill(file, index, time, flipped, decodes);
+            return fill(file, index, time, level, flipped, decodes);
         };
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let (file, decodes) = (file.clone(), decodes.clone());
@@ -261,7 +256,7 @@ pub(crate) fn read_uncached(
             let _slot = slot;
             let _mode = io::enter(Mode::Detached);
             // The query may have given up: the chunk is cached anyway.
-            let _ = sender.send(fill(&file, index, time, flipped, &decodes));
+            let _ = sender.send(fill(&file, index, time, level, flipped, &decodes));
         });
         let wait = end.map_or(Duration::from_secs(30), |end| {
             end.saturating_duration_since(Instant::now())
@@ -283,11 +278,23 @@ pub(crate) fn read_uncached(
     result
 }
 
+/// The cache key of variable `index` of `file` at step `time`, level
+/// `level`.
+fn field_key(file: &OpenFile, index: usize, time: u32, level: usize) -> FieldKey {
+    FieldKey {
+        file: file.id,
+        variable: file.reads[index].name.clone(),
+        time,
+        level: level as u32,
+    }
+}
+
 /// One reader's fill of one field.
 struct Fill<'a> {
     file: &'a Arc<OpenFile>,
     index: usize,
     time: u32,
+    level: usize,
     flipped: bool,
     decodes: &'a Arc<AtomicU64>,
     /// The reader's deadline.
@@ -320,7 +327,14 @@ impl Fill<'_> {
                 // A failed owner hands the fill to a waiter: recheck that
                 // caller's deadline before reading.
                 deadline::check()?;
-                fill(self.file, self.index, self.time, self.flipped, self.decodes)
+                fill(
+                    self.file,
+                    self.index,
+                    self.time,
+                    self.level,
+                    self.flipped,
+                    self.decodes,
+                )
             },
             || self.timed_out(),
         )
@@ -337,17 +351,24 @@ impl Fill<'_> {
             CacheEntry::Vacant(guard) => {
                 FIELDS.record_miss();
                 let Some(slot) = RENDER_FILLS.claim() else {
-                    let values =
-                        fill(self.file, self.index, self.time, self.flipped, self.decodes)?;
+                    let values = fill(
+                        self.file,
+                        self.index,
+                        self.time,
+                        self.level,
+                        self.flipped,
+                        self.decodes,
+                    )?;
                     let _ = guard.insert(values.clone());
                     return Ok(values);
                 };
                 let (file, decodes) = (self.file.clone(), self.decodes.clone());
-                let (index, time, flipped) = (self.index, self.time, self.flipped);
+                let (index, time, level, flipped) =
+                    (self.index, self.time, self.level, self.flipped);
                 io::handle().spawn_blocking(move || {
                     let _slot = slot;
                     let _mode = io::enter(Mode::Detached);
-                    match fill(&file, index, time, flipped, &decodes) {
+                    match fill(&file, index, time, level, flipped, &decodes) {
                         Ok(values) => {
                             let _ = guard.insert(values);
                         }
@@ -379,7 +400,14 @@ impl Fill<'_> {
                 if !own {
                     FIELDS.record_miss();
                 }
-                let values = fill(self.file, self.index, self.time, self.flipped, self.decodes)?;
+                let values = fill(
+                    self.file,
+                    self.index,
+                    self.time,
+                    self.level,
+                    self.flipped,
+                    self.decodes,
+                )?;
                 let _ = guard.insert(values.clone());
                 Ok(values)
             }
@@ -389,43 +417,39 @@ impl Fill<'_> {
 }
 
 /// Reserve the decode's transient peak and decode variable `index` of
-/// `file` at step `time`: one cache fill.
+/// `file` at step `time`, level `level`: one cache fill.
 fn fill(
     file: &OpenFile,
     index: usize,
     time: u32,
+    level: usize,
     flipped: bool,
     decodes: &AtomicU64,
 ) -> Result<Values, DataServerError> {
     let read = &file.reads[index];
     let _permit = BUDGET.reserve(peak_bytes(read))?;
     decodes.fetch_add(1, Ordering::Relaxed);
-    decode(&file.nc, read, time, flipped).map(Values::from)
+    decode(&file.nc, read, time, level, flipped).map(Values::from)
 }
 
-/// Fetch variable `index` of `file` at step `time` ahead of requests, for
-/// the poll's prewarm: its compressed chunk lands in the chunk cache
-/// ([`crate::remote`]); the decoded field is dropped, not cached, so a
-/// prewarm never evicts the fields being drawn. `Ok(false)` when the field
-/// is decoded already.
+/// Fetch variable `index` of `file` at step `time`, level `level`, ahead of
+/// requests, for the poll's prewarm: its compressed chunk lands in the
+/// chunk cache ([`crate::remote`]); the decoded field is dropped, not
+/// cached, so a prewarm never evicts the fields being drawn. `Ok(false)`
+/// when the field is decoded already.
 pub(crate) fn prewarm(
     file: &OpenFile,
     index: usize,
     time: u32,
+    level: usize,
     flipped: bool,
 ) -> Result<bool, DataServerError> {
     let read = &file.reads[index];
-    let key = FieldKey {
-        file: file.id,
-        variable: read.name.clone(),
-        time,
-        level: 0,
-    };
-    if FIELDS.contains_key(&key) {
+    if FIELDS.contains_key(&field_key(file, index, time, level)) {
         return Ok(false);
     }
     let _permit = BUDGET.reserve(peak_bytes(read))?;
-    decode(&file.nc, read, time, flipped).map(|_| true)
+    decode(&file.nc, read, time, level, flipped).map(|_| true)
 }
 
 /// Read and decode one field: the typed hyperslab, CF masking and packing,
@@ -436,16 +460,19 @@ fn decode(
     nc: &NcFile,
     read: &FieldRead,
     time: u32,
+    level: usize,
     flipped: bool,
 ) -> Result<Vec<f32>, DataServerError> {
-    let selection = read.selection(time);
+    let selection = read.selection(time, level);
     let name = &*read.name;
     let packing = &read.packing;
     let (ny, nx) = read.shape();
     let cells = ny * nx;
     let fail = |e: netcdf_reader::Error| match ReadFailure::find(&e) {
         Some(failure) => failure.to_error(),
-        None => DataServerError::Storage(format!("variable '{name}' step {time}: {e}")),
+        None => {
+            DataServerError::Storage(format!("variable '{name}' step {time} level {level}: {e}"))
+        }
     };
     macro_rules! typed {
         ($t:ty) => {{
@@ -485,7 +512,7 @@ fn decode(
     };
     if values.len() != cells {
         return Err(DataServerError::Storage(format!(
-            "variable '{name}' step {time}: read {} values for a {nx} x {ny} field",
+            "variable '{name}' step {time} level {level}: read {} values for a {nx} x {ny} field",
             values.len()
         )));
     }
@@ -567,7 +594,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         start.wait();
-                        read(&file, 0, 0, flipped, &decodes).unwrap()
+                        read(&file, 0, 0, 0, flipped, &decodes).unwrap()
                     })
                 })
                 .collect();

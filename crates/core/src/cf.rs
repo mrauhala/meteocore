@@ -7,6 +7,8 @@
 //!   ([`crs_from_grid_mapping`]), the unit of a coordinate variable
 //!   ([`coordinate_scale`]), and a field's regular 1-D x/y coordinates
 //!   resolved to a north-up [`GeoTransform`] ([`grid`]).
+//! - A pressure vertical coordinate, known by its units, and its levels in
+//!   hPa ([`PressureUnit`]).
 //!
 //! Readers own attribute and coordinate access and pass plain values or a
 //! lookup closure, so this module stays independent of any NetCDF or Zarr
@@ -362,9 +364,138 @@ pub fn grid(crs: Crs, x: &RegularAxis, y: &RegularAxis) -> Result<CfGrid, String
     Ok(CfGrid { transform, flipped })
 }
 
+/// The unit of a CF pressure coordinate. CF 1.11 §4.3 identifies a
+/// vertical coordinate by units of pressure alone (`positive` is then
+/// optional), so these units make an axis a pressure axis, unless it is a
+/// parametric coordinate (§4.3.3: `formula_terms`, a hybrid
+/// `standard_name`), which may carry pressure units too and which a reader
+/// rules out first. Served levels are in hPa
+/// ([`crate::vertical::VerticalKind::Pressure`]): MEPS stores hPa, ERA5
+/// and many CF writers Pa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureUnit {
+    Pa,
+    HPa,
+    KPa,
+    Bar,
+}
+
+impl PressureUnit {
+    /// The pressure unit `units` spells, or `None` for any other unit.
+    /// UDUNITS symbols are case-sensitive (`Pa`, `hPa`, `kPa`, `mbar`,
+    /// `bar`); `mb` is the meteorological millibar, and the spelled-out
+    /// names are matched in any case.
+    pub fn parse(units: &str) -> Option<Self> {
+        let units = units.trim();
+        match units {
+            "Pa" => return Some(Self::Pa),
+            "hPa" | "mbar" | "mb" => return Some(Self::HPa),
+            "kPa" => return Some(Self::KPa),
+            "bar" => return Some(Self::Bar),
+            _ => {}
+        }
+        match units.to_ascii_lowercase().as_str() {
+            "pascal" | "pascals" => Some(Self::Pa),
+            "hectopascal" | "hectopascals" | "millibar" | "millibars" => Some(Self::HPa),
+            "kilopascal" | "kilopascals" => Some(Self::KPa),
+            "bars" => Some(Self::Bar),
+            _ => None,
+        }
+    }
+
+    /// `value`, in this unit, in hPa, to six significant digits. Pa is
+    /// divided by 100 rather than multiplied by 0.01, so 85000 Pa is
+    /// exactly 850 hPa; the rounding drops what a `float` coordinate adds
+    /// in `f64`, so a level is the number a client types: 0.85 bar stored
+    /// as `float` is 850 hPa, not 850.0000238, and 0.1 hPa is 0.1, not
+    /// 0.10000000149.
+    pub fn to_hpa(self, value: f64) -> f64 {
+        let hpa = match self {
+            Self::Pa => value / 100.0,
+            Self::HPa => value,
+            Self::KPa => value * 10.0,
+            Self::Bar => value * 1000.0,
+        };
+        round_significant(hpa, LEVEL_DIGITS)
+    }
+}
+
+/// Significant decimal digits a pressure level keeps
+/// ([`PressureUnit::to_hpa`]): the digits a `float` holds exactly (C's
+/// `FLT_DIG`), 0.001 hPa at 1000 hPa.
+const LEVEL_DIGITS: i32 = 6;
+
+/// `value` rounded to `digits` significant decimal digits; zero and
+/// non-finite values as they are.
+fn round_significant(value: f64, digits: i32) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+    let shift = digits - 1 - value.abs().log10().floor() as i32;
+    if shift >= 0 {
+        let scale = 10f64.powi(shift);
+        (value * scale).round() / scale
+    } else {
+        let scale = 10f64.powi(-shift);
+        (value / scale).round() * scale
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pressure axis is known by its units, in any CF spelling, and its
+    /// levels convert to hPa exactly: 85000 Pa is 850 hPa, not 850.0000001,
+    /// and a `float` coordinate's level is its decimal value.
+    #[test]
+    fn pressure_units_convert_to_hpa_exactly() {
+        for (units, unit) in [
+            ("Pa", PressureUnit::Pa),
+            (" Pa ", PressureUnit::Pa),
+            ("pascals", PressureUnit::Pa),
+            ("hPa", PressureUnit::HPa),
+            ("mbar", PressureUnit::HPa),
+            ("mb", PressureUnit::HPa),
+            ("millibar", PressureUnit::HPa),
+            ("kPa", PressureUnit::KPa),
+            ("bar", PressureUnit::Bar),
+        ] {
+            assert_eq!(PressureUnit::parse(units), Some(unit), "{units}");
+        }
+        for units in ["m", "K", "1", "Pa s-1", "PA", "hpa", "level", ""] {
+            assert_eq!(PressureUnit::parse(units), None, "{units}");
+        }
+        for (pa, hpa) in [
+            (100_000.0, 1000.0),
+            (92_500.0, 925.0),
+            (85_000.0, 850.0),
+            (70_000.0, 700.0),
+            (101_325.0, 1013.25),
+            (5_000.0, 50.0),
+        ] {
+            assert_eq!(PressureUnit::Pa.to_hpa(pa), hpa);
+        }
+        assert_eq!(PressureUnit::HPa.to_hpa(850.0), 850.0);
+        assert_eq!(PressureUnit::KPa.to_hpa(85.0), 850.0);
+        assert_eq!(PressureUnit::Bar.to_hpa(0.85), 850.0);
+        // `float` coordinates, widened to f64 as the reader gives them.
+        let float = |v: f32| f64::from(v);
+        assert_ne!(float(0.85) * 1000.0, 850.0, "what the rounding is for");
+        for (unit, stored, hpa) in [
+            (PressureUnit::Bar, 0.85, 850.0),
+            (PressureUnit::Bar, 0.925, 925.0),
+            (PressureUnit::KPa, 0.1, 1.0),
+            (PressureUnit::KPa, 92.5, 925.0),
+            (PressureUnit::HPa, 0.1, 0.1),
+            (PressureUnit::HPa, 0.01, 0.01),
+            (PressureUnit::HPa, 1013.25, 1013.25),
+            (PressureUnit::Pa, 1.0, 0.01),
+            (PressureUnit::Pa, 85_000.0, 850.0),
+        ] {
+            assert_eq!(unit.to_hpa(float(stored)), hpa, "{stored} {unit:?}");
+        }
+    }
 
     fn attrs<'a>(pairs: &'a [(&'a str, CfAttr)]) -> impl Fn(&str) -> Option<CfAttr> + 'a {
         move |name| {

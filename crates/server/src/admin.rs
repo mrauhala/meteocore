@@ -8211,6 +8211,51 @@ mod tests {
         }
     }
 
+    /// #1067 PR 8: the shipped local MEPS pressure-level example, loaded
+    /// over its committed sample. The layers advertise the pressure axis
+    /// (WMS ELEVATION, EDR `z`), and every layer, the derived
+    /// `wind_speed_pl` included, takes the built-in default its name and
+    /// unit select: the wind on twice the surface scale, for the jet.
+    #[test]
+    fn meps_netcdf_pressure_level_example_serves_its_levels_and_styles() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("collections.d/meps-netcdf-pl-local.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        collection.netcdf.as_mut().unwrap().data_path = Some(
+            root.join("testdata/meps-netcdf-pl")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let id = "meps-netcdf-pl-local";
+        let loaded = load_with_reuse(&[collection], super::EngineReuse::default());
+        let levels = ds_core::vertical::VerticalDimension::new(
+            ds_core::vertical::VerticalKind::Pressure,
+            vec![1000.0, 850.0, 500.0, 300.0],
+        );
+        let info = loaded.wms_state.engines[id].raster_info();
+        assert_eq!(info.vertical.as_ref(), Some(&levels));
+        assert_eq!(
+            loaded.edr_state.engines[id].get_vertical_extent(),
+            Some(levels)
+        );
+        let styles = &loaded.wms_state.styles;
+        let style = |name: &str| {
+            let s = &styles[&format!("{id}/{name}")]["default"];
+            (s.palette.name.as_str(), s.min, s.max)
+        };
+        for (name, expected) in [
+            ("air_temperature_pl", ("temperature", 183.15, 323.15)),
+            ("x_wind_pl", ("diverging", -80.0, 80.0)),
+            ("y_wind_pl", ("diverging", -80.0, 80.0)),
+            ("wind_speed_pl", ("wind_speed", 0.0, 80.0)),
+            ("geopotential_pl", ("viridis", 0.0, 206_000.0)),
+            ("relative_humidity_pl", ("humidity_fraction", 0.0, 1.0)),
+        ] {
+            assert_eq!(style(name), expected, "{name}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nowcast_geojson_reload_preserves_serving_and_adopts_edited_file() {
         use ds_core::feature::{DatetimeInterval, FeatureQuery, PropertyValue};

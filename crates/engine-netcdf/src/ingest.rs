@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use ds_core::cf::{self, AxisRole, CfAttr, RegularAxis};
+use ds_core::cf::{self, AxisRole, CfAttr, PressureUnit, RegularAxis};
 use ds_core::geo::{Crs, GeoTransform};
 use netcdf_reader::{
     DynStorage, FileStorage, NcAttrValue, NcFile, NcFormat, NcOpenOptions, NcSliceInfo,
@@ -128,6 +128,8 @@ pub(crate) enum Dim {
     Time,
     /// A fixed index: a level of one, or the configured ensemble member.
     Index(u64),
+    /// The pressure axis, at the level read ([`FieldRead::levels`]).
+    Level,
     /// The whole y or x axis, of this many cells.
     Whole(u64),
 }
@@ -144,6 +146,10 @@ pub(crate) struct FieldRead {
     pub chunk_bytes: u64,
     /// Bytes of the field in its stored type.
     pub field_bytes: u64,
+    /// The stored index along the pressure axis of each served level,
+    /// bottom first ([`Variable::pressure`]'s order); empty for a field
+    /// with one level.
+    pub levels: Vec<u64>,
 }
 
 impl FieldRead {
@@ -164,14 +170,16 @@ impl FieldRead {
         ((ny * nx) as u64 * 4).max(self.chunk_bytes)
     }
 
-    /// The hyperslab of time step `time`.
-    pub(crate) fn selection(&self, time: u32) -> NcSliceInfo {
+    /// The hyperslab of time step `time` at served level `level` (an index
+    /// into [`Self::levels`]; 0 for a field with one level).
+    pub(crate) fn selection(&self, time: u32, level: usize) -> NcSliceInfo {
         let selections = self
             .dims
             .iter()
             .map(|dim| match *dim {
                 Dim::Time => NcSliceInfoElem::Index(u64::from(time)),
                 Dim::Index(i) => NcSliceInfoElem::Index(i),
+                Dim::Level => NcSliceInfoElem::Index(self.levels.get(level).copied().unwrap_or(0)),
                 Dim::Whole(n) => NcSliceInfoElem::Slice {
                     start: 0,
                     end: n,
@@ -203,17 +211,27 @@ pub(crate) struct Variable {
     /// CF `standard_name`, when the file states one: EDR's observed
     /// property, and what identifies wind components (`x_wind`).
     pub standard_name: Option<String>,
+    /// The identity of a field with one level ([`Level`]): every size-1
+    /// axis that is not time, run, lead or ensemble.
     pub levels: Vec<Level>,
+    /// The pressure levels of a field on a pressure axis (#1067 PR 8), in
+    /// hPa, bottom first: the largest pressure first, as engine-grib orders
+    /// its pressure views, so a map without `ELEVATION` draws the lowest.
+    /// `None` for a field with one level.
+    pub pressure: Option<Vec<f64>>,
 }
 
 impl Variable {
     /// Whether `other` holds this variable's quantity at its levels: the
     /// same units and level units in any spelling
     /// (`ds_core::units::same_unit`: `kg/m^2` is `kg m-2`), the same level
-    /// values. The served spelling stays the first file's.
+    /// values, and the same pressure levels (in hPa, whatever unit and
+    /// order each file stores them in). The served spelling stays the
+    /// first file's.
     pub(crate) fn same_quantity(&self, other: &Variable) -> bool {
         use ds_core::units::same_unit;
         same_unit(&self.units, &other.units)
+            && self.pressure == other.pressure
             && self.levels.len() == other.levels.len()
             && self
                 .levels
@@ -350,6 +368,7 @@ pub(crate) fn inspect(
             },
         }
     }
+    let fields = one_vertical_axis(fields, wanted, &mut skipped)?;
     let (Some((.., grid)), Some(time_dim)) = (grid, time_dim) else {
         return Err(
             "has no variable on a 1-D latitude/longitude or projected x/y grid with a \
@@ -368,6 +387,88 @@ pub(crate) fn inspect(
         fields,
         skipped,
     })
+}
+
+/// The fields a collection serves on its one vertical axis (#1067 PR 8): a
+/// collection's variables all sit on the same pressure levels, or none has
+/// any, since `RasterInfo::vertical` is one axis that `ELEVATION` and EDR
+/// `z` select on for every layer. MEPS keeps its pressure-level fields in
+/// their own file family (`pl`), served as their own collection.
+///
+/// With an allowlist the first listed variable decides, and a variable on
+/// another axis fails the file, naming it. Without one, the fields are
+/// grouped by their levels (one level, or each distinct set of pressure
+/// levels) and the largest group wins: single-level fields on a tie, as
+/// before pressure levels were served, else the first group found. The
+/// others are skipped with why.
+fn one_vertical_axis(
+    fields: Vec<Field>,
+    wanted: &Wanted,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<Vec<Field>, String> {
+    let axis: Option<Vec<f64>> = match wanted {
+        Wanted::Listed(_) => fields.first().and_then(|f| f.variable.pressure.clone()),
+        Wanted::All => {
+            let mut groups: Vec<(Option<&Vec<f64>>, usize)> = Vec::new();
+            for field in &fields {
+                let levels = field.variable.pressure.as_ref();
+                match groups.iter_mut().find(|(group, _)| *group == levels) {
+                    Some((_, count)) => *count += 1,
+                    None => groups.push((levels, 1)),
+                }
+            }
+            let single = groups
+                .iter()
+                .find(|(levels, _)| levels.is_none())
+                .map_or(0, |&(_, count)| count);
+            let mut best: (Option<&Vec<f64>>, usize) = (None, single);
+            for &(levels, count) in &groups {
+                if levels.is_some() && count > best.1 {
+                    best = (levels, count);
+                }
+            }
+            best.0.cloned()
+        }
+    };
+    let mut kept = Vec::with_capacity(fields.len());
+    for field in fields {
+        let reason = match (&axis, &field.variable.pressure) {
+            (None, None) => None,
+            (Some(axis), Some(levels)) if axis == levels => None,
+            (Some(axis), Some(levels)) => Some(format!(
+                "is on the pressure levels {} hPa, the collection's other variables on {} hPa",
+                list_levels(levels),
+                list_levels(axis)
+            )),
+            (Some(_), None) => Some(
+                "has one level, while the collection's other variables are on pressure \
+                 levels: a collection serves one vertical axis"
+                    .to_string(),
+            ),
+            (None, Some(levels)) => Some(format!(
+                "is on {} pressure levels, while the collection's other variables have one \
+                 level: a collection serves one vertical axis",
+                levels.len()
+            )),
+        };
+        match (reason, wanted) {
+            (None, _) => kept.push(field),
+            (Some(reason), Wanted::Listed(_)) => {
+                return Err(format!("variable '{}' {reason}", field.variable.name))
+            }
+            (Some(reason), Wanted::All) => skipped.push((field.variable.name.to_string(), reason)),
+        }
+    }
+    Ok(kept)
+}
+
+/// Levels as a short list: `1000, 850, 500`.
+pub(crate) fn list_levels(levels: &[f64]) -> String {
+    levels
+        .iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A field before its grid is resolved: the field, its time dimension and
@@ -394,7 +495,13 @@ fn field(
         .iter()
         .map(|d| (d.name.clone(), d.size, role(variables, &d.name)))
         .collect();
-    let shape = classify(&roles, member)?;
+    let shape = classify(&roles, member, |dim| {
+        pressure_unit(variables, dim).is_some()
+    })?;
+    let (pressure, level_index) = match shape.vertical {
+        Some(i) => pressure_levels(nc, variables, &roles[i].0, roles[i].1)?,
+        None => (None, Vec::new()),
+    };
     let mut levels = Vec::new();
     for &i in &shape.levels {
         let name = &roles[i].0;
@@ -444,6 +551,7 @@ fn field(
                 .map(|name| name.trim().to_string())
                 .filter(|name| !name.is_empty()),
             levels,
+            pressure,
         },
         read: FieldRead {
             name,
@@ -452,6 +560,7 @@ fn field(
             packing,
             chunk_bytes,
             field_bytes,
+            levels: level_index,
         },
     };
     Ok((
@@ -471,15 +580,25 @@ pub(crate) struct Shape {
     /// Indices of the single-level dimensions that are not time,
     /// reference, lead or ensemble: the field's level identity.
     pub levels: Vec<usize>,
+    /// Index of the pressure axis ([`Dim::Level`]), when the field has one.
+    pub vertical: Option<usize>,
     pub ny: u64,
     pub nx: u64,
 }
 
 /// Classify a variable's `(name, size, role)` dimensions: `(y, x)` last,
-/// one time axis, any ensemble axis read at `member`, and every other axis
-/// of size 1. Another axis longer than 1 is a reason not to serve it: a
-/// field is never silently pinned to one of its levels.
-pub(crate) fn classify(dims: &[(String, u64, AxisRole)], member: u32) -> Result<Shape, String> {
+/// one time axis, any ensemble axis read at `member`, at most one axis of
+/// several pressure levels (a dimension `pressure` says is one: its
+/// coordinate's units are a pressure and it is no parametric coordinate,
+/// [`pressure_unit`], #1067 PR 8), and every other axis of size 1. Another
+/// axis longer than 1 (height above ground, hybrid model levels) is a
+/// reason not to serve it: a field is never silently pinned to one of its
+/// levels.
+pub(crate) fn classify(
+    dims: &[(String, u64, AxisRole)],
+    member: u32,
+    pressure: impl Fn(&str) -> bool,
+) -> Result<Shape, String> {
     let n = dims.len();
     if n < 2 {
         return Err("has fewer than two dimensions".to_string());
@@ -495,6 +614,7 @@ pub(crate) fn classify(dims: &[(String, u64, AxisRole)], member: u32) -> Result<
     let mut out = Vec::with_capacity(n);
     let mut time_dim = None;
     let mut levels = Vec::new();
+    let mut vertical = None;
     for (i, (name, size, role)) in dims[..n - 2].iter().enumerate() {
         match role {
             AxisRole::Time if time_dim.is_none() => {
@@ -515,10 +635,14 @@ pub(crate) fn classify(dims: &[(String, u64, AxisRole)], member: u32) -> Result<
                 }
                 out.push(Dim::Index(0));
             }
+            AxisRole::Other if vertical.is_none() && pressure(name) => {
+                vertical = Some(i);
+                out.push(Dim::Level);
+            }
             _ => {
                 return Err(format!(
-                    "has {size} values on its '{name}' axis; only fields with one level are \
-                     served"
+                    "has {size} values on its '{name}' axis; only fields with one level, or \
+                     with levels on one pressure axis, are served"
                 ))
             }
         }
@@ -530,9 +654,69 @@ pub(crate) fn classify(dims: &[(String, u64, AxisRole)], member: u32) -> Result<
         dims: out,
         time_dim,
         levels,
+        vertical,
         ny: y.1,
         nx: x.1,
     })
+}
+
+/// The pressure unit of dimension `dim`'s coordinate variable, when its
+/// units are a pressure (CF 1.11 §4.3) and it is not a parametric
+/// coordinate: what makes an axis a pressure axis. A coordinate with
+/// `formula_terms`, or with a `standard_name` other than `air_pressure`,
+/// is not one whatever its units: CF 4.3.3 knows a parametric (hybrid)
+/// axis by those, and CESM/CAM's hybrid `lev` has `units = "hPa"`. A
+/// coordinate without a `standard_name` is known by its units alone.
+fn pressure_unit(variables: &[NcVariable], dim: &str) -> Option<PressureUnit> {
+    let coord = coordinate(variables, dim)?;
+    if coord.attribute("formula_terms").is_some() {
+        return None;
+    }
+    if let Some(name) = text_attr(coord, "standard_name") {
+        let name = name.trim();
+        if !name.is_empty() && name != "air_pressure" {
+            return None;
+        }
+    }
+    PressureUnit::parse(&text_attr(coord, "units")?)
+}
+
+/// The levels of pressure axis `dim` (`size` long), in hPa, bottom first
+/// (the largest pressure first), and the stored index of each. MEPS stores
+/// them in hPa from 50 up; a file in Pa (ERA5) gives the same hPa values.
+/// Levels must be finite, positive and distinct.
+fn pressure_levels(
+    nc: &NcFile,
+    variables: &[NcVariable],
+    dim: &str,
+    size: u64,
+) -> Result<(Option<Vec<f64>>, Vec<u64>), String> {
+    let (Some(coord), Some(unit)) = (coordinate(variables, dim), pressure_unit(variables, dim))
+    else {
+        return Err(format!("pressure axis '{dim}' has no coordinate variable"));
+    };
+    let hpa: Vec<f64> = read_coordinate(nc, coord)?
+        .into_iter()
+        .map(|value| unit.to_hpa(value))
+        .collect();
+    if hpa.len() as u64 != size {
+        return Err(format!(
+            "pressure axis '{dim}' has {} values for {size} levels",
+            hpa.len()
+        ));
+    }
+    if hpa.iter().any(|p| !p.is_finite() || *p <= 0.0) {
+        return Err(format!(
+            "pressure axis '{dim}' has a level that is not a positive pressure"
+        ));
+    }
+    let mut order: Vec<usize> = (0..hpa.len()).collect();
+    order.sort_by(|&a, &b| hpa[b].total_cmp(&hpa[a]));
+    let levels: Vec<f64> = order.iter().map(|&i| hpa[i]).collect();
+    if levels.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(format!("pressure axis '{dim}' repeats a level"));
+    }
+    Ok((Some(levels), order.into_iter().map(|i| i as u64).collect()))
 }
 
 /// Whether `(y, x)` roles form a supported horizontal grid: latitude and

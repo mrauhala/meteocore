@@ -1,9 +1,12 @@
-//! MEPS read live from MET Norway's thredds.met.no (#1067 PRs 5 and 7).
+//! MEPS read live from MET Norway's thredds.met.no (#1067 PRs 5, 7 and 8).
 //! Ignored: it goes to the network. Run it by hand, on a connection that can
-//! take about 9 MB:
+//! take about 18 MB for the whole file (about 9 MB for each of the two MEPS
+//! tests), or one test at a time:
 //!
 //! ```text
 //! cargo test -p engine-netcdf --test live_thredds -- --ignored --nocapture
+//! cargo test -p engine-netcdf --test live_thredds -- --ignored --nocapture \
+//!     --exact meps_pressure_levels_from_thredds
 //! ```
 //!
 //! What it reads: a few HEADs for the sentinels and leads of the runs in
@@ -14,8 +17,9 @@
 //! leads, which fetches the other two leads' chunks (~3 MB). It prints the
 //! requests, bytes and time of each step
 //! and the heap a kept per-lead handle holds, for the crate notes'
-//! "handle × 67 × max_runs". `a_ranged_get_names_the_whole_file` is one
-//! HEAD and a 1 KiB GET.
+//! "handle × 67 × max_runs". `meps_pressure_levels_from_thredds` opens
+//! two pl files and reads four fields, about 9 MB.
+//! `a_ranged_get_names_the_whole_file` is one HEAD and a 1 KiB GET.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -191,6 +195,90 @@ fn meps_per_lead_files_from_thredds() {
         engine_netcdf::chunk_cache_metrics(),
         traffic(&engine)
     );
+}
+
+const PL_CONFIG: &str = r#"
+data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
+run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+leads = [0, 1]
+time_window = "-PT6H"
+variables = ["air_temperature_pl"]
+max_runs = 1
+"#;
+
+/// Pressure levels (#1067 PR 8), live: leads 00-01 of the newest published
+/// pl run, opened for `air_temperature_pl` (two files' metadata), and one
+/// EDR position query at 850 and 500 hPa over both leads: four fields, one
+/// ~1.5 MB chunk each. About 9 MB. It prints the levels, the traffic of
+/// the opens and of the query.
+#[test]
+#[ignore = "reads about 9 MB from thredds.met.no; run by hand"]
+fn meps_pressure_levels_from_thredds() {
+    use ds_core::edr_engine::EdrEngine;
+    let config: NetcdfConfig = toml::from_str(PL_CONFIG).unwrap();
+    let started = Instant::now();
+    let engine = NetcdfEngine::new("meps-pl-live", &config).unwrap();
+    let opened = traffic(&engine);
+    let info = engine.raster_info();
+    println!(
+        "first scan: {:.1} s, {opened:?}, run {:?}, valid times {:?}, levels {:?}",
+        started.elapsed().as_secs_f64(),
+        info.reference_times,
+        info.times,
+        info.vertical
+    );
+    let vertical = info.vertical.expect("a pressure axis");
+    assert_eq!(vertical.kind, ds_core::vertical::VerticalKind::Pressure);
+    assert_eq!(
+        vertical.levels,
+        [
+            1000.0, 925.0, 850.0, 800.0, 700.0, 500.0, 400.0, 300.0, 250.0, 200.0, 150.0, 100.0,
+            50.0
+        ]
+    );
+    assert_eq!(
+        info.times.len(),
+        2,
+        "leads 00-01 of the newest published run"
+    );
+
+    let started = Instant::now();
+    let _deadline =
+        ds_core::deadline::enter(Some(Instant::now() + std::time::Duration::from_secs(30)));
+    let response = engine
+        .query_position(
+            "POINT(10.75 59.91)",
+            None,
+            Some(&["air_temperature_pl".to_string()]),
+            Some(&[850.0, 500.0]),
+            None,
+        )
+        .unwrap();
+    let after = traffic(&engine);
+    let ds_core::model::CoverageResponse::Collection(profiles) = response else {
+        panic!("a vertical profile per lead");
+    };
+    let values: Vec<Vec<Option<f64>>> = profiles
+        .iter()
+        .map(|p| p.ranges["air_temperature_pl"].values.clone())
+        .collect();
+    println!(
+        "EDR position at 850 and 500 hPa over 2 leads: {:.1} s, {} GETs, {} bytes, values \
+         {values:?}",
+        started.elapsed().as_secs_f64(),
+        after.gets - opened.gets,
+        after.bytes - opened.bytes
+    );
+    assert_eq!(values.len(), 2);
+    for profile in &values {
+        let (t850, t500) = (profile[0].unwrap(), profile[1].unwrap());
+        assert!(t850 > t500, "colder aloft: {t850} {t500}");
+        assert!((200.0..320.0).contains(&t500), "{t500}");
+    }
+    assert_eq!(after.gets - opened.gets, 4, "one chunk per field");
+    println!("total {:?}", traffic(&engine));
 }
 
 /// One file of the archive, the run the committed MEPS sample was cut from.

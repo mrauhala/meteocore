@@ -1423,6 +1423,77 @@ mod tests {
         assert_eq!(cloud.colormap.color(Some(1.0))[3], 255);
     }
 
+    /// #1067 PR 8: MEPS's pressure-level layers, as engine-netcdf reports
+    /// them with the speed `DerivedWind` adds: the jet's 50–70 m/s
+    /// components and speeds draw colours of their own, which the surface
+    /// scale's ±40 / 0–40 m/s would merge into its end colour.
+    #[test]
+    fn meps_pressure_level_winds_resolve_the_jet() {
+        let ctx = StyleContext::with_builtins();
+        let c = coll("colormap = \"temperature\"\nmin = 183.15\nmax = 323.15\n");
+        let params = [
+            (
+                "x_wind_pl",
+                "Wind along x-coordinate on pressure levels",
+                "m/s",
+            ),
+            (
+                "y_wind_pl",
+                "Wind along y-coordinate on pressure levels",
+                "m/s",
+            ),
+            ("wind_speed_pl", "Wind speed", "m/s"),
+            ("geopotential_pl", "Geopotential pressure levels", "m^2/s^2"),
+        ]
+        .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
+            name: name.into(),
+            title: title.into(),
+            unit: unit.into(),
+        });
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
+            .unwrap();
+        let style = |name: &str| &maps[&format!("c1/{name}")]["default"];
+        type Case = (&'static str, &'static str, (f64, f64), &'static [f64]);
+        let cases: [Case; 4] = [
+            (
+                "x_wind_pl",
+                "diverging",
+                (-80.0, 80.0),
+                &[-70.0, -50.0, -10.0, 0.0, 10.0, 50.0, 70.0],
+            ),
+            (
+                "y_wind_pl",
+                "diverging",
+                (-80.0, 80.0),
+                &[-50.0, 0.0, 50.0, 70.0],
+            ),
+            (
+                "wind_speed_pl",
+                "wind_speed",
+                (0.0, 80.0),
+                &[10.0, 30.0, 45.0],
+            ),
+            (
+                "geopotential_pl",
+                "viridis",
+                (0.0, 206_000.0),
+                &[1_000.0, 14_000.0, 90_000.0],
+            ),
+        ];
+        for (name, palette, (min, max), values) in cases {
+            let s = style(name);
+            assert_eq!(s.palette.name, palette, "{name}");
+            assert_eq!((s.min, s.max), (min, max), "{name}");
+            let colors: Vec<[u8; 4]> = values.iter().map(|v| s.colormap.color(Some(*v))).collect();
+            for (i, a) in colors.iter().enumerate() {
+                for b in &colors[i + 1..] {
+                    assert_ne!(a, b, "{name}: {values:?} rendered {colors:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn parameter_defaults_opt_out_and_inline_override() {
         let ctx = StyleContext::with_builtins();
