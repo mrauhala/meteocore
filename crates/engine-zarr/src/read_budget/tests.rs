@@ -50,8 +50,8 @@ fn tiny_subset_budgets_full_native_chunk_including_edge_padding() {
         budget.reserve(&a, &subset, Some(0), false),
         Err(DataServerError::ResourceExhausted)
     ));
-    assert_eq!(budget.used.load(Ordering::Relaxed), 0);
-    assert_eq!(budget.rejected.load(Ordering::Relaxed), 1);
+    assert_eq!(budget.metrics().0, 0);
+    assert_eq!(budget.metrics().2, 1);
 }
 
 #[test]
@@ -176,26 +176,26 @@ fn concurrent_reservations_cannot_overcommit_and_last_owner_releases() {
             scope.spawn(move || {
                 let held = budget.reserve(a, subset, Some(0), false);
                 barrier.wait();
-                assert_eq!(budget.used.load(Ordering::Relaxed), size * 3);
+                assert_eq!(budget.metrics().0, size * 3);
                 barrier.wait();
                 drop(held);
             });
         }
     });
-    assert_eq!(budget.used.load(Ordering::Relaxed), 0);
-    assert_eq!(budget.rejected.load(Ordering::Relaxed), 9);
+    assert_eq!(budget.metrics().0, 0);
+    assert_eq!(budget.metrics().2, 9);
     let request = budget.reserve(&a, &subset, Some(0), false).unwrap();
     let worker = request.clone();
     drop(request);
-    assert_eq!(budget.used.load(Ordering::Relaxed), size);
+    assert_eq!(budget.metrics().0, size);
     drop(worker);
-    assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+    assert_eq!(budget.metrics().0, 0);
     let held = budget.reserve(&a, &subset, Some(0), false).unwrap();
     let _ = std::panic::catch_unwind(move || {
         let _held = held;
         panic!("decode panic");
     });
-    assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+    assert_eq!(budget.metrics().0, 0);
 }
 
 #[test]
@@ -215,6 +215,6 @@ fn expired_deadline_and_overflow_never_reserve() {
         budget.reserve(&a, &a.subset_all(), Some(0), false),
         Err(DataServerError::DeadlineExceeded)
     ));
-    assert_eq!(budget.used.load(Ordering::Relaxed), 0);
-    assert_eq!(budget.rejected.load(Ordering::Relaxed), 1);
+    assert_eq!(budget.metrics().0, 0);
+    assert_eq!(budget.metrics().2, 1);
 }

@@ -425,7 +425,7 @@ fn read_chunk_cached(
         }
         // The decoder's intermediate buffer is separately capped at 64 MiB.
         // Cached native chunks subsequently belong to the decoded-cache budget.
-        let _permit = BUDGET.reserve(size + MAX_DECODED_TILE_BYTES)?;
+        let _permit = BUDGET.reserve((size + MAX_DECODED_TILE_BYTES) as u64)?;
         decoder
             .read_chunk(chunk_index)
             .map_err(|e| DataServerError::Engine(format!("Failed to read tile: {e}")))
@@ -1291,7 +1291,7 @@ fn read_encoded_chunk(
             _permit: None,
         });
     }
-    let permit = BUDGET.reserve(bytes).map_err(TileReadError::Fatal)?;
+    let permit = BUDGET.reserve(bytes as u64).map_err(TileReadError::Fatal)?;
 
     // Sanity check: offset 0 for a non-first tile is suspicious (likely truncated header)
     if offset == 0 && idx > 0 {
@@ -2365,7 +2365,7 @@ fn read_bbox_tiles(
                         // Account for the merged input in addition to each tile's
                         // compressed copy + decoder/output allocations. It lives
                         // until the whole batch is decoded; failures unwind it.
-                        let permit = BUDGET.reserve(batch.range.len())?;
+                        let permit = BUDGET.reserve(batch.range.len() as u64)?;
                         let bytes = match fetch(batch.range.clone()) {
                             Ok(bytes) if bytes.len() == batch.range.len() => Some(bytes),
                             Err(
@@ -4061,7 +4061,7 @@ mod tests {
                     if call == 1 {
                         assert_eq!(
                         crate::decode_budget::metrics().0,
-                        remote_chunk_layout(&info, meta.samples_per_pixel, 0).unwrap().1,
+                        remote_chunk_layout(&info, meta.samples_per_pixel, 0).unwrap().1 as u64,
                         "first fallback read owns only its tile reservation, not the failed batch"
                     );
                     }
