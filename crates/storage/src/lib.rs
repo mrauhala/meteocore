@@ -473,17 +473,72 @@ impl DataStore {
         path: &ObjectPath,
         handle: Option<&tokio::runtime::Handle>,
     ) -> Result<Option<Bytes>, DataServerError> {
-        let result = self.block_on_with(handle, FetchBudget::Request, async {
-            match self.inner.get(path).await {
-                Ok(res) => Ok(Some(res.bytes().await?)),
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e),
-            }
-        })?;
+        let result = self.block_on_with(handle, FetchBudget::Request, self.whole_opt(path))?;
         if let Some(b) = &result {
             self.bytes_read.fetch_add(b.len() as u64, Ordering::Relaxed);
         }
         Ok(result)
+    }
+
+    /// The whole object at `path`, or `None` when it is missing.
+    async fn whole_opt(&self, path: &ObjectPath) -> Result<Option<Bytes>, object_store::Error> {
+        match self.inner.get(path).await {
+            Ok(res) => Ok(Some(res.bytes().await?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Start [`Self::get_opt`] of `path` as a task on `handle`'s runtime and
+    /// return at once; [`PendingGet::wait`] collects it. Reads started before
+    /// the first is collected run concurrently, so synchronous code walking
+    /// many objects can start the next few while it works on the current
+    /// one, instead of paying one round trip per object in turn (root
+    /// CLAUDE.md Critical Rule 9, #999). The caller bounds how many it
+    /// starts, and with them how many objects it holds.
+    ///
+    /// The read is limited like [`Self::get_opt`]: by the request deadline
+    /// in scope on the calling thread, which the task carries, else by
+    /// [`FetchBudget::Request`]. A deadline that has already passed fails
+    /// the read without sending it.
+    ///
+    /// `handle` must be a multi-thread runtime: a current-thread runtime
+    /// runs the task only while something drives it, so the reads would not
+    /// progress while the caller works.
+    pub fn start_get_opt(&self, path: &ObjectPath, handle: &tokio::runtime::Handle) -> PendingGet {
+        debug_assert_eq!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread,
+            "start_get_opt needs a multi-thread runtime"
+        );
+        if ds_core::deadline::check().is_err() {
+            return PendingGet {
+                path: path.clone(),
+                read: PendingRead::Expired,
+            };
+        }
+        let deadline = ds_core::deadline::current();
+        let store = self.clone();
+        let object = path.clone();
+        let task = handle.spawn(async move {
+            let result = within(FetchBudget::Request, deadline, async {
+                store
+                    .whole_opt(&object)
+                    .await
+                    .map_err(|e| DataServerError::from(StorageError::from(e)))
+            })
+            .await?;
+            if let Some(b) = &result {
+                store
+                    .bytes_read
+                    .fetch_add(b.len() as u64, Ordering::Relaxed);
+            }
+            Ok(result)
+        });
+        PendingGet {
+            path: path.clone(),
+            read: PendingRead::Running(task),
+        }
     }
 
     /// One-level (delimiter) listing under `prefix`, returning `(objects,
@@ -757,14 +812,7 @@ impl DataStore {
     where
         F: std::future::Future<Output = T>,
     {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
-            Err(_) => {
-                let rt = tokio::runtime::Runtime::new()
-                    .map_err(|e| DataServerError::Storage(format!("Cannot create runtime: {e}")))?;
-                Ok(rt.block_on(future))
-            }
-        }
+        block_on_ambient(future)
     }
 
     /// Core sync→async bridge. With an explicit `handle` (caller is on a
@@ -862,6 +910,80 @@ where
             "Request timed out after {}s",
             budget.timeout().as_secs()
         ))),
+    }
+}
+
+/// Drive `future` to completion from synchronous code on the ambient
+/// runtime: a multi-threaded async worker yields via `block_in_place`, a
+/// blocking-pool worker runs it directly, and a foreign thread without a
+/// runtime creates a temporary one. Current-thread async tasks and
+/// `LocalSet` are unsupported.
+fn block_on_ambient<F: std::future::Future>(future: F) -> Result<F::Output, DataServerError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| DataServerError::Storage(format!("Cannot create runtime: {e}")))?;
+            Ok(rt.block_on(future))
+        }
+    }
+}
+
+/// A whole-object read running on a runtime ahead of the synchronous code
+/// that needs its bytes, from [`DataStore::start_get_opt`]. Collect it with
+/// [`Self::wait`]; dropping it unread aborts the read.
+#[must_use = "dropping a PendingGet aborts its read"]
+pub struct PendingGet {
+    path: ObjectPath,
+    read: PendingRead,
+}
+
+enum PendingRead {
+    /// The request deadline had passed when the read was asked for, so it
+    /// was never sent.
+    Expired,
+    Running(tokio::task::JoinHandle<Result<Option<Bytes>, DataServerError>>),
+}
+
+impl PendingGet {
+    /// Wait for the read and return what [`DataStore::get_opt`] would have:
+    /// `Ok(None)` for a missing object, and `Err` for every other failure,
+    /// the request deadline as `DeadlineExceeded`.
+    ///
+    /// `handle` picks the bridge by the caller's context, as
+    /// [`DataStore::get_opt_on`] and [`DataStore::get_opt`] do: `Some` drives
+    /// the wait with `handle.block_on`, for a `spawn_blocking` worker or a
+    /// foreign thread; `None` uses `block_in_place` around the ambient
+    /// runtime, for a multi-thread runtime worker.
+    pub fn wait(
+        mut self,
+        handle: Option<&tokio::runtime::Handle>,
+    ) -> Result<Option<Bytes>, DataServerError> {
+        let task = match &mut self.read {
+            PendingRead::Expired => return Err(DataServerError::DeadlineExceeded),
+            PendingRead::Running(task) => task,
+        };
+        let joined = match handle {
+            Some(handle) => handle.block_on(task),
+            None => block_on_ambient(task)?,
+        };
+        joined.unwrap_or_else(|e| Err(DataServerError::Storage(format!("read task failed: {e}"))))
+    }
+}
+
+impl Drop for PendingGet {
+    fn drop(&mut self) {
+        if let PendingRead::Running(task) = &self.read {
+            task.abort();
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingGet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingGet")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1512,6 +1634,84 @@ mod deadline_tests {
         })
         .await
         .unwrap();
+    }
+
+    /// #999: reads started with `start_get_opt` run concurrently on the
+    /// runtime and are collected in any order; a missing object stays
+    /// `Ok(None)`, apart from a failed read; and each read carries the request
+    /// deadline of the thread that started it, one already past never sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn started_reads_overlap_and_carry_the_starting_deadline() {
+        use crate::test_store::MetaStore;
+        use std::time::{Duration, Instant};
+        let meta = Arc::new(MetaStore {
+            delay: Duration::from_millis(200),
+            ..MetaStore::default()
+        });
+        for key in ["a", "b", "c", "failing"] {
+            meta.set(key, 0, None);
+        }
+        meta.failing.lock().unwrap().insert("failing".to_string());
+        let store = DataStore::new(meta.clone());
+        let handle = tokio::runtime::Handle::current();
+        let on_worker = (store.clone(), handle.clone());
+        tokio::task::spawn_blocking(move || {
+            let start = |key: &str| store.start_get_opt(&ObjectPath::from(key), &handle);
+            let reads: Vec<_> = ["a", "b", "c", "missing", "failing"]
+                .into_iter()
+                .map(start)
+                .collect();
+            let mut results: Vec<_> = reads
+                .into_iter()
+                .rev()
+                .map(|read| read.wait(Some(&handle)))
+                .collect();
+            results.reverse();
+            assert_eq!(
+                meta.peak.load(Ordering::SeqCst),
+                5,
+                "every read was in flight before the first was collected"
+            );
+            for result in &results[..3] {
+                assert_eq!(result.as_ref().unwrap().as_deref(), Some(&b""[..]));
+            }
+            assert!(matches!(results[3], Ok(None)), "missing: {:?}", results[3]);
+            assert!(
+                matches!(results[4], Err(DataServerError::Storage(_))),
+                "a failed read is an error, not a missing object: {:?}",
+                results[4]
+            );
+
+            let _scope = ds_core::deadline::enter(Some(Instant::now() + Duration::from_millis(50)));
+            let read = start("a");
+            assert!(matches!(
+                read.wait(Some(&handle)),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+            meta.peak.store(0, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            let read = start("a");
+            assert!(matches!(
+                read.wait(Some(&handle)),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+            assert_eq!(
+                meta.peak.load(Ordering::SeqCst),
+                0,
+                "an expired read is not sent"
+            );
+        })
+        .await
+        .unwrap();
+
+        // A runtime worker collects through `block_in_place` (`None`).
+        let (store, handle) = on_worker;
+        let read = tokio::spawn(async move {
+            store
+                .start_get_opt(&ObjectPath::from("b"), &handle)
+                .wait(None)
+        });
+        assert!(matches!(read.await.unwrap(), Ok(Some(_))));
     }
 }
 

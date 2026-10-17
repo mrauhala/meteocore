@@ -56,7 +56,7 @@ const NEGATIVE_CAPACITY_ITEMS: usize = 4096;
 pub struct PixelCache {
     inner: ByteBoundedCache<PixelKey, Arc<RawPixels>>,
     /// Count-bounded LRU of keys whose pixel read/decode failed. A per-cell
-    /// sampler loop (e.g. `volume_section`, thousands of cells) would otherwise
+    /// sampler loop (e.g. `sample_section`, thousands of cells) would otherwise
     /// re-fetch and re-count a failed moment on every cell, since a failure
     /// caches nothing — one transient S3 error inflated `pvol_pixel_read_
     /// failures_total` by thousands and hammered the store (PR #290 review).

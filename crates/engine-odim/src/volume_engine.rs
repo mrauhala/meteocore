@@ -560,30 +560,54 @@ impl PixelReadError {
     }
 }
 
-/// Per-file count of [`fetch_file_bytes`] calls, so tests can pin how many
-/// times one request downloads a volume file (#994).
+/// Per-file count of volume file downloads, [`fetch_file_bytes`] calls and
+/// the reads a walk starts ahead (`Pixels::start_read`), so tests can pin
+/// how many times one request downloads a volume file (#994) and that a
+/// walk read it ahead (#999).
 #[cfg(test)]
 mod file_fetches {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    static FETCHES: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+    type Counts = Mutex<Option<HashMap<String, usize>>>;
 
-    pub(super) fn record(file_id: &str) {
-        let mut fetches = FETCHES.lock().unwrap_or_else(|e| e.into_inner());
-        *fetches
+    static FETCHES: Counts = Mutex::new(None);
+    static AHEAD: Counts = Mutex::new(None);
+
+    fn bump(counts: &Counts, file_id: &str) {
+        let mut counts = counts.lock().unwrap_or_else(|e| e.into_inner());
+        *counts
             .get_or_insert_with(HashMap::new)
             .entry(file_id.to_owned())
             .or_default() += 1;
     }
 
-    pub(super) fn count(file_id: &str) -> usize {
-        FETCHES
+    fn get(counts: &Counts, file_id: &str) -> usize {
+        counts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .and_then(|fetches| fetches.get(file_id).copied())
+            .and_then(|counts| counts.get(file_id).copied())
             .unwrap_or(0)
+    }
+
+    pub(super) fn record(file_id: &str) {
+        bump(&FETCHES, file_id);
+    }
+
+    /// A download a walk started ahead of reaching the file: counted as a
+    /// fetch, and as read ahead.
+    pub(super) fn record_ahead(file_id: &str) {
+        bump(&FETCHES, file_id);
+        bump(&AHEAD, file_id);
+    }
+
+    pub(super) fn count(file_id: &str) -> usize {
+        get(&FETCHES, file_id)
+    }
+
+    pub(super) fn ahead(file_id: &str) -> usize {
+        get(&AHEAD, file_id)
     }
 }
 
@@ -621,16 +645,41 @@ fn fetch_file_bytes(
                 Some(h) => store.get_opt_on(&object, h),
                 None => store.get_opt(&object),
             };
-            match bytes {
-                Ok(Some(b)) => Ok(b),
-                Ok(None) => Err(PixelReadError::Bad(format!(
-                    "get `{file_id}`: object not found"
-                ))),
-                Err(e) => Err(PixelReadError::from_storage(file_id, e)),
-            }
+            classify_remote_read(file_id, bytes)
         }
     }
 }
+
+/// A remote whole-file read as the pixel reader sees it (#993): a missing
+/// object is unusable data, any other failure the request's. Shared by
+/// [`fetch_file_bytes`] and a walk's read-ahead ([`Pixels::finish_read`]),
+/// so both classify alike.
+fn classify_remote_read(
+    file_id: &str,
+    read: Result<Option<Bytes>, DataServerError>,
+) -> Result<Bytes, PixelReadError> {
+    match read {
+        Ok(Some(b)) => Ok(b),
+        Ok(None) => Err(PixelReadError::Bad(format!(
+            "get `{file_id}`: object not found"
+        ))),
+        Err(e) => Err(PixelReadError::from_storage(file_id, e)),
+    }
+}
+
+/// Most volume files an EDR walk over several volumes downloads at once,
+/// and so the most volumes it holds fetched or decoded (#999): the volume it
+/// samples plus the reads running ahead of it. A cold hour of 5-minute S3
+/// volumes then costs three rounds of whole-file GETs instead of twelve in
+/// turn (root CLAUDE.md Critical Rule 9), and a walk's peak memory stays at
+/// four volumes however long its window: at most 4 × `MAX_REMOTE_FILE_SIZE`
+/// (64 MiB) of downloaded bytes per query, times the EDR queries admitted at
+/// once (`ds_executor::query_workers()`), plus a cross-section's cell
+/// geometry per volume (`SectionPlan`, up to 1024 nodes × 100 levels × 32 B
+/// ≈ 3.3 MB).
+const MAX_WALK_VOLUMES_IN_FLIGHT: usize = 4;
+// The cap is a maintainer decision bounding per-request memory (#999).
+const _: () = assert!(MAX_WALK_VOLUMES_IN_FLIGHT == 4);
 
 /// Lazy-pixel access context threaded through the samplers: just the file
 /// source, used to re-fetch a volume's bytes on a [`PIXEL_CACHE`] miss.
@@ -854,6 +903,22 @@ impl<'a> Pixels<'a> {
         file_id: &str,
         targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
     ) -> Result<MomentPixels, DataServerError> {
+        self.load_moments_from(file_id, targets, None)
+    }
+
+    /// [`Self::load_moments`], decoding any missing moment from `fetched`
+    /// when the file was already downloaded ahead of this call (#999):
+    /// bytes a background sibling decode holds come first, then `fetched`,
+    /// and only with neither is the file downloaded here. Unused when every
+    /// moment turns out resident or known bad by now, a failed read
+    /// included: the batch then needs no bytes, as it would not have
+    /// fetched any.
+    fn load_moments_from<'v>(
+        &self,
+        file_id: &str,
+        targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
+        fetched: Option<Result<Bytes, PixelReadError>>,
+    ) -> Result<MomentPixels, DataServerError> {
         let cache_id = pixel_cache_id(self.source, file_id);
         let requests: Vec<_> = targets
             .into_iter()
@@ -863,9 +928,10 @@ impl<'a> Pixels<'a> {
             return Ok(MomentPixels::new());
         }
         let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
-            let bytes = match held {
-                Some(bytes) => Ok(bytes),
-                None => fetch_file_bytes(self.source, file_id, self.handle),
+            let bytes = match (held, fetched) {
+                (Some(bytes), _) => Ok(bytes),
+                (None, Some(fetched)) => fetched,
+                (None, None) => fetch_file_bytes(self.source, file_id, self.handle),
             };
             let decoded = bytes.and_then(|bytes| {
                 crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
@@ -893,15 +959,78 @@ impl<'a> Pixels<'a> {
     /// would download the file once per quantity. `None` when this context
     /// already carries a batch (it then answers every read itself).
     /// Sample through [`Self::batched`] with the result.
+    ///
+    /// `fetched` is the file's download when the walk started it ahead
+    /// ([`Self::start_read`], collected by [`Self::finish_read`]; #999), else
+    /// `None` and the batch downloads it if it needs it.
     fn prefetch<'v>(
         &self,
         file_id: &str,
         targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
+        fetched: Option<Result<Bytes, PixelReadError>>,
     ) -> Result<Option<MomentPixels>, DataServerError> {
         if self.moments.is_some() {
             return Ok(None);
         }
-        self.load_moments(file_id, targets).map(Some)
+        self.load_moments_from(file_id, targets, fetched).map(Some)
+    }
+
+    /// The runtime a walk over `volumes` volumes starts its downloads on
+    /// (#999): the explicit handle on a blocking-pool worker (a
+    /// cross-section), else the runtime whose worker runs the query (EDR
+    /// position, area and locations, GetFeatureInfo: the query runtime).
+    /// `None` reads each file as the walk reaches it, inside the per-file
+    /// lock as before: a local source (no round trip to overlap), a context
+    /// that already carries its batch, a thread with no runtime, or a walk
+    /// of one volume, which has nothing to overlap and keeps that lock's
+    /// coalescing of concurrent cold reads of one file. A current-thread
+    /// runtime is `None` too: nothing would drive the downloads while the
+    /// walk waits.
+    fn read_ahead_runtime(&self, volumes: usize) -> Option<tokio::runtime::Handle> {
+        if volumes < 2 || self.moments.is_some() || !matches!(self.source, Source::Remote { .. }) {
+            return None;
+        }
+        self.handle
+            .cloned()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+            .filter(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    }
+
+    /// Start downloading the remote `file_id` on `runtime` when the batch
+    /// for `targets` will read it: some target is neither resident nor known
+    /// bad, and no background sibling decode holds the file's bytes. `None`
+    /// when nothing needs downloading, and for a local source.
+    fn start_read(
+        &self,
+        file_id: &str,
+        targets: &[(&Sweep, &PolarMoment)],
+        runtime: &tokio::runtime::Handle,
+    ) -> Option<ds_storage::PendingGet> {
+        let Source::Remote { store, .. } = self.source else {
+            return None;
+        };
+        let cache_id = pixel_cache_id(self.source, file_id);
+        let cold = targets.iter().any(|(_, m)| {
+            !PIXEL_CACHE.contains(&cache_id, &m.dataset_path)
+                && !PIXEL_CACHE.is_known_bad(&cache_id, &m.dataset_path)
+        });
+        if !cold || PIXEL_CACHE.held_bytes(&cache_id).is_some() {
+            return None;
+        }
+        #[cfg(test)]
+        file_fetches::record_ahead(file_id);
+        let object = ds_storage::object_store::path::Path::from(file_id);
+        Some(store.start_get_opt(&object, runtime))
+    }
+
+    /// Wait for a download [`Self::start_read`] started, classified exactly
+    /// as [`fetch_file_bytes`] classifies its own (#993).
+    fn finish_read(
+        &self,
+        file_id: &str,
+        read: ds_storage::PendingGet,
+    ) -> Result<Bytes, PixelReadError> {
+        classify_remote_read(file_id, read.wait(self.handle))
     }
 
     /// This context reading from `batch` (a [`Self::prefetch`] result) when
@@ -971,7 +1100,7 @@ impl<'a> Pixels<'a> {
             return Ok(Some(p));
         }
         // A previously-failed read degrades straight to nodata without
-        // re-fetching — a per-cell sampler loop (e.g. `volume_section`) must
+        // re-fetching — a per-cell sampler loop (e.g. `sample_section`) must
         // not storm the store, nor re-inflate the failure metric, on one bad
         // moment (PR #290 review).
         if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
@@ -2814,7 +2943,7 @@ fn quantity_description(quantity: &str) -> ParameterDescription {
 /// dual-PRF `VRADH`/`WRADH`), and a quantity may drop out of the newest
 /// scan (firmware change / reduced strategy) while earlier volumes in the
 /// window still carry it — intersected with the optional `parameters`
-/// filter. `volume_profile`/`level_series` map a missing moment in any one
+/// filter. `sample_profile`/`level_series` map a missing moment in any one
 /// timestep to `None`, so unioning here never fabricates data; it only
 /// keeps a quantity queryable for the timesteps that actually have it.
 fn resolve_quantities(
@@ -2908,16 +3037,66 @@ fn level_target<'v>(
     })
 }
 
-/// One `VerticalProfile` coverage: every elevation sweep of `entry`'s
-/// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
-/// `z` axis.
-fn volume_profile(
-    entry: &VolumeEntry,
+/// Walk `entries` in time order, one volume file at a time, and return what
+/// `sample` makes of each (#999). `prepare` names the moments a volume's
+/// sampler reads, plus whatever geometry the sampler keeps, and `sample`
+/// reads exactly those from the volume's batch ([`Pixels::prefetch`]: one
+/// GET and one HDF5 open per file, #994).
+///
+/// Up to [`MAX_WALK_VOLUMES_IN_FLIGHT`] volumes are prepared ahead, and the
+/// remote files among them that the batch will read are downloaded
+/// concurrently on the runtime ([`Pixels::read_ahead_runtime`]) through
+/// `ds_storage`'s started reads — async tasks, never a thread per file
+/// (root CLAUDE.md Critical Rules 7 and 9). Each volume is still decoded and
+/// sampled on the caller's thread, in order, from the same batch as a
+/// sequential walk reads, and dropped before the next download starts, so
+/// the results are the sequential walk's and at most that many volumes are
+/// fetched or decoded at once.
+///
+/// The first error ends the walk and is its result, as before (#993): the
+/// request deadline, checked before each volume and carried by every
+/// download, or a transient read failure. Downloads still running are
+/// aborted, and no volume after the failing one is decoded or marked bad. A
+/// missing object stays unusable data: nodata, negatively cached (#996).
+fn walk_volumes<'v, S, T>(
     pix: Pixels,
-    lon: f64,
-    lat: f64,
-    quantities: &[String],
-) -> Result<Option<QueryResult>, DataServerError> {
+    entries: &[&'v VolumeEntry],
+    mut prepare: impl FnMut(&'v VolumeEntry) -> (Vec<(&'v Sweep, &'v PolarMoment)>, S),
+    mut sample: impl FnMut(&'v VolumeEntry, S, Pixels) -> Result<T, DataServerError>,
+) -> Result<Vec<T>, DataServerError> {
+    let runtime = pix.read_ahead_runtime(entries.len());
+    let mut rest = entries.iter().copied();
+    let mut ahead = std::collections::VecDeque::with_capacity(MAX_WALK_VOLUMES_IN_FLIGHT);
+    let mut out = Vec::with_capacity(entries.len());
+    while !ahead.is_empty() || rest.len() > 0 {
+        // A deadline stops the walk at the volume it reached (#993), before
+        // another download starts.
+        ds_core::deadline::check()?;
+        // Top up to the cap, counting the volume about to be sampled: the
+        // previous one, and its batch, are dropped by now.
+        while ahead.len() < MAX_WALK_VOLUMES_IN_FLIGHT {
+            let Some(entry) = rest.next() else {
+                break;
+            };
+            let (targets, state) = prepare(entry);
+            let read = runtime
+                .as_ref()
+                .and_then(|runtime| pix.start_read(&entry.id, &targets, runtime));
+            ahead.push_back((entry, targets, state, read));
+        }
+        let Some((entry, targets, state, read)) = ahead.pop_front() else {
+            break;
+        };
+        let fetched = read.map(|read| pix.finish_read(&entry.id, read));
+        let batch = pix.prefetch(&entry.id, targets, fetched)?;
+        out.push(sample(entry, state, pix.batched(&batch))?);
+    }
+    Ok(out)
+}
+
+/// The `z` axis of a profile of `volume`: its sweeps' distinct advertised
+/// elevation angles, ascending.
+fn profile_levels(volume: &PolarVolume) -> Vec<f64> {
     // A radar may run split cuts — two sweeps at the same nominal
     // elevation angle (e.g. separate surveillance and Doppler scans),
     // so the raw per-sweep angles can repeat (FMI volumes carry two
@@ -2925,8 +3104,7 @@ fn volume_profile(
     // (`uniqueItems`), so collapse to distinct angles — matching the
     // catalog's deduped vertical extent — and sample each quantity from
     // whichever sweep at that angle carries it.
-    let mut levels: Vec<f64> = entry
-        .volume
+    let mut levels: Vec<f64> = volume
         .sweeps
         .iter()
         .map(|s| round_elevation(s.elangle))
@@ -2938,27 +3116,69 @@ fn volume_profile(
     levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
     levels.dedup();
+    levels
+}
+
+/// Every (quantity × level) moment a profile of `volume` reads, fetched with
+/// one GET of the file (#994), not one per quantity.
+fn profile_targets<'v>(
+    volume: &'v PolarVolume,
+    levels: &[f64],
+    quantities: &[String],
+) -> Vec<(&'v Sweep, &'v PolarMoment)> {
+    quantities
+        .iter()
+        .flat_map(|quantity| {
+            levels
+                .iter()
+                .filter_map(move |&level| level_target(volume, level, quantity))
+        })
+        .collect()
+}
+
+/// One `VerticalProfile` coverage, as [`site_coverages`] builds it for each
+/// volume of its walk: a one-volume walk, for tests.
+#[cfg(test)]
+fn volume_profile(
+    entry: &VolumeEntry,
+    pix: Pixels,
+    lon: f64,
+    lat: f64,
+    quantities: &[String],
+) -> Result<Option<QueryResult>, DataServerError> {
+    let profiles = walk_volumes(
+        pix,
+        &[entry],
+        |e| {
+            let levels = profile_levels(&e.volume);
+            (profile_targets(&e.volume, &levels, quantities), levels)
+        },
+        |e, levels, pix| sample_profile(e, pix, lon, lat, quantities, levels),
+    )?;
+    Ok(profiles.into_iter().flatten().next())
+}
+
+/// One `VerticalProfile` coverage: every elevation sweep of `entry`'s
+/// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
+/// `z` axis. `pix` holds the volume's batch for `levels`
+/// ([`profile_levels`], [`profile_targets`]).
+fn sample_profile(
+    entry: &VolumeEntry,
+    pix: Pixels,
+    lon: f64,
+    lat: f64,
+    quantities: &[String],
+    levels: Vec<f64>,
+) -> Result<Option<QueryResult>, DataServerError> {
     // No usable sweep (a severely malformed volume where every elangle was
     // non-finite) — skip this coverage rather than emit a `VerticalProfile`
     // with an empty z axis, which the CoverageJSON schema rejects
-    // (`numericValuesAxis.values` has `minItems: 1`).
+    // (`numericValuesAxis.values` has `minItems: 1`). Its batch is empty:
+    // nothing was fetched for it.
     if levels.is_empty() {
         return Ok(None);
     }
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
-
-    // Every (quantity × level) moment this profile reads, fetched with one
-    // GET of the file (#994), not one per quantity.
-    let levels_ref = &levels;
-    let batch = pix.prefetch(
-        &entry.id,
-        quantities.iter().flat_map(|quantity| {
-            levels_ref
-                .iter()
-                .filter_map(move |&level| level_target(&entry.volume, level, quantity))
-        }),
-    )?;
-    let pix = pix.batched(&batch);
 
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
@@ -3004,15 +3224,16 @@ fn volume_profile(
 
 /// One `PointSeries` coverage per advertised elevation angle in `levels`:
 /// in each selected volume, the sweep at that angle, sampled at
-/// `(lon, lat)`. As in [`volume_profile`], a split cut's first sweep that
+/// `(lon, lat)`. As in [`sample_profile`], a split cut's first sweep that
 /// carries the quantity is authoritative ([`level_target`]). A volume
 /// without a sweep at a level (an older scan strategy in the window) has
 /// no sample there, never a neighbouring sweep's (`/req/edr/z-response` B).
 ///
-/// The walk is volume-major: each volume file's (quantity × level) moments
-/// are prefetched with one GET (#994) and released before the next volume,
-/// so a series over several levels and quantities never fetches a file
-/// twice nor holds more than one volume's batch.
+/// The walk is volume-major ([`walk_volumes`]): each volume file's
+/// (quantity × level) moments are prefetched with one GET (#994), the next
+/// few files downloading meanwhile (#999), and released before the next
+/// volume, so a series over several levels and quantities never fetches a
+/// file twice nor holds more than one volume's batch.
 ///
 /// Each result's flag is "this level ever *measured* the point": at least
 /// one sample classified `Value` or `Undetect` across every quantity and
@@ -3021,8 +3242,8 @@ fn volume_profile(
 /// (out of the sweep's range, no sweep at the level carries the quantity,
 /// unreadable pixels) means the point was never observed. The caller
 /// drops a level whose flag is false.
-fn level_series(
-    selected: &[&VolumeEntry],
+fn level_series<'v>(
+    selected: &[&'v VolumeEntry],
     pix: Pixels,
     lon: f64,
     lat: f64,
@@ -3041,18 +3262,18 @@ fn level_series(
         })
         .collect();
     let mut measured = vec![false; levels.len()];
-    for e in selected {
-        // A deadline stops the series at the volume it reached (#993).
-        ds_core::deadline::check()?;
-        let batch = pix.prefetch(
-            &e.id,
-            levels.iter().flat_map(|&level| {
+    let targets = |e: &'v VolumeEntry| {
+        let targets = levels
+            .iter()
+            .flat_map(|&level| {
                 quantities
                     .iter()
                     .filter_map(move |quantity| level_target(&e.volume, level, quantity))
-            }),
-        )?;
-        let pix = pix.batched(&batch);
+            })
+            .collect();
+        (targets, ())
+    };
+    walk_volumes(pix, selected, targets, |e, (), pix| {
         for (li, &level) in levels.iter().enumerate() {
             for (qi, quantity) in quantities.iter().enumerate() {
                 let class = match level_target(&e.volume, level, quantity) {
@@ -3085,7 +3306,8 @@ fn level_series(
                 });
             }
         }
-    }
+        Ok(())
+    })?;
 
     Ok(levels
         .iter()
@@ -3329,7 +3551,7 @@ fn sweep_envelope(volume: &PolarVolume) -> Option<(f64, f64)> {
 ///
 /// Distinct from `sample_sweep_moment` so the existing ground-range
 /// interim (used by position/area/Map paths) is untouched: the slant
-/// range here comes from the 4/3-Earth inversion in `volume_section`,
+/// range here comes from the 4/3-Earth inversion in `section_plan`,
 /// not from a ground-range fixup.
 ///
 /// `keep`, when given, is one flag per `volume.sweeps` entry: the sweeps a
@@ -3381,7 +3603,7 @@ fn slant_cell(
 
 /// One cross-section cell's value: [`slant_cell`] then
 /// [`sample_slant_cell`], with clear-air `Undetect` and `Masked` both
-/// `None`, as `volume_section` emits them.
+/// `None`, as `sample_section` emits them.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn sample_polar_slant(
@@ -3449,10 +3671,48 @@ fn sample_slant_cell(
     ))
 }
 
-/// Build one `Section` coverage: the volume's polar field resampled on
-/// `(along-path-distance, height-above-antenna)` and exposed via the
-/// CoverageJSON composite axis `[t, lon, lat]` plus a numeric `z` axis
-/// in metres. `window` is the caller's selected elevation-angle band
+/// One `Section` coverage of `entry`'s volume, as [`site_trajectory`]
+/// builds it for each volume of its walk ([`section_plan`], then
+/// [`sample_section`]): a one-volume walk, for tests.
+#[cfg(test)]
+fn volume_section(
+    entry: &VolumeEntry,
+    pix: Pixels,
+    path: &[(f64, f64)],
+    heights_m: &[f64],
+    quantities: &[String],
+    window: (f64, f64),
+    levels: Option<&[f64]>,
+) -> Result<Option<QueryResult>, DataServerError> {
+    let sections = walk_volumes(
+        pix,
+        &[entry],
+        |e| match section_plan(e, path, heights_m, quantities, window, levels) {
+            Some((plan, targets)) => (targets, Some(plan)),
+            None => (Vec::new(), None),
+        },
+        |e, plan, pix| {
+            plan.map(|plan| sample_section(e, plan, pix, path, heights_m, quantities))
+                .transpose()
+        },
+    )?;
+    Ok(sections.into_iter().flatten().next())
+}
+
+/// A section's geometry in one volume, computed before its file is read, so
+/// a walk can name the moments it reads ahead of reading them (#999).
+struct SectionPlan {
+    /// Lowest-beam coverage floor per node (#514).
+    coverage_floor: Vec<f64>,
+    /// Each cell's gate, row-major `[node][height]` — shared by every
+    /// quantity.
+    cells: Vec<Option<(usize, usize, usize)>>,
+}
+
+/// Plan one `Section` coverage of `entry`'s volume ([`sample_section`]):
+/// the volume's polar field resampled on `(along-path-distance,
+/// height-above-antenna)`, each cell's gate computed here, before the file
+/// is read. `window` is the caller's selected elevation-angle band
 /// `[lo, hi]` (from `z`) — cells whose 4/3-Earth-inverted beam angle
 /// falls outside it become nodata.
 ///
@@ -3469,25 +3729,26 @@ fn sample_slant_cell(
 /// section shows exactly the selected sweeps' cells of the unfiltered
 /// section and nothing of the sweeps between them (EDR 1.2
 /// `/req/edr/z-response` B).
-fn volume_section(
-    entry: &VolumeEntry,
-    pix: Pixels,
+///
+/// Returns the plan and the moments the section reads: every quantity at
+/// each sweep a cell lands in (#994). `None` when the volume has no
+/// section to show.
+fn section_plan<'v>(
+    entry: &'v VolumeEntry,
     path: &[(f64, f64)],
     heights_m: &[f64],
     quantities: &[String],
     window: (f64, f64),
     levels: Option<&[f64]>,
-) -> Result<Option<QueryResult>, DataServerError> {
+) -> Option<(SectionPlan, Vec<(&'v Sweep, &'v PolarMoment)>)> {
     if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
-        return Ok(None);
+        return None;
     }
     // Per-entry effective envelope: the selected window clamped to this
     // volume's surveyed sweep range. A volume with no finite sweeps is
     // skipped; one that doesn't cover the window yields all-nodata cells
     // (an inverted envelope rejects every beam angle).
-    let Some(entry_env) = sweep_envelope(&entry.volume) else {
-        return Ok(None);
-    };
+    let entry_env = sweep_envelope(&entry.volume)?;
     let envelope = (window.0.max(entry_env.0), window.1.min(entry_env.1));
     // One flag per sweep, built once per entry so the per-cell check is O(1).
     let keep: Option<Vec<bool>> = levels.map(|levels| {
@@ -3499,9 +3760,6 @@ fn volume_section(
             .collect()
     });
     let site = &entry.volume.site;
-    let t = entry.volume.time;
-    let nodes: Vec<(DateTime<Utc>, f64, f64)> =
-        path.iter().map(|&(lon, lat)| (t, lon, lat)).collect();
 
     // Per-node geometry from the radar antenna — computed once and shared
     // across every quantity and every z level.
@@ -3521,11 +3779,6 @@ fn volume_section(
         .map(|&(d, _)| beam_height_at_ground(envelope.0, d))
         .collect();
 
-    let mut ranges = HashMap::new();
-    let mut param_descs = HashMap::new();
-    let nz = heights_m.len();
-    let nn = nodes.len();
-
     // Each cell's gate, row-major [node][height] — geometry only, shared by
     // every quantity. The sweeps the cells land in name exactly the moments
     // the section reads, prefetched with one GET of the file (#994).
@@ -3543,26 +3796,48 @@ fn volume_section(
     for &(index, _, _) in cells.iter().flatten() {
         hit[index] = true;
     }
-    let batch = pix.prefetch(
-        &entry.id,
-        quantities.iter().flat_map(|quantity| {
+    let volume: &'v PolarVolume = &entry.volume;
+    let targets = quantities
+        .iter()
+        .flat_map(|quantity| {
             let hit = &hit;
-            entry
-                .volume
-                .sweeps
-                .iter()
-                .enumerate()
-                .filter(move |(index, _)| hit[*index])
-                .filter_map(move |(index, _)| {
-                    slant_cell_moment(&entry.volume, quantity, (index, 0, 0))
-                })
-        }),
-    )?;
-    let pix = pix.batched(&batch);
+            (0..volume.sweeps.len())
+                .filter(move |&index| hit[index])
+                .filter_map(move |index| slant_cell_moment(volume, quantity, (index, 0, 0)))
+        })
+        .collect();
+    Some((
+        SectionPlan {
+            coverage_floor,
+            cells,
+        },
+        targets,
+    ))
+}
+
+/// One `Section` coverage from `plan` ([`section_plan`]): exposed via the
+/// CoverageJSON composite axis `[t, lon, lat]` plus a numeric `z` axis in
+/// metres, sampled from `pix`, which holds the volume's batch for the
+/// plan's moments.
+fn sample_section(
+    entry: &VolumeEntry,
+    plan: SectionPlan,
+    pix: Pixels,
+    path: &[(f64, f64)],
+    heights_m: &[f64],
+    quantities: &[String],
+) -> Result<QueryResult, DataServerError> {
+    let t = entry.volume.time;
+    let nodes: Vec<(DateTime<Utc>, f64, f64)> =
+        path.iter().map(|&(lon, lat)| (t, lon, lat)).collect();
+    let mut ranges = HashMap::new();
+    let mut param_descs = HashMap::new();
+    let nz = heights_m.len();
+    let nn = nodes.len();
 
     for quantity in quantities {
         let mut values: Vec<Option<f64>> = Vec::with_capacity(nn * nz);
-        for cell in &cells {
+        for cell in &plan.cells {
             let class = match *cell {
                 Some(cell) => sample_slant_cell(&entry.volume, &entry.id, pix, quantity, cell)?,
                 None => PixelClass::Masked,
@@ -3585,18 +3860,18 @@ fn volume_section(
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    Ok(Some(QueryResult {
+    Ok(QueryResult {
         domain: DomainDescription::Section {
             nodes,
             z: VerticalCoord {
                 kind: VerticalKind::HeightAboveAntenna,
                 values: heights_m.to_vec(),
             },
-            coverage_floor: Some(coverage_floor),
+            coverage_floor: Some(plan.coverage_floor),
         },
         parameters: param_descs,
         ranges,
-    }))
+    })
 }
 
 /// Build the EDR coverages for one radar site at WGS84 `(lon, lat)`.
@@ -3633,18 +3908,22 @@ fn site_coverages(
     let quantities = resolve_quantities(&selected, parameters)?;
 
     match levels {
-        // `transpose` + `filter_map` drop volumes that produced no plottable
-        // profile (every elangle non-finite — `volume_profile` returns
-        // `Ok(None)`); the `Result` collect stops at the first deadline or
-        // transient read error and returns it (#993).
-        None => selected
-            .iter()
-            .map(|e| {
-                ds_core::deadline::check()?;
-                volume_profile(e, pix, lon, lat, &quantities)
-            })
-            .filter_map(Result::transpose)
-            .collect(),
+        // `flatten` drops volumes that produced no plottable profile (every
+        // elangle non-finite — `sample_profile` returns `Ok(None)`); the
+        // walk stops at the first deadline or transient read error and
+        // returns it (#993).
+        None => {
+            let profiles = walk_volumes(
+                pix,
+                &selected,
+                |e| {
+                    let levels = profile_levels(&e.volume);
+                    (profile_targets(&e.volume, &levels, &quantities), levels)
+                },
+                |e, levels, pix| sample_profile(e, pix, lon, lat, &quantities, levels),
+            )?;
+            Ok(profiles.into_iter().flatten().collect())
+        }
         Some(lvls) => {
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
             // Drop a level only when the point was never *measured* there —
@@ -3799,24 +4078,23 @@ fn site_trajectory(
     }
 
     // The first deadline or transient read error ends the walk and is the
-    // response (504/503): the volumes after it are never read, let alone
+    // response (504/503): the volumes after it are never decoded, let alone
     // marked bad (#993).
-    let coverages: Vec<QueryResult> = selected
-        .iter()
-        .map(|e| {
-            ds_core::deadline::check()?;
-            volume_section(
-                e,
-                pix,
-                path,
-                &heights,
-                &quantities,
-                window,
-                levels.as_deref(),
-            )
-        })
-        .filter_map(Result::transpose)
-        .collect::<Result<_, _>>()?;
+    let coverages: Vec<QueryResult> = walk_volumes(
+        pix,
+        &selected,
+        |e| match section_plan(e, path, &heights, &quantities, window, levels.as_deref()) {
+            Some((plan, targets)) => (targets, Some(plan)),
+            None => (Vec::new(), None),
+        },
+        |e, plan, pix| {
+            plan.map(|plan| sample_section(e, plan, pix, path, &heights, &quantities))
+                .transpose()
+        },
+    )?
+    .into_iter()
+    .flatten()
+    .collect();
     if coverages.is_empty() {
         return Err(DataServerError::LocationNotFound(
             "No PVOL volumes produced a section for the requested path".into(),
@@ -4482,7 +4760,7 @@ impl MapEngine for PolarVolumeSiteView {
 /// 4/3-Earth beam model (slant range → ground distance + height above the
 /// antenna), then offset from the antenna's ECEF position.
 ///
-/// This is the cross-section sampler ([`volume_section`]) generalized from a
+/// This is the cross-section sampler ([`section_plan`]) generalized from a
 /// 1-D path to the full `(sweep, ray, bin)` lattice. It uses real slant→ground
 /// geometry — unlike the 2-D [`polar_sample`], which renders with the
 /// ground-range interim. Azimuth is uniform `360/nrays` spacing (north-first,
@@ -6950,6 +7228,283 @@ mod tests {
         let profile = volume_profile(&volumes[0], pix, lon, lat, &["DBZH".to_string()]);
         assert!(matches!(profile, Err(DataServerError::DeadlineExceeded)));
         assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// Per-GET delay of the read-ahead tests (#999): what makes a walk's
+    /// round trips visible in its wall time.
+    const READ_DELAY: Duration = Duration::from_millis(200);
+
+    /// The cold-batch fixture (sweeps at 0.5° and 1.0°, each with DBZH and
+    /// VRAD; every gate a value out to 8 km).
+    const COLD_BATCH: &[u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+
+    /// A remote source whose every GET first waits `delay` (object_store's
+    /// `ThrottledStore` over an in-memory store), and `n` catalog entries
+    /// five minutes apart, each the cold-batch fixture under a key of its
+    /// own. The entry at `missing` is catalogued but absent from the store.
+    fn throttled_remote_volumes(
+        n: usize,
+        delay: Duration,
+        missing: Option<usize>,
+    ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>) {
+        use ds_storage::object_store::throttle::{ThrottleConfig, ThrottledStore};
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let volume = crate::pvol::read_polar_volume(COLD_BATCH).unwrap();
+        let inner = ds_storage::object_store::memory::InMemory::new();
+        let put = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let volumes = (0..n)
+            .map(|i| {
+                let id = unique_file_id();
+                if missing != Some(i) {
+                    let key = ds_storage::object_store::path::Path::from(id.as_str());
+                    put.block_on(inner.put(&key, PutPayload::from_static(COLD_BATCH)))
+                        .unwrap();
+                }
+                let mut volume = volume.clone();
+                volume.time += chrono::Duration::minutes(5 * i as i64);
+                VolumeEntry {
+                    id,
+                    volume: Arc::new(volume),
+                }
+            })
+            .collect();
+        let config = ThrottleConfig {
+            wait_get_per_call: delay,
+            ..ThrottleConfig::default()
+        };
+        let source = Source::Remote {
+            store: ds_storage::DataStore::new(Arc::new(ThrottledStore::new(inner, config))),
+            endpoint: "https://s3.example.com".to_string(),
+            bucket: "read-ahead-test".to_string(),
+            prefix_pattern: "%Y/".to_string(),
+            time_window: None,
+        };
+        (Arc::new(source), Arc::new(volumes))
+    }
+
+    /// A multi-thread runtime standing in for the query runtime (#1103).
+    fn query_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
+            std::sync::LazyLock::new(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            });
+        &RUNTIME
+    }
+
+    /// The EDR walks over several volumes (#999).
+    #[derive(Debug, Clone, Copy)]
+    enum Walk {
+        /// Position at two levels: `level_series`.
+        Series,
+        /// Position without `z`: a profile per volume.
+        Profiles,
+        /// A trajectory: a cross-section per volume.
+        Section,
+    }
+
+    /// Run `walk` over `volumes` under `deadline` as the per-site view runs
+    /// it: series and profiles (position, area, locations) on a query
+    /// runtime worker with no handle, the section (trajectory) on the
+    /// runtime's blocking pool with the explicit one. With no `runtime` it
+    /// runs on this thread, outside any runtime: the sequential walk.
+    fn run_walk(
+        walk: Walk,
+        source: Arc<Source>,
+        volumes: Arc<Vec<VolumeEntry>>,
+        runtime: Option<&tokio::runtime::Runtime>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<QueryResult>, DataServerError> {
+        let run = move |handle: Option<&tokio::runtime::Handle>| {
+            let _deadline = ds_core::deadline::enter(deadline);
+            let pix = Pixels {
+                moments: None,
+                source: &source,
+                handle,
+            };
+            let (lon, lat) = east_of_fixture_site(2_500.0);
+            match walk {
+                Walk::Series => {
+                    site_coverages(&volumes, pix, lon, lat, None, None, Some(&[0.5, 1.0]))
+                }
+                Walk::Profiles => site_coverages(&volumes, pix, lon, lat, None, None, None),
+                Walk::Section => {
+                    let path = [(24.5, 60.3), east_of_fixture_site(6_000.0)];
+                    site_trajectory(&volumes, pix, &path, None, None, None, None).map(|section| {
+                        match section {
+                            CoverageResponse::Single(coverage) => vec![coverage],
+                            CoverageResponse::Collection(coverages) => coverages,
+                        }
+                    })
+                }
+            }
+        };
+        match (runtime, walk) {
+            (None, _) => run(None),
+            (Some(runtime), Walk::Section) => runtime
+                .block_on(
+                    runtime.spawn_blocking(move || run(Some(&tokio::runtime::Handle::current()))),
+                )
+                .unwrap(),
+            (Some(runtime), _) => runtime
+                .block_on(runtime.spawn(async move { run(None) }))
+                .unwrap(),
+        }
+    }
+
+    /// `results` in a form two walks can be compared by: each coverage's
+    /// domain, ranges and parameters, the maps sorted.
+    fn fingerprint(results: &[QueryResult]) -> Vec<String> {
+        results
+            .iter()
+            .map(|r| {
+                let ranges: std::collections::BTreeMap<_, _> = r.ranges.iter().collect();
+                let parameters: std::collections::BTreeMap<_, _> = r
+                    .parameters
+                    .iter()
+                    .map(|(k, v)| (k, format!("{v:?}")))
+                    .collect();
+                format!("{:?} {ranges:?} {parameters:?}", r.domain)
+            })
+            .collect()
+    }
+
+    /// #999: a walk over V cold remote volumes downloads them concurrently,
+    /// at most `MAX_WALK_VOLUMES_IN_FLIGHT` (four) at a time: its wall time
+    /// scales with ceil(V / 4) round trips, not V, and each file is
+    /// downloaded exactly once, ahead of the walk reaching it. For level
+    /// series and profiles on a query runtime worker and cross-sections on
+    /// its blocking pool. 17 volumes are five rounds at four in flight but
+    /// four at five, so the lower bound pins the cap; the upper bound is
+    /// half the sequential walk's time, 0.7 s above the lower one for a
+    /// loaded runner.
+    #[test]
+    fn walks_download_volumes_concurrently_at_most_four_at_once() {
+        let n: usize = 17;
+        let rounds = n.div_ceil(MAX_WALK_VOLUMES_IN_FLIGHT) as u32;
+        let sequential = READ_DELAY * n as u32;
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let (source, volumes) = throttled_remote_volumes(n, READ_DELAY, None);
+            let started = std::time::Instant::now();
+            let results = run_walk(
+                walk,
+                source.clone(),
+                volumes.clone(),
+                Some(query_runtime()),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+            let elapsed = started.elapsed();
+            let coverages = match walk {
+                Walk::Series => 2,
+                Walk::Profiles | Walk::Section => n,
+            };
+            assert_eq!(results.len(), coverages, "{walk:?}");
+            assert!(
+                elapsed >= READ_DELAY * rounds,
+                "{walk:?}: {elapsed:?} for {n} volumes: more than \
+                 {MAX_WALK_VOLUMES_IN_FLIGHT} downloads overlapped"
+            );
+            assert!(
+                elapsed < sequential / 2,
+                "{walk:?}: {elapsed:?} is not well under the sequential {sequential:?}"
+            );
+            for e in volumes.iter() {
+                assert_eq!(file_fetches::count(&e.id), 1, "{walk:?}: `{}`", e.id);
+                assert_eq!(file_fetches::ahead(&e.id), 1, "{walk:?}: `{}`", e.id);
+            }
+            let Source::Remote { store, .. } = &*source else {
+                unreachable!("a remote source")
+            };
+            assert_eq!(
+                store.bytes_read(),
+                (n * COLD_BATCH.len()) as u64,
+                "{walk:?}: one whole-file GET per volume at the store"
+            );
+        }
+    }
+
+    /// #999: a walk that reads ahead answers exactly what the sequential
+    /// walk answers, a volume whose object is missing included: nodata
+    /// there, and its moments negatively cached, as before (#993/#996).
+    #[test]
+    fn read_ahead_walks_answer_as_the_sequential_walk() {
+        let n = 6;
+        let missing = 2;
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let run = |runtime| {
+                let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, Some(missing));
+                let results = run_walk(walk, source.clone(), volumes.clone(), runtime, None)
+                    .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+                let gone = &volumes[missing];
+                let cache_id = pixel_cache_id(&source, &gone.id);
+                let path = &gone.volume.sweeps[0].moments[0].dataset_path;
+                assert!(
+                    pixel_cache().is_known_bad(&cache_id, path),
+                    "{walk:?}: the missing volume is unusable data"
+                );
+                let ahead: Vec<_> = volumes.iter().map(|e| file_fetches::ahead(&e.id)).collect();
+                (fingerprint(&results), ahead)
+            };
+            let (sequential, sequential_ahead) = run(None);
+            let (concurrent, concurrent_ahead) = run(Some(query_runtime()));
+            assert_eq!(sequential_ahead, vec![0; n], "{walk:?}: read as it went");
+            assert_eq!(
+                concurrent_ahead,
+                vec![1; n],
+                "{walk:?}: every file read ahead"
+            );
+            assert_eq!(concurrent, sequential, "{walk:?}");
+        }
+    }
+
+    /// #999: the request deadline still stops a walk that reads ahead, both
+    /// one already past and one that passes while downloads are in flight.
+    /// The walk returns the deadline, starts no download after it and marks
+    /// nothing bad.
+    #[test]
+    fn read_ahead_walk_stops_at_the_deadline() {
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let (source, volumes) = throttled_remote_volumes(12, READ_DELAY, None);
+            let result = run_walk(
+                walk,
+                source.clone(),
+                volumes.clone(),
+                Some(query_runtime()),
+                Some(std::time::Instant::now()),
+            );
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "{walk:?}: got {:?}",
+                result.map(|r| r.len())
+            );
+            assert!(volumes.iter().all(|e| file_fetches::count(&e.id) == 0));
+
+            // Halfway through the second round of downloads: the third
+            // round would start only after the second's first download.
+            let deadline = std::time::Instant::now() + READ_DELAY * 3 / 2;
+            let result = run_walk(
+                walk,
+                source.clone(),
+                volumes.clone(),
+                Some(query_runtime()),
+                Some(deadline),
+            );
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "{walk:?}: got {:?}",
+                result.map(|r| r.len())
+            );
+            for e in &volumes[8..] {
+                assert_eq!(file_fetches::count(&e.id), 0, "{walk:?}: `{}`", e.id);
+            }
+            assert_none_marked_bad(&source, &volumes);
+        }
     }
 
     /// A dummy file source for the lazy-pixel context; never actually read,
