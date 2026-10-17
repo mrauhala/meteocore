@@ -15,7 +15,7 @@ pub const WGS84_A: f64 = 6_378_137.0;
 /// not copied from them. PROJ 9.8 identifies it:
 /// `projinfo '<wkt>' --identify` → `OGC:CRS84: 100 %`.
 pub const CRS84_WKT: &str = r#"GEOGCRS["WGS 84 (CRS84)",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,2],AXIS["geodetic longitude (Lon)",east,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic latitude (Lat)",north,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],ID["OGC","CRS84"]]"#;
-const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
+pub(crate) const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
 const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 
 /// Convert WGS84 geodetic coordinates to Earth-Centered, Earth-Fixed (ECEF)

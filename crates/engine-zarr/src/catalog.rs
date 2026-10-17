@@ -19,12 +19,15 @@ use zarrs::array::{
 use zarrs::group::Group;
 use zarrs::storage::StorageError;
 
+use ds_core::cf::{
+    classify_axis, decode_times, is_standard_calendar, parse_duration_seconds, AxisRole,
+};
 use ds_core::error::DataServerError;
 use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 
-use crate::cf::{self, AxisRole};
+use crate::cf;
 use crate::decoded::{DecodedArray, DecodedCache};
 use crate::read_budget::{self, Budget, Permit};
 use crate::store::EngineStore;
@@ -651,7 +654,13 @@ fn build_with_codec_setup(
                 AxisRole::Time => time = Some(dn.clone()),
                 AxisRole::Reference => reference = Some(dn.clone()),
                 AxisRole::Lead => lead = Some(dn.clone()),
-                AxisRole::Other => {}
+                // Projected x/y are not geolocated here, so a projected store
+                // finds no lat/lon pair and is rejected below; an ensemble
+                // dimension is pinned to index 0 like any other.
+                AxisRole::ProjectionX
+                | AxisRole::ProjectionY
+                | AxisRole::Ensemble
+                | AxisRole::Other => {}
             }
         }
         if let (Some(la), Some(lo)) = (lat, lon) {
@@ -723,7 +732,7 @@ fn build_with_codec_setup(
         let units = str_attr(ref_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("reference-time coordinate '{rd}' has no 'units'"))
         })?;
-        if !cf::is_standard_calendar(str_attr(ref_arr, "calendar").as_deref()) {
+        if !is_standard_calendar(str_attr(ref_arr, "calendar").as_deref()) {
             tracing::warn!(
                 "collection '{collection_id}': non-standard CF calendar '{}' on reference-time \
                  axis '{rd}' approximated as proleptic Gregorian",
@@ -731,7 +740,7 @@ fn build_with_codec_setup(
             );
         }
         let decoded =
-            cf::decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
+            decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
         for (i, rt) in decoded.iter().enumerate() {
             // A duplicated reference time keeps its LAST axis position.
             runs.insert(*rt, i);
@@ -759,14 +768,14 @@ fn build_with_codec_setup(
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("lead coordinate '{primary_dim}' has no 'units'"))
         })?;
-        let secs = cf::parse_duration_seconds(&units).ok_or_else(|| {
+        let secs = parse_duration_seconds(&units).ok_or_else(|| {
             DataServerError::Engine(format!(
                 "lead coordinate '{primary_dim}' has unrecognised duration units '{units}'"
             ))
         })?;
         let base = latest_ref_time.expect("forecast sets latest_ref_time");
         // Guard non-finite leads: `NaN as i64` is 0, which would silently yield
-        // the run time (mirrors `cf::decode_times`'s finite check).
+        // the run time (mirrors `decode_times`'s finite check).
         leads = read_coord_f64(primary_arr)?
             .iter()
             .map(|&v| {
@@ -785,14 +794,14 @@ fn build_with_codec_setup(
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("time coordinate '{primary_dim}' has no 'units'"))
         })?;
-        if !cf::is_standard_calendar(str_attr(primary_arr, "calendar").as_deref()) {
+        if !is_standard_calendar(str_attr(primary_arr, "calendar").as_deref()) {
             tracing::warn!(
                 "collection '{collection_id}': non-standard CF calendar '{}' approximated as \
                  proleptic Gregorian",
                 str_attr(primary_arr, "calendar").unwrap_or_default()
             );
         }
-        cf::decode_times(&read_coord_f64(primary_arr)?, &units).map_err(DataServerError::Engine)?
+        decode_times(&read_coord_f64(primary_arr)?, &units).map_err(DataServerError::Engine)?
     };
     let time_dim = primary_dim;
 
@@ -1047,12 +1056,12 @@ fn build_raster_info(
 /// or its name.
 fn role_of(by_name: &HashMap<String, Array<Store>>, dim: &str) -> AxisRole {
     match by_name.get(dim) {
-        Some(a) => cf::classify_axis(
+        Some(a) => classify_axis(
             dim,
             str_attr(a, "standard_name").as_deref(),
             str_attr(a, "units").as_deref(),
         ),
-        None => cf::classify_axis(dim, None, None),
+        None => classify_axis(dim, None, None),
     }
 }
 
@@ -1608,5 +1617,87 @@ mod tests {
         assert_eq!(convert_sample(f64::INFINITY, 1.0, 0.0, &[]), None);
         assert_eq!(convert_sample(f64::NEG_INFINITY, 1.0, 0.0, &[]), None);
         assert_eq!(convert_sample(f64::MAX, 2.0, 0.0, &[]), None);
+    }
+
+    /// A MEPS-like projected store: 1-D x/y in metres placed by a
+    /// `grid_mapping`, with 2-D latitude/longitude auxiliaries. The engine
+    /// serves latitude/longitude grids only, so it rejects the store whether
+    /// x/y are named by `standard_name` or carry metre units alone.
+    #[test]
+    fn a_projected_store_is_rejected() {
+        use serde_json::json;
+        use zarrs::array::ArrayBuilder;
+        use zarrs::filesystem::FilesystemStore;
+        use zarrs::group::GroupBuilder;
+        for standard_names in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(FilesystemStore::new(dir.path()).unwrap());
+            GroupBuilder::new()
+                .build(store.clone(), "/")
+                .unwrap()
+                .store_metadata()
+                .unwrap();
+            let write = |name: &str, dims: &[&str], attributes: serde_json::Value| {
+                let shape: Vec<u64> = dims
+                    .iter()
+                    .map(|dim| if *dim == "time" { 1 } else { 2 })
+                    .collect();
+                let values = vec![0f64; shape.iter().product::<u64>() as usize];
+                let array = ArrayBuilder::new(shape.clone(), shape, data_type::float64(), f64::NAN)
+                    .dimension_names(Some(dims.to_vec()))
+                    .attributes(attributes.as_object().unwrap().clone())
+                    .build(store.clone(), &format!("/{name}"))
+                    .unwrap();
+                array.store_metadata().unwrap();
+                array.store_chunk(&vec![0; dims.len()], values).unwrap();
+            };
+            write(
+                "time",
+                &["time"],
+                json!({ "standard_name": "time", "units": "hours since 2026-01-01" }),
+            );
+            for (axis, standard_name) in [
+                ("x", "projection_x_coordinate"),
+                ("y", "projection_y_coordinate"),
+            ] {
+                let mut attributes = json!({ "units": "m" });
+                if standard_names {
+                    attributes["standard_name"] = standard_name.into();
+                }
+                write(axis, &[axis], attributes);
+            }
+            write(
+                "latitude",
+                &["y", "x"],
+                json!({ "standard_name": "latitude", "units": "degrees_north" }),
+            );
+            write(
+                "longitude",
+                &["y", "x"],
+                json!({ "standard_name": "longitude", "units": "degrees_east" }),
+            );
+            write(
+                "air_temperature_2m",
+                &["time", "y", "x"],
+                json!({ "units": "K", "grid_mapping": "projection_lambert" }),
+            );
+            let config =
+                ds_core::config::ZarrConfig::auto_local(dir.path().to_string_lossy().into());
+            let error = build(
+                Arc::new(EngineStore::plain(
+                    crate::build_store("projected", &config).unwrap(),
+                )),
+                "projected",
+                None,
+                Arc::new(DecodedCache::new(0)),
+            )
+            .err()
+            .expect("a projected store must be rejected");
+            assert!(
+                matches!(&error, DataServerError::Engine(message)
+                    if message.starts_with("no geographic (latitude/longitude) data variable")),
+                "standard_names={standard_names}: {error:?}"
+            );
+        }
     }
 }

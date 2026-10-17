@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use ds_core::cf::{coordinate_scale, crs_from_grid_mapping, CfAttr};
+use ds_core::cf::{self, crs_from_grid_mapping, CfAttr, RegularAxis};
 use ds_core::geo::{crs84_extent, Crs, GeoTransform};
 use hdf5_reader::storage::{BytesStorage, DynStorage};
 use netcdf_reader::{NcAttrValue, NcFile, NcOpenOptions, NcSliceInfo, NcSliceInfoElem, NcType};
@@ -648,7 +648,7 @@ impl Part {
 }
 
 /// The grid of a field with a CF grid mapping and regular 1-D x/y
-/// coordinates.
+/// coordinates of `nx` and `ny` values.
 fn cf_grid(
     nc: &NcFile,
     mapping: &str,
@@ -669,11 +669,23 @@ fn cf_grid(
             _ => None,
         })
     })?;
-    let (x0, dx, x_units) = coordinate_axis(nc, x_name)?;
-    let (y0, dy, _) = coordinate_axis(nc, y_name)?;
-    let scale = coordinate_scale(&x_units, &crs)
-        .ok_or_else(|| format!("coordinate '{x_name}' has unusable units '{x_units}'"))?;
-    GeoTransform::from_cell_centres(x0 * scale, dx * scale, y0 * scale, dy * scale, nx, ny, crs)
+    let grid = cf::grid(
+        crs,
+        &coordinate_axis(nc, x_name)?,
+        &coordinate_axis(nc, y_name)?,
+    )?;
+    // Blocks are read north-up as stored.
+    if grid.flipped {
+        return Err(format!(
+            "coordinate '{y_name}' runs south to north; only north-up grids are served"
+        ));
+    }
+    if (grid.transform.width, grid.transform.height) != (nx, ny) {
+        return Err(format!(
+            "coordinates '{x_name}', '{y_name}' do not span the field's {nx} × {ny} grid"
+        ));
+    }
+    Ok(grid.transform)
 }
 
 /// A `float` field's value `v` as its whole count: missing (its fill, NaN,
@@ -847,10 +859,9 @@ fn mask_off_disk(
     }
 }
 
-/// First value, step and units of the 1-D coordinate variable `name`, with
-/// its CF packing applied (GOES-R stores x/y as packed `short`). The axis
-/// must be regular.
-fn coordinate_axis(nc: &NcFile, name: &str) -> Result<(f64, f64, String), String> {
+/// The 1-D coordinate variable `name`, with its CF packing applied (GOES-R
+/// stores x/y as packed `short`). The axis must be regular.
+fn coordinate_axis(nc: &NcFile, name: &str) -> Result<RegularAxis, String> {
     let var = nc
         .variable(name)
         .map_err(|e| format!("coordinate '{name}': {e}"))?;
@@ -866,28 +877,27 @@ fn coordinate_axis(nc: &NcFile, name: &str) -> Result<(f64, f64, String), String
         .iter()
         .map(|v| v * scale + offset)
         .collect();
-    if values.len() < 2 {
-        return Err(format!("coordinate '{name}' has fewer than two values"));
-    }
-    let step = values[1] - values[0];
-    let irregular = values
-        .iter()
-        .enumerate()
-        .any(|(i, v)| (v - (values[0] + i as f64 * step)).abs() > step.abs() * 1e-3);
-    if step == 0.0 || irregular {
-        return Err(format!("coordinate '{name}' is not a regular axis"));
-    }
-    Ok((values[0], step, units))
+    RegularAxis::from_values(name, &values, &units)
 }
 
 fn text_attr(value: Option<&NcAttrValue>) -> Option<String> {
     value.and_then(NcAttrValue::as_string)
 }
 
+/// A grid-mapping attribute for [`crs_from_grid_mapping`]: a numeric
+/// attribute of several elements stays whole, so a parameter that takes one
+/// number rejects it rather than reading its first.
 fn cf_attr(value: &NcAttrValue) -> Option<CfAttr> {
     match value {
         NcAttrValue::Chars(_) | NcAttrValue::Strings(_) => value.as_string().map(CfAttr::Text),
-        _ => value.as_f64().map(CfAttr::Number),
+        _ => {
+            let mut values = value.as_f64_vec()?;
+            match values.len() {
+                0 => None,
+                1 => values.pop().map(CfAttr::Number),
+                _ => Some(CfAttr::Numbers(values)),
+            }
+        }
     }
 }
 
@@ -897,7 +907,34 @@ fn to_u32(size: u64) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{float_count, mosaic, Frame, FrameOptions, Packing, Part, OVERVIEW_FACTOR};
+    use super::{
+        cf_attr, float_count, mosaic, Frame, FrameOptions, Packing, Part, OVERVIEW_FACTOR,
+    };
+    use ds_core::cf::CfAttr;
+    use netcdf_reader::NcAttrValue;
+
+    /// A numeric attribute of several elements, such as a secant cone's
+    /// `standard_parallel = 63.3, 63.3`, reaches the grid mapping whole.
+    #[test]
+    fn grid_mapping_attributes_keep_every_element() {
+        assert_eq!(
+            cf_attr(&NcAttrValue::Doubles(vec![63.3, 63.3])),
+            Some(CfAttr::Numbers(vec![63.3, 63.3]))
+        );
+        assert_eq!(
+            cf_attr(&NcAttrValue::Floats(vec![-75.0])),
+            Some(CfAttr::Number(-75.0))
+        );
+        assert_eq!(
+            cf_attr(&NcAttrValue::Shorts(vec![1, 2, 3])),
+            Some(CfAttr::Numbers(vec![1.0, 2.0, 3.0]))
+        );
+        assert_eq!(cf_attr(&NcAttrValue::Doubles(vec![])), None);
+        assert_eq!(
+            cf_attr(&NcAttrValue::Chars("geostationary".into())),
+            Some(CfAttr::Text("geostationary".into()))
+        );
+    }
 
     /// GOES-R CMI: stored `short`, `_Unsigned = "true"`, fill `-1s`,
     /// `valid_range = 0s, 4095s`, 12-bit brightness temperatures.
