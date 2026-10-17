@@ -242,7 +242,8 @@ const STAC_PRELOAD_BUDGET: Duration = Duration::from_secs(60);
 /// download for a non-COG), `STAC_PRELOAD_CONCURRENCY` at a time: at most
 /// 100 rounds, which fit the 30 s EDR deadline on a responsive host.
 /// Counted from the STAC response before its items are installed and before
-/// any load; more is a 400 naming both counts.
+/// any load; more is a 400 naming both counts. An on-demand listing stops
+/// paging once its window holds more (#1075).
 const STAC_REQUEST_MAX_COLD_ITEMS: usize = 400;
 
 /// One STAC stub to load: its timestamp, its single-flight path, its asset
@@ -292,17 +293,62 @@ fn cold_stac_items(
 /// it is told is to add one.
 fn check_cold_stac_budget(cold: usize, windowed: bool) -> Result<(), DataServerError> {
     if cold > STAC_REQUEST_MAX_COLD_ITEMS {
-        let remedy = if windowed {
-            "narrow the datetime window"
-        } else {
-            "add a datetime window"
-        };
-        return Err(DataServerError::QueryTooLarge(format!(
-            "Query would load the metadata of {cold} STAC items not read yet; one request may \
-             load at most {STAC_REQUEST_MAX_COLD_ITEMS} — {remedy}"
-        )));
+        return Err(cold_stac_budget_exceeded(&cold.to_string(), windowed));
     }
     Ok(())
+}
+
+/// The 400 of [`check_cold_stac_budget`] for `count` cold items: the exact
+/// count, or "at least N" when the STAC listing stopped paging past the cap
+/// and the rest of the window was never counted (#1075).
+fn cold_stac_budget_exceeded(count: &str, windowed: bool) -> DataServerError {
+    let remedy = if windowed {
+        "narrow the datetime window"
+    } else {
+        "add a datetime window"
+    };
+    DataServerError::QueryTooLarge(format!(
+        "Query would load the metadata of {count} STAC items not read yet; one request may \
+         load at most {STAC_REQUEST_MAX_COLD_ITEMS} — {remedy}"
+    ))
+}
+
+/// What an area query checks on its window's grid before the window's cold
+/// STAC items load (#1075), given the grid's metadata and the window's entry
+/// count.
+type WindowCheck<'a> = &'a dyn Fn(&reader::TiffMetadata, usize) -> Result<(), DataServerError>;
+
+/// The metadata of the loaded catalog entry nearest `timestamp`: the latest
+/// before it, else the earliest after it. An estimate of a stub's grid,
+/// never its grid: entries can differ.
+fn nearest_loaded_metadata(
+    catalog: &Catalog,
+    timestamp: DateTime<Utc>,
+) -> Option<&reader::TiffMetadata> {
+    catalog
+        .entries
+        .range(..timestamp)
+        .rev()
+        .chain(catalog.entries.range(timestamp..))
+        .find_map(|(_, entry)| entry.metadata())
+        .map(Arc::as_ref)
+}
+
+/// The native pixel window `(col_start, row_start, col_end, row_end)` of an
+/// area query's bbox on `geo_transform`; a bbox that misses the raster is
+/// the 400.
+fn area_pixel_window(
+    geo_transform: &ds_core::geo::GeoTransform,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+) -> Result<(u32, u32, u32, u32), DataServerError> {
+    geo_transform
+        .bbox_to_pixels(west, south, east, north)
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter("Requested bbox does not intersect the raster".into())
+        })
 }
 
 /// Most newly discovered remote frames one poll cycle pre-warms (#1004),
@@ -1179,15 +1225,19 @@ impl GeoTiffEngine {
     /// Ensure entries exist and have metadata loaded for the requested datetime range.
     ///
     /// For STAC mode: if the catalog has no entries for the requested range,
-    /// fetches items from the STAC API first (on-demand discovery), then
-    /// loads the GeoTIFF metadata of the matching stubs, bounded and
-    /// concurrently ([`load_cold_stac_entries`](Self::load_cold_stac_entries)).
+    /// fetches items from the STAC API first (on-demand discovery,
+    /// [`list_stac_window`](Self::list_stac_window)), then loads the GeoTIFF
+    /// metadata of the matching stubs, bounded and concurrently
+    /// ([`load_cold_stac_entries`](Self::load_cold_stac_entries)).
     /// The fetched items are counted against `STAC_REQUEST_MAX_COLD_ITEMS`
     /// before they are installed (#889): a refused query leaves the catalog
-    /// as it was, so its stubs never count against later queries.
+    /// as it was, so its stubs never count against later queries. Between
+    /// the count and the loads, an area query's `check` runs on the window's
+    /// grid ([`check_window`](Self::check_window), #1075).
     fn ensure_entries_loaded(
         &self,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        check: Option<WindowCheck<'_>>,
     ) -> Result<(), DataServerError> {
         let StoreMode::RemoteStac { client } = &self.store_mode else {
             return Ok(());
@@ -1211,17 +1261,7 @@ impl GeoTiffEngine {
         };
         if let Some(range) = fetch {
             let current = self.catalog.load();
-            let mut updated =
-                match catalog::fetch_stac_range(client, &current, range, &self.collection_id) {
-                    Ok(updated) => {
-                        self.record_stac_success();
-                        updated
-                    }
-                    Err(e) => {
-                        self.record_stac_failure();
-                        return Err(e);
-                    }
-                };
+            let mut updated = self.list_stac_window(client, &current, range, datetime)?;
             // Count what the query would load from the catalog it would see.
             self.trim_stac_catalog(&mut updated);
             check_cold_stac_budget(
@@ -1231,7 +1271,111 @@ impl GeoTiffEngine {
             self.store_stac_catalog(updated);
         }
 
+        if let Some(check) = check {
+            self.check_window(datetime, check)?;
+        }
         self.load_cold_stac_entries(datetime)
+    }
+
+    /// List the STAC items of `range` on demand for a query over `datetime`
+    /// and merge them into `current` as stubs, for
+    /// [`ensure_entries_loaded`](Self::ensure_entries_loaded) to count and
+    /// install. The listing stops paging once the query's window holds more
+    /// than `STAC_REQUEST_MAX_COLD_ITEMS` cold items (#1075): the window's
+    /// stubs already in `current` plus each new timestamp the listing
+    /// returned in it. Later pages can only add to that, so the query is
+    /// then the 400 with the count so far as a lower bound, "at least N",
+    /// and nothing is installed. A `max_files` trim can drop window items
+    /// after the listing, so such a catalog lists the window in full and
+    /// the count after the trim decides.
+    fn list_stac_window(
+        &self,
+        client: &stac::StacClient,
+        current: &Catalog,
+        range: (DateTime<Utc>, DateTime<Utc>),
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<Catalog, DataServerError> {
+        let stubs = cold_stac_items(current, datetime).len();
+        let can_stop = self.max_files.is_none();
+        let mut listed = std::collections::HashSet::new();
+        let listing = client.fetch_items_until(Some(range), None, |page| {
+            listed.extend(page.iter().map(|item| item.datetime).filter(|t| {
+                datetime.is_none_or(|(start, end)| (start..=end).contains(t))
+                    && !current.entries.contains_key(t)
+            }));
+            can_stop && stubs + listed.len() > STAC_REQUEST_MAX_COLD_ITEMS
+        });
+        match listing {
+            Ok(stac::StacListing::Complete(items)) => {
+                self.record_stac_success();
+                Ok(catalog::merge_stac_range(
+                    current,
+                    &items,
+                    range,
+                    &self.collection_id,
+                ))
+            }
+            Ok(stac::StacListing::Stopped) => {
+                self.record_stac_success();
+                let counted = stubs + listed.len();
+                tracing::debug!(
+                    "[{}] STAC listing stopped after {counted} cold items in the query window",
+                    self.collection_id
+                );
+                Err(cold_stac_budget_exceeded(
+                    &format!("at least {counted}"),
+                    datetime.is_some(),
+                ))
+            }
+            Err(e) => {
+                self.record_stac_failure();
+                Err(e)
+            }
+        }
+    }
+
+    /// Run an area query's `check` on its window's grid before the window's
+    /// cold STAC items load (#1075). The query answers on the grid of the
+    /// window's first entry. When that entry is loaded, it is checked at
+    /// once and a refused query loads nothing. A stub's grid is unknown
+    /// until it loads, so the first entry then loads alone, one round trip,
+    /// and a refused query has loaded that one item. The grid of the loaded
+    /// entry nearest it only decides whether that round trip is worth it:
+    /// when it passes `check`, the first entry loads with the rest. Entries
+    /// can differ in grid, so this estimate never refuses a query. The
+    /// query's own checks still run after the loads.
+    fn check_window(
+        &self,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        check: WindowCheck<'_>,
+    ) -> Result<(), DataServerError> {
+        let (first, timesteps) = {
+            let catalog = self.catalog.load();
+            let window = filter_by_datetime(&catalog.entries, datetime);
+            let Some(&(&first, entry)) = window.first() else {
+                return Ok(());
+            };
+            if let Some(metadata) = entry.metadata() {
+                return check(metadata, window.len());
+            }
+            if nearest_loaded_metadata(&catalog, first)
+                .is_some_and(|estimate| check(estimate, window.len()).is_ok())
+            {
+                return Ok(());
+            }
+            (first, window.len())
+        };
+        ds_core::deadline::check()?;
+        self.ensure_metadata(&first)?;
+        let catalog = self.catalog.load();
+        match catalog
+            .entries
+            .get(&first)
+            .and_then(|entry| entry.metadata())
+        {
+            Some(metadata) => check(metadata, timesteps),
+            None => Ok(()),
+        }
     }
 
     /// Run the polling loop. Call this from a tokio::spawn task.
@@ -1477,7 +1621,7 @@ impl GeoTiffEngine {
         ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
         // Lazily load STAC stubs for the requested time range
-        self.ensure_entries_loaded(datetime)?;
+        self.ensure_entries_loaded(datetime, None)?;
 
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
@@ -1580,8 +1724,9 @@ impl GeoTiffEngine {
     ) -> Result<QueryResult, DataServerError> {
         ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
-        // Lazily load STAC stubs for the requested time range
-        self.ensure_entries_loaded(datetime)?;
+        // Lazily load STAC stubs for the requested time range. `query_area`
+        // already did, with its checks on the window's grid first (#1075).
+        self.ensure_entries_loaded(datetime, None)?;
 
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
@@ -1597,14 +1742,8 @@ impl GeoTiffEngine {
         let first_metadata = first_entry
             .metadata()
             .ok_or_else(|| DataServerError::Engine("First entry has no metadata loaded".into()))?;
-        let (col_start, row_start, col_end, row_end) = first_metadata
-            .geo_transform
-            .bbox_to_pixels(west, south, east, north)
-            .ok_or_else(|| {
-                DataServerError::InvalidParameter(
-                    "Requested bbox does not intersect the raster".into(),
-                )
-            })?;
+        let (col_start, row_start, col_end, row_end) =
+            area_pixel_window(&first_metadata.geo_transform, west, south, east, north)?;
 
         let nx = (col_end - col_start) as usize;
         let ny = (row_end - row_start) as usize;
@@ -2192,12 +2331,32 @@ impl EdrEngine for GeoTiffEngine {
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
+        ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
+
+        // On a STAC source, the checks below and in `query_bbox` that need
+        // the window's grid run before its cold items load, in the same
+        // order (#1075): the bbox must meet the grid, then the mask and the
+        // response budgets over its native pixel window.
+        let ds_core::feature::Bbox {
+            west,
+            south,
+            east,
+            north,
+        } = polygon.bbox;
+        let check = |metadata: &reader::TiffMetadata, timesteps: usize| {
+            let (col_start, row_start, col_end, row_end) =
+                area_pixel_window(&metadata.geo_transform, west, south, east, north)?;
+            let nx = (col_end - col_start) as usize;
+            let ny = (row_end - row_start) as usize;
+            ds_core::feature::check_mask_budget(nx * ny, &polygon)?;
+            ds_core::feature::check_area_budget(timesteps, ny, nx, 1)
+        };
 
         // Get pixel range and geo_transform for accurate per-pixel coordinates.
         // For projected CRS (LCC, TM, etc.), the Grid x/y axes are approximations —
         // each pixel's true WGS84 position depends on both its column and row.
         // We must use pixel_to_world(col, row) for polygon containment tests.
-        self.ensure_entries_loaded(datetime)?;
+        self.ensure_entries_loaded(datetime, Some(&check))?;
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
         let geo_transform = entries

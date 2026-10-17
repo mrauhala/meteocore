@@ -11,7 +11,7 @@ use ds_core::error::DataServerError;
 use url::Url;
 
 /// Maximum items per page when querying the STAC API.
-const STAC_PAGE_LIMIT: u32 = 100;
+pub(crate) const STAC_PAGE_LIMIT: u32 = 100;
 
 /// Maximum number of pages to follow when paginating.
 /// With 100 items/page, this allows up to 100K items on initial bootstrap.
@@ -33,6 +33,17 @@ pub struct StacItem {
     pub file_size: Option<u64>,
     pub item_id: String,
     pub bbox: Option<[f64; 4]>,
+}
+
+/// How a [`StacClient::fetch_items_until`] listing ended.
+#[derive(Debug)]
+pub enum StacListing {
+    /// Every page was read, up to the pagination limits `fetch_items` has:
+    /// the items, sorted by datetime.
+    Complete(Vec<StacItem>),
+    /// The caller had seen enough with pages still left. What it saw is not
+    /// the whole answer, so no items are returned.
+    Stopped,
 }
 
 /// Extent metadata from a STAC collection (no item fetching needed).
@@ -226,6 +237,23 @@ impl StacClient {
         time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
         max_items: Option<usize>,
     ) -> Result<Vec<StacItem>, DataServerError> {
+        match self.fetch_items_until(time_filter, max_items, |_| false)? {
+            StacListing::Complete(items) => Ok(items),
+            StacListing::Stopped => unreachable!("a listing that never has enough is not stopped"),
+        }
+    }
+
+    /// [`fetch_items`](Self::fetch_items) that stops paging once the caller
+    /// has seen enough (#1075). `enough` is called with each page's parsed
+    /// items; when it returns `true` and another page is left, the listing
+    /// ends there as [`StacListing::Stopped`], without following the `next`
+    /// link. On the last page the listing is complete whatever it returns.
+    pub fn fetch_items_until(
+        &self,
+        time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        max_items: Option<usize>,
+        mut enough: impl FnMut(&[StacItem]) -> bool,
+    ) -> Result<StacListing, DataServerError> {
         let mut items = Vec::new();
         let mut url = self.build_initial_url(time_filter, max_items);
         let mut pages = 0;
@@ -333,6 +361,7 @@ impl StacClient {
                 break;
             }
 
+            let page_start = items.len();
             for feature in features {
                 if let Some(item) = self.parse_item(feature) {
                     items.push(item);
@@ -348,7 +377,10 @@ impl StacClient {
             }
 
             // Follow pagination
-            match self.extract_next_link(&body) {
+            let next = self.extract_next_link(&body);
+            let seen_enough = enough(&items[page_start..]);
+            match next {
+                Some(_) if seen_enough => return Ok(StacListing::Stopped),
                 Some(next_url) => {
                     url = next_url;
                     pages += 1;
@@ -360,7 +392,7 @@ impl StacClient {
         // Sort by datetime ascending
         items.sort_by_key(|item| item.datetime);
 
-        Ok(items)
+        Ok(StacListing::Complete(items))
     }
 
     /// Build the initial request URL with query parameters.
