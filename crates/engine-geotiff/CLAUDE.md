@@ -40,7 +40,10 @@ apply here.
   unanchored `filename_pattern` matches `….tif.part`, which sorts after its
   finished `….tif` and would win the timestamp before being dropped (#817
   review). The scan also skips hidden names (`.name`) whatever
-  `exclude_patterns` holds (#1009). The engine keeps its post-processing:
+  `exclude_patterns` holds (#1009), and the remote scan skips objects in a
+  hidden folder below the prefix, such as rsync `--delay-updates`'
+  `.~tmp~/` (#1029); the local scan never descends into a folder. The
+  engine keeps its post-processing:
   the pending-file readiness check and metadata reuse (local), header reads
   (remote). The readiness check is the shared
   `ds_storage::discovery::PendingFile` over the file's size

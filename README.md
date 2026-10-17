@@ -608,9 +608,13 @@ time_window = "PT12H"
 
 Every engine that polls a directory or object prefix skips a publisher's
 temporary files: hidden names (`.name`, written and then renamed into place)
-always, and names ending in `.tmp` or `.part`. A partial file is therefore
-never parsed; the finished file is picked up under its own name on the next
-poll. GeoTIFF leaves the suffixes to its `exclude_patterns`.
+always, and names ending in `.tmp` or `.part`. Where an engine also reads
+subfolders, it skips every file inside a hidden folder below the configured
+directory or prefix, such as the `.~tmp~/` that rsync `--delay-updates`
+stages files in; a dot folder in the configured path itself is fine. A
+partial file is therefore never parsed; the finished file is picked up
+under its own name on the next poll. GeoTIFF leaves the suffixes to its
+`exclude_patterns`.
 
 ### CSV
 
@@ -751,7 +755,7 @@ Values are converted to `f64` internally. Physical values: `physical = raw * sca
 The engine polls for new files at a configurable interval (`poll_interval_secs`, default 30s):
 
 - **Local files:** A new file is held in a "pending" state until two more poll cycles see the same size, to confirm it is fully written (size stability check).
-- **Excluded files:** Local files and remote objects whose names match `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped before the filename is matched, so a partial upload never replaces the finished file of the same timestamp or counts toward `max_files`. Hidden files (`.name`) are skipped whatever `exclude_patterns` holds.
+- **Excluded files:** Local files and remote objects whose names match `exclude_patterns` (default: `*.tmp`, `*.part`) are skipped before the filename is matched, so a partial upload never replaces the finished file of the same timestamp or counts toward `max_files`. Hidden files (`.name`) are skipped whatever `exclude_patterns` holds, and so are remote objects in a hidden folder below the prefix.
 - **Remote files:** Uses COG byte-range reads to fetch only the first 512 KB, which hold a COG's IFD header, for metadata. Falls back to a full download only when those bytes do not parse as a COG. When the range read itself fails, for example on a storage timeout, the file is skipped for that poll cycle and its header is read again on the next one.
 - **Remote files that change after the scan:** a tile range the store refuses for good is not retried. A 404, a 416, or a response showing the object is now shorter than the range means the object is gone: that request draws the tile as nodata (nulls in EDR), and the timestep leaves the catalog at once, so later requests resolve to a timestep that exists. While the listing still names the same object, by key or STAC asset URL and size, it stays out; a new object at that timestep is catalogued again. A 401 or 403 is about the server's credentials, not the data: it answers 503 without retries, so no cache keeps a gap. The timestep stays, and a WARN is logged at most once a minute per collection. Other failed tile reads are retried twice, then answer 503.
 - **Metadata caching:** Files with unchanged size reuse their cached metadata across poll cycles.

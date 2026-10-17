@@ -229,7 +229,10 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
 
 ## Config
 
-`[satellite]`: `provider = "goes-r" | "isatss" | "gmgsi"`, `data_path` XOR
+`[satellite]`: `provider = "goes-r" | "isatss" | "gmgsi"`, `data_path` (a
+mirror, listed recursively; a file in a hidden folder below it, such as
+rsync `--delay-updates`' `.~tmp~/`, is never a scan, and the same holds
+below a bucket prefix: `Source::list`, #1029) XOR
 `endpoint`+`bucket`, `time_window` (required for a bucket: ≤ 24 h of GOES-R
 or GMGSI hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
 `Naming::validate_window`),
