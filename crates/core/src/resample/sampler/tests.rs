@@ -491,3 +491,184 @@ fn a_grid_holding_the_pole_is_drawn_to_the_pole() {
         }
     }
 }
+
+/// MEPS's grid as the engine-netcdf fixture samples it, every 100th
+/// point: 10 × 11 cells 250 km apart.
+fn meps_sample() -> GeoTransform {
+    let crs = lambert(63.3, 15.0);
+    GeoTransform::from_cell_centres(
+        -1_060_084.0,
+        250_000.0,
+        1_167_482.1,
+        -250_000.0,
+        10,
+        11,
+        crs,
+    )
+    .unwrap()
+}
+
+/// MEPS's grid in full: 949 × 1069 cells at 2.5 km.
+fn meps() -> GeoTransform {
+    let crs = lambert(63.3, 15.0);
+    GeoTransform::from_cell_centres(-1_060_084.0, 2_500.0, 1_337_482.1, -2_500.0, 949, 1069, crs)
+        .unwrap()
+}
+
+/// #1110: the 256 px WMS meta-tiles of an EPSG:3067 and an EPSG:3035
+/// request near the pole, on MEPS's grid sampled and in full. Past the
+/// grid's footprint their output→source map jumps: EPSG:3067's inverse
+/// breaks down in the first tile's north-east corner, and the Lambert
+/// forward transform jumps where longitude wraps, half a turn from the
+/// grid, in the second. Only the footprint is sampled, so only its error
+/// counts: a few hundred nodes instead of the 256 × 256 cap's 66 049.
+/// Every pixel with a place on the Earth is what the same map projected
+/// per pixel draws, except where its own position error, under the half
+/// pixel nearest-neighbour resolves, reaches across the sampler's edge.
+#[test]
+fn polar_meta_tiles_refine_only_the_footprint() {
+    let tiles = [
+        (
+            "EPSG:3067",
+            [
+                1448154.6878700492,
+                7240773.439350246,
+                2896309.3757400983,
+                8688928.127220295,
+            ],
+            [
+                -651.893197248287,
+                57.99572959596767,
+                168.97855020194945,
+                143.55146987202554,
+            ],
+        ),
+        (
+            "EPSG:3035",
+            [
+                2896309.3757400983,
+                5792618.7514801975,
+                5792618.751480197,
+                8688928.127220295,
+            ],
+            [
+                -165.5766516894288,
+                70.8962238105685,
+                189.14274294709074,
+                77.91855602096956,
+            ],
+        ),
+    ];
+    let (width, height) = (256, 256);
+    for (label, gt) in [("sample", meps_sample()), ("full", meps())] {
+        let grid = SourceGrid::new(gt.clone());
+        let Layout::Projected {
+            envelope: Some([w, _, e, _]),
+        } = grid.layout
+        else {
+            panic!("{label}: no envelope");
+        };
+        let values = field_of(&gt);
+        let (nx, ny) = (f64::from(gt.width), f64::from(gt.height));
+        for (epsg, projected, bbox) in tiles {
+            let out = projected_output_crs(epsg).unwrap();
+            let crs = OutputCrs::Projected {
+                crs: out.clone(),
+                bbox: projected,
+            };
+            let label = format!("{label} {epsg}");
+            let map = grid.output_map(bbox, width, height, &crs);
+            let nodes = map.grid.node_count();
+            assert!(nodes <= 400, "{label}: {nodes} nodes");
+            let tile = map.sample_f32(&values, None).unwrap();
+            let (x_lo, x_hi, y_lo, y_hi) = map.window.unwrap();
+            // Whether output position (fx, fy) has a reproducible place on
+            // the Earth: a latitude within 90° and, its longitude taken
+            // within ±180°, a forward transform that returns to the point.
+            // Some 60° from its central meridian EPSG:3067's inverse breaks
+            // down (#1113), into positions that land anywhere, differently
+            // with each platform's libm. A pixel there has no per-pixel
+            // truth, nor does a pixel of a cell with a corner there,
+            // interpolated from it or from a sub-grid around it.
+            let on_earth = |fx: f64, fy: f64| {
+                let [min_e, min_n, max_e, max_n] = projected;
+                let (x, y) = (min_e + fx * (max_e - min_e), max_n - fy * (max_n - min_n));
+                let (lon, lat) = crs.project_node(bbox, fx, fy);
+                let (bx, by) = out.forward((lon + 180.0).rem_euclid(360.0) - 180.0, lat);
+                lat.abs() <= 90.0 && (bx - x).hypot(by - y) < 1.0
+            };
+            let g = &map.grid;
+            let node_on_earth: Vec<bool> = (0..=g.cells_y)
+                .flat_map(|j| (0..=g.cells_x).map(move |i| (i, j)))
+                .map(|(i, j)| on_earth(i as f64 / g.cells_x as f64, j as f64 / g.cells_y as f64))
+                .collect();
+            let (mut filled, mut skipped) = (0, 0);
+            for (i, got) in pixels(&tile).into_iter().enumerate() {
+                let (ox, oy) = (i as u32 % width, i as u32 / width);
+                let (fx, fy) = (
+                    (f64::from(ox) + 0.5) / f64::from(width),
+                    (f64::from(oy) + 0.5) / f64::from(height),
+                );
+                let read = (x_lo..=x_hi).contains(&ox) && (y_lo..=y_hi).contains(&oy);
+                let cx = ((f64::from(ox) + 0.5) / g.cell_w) as usize;
+                let cy = ((f64::from(oy) + 0.5) / g.cell_h) as usize;
+                let n = cy.min(g.cells_y - 1) * g.stride + cx.min(g.cells_x - 1);
+                let corners = [n, n + 1, n + g.stride, n + g.stride + 1];
+                if !on_earth(fx, fy) || (read && !corners.iter().all(|&k| node_on_earth[k])) {
+                    skipped += usize::from(read);
+                    continue;
+                }
+                let (lon, lat) = crs.project_node(bbox, fx, fy);
+                let exact =
+                    centred(gt.world_to_pixel_f64(within_half_turn(lon, (w + e) / 2.0), lat));
+                let want = grid.sample(&values, None, exact.0, exact.1);
+                if !read {
+                    // Outside the footprint: nothing drawn, nothing to draw.
+                    assert_eq!((got, want), (None, None), "{label}: pixel ({ox}, {oy})");
+                    continue;
+                }
+                // Where it can be seen, the coarse map holds the half
+                // pixel nearest-neighbour resolves, as `grid_matches_exact_*`
+                // pin it; the 0.2 px budget is the estimate's target.
+                let (col, row) = g.sample(ox, oy);
+                let err = (col - exact.0).abs().max((row - exact.1).abs());
+                let seen = |c: f64, r: f64| c > -2.0 && c < nx + 1.0 && r > -2.0 && r < ny + 1.0;
+                assert!(
+                    !(seen(col, row) || seen(exact.0, exact.1)) || err < 0.5,
+                    "{label}: pixel ({ox}, {oy}) at ({col}, {row}), per pixel {exact:?}"
+                );
+                match (got, want) {
+                    (Some(got), Some(want)) => {
+                        filled += 1;
+                        assert!(
+                            (got - want).abs() < 0.01,
+                            "{label}: pixel ({ox}, {oy}) is {got}, per pixel {want}"
+                        );
+                    }
+                    (None, None) => {}
+                    // Drawn on one side of the grid's edge only: the
+                    // pixel's own position error must reach across it. The
+                    // sampler draws positions in [-1, n) along each axis.
+                    _ => {
+                        let edge = [exact.0 + 1.0, exact.0 - nx, exact.1 + 1.0, exact.1 - ny]
+                            .iter()
+                            .fold(f64::MAX, |d, x| d.min(x.abs()));
+                        assert!(
+                            edge <= err,
+                            "{label}: pixel ({ox}, {oy}) is {got:?}, per pixel {want:?}, \
+                             {edge:.3} px from the edge, {err:.3} px off"
+                        );
+                    }
+                }
+            }
+            // EPSG:3067's tile reads one 16 px cell with a corner where the
+            // inverse breaks down, and a few pixels there.
+            assert!(skipped < 100, "{label}: {skipped} read pixels skipped");
+            // The sample's 250 km cells reach past the full grid's east
+            // edge, into the EPSG:3067 tile.
+            if label != "full EPSG:3067" {
+                assert!(filled > 300, "{label}: {filled} filled");
+            }
+        }
+    }
+}

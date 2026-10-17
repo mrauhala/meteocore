@@ -28,9 +28,11 @@
 //!   ±180° reaches a grid near the antimeridian. Its forward transform can
 //!   alias a far-away output pixel onto valid data at low zoom, so output
 //!   outside [`OutputCrs::footprint_pixel_window`] of the grid's WGS84
-//!   envelope stays empty (#449, #453). The envelope is the grid's
-//!   inverse-projected cell edges ([`GeoTransform::bbox`]), computed once
-//!   by [`SourceGrid::new`], never per request.
+//!   envelope stays empty (#449, #453), and the coordinate map is refined
+//!   for that window alone ([`ProjectionGrid::build_2d_within`], #1110).
+//!   The envelope is the grid's inverse-projected cell edges
+//!   ([`GeoTransform::bbox`]), computed once by [`SourceGrid::new`], never
+//!   per request.
 //!
 //! The output is [`RasterValues::F32`]: interpolation runs in `f64` and only
 //! the stored value is narrowed, with NaN for nodata.
@@ -147,17 +149,10 @@ impl SourceGrid {
             ),
             Layout::Projected { envelope } => {
                 let centre = envelope.map(|[w, _, e, _]| (w + e) / 2.0);
-                let grid = ProjectionGrid::build_2d(
-                    width,
-                    height,
-                    gt.width,
-                    gt.height,
-                    node,
-                    |lon, lat| {
-                        let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
-                        centred(gt.world_to_pixel_f64(lon, lat))
-                    },
-                );
+                let to_src = |lon, lat| {
+                    let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
+                    centred(gt.world_to_pixel_f64(lon, lat))
+                };
                 let window = envelope.filter(|_| width > 0 && height > 0).map(|env| {
                     output_crs.footprint_pixel_window(
                         bbox,
@@ -166,6 +161,16 @@ impl SourceGrid {
                         height,
                     )
                 });
+                let grid = match window {
+                    // Only the footprint is sampled, so only its error
+                    // counts (#1110).
+                    Some(read) => ProjectionGrid::build_2d_within(
+                        width, height, read, gt.width, gt.height, node, to_src,
+                    ),
+                    None => {
+                        ProjectionGrid::build_2d(width, height, gt.width, gt.height, node, to_src)
+                    }
+                };
                 (grid, window)
             }
         };
