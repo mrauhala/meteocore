@@ -1,6 +1,7 @@
 //! STAC metadata loading against a mock STAC API whose assets are the
 //! committed TM35FIN COG fixture, served with Range support: the poll-cycle
-//! preload (#90) and a query's bounded, concurrent cold loads (#889).
+//! preload (#90), a query's bounded, concurrent cold loads (#889), and the
+//! budgets and listing cap checked before them (#1075).
 
 use super::*;
 use ds_core::map_engine::{MapEngine, OutputCrs};
@@ -31,6 +32,9 @@ struct MockOptions {
     filter_datetime: bool,
     /// Answer this item's asset requests with 404.
     missing: Option<usize>,
+    /// Serve `/items` in pages of the request's `limit`, each linking the
+    /// next, as a STAC API does.
+    paged: bool,
 }
 
 /// The asset requests a mock STAC host served, and the most it had in
@@ -47,6 +51,8 @@ struct MockStac {
     allowlist: String,
     times: Vec<DateTime<Utc>>,
     assets: Arc<AssetLoad>,
+    /// The `/items` pages it served.
+    pages: Arc<AtomicUsize>,
 }
 
 /// [`mock_stac`] shaped by `options`, whose asset host counts its requests
@@ -56,6 +62,7 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         delay,
         filter_datetime,
         missing,
+        paged,
     } = options;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -79,10 +86,16 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
             })
             .collect(),
     );
+    let pages = Arc::new(AtomicUsize::new(0));
+    let served = Arc::clone(&pages);
+    let items_url = format!("{base}/collections/radar/items");
+    let page_base = items_url.clone();
     let items = move |axum::extract::Query(query): axum::extract::Query<
         std::collections::HashMap<String, String>,
     >| {
         let features = Arc::clone(&features);
+        served.fetch_add(1, Ordering::SeqCst);
+        let page_base = page_base.clone();
         async move {
             let window = query
                 .get("datetime")
@@ -92,15 +105,30 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
                     let parse = |t: &str| t.parse::<DateTime<Utc>>().expect("RFC 3339");
                     (parse(start), parse(end))
                 });
-            let features: Vec<&serde_json::Value> = features
+            let mut features: Vec<&serde_json::Value> = features
                 .iter()
                 .filter(|(t, _)| window.is_none_or(|(start, end)| (start..=end).contains(t)))
                 .map(|(_, feature)| feature)
                 .collect();
+            let mut links = Vec::new();
+            if paged {
+                let number = |key: &str| query.get(key).map(|n| n.parse::<usize>().unwrap());
+                let limit = number("limit").expect("the client sends a limit");
+                let offset = number("offset").unwrap_or(0);
+                let next = offset + limit;
+                if next < features.len() {
+                    let mut params =
+                        vec![("limit", limit.to_string()), ("offset", next.to_string())];
+                    params.extend(query.get("datetime").map(|dt| ("datetime", dt.clone())));
+                    let href = url::Url::parse_with_params(&page_base, &params).unwrap();
+                    links.push(serde_json::json!({ "rel": "next", "href": href.as_str() }));
+                }
+                features = features.into_iter().skip(offset).take(limit).collect();
+            }
             axum::Json(serde_json::json!({
                 "type": "FeatureCollection",
                 "features": features,
-                "links": [],
+                "links": links,
             }))
         }
     };
@@ -148,10 +176,11 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         .merge(data);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     MockStac {
-        items_url: format!("{base}/collections/radar/items"),
+        items_url,
         allowlist: format!("{base}/data/"),
         times,
         assets,
+        pages,
     }
 }
 
@@ -166,6 +195,16 @@ fn stac_engine_with_cache(
     allowlist: String,
     tile_cache_mb: u64,
 ) -> GeoTiffEngine {
+    stac_engine_with(items_url, allowlist, tile_cache_mb, None)
+}
+
+/// [`stac_engine_with_cache`] whose catalog keeps at most `max_files`.
+fn stac_engine_with(
+    items_url: String,
+    allowlist: String,
+    tile_cache_mb: u64,
+    max_files: Option<usize>,
+) -> GeoTiffEngine {
     let config = GeoTiffConfig {
         filename_template: None,
         filename_pattern: None,
@@ -174,7 +213,7 @@ fn stac_engine_with_cache(
         unit: "dBZ".to_string(),
         poll_interval_secs: 3600,
         exclude_patterns: vec![],
-        max_files: None,
+        max_files,
         tile_cache_mb,
         band: 1,
         nodata: None,
@@ -625,4 +664,218 @@ async fn query_loads_the_rest_while_another_loader_holds_an_item() {
         .unwrap()
         .expect("the query loads the released item");
     assert_eq!(loaded_times(&engine), times);
+}
+
+/// A rectangle over the whole fixture grid, 480 × 360 cells: six timesteps
+/// of it are over `MAX_AREA_VALUES`, five are within.
+const WHOLE_GRID: &str = "POLYGON((0 50, 50 50, 50 80, 0 80, 0 50))";
+const WHOLE_GRID_CELLS: usize = 480 * 360;
+
+/// Run an EDR area query the way the EDR executor does, like
+/// [`query_position`].
+async fn query_area(
+    engine: &Arc<GeoTiffEngine>,
+    coords: &str,
+    window: (DateTime<Utc>, DateTime<Utc>),
+) -> Result<CoverageResponse, DataServerError> {
+    let engine = Arc::clone(engine);
+    let coords = coords.to_string();
+    tokio::spawn(async move { engine.query_area(&coords, Some(window), None, None, None) })
+        .await
+        .unwrap()
+}
+
+/// The timesteps of an area query's answer.
+fn grid_times(response: CoverageResponse) -> Vec<DateTime<Utc>> {
+    let CoverageResponse::Single(grid) = response else {
+        panic!("expected one coverage");
+    };
+    let DomainDescription::Grid { t, .. } = grid.domain else {
+        panic!("expected a Grid, got {:?}", grid.domain);
+    };
+    t.expect("several timesteps")
+}
+
+fn expect_too_large(result: Result<CoverageResponse, DataServerError>, needle: &str) -> String {
+    match result {
+        Err(DataServerError::QueryTooLarge(msg)) => {
+            assert!(msg.contains(needle), "{msg}");
+            msg
+        }
+        Err(e) => panic!("expected QueryTooLarge, got {e:?}"),
+        Ok(_) => panic!("expected QueryTooLarge, got a coverage"),
+    }
+}
+
+/// #1075: the area budget runs on the window's grid before the window's
+/// cold items load. With every item cold, only the first loads, the one
+/// whose grid the answer uses; once it is loaded, the same query refuses
+/// without fetching any item metadata. A window within the budget loads
+/// and answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_budget_area_query_loads_at_most_its_first_item() {
+    let options = MockOptions {
+        filter_datetime: true,
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(6, options).await;
+    let times = mock.times.clone();
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+    let window = (times[0], times[5]);
+    assert!(ds_core::feature::check_area_budget(6, 360, 480, 1).is_err());
+
+    let refused = query_area(&engine, WHOLE_GRID, window).await;
+    let msg = expect_too_large(refused, "Area query would return");
+    assert!(msg.contains("6 timesteps × 360 × 480 cells"), "{msg}");
+    assert_eq!(
+        loaded_times(&engine),
+        vec![times[0]],
+        "only the first item, whose grid the budget needs"
+    );
+
+    let after_first = asset_requests(&mock);
+    let refused = query_area(&engine, WHOLE_GRID, window).await;
+    expect_too_large(refused, "Area query would return");
+    assert_eq!(
+        asset_requests(&mock),
+        after_first,
+        "no item metadata fetched"
+    );
+    assert_eq!(loaded_times(&engine), vec![times[0]]);
+
+    let response = query_area(&engine, WHOLE_GRID, (times[0], times[4]))
+        .await
+        .expect("five timesteps of the grid are within the budget");
+    assert_eq!(grid_times(response), times[..5].to_vec());
+}
+
+/// A polygon of `vertices` points on an ellipse around the fixture's grid,
+/// its bbox covering all of it.
+fn ring_over_the_grid(vertices: usize) -> String {
+    let points: Vec<String> = (0..=vertices)
+        .map(|i| {
+            let angle = std::f64::consts::TAU * (i % vertices) as f64 / vertices as f64;
+            format!(
+                "{} {}",
+                25.0 + 20.0 * angle.cos(),
+                64.0 + 12.0 * angle.sin()
+            )
+        })
+        .collect();
+    format!("POLYGON(({}))", points.join(", "))
+}
+
+/// #1075: the polygon mask budget runs before the window's cold items load
+/// as well. With the first item loaded, a polygon whose mask is over the
+/// budget fetches no item metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_over_budget_polygon_mask_fetches_no_item_metadata() {
+    // Unfiltered: the first query's listing installs every item as a stub.
+    let mock = mock_stac_with(3, MockOptions::default()).await;
+    let times = mock.times.clone();
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+    query_position(&engine, (times[0], times[0])).await.unwrap();
+    assert_eq!(loaded_times(&engine), vec![times[0]]);
+    assert_eq!(cold_stac_items(&engine.catalog.load(), None).len(), 2);
+    let polygon = ring_over_the_grid(200);
+    // Within the area budget, over the mask budget.
+    assert!(ds_core::feature::check_area_budget(3, 360, 480, 1).is_ok());
+    let ring = ds_core::feature::parse_area_coords(&polygon).unwrap();
+    assert!(ds_core::feature::check_mask_budget(WHOLE_GRID_CELLS, &ring).is_err());
+
+    let before = asset_requests(&mock);
+    let refused = query_area(&engine, &polygon, (times[0], times[2])).await;
+    expect_too_large(refused, "edge tests");
+    assert_eq!(asset_requests(&mock), before, "no item metadata fetched");
+    assert_eq!(loaded_times(&engine), vec![times[0]]);
+}
+
+/// #1075: the grid of a loaded entry outside the window only estimates the
+/// window's. Here it is finer than the window's own, so its estimate is
+/// over the budget while the window's grid is within: the query loads its
+/// first item, checks that grid and answers. Never a refusal the checks
+/// after the loads would not make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grid_estimate_never_refuses_what_the_window_grid_admits() {
+    let options = MockOptions {
+        filter_datetime: true,
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(6, options).await;
+    let times = mock.times.clone();
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+    query_position(&engine, (times[5], times[5])).await.unwrap();
+    // The newest item now claims a grid of twice the resolution.
+    engine.catalog.rcu(|current| {
+        let mut next = (**current).clone();
+        let entry = next.entries.get_mut(&times[5]).unwrap();
+        let mut finer = (**entry.metadata().unwrap()).clone();
+        let gt = &mut finer.geo_transform;
+        (gt.pixel_width, gt.pixel_height) = (gt.pixel_width / 2.0, gt.pixel_height / 2.0);
+        (gt.width, gt.height) = (gt.width * 2, gt.height * 2);
+        let source = Arc::clone(entry.source().unwrap());
+        entry.set_loaded(Arc::new(finer), source);
+        next
+    });
+    assert!(ds_core::feature::check_area_budget(2, 720, 960, 1).is_err());
+    assert!(ds_core::feature::check_area_budget(2, 360, 480, 1).is_ok());
+
+    let response = query_area(&engine, WHOLE_GRID, (times[0], times[1]))
+        .await
+        .expect("the window's own grid is within the budget");
+    assert_eq!(grid_times(response), times[..2].to_vec());
+}
+
+/// #1075: an on-demand listing over a long window stops paging once the
+/// window holds more than `STAC_REQUEST_MAX_COLD_ITEMS` items. The 400
+/// gives the count so far as a lower bound, and nothing is installed or
+/// loaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_on_demand_listing_stops_paging_past_the_cap() {
+    let count = 3 * STAC_REQUEST_MAX_COLD_ITEMS;
+    let options = MockOptions {
+        filter_datetime: true,
+        paged: true,
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(count, options).await;
+    let times = mock.times.clone();
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+    let page = stac::STAC_PAGE_LIMIT as usize;
+    // The first full page that takes the count past the cap.
+    let pages = STAC_REQUEST_MAX_COLD_ITEMS / page + 1;
+
+    let refused = query_position(&engine, (times[0], times[count - 1])).await;
+    let msg = expect_too_large(refused, &format!("at least {} STAC items", pages * page));
+    assert!(msg.ends_with("narrow the datetime window"), "{msg}");
+    assert_eq!(mock.pages.load(Ordering::SeqCst), pages);
+    assert!(engine.catalog.load().entries.is_empty());
+    assert_eq!(asset_requests(&mock), 0);
+}
+
+/// #1075: a `max_files` trim can drop window items after the listing, so
+/// such a catalog lists the window in full and counts after the trim, as
+/// before: a long window trimmed to its newest items is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_max_files_catalog_lists_the_window_in_full() {
+    let count = 6 * stac::STAC_PAGE_LIMIT as usize;
+    let options = MockOptions {
+        filter_datetime: true,
+        paged: true,
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(count, options).await;
+    let times = mock.times.clone();
+    let engine = Arc::new(stac_engine_with(
+        mock.items_url.clone(),
+        mock.allowlist.clone(),
+        0,
+        Some(10),
+    ));
+
+    let response = query_position(&engine, (times[0], times[count - 1]))
+        .await
+        .expect("the trimmed window is within the cap");
+    assert_eq!(series_times(response), times[count - 10..].to_vec());
+    assert_eq!(mock.pages.load(Ordering::SeqCst), 6);
 }

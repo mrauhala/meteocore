@@ -646,7 +646,24 @@ pub fn fetch_stac_range(
     collection_id: &str,
 ) -> Result<Catalog, DataServerError> {
     let items = client.fetch_items(Some(time_range), None)?;
+    Ok(merge_stac_range(
+        existing_catalog,
+        &items,
+        time_range,
+        collection_id,
+    ))
+}
 
+/// Merge the STAC items listed for `time_range` into a copy of
+/// `existing_catalog` as stub entries, the second half of
+/// [`fetch_stac_range`] for a caller that lists the items itself (an EDR
+/// query's bounded listing, #1075). Existing entries are preserved.
+pub fn merge_stac_range(
+    existing_catalog: &Catalog,
+    items: &[crate::stac::StacItem],
+    time_range: (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
+    collection_id: &str,
+) -> Catalog {
     tracing::info!(
         "[{}] STAC: fetched {} items for range {}/{}",
         collection_id,
@@ -658,7 +675,7 @@ pub fn fetch_stac_range(
     // Start with existing entries
     let mut entries = existing_catalog.entries.clone();
 
-    for item in &items {
+    for item in items {
         // Skip if we already have this timestamp
         if entries.contains_key(&item.datetime) {
             continue;
@@ -683,11 +700,11 @@ pub fn fetch_stac_range(
     let temporal_extent = existing_catalog.temporal_extent;
     let spatial_extent = existing_catalog.spatial_extent;
 
-    Ok(Catalog {
+    Catalog {
         entries,
         temporal_extent,
         spatial_extent,
-    })
+    }
 }
 
 /// Poll STAC for new items since the latest catalog entry.

@@ -57,7 +57,7 @@ apply here.
   header again. A timeout is not a non-COG, and a full download from the
   same stalled storage only stalls longer.
 
-## STAC metadata loading (#90, #889)
+## STAC metadata loading (#90, #889, #1075)
 
 - Startup reads only the collection extent. Each `poll_cycle` adds items
   newer than the newest entry as stubs (the first poll: the last hour), then
@@ -79,6 +79,25 @@ apply here.
   later queries. The stubs a query without `datetime` can still meet are a
   poll backlog past the preload cap and items whose load failed; a windowed
   query loads those in its window.
+- The on-demand listing (`list_stac_window`, through
+  `StacClient::fetch_items_until`) counts the window's cold items page by
+  page and stops paging once they pass `STAC_REQUEST_MAX_COLD_ITEMS`
+  (#1075). Later pages only add items, so the 400 gives the count so far as
+  "at least N" and installs nothing; a listing that reaches its last page
+  gives the exact count. A catalog with `max_files` lists the window in
+  full: its trim can drop window items again, and the count after the trim
+  decides, as before.
+- An area query checks its window's grid between that count and the loads
+  (`check_window`, #1075): the bbox must meet the grid, then the mask and
+  the response budgets, in `query_area`'s order. The answer uses the grid of
+  the window's first entry, so that is the grid checked. Loaded, it is
+  checked at once and a refused query loads nothing. A stub loads alone
+  first, one round trip, so a refused query loads that one item, not the
+  window. The loaded entry nearest it only decides whether that extra
+  round trip is needed: its grid passing the check lets the first entry
+  load with the rest. Entries can differ in grid, so never refuse on that
+  estimate. The checks after the loads stay, for scanned sources and for a
+  catalog that changed meanwhile.
 - The cold items load `STAC_PRELOAD_CONCURRENCY` at a time under one
   `block_on` of the STAC bridge, and none starts once the request's
   `ds_core::deadline` has passed. Never loop `ensure_metadata` over a
@@ -254,8 +273,10 @@ timestep of nulls with HTTP 200 (#1051). Remote bytes that do not decode are
 nulls in that tile's cells. Position follows the same policy: a failed remote
 fetch is a 503, an undecodable tile or an invalid tile layout a null. On a
 STAC source a query first loads the metadata of the cold items in its window,
-bounded and concurrent (see STAC metadata loading above); the area and mask
-budgets need the window's grid, so they run after those loads.
+bounded and concurrent (see STAC metadata loading above). The area and mask
+budgets need the window's grid, so on a STAC source they also run before
+those loads, on the window's first entry, which loads alone first when it is
+cold (#1075).
 
 Encoded remote tile ranges are validated before fetching: each is capped at
 64 MiB and included in decode admission alongside raw and boxed output buffers.
