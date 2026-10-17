@@ -108,8 +108,9 @@ impl PostgisEngine {
                 .map(|(_, key, _)| key.to_string())
                 .unwrap_or_else(|_| "unknown".to_string())
         });
-        // Seeded with the configured station property columns, so a
-        // property filter is valid before the first refresh lands (#1024).
+        // Seeded with what the config alone determines, so the parameter
+        // descriptions (#1072) and a property filter on a configured station
+        // column (#1024) are served before the first refresh lands.
         let cache = Arc::new(MetadataCache::new(&config));
         Self {
             collection_id,
@@ -2275,6 +2276,74 @@ mod tests {
         engine.cache().store(refreshed);
         assert_eq!(engine.cache().load().version, 1);
         assert_territory_filter_matches_nothing(&engine);
+    }
+
+    /// The EDR descriptions of `t2m` (labelled) and `ws` (no label, so the
+    /// name stands in), as configured.
+    fn assert_configured_parameters_described(engine: &PostgisEngine) {
+        let params = engine.get_parameter_descriptions();
+        assert_eq!(params.len(), 2, "descriptions: {params:?}");
+        let t2m = &params["t2m"];
+        assert_eq!(t2m.label, "Air temperature");
+        assert_eq!(t2m.unit, "°C");
+        assert_eq!(t2m.observed_property, "air_temperature");
+        let ws = &params["ws"];
+        assert_eq!(ws.label, "ws");
+        assert_eq!(ws.unit, "m/s");
+        assert_eq!(ws.observed_property, "wind_speed");
+    }
+
+    /// #1072: the parameter descriptions come from config alone, so they are
+    /// served before the first metadata refresh and after one that failed
+    /// because the database was unreachable at boot.
+    #[tokio::test]
+    async fn configured_parameters_are_described_before_any_refresh() {
+        use crate::config::ValidatedParameter;
+        let engine = engine_with(PostgisEngineConfig {
+            parameters: vec![
+                ValidatedParameter {
+                    name: "t2m".into(),
+                    label: "Air temperature".into(),
+                    unit: "°C".into(),
+                    observed_property: "air_temperature".into(),
+                    source_key: "TEMP".into(),
+                },
+                ValidatedParameter {
+                    name: "ws".into(),
+                    label: "".into(),
+                    unit: "m/s".into(),
+                    observed_property: "wind_speed".into(),
+                    source_key: "WIND".into(),
+                },
+            ],
+            ..stations_engine_config(&[])
+        });
+        assert_configured_parameters_described(&engine);
+
+        // Nothing listens on port 1: the refresh fails and the seeded
+        // snapshot stays in place.
+        let refreshed =
+            tokio::time::timeout(Duration::from_secs(30), engine.refresh_metadata()).await;
+        assert!(
+            matches!(refreshed, Ok(Err(_))),
+            "a refresh against port 1 must fail, not succeed or hang"
+        );
+        assert_eq!(engine.cache().load().version, 0);
+        assert_configured_parameters_described(&engine);
+    }
+
+    /// #1072: the events shape's spatial extent is its configured
+    /// `extent_bbox`, never read from the database, so it too is served
+    /// before the first refresh.
+    #[test]
+    fn events_extent_is_served_before_any_refresh() {
+        let engine = engine_with(events_engine_config());
+        assert_eq!(engine.cache().load().version, 0);
+        assert_eq!(engine.get_spatial_extent(), Some([4.0, 54.0, 42.0, 72.0]));
+        assert_eq!(
+            engine.get_parameter_descriptions()["peak_current"].unit,
+            "kA"
+        );
     }
 
     // ---- #1061: a station list cut at max_locations ------------------------

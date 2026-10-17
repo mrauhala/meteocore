@@ -165,21 +165,14 @@ pub struct CollectionMeta {
 }
 
 impl CollectionMeta {
-    /// The snapshot before the first successful refresh: no stations yet,
-    /// but the configured property columns are already filterable (#1024).
+    /// The snapshot before the first successful refresh: what a refresh that
+    /// read no rows and no temporal extent builds. No stations or time axis
+    /// yet, but everything the config alone determines is already there, so
+    /// a database unreachable at boot hides none of it: the parameter
+    /// descriptions (#1072), the configured property columns as filterables
+    /// (#1024) and the events shape's `extent_bbox`.
     fn empty(cfg: &PostgisEngineConfig) -> Self {
-        Self {
-            feature_stations: Arc::new(Vec::new()),
-            filterables: station_filterables(cfg, &[]),
-            locations: LocationSnapshot::empty(),
-            station_idx: Arc::new(HashMap::new()),
-            parameters: Arc::new(HashMap::new()),
-            temporal_extent: None,
-            spatial_extent: None,
-            wms_times: Arc::new(Vec::new()),
-            locations_cut: None,
-            version: 0,
-        }
+        Self::build(cfg, LocationSet::default(), None, 0)
     }
 
     /// Assemble a refreshed snapshot from what [`MetadataCache::refresh`]
@@ -280,8 +273,9 @@ pub struct MetadataCache {
 }
 
 impl MetadataCache {
-    /// An empty cache for `cfg`, its filterables already seeded from the
-    /// configured `stations.property_cols` (#1024).
+    /// An empty cache for `cfg`, already holding what the config alone
+    /// determines: the parameter descriptions (#1072) and the filterables
+    /// seeded from `stations.property_cols` (#1024).
     pub fn new(cfg: &PostgisEngineConfig) -> Self {
         Self {
             inner: ArcSwap::from_pointee(CollectionMeta::empty(cfg)),
