@@ -5,16 +5,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
 
 use deadpool_postgres::{Client, Pool};
 use tokio::sync::OnceCell;
 use tokio::time::{timeout_at, Instant};
 
+use crate::catalog::{AuditClient, AuditError, AUDIT_TIMEOUT};
 use crate::config::PostgisEngineConfig;
 use crate::schema::{ObservationSchema, QualifiedTable};
-
-const AUDIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) struct PrivilegeAudit {
     relations: Vec<QualifiedTable>,
@@ -155,30 +153,6 @@ struct Report {
     relations: Vec<Relation>,
 }
 
-#[derive(Debug, thiserror::Error)]
-enum AuditError {
-    #[error("pool acquisition failed: {0}")]
-    Pool(#[from] deadpool_postgres::PoolError),
-    #[error("catalog query failed: {0}")]
-    Database(#[from] tokio_postgres::Error),
-    #[error("mapped relation not found: {0}.{1}")]
-    MissingRelation(String, String),
-    #[error("privilege audit exceeded its two-second deadline")]
-    Timeout,
-}
-
-/// On timeout/error/cancellation discard the connection, never recycle an
-/// unfinished transaction. ClientWrapper::drop aborts its connection driver.
-struct AuditClient(Option<Client>);
-
-impl Drop for AuditClient {
-    fn drop(&mut self) {
-        if let Some(client) = self.0.take() {
-            drop(Client::take(client));
-        }
-    }
-}
-
 async fn inspect(pool: &Pool, relations: &[QualifiedTable]) -> Result<Report, AuditError> {
     let deadline = Instant::now() + AUDIT_TIMEOUT;
     let client = timeout_at(deadline, pool.get())
@@ -200,17 +174,7 @@ async fn inspect_on(
     client: &mut Client,
     relations: &[QualifiedTable],
 ) -> Result<Report, AuditError> {
-    let transaction = client
-        .build_transaction()
-        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-        .read_only(true)
-        .start()
-        .await?;
-    // Transaction-local and no weaker than the role's existing timeout. The
-    // server-side bound also stops work after a disconnected client times out.
-    transaction.query_one(
-        "SELECT pg_catalog.set_config('statement_timeout', LEAST(COALESCE(NULLIF(EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval) * 1000, 0), 2000), 2000)::bigint::text, true)", &[],
-    ).await?;
+    let transaction = crate::catalog::read_only(client).await?;
     let role = transaction.query_one(
         "SELECT oid, rolname::text, rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user", &[],
     ).await?;

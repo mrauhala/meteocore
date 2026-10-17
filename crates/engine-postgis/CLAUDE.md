@@ -97,6 +97,25 @@ skip subsequent I/O. Warnings are deduplicated by role/relation/privileges withi
 the shared pool, including across incremental reloads, but rebuilt engines
 inspect permissions afresh. The weak registry must not retain dead pools.
 
+## Advisory index audit
+
+`indexes.rs` follows the privilege audit lifecycle independently; both run
+concurrently, each bounded to two seconds. `catalog.rs` shares their read-only
+transaction, stricter-timeout preservation and connection-discard rules. Never
+scan source data, run EXPLAIN, or execute suggested DDL in these audits.
+
+Derive access paths from resolved mappings: station/time on every observation
+table (including per-parameter overrides), event time/geometry, and station
+geometry/geography only in stations-only mode. B-tree key prefixes accept either
+sort direction and long-shape parameter equality keys; INCLUDE is not a key.
+Inspect validity and spatial operator-family support. Partial/expression keys,
+custom operator classes/collations and alternative methods are inconclusive,
+not proof that an index is missing. Views are not traced; materialized views
+are direct relations. Accept valid logical parent indexes; do not infer missing
+partition/chunk indexes from a parent's storage or absent matching parent index.
+Bound catalog rows too (4096 index keys per relation). Deduplicate by pool,
+relation, mapped access path and finding; rebuilt engines inspect afresh.
+
 ## Database schema validation
 
 `validation.rs` checks every resolved timestamp and used geometry mapping on
@@ -325,3 +344,8 @@ in step when changing this lifecycle.
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It
   never fails on a number; without TimescaleDB it prints that it skipped.
   Run with `-- --nocapture --test-threads=1`.
+
+- Advisory audit tests in `tests/support/{privileges,indexes}.rs` share read-only
+  role fixtures and capture lifecycle diagnostics. They use a disposable DB,
+  run serially, and restore temporarily revoked catalog privileges even after
+  assertion failures. Keep the shared pool-wait test covering both audits.
